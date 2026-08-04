@@ -160,7 +160,7 @@ impl LpmDependencyProvider {
                         if activate_workspace_fallback(&self.cache, &key).is_some() =>
                     {
                         self.available_versions_cache
-                            .borrow_mut()
+                            .lock()
                             .retain(|package, _| CanonicalKey::from(package) != key);
                         return Ok(());
                     }

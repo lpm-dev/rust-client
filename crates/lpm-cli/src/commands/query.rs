@@ -85,7 +85,7 @@ pub async fn run(
             );
             for pkg in &inv.discovery.packages {
                 let pkg_dir = crate::commands::audit::inventory::find_project_baseline(
-                    baseline_index.as_ref(),
+                    Some(&baseline_index),
                     &lpm_root_inner,
                     &pkg.name,
                     &pkg.version,
@@ -223,9 +223,10 @@ pub async fn run(
     // ── Build dependency graph ──────────────────────────────────────────
 
     // For LPM projects with a lockfile, use name-based graph
-    let lockfile_path = project_root.join("lpm.lock");
     let lockfile = if is_lpm_project {
-        lpm_lockfile::Lockfile::read_fast(&lockfile_path).ok()
+        lpm_lockfile::Lockfile::read_for_project(project_root)
+            .ok()
+            .map(|project| project.lockfile)
     } else {
         None
     };

@@ -11,9 +11,8 @@ use super::state::{PendingRootConstraints, ResolveState, selected_package_cardin
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 use super::types::{Edge, PeerRequirement};
 use crate::resolve::SelectedPackageEvent;
-use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Command-scoped permit pool shared by importer-local resolver passes.
 #[derive(Clone)]
@@ -140,9 +139,9 @@ struct FusedTreeProvider<'a> {
     shared_fact_cache: Option<&'a SharedCache>,
     policy: &'a ResolverPolicy,
     spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
-    dispatcher_rpc_count: Cell<u64>,
-    tarball_dispatched_count: Cell<u64>,
-    worker_batch_disabled: &'a Cell<bool>,
+    dispatcher_rpc_count: AtomicU64,
+    tarball_dispatched_count: AtomicU64,
+    worker_batch_disabled: &'a AtomicBool,
     release_age_package_names: &'a [String],
     release_age_all_packages: bool,
     trace_metadata_fetches: bool,
@@ -367,7 +366,11 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
         &'a self,
         canonical: &'a CanonicalKey,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(async move {
             if let Some(info_arc) = cached_manifest_from_importer_or_facts(
@@ -413,13 +416,12 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 canonical.clone(),
                 info_arc.clone(),
             );
-            self.dispatcher_rpc_count
-                .set(self.dispatcher_rpc_count.get() + 1);
+            self.dispatcher_rpc_count.fetch_add(1, Ordering::Relaxed);
             if let (Some(tx), Some(speculation)) = (self.spec_tx, speculation)
                 && tx.try_send((canonical.to_string(), speculation)).is_ok()
             {
                 self.tarball_dispatched_count
-                    .set(self.tarball_dispatched_count.get() + 1);
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Ok(info_arc)
         })
@@ -428,9 +430,9 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
     fn prefetch_manifests<'a>(
         &'a self,
         canonicals: &'a [CanonicalKey],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            if self.worker_batch_disabled.get() || canonicals.is_empty() {
+            if self.worker_batch_disabled.load(Ordering::Relaxed) || canonicals.is_empty() {
                 return;
             }
 
@@ -467,8 +469,7 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                 .await
             {
                 Ok(batch) => {
-                    self.dispatcher_rpc_count
-                        .set(self.dispatcher_rpc_count.get() + 1);
+                    self.dispatcher_rpc_count.fetch_add(1, Ordering::Relaxed);
                     for (name, meta) in batch {
                         let canonical = crate::package::CanonicalKey::from_dep_name(&name);
                         if matches!(canonical, crate::package::CanonicalKey::Root) {
@@ -497,12 +498,12 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
                             && tx.try_send((canonical.to_string(), speculation)).is_ok()
                         {
                             self.tarball_dispatched_count
-                                .set(self.tarball_dispatched_count.get() + 1);
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
                 Err(e) => {
-                    self.worker_batch_disabled.set(true);
+                    self.worker_batch_disabled.store(true, Ordering::Relaxed);
                     tracing::debug!(
                         "greedy-fusion: Worker tree prefetch batch failed ({} names): {e} \
                          — falling back to per-package dispatch",
@@ -999,6 +1000,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip_all,
+    name = "resolve_greedy_fused",
+    level = "debug",
+    fields(n_deps = root_dependencies.dependencies.len(), npm_fanout)
+)]
 pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
     client: Arc<RegistryClient>,
     root_dependencies: crate::resolve::RootDependencies,
@@ -1014,12 +1021,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     shared_fact_cache: Option<SharedCache>,
     shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
 ) -> Result<ResolveResult, ResolveError> {
-    let _span = tracing::debug_span!(
-        "resolve_greedy_fused",
-        n_deps = root_dependencies.dependencies.len(),
-        npm_fanout
-    )
-    .entered();
     let pass_start = Instant::now();
 
     // Reset profiling accumulators so substage telemetry zeroes correctly
@@ -1039,7 +1040,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     state.set_selected_package_tx(selected_package_tx);
     state.seed_root_edges()?;
     let mut pending_root_constraints = PendingRootConstraints::from_task_queue(&state.task_queue);
-    let worker_batch_disabled = Cell::new(false);
+    let worker_batch_disabled = AtomicBool::new(false);
     let release_age_all_packages = policy.release_age_checks_all_packages();
     let release_age_package_names = if release_age_all_packages {
         Vec::new()
@@ -1054,14 +1055,14 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         shared_fact_cache: shared_fact_cache.as_ref(),
         policy: &policy,
         spec_tx: spec_tx.as_ref(),
-        dispatcher_rpc_count: Cell::new(0),
-        tarball_dispatched_count: Cell::new(0),
+        dispatcher_rpc_count: AtomicU64::new(0),
+        tarball_dispatched_count: AtomicU64::new(0),
         worker_batch_disabled: &worker_batch_disabled,
         release_age_package_names: &release_age_package_names,
         release_age_all_packages,
         trace_metadata_fetches,
     };
-    let tree_status_cache = super::tree_policy::TreeStatusCache::default();
+    let mut tree_status_cache = super::tree_policy::TreeStatusCache::default();
 
     // Loop-local state, owned by this single task. No Arcs needed
     // around `inflight` / `parked` because they never cross task
@@ -1185,7 +1186,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     worker_stream_can_batch_waiting = true;
                 }
                 Err(e) => {
-                    worker_batch_disabled.set(true);
+                    worker_batch_disabled.store(true, Ordering::Relaxed);
                     tracing::debug!(
                         "greedy-fusion: streaming Worker pre-batch failed to open ({} names): {e} \
                          — falling back to per-package dispatch",
@@ -1257,7 +1258,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                 }
                 Err(e) => {
-                    worker_batch_disabled.set(true);
+                    worker_batch_disabled.store(true, Ordering::Relaxed);
                     tracing::debug!(
                         "greedy-fusion: Worker pre-batch failed ({} names): {e} \
                          — falling back to per-package dispatch",
@@ -1303,7 +1304,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     let worker_name = match &canonical {
                         CanonicalKey::Npm { name }
                             if range_aware_worker_batch
-                                && !worker_batch_disabled.get()
+                                && !worker_batch_disabled.load(Ordering::Relaxed)
                                 && matches!(
                                     route_table.route_for_package(name),
                                     UpstreamRoute::LpmWorker
@@ -1398,7 +1399,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     &info_arc,
                     &policy,
                     &tree_provider,
-                    &tree_status_cache,
+                    &mut tree_status_cache,
                 )
                 .await;
                 if let Some(started) = tree_policy_started {
@@ -1427,7 +1428,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 let include_speculation = spec_tx.is_some();
                 let worker_name = match &canonical {
                     CanonicalKey::Npm { name }
-                        if !worker_batch_disabled.get()
+                        if !worker_batch_disabled.load(Ordering::Relaxed)
                             && matches!(
                                 route_table.route_for_package(name),
                                 UpstreamRoute::LpmWorker
@@ -1494,7 +1495,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         continue;
                     }
                     Err(e) => {
-                        worker_batch_disabled.set(true);
+                        worker_batch_disabled.store(true, Ordering::Relaxed);
                         tracing::debug!(
                             "greedy-fusion: streaming Worker tail batch failed to open ({} names): {e} \
                              — falling back to per-package dispatch",
@@ -1615,7 +1616,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         continue;
                     }
                     Err(e) => {
-                        worker_batch_disabled.set(true);
+                        worker_batch_disabled.store(true, Ordering::Relaxed);
                         tracing::debug!(
                             "greedy-fusion: Worker tail batch failed ({} names): {e} \
                              — falling back to per-package dispatch",
@@ -1763,7 +1764,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     Err(e) => {
                         worker_stream_finished = true;
-                        worker_batch_disabled.set(true);
+                        worker_batch_disabled.store(true, Ordering::Relaxed);
                         tracing::debug!(
                             "greedy-fusion: streaming Worker batch failed mid-body: {e} \
                              — falling back to per-package dispatch for pending names"
@@ -1813,7 +1814,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                     continue;
                                 }
                                 Err(e) => {
-                                    worker_batch_disabled.set(true);
+                                    worker_batch_disabled.store(true, Ordering::Relaxed);
                                     tracing::debug!(
                                         "greedy-fusion: streaming Worker follow-up batch failed to open ({} names): {e} \
                                          — falling back to per-package dispatch",
@@ -2049,7 +2050,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             // fast-path-cache-hit ratio.
             walker_rpc_count: 0,
             escape_hatch_rpc_count: 0,
-            dispatcher_rpc_count: dispatcher_rpc_count + tree_provider.dispatcher_rpc_count.get(),
+            dispatcher_rpc_count: dispatcher_rpc_count
+                + tree_provider.dispatcher_rpc_count.load(Ordering::Relaxed),
             dispatcher_configured_fanout: u64::try_from(npm_fanout).unwrap_or(u64::MAX),
             dispatcher_concurrency_shared,
             dispatcher_inflight_high_water: metadata_fetch_telemetry
@@ -2064,7 +2066,9 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 .load(Ordering::Relaxed),
             parked_max_depth,
             tarball_dispatched_count: tarball_dispatched_count
-                + tree_provider.tarball_dispatched_count.get(),
+                + tree_provider
+                    .tarball_dispatched_count
+                    .load(Ordering::Relaxed),
             peer_prefetch_count,
             work_edge_process_count: work_stats.edge_process_count,
             work_edge_reuse_count: work_stats.edge_reuse_count,

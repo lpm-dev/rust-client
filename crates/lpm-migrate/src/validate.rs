@@ -272,6 +272,7 @@ mod tests {
             catalogs: lpm_lockfile::CatalogSnapshots::new(),
             provenance: std::collections::BTreeMap::new(),
             packages,
+            workspace_packages: std::collections::BTreeMap::new(),
             root_aliases: std::collections::BTreeMap::new(),
             root_resolutions: lpm_lockfile::RootResolutions::new(),
             ambient_peer_installs: Vec::new(),

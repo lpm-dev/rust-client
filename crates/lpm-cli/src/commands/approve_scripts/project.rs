@@ -353,12 +353,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             // alongside the regular card when this is an UPDATE
             // (prior binding under same name exists). No-op for
             // first-time review.
-            print_version_diff_card_for_blocked(
-                target,
-                &trusted,
-                baseline_index.as_ref(),
-                &lpm_root,
-            );
+            print_version_diff_card_for_blocked(target, &trusted, Some(&baseline_index), &lpm_root);
             let prompt = if trusted
                 .latest_binding_for_name(&target.name, &target.version)
                 .is_some()
@@ -480,7 +475,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             &trusted,
             dry_run,
             json_output,
-            baseline_index.as_ref(),
+            Some(&baseline_index),
             &lpm_root,
         );
         return Ok(());
@@ -607,7 +602,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         // render the version-diff card for
         // updates (no-op when no prior binding exists for the same
         // package name).
-        print_version_diff_card_for_blocked(blocked, &trusted, baseline_index.as_ref(), &lpm_root);
+        print_version_diff_card_for_blocked(blocked, &trusted, Some(&baseline_index), &lpm_root);
 
         // branch the Select on whether this is
         // a first-time review or an update. The two branches share
@@ -672,7 +667,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 }
                 None => match choice {
                     InteractiveChoice::View => {
-                        print_full_script(blocked, baseline_index.as_ref(), &lpm_root);
+                        print_full_script(blocked, Some(&baseline_index), &lpm_root);
                         // Loop back: rebuild Select and re-prompt
                         continue;
                     }

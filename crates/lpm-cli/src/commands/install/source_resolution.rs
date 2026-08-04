@@ -464,12 +464,12 @@ pub(super) fn registry_source_url_for(
     }
 }
 
-/// — `true` iff `project_dir` is on a legacy v1
-/// layout that must be wiped before a v2 install can run cleanly.
+/// `true` iff `project_dir` is on a legacy v1 project layout that must be
+/// wiped before a v2 install can run cleanly.
 ///
 /// Either signal is enough — a project running v1 isolated has
 /// `<project>/.lpm/wrappers/`, hoisted has `<project>/.lpm/hoisted/`,
-/// and a project mid-mode-switch may have both. v2 has neither
+/// and a project mid-mode-switch may have both. Virtual stores have neither
 /// (project node_modules holds only symlinks into the global store),
 /// so the predicate also returns `false` on a clean v2 install (which
 /// is what makes it idempotent on re-runs after migration).
@@ -477,7 +477,7 @@ pub(super) fn registry_source_url_for(
 /// Detection lives in this module rather than `lpm-linker`'s
 /// `LayoutPaths` because migration is an install-pipeline concern —
 /// the linker shouldn't know about lpm-rs upgrade lifecycle.
-pub(super) fn needs_v2_migration(project_dir: &Path) -> bool {
+pub(super) fn needs_virtual_store_migration(project_dir: &Path) -> bool {
     project_dir.join(".lpm").join("wrappers").exists()
         || project_dir.join(".lpm").join("hoisted").exists()
 }
@@ -502,7 +502,7 @@ pub(super) fn needs_v2_migration(project_dir: &Path) -> bool {
 /// `~/.lpm/store/v1/` is intentionally NOT wiped here — it may still
 /// serve other projects on the same machine. `lpm store clean` is the
 /// blunt-wipe escape hatch for users who want to discard it.
-pub(super) fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
+pub(super) fn migrate_v1_to_virtual_store(project_dir: &Path) -> std::io::Result<()> {
     let dot_lpm = project_dir.join(".lpm");
     for stale in [dot_lpm.join("wrappers"), dot_lpm.join("hoisted")] {
         if stale.exists() {
@@ -520,19 +520,23 @@ pub(super) fn migrate_v1_to_v2(project_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(super) fn apply_v2_migration(
+pub(super) fn apply_virtual_store_migration(
     project_dir: &Path,
     migration_needed: bool,
+    store_version: lpm_store::StoreVersion,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if !migration_needed {
         return Ok(());
     }
     if !json_output {
-        output::info("migrating to v2 store layout (one-time, ~5\u{2013}10s)");
+        output::info(&format!(
+            "migrating to {store_version} store layout (one-time, ~5\u{2013}10s)"
+        ));
     }
-    migrate_v1_to_v2(project_dir)
-        .map_err(|error| LpmError::Registry(format!("v1→v2 migration failed: {error}")))
+    migrate_v1_to_virtual_store(project_dir).map_err(|error| {
+        LpmError::Registry(format!("v1→{store_version} migration failed: {error}"))
+    })
 }
 
 /// pre-resolve
@@ -2132,7 +2136,7 @@ pub(super) fn recurse_local_source_deps(
                     WorkspaceTransitiveMode::RootSymlinkOnly
                 ) {
                     return Err(LpmError::Registry(format!(
-                        "Git dependency {:?} declared in {} requires the v2 source graph",
+                        "Git dependency {:?} declared in {} requires the virtual-store source graph",
                         spec.local_name,
                         source_dir.display()
                     )));
@@ -2618,12 +2622,12 @@ mod routing_tests {
     use super::*;
 
     #[tokio::test]
-    async fn recursive_metadata_sharing_detaches_for_authenticated_route_contexts() {
+    async fn recursive_metadata_sharing_remains_enabled_for_unused_npm_auth() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let package = "route-isolated-package";
+        let package = "shared-route-package";
         Mock::given(method("GET"))
             .and(path(format!("/{package}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2634,13 +2638,13 @@ mod routing_tests {
                         "name": package,
                         "version": "1.0.0",
                         "dist": {
-                            "tarball": "https://example.invalid/route-isolated-package.tgz",
+                            "tarball": "https://example.invalid/shared-route-package.tgz",
                             "integrity": "sha512-test"
                         }
                     }
                 }
             })))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -2656,7 +2660,7 @@ mod routing_tests {
         );
         let route_table =
             RouteTable::new(lpm_registry::RouteMode::Direct, npmrc).expect("valid route table");
-        assert!(!route_table.supports_workspace_fetch_sharing());
+        assert!(route_table.supports_workspace_fetch_sharing());
 
         let coordinator = Arc::new(workspace_resolution::WorkspaceResolutionCoordinator::new(
             1, 1,
@@ -2671,6 +2675,6 @@ mod routing_tests {
             Ok::<(), LpmError>(())
         })
         .await
-        .expect("route-isolated metadata requests");
+        .expect("shared metadata requests");
     }
 }

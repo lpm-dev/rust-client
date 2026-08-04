@@ -3405,6 +3405,7 @@ dependencies = [
 name = "lpm-extractor"
 version = "0.71.0"
 dependencies = [
+ "blake3",
  "criterion",
  "flate2",
  "libc",
@@ -3512,6 +3513,7 @@ dependencies = [
  "lpm-common",
  "memmap2",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -3643,6 +3645,7 @@ dependencies = [
  "lpm-registry",
  "lpm-semver",
  "node-semver",
+ "parking_lot",
  "pubgrub",
  "serde",
  "serde_json",
@@ -3652,6 +3655,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "version-ranges",
  "wiremock",
 ]
@@ -3772,6 +3776,7 @@ dependencies = [
  "blake3",
  "chrono",
  "criterion",
+ "filetime",
  "flate2",
  "hex",
  "libc",
@@ -3779,6 +3784,7 @@ dependencies = [
  "lpm-extractor",
  "lpm-security",
  "rand 0.8.6",
+ "rmp-serde",
  "serde",
  "serde_json",
  "sha1 0.10.6",
@@ -3788,6 +3794,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

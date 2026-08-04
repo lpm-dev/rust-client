@@ -491,17 +491,15 @@ fn resolve_dlx_target(project_dir: &Path, package_spec: &str) -> Result<DlxTarge
         expected_identity: None,
     };
 
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !lockfile_path.exists() {
-        return Ok(target);
-    }
-
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read {} for dlx resolution: {e}",
-            lockfile_path.display()
-        ))
-    })?;
+    let lockfile = match lpm_lockfile::Lockfile::read_for_project(project_dir) {
+        Ok(project) => project.lockfile,
+        Err(lpm_lockfile::LockfileError::NotFound(_)) => return Ok(target),
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read lpm.lock for dlx resolution: {error}"
+            )));
+        }
+    };
     let Some(locked) =
         lockfile_package_for_dlx(&lockfile, &target.package_name, &target.requested_spec)
     else {

@@ -1339,201 +1339,203 @@ pub async fn run_install_filtered_add(
         )?;
     }
 
-    let workspace_lock = lpm_common::project_install_lock(&workspace_root_for_config);
-    lpm_common::with_exclusive_lock_async(workspace_lock, async {
-    let swift_manifests = targets
-        .member_manifests
-        .iter()
-        .map(|manifest| {
-            crate::commands::install_targets::install_root_for(manifest).join("Package.swift")
-        })
-        .filter(|manifest| manifest.is_file())
-        .collect::<Vec<_>>();
-    if !swift_packages.is_empty() && swift_manifests.is_empty() {
-        return Err(LpmError::Registry(
+    let requires_workspace_lockfile = !js_packages.is_empty();
+    let mutation = async {
+        let swift_manifests = targets
+            .member_manifests
+            .iter()
+            .map(|manifest| {
+                crate::commands::install_targets::install_root_for(manifest).join("Package.swift")
+            })
+            .filter(|manifest| manifest.is_file())
+            .collect::<Vec<_>>();
+        if !swift_packages.is_empty() && swift_manifests.is_empty() {
+            return Err(LpmError::Registry(
             "the selected workspace targets do not contain a Package.swift for the requested Swift package"
                 .into(),
         ));
-    }
+        }
 
-    let mut swift_transaction = if swift_packages.is_empty() {
-        None
-    } else {
-        let required = swift_manifests
-            .iter()
-            .map(PathBuf::as_path)
-            .collect::<Vec<_>>();
-        let swift_lockfiles = swift_manifests
-            .iter()
-            .map(|manifest| manifest.with_file_name("Package.resolved"))
-            .collect::<Vec<_>>();
-        let optional = swift_lockfiles
-            .iter()
-            .map(PathBuf::as_path)
-            .collect::<Vec<_>>();
-        Some(crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-            &required,
-            &optional,
-            &[],
-        )?)
-    };
-    for manifest_path in &swift_manifests {
-        let manifest_dir = manifest_path.parent().ok_or_else(|| {
-            LpmError::Registry(format!(
-                "selected Swift manifest has no parent directory: {}",
-                manifest_path.display()
-            ))
-        })?;
-        for (package_name, version, version_metadata) in &swift_packages {
-            let identifier = crate::swift_manifest::lpm_to_se0292_id(package_name);
-            let product_name = version_metadata
-                .swift_product_name()
-                .unwrap_or(&package_name.name);
-            run_swift_install_spm(
-                manifest_dir,
-                manifest_path,
-                package_name,
-                version,
-                version_metadata,
-                &identifier,
-                product_name,
-                yes,
-                json_output,
-                client.base_url(),
+        let mut swift_transaction = if swift_packages.is_empty() {
+            None
+        } else {
+            let required = swift_manifests
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let swift_lockfiles = swift_manifests
+                .iter()
+                .map(|manifest| manifest.with_file_name("Package.resolved"))
+                .collect::<Vec<_>>();
+            let optional = swift_lockfiles
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            Some(
+                crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                    &required,
+                    &optional,
+                    &[],
+                )?,
             )
-            .await?;
+        };
+        for manifest_path in &swift_manifests {
+            let manifest_dir = manifest_path.parent().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "selected Swift manifest has no parent directory: {}",
+                    manifest_path.display()
+                ))
+            })?;
+            for (package_name, version, version_metadata) in &swift_packages {
+                let identifier = crate::swift_manifest::lpm_to_se0292_id(package_name);
+                let product_name = version_metadata
+                    .swift_product_name()
+                    .unwrap_or(&package_name.name);
+                run_swift_install_spm(
+                    manifest_dir,
+                    manifest_path,
+                    package_name,
+                    version,
+                    version_metadata,
+                    &identifier,
+                    product_name,
+                    yes,
+                    json_output,
+                    client.base_url(),
+                )
+                .await?;
+            }
         }
-    }
 
-    if js_packages.is_empty() {
-        if let Some(transaction) = swift_transaction.take() {
-            transaction.commit();
+        if js_packages.is_empty() {
+            if let Some(transaction) = swift_transaction.take() {
+                workspace_lockfile::commit_manifest_transaction(transaction);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-    let packages = js_packages;
+        let packages = js_packages;
 
-    // 4. Iterate per target. For EACH targeted manifest:
-    // a. Mutate the manifest with the new package entries.
-    // b. Remove that member's lockfile to force re-resolution.
-    // c. Run the install pipeline AT THE MEMBER'S DIR (not at the
-    // workspace root). LPM uses per-directory lockfiles + node_modules,
-    // so this is the only place the new dependency will be installed
-    // and linked correctly.
-    //
-    // A single install pipeline at the workspace root would silently drop
-    // member-targeted installs on workspaces with no root deps.
-    //
-    // For multi-target filtered installs (`--filter "ui-*"` matching N
-    // members), the pipeline runs N times sequentially. JSON output mode
-    // produces N JSON objects on stdout (JSON-Lines), one per member.
-    let target_paths: Vec<String> = targets
-        .member_manifests
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
+        // 4. Iterate per target. For each targeted manifest:
+        // a. Mutate the manifest with the new package entries.
+        // b. Run the install pipeline at the member directory so linking and
+        // lifecycle behavior remain importer-local. Lockfile writes are staged
+        // as importer projections and committed once at the workspace root.
+        //
+        // A single install pipeline at the workspace root would silently drop
+        // member-targeted installs on workspaces with no root deps.
+        //
+        // For multi-target filtered installs (`--filter "ui-*"` matching N
+        // members), the pipeline runs N times sequentially. JSON output mode
+        // produces N JSON objects on stdout (JSON-Lines), one per member.
+        let target_paths: Vec<String> = targets
+            .member_manifests
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
 
-    // ── snapshot the FULL install state surface for every
-    // targeted member in a single transaction. Invariant:
-    // each member contributes its own (manifest, lockfile, lockfile.b,
-    // install-hash) quadruple. A failure halfway through a multi-member
-    // install rolls every touched member back; earlier members'
-    // node_modules trees are left as-is, but their install-hash files
-    // are invalidated so the next `lpm install` re-resolves and
-    // converges. ──────────────────────────────────────────────────────
+        // ── snapshot the FULL install state surface for every
+        // targeted member in a single transaction. Each member contributes its
+        // manifest, legacy lockfile sidecars, and install hash. The root union
+        // lockfile remains staged in memory until every target succeeds. A
+        // failure halfway through a multi-member install rolls every touched
+        // manifest back; earlier node_modules trees are left as-is, but their
+        // install hashes are invalidated so the next install converges.
 
-    // Compute per-member install roots and the four state paths.
-    let lockfile_paths: Vec<PathBuf> = member_install_roots
-        .iter()
-        .map(|r| r.join(lpm_lockfile::LOCKFILE_NAME))
-        .collect();
-    let lockfile_bin_paths: Vec<PathBuf> = lockfile_paths
-        .iter()
-        .map(|p| p.with_extension("lockb"))
-        .collect();
-    let install_hash_paths: Vec<PathBuf> = member_install_roots
-        .iter()
-        .map(|r| r.join(".lpm").join("install-hash"))
-        .collect();
+        // Compute per-member install roots and the four state paths.
+        let lockfile_paths: Vec<PathBuf> = member_install_roots
+            .iter()
+            .map(|r| r.join(lpm_lockfile::LOCKFILE_NAME))
+            .collect();
+        let lockfile_bin_paths: Vec<PathBuf> = lockfile_paths
+            .iter()
+            .map(|p| p.with_extension("lockb"))
+            .collect();
+        let install_hash_paths: Vec<PathBuf> = member_install_roots
+            .iter()
+            .map(|r| r.join(".lpm").join("install-hash"))
+            .collect();
 
-    // Workspace-aware config resolution reads from the workspace root, and
-    // catalog cleanup can mutate the root package even when only a member was
-    // targeted.
-    let root_package_json_path = workspace_root_for_config.join("package.json");
-    let pnpm_workspace_path = workspace_root_for_config.join("pnpm-workspace.yaml");
+        // Workspace-aware config resolution reads from the workspace root, and
+        // catalog cleanup can mutate the root package even when only a member was
+        // targeted.
+        let root_package_json_path = workspace_root_for_config.join("package.json");
+        let pnpm_workspace_path = workspace_root_for_config.join("pnpm-workspace.yaml");
 
-    // Build the (required, optional, invalidate) reference slices the
-    // transaction expects. `required` = manifests; `optional` = lockfile
-    // + lockfile.b for every member; `invalidate` = install-hash for
-    // every member.
-    let mut required_paths = targets.member_manifests.clone();
-    if !required_paths
-        .iter()
-        .any(|path| path == &root_package_json_path)
-    {
-        required_paths.push(root_package_json_path);
-    }
-    let required_refs: Vec<&Path> = required_paths.iter().map(|p| p.as_path()).collect();
-    let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2 + 1);
-    for p in &lockfile_paths {
-        optional_refs.push(p.as_path());
-    }
-    for p in &lockfile_bin_paths {
-        optional_refs.push(p.as_path());
-    }
-    optional_refs.push(pnpm_workspace_path.as_path());
-    let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
+        // Build the (required, optional, invalidate) reference slices the
+        // transaction expects. `required` = manifests; `optional` = lockfile
+        // + lockfile.b for every member; `invalidate` = install-hash for
+        // every member.
+        let mut required_paths = targets.member_manifests.clone();
+        if !required_paths
+            .iter()
+            .any(|path| path == &root_package_json_path)
+        {
+            required_paths.push(root_package_json_path);
+        }
+        let required_refs: Vec<&Path> = required_paths.iter().map(|p| p.as_path()).collect();
+        let mut optional_refs: Vec<&Path> = Vec::with_capacity(lockfile_paths.len() * 2 + 1);
+        for p in &lockfile_paths {
+            optional_refs.push(p.as_path());
+        }
+        for p in &lockfile_bin_paths {
+            optional_refs.push(p.as_path());
+        }
+        optional_refs.push(pnpm_workspace_path.as_path());
+        let invalidate_refs: Vec<&Path> = install_hash_paths.iter().map(|p| p.as_path()).collect();
 
-    // per-command save flags from the CLI flow into stage and
-    // finalize so multi-member installs honor `--exact`/`--tilde`/etc.
-    // for every targeted member identically.
-    //
-    // **Workspace-aware config resolution (Invariant:):** the
-    // project-tier `lpm.toml` MUST be read from the WORKSPACE ROOT, not
-    // from `cwd`. Save policy is a workspace-wide preference; per-member
-    // overrides would create incoherent multi-member installs where the
-    // same `--filter "ui-*"` produces different prefixes per member.
-    //
-    // Previously this read from `cwd` directly, which broke the moment a
-    // user invoked `lpm install ms --filter app` from
-    // `packages/app/` instead of from the workspace root: `cwd` was the
-    // member dir, no `lpm.toml` lived there, and the loader silently
-    // returned defaults. Now we walk up via `discover_workspace` and
-    // pass the discovered root to the loader. Falls back to `cwd` only
-    // when no workspace is discoverable (defensive — this path is only
-    // reachable from a workspace context, but the fallback keeps the
-    // loader call infallible if `discover_workspace` ever returns None
-    // through some future code change).
-    let save_config =
-        crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
-    let catalog_policy =
-        catalog_save_policy_for_project(&workspace_root_for_config, catalog_name_override)?;
+        // per-command save flags from the CLI flow into stage and
+        // finalize so multi-member installs honor `--exact`/`--tilde`/etc.
+        // for every targeted member identically.
+        //
+        // **Workspace-aware config resolution (Invariant:):** the
+        // project-tier `lpm.toml` MUST be read from the WORKSPACE ROOT, not
+        // from `cwd`. Save policy is a workspace-wide preference; per-member
+        // overrides would create incoherent multi-member installs where the
+        // same `--filter "ui-*"` produces different prefixes per member.
+        //
+        // Previously this read from `cwd` directly, which broke the moment a
+        // user invoked `lpm install ms --filter app` from
+        // `packages/app/` instead of from the workspace root: `cwd` was the
+        // member dir, no `lpm.toml` lived there, and the loader silently
+        // returned defaults. Now we walk up via `discover_workspace` and
+        // pass the discovered root to the loader. Falls back to `cwd` only
+        // when no workspace is discoverable (defensive — this path is only
+        // reachable from a workspace context, but the fallback keeps the
+        // loader call infallible if `discover_workspace` ever returns None
+        // through some future code change).
+        let save_config =
+            crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
+        let catalog_policy =
+            catalog_save_policy_for_project(&workspace_root_for_config, catalog_name_override)?;
 
-    // ** fix.** Wrap the workspace-install snapshot → loop
-    // → commit in an exclusive per-WORKSPACE lock. Two concurrent
-    // `lpm install --filter <member>` invocations on the same workspace
-    // serialize through this lock so the multi-member ManifestTransaction
-    // doesn't race with itself. Per-member locks would be more granular
-    // but require sorted-acquisition to avoid deadlock between two
-    // processes targeting overlapping member sets — the workspace-root
-    // lock is the simpler correct primitive for v1. Sibling lock to the
-    // single-project path's per-project lock; same `.install.lock`
-    // filename so a future refactor can unify them.
-    let js_result = async {
-        let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-            &required_refs,
-            &optional_refs,
-            &invalidate_refs,
-        )?;
+        // Wrap the workspace-install snapshot, target loop, and commit in an
+        // exclusive per-workspace lock. Two concurrent
+        // `lpm install --filter <member>` invocations on the same workspace
+        // serialize through this lock so the multi-member ManifestTransaction
+        // doesn't race with itself. Per-member locks would be more granular
+        // but require sorted-acquisition to avoid deadlock between two
+        // processes targeting overlapping member sets. The workspace-root lock
+        // avoids that deadlock and uses the same `.install.lock` name as the
+        // single-project path.
+        let js_result = async {
+            let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                &required_refs,
+                &optional_refs,
+                &invalidate_refs,
+            )?;
 
-        let mut staged_manifests: Vec<StagedManifest> =
-            Vec::with_capacity(targets.member_manifests.len());
-        let mut last_err: Option<LpmError> = None;
-        for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
-            // (a) Stage the target manifest. Explicit specs land verbatim;
-            // bare/dist-tag entries get a `*` placeholder.
-            let staged =
-                match stage_packages_to_manifest(manifest_path, &packages, save_dev, save_flags) {
+            let mut staged_manifests: Vec<StagedManifest> =
+                Vec::with_capacity(targets.member_manifests.len());
+            let mut last_err: Option<LpmError> = None;
+            for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
+                // (a) Stage the target manifest. Explicit specs land verbatim;
+                // bare/dist-tag entries get a `*` placeholder.
+                let staged = match stage_packages_to_manifest(
+                    manifest_path,
+                    &packages,
+                    save_dev,
+                    save_flags,
+                ) {
                     Ok(s) => s,
                     Err(e) => {
                         last_err = Some(e);
@@ -1541,137 +1543,156 @@ pub async fn run_install_filtered_add(
                     }
                 };
 
-            // Use the precomputed install root so the transaction
-            // snapshot above and the loop below agree on the exact
-            // member path (no double-compute, no path drift).
-            let install_root = &member_install_roots[idx];
+                // Use the precomputed install root so the transaction
+                // snapshot above and the loop below agree on the exact
+                // member path (no double-compute, no path drift).
+                let install_root = &member_install_roots[idx];
 
-            if let Err(e) = pin_staged_dist_tags_for_resolution(client, install_root, &staged).await
-            {
-                last_err = Some(e);
-                break;
+                if let Err(e) =
+                    pin_staged_dist_tags_for_resolution(client, install_root, &staged).await
+                {
+                    last_err = Some(e);
+                    break;
+                }
+
+                if let Err(e) = preflight_catalog_policy_rejection(
+                    client,
+                    install_root,
+                    &staged,
+                    &catalog_policy,
+                )
+                .await
+                {
+                    last_err = Some(e);
+                    break;
+                }
+
+                staged_manifests.push(staged);
             }
 
-            if let Err(e) =
-                preflight_catalog_policy_rejection(client, install_root, &staged, &catalog_policy)
-                    .await
-            {
-                last_err = Some(e);
-                break;
+            if let Some(e) = last_err {
+                return Err(e);
             }
 
-            staged_manifests.push(staged);
-        }
+            for (idx, staged) in staged_manifests.iter().enumerate() {
+                let install_root = &member_install_roots[idx];
 
-        if let Some(e) = last_err {
-            return Err(e);
-        }
+                // (b) Run the install pipeline at THIS member's directory,
+                // capturing the direct-dep map for finalize via the // out-param.
+                // Keep the existing importer projection available so the install
+                // pipeline can diff against the pre-install direct graph. The
+                // warm fast-path validator rejects projections that no longer
+                // satisfy the staged manifest.
+                let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
+                let result = run_with_options(
+                    client,
+                    install_root,
+                    json_output,
+                    false, // offline
+                    FrozenLockfileMode::Never,
+                    force,
+                    allow_new,
+                    false, // strict_integrity — workspace-add path, no flag
+                    no_engine_strict,
+                    strict_peer_dependencies_override,
+                    None, // linker_override
+                    lpm_skills_preference,
+                    false, // no_editor_setup
+                    false, // no_security_summary
+                    false, // auto_build
+                    Some(&target_paths),
+                    Some(&mut direct_versions),
+                    Some(packages.len()),
+                    script_policy_override,
+                    // Same per-iteration clone rationale as `drift_ignore_policy`
+                    // below: each loop pass moves the override into
+                    // `run_with_options`, so the multi-member loop has to clone.
+                    // `Option<String>` is cheap to clone.
+                    advisor_override.clone(),
+                    min_release_age_override,
+                    min_release_age_exclude,
+                    // Multi-member loop: `run_install_filtered_add` runs the
+                    // install pipeline once per targeted member. Each
+                    // iteration consumes the policy, so we clone per call.
+                    // Cloning an enum + HashSet of ignored names is cheap
+                    // relative to the per-iteration install pipeline itself.
+                    drift_ignore_policy.clone(),
+                    // Same per-iteration clone rationale as drift_ignore_policy.
+                    // `VerifyPolicy` carries an `EnforceMode` (Copy) and a
+                    // `SkipPolicy` (HashSet of skip-listed names); cloning is
+                    // bounded by the user-passed flag count.
+                    verify_policy.clone(),
+                    omit_policy,
+                    strict_sandbox,
+                    no_sandbox,
+                    verbose,
+                    audit_after_install,
+                    timing,
+                    &[],
+                )
+                .await;
 
-        for (idx, staged) in staged_manifests.iter().enumerate() {
-            let install_root = &member_install_roots[idx];
+                if let Err(e) = result {
+                    // Abort on first failure. Half-installed multi-member states
+                    // are confusing and the user should fix the failure before
+                    // retrying. The transaction guard restores ALL touched
+                    // manifests when we drop without commit.
+                    last_err = Some(e);
+                    break;
+                }
 
-            // (b) Run the install pipeline at THIS member's directory,
-            // capturing the direct-dep map for finalize via the // out-param.
-            // We intentionally keep each member's existing lockfile so the
-            // install pipeline can diff against the pre-install direct
-            // graph. The warm fast-path validator rejects stale lockfiles
-            // that no longer satisfy the staged manifest.
-            let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-            let result = run_with_options(
-                client,
-                install_root,
-                json_output,
-                false, // offline
-                FrozenLockfileMode::Never,
-                force,
-                allow_new,
-                false, // strict_integrity — workspace-add path, no flag
-                no_engine_strict,
-                strict_peer_dependencies_override,
-                None, // linker_override
-                lpm_skills_preference,
-                false, // no_editor_setup
-                false, // no_security_summary
-                false, // auto_build
-                Some(&target_paths),
-                Some(&mut direct_versions),
-                Some(packages.len()),
-                script_policy_override,
-                // Same per-iteration clone rationale as `drift_ignore_policy`
-                // below: each loop pass moves the override into
-                // `run_with_options`, so the multi-member loop has to clone.
-                // `Option<String>` is cheap to clone.
-                advisor_override.clone(),
-                min_release_age_override,
-                min_release_age_exclude,
-                // Multi-member loop: `run_install_filtered_add` runs the
-                // install pipeline once per targeted member. Each
-                // iteration consumes the policy, so we clone per call.
-                // Cloning an enum + HashSet of ignored names is cheap
-                // relative to the per-iteration install pipeline itself.
-                drift_ignore_policy.clone(),
-                // Same per-iteration clone rationale as drift_ignore_policy.
-                // `VerifyPolicy` carries an `EnforceMode` (Copy) and a
-                // `SkipPolicy` (HashSet of skip-listed names); cloning is
-                // bounded by the user-passed flag count.
-                verify_policy.clone(),
-                omit_policy,
-                strict_sandbox,
-                no_sandbox,
-                verbose,
-                audit_after_install,
-                timing,
-                &[],
-            )
-            .await;
-
-            if let Err(e) = result {
-                // Abort on first failure. Half-installed multi-member states
-                // are confusing and the user should fix the failure before
-                // retrying. The transaction guard restores ALL touched
-                // manifests when we drop without commit.
-                last_err = Some(e);
-                break;
+                // (d) Finalize this member's manifest using the direct-dep
+                // versions from the resolver.
+                if let Err(e) = finalize_packages_in_manifest_with_catalog_policy(
+                    staged,
+                    &direct_versions,
+                    save_flags,
+                    save_config,
+                    &catalog_policy,
+                ) {
+                    last_err = Some(e);
+                    break;
+                }
             }
 
-            // (d) Finalize this member's manifest using the direct-dep
-            // versions from the resolver.
-            if let Err(e) = finalize_packages_in_manifest_with_catalog_policy(
-                staged,
-                &direct_versions,
-                save_flags,
-                save_config,
-                &catalog_policy,
-            ) {
-                last_err = Some(e);
-                break;
+            if let Some(e) = last_err {
+                // Drop `tx` here without committing → every snapshotted manifest
+                // is restored to its pre-stage bytes.
+                return Err(e);
             }
-        }
 
-        if let Some(e) = last_err {
-            // Drop `tx` here without committing → every snapshotted manifest
-            // is restored to its pre-stage bytes.
-            return Err(e);
-        }
+            cleanup_unused_catalogs_after_install(&workspace_root_for_config)?;
+            for install_root in &member_install_roots {
+                reconcile_finalized_add_install_state(install_root)?;
+            }
 
-        cleanup_unused_catalogs_after_install(&workspace_root_for_config)?;
-        for install_root in &member_install_roots {
-            reconcile_finalized_add_install_state(install_root)?;
+            // All members succeeded — persist every staged + finalized manifest.
+            workspace_lockfile::commit_manifest_transaction(tx);
+            Ok(())
         }
-
-        // All members succeeded — persist every staged + finalized manifest.
-        tx.commit();
-        Ok(())
+        .await;
+        if js_result.is_ok()
+            && let Some(transaction) = swift_transaction.take()
+        {
+            workspace_lockfile::commit_manifest_transaction(transaction);
+        }
+        js_result
+    };
+    if requires_workspace_lockfile {
+        workspace_lockfile::scope_workspace_mutation(
+            &workspace_root_for_config,
+            &member_install_roots,
+            mutation,
+        )
+        .await
+    } else {
+        workspace_lockfile::scope_workspace_mutation_if_present(
+            &workspace_root_for_config,
+            &member_install_roots,
+            mutation,
+        )
+        .await
     }
-    .await;
-    if js_result.is_ok()
-        && let Some(transaction) = swift_transaction.take()
-    {
-        transaction.commit();
-    }
-    js_result
-    })
-    .await
 }
 
 pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Result<(), LpmError> {
@@ -1693,11 +1714,10 @@ pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Resul
         ))
     })?;
 
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let mut lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).map_err(|e| {
+    let mut lockfile = workspace_lockfile::read_project(project_dir).map_err(|e| {
         LpmError::Registry(format!(
-            "failed to read {} after finalizing package.json: {e}",
-            lockfile_path.display(),
+            "failed to read lpm.lock after finalizing {}: {e}",
+            project_dir.display(),
         ))
     })?;
     let auto_install_peers = lockfile
@@ -1712,10 +1732,10 @@ pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Resul
     }
 
     lockfile.importers.insert(".".to_string(), importer);
-    lockfile.write_all(&lockfile_path).map_err(|e| {
+    workspace_lockfile::write(project_dir, lockfile).map_err(|e| {
         LpmError::Registry(format!(
-            "failed to reconcile {} with finalized package.json: {e}",
-            lockfile_path.display(),
+            "failed to reconcile lpm.lock with finalized {}: {e}",
+            project_dir.display(),
         ))
     })?;
     super::state::refresh_post_install_hash_after_manifest_finalize(project_dir)

@@ -1064,11 +1064,10 @@ fn write_pruned_deploy_lockfile_keeps_only_reachable_registry_packages() {
 }
 
 #[cfg(unix)]
-#[test]
-fn retarget_internal_node_modules_symlinks_makes_absolute_internal_links_relative() {
+fn assert_retarget_internal_node_modules_symlinks_for_store_version(store_version: &str) {
     let tmp = tempfile::tempdir().unwrap();
     let output = tmp.path().join("deploy");
-    let target = output.join(".lpm/store/v2/links/runtime");
+    let target = output.join(format!(".lpm/store/{store_version}/links/runtime"));
     let link = output.join("node_modules/runtime");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
@@ -1082,7 +1081,22 @@ fn retarget_internal_node_modules_symlinks_makes_absolute_internal_links_relativ
         !new_target.is_absolute(),
         "deploy-internal symlink target must be relative after retargeting"
     );
-    assert_eq!(new_target, PathBuf::from("../.lpm/store/v2/links/runtime"));
+    assert_eq!(
+        new_target,
+        PathBuf::from(format!("../.lpm/store/{store_version}/links/runtime"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retarget_internal_node_modules_symlinks_handles_default_v2_links() {
+    assert_retarget_internal_node_modules_symlinks_for_store_version("v2");
+}
+
+#[cfg(unix)]
+#[test]
+fn retarget_internal_node_modules_symlinks_handles_experimental_v3_links() {
+    assert_retarget_internal_node_modules_symlinks_for_store_version("v3");
 }
 
 #[test]

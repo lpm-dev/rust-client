@@ -262,9 +262,33 @@ fn prune_apply_human_output_uses_done_line_with_elapsed() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     ));
+    let done_line = combined
+        .lines()
+        .find(|line| line.contains("✓ Done · pruned"))
+        .unwrap_or_else(|| panic!("cache prune apply should emit a done line, got:\n{combined}"));
+    let physical_and_elapsed = done_line
+        .strip_prefix(
+            "✓ Done · pruned 0 link entries + 0 objects + 0 CAS materializations + 0 CAS trees + 0 CAS blobs (0 B logical; ",
+        )
+        .unwrap_or_else(|| panic!("cache prune apply emitted an unexpected summary:\n{done_line}"));
+    let (physical, elapsed) = physical_and_elapsed
+        .split_once(" physical free-space increase) in ")
+        .unwrap_or_else(|| {
+            panic!("cache prune apply omitted physical or elapsed data:\n{done_line}")
+        });
     assert!(
-        combined.contains("✓ Done · pruned 0 link entries + 0 objects (0 B) in "),
-        "cache prune apply should finish with elapsed done line, got:\n{combined}"
+        !physical.is_empty(),
+        "cache prune apply should report physical free-space availability:\n{done_line}"
+    );
+    let elapsed_is_valid = elapsed
+        .strip_suffix("ms")
+        .is_some_and(|value| value.parse::<u128>().is_ok())
+        || elapsed
+            .strip_suffix('s')
+            .is_some_and(|value| value.parse::<f64>().is_ok());
+    assert!(
+        elapsed_is_valid,
+        "cache prune apply should finish with a formatted duration:\n{done_line}"
     );
 }
 

@@ -735,7 +735,8 @@ pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -
 /// user running `lpm dev`. With a placeholder hash, dev triggers the
 /// install attempt that fails loud — same posture as `lpm install`.
 fn invalid_linker_state(project_dir: &Path, pkg_content: &str) -> InstallState {
-    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let lock_content =
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
     let platform = PlatformTuple::current();
     let placeholder = compute_install_hash_v8(
@@ -757,7 +758,8 @@ fn invalid_integrity_state(
     pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
 ) -> InstallState {
-    let lock_content = std::fs::read_to_string(project_dir.join("lpm.lock")).unwrap_or_default();
+    let lock_content =
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = collect_file_link_manifest_bytes(project_dir, pkg_content);
     let platform = PlatformTuple::current();
     let placeholder = compute_install_hash_v8(
@@ -859,14 +861,13 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         return state;
     }
 
-    let lock_path = project_dir.join("lpm.lock");
+    let lock_path = crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
     let hash_file = project_dir.join(".lpm").join("install-hash");
     let nm = project_dir.join("node_modules");
 
     // Read lockfile — empty string if missing (hash will mismatch → needs install)
     let lock_content =
-        lpm_common::read_text_file_capped(&lock_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .unwrap_or_default();
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
     // Local directory source manifests participate in freshness. Empty
     // bytes for projects without local-source deps preserve the common
     // no-local-source path.
@@ -919,10 +920,10 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         };
     }
 
-    // — v1 → v2 store-layout migration gate. After
-    // the default flip, an upgrade-in-place user (still with
+    // v1 → virtual-store layout migration gate. After the default flip, an
+    // upgrade-in-place user (still with
     // v1's `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/`
-    // populated) needs the install pipeline to run the v1→v2 wipe-
+    // populated) needs the install pipeline to run the v1→virtual-store wipe-
     // and-rebuild sequence. Without this gate the sync fast lane in
     // `main.rs` short-circuits with "up to date" and the user's
     // project stays on the legacy layout indefinitely. The dual-gate
@@ -930,12 +931,12 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
     // store version active = freshness reset.
     //
     // Detection mirrors the install-pipeline's
-    // [`commands::install::needs_v2_migration`] but is duplicated
+    // [`commands::install::needs_virtual_store_migration`] but is duplicated
     // here intentionally: importing the install module from
     // install_state would create a cyclic-ish coupling for one
     // two-line predicate, and the predicate is small enough that
     // drift won't realistically diverge.
-    if store_version.is_v2() {
+    if store_version.uses_virtual_store() {
         let legacy_isolated = project_dir.join(".lpm").join("wrappers");
         let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
         if legacy_isolated.exists() || legacy_hoisted.exists() {
@@ -944,6 +945,12 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
                 hash: Some(current_hash),
             };
         }
+    }
+    if project_uses_other_virtual_store(project_dir, store_version) {
+        return InstallState {
+            up_to_date: false,
+            hash: Some(current_hash),
+        };
     }
 
     // Hash comparison — read only the first line of the file so v1 (bare
@@ -987,6 +994,22 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         up_to_date,
         hash: Some(current_hash),
     }
+}
+
+fn project_uses_other_virtual_store(project_dir: &Path, selected: lpm_store::StoreVersion) -> bool {
+    let Ok(lpm_root) = lpm_common::LpmRoot::from_env() else {
+        return false;
+    };
+    let other_links = match selected {
+        lpm_store::StoreVersion::V1 => return false,
+        lpm_store::StoreVersion::V2 => {
+            lpm_store::v2::StoreV2Paths::from_lpm_root_v3(&lpm_root).links_root()
+        }
+        lpm_store::StoreVersion::V3 => {
+            lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_root).links_root()
+        }
+    };
+    lpm_linker::LayoutPaths::for_project(project_dir).is_v2_install(&other_links)
 }
 
 /// mtime short-circuit for the up-to-date check.
@@ -1048,19 +1071,22 @@ fn try_mtime_fast_path(
         return None;
     }
 
-    // — v1 → v2 store migration gate. Must mirror
+    // v1 → virtual-store migration gate. Must mirror
     // the slow-path guard in `check_install_state_with_content`
     // because the mtime fast lane skips that function entirely on
     // mtime hits. Without this, an upgrade-in-place user whose
     // package.json + lpm.lock mtimes haven't changed would
     // permanently short-circuit at "up to date" and never run the
-    // v1 → v2 wipe-and-rebuild sequence.
-    if store_version.is_v2() {
+    // v1 → virtual-store wipe-and-rebuild sequence.
+    if store_version.uses_virtual_store() {
         let legacy_isolated = project_dir.join(".lpm").join("wrappers");
         let legacy_hoisted = project_dir.join(".lpm").join("hoisted");
         if legacy_isolated.exists() || legacy_hoisted.exists() {
             return None;
         }
+    }
+    if project_uses_other_virtual_store(project_dir, store_version) {
+        return None;
     }
 
     let hash_file = project_dir.join(".lpm").join("install-hash");
@@ -1119,7 +1145,9 @@ fn try_mtime_fast_path(
     let pkg_ns = mtime_ns(&project_dir.join("package.json"))?;
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
-    let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
+    let lock_ns =
+        mtime_ns(&crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir))
+            .unwrap_or(0);
 
     if pkg_ns != stored_pkg_ns || lock_ns != stored_lock_ns {
         return None;
@@ -1189,7 +1217,8 @@ fn binary_lockfile_sidecar_needs_refresh(
     project_dir: &Path,
     expectation: Option<BinarySidecarExpectation>,
 ) -> bool {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lockfile_path =
+        crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
     if !lockfile_path.exists() {
         return false;
     }
@@ -1298,15 +1327,17 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
     node_runtime_fingerprint: Option<&str>,
 ) -> std::io::Result<()> {
     let binary_sidecar_expectation =
-        lpm_lockfile::Lockfile::read_from_file(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
-            .ok()
-            .map(|lockfile| {
-                if lpm_lockfile::binary::binary_format_supports(&lockfile) {
-                    BinarySidecarExpectation::Required
-                } else {
-                    BinarySidecarExpectation::NotRequired
-                }
-            });
+        crate::commands::install::workspace_lockfile::read_metadata_shared(
+            &project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+        )
+        .ok()
+        .map(|lockfile| {
+            if lpm_lockfile::binary::binary_format_supports(&lockfile) {
+                BinarySidecarExpectation::Required
+            } else {
+                BinarySidecarExpectation::NotRequired
+            }
+        });
     write_install_hash_with_metadata(
         project_dir,
         hash,
@@ -1382,7 +1413,9 @@ fn write_install_hash_with_metadata(
         ));
     }
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
-    let lock_ns = mtime_ns(&project_dir.join("lpm.lock")).unwrap_or(0);
+    let lock_ns =
+        mtime_ns(&crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir))
+            .unwrap_or(0);
 
     let hash_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&hash_dir)?;
@@ -1590,21 +1623,27 @@ mod tests {
     fn scoped_home_for(_path: &Path) -> crate::test_env::ScopedEnv {
         crate::test_env::ScopedEnv::update([
             ("LPM_LINKER", None),
+            (lpm_store::StoreVersion::ENV_VAR, None),
             (lpm_store::v2::ENV_V2_OBJECT_INTEGRITY, None),
         ])
+    }
+
+    fn write_test_lockfile(project_dir: &Path) -> std::sync::Arc<str> {
+        lpm_lockfile::Lockfile::default()
+            .write_all(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir)
     }
 
     fn setup_up_to_date_project() -> TempDir {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
-        let hash = compute_install_hash(
-            &fs::read_to_string(p.join("package.json")).unwrap(),
-            "lock-content",
-        );
+        let hash =
+            compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
         dir
     }
@@ -1899,12 +1938,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
-        let hash = compute_install_hash(
-            &fs::read_to_string(p.join("package.json")).unwrap(),
-            "lock-content",
-        );
+        let hash =
+            compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
         write_install_hash(p, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
         dir
     }
@@ -2000,13 +2037,11 @@ mod tests {
         let p = dir.path();
         let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{"a":"^1.0.0"}}"#).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
-        let hash = compute_install_hash(
-            &fs::read_to_string(p.join("package.json")).unwrap(),
-            "lock-content",
-        );
+        let hash =
+            compute_install_hash(&fs::read_to_string(p.join("package.json")).unwrap(), &lock);
         // Bare write — v1 format only.
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
         let state = check_install_state(p);
@@ -2084,6 +2119,7 @@ mod tests {
     fn install_hash_records_when_binary_sidecar_is_not_required() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
+        let _home = scoped_home_for(p);
         fs::write(p.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::default();
         lockfile
@@ -2833,13 +2869,13 @@ mod tests {
         let local = make_dir_dep(p, "local", "1.0.0");
         let pkg = r#"{"dependencies":{"local":"file:./local"}}"#;
         fs::write(p.join("package.json"), pkg).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
 
         // Compute and write the v3 hash AS THE INSTALL PIPELINE
         // WOULD (with file/link bytes folded in).
         let bytes = collect_file_link_manifest_bytes(p, pkg);
-        let initial_hash = compute_install_hash_v3(pkg, "lock-content", &bytes);
+        let initial_hash = compute_install_hash_v3(pkg, &lock, &bytes);
         write_install_hash(p, &initial_hash, lpm_linker::LinkerMode::Isolated).unwrap();
         let _home = scoped_home_for(p);
 
@@ -3030,32 +3066,22 @@ mod tests {
         let _home = scoped_home_for(p);
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         // Empty `.lpm/` dir created before hash write.
         fs::create_dir_all(p.join("node_modules/.lpm")).unwrap();
         fs::create_dir_all(p.join(".lpm")).unwrap();
-        let hash = compute_install_hash(pkg_json, "lock-content");
+        let hash = compute_install_hash(pkg_json, &lock);
         fs::write(p.join(".lpm").join("install-hash"), &hash).unwrap();
 
         let state = check_install_state(p);
         assert!(state.up_to_date, "empty legacy dir must not gate install");
     }
 
-    /// D8c contract — historically asserted that "both
-    /// legacy + new isolated wrapper layouts populated → migration
-    /// complete → up-to-date".  the default flip to
-    /// v2 changes this: `<project>/.lpm/wrappers/` is now the
-    /// LEGACY-V1 marker and triggers a v2 migration regardless of
-    /// the legacy isolated-vs-new-isolated distinction. The 4d gate
-    /// fires unconditionally on v1 wrappers when the active store
-    /// version is v2, and `StoreVersion::default()` is v2 since the
-    /// flip — so this test now asserts the post-contract:
-    /// v1 wrappers populated → v2 migration owed → up-to-date is
-    /// false. The pre-"both isolated layouts populated →
-    /// fresh" contract is intentionally retired.
+    /// Populated v1 wrapper state is stale whenever a virtual-store version is
+    /// selected, even if the manifest and lockfile hash still match.
     #[test]
-    fn populated_v1_wrappers_force_v2_migration_on_default() {
+    fn populated_v1_wrappers_force_virtual_store_migration_on_default() {
         let dir = TempDir::new().unwrap();
         let p = dir.path();
         let _home = scoped_home_for(p);
@@ -3070,7 +3096,7 @@ mod tests {
         let state = check_install_state(p);
         assert!(
             !state.up_to_date,
-            "v1 wrappers under post-4d v2 default must trigger migration"
+            "v1 wrappers under the virtual-store default must trigger migration"
         );
     }
 
@@ -3080,10 +3106,10 @@ mod tests {
         let p = dir.path();
         let pkg_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
         fs::write(p.join("package.json"), pkg_json).unwrap();
-        fs::write(p.join("lpm.lock"), "lock-content").unwrap();
+        let lock = write_test_lockfile(p);
         fs::create_dir_all(p.join("node_modules")).unwrap();
         fs::create_dir_all(p.join(".lpm/hoisted")).unwrap();
-        let hash = compute_install_hash(pkg_json, "lock-content");
+        let hash = compute_install_hash(pkg_json, &lock);
         fs::write(p.join(".lpm/install-hash"), &hash).unwrap();
 
         let v1 = check_install_state_with_linker_integrity_and_dependency_engine(
@@ -3102,9 +3128,70 @@ mod tests {
             "none",
             lpm_store::StoreVersion::V2,
         );
+        let v3 = check_install_state_with_linker_integrity_and_dependency_engine(
+            p,
+            pkg_json,
+            lpm_linker::LinkerMode::Hoisted,
+            ObjectIntegrityPolicy::Source,
+            "none",
+            lpm_store::StoreVersion::V3,
+        );
 
         assert_eq!(v1.hash.as_deref(), Some(hash.as_str()));
         assert!(v1.up_to_date, "explicit v1 keeps its rollback layout valid");
-        assert!(!v2.up_to_date, "v2 must migrate the same rollback layout");
+        assert!(!v2.up_to_date, "v2 must migrate the same legacy v1 layout");
+        assert!(!v3.up_to_date, "v3 must migrate the same legacy v1 layout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_virtual_store_version_invalidates_links_to_the_other_store() {
+        let dir = TempDir::new().unwrap();
+        let lpm_home = dir.path().join("lpm-home");
+        let _home =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", lpm_home.as_os_str().to_owned())]);
+        let lpm_root = lpm_common::LpmRoot::from_dir(&lpm_home);
+
+        for (actual, selected, project_name) in [
+            (
+                lpm_store::StoreVersion::V3,
+                lpm_store::StoreVersion::V2,
+                "v3-to-v2",
+            ),
+            (
+                lpm_store::StoreVersion::V2,
+                lpm_store::StoreVersion::V3,
+                "v2-to-v3",
+            ),
+        ] {
+            let project = dir.path().join(project_name);
+            let package_json = r#"{"dependencies":{"a":"^1.0.0"}}"#;
+            fs::create_dir_all(project.join("node_modules")).unwrap();
+            fs::create_dir_all(project.join(".lpm")).unwrap();
+            fs::write(project.join("package.json"), package_json).unwrap();
+            let lock = write_test_lockfile(&project);
+
+            let store = lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, actual);
+            let target = store.paths().links_root().join("entry/node_modules/a");
+            fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, project.join("node_modules/a")).unwrap();
+
+            let hash = compute_install_hash(package_json, &lock);
+            write_install_hash(&project, &hash, lpm_linker::LinkerMode::Isolated).unwrap();
+
+            let state = check_install_state_with_linker_integrity_and_dependency_engine(
+                &project,
+                package_json,
+                lpm_linker::LinkerMode::Isolated,
+                ObjectIntegrityPolicy::Source,
+                "none",
+                selected,
+            );
+
+            assert!(
+                !state.up_to_date,
+                "selecting {selected} must relink a project that still points into {actual}"
+            );
+        }
     }
 }

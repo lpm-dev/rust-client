@@ -108,7 +108,7 @@ pub fn discover_packages(start_dir: &Path) -> Result<DiscoveryResult, LpmError> 
     loop {
         // 1. lpm.lock — always highest priority (LPM-managed project)
         if current.join("lpm.lock").exists() {
-            return discover_from_lpm_lock(&current);
+            return discover_from_lpm_lock(start_dir, &current);
         }
 
         // 2. Foreign lockfiles — use lpm-migrate's mtime-based detection.
@@ -142,9 +142,14 @@ pub fn discover_packages(start_dir: &Path) -> Result<DiscoveryResult, LpmError> 
 
 // ─── LPM lockfile ───────────────────────────────────────────────────────────
 
-fn discover_from_lpm_lock(project_root: &Path) -> Result<DiscoveryResult, LpmError> {
+fn discover_from_lpm_lock(
+    start_dir: &Path,
+    project_root: &Path,
+) -> Result<DiscoveryResult, LpmError> {
     let lockfile_path = project_root.join("lpm.lock");
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
+    let target_root =
+        lpm_workspace::find_project_root(start_dir).unwrap_or_else(|| start_dir.to_path_buf());
+    let lockfile = crate::commands::install::workspace_lockfile::read_project(&target_root)
         .map_err(|e| LpmError::Registry(format!("failed to read lpm.lock: {e}")))?;
 
     let packages = lockfile
@@ -190,7 +195,7 @@ fn discover_from_lpm_lock(project_root: &Path) -> Result<DiscoveryResult, LpmErr
     Ok(DiscoveryResult {
         manager: ManagerKind::Lpm,
         lockfile_path: Some(lockfile_path),
-        project_root: project_root.to_path_buf(),
+        project_root: target_root,
         is_degraded: false,
         is_yarn_pnp: false,
         packages,

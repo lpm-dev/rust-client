@@ -56,7 +56,9 @@ mod tests;
 mod timing;
 mod validation;
 mod workspace;
+pub(crate) mod workspace_lockfile;
 mod workspace_materialization;
+mod workspace_project_state;
 mod workspace_resolution;
 
 use accounting::*;
@@ -426,9 +428,9 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // the tokio reactor; the held handle lives for the lifetime of
     // the inner future and releases when the future returns.
     let store_lock_path = lpm_root.store_lock();
-    lpm_common::with_shared_lock_async(
+    let install = lpm_common::with_shared_lock_async(
         store_lock_path,
-        run_with_options_under_store_lock(
+        assert_send_install_future(run_with_options_under_store_lock(
             client,
             project_dir,
             json_output,
@@ -463,9 +465,16 @@ pub(crate) async fn run_with_options_with_lpm_root(
             emit_install_report,
             reserve_stdout,
             &lpm_root,
-        ),
-    )
-    .await
+        )),
+    );
+    workspace_lockfile::scope_member_install(project_dir, install).await
+}
+
+fn assert_send_install_future<F>(future: F) -> F
+where
+    F: Future + Send,
+{
+    future
 }
 
 /// Body of [`run_with_options`] — the actual install pipeline. Lives
@@ -574,7 +583,7 @@ async fn run_with_options_under_store_lock(
         };
     let fetch_lpm_security_insights =
         crate::lpm_insights_config::read_fetch_lpm_security_insights(&global_config)?;
-    let requested_v2_mode = store_version.is_v2();
+    let requested_v2_mode = store_version.uses_virtual_store();
     let no_skills = !lpm_skills_preference.resolve(&global_config)?;
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_audit_after_install_ms = 0u128;
@@ -617,6 +626,12 @@ async fn run_with_options_under_store_lock(
     if freshness_completed {
         return Ok(());
     }
+    workspace_project_state::enter(project_dir).map_err(|error| {
+        LpmError::Io(std::io::Error::other(format!(
+            "failed to begin workspace project-state transaction for {}: {error}",
+            project_dir.display()
+        )))
+    })?;
 
     let pkg_name = pkg.name.as_deref().unwrap_or("(unnamed)");
     // The persistent `› Resolving …` phase line is emitted below after
@@ -761,7 +776,7 @@ async fn run_with_options_under_store_lock(
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
         workspace_resolution::publish_root_peer_providers_for_empty_install(project_dir);
-        workspace_resolution::wait_for_commit().await;
+        workspace_resolution::enter_commit();
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
         }
@@ -958,32 +973,34 @@ async fn run_with_options_under_store_lock(
     let store =
         PackageStore::from_root_with_security_analysis_policy(lpm_root, security_analysis_policy);
     // `lpm_root` stays in function scope so post-install helpers can reach
-    // the v2 store via `find_installed_package_baseline`. Those helpers need
-    // the actual install root to find v2-installed scripted packages for
+    // the virtual stores via `find_installed_package_baseline`. Those helpers
+    // need the actual install root to find scripted packages for
     // auto-build and build-hint decisions.
     // The store-version flag was resolved once during install setup.
-    // The v2 store handle is constructed eagerly when that selection is
+    // The v2 handle is constructed eagerly when that selection is
     // active, then wrapped in `Arc` so per-package spawn tasks can
     // capture a cheap clone alongside the v1 `store_ref`. Holding
     // it as `Option<Arc<…>>` keeps the v1 rollback path
     // allocation-free.
-    let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> = if store_version.is_v2() {
-        Some(std::sync::Arc::new(
-            lpm_store::v2::Store::from_lpm_root_with_policies(
-                lpm_root,
-                object_integrity_policy,
-                security_analysis_policy,
-            ),
-        ))
-    } else {
-        None
-    };
+    let store_v2_handle: Option<std::sync::Arc<lpm_store::v2::Store>> =
+        if store_version.uses_virtual_store() {
+            Some(std::sync::Arc::new(
+                lpm_store::v2::Store::from_lpm_root_for_version_with_policies(
+                    lpm_root,
+                    store_version,
+                    object_integrity_policy,
+                    security_analysis_policy,
+                ),
+            ))
+        } else {
+            None
+        };
     if store_v2_handle.is_some() {
-        tracing::info!("store version v2 — routing object extracts to ~/.lpm/store/v2/");
+        tracing::info!(store_version = %store_version, "routing object extracts to virtual store");
     }
 
-    // — silent v1 → v2 layout migration on first
-    // v2-mode install in this project.
+    // Silent v1 → v2 layout migration on the first virtual-store
+    // install in this project.
     //
     // Detection (design): the project is on v1 if either
     // `<project>/.lpm/wrappers/` or `<project>/.lpm/hoisted/` exists.
@@ -996,7 +1013,8 @@ async fn run_with_options_under_store_lock(
     // (every `rm -rf` is a no-op on already-clean state). A crash
     // mid-migration leaves a half-wiped project; the next install
     // re-runs the same wipes and re-attempts the v2 install.
-    let project_needs_v2_migration = store_v2_handle.is_some() && needs_v2_migration(project_dir);
+    let project_needs_virtual_store_migration =
+        store_v2_handle.is_some() && needs_virtual_store_migration(project_dir);
 
     let experimental_resolver_requested = experimental_resolver::enabled();
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
@@ -1119,11 +1137,17 @@ async fn run_with_options_under_store_lock(
             &resolved_git_sources,
         );
 
-        workspace_resolution::wait_for_commit().await;
+        workspace_resolution::enter_commit();
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
         }
-        apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
+        apply_virtual_store_migration(
+            project_dir,
+            project_needs_virtual_store_migration,
+            store_version,
+            json_output,
+        )?;
+        workspace_lockfile::mark_active_importer_non_persisting();
         return experimental_resolver::run(
             arc_client.clone(),
             project_dir,
@@ -1393,11 +1417,16 @@ async fn run_with_options_under_store_lock(
     } else {
         None
     };
-    let wf_commit_wait_ms = workspace_resolution::wait_for_commit().await;
+    let wf_commit_wait_ms = workspace_resolution::enter_commit();
     if defer_project_linker_layout_maintenance {
         maintain_project_linker_layout(project_dir, json_output);
     }
-    apply_v2_migration(project_dir, project_needs_v2_migration, json_output)?;
+    apply_virtual_store_migration(
+        project_dir,
+        project_needs_virtual_store_migration,
+        store_version,
+        json_output,
+    )?;
 
     let link_phase = run_online_link_phase(OnlineLinkPhaseInput {
         start,

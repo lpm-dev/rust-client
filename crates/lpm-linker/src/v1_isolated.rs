@@ -871,16 +871,6 @@ pub fn link_workspace_member(
         ensure_child_dir(link_parent, "workspace member scope")?;
     }
 
-    // Defensive cleanup: any existing entry (file, dir, symlink) at the link
-    // path must go before we create the new symlink. The most common case is
-    // a stale workspace symlink from a previous install — those are still
-    // technically symlinks so `remove_file` succeeds. The fallback handles
-    // the rare case where someone (or another tool) put a real directory
-    // there: we want the install to recover, not crash.
-    if link_path.symlink_metadata().is_ok() {
-        let _ = remove_path_entry(&link_path);
-    }
-
     // Compute the symlink target relative to the link's parent directory.
     // Relative symlinks survive `mv workspace_root /elsewhere/` and match the
     // strategy used by the bin shim path at the bottom of `link_packages`.
@@ -893,7 +883,38 @@ pub fn link_workspace_member(
     let relative_target = pathdiff::diff_paths(&source_target, &link_parent_canonical)
         .unwrap_or_else(|| source_target.clone());
 
-    create_symlink_or_junction(&relative_target, &link_path).map_err(LpmError::Io)?;
+    #[cfg(unix)]
+    {
+        if link_path
+            .symlink_metadata()
+            .is_ok_and(|metadata| !is_symlink_or_junction(&metadata))
+        {
+            let _ = remove_path_entry(&link_path);
+        }
+        lpm_common::replace_symlink_atomic(&link_path, &relative_target).map_err(|error| {
+            LpmError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to link workspace member at {} to {}: {error}",
+                    link_path.display(),
+                    relative_target.display()
+                ),
+            ))
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        static WORKSPACE_LINK_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = WORKSPACE_LINK_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if link_path.symlink_metadata().is_ok() {
+            let _ = remove_path_entry(&link_path);
+        }
+        create_symlink_or_junction(&relative_target, &link_path).map_err(LpmError::Io)?;
+    }
     Ok(())
 }
 

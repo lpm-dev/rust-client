@@ -320,7 +320,7 @@ fn peer_state_repair_gate_v2_lockfile_with_auto_install_takes_fast_path() {
     let lf = make_lockfile_with_version(MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE);
     assert!(
         !lockfile_needs_peer_state_repair(&lf, true),
-        "v2 lockfile with auto-install on must take fast path — \
+        "virtual-store lockfile with auto-install on must take fast path — \
          empty ambient-peer-installs is authoritative"
     );
 }
@@ -366,7 +366,7 @@ fn peer_state_repair_gate_v2_lockfile_with_auto_install_off_takes_fast_path() {
 fn fresh_lockfiles_use_current_schema_version() {
     assert_eq!(
         lpm_lockfile::LOCKFILE_VERSION,
-        lpm_lockfile::LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS
+        lpm_lockfile::LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
     );
     let lf = lpm_lockfile::Lockfile::new();
     assert_eq!(lf.metadata.lockfile_version, lpm_lockfile::LOCKFILE_VERSION);
@@ -1315,11 +1315,11 @@ fn lockfile_fast_path_skips_upgrade_when_binary_current() {
         &gate_stats,
         false,
     )
-    .expect("fast path should succeed with both TOML + v2 binary");
+    .expect("fast path should succeed with both TOML + virtual-store binary");
 
     assert!(
         !result.needs_binary_upgrade,
-        "current v2 binary must NOT trigger needs_binary_upgrade"
+        "current virtual-store binary must NOT trigger needs_binary_upgrade"
     );
 }
 

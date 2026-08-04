@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn sample_lockfile() -> Lockfile {
     let mut lf = Lockfile::new();
@@ -2728,4 +2728,474 @@ fn legacy_find_package_returns_some_match_under_collision() {
     // Returns *some* react entry. Don't depend on which one.
     let found = lf.find_package("react");
     assert!(found.is_some());
+}
+
+fn importer_lockfile(package_name: &str, peer_version: &str) -> Lockfile {
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        name: package_name.to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        peers: vec![format!("runtime@{peer_version}")],
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        package_name.to_string(),
+        LockedRootResolution {
+            package: package_name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+    lockfile
+        .importers
+        .insert(".".to_string(), ImporterSnapshot::default());
+    lockfile
+}
+
+#[test]
+fn workspace_union_round_trips_distinct_importer_peer_contexts() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/one", importer_lockfile("plugin", "1.0.0"))
+        .unwrap();
+    union
+        .absorb_importer("packages/two", importer_lockfile("plugin", "2.0.0"))
+        .unwrap();
+
+    assert_eq!(union.workspace_packages.len(), 2);
+    let encoded = union.to_toml().expect("serialize workspace union");
+    let decoded = Lockfile::from_toml(&encoded).expect("parse workspace union");
+    assert_eq!(decoded, union);
+    assert_eq!(
+        decoded.project_importer("packages/one").unwrap().packages[0].peers,
+        ["runtime@1.0.0"]
+    );
+    assert_eq!(
+        decoded.project_importer("packages/two").unwrap().packages[0].peers,
+        ["runtime@2.0.0"]
+    );
+}
+
+#[test]
+fn validated_workspace_projection_does_not_recompute_loaded_package_addresses() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    let encoded = union.to_toml().expect("serialize workspace union");
+    crate::model::reset_workspace_package_id_call_count();
+    let validated =
+        crate::ValidatedLockfile::from_toml(&encoded).expect("validate workspace union");
+    let load_calls = crate::model::workspace_package_id_call_count();
+
+    validated
+        .project_importer("packages/app")
+        .expect("first trusted projection");
+    validated
+        .project_importer("packages/app")
+        .expect("second trusted projection");
+
+    assert_eq!(
+        (load_calls, crate::model::workspace_package_id_call_count()),
+        (1, 1)
+    );
+}
+
+#[test]
+fn validated_workspace_projection_reuses_loaded_package_order() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    let encoded = union.to_toml().expect("serialize workspace union");
+    let validated =
+        crate::ValidatedLockfile::from_toml(&encoded).expect("validate workspace union");
+    crate::model::reset_package_key_call_count();
+
+    validated
+        .project_importer("packages/app")
+        .expect("trusted projection");
+
+    assert_eq!(crate::model::package_key_call_count(), 0);
+}
+
+#[test]
+fn validated_workspace_metadata_projection_borrows_union_package_rows() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    let encoded = union.to_toml().expect("serialize workspace union");
+    let validated =
+        crate::ValidatedLockfile::from_toml(&encoded).expect("validate workspace union");
+
+    let metadata = validated
+        .project_importer_metadata("packages/app")
+        .expect("project importer metadata");
+    let packages = validated
+        .importer_packages("packages/app")
+        .expect("borrow importer packages");
+
+    assert!(metadata.packages.is_empty());
+    assert_eq!(packages[0].name, "app-dep");
+}
+
+#[test]
+fn workspace_union_stores_importer_packages_in_package_identity_order() {
+    let mut standalone = Lockfile::new();
+    standalone.packages = vec![
+        LockedPackage {
+            name: "zlib".to_string(),
+            version: "1.0.0".to_string(),
+            ..LockedPackage::default()
+        },
+        LockedPackage {
+            name: "alpha".to_string(),
+            version: "2.0.0".to_string(),
+            ..LockedPackage::default()
+        },
+    ];
+    let mut union = Lockfile::new();
+
+    union
+        .absorb_importer("packages/app", standalone)
+        .expect("absorb unsorted standalone lockfile");
+
+    let package_names = union.importers["packages/app"]
+        .locked_packages
+        .iter()
+        .map(|id| union.workspace_packages[id].name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(package_names, ["alpha", "zlib"]);
+}
+
+#[test]
+fn validated_workspace_lockfile_rejects_importer_package_ids_out_of_identity_order() {
+    let mut standalone = Lockfile::new();
+    standalone.add_package(LockedPackage {
+        name: "alpha".to_string(),
+        version: "1.0.0".to_string(),
+        ..LockedPackage::default()
+    });
+    standalone.add_package(LockedPackage {
+        name: "zlib".to_string(),
+        version: "1.0.0".to_string(),
+        ..LockedPackage::default()
+    });
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", standalone)
+        .expect("build workspace union");
+    union
+        .importers
+        .get_mut("packages/app")
+        .expect("workspace importer")
+        .locked_packages
+        .reverse();
+    let malformed = toml::to_string_pretty(&union).expect("serialize malformed fixture");
+
+    let error = crate::ValidatedLockfile::from_toml(&malformed)
+        .expect_err("out-of-order importer projection must fail validation");
+
+    assert!(error.to_string().contains("package identity order"));
+}
+
+#[test]
+fn validated_workspace_lockfile_rejects_tampered_package_address_at_load() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    union
+        .workspace_packages
+        .values_mut()
+        .next()
+        .expect("workspace package")
+        .version = "2.0.0".to_string();
+    let tampered = toml::to_string_pretty(&union).expect("serialize malformed fixture");
+
+    assert!(crate::ValidatedLockfile::from_toml(&tampered).is_err());
+}
+
+#[test]
+fn workspace_package_address_includes_every_serialized_package_field() {
+    let base = LockedPackage {
+        name: "package".to_string(),
+        version: "1.0.0".to_string(),
+        ..LockedPackage::default()
+    };
+    let mut variants = Vec::with_capacity(16);
+    variants.push(base.clone());
+    let mut package = base.clone();
+    package.name = "renamed".to_string();
+    variants.push(package);
+    let mut package = base.clone();
+    package.version = "2.0.0".to_string();
+    variants.push(package);
+    let mut package = base.clone();
+    package.source = Some("registry+https://registry.npmjs.org".to_string());
+    variants.push(package);
+    let mut package = base.clone();
+    package.integrity = Some("sha512-value".to_string());
+    variants.push(package);
+    let mut package = base.clone();
+    package.registry_signatures = vec![LockedRegistrySignature {
+        keyid: Some("key".to_string()),
+        sig: Some("signature".to_string()),
+    }];
+    variants.push(package);
+    let mut package = base.clone();
+    package.registry_published_at = Some("2026-01-01T00:00:00Z".to_string());
+    variants.push(package);
+    let mut package = base.clone();
+    package.os = vec!["darwin".to_string()];
+    variants.push(package);
+    let mut package = base.clone();
+    package.cpu = vec!["arm64".to_string()];
+    variants.push(package);
+    let mut package = base.clone();
+    package.libc = vec!["glibc".to_string()];
+    variants.push(package);
+    let mut package = base.clone();
+    package.node_engine = Some(">=22".to_string());
+    variants.push(package);
+    let mut package = base.clone();
+    package.optional = true;
+    variants.push(package);
+    let mut package = base.clone();
+    package.dependencies = vec!["dependency@1.0.0".to_string()];
+    variants.push(package);
+    let mut package = base.clone();
+    package.alias_dependencies = vec![["alias".to_string(), "target".to_string()]];
+    variants.push(package);
+    let mut package = base.clone();
+    package.peers = vec!["peer@1.0.0".to_string()];
+    variants.push(package);
+    let mut package = base;
+    package.tarball = Some("https://registry.npmjs.org/package/-/package-1.0.0.tgz".to_string());
+    variants.push(package);
+
+    let addresses = variants
+        .iter()
+        .map(crate::model::workspace_package_id_for_test)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(addresses.len(), variants.len());
+}
+
+#[test]
+fn workspace_package_address_v1_has_stable_encoding() {
+    let package = LockedPackage {
+        name: "@scope/package".to_string(),
+        version: "1.2.3".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some("sha512-integrity".to_string()),
+        registry_signatures: vec![LockedRegistrySignature {
+            keyid: Some("SHA256:key".to_string()),
+            sig: Some("signature".to_string()),
+        }],
+        registry_published_at: Some("2026-08-03T12:34:56Z".to_string()),
+        os: vec!["darwin".to_string(), "linux".to_string()],
+        cpu: vec!["arm64".to_string()],
+        libc: vec!["glibc".to_string()],
+        node_engine: Some(">=22".to_string()),
+        optional: true,
+        dependencies: vec![
+            "@scope/dependency@2.0.0".to_string(),
+            "plain@3.0.0".to_string(),
+        ],
+        alias_dependencies: vec![["alias".to_string(), "target@4.0.0".to_string()]],
+        peers: vec!["react@19.0.0".to_string()],
+        tarball: Some("https://registry.npmjs.org/@scope/package/-/package-1.2.3.tgz".to_string()),
+    };
+
+    assert_eq!(
+        crate::model::workspace_package_id_for_test(&package),
+        "sha256:8a75a99e5a0df0b37450d5ffbbb5c332e96874ee1d56f2a2dcdeeef759706bd8"
+    );
+}
+
+#[test]
+fn workspace_union_serialization_is_independent_of_importer_insertion_order() {
+    let mut forward = Lockfile::new();
+    forward
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    forward
+        .absorb_importer("packages/b", importer_lockfile("b", "2.0.0"))
+        .unwrap();
+
+    let mut reverse = Lockfile::new();
+    reverse
+        .absorb_importer("packages/b", importer_lockfile("b", "2.0.0"))
+        .unwrap();
+    reverse
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+
+    assert_eq!(forward.to_toml().unwrap(), reverse.to_toml().unwrap());
+}
+
+#[test]
+fn workspace_union_rejects_missing_duplicate_and_unreachable_package_ids() {
+    let mut missing = Lockfile::new();
+    missing
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    missing
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages[0] = format!("sha256:{}", "00".repeat(32));
+    assert!(missing.to_toml().is_err(), "missing package id must fail");
+
+    let mut duplicate = Lockfile::new();
+    duplicate
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    let id = duplicate.importers["packages/a"].locked_packages[0].clone();
+    duplicate
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages
+        .push(id);
+    assert!(
+        duplicate.to_toml().is_err(),
+        "duplicate package id must fail"
+    );
+
+    let mut unreachable = Lockfile::new();
+    unreachable
+        .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
+        .unwrap();
+    unreachable
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages
+        .clear();
+    assert!(
+        unreachable.to_toml().is_err(),
+        "unreachable package row must fail"
+    );
+}
+
+#[test]
+fn workspace_union_rejects_parent_traversal_importer_paths() {
+    let error = Lockfile::new()
+        .absorb_importer("../outside", importer_lockfile("a", "1.0.0"))
+        .expect_err("parent traversal importer must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid workspace importer path")
+    );
+}
+
+#[test]
+fn read_for_project_returns_the_nearest_workspace_importer_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    std::fs::create_dir_all(&member).unwrap();
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let projected = Lockfile::read_for_project(&member).unwrap();
+    assert_eq!(projected.importer, "packages/app");
+    assert_eq!(projected.path, directory.path().join(LOCKFILE_NAME));
+    assert_eq!(projected.lockfile.packages[0].name, "app-dep");
+}
+
+#[test]
+fn read_for_project_anchors_nested_directories_at_the_nearest_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    let nested = member.join("src/components");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let projected = Lockfile::read_for_project(&nested).unwrap();
+    assert_eq!(projected.importer, "packages/app");
+    assert_eq!(projected.lockfile.packages[0].name, "app-dep");
+}
+
+#[test]
+fn read_for_project_prefers_the_authoritative_workspace_projection_over_a_legacy_member_lockfile() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    importer_lockfile("legacy-dep", "1.0.0")
+        .write_to_file(&member.join(LOCKFILE_NAME))
+        .unwrap();
+
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", importer_lockfile("root-dep", "2.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let projected = Lockfile::read_for_project(&member).unwrap();
+    assert_eq!(projected.path, directory.path().join(LOCKFILE_NAME));
+    assert_eq!(projected.importer, "packages/app");
+    assert_eq!(projected.lockfile.packages[0].name, "root-dep");
+}
+
+#[test]
+fn write_for_project_replaces_only_the_member_projection_and_prunes_old_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("packages/first");
+    let second = directory.path().join("packages/second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/first", importer_lockfile("old", "1.0.0"))
+        .unwrap();
+    union
+        .absorb_importer("packages/second", importer_lockfile("kept", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    Lockfile::write_for_project(&first, importer_lockfile("new", "2.0.0")).unwrap();
+    let owner = Lockfile::read_from_file(&directory.path().join(LOCKFILE_NAME)).unwrap();
+    assert_eq!(
+        owner.project_importer("packages/first").unwrap().packages[0].name,
+        "new"
+    );
+    assert_eq!(
+        owner.project_importer("packages/second").unwrap().packages[0].name,
+        "kept"
+    );
+    assert!(
+        owner
+            .workspace_packages
+            .values()
+            .all(|package| package.name != "old")
+    );
 }

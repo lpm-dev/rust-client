@@ -899,6 +899,7 @@ impl BinaryLockfileReader {
             catalogs: crate::CatalogSnapshots::new(),
             provenance,
             packages,
+            workspace_packages: std::collections::BTreeMap::new(),
             // The binary format cannot represent alias metadata; any
             // project with aliases skips the binary write (see
             // `binary_format_supports`), so binary-backed reads always

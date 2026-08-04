@@ -120,8 +120,15 @@ pub(crate) fn run() -> Result<()> {
     // Paired bench runs on `bench/fixture-large` found no measurable
     // wall-clock effect from capping the pool, so default behavior
     // preserves tokio's unbounded blocking pool.
+    // The install pipeline is one very large future. Recursive installs move
+    // each target pipeline onto a runtime worker, while standalone installs
+    // are polled by the thread driving `block_on`. Give both thread classes
+    // the same explicit budget so debug frames and large workspaces cannot
+    // overflow Tokio's 2 MiB default worker stack.
+    const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
+    runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
     if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -132,16 +139,9 @@ pub(crate) fn run() -> Result<()> {
         .build()
         .expect("failed to create tokio runtime");
 
-    // The install pipeline is one very large future, and a recursive
-    // workspace install polls every target's pipeline on the thread
-    // driving `block_on` (their futures are !Send). Debug-build async
-    // frames are large enough that the platform main-thread stack is
-    // not a safe budget for that, so drive the async entry point on a
-    // dedicated thread with an explicit, generous stack.
-    const ASYNC_MAIN_STACK_BYTES: usize = 64 * 1024 * 1024;
     std::thread::Builder::new()
         .name("lpm-async-main".into())
-        .stack_size(ASYNC_MAIN_STACK_BYTES)
+        .stack_size(ASYNC_STACK_BYTES)
         .spawn(move || runtime.block_on(async_main()))
         .expect("failed to spawn async main thread")
         .join()
@@ -176,16 +176,20 @@ fn check_fast_lane_admission(
 }
 
 fn lockfile_contains_lpm_package(project_dir: &std::path::Path) -> bool {
-    let binary_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let project_lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir);
+    let binary_path = project_lockfile.as_ref().map_or_else(
+        |_| project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME),
+        |project| project.path.with_extension("lockb"),
+    );
     if let Ok(Some(reader)) = lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
         return reader
             .iter()
             .any(|package| package.name().starts_with("@lpm.dev/"));
     }
 
-    let toml_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    lpm_lockfile::Lockfile::read_from_file(&toml_path).map_or(true, |lockfile| {
-        lockfile
+    project_lockfile.map_or(true, |project| {
+        project
+            .lockfile
             .packages
             .iter()
             .any(|package| package.name.starts_with("@lpm.dev/"))
@@ -724,7 +728,7 @@ async fn async_main() -> Result<()> {
             if !packages.is_empty()
                 && frozen_lockfile_mode != commands::install::FrozenLockfileMode::Never
                 && (frozen_lockfile
-                    || (cwd.join(lpm_lockfile::LOCKFILE_NAME).exists()
+                    || (lpm_lockfile::Lockfile::read_for_project(&cwd).is_ok()
                         && commands::install::install_running_in_ci()))
             {
                 return Err(lpm_common::LpmError::Script(

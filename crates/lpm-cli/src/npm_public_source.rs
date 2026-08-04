@@ -105,6 +105,7 @@ mod tests {
                 tarball: tarball.map(str::to_string),
                 ..Default::default()
             }],
+            workspace_packages: Default::default(),
             root_aliases: Default::default(),
             root_resolutions: Default::default(),
             ambient_peer_installs: Vec::new(),

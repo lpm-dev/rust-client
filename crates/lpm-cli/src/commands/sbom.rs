@@ -78,15 +78,13 @@ pub async fn run(
         install_ui::yellow(sbom_format_title(format)),
     ));
 
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !lockfile_path.exists() {
-        return Err(LpmError::NotFound(
-            "no lpm.lock found. Run `lpm install` before generating an SBOM.".into(),
-        ));
-    }
-
-    let lockfile = Lockfile::read_fast(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read lpm.lock: {e}")))?;
+    let lockfile = Lockfile::read_for_project(project_dir)
+        .map_err(|e| {
+            LpmError::NotFound(format!(
+                "no usable lpm.lock found. Run `lpm install` before generating an SBOM: {e}"
+            ))
+        })?
+        .lockfile;
     let package_json_path = project_dir.join("package.json");
     let root_json = read_json_file(&package_json_path)?;
     let document = build_document(client, project_dir, root_json, lockfile, registry).await?;

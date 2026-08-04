@@ -390,25 +390,24 @@ pub struct LpmDependencyProvider {
     pub(super) root_dependencies: RootDependencies,
     /// Packages that should be split into per-parent identities.
     pub(super) split_packages: HashSet<String>,
-    /// Fully-parsed override IR. Records every applied override into its
-    /// internal `RefCell<Vec<OverrideHit>>` so callers can drain the trace
-    /// after `pubgrub::resolve` returns. Always present (defaults to
-    /// `OverrideSet::empty()` when no overrides are declared).
+    /// Fully-parsed override IR. Records every applied override so callers
+    /// can drain the trace after `pubgrub::resolve` returns. Always present
+    /// (defaults to `OverrideSet::empty()` when no overrides are declared).
     pub(super) overrides: OverrideSet,
     /// Set after the first batch_metadata call fails (e.g., 401).
     /// Prevents repeated guaranteed-failing batch requests during resolution.
     /// Individual ensure_cached calls still work as fallback.
-    pub(super) batch_disabled: RefCell<bool>,
+    pub(super) batch_disabled: Mutex<bool>,
     pub(super) policy: ResolverPolicy,
     /// Root-level npm-alias edges accumulated as `get_dependencies(Root)`
     /// walks `self.root_dependencies`. Shape: `local_name → target_canonical_name`.
     /// Surfaced via `into_parts()` so `ResolveResult.root_aliases` carries
     /// the map into the install pipeline, which feeds it to the linker.
-    pub(super) root_aliases: RefCell<HashMap<String, String>>,
+    pub(super) root_aliases: Mutex<HashMap<String, String>>,
     /// Dependency edges provisionally omitted while PubGrub explores versions.
     /// Their effective optionality is decided from the final selected graph.
     pub(super) skipped_dependencies:
-        RefCell<HashMap<(ResolverPackage, String, ResolverPackage, String), SkippedDependency>>,
+        Mutex<HashMap<(ResolverPackage, String, ResolverPackage, String), SkippedDependency>>,
     /// Memoize `(ResolverPackage, raw_range) → Ranges<NpmVersion>` so
     /// repeated PubGrub `get_dependencies` queries for the same edge skip
     /// the O(N-versions) conversion inside `NpmRange::to_pubgrub_ranges`.
@@ -432,7 +431,7 @@ pub struct LpmDependencyProvider {
     /// local: anything that changes how `available_versions` resolves
     /// (e.g. a future per-split platform override) can't accidentally
     /// read stale memoized Ranges from a prior pass.
-    pub(super) range_cache: RefCell<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
-    pub(super) available_versions_cache: RefCell<HashMap<ResolverPackage, Vec<NpmVersion>>>,
+    pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
+    pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, Vec<NpmVersion>>>,
     pub(super) include_optional_dependencies: bool,
 }

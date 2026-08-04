@@ -142,6 +142,69 @@ pub struct ReusableObjectCheckTimings {
     pub removed_count: u64,
     /// Time spent removing unusable object directories.
     pub remove_ms: u128,
+    /// Number of v3 source-record reads attempted.
+    pub cas_source_record_read_count: u64,
+    /// Time spent reading and parsing v3 source records.
+    pub cas_source_record_read_ms: u128,
+    /// Number of v3 tree-manifest reads performed.
+    pub cas_manifest_read_count: u64,
+    /// Time spent reading v3 tree-manifest bytes.
+    pub cas_manifest_read_ms: u128,
+    /// Time spent hashing, parsing, and validating v3 tree manifests.
+    pub cas_manifest_validate_ms: u128,
+    /// Number of v3 blob metadata reads performed.
+    pub cas_blob_stat_count: u64,
+    /// Number of shared v3 blob stats reused inside one validation batch.
+    pub cas_blob_stat_cache_hit_count: u64,
+    /// Time spent reading and checking v3 blob metadata.
+    pub cas_blob_stat_ms: u128,
+    /// Number of v3 source-validation record reads attempted.
+    pub cas_source_validation_read_count: u64,
+    /// Time spent reading and parsing v3 source-validation records.
+    pub cas_source_validation_read_ms: u128,
+    /// Number of v3 blob content rehashes after metadata changes.
+    pub cas_blob_rehash_count: u64,
+    /// Time spent rehashing v3 blobs after metadata changes.
+    pub cas_blob_rehash_ms: u128,
+}
+
+impl ReusableObjectCheckTimings {
+    pub(crate) fn record_file_cas(&mut self, timings: crate::v3::FileCasReuseTimings) {
+        self.cas_source_record_read_count = self
+            .cas_source_record_read_count
+            .saturating_add(timings.source_record_read_count);
+        self.cas_source_record_read_ms = self
+            .cas_source_record_read_ms
+            .saturating_add(timings.source_record_read_ms);
+        self.cas_manifest_read_count = self
+            .cas_manifest_read_count
+            .saturating_add(timings.manifest_read_count);
+        self.cas_manifest_read_ms = self
+            .cas_manifest_read_ms
+            .saturating_add(timings.manifest_read_ms);
+        self.cas_manifest_validate_ms = self
+            .cas_manifest_validate_ms
+            .saturating_add(timings.manifest_validate_ms);
+        self.cas_blob_stat_count = self
+            .cas_blob_stat_count
+            .saturating_add(timings.blob_stat_count);
+        self.cas_blob_stat_cache_hit_count = self
+            .cas_blob_stat_cache_hit_count
+            .saturating_add(timings.blob_stat_cache_hit_count);
+        self.cas_blob_stat_ms = self.cas_blob_stat_ms.saturating_add(timings.blob_stat_ms);
+        self.cas_source_validation_read_count = self
+            .cas_source_validation_read_count
+            .saturating_add(timings.source_validation_read_count);
+        self.cas_source_validation_read_ms = self
+            .cas_source_validation_read_ms
+            .saturating_add(timings.source_validation_read_ms);
+        self.cas_blob_rehash_count = self
+            .cas_blob_rehash_count
+            .saturating_add(timings.blob_rehash_count);
+        self.cas_blob_rehash_ms = self
+            .cas_blob_rehash_ms
+            .saturating_add(timings.blob_rehash_ms);
+    }
 }
 
 pub(crate) fn try_migrate_legacy_tree_object_integrity_to_source(
@@ -221,7 +284,7 @@ pub(crate) fn verified_tree_object_integrity_or_migrate(
         return Ok(VerifiedObjectIntegrity::new(expected));
     }
     Err(LpmError::Store(format!(
-        "v2 object integrity mismatch at {}: expected {expected}, actual {}",
+        "virtual-store object integrity mismatch at {}: expected {expected}, actual {}",
         dir.display(),
         actual.content
     )))
@@ -247,13 +310,13 @@ pub(crate) fn is_regular_file_no_symlink(path: &Path) -> bool {
 pub(crate) fn object_metadata_dir(dir: &Path) -> Result<PathBuf, LpmError> {
     let parent = dir.parent().ok_or_else(|| {
         LpmError::Store(format!(
-            "v2 object dir has no parent for metadata path: {}",
+            "virtual-store object dir has no parent for metadata path: {}",
             dir.display()
         ))
     })?;
     let name = dir.file_name().ok_or_else(|| {
         LpmError::Store(format!(
-            "v2 object dir has no filename for metadata path: {}",
+            "virtual-store object dir has no filename for metadata path: {}",
             dir.display()
         ))
     })?;
@@ -333,7 +396,7 @@ pub(crate) fn object_integrity_or_remove_with_timings(
                     Err(migration_err) => {
                         tracing::warn!(
                             target = %dir.display(),
-                            "v2 store: treating object as unusable {context}: {migration_err}"
+                            "virtual store: treating object as unusable {context}: {migration_err}"
                         );
                         let remove_start = std::time::Instant::now();
                         remove_unusable_object_dir(dir, context)?;
@@ -346,7 +409,7 @@ pub(crate) fn object_integrity_or_remove_with_timings(
                 }
                 tracing::warn!(
                     target = %dir.display(),
-                    "v2 store: treating object as unusable {context}: {err}"
+                    "virtual store: treating object as unusable {context}: {err}"
                 );
                 let remove_start = std::time::Instant::now();
                 remove_unusable_object_dir(dir, context)?;
@@ -366,7 +429,7 @@ pub(crate) fn object_integrity_or_remove_with_timings(
             }
             tracing::warn!(
                 target = %dir.display(),
-                "v2 store: treating object as unusable {context}: {err}"
+                "virtual store: treating object as unusable {context}: {err}"
             );
             let remove_start = std::time::Instant::now();
             remove_unusable_object_dir(dir, context)?;
@@ -395,7 +458,7 @@ pub(crate) fn object_integrity_or_remove(
             Err(err) => {
                 tracing::warn!(
                     target = %dir.display(),
-                    "v2 store: treating object as unusable {context}: {err}"
+                    "virtual store: treating object as unusable {context}: {err}"
                 );
                 remove_unusable_object_dir(dir, context)?;
                 Ok(None)
@@ -410,7 +473,7 @@ pub(crate) fn object_integrity_or_remove(
             }
             tracing::warn!(
                 target = %dir.display(),
-                "v2 store: treating object as unusable {context}: {err}"
+                "virtual store: treating object as unusable {context}: {err}"
             );
             remove_unusable_object_dir(dir, context)?;
             Ok(None)
@@ -438,12 +501,12 @@ pub(crate) fn remove_unusable_object_dir_inner(
     if warn {
         tracing::warn!(
             target = %dir.display(),
-            "v2 store: removing incomplete or unverifiable object {context}"
+            "virtual store: removing incomplete or unverifiable object {context}"
         );
     }
     std::fs::remove_dir_all(&claimed_dir).map_err(|e| {
         LpmError::Store(format!(
-            "failed to remove incomplete or unverifiable v2 object at {} {context}: {e}",
+            "failed to remove incomplete or unverifiable virtual-store object at {} {context}: {e}",
             dir.display()
         ))
     })?;
@@ -463,14 +526,14 @@ pub(crate) fn claim_unusable_object_dir(
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(LpmError::Store(format!(
-                    "failed to claim incomplete or unverifiable v2 object at {} {context}: {e}",
+                    "failed to claim incomplete or unverifiable virtual-store object at {} {context}: {e}",
                     dir.display()
                 )));
             }
         }
     }
     Err(LpmError::Store(format!(
-        "failed to claim incomplete or unverifiable v2 object at {} {context}: could not allocate a temporary removal path",
+        "failed to claim incomplete or unverifiable virtual-store object at {} {context}: could not allocate a temporary removal path",
         dir.display()
     )))
 }
@@ -501,7 +564,7 @@ pub(crate) fn finish_object_rename_after_collision(
                 } else {
                     tracing::warn!(
                         target = %object_dir.display(),
-                        "v2 store: treating collided object as unusable during {context}: {err}"
+                        "virtual store: treating collided object as unusable during {context}: {err}"
                     );
                     remove_unusable_object_dir(object_dir, "after rename collision")?;
                 }
@@ -512,14 +575,14 @@ pub(crate) fn finish_object_rename_after_collision(
             .map_err(|retry_error| {
                 let _ = std::fs::remove_dir_all(tmp_dir);
                 LpmError::Store(format!(
-                    "{context}: failed to replace unusable v2 object after rename collision: {retry_error}; original rename error: {original_error}"
+                    "{context}: failed to replace unusable virtual-store object after rename collision: {retry_error}; original rename error: {original_error}"
                 ))
             });
     }
 
     let _ = std::fs::remove_dir_all(tmp_dir);
     Err(LpmError::Store(format!(
-        "{context}: failed to atomically install v2 object: {original_error}"
+        "{context}: failed to atomically install virtual-store object: {original_error}"
     )))
 }
 
@@ -547,7 +610,7 @@ pub(crate) fn verified_source_object_integrity(
         return Ok(actual);
     }
     Err(LpmError::Store(format!(
-        "v2 object source integrity mismatch at {}: expected {expected}, actual {actual}",
+        "virtual-store object source integrity mismatch at {}: expected {expected}, actual {actual}",
         dir.display()
     )))
 }
@@ -610,7 +673,7 @@ pub(crate) fn verified_tree_object_integrity_or_migrate_with_timings(
         return Ok(VerifiedObjectIntegrity::new(expected));
     }
     Err(LpmError::Store(format!(
-        "v2 object integrity mismatch at {}: expected {expected}, actual {}",
+        "virtual-store object integrity mismatch at {}: expected {expected}, actual {}",
         dir.display(),
         actual.content
     )))
@@ -750,7 +813,7 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
         Err(error) => {
             tracing::debug!(
                 target = %path.display(),
-                "v2 store: ignoring unreadable tree snapshot: {error}"
+                "virtual store: ignoring unreadable tree snapshot: {error}"
             );
             return None;
         }
@@ -762,7 +825,7 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
         tracing::debug!(
             target = %path.display(),
             bytes = metadata.len(),
-            "v2 store: ignoring oversized tree snapshot"
+            "virtual store: ignoring oversized tree snapshot"
         );
         return None;
     }
@@ -771,7 +834,7 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
         Err(error) => {
             tracing::debug!(
                 target = %path.display(),
-                "v2 store: ignoring unreadable tree snapshot: {error}"
+                "virtual store: ignoring unreadable tree snapshot: {error}"
             );
             return None;
         }
@@ -781,7 +844,7 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
         Err(error) => {
             tracing::debug!(
                 target = %path.display(),
-                "v2 store: ignoring malformed tree snapshot: {error}"
+                "virtual store: ignoring malformed tree snapshot: {error}"
             );
             return None;
         }
@@ -808,7 +871,7 @@ pub(crate) fn write_tree_snapshot_best_effort(dir: &Path, integrities: &TreeInte
     if let Err(error) = write_tree_snapshot(dir, integrities) {
         tracing::debug!(
             target = %dir.display(),
-            "v2 store: failed to refresh tree snapshot: {error}"
+            "virtual store: failed to refresh tree snapshot: {error}"
         );
     }
 }
@@ -822,12 +885,15 @@ pub(crate) fn write_tree_snapshot(
         content_integrity: integrities.content.clone(),
         metadata_integrity: integrities.metadata.clone(),
     };
-    let bytes = serde_json::to_vec(&snapshot)
-        .map_err(|e| LpmError::Store(format!("failed to serialize v2 tree snapshot: {e}")))?;
+    let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to serialize virtual-store tree snapshot: {e}"
+        ))
+    })?;
     let final_path = dir.join(TREE_SNAPSHOT_FILENAME);
     write_file_atomic(&final_path, bytes).map_err(|error| {
         LpmError::Store(format!(
-            "failed to atomically install v2 tree snapshot at {}: {error}",
+            "failed to atomically install virtual-store tree snapshot at {}: {error}",
             final_path.display()
         ))
     })
@@ -837,26 +903,26 @@ pub(crate) fn read_object_integrity(dir: &Path) -> Result<String, LpmError> {
     let path = dir.join(OBJECT_INTEGRITY_FILENAME);
     if !is_regular_file_no_symlink(&path) {
         return Err(LpmError::Store(format!(
-            "v2 object integrity sidecar is missing or not a regular file at {}",
+            "virtual-store object integrity sidecar is missing or not a regular file at {}",
             path.display()
         )));
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         LpmError::Store(format!(
-            "failed to read v2 object integrity sidecar at {}: {e}",
+            "failed to read virtual-store object integrity sidecar at {}: {e}",
             path.display()
         ))
     })?;
     let digest = raw.trim();
     let hex_part = digest.strip_prefix("sha256-").ok_or_else(|| {
         LpmError::Store(format!(
-            "invalid v2 object integrity sidecar at {}: expected sha256-<hex>",
+            "invalid virtual-store object integrity sidecar at {}: expected sha256-<hex>",
             path.display()
         ))
     })?;
     if hex_part.len() != 64 || !hex_part.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return Err(LpmError::Store(format!(
-            "invalid v2 object integrity sidecar at {}: expected sha256-<64 hex chars>",
+            "invalid virtual-store object integrity sidecar at {}: expected sha256-<64 hex chars>",
             path.display()
         )));
     }
@@ -914,8 +980,11 @@ pub(crate) fn write_source_object_integrity_with_tree(
 
 pub(crate) fn write_object_integrity_content(dir: &Path, content: &str) -> Result<(), LpmError> {
     let path = dir.join(OBJECT_INTEGRITY_FILENAME);
-    write_file_atomic(&path, format!("{content}\n"))
-        .map_err(|e| LpmError::Store(format!("failed to write v2 object integrity sidecar: {e}")))
+    write_file_atomic(&path, format!("{content}\n")).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to write virtual-store object integrity sidecar: {e}"
+        ))
+    })
 }
 
 pub(crate) fn source_object_integrity(source_sri: &str) -> String {

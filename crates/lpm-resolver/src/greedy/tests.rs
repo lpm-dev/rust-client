@@ -13,10 +13,35 @@ use super::types::*;
 use super::version::*;
 use crate::policy::{TrustPolicyMode, parse_npm_time_unix};
 use crate::provider::{CachedDistInfo, CachedPackageInfo};
-use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tracing::instrument::WithSubscriber as _;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TraceBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("trace buffer poisoned").extend(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for TraceBuffer {
+    type Writer = TraceBuffer;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 struct ScopedEnvVars {
     originals: Vec<(&'static str, Option<String>)>,
@@ -544,14 +569,15 @@ fn find_best_version_release_age_exclude_allows_latest_for_canonical_package() {
 
 struct CountingTreeProvider {
     manifests: AHashMap<CanonicalKey, Arc<CachedPackageInfo>>,
-    cached: RefCell<AHashSet<CanonicalKey>>,
-    ensure_calls: Cell<usize>,
+    cached: Mutex<AHashSet<CanonicalKey>>,
+    ensure_calls: AtomicUsize,
 }
 
 impl TreeManifestProvider for CountingTreeProvider {
     fn cached_manifest(&self, canonical: &CanonicalKey) -> Option<Arc<CachedPackageInfo>> {
         self.cached
-            .borrow()
+            .lock()
+            .expect("cached manifests mutex poisoned")
             .contains(canonical)
             .then(|| self.manifests.get(canonical).cloned())
             .flatten()
@@ -560,8 +586,9 @@ impl TreeManifestProvider for CountingTreeProvider {
     fn ensure_manifest<'a>(
         &'a self,
         canonical: &'a CanonicalKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>> {
-        self.ensure_calls.set(self.ensure_calls.get() + 1);
+    ) -> Pin<Box<dyn Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + Send + 'a>>
+    {
+        self.ensure_calls.fetch_add(1, Ordering::Relaxed);
         let result = self
             .manifests
             .get(canonical)
@@ -569,7 +596,10 @@ impl TreeManifestProvider for CountingTreeProvider {
             .ok_or_else(|| ResolveError::Internal(format!("missing manifest for {canonical}")));
         Box::pin(async move {
             let info = result?;
-            self.cached.borrow_mut().insert(canonical.clone());
+            self.cached
+                .lock()
+                .expect("cached manifests mutex poisoned")
+                .insert(canonical.clone());
             Ok(info)
         })
     }
@@ -595,19 +625,21 @@ async fn preferred_tree_compatible_version_reuses_cached_subtree_status_for_trus
     let policy = ResolverPolicy::new(0, TrustPolicyMode::NoDowngrade);
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let first =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
     let second =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert_eq!(first, Some(NpmVersion::parse("1.0.0").unwrap()));
     assert_eq!(second, Some(NpmVersion::parse("1.0.0").unwrap()));
-    assert_eq!(provider.ensure_calls.get(), 1);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -635,16 +667,17 @@ async fn preferred_tree_compatible_version_skips_subtree_walk_for_scoped_release
     );
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let preferred =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert!(preferred.is_none());
-    assert_eq!(provider.ensure_calls.get(), 0);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -667,16 +700,17 @@ async fn preferred_tree_compatible_version_skips_subtree_walk_for_transitive_edg
     let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, child_info)]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let preferred =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert!(preferred.is_none());
-    assert_eq!(provider.ensure_calls.get(), 0);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -707,16 +741,17 @@ async fn preferred_tree_compatible_version_uses_bounded_release_age_lookahead() 
     let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, TrustPolicyMode::Off);
     let provider = CountingTreeProvider {
         manifests: AHashMap::from_iter([(child, Arc::new(child_info))]),
-        cached: RefCell::new(AHashSet::new()),
-        ensure_calls: Cell::new(0),
+        cached: Mutex::new(AHashSet::new()),
+        ensure_calls: AtomicUsize::new(0),
     };
-    let cache = TreeStatusCache::default();
+    let mut cache = TreeStatusCache::default();
 
     let preferred =
-        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &cache).await;
+        preferred_tree_compatible_version(&edge, &parent_info, &policy, &provider, &mut cache)
+            .await;
 
     assert_eq!(preferred, Some(NpmVersion::parse("1.0.0").unwrap()));
-    assert_eq!(provider.ensure_calls.get(), 1);
+    assert_eq!(provider.ensure_calls.load(Ordering::Relaxed), 1);
     assert_eq!(cache.release_age_lookahead_fetches(), 1);
 }
 
@@ -3186,6 +3221,57 @@ async fn peer_drain_best_effort_synthesizes_for_incompatible_required_ranges() {
     assert_eq!(report.unsatisfied_consumers.len(), 1);
     assert_eq!(report.unsatisfied_consumers[0].0, "legacy-pkg");
     assert_eq!(report.unsatisfied_consumers[0].1, "^17.0.0");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_drain_best_effort_warning_excludes_optional_consumers_from_satisfied_count() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let legacy = push_node(&mut state, CanonicalKey::npm("legacy"), "1.0.0");
+    let modern = push_node(&mut state, CanonicalKey::npm("modern"), "1.0.0");
+    let optional_a = push_node(&mut state, CanonicalKey::npm("optional-a"), "1.0.0");
+    let optional_b = push_node(&mut state, CanonicalKey::npm("optional-b"), "1.0.0");
+
+    for (consumer, range, optional) in [
+        (legacy, "^17.0.0", false),
+        (modern, "^18.0.0", false),
+        (optional_a, "^18.0.0", true),
+        (optional_b, "^99.0.0", true),
+    ] {
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "react",
+            CanonicalKey::npm("react"),
+            range,
+            optional,
+        ));
+    }
+
+    let output = TraceBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_level(false)
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(output.clone())
+        .finish();
+    let info = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+
+    drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = Arc::clone(&info);
+        async move { Ok(info) }
+    })
+    .with_subscriber(subscriber)
+    .await
+    .expect("best-effort synthesis should succeed");
+
+    let rendered = String::from_utf8(output.0.lock().expect("trace buffer poisoned").clone())
+        .expect("trace output must be UTF-8");
+    assert!(
+        rendered.contains("satisfies 1 of 2 required consumer(s)"),
+        "{rendered}"
+    );
 }
 
 #[tokio::test]

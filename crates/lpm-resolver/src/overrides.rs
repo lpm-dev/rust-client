@@ -62,8 +62,8 @@
 
 use crate::npm_version::NpmVersion;
 use crate::ranges::NpmRange;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The source location an override was loaded from. Used for error
@@ -308,9 +308,8 @@ pub struct OverrideSet {
     /// they appear as the target of at least one path selector.
     split_targets: HashSet<String>,
     /// Apply trace buffer. Populated by `record_hit` during resolution
-    /// and drained by `take_hits` after. RefCell because the resolver
-    /// holds the OverrideSet by `&self` inside `choose_version`.
-    hits: RefCell<Vec<OverrideHit>>,
+    /// and drained by `take_hits` after.
+    hits: Mutex<Vec<OverrideHit>>,
     /// Pre-computed canonical fingerprint of the parsed set. Used to
     /// invalidate the lockfile fast path when overrides change.
     fingerprint: String,
@@ -323,7 +322,7 @@ impl OverrideSet {
             entries: Vec::new(),
             target_names: HashSet::new(),
             split_targets: HashSet::new(),
-            hits: RefCell::new(Vec::new()),
+            hits: Mutex::new(Vec::new()),
             fingerprint: empty_fingerprint(),
         }
     }
@@ -420,7 +419,7 @@ impl OverrideSet {
             entries,
             target_names,
             split_targets,
-            hits: RefCell::new(Vec::new()),
+            hits: Mutex::new(Vec::new()),
             fingerprint,
         })
     }
@@ -519,7 +518,7 @@ impl OverrideSet {
     /// the resolver has decided to honor the entry. Idempotent on
     /// (raw_key, source, package, from_version, to_version, via_parent).
     pub fn record_hit(&self, hit: OverrideHit) {
-        let mut hits = self.hits.borrow_mut();
+        let mut hits = self.hits.lock();
         if !hits.contains(&hit) {
             hits.push(hit);
         }
@@ -528,7 +527,7 @@ impl OverrideSet {
     /// Drain and return all recorded hits, sorted by (package, raw_key).
     /// Stable order so the install summary and JSON output don't churn.
     pub fn take_hits(&self) -> Vec<OverrideHit> {
-        let mut hits = std::mem::take(&mut *self.hits.borrow_mut());
+        let mut hits = std::mem::take(&mut *self.hits.lock());
         hits.sort_by(|a, b| a.package.cmp(&b.package).then(a.raw_key.cmp(&b.raw_key)));
         hits
     }
@@ -540,7 +539,7 @@ impl Clone for OverrideSet {
             entries: self.entries.clone(),
             target_names: self.target_names.clone(),
             split_targets: self.split_targets.clone(),
-            hits: RefCell::new(self.hits.borrow().clone()),
+            hits: Mutex::new(self.hits.lock().clone()),
             fingerprint: self.fingerprint.clone(),
         }
     }

@@ -627,7 +627,10 @@ pub async fn run(
     // Resolve `--pm auto` to a concrete PM so the tx can snapshot the
     // right per-PM lockfile alongside the LPM lockfiles.
     let pkg_json_path = project_dir.join("package.json");
-    let lpm_lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lpm_lock_path = lpm_lockfile::Lockfile::read_for_project(project_dir).map_or_else(
+        |_| project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+        |project| project.path,
+    );
     let lpm_lock_bin_path = lpm_lock_path.with_extension("lockb");
     let added_sources_state_path = crate::added_sources_state::state_path(project_dir);
     let install_hash_path = project_dir.join(".lpm").join("install-hash");

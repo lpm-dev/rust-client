@@ -2,7 +2,7 @@ use super::prelude::*;
 
 impl LpmDependencyProvider {
     fn record_skipped_dependency(&self, skipped: SkippedDependency) {
-        self.skipped_dependencies.borrow_mut().insert(
+        self.skipped_dependencies.lock().insert(
             (
                 skipped.parent.clone(),
                 skipped.parent_version.clone(),
@@ -295,7 +295,7 @@ impl DependencyProvider for LpmDependencyProvider {
                     })
                     .collect();
 
-                if uncached.len() > 1 && !*self.batch_disabled.borrow() {
+                if uncached.len() > 1 && !*self.batch_disabled.lock() {
                     // Root-level follow-up (only fires when the pre-resolve
                     // batch was absent or incomplete) also uses the deep
                     // variant so the first pubgrub walk starts with a
@@ -324,7 +324,7 @@ impl DependencyProvider for LpmDependencyProvider {
                             tracing::debug!(
                                 "root batch prefetch failed, disabling batching for this run: {e}"
                             );
-                            *self.batch_disabled.borrow_mut() = true;
+                            *self.batch_disabled.lock() = true;
                         }
                     }
                 }
@@ -342,12 +342,11 @@ impl DependencyProvider for LpmDependencyProvider {
                 // registry identity) while the install pipeline remembers
                 // `local → target` for the linker to build
                 // `node_modules/<local>/`. The alias is recorded in
-                // `self.root_aliases` (RefCell, accumulated as we walk
-                // each root dep).
+                // `self.root_aliases`, accumulated as we walk each root dep.
                 let (target_name, range_str) = match crate::ranges::parse_npm_alias(dep_range_str) {
                     Some(alias) => {
                         self.root_aliases
-                            .borrow_mut()
+                            .lock()
                             .insert(dep_name.clone(), alias.target.clone());
                         (alias.target, alias.range)
                     }
@@ -505,7 +504,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 .cloned()
                 .collect();
 
-            if uncached.len() > 1 && !*self.batch_disabled.borrow() {
+            if uncached.len() > 1 && !*self.batch_disabled.lock() {
                 let fetch = async {
                     if deep_followup {
                         self.client.batch_metadata_deep(&uncached).await
@@ -527,7 +526,7 @@ impl DependencyProvider for LpmDependencyProvider {
                         tracing::debug!(
                             "dep batch prefetch failed, disabling batching for this run: {e}"
                         );
-                        *self.batch_disabled.borrow_mut() = true;
+                        *self.batch_disabled.lock() = true;
                     }
                 }
             }

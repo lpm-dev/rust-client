@@ -25,12 +25,13 @@ pub(in crate::commands::deploy) fn write_pruned_deploy_lockfile_if_possible(
         Some(specs) => specs,
         None => return Ok(None),
     };
-    let source_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&source_lockfile_path).map_err(|e| {
+    let source_lockfile = lpm_lockfile::Lockfile::read_for_project(source_cwd)
+        .map_err(|e| {
             LpmError::Script(format!(
                 "deploy: failed to read source lockfile {source_lockfile_path:?}: {e}"
             ))
-        })?;
+        })?
+        .lockfile;
 
     let mut queue = VecDeque::new();
     for (name, spec) in &root_specs {

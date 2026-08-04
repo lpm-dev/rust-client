@@ -1816,7 +1816,7 @@ fn to_pubgrub_ranges_cached_hits_on_repeated_query() {
     // Miss path — first call computes + caches.
     let r1 = provider.to_pubgrub_ranges_cached(&pkg, &npm_range, &available);
     assert_eq!(
-        provider.range_cache.borrow().len(),
+        provider.range_cache.lock().len(),
         1,
         "first call must populate exactly one entry"
     );
@@ -1830,7 +1830,7 @@ fn to_pubgrub_ranges_cached_hits_on_repeated_query() {
         "memoized Ranges must equal the freshly-computed Ranges"
     );
     assert_eq!(
-        provider.range_cache.borrow().len(),
+        provider.range_cache.lock().len(),
         1,
         "repeated query with identical (pkg, range) must NOT add a second cache entry"
     );
@@ -1839,7 +1839,7 @@ fn to_pubgrub_ranges_cached_hits_on_repeated_query() {
     let npm_range2 = NpmRange::parse("~4.17.0").unwrap();
     provider.to_pubgrub_ranges_cached(&pkg, &npm_range2, &available);
     assert_eq!(
-        provider.range_cache.borrow().len(),
+        provider.range_cache.lock().len(),
         2,
         "different raw-range string must key a new entry"
     );
@@ -1861,11 +1861,11 @@ fn available_versions_cached_hits_on_repeated_query() {
     provider.insert_and_notify(CanonicalKey::from(&pkg), info);
 
     let first = provider.available_versions(&pkg);
-    assert_eq!(provider.available_versions_cache.borrow().len(), 1);
+    assert_eq!(provider.available_versions_cache.lock().len(), 1);
 
     let second = provider.available_versions(&pkg);
     assert_eq!(first, second);
-    assert_eq!(provider.available_versions_cache.borrow().len(), 1);
+    assert_eq!(provider.available_versions_cache.lock().len(), 1);
 }
 
 #[test]
@@ -1950,7 +1950,7 @@ fn to_pubgrub_ranges_cached_distinguishes_split_packages() {
     provider.to_pubgrub_ranges_cached(&pkg_plain, &npm_range, &available_plain);
     provider.to_pubgrub_ranges_cached(&pkg_split, &npm_range, &available_split);
     assert_eq!(
-        provider.range_cache.borrow().len(),
+        provider.range_cache.lock().len(),
         2,
         "split and plain keys must live in separate cache entries"
     );

@@ -1,9 +1,10 @@
 use super::uninstall_ui;
+use crate::commands::install::workspace_lockfile;
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -11,6 +12,15 @@ use std::time::Instant;
 struct UninstallResult {
     removed: Vec<String>,
     not_found: Vec<String>,
+}
+
+struct UninstallBatchResult {
+    removed: Vec<String>,
+    not_found: Vec<String>,
+    removed_versions: HashMap<String, String>,
+    orphaned: Vec<PackageVersion>,
+    cleaned_empty_dirs: usize,
+    freed_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -356,6 +366,25 @@ fn collect_manifest_dependency_specs(doc: &Value) -> HashMap<String, String> {
     specs
 }
 
+fn collect_manifest_section(doc: &Value, section: &str) -> BTreeMap<String, String> {
+    doc.get(section)
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, spec)| spec.as_str().map(|spec| (name.clone(), spec.to_string())))
+        .collect()
+}
+
+fn reconcile_importer_dependencies(lockfile: &mut lpm_lockfile::Lockfile, manifest: &Value) {
+    let Some(importer) = lockfile.importers.get_mut(".") else {
+        return;
+    };
+    importer.dependencies = collect_manifest_section(manifest, "dependencies");
+    importer.dev_dependencies = collect_manifest_section(manifest, "devDependencies");
+    importer.optional_dependencies = collect_manifest_section(manifest, "optionalDependencies");
+    importer.peer_dependencies = collect_manifest_section(manifest, "peerDependencies");
+}
+
 fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<String> {
     match lpm_resolver::Specifier::parse(requested_spec).ok()? {
         lpm_resolver::Specifier::SemverRange(range) => Some(range),
@@ -415,8 +444,7 @@ fn split_locked_dependency(entry: &str) -> Option<(&str, &str)> {
 
 fn locked_package_versions(project_dir: &Path, packages: &[String]) -> HashMap<String, String> {
     let mut versions = HashMap::with_capacity(packages.len());
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) {
+    if let Ok(lockfile) = workspace_lockfile::read_project(project_dir) {
         let package_names: HashSet<&str> = packages.iter().map(String::as_str).collect();
         for pkg in &lockfile.packages {
             if package_names.contains(pkg.name.as_str()) {
@@ -458,11 +486,6 @@ struct LockfilePruneReport {
 }
 
 fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePruneReport, LpmError> {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !lockfile_path.exists() {
-        return Ok(LockfilePruneReport::default());
-    }
-
     let manifest_path = project_dir.join("package.json");
     let manifest_content =
         lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
@@ -470,9 +493,10 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
         serde_json::from_str(&manifest_content).map_err(|e| LpmError::Registry(e.to_string()))?;
     let direct_specs = collect_manifest_dependency_specs(&manifest);
 
-    let Ok(mut lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
+    let Ok(mut lockfile) = workspace_lockfile::read_project(project_dir) else {
         return Ok(LockfilePruneReport::default());
     };
+    reconcile_importer_dependencies(&mut lockfile, &manifest);
 
     let package_key = |name: &str, version: &str| -> String {
         let mut key = String::with_capacity(name.len() + 1 + version.len());
@@ -494,8 +518,7 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
         lockfile.packages.clear();
         lockfile.root_aliases.clear();
         lockfile.ambient_peer_installs.clear();
-        lockfile
-            .write_all(&lockfile_path)
+        workspace_lockfile::write(project_dir, lockfile)
             .map_err(|e| LpmError::Registry(e.to_string()))?;
         return Ok(LockfilePruneReport { removed_packages });
     }
@@ -571,8 +594,7 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
         .ambient_peer_installs
         .retain(|name| kept_names.contains(name.as_str()));
 
-    lockfile
-        .write_all(&lockfile_path)
+    workspace_lockfile::write(project_dir, lockfile)
         .map_err(|e| LpmError::Registry(e.to_string()))?;
 
     Ok(LockfilePruneReport { removed_packages })
@@ -634,6 +656,56 @@ fn uninstall_from_project(
         cleanup_removed_packages(project_dir, &result.removed, &direct_versions)?;
     }
     Ok(result)
+}
+
+fn uninstall_selected_targets(
+    member_manifests: &[PathBuf],
+    packages: &[String],
+    json_output: bool,
+) -> Result<UninstallBatchResult, LpmError> {
+    let mut removed = Vec::new();
+    let mut not_found = Vec::new();
+    let mut removed_versions = HashMap::new();
+    let mut orphaned = Vec::new();
+    let mut cleaned_empty_dirs = 0usize;
+    let mut freed_bytes = 0u64;
+
+    for manifest_path in member_manifests {
+        let per_member = uninstall_from_manifest(manifest_path, packages, json_output)?;
+
+        if !per_member.removed.is_empty() {
+            let member_dir = crate::commands::install_targets::install_root_for(manifest_path);
+            let per_member_versions = locked_package_versions(member_dir, &per_member.removed);
+            removed_versions.extend(per_member_versions.clone());
+            let cleanup =
+                cleanup_removed_packages(member_dir, &per_member.removed, &per_member_versions)?;
+            orphaned.extend(cleanup.orphaned);
+            cleaned_empty_dirs += cleanup.cleaned_empty_dirs;
+            freed_bytes = freed_bytes.saturating_add(cleanup.freed_bytes);
+        }
+
+        removed.extend(per_member.removed);
+        not_found.extend(per_member.not_found);
+    }
+
+    let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();
+    not_found.retain(|name| !removed_set.contains(name.as_str()));
+
+    removed.sort();
+    removed.dedup();
+    not_found.sort();
+    not_found.dedup();
+    orphaned.sort();
+    orphaned.dedup();
+
+    Ok(UninstallBatchResult {
+        removed,
+        not_found,
+        removed_versions,
+        orphaned,
+        cleaned_empty_dirs,
+        freed_bytes,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,52 +788,46 @@ pub async fn run(
         uninstall_ui::phase_resolving_graph(packages.len());
     }
 
-    // Run uninstall against every target manifest. Aggregate results so we
-    // can report a single deduped (removed, not_found) summary at the end.
-    //
-    // audit correction: lockfile + node_modules cleanup happens
-    // PER TARGET at the member's own dir. LPM uses per-directory lockfiles
-    // and per-directory node_modules, so a multi-member uninstall must
-    // clean each member's own state — not the workspace root's.
-    let mut all_removed: Vec<String> = Vec::new();
-    let mut all_not_found: Vec<String> = Vec::new();
-    let mut removed_versions: HashMap<String, String> = HashMap::new();
-    let mut all_orphaned: Vec<PackageVersion> = Vec::new();
-    let mut cleaned_empty_dirs = 0usize;
-    let mut freed_bytes = 0u64;
-    for manifest_path in &targets.member_manifests {
-        let per_member = uninstall_from_manifest(manifest_path, packages, json_output)?;
+    let member_roots = targets
+        .member_manifests
+        .iter()
+        .map(|manifest| crate::commands::install_targets::install_root_for(manifest).to_path_buf())
+        .collect::<Vec<_>>();
+    let manifest_refs = targets
+        .member_manifests
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    let install_hash_paths = member_roots
+        .iter()
+        .map(|root| root.join(".lpm").join("install-hash"))
+        .collect::<Vec<_>>();
+    let install_hash_refs = install_hash_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
 
-        if !per_member.removed.is_empty() {
-            // Clean THIS member's lockfile and node_modules. install_root_for
-            // returns the manifest's parent directory.
-            let member_dir = crate::commands::install_targets::install_root_for(manifest_path);
-            let per_member_versions = locked_package_versions(member_dir, &per_member.removed);
-            removed_versions.extend(per_member_versions.clone());
-            let cleanup =
-                cleanup_removed_packages(member_dir, &per_member.removed, &per_member_versions)?;
-            all_orphaned.extend(cleanup.orphaned);
-            cleaned_empty_dirs += cleanup.cleaned_empty_dirs;
-            freed_bytes = freed_bytes.saturating_add(cleanup.freed_bytes);
-        }
-
-        all_removed.extend(per_member.removed);
-        all_not_found.extend(per_member.not_found);
-    }
-
-    // A package is "not found" only if no target manifest had it. If at
-    // least one target removed it, drop it from the not_found set.
-    let removed_set: std::collections::HashSet<&str> =
-        all_removed.iter().map(String::as_str).collect();
-    all_not_found.retain(|name| !removed_set.contains(name.as_str()));
-
-    // Dedupe both lists for stable output.
-    all_removed.sort();
-    all_removed.dedup();
-    all_not_found.sort();
-    all_not_found.dedup();
-    all_orphaned.sort();
-    all_orphaned.dedup();
+    let result =
+        workspace_lockfile::scope_workspace_mutation_if_present(cwd, &member_roots, async {
+            let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                &manifest_refs,
+                &[],
+                &install_hash_refs,
+            )?;
+            let result =
+                uninstall_selected_targets(&targets.member_manifests, packages, json_output)?;
+            workspace_lockfile::commit_manifest_transaction(transaction);
+            Ok(result)
+        })
+        .await?;
+    let UninstallBatchResult {
+        removed: all_removed,
+        not_found: all_not_found,
+        removed_versions,
+        orphaned: all_orphaned,
+        cleaned_empty_dirs,
+        freed_bytes,
+    } = result;
 
     if all_removed.is_empty() {
         if !json_output {
@@ -1422,6 +1488,32 @@ mod tests {
         }
     }
 
+    fn write_workspace_union_lockfile(root: &Path, importers: &[(&str, &str, &str)]) {
+        let mut union = lpm_lockfile::Lockfile::new();
+        for (importer, package, version) in importers {
+            let mut projection = lpm_lockfile::Lockfile::new();
+            projection.add_package(lpm_lockfile::LockedPackage {
+                name: (*package).to_string(),
+                version: (*version).to_string(),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            projection.importers.insert(
+                ".".to_string(),
+                lpm_lockfile::ImporterSnapshot {
+                    dependencies: std::collections::BTreeMap::from([(
+                        (*package).to_string(),
+                        (*version).to_string(),
+                    )]),
+                    ..lpm_lockfile::ImporterSnapshot::default()
+                },
+            );
+            union.absorb_importer(importer, projection).unwrap();
+        }
+        union
+            .write_all(&root.join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn run_uninstall_with_filter_removes_only_from_targeted_member() {
         let dir = tempfile::tempdir().unwrap();
@@ -1750,21 +1842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_uninstall_lockfile_cleanup_happens_per_member_not_at_workspace_root() {
-        // audit correction: LPM uses per-directory lockfiles. A
-        // multi-member uninstall must clean each TARGETED member's own
-        // lockfile — and must NOT touch the workspace root lockfile (or any
-        // unrelated member's lockfile).
-        //
-        // The original implementation set install_root = workspace_root
-        // and removed only the workspace root lockfile. That was wrong:
-        // member node_modules/lockfiles were left stale, and the workspace
-        // root lockfile (if any) might not even be related to the members.
-        //
-        // This test asserts the current behavior:
-        //   1. Each TARGETED member's lockfile is preserved in place.
-        //   2. The workspace root lockfile is NOT touched.
-        //   3. Unrelated members' lockfiles are NOT touched.
+    async fn run_uninstall_updates_targeted_root_projections_and_preserves_untargeted_importers() {
         let dir = tempfile::tempdir().unwrap();
         write_workspace_fixture(
             dir.path(),
@@ -1774,28 +1852,15 @@ mod tests {
                 ("auth", "packages/auth", &[("foo", "1.0.0")]), // unrelated to filter
             ],
         );
-
-        // Place lockfiles in: workspace root + each member dir
         let root_lock = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-        let ui_a_lock = dir
-            .path()
-            .join("packages")
-            .join("ui-a")
-            .join(lpm_lockfile::LOCKFILE_NAME);
-        let ui_b_lock = dir
-            .path()
-            .join("packages")
-            .join("ui-b")
-            .join(lpm_lockfile::LOCKFILE_NAME);
-        let auth_lock = dir
-            .path()
-            .join("packages")
-            .join("auth")
-            .join(lpm_lockfile::LOCKFILE_NAME);
-
-        for path in [&root_lock, &ui_a_lock, &ui_b_lock, &auth_lock] {
-            std::fs::write(path, "stub-lock-content").unwrap();
-        }
+        write_workspace_union_lockfile(
+            dir.path(),
+            &[
+                ("packages/ui-a", "foo", "1.0.0"),
+                ("packages/ui-b", "foo", "1.0.0"),
+                ("packages/auth", "foo", "1.0.0"),
+            ],
+        );
 
         let client = lpm_registry::RegistryClient::new();
         let result = run(
@@ -1811,44 +1876,29 @@ mod tests {
         .await;
         assert!(result.is_ok(), "uninstall should succeed: {result:?}");
 
-        // CRITICAL: targeted members' lockfiles must remain in place
-        assert!(
-            ui_a_lock.exists(),
-            "ui-a lockfile must remain (it's a filter target)"
-        );
-        assert!(
-            ui_b_lock.exists(),
-            "ui-b lockfile must remain (it's a filter target)"
-        );
-
-        // CRITICAL: unrelated members' lockfiles must be preserved
-        assert!(
-            auth_lock.exists(),
-            "auth lockfile must be preserved (not in filter target set)"
-        );
-
-        // CRITICAL: workspace root lockfile must NOT be touched
-        assert!(
-            root_lock.exists(),
-            "workspace root lockfile must NOT be touched by a member-targeted uninstall"
-        );
+        let union = lpm_lockfile::Lockfile::read_fast(&root_lock).unwrap();
+        for importer in ["packages/ui-a", "packages/ui-b"] {
+            let projection = union.project_importer(importer).unwrap();
+            assert!(projection.packages.is_empty());
+            assert!(projection.importers["."].dependencies.is_empty());
+        }
+        let auth = union.project_importer("packages/auth").unwrap();
+        assert_eq!(auth.packages.len(), 1);
+        assert_eq!(auth.packages[0].name, "foo");
+        assert_eq!(auth.importers["."].dependencies["foo"], "1.0.0");
     }
 
     // ── Install pipeline runs at member dir for filtered installs ───────────
 
     #[tokio::test]
-    async fn run_uninstall_targets_member_dir_lockfile_for_in_member_dir_default() {
-        // When the user is `cd packages/foo && lpm uninstall bar`, the
-        // lockfile that gets cleaned is packages/foo/lpm.lock — NOT the
-        // workspace root lockfile.
+    async fn run_uninstall_from_member_updates_that_importer_in_the_root_lockfile() {
         let dir = tempfile::tempdir().unwrap();
         write_workspace_fixture(dir.path(), &[("foo", "packages/foo", &[("bar", "1.0.0")])]);
 
         let foo_dir = dir.path().join("packages").join("foo");
         let foo_lock = foo_dir.join(lpm_lockfile::LOCKFILE_NAME);
         let root_lock = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-        std::fs::write(&foo_lock, "stub").unwrap();
-        std::fs::write(&root_lock, "stub").unwrap();
+        write_workspace_union_lockfile(dir.path(), &[("packages/foo", "bar", "1.0.0")]);
 
         let client = lpm_registry::RegistryClient::new();
         let result = run(
@@ -1864,13 +1914,10 @@ mod tests {
         .await;
         assert!(result.is_ok());
 
-        assert!(
-            foo_lock.exists(),
-            "member lockfile must remain when uninstalling from inside the member dir"
-        );
-        assert!(
-            root_lock.exists(),
-            "workspace root lockfile must NOT be touched by an in-member uninstall"
-        );
+        assert!(!foo_lock.exists());
+        let union = lpm_lockfile::Lockfile::read_fast(&root_lock).unwrap();
+        let projection = union.project_importer("packages/foo").unwrap();
+        assert!(projection.packages.is_empty());
+        assert!(projection.importers["."].dependencies.is_empty());
     }
 }

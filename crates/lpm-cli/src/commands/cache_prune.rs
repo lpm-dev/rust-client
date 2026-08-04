@@ -1,6 +1,6 @@
 //! `lpm cache prune` — implementation.
 //!
-//! Walks the v2 virtual store at `~/.lpm/store/v2/{links,objects}/` and
+//! Walks the default v2 and experimental-v3 virtual stores and
 //! removes entries no longer reachable from any registered project's
 //! `node_modules/` symlink graph. Per-mode behavior:
 //!
@@ -84,6 +84,14 @@ pub struct PruneSummary {
     pub object_entries_reachable: usize,
     /// Orphan objects — pruneable per the algorithm.
     pub object_entries_orphaned: Vec<PathBuf>,
+    pub cas_trees_total: usize,
+    pub cas_tree_files_orphaned: Vec<PathBuf>,
+    pub cas_blobs_total: usize,
+    pub cas_blob_files_orphaned: Vec<PathBuf>,
+    pub cas_source_record_files_orphaned: Vec<PathBuf>,
+    pub cas_source_validation_files_orphaned: Vec<PathBuf>,
+    pub cas_materialized_total: usize,
+    pub cas_materialized_entries_orphaned: Vec<PathBuf>,
     /// `compat/<key>/` cached framework-compatibility islands on disk.
     pub compat_islands_total: usize,
     /// Orphan compat islands — pruneable. An island is orphaned when it is
@@ -97,9 +105,13 @@ pub struct PruneSummary {
     /// Incomplete or age-expired lifecycle-build artifacts.
     pub build_artifacts_orphaned: Vec<PathBuf>,
     /// Total bytes that would be / were freed by deleting orphans.
-    /// Sum of `link_entries_orphaned` + `object_entries_orphaned` +
-    /// `compat_islands_orphaned` directory sizes.
+    /// This is the logical sum of eligible file lengths. Hardlinks and
+    /// copy-on-write extents can make the physical result smaller.
     pub bytes_freed_or_eligible: u64,
+    /// Increase in filesystem free space observed across an applied prune.
+    /// `None` for dry-runs, unsupported platforms, or when unrelated writes
+    /// make the before/after delta indeterminate.
+    pub observed_physical_bytes_freed: Option<u64>,
     /// Number of pending global-install tombstones (deferred-uninstall
     /// roots from `lpm uninstall -g`) counted at preview time. Both
     /// dry-run and `--apply` populate this — it represents the count
@@ -149,7 +161,7 @@ pub struct PruneSummary {
     pub tombstone_sweep_error: Option<String>,
 }
 
-/// Entry point for the CLI dispatcher. Resolves the v2 store + flags,
+/// Entry point for the CLI dispatcher. Resolves both virtual stores + flags,
 /// runs the algorithm under the store reader/writer lock, and emits
 /// human or JSON output.
 ///
@@ -163,7 +175,8 @@ pub struct PruneSummary {
 /// [`lpm store` — Locking model](https://cli.lpm.dev/docs/infra/store#locking-model).
 pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Result<(), LpmError> {
     let start = Instant::now();
-    let v2_store = V2Store::from_lpm_root(root);
+    let v2_store = V2Store::from_lpm_root_for_version(root, lpm_store::StoreVersion::V2);
+    let v3_store = V2Store::from_lpm_root_for_version(root, lpm_store::StoreVersion::V3);
     let max_age = match flags.max_age {
         Some(s) => Some(parse_duration(s)?),
         None => None,
@@ -171,11 +184,11 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
 
     let summary = if flags.apply {
         with_exclusive_lock(root.store_lock(), || {
-            run_locked(root, &v2_store, &flags, max_age)
+            run_all_virtual_stores_locked(root, &v2_store, &v3_store, &flags, max_age)
         })?
     } else {
         with_shared_lock(root.store_lock(), || {
-            run_locked(root, &v2_store, &flags, max_age)
+            run_all_virtual_stores_locked(root, &v2_store, &v3_store, &flags, max_age)
         })?
     };
 
@@ -197,6 +210,97 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
     Ok(())
 }
 
+fn run_all_virtual_stores_locked(
+    root: &LpmRoot,
+    v2_store: &V2Store,
+    v3_store: &V2Store,
+    flags: &PruneFlags<'_>,
+    max_age: Option<ChronoDuration>,
+) -> Result<PruneSummary, LpmError> {
+    let free_before = flags
+        .apply
+        .then(|| filesystem_available_bytes(v3_store.paths().root()))
+        .flatten();
+    let v2 = run_locked(root, v2_store, flags, max_age, false)?;
+    let v3 = run_locked(root, v3_store, flags, max_age, true)?;
+    let mut summary = merge_prune_summaries(v2, v3);
+    summary.observed_physical_bytes_freed = free_before.and_then(|before| {
+        filesystem_available_bytes(v3_store.paths().root())?.checked_sub(before)
+    });
+    Ok(summary)
+}
+
+fn merge_prune_summaries(mut left: PruneSummary, right: PruneSummary) -> PruneSummary {
+    left.applied |= right.applied;
+    left.projects_walked = left.projects_walked.max(right.projects_walked);
+    left.registry_entries_dropped = left
+        .registry_entries_dropped
+        .max(right.registry_entries_dropped);
+    left.link_entries_total = left
+        .link_entries_total
+        .saturating_add(right.link_entries_total);
+    left.link_entries_reachable = left
+        .link_entries_reachable
+        .saturating_add(right.link_entries_reachable);
+    left.link_entries_orphaned
+        .extend(right.link_entries_orphaned);
+    left.object_entries_total = left
+        .object_entries_total
+        .saturating_add(right.object_entries_total);
+    left.object_entries_reachable = left
+        .object_entries_reachable
+        .saturating_add(right.object_entries_reachable);
+    left.object_entries_orphaned
+        .extend(right.object_entries_orphaned);
+    left.cas_trees_total = left.cas_trees_total.saturating_add(right.cas_trees_total);
+    left.cas_tree_files_orphaned
+        .extend(right.cas_tree_files_orphaned);
+    left.cas_blobs_total = left.cas_blobs_total.saturating_add(right.cas_blobs_total);
+    left.cas_blob_files_orphaned
+        .extend(right.cas_blob_files_orphaned);
+    left.cas_source_record_files_orphaned
+        .extend(right.cas_source_record_files_orphaned);
+    left.cas_source_validation_files_orphaned
+        .extend(right.cas_source_validation_files_orphaned);
+    left.cas_materialized_total = left
+        .cas_materialized_total
+        .saturating_add(right.cas_materialized_total);
+    left.cas_materialized_entries_orphaned
+        .extend(right.cas_materialized_entries_orphaned);
+    left.compat_islands_total = left
+        .compat_islands_total
+        .saturating_add(right.compat_islands_total);
+    left.compat_islands_orphaned
+        .extend(right.compat_islands_orphaned);
+    left.build_artifacts_total = left
+        .build_artifacts_total
+        .saturating_add(right.build_artifacts_total);
+    left.build_artifacts_orphaned
+        .extend(right.build_artifacts_orphaned);
+    left.bytes_freed_or_eligible = left
+        .bytes_freed_or_eligible
+        .saturating_add(right.bytes_freed_or_eligible);
+    left.observed_physical_bytes_freed = left
+        .observed_physical_bytes_freed
+        .or(right.observed_physical_bytes_freed);
+    left.tombstones_pending = left.tombstones_pending.max(right.tombstones_pending);
+    left.tombstones_swept = left.tombstones_swept.max(right.tombstones_swept);
+    if !right.tombstones_retained.is_empty() {
+        left.tombstones_retained = right.tombstones_retained;
+    }
+    left.tombstone_bytes_freed = left
+        .tombstone_bytes_freed
+        .saturating_add(right.tombstone_bytes_freed);
+    left.registry_missing |= right.registry_missing;
+    left.registry_corrupt |= right.registry_corrupt;
+    if left.registry_corrupt_reason.is_empty() {
+        left.registry_corrupt_reason = right.registry_corrupt_reason;
+    }
+    left.tombstone_count_error = left.tombstone_count_error.or(right.tombstone_count_error);
+    left.tombstone_sweep_error = left.tombstone_sweep_error.or(right.tombstone_sweep_error);
+    left
+}
+
 fn prune_had_errors(summary: &PruneSummary) -> bool {
     summary.tombstone_count_error.is_some() || summary.tombstone_sweep_error.is_some()
 }
@@ -208,10 +312,48 @@ fn run_locked(
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
+    handle_tombstones: bool,
 ) -> Result<PruneSummary, LpmError> {
     let mut summary = compute_prune_plan(root, v2_store, flags, max_age)?;
 
+    if !summary.registry_missing && !summary.registry_corrupt {
+        let objects_to_remove = summary
+            .object_entries_orphaned
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if let Some(cas_plan) = v2_store.file_cas_prune_plan(&objects_to_remove)? {
+            summary.cas_trees_total = cas_plan.trees_total;
+            summary.cas_blobs_total = cas_plan.blobs_total;
+            summary.cas_tree_files_orphaned = cas_plan.tree_files_orphaned;
+            summary.cas_blob_files_orphaned = cas_plan.blob_files_orphaned;
+            summary.cas_source_record_files_orphaned = cas_plan.source_record_files_orphaned;
+            summary.cas_source_validation_files_orphaned =
+                cas_plan.source_validation_files_orphaned;
+            summary.cas_materialized_total = cas_plan.materialized_total;
+            summary.cas_materialized_entries_orphaned = cas_plan.materialized_entries_orphaned;
+            for path in summary
+                .cas_tree_files_orphaned
+                .iter()
+                .chain(&summary.cas_blob_files_orphaned)
+                .chain(&summary.cas_source_record_files_orphaned)
+                .chain(&summary.cas_source_validation_files_orphaned)
+            {
+                summary.bytes_freed_or_eligible = summary
+                    .bytes_freed_or_eligible
+                    .saturating_add(path.metadata().map_or(0, |metadata| metadata.len()));
+            }
+            for entry in &summary.cas_materialized_entries_orphaned {
+                summary.bytes_freed_or_eligible = summary
+                    .bytes_freed_or_eligible
+                    .saturating_add(dir_size(entry).unwrap_or(0));
+            }
+        }
+    }
+
     if flags.apply {
+        let prune_tombstones = v2_store.paths().root().join(".prune-tombstones");
+        sweep_prune_tombstones(&prune_tombstones)?;
         // When the registry is missing OR corrupt AND no explicit
         // `--project` was given, `compute_prune_plan` skipped the
         // reachability walk and `link_entries_orphaned` /
@@ -221,20 +363,25 @@ fn run_locked(
         // of project reachability.
         if !summary.registry_missing && !summary.registry_corrupt {
             for orphan in &summary.link_entries_orphaned {
-                std::fs::remove_dir_all(orphan).map_err(|e| {
-                    LpmError::Store(format!(
-                        "cache prune: failed to remove {}: {e}",
-                        orphan.display()
-                    ))
-                })?;
+                remove_via_prune_tombstone(orphan, &prune_tombstones)?;
             }
             for orphan in &summary.object_entries_orphaned {
-                std::fs::remove_dir_all(orphan).map_err(|e| {
-                    LpmError::Store(format!(
-                        "cache prune: failed to remove {}: {e}",
-                        orphan.display()
-                    ))
-                })?;
+                remove_via_prune_tombstone(orphan, &prune_tombstones)?;
+            }
+            for source_record in &summary.cas_source_record_files_orphaned {
+                remove_via_prune_tombstone(source_record, &prune_tombstones)?;
+            }
+            for validation in &summary.cas_source_validation_files_orphaned {
+                remove_via_prune_tombstone(validation, &prune_tombstones)?;
+            }
+            for entry in &summary.cas_materialized_entries_orphaned {
+                remove_via_prune_tombstone(entry, &prune_tombstones)?;
+            }
+            for manifest in &summary.cas_tree_files_orphaned {
+                remove_via_prune_tombstone(manifest, &prune_tombstones)?;
+            }
+            for blob in &summary.cas_blob_files_orphaned {
+                remove_via_prune_tombstone(blob, &prune_tombstones)?;
             }
         }
 
@@ -243,20 +390,10 @@ fn run_locked(
         // (never reachability), so a missing/corrupt registry can't make it
         // wrongly wipe a live island.
         for island in &summary.compat_islands_orphaned {
-            std::fs::remove_dir_all(island).map_err(|e| {
-                LpmError::Store(format!(
-                    "cache prune: failed to remove compat island {}: {e}",
-                    island.display()
-                ))
-            })?;
+            remove_via_prune_tombstone(island, &prune_tombstones)?;
         }
         for artifact in &summary.build_artifacts_orphaned {
-            std::fs::remove_dir_all(artifact).map_err(|e| {
-                LpmError::Store(format!(
-                    "cache prune: failed to remove build artifact {}: {e}",
-                    artifact.display()
-                ))
-            })?;
+            remove_via_prune_tombstone(artifact, &prune_tombstones)?;
         }
         remove_orphaned_build_locks(v2_store)?;
         remove_orphaned_build_entry_locks(v2_store)?;
@@ -272,22 +409,79 @@ fn run_locked(
         // reachable when `~/.lpm/known-projects.json` hasn't been
         // populated yet (registry writes are best-effort during
         // install per `crates/lpm-common/src/known_projects.rs:102`).
-        match lpm_global::sweep_tombstones(root) {
-            Ok(sweep) => {
-                summary.tombstones_swept = sweep.swept.len();
-                summary.tombstones_retained = sweep.retained;
-                summary.tombstone_bytes_freed = sweep.freed_bytes;
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                tracing::warn!("cache prune: global tombstone sweep failed: {msg}");
-                summary.tombstone_sweep_error = Some(msg);
+        if handle_tombstones {
+            match lpm_global::sweep_tombstones(root) {
+                Ok(sweep) => {
+                    summary.tombstones_swept = sweep.swept.len();
+                    summary.tombstones_retained = sweep.retained;
+                    summary.tombstone_bytes_freed = sweep.freed_bytes;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    tracing::warn!("cache prune: global tombstone sweep failed: {msg}");
+                    summary.tombstone_sweep_error = Some(msg);
+                }
             }
         }
         summary.applied = true;
     }
 
     Ok(summary)
+}
+
+fn remove_via_prune_tombstone(path: &Path, tombstone_root: &Path) -> Result<(), LpmError> {
+    use rand::RngCore;
+
+    ensure_prune_tombstone_root(tombstone_root)?;
+    let suffix = rand::thread_rng().next_u64();
+    let label = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("entry");
+    let tombstone = tombstone_root.join(format!("{label}.{suffix:016x}"));
+    match std::fs::rename(path, &tombstone) {
+        Ok(()) => remove_prune_tombstone(&tombstone),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LpmError::Store(format!(
+            "cache prune: failed to tombstone {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn ensure_prune_tombstone_root(path: &Path) -> Result<(), LpmError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    Ok(())
+}
+
+fn sweep_prune_tombstones(tombstone_root: &Path) -> Result<(), LpmError> {
+    let entries = match std::fs::read_dir(tombstone_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        remove_prune_tombstone(&entry?.path())?;
+    }
+    Ok(())
+}
+
+fn remove_prune_tombstone(path: &Path) -> Result<(), LpmError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn remove_orphaned_build_locks(store: &V2Store) -> Result<(), LpmError> {
@@ -459,11 +653,20 @@ pub fn compute_prune_plan(
                 object_entries_total: 0,
                 object_entries_reachable: 0,
                 object_entries_orphaned: Vec::new(),
+                cas_trees_total: 0,
+                cas_tree_files_orphaned: Vec::new(),
+                cas_blobs_total: 0,
+                cas_blob_files_orphaned: Vec::new(),
+                cas_source_record_files_orphaned: Vec::new(),
+                cas_source_validation_files_orphaned: Vec::new(),
+                cas_materialized_total: 0,
+                cas_materialized_entries_orphaned: Vec::new(),
                 compat_islands_total,
                 compat_islands_orphaned,
                 build_artifacts_total,
                 build_artifacts_orphaned,
                 bytes_freed_or_eligible,
+                observed_physical_bytes_freed: None,
                 tombstones_pending,
                 tombstones_swept: 0,
                 tombstones_retained: Vec::new(),
@@ -637,11 +840,20 @@ pub fn compute_prune_plan(
         object_entries_total,
         object_entries_reachable: object_referenced_segments.len(),
         object_entries_orphaned,
+        cas_trees_total: 0,
+        cas_tree_files_orphaned: Vec::new(),
+        cas_blobs_total: 0,
+        cas_blob_files_orphaned: Vec::new(),
+        cas_source_record_files_orphaned: Vec::new(),
+        cas_source_validation_files_orphaned: Vec::new(),
+        cas_materialized_total: 0,
+        cas_materialized_entries_orphaned: Vec::new(),
         compat_islands_total,
         compat_islands_orphaned,
         build_artifacts_total,
         build_artifacts_orphaned,
         bytes_freed_or_eligible,
+        observed_physical_bytes_freed: None,
         tombstones_pending,
         tombstones_swept: 0,
         tombstones_retained: Vec::new(),
@@ -766,6 +978,35 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+#[cfg(unix)]
+fn filesystem_available_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut probe = path.to_path_buf();
+    while !probe.try_exists().ok()? {
+        if !probe.pop() {
+            return None;
+        }
+    }
+    let path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` points to writable,
+    // properly aligned storage that is read only after a successful call.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` returned success and initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    let bytes = u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?;
+    u64::try_from(bytes).ok()
+}
+
+#[cfg(not(unix))]
+fn filesystem_available_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// LRU + crash-recovery orphan detection for the compat-island cache at
 /// `~/.lpm/store/v2/compat/`.
 ///
@@ -866,8 +1107,11 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
              still runs under --apply.",
         );
     } else if applied {
+        let physical = summary
+            .observed_physical_bytes_freed
+            .map_or_else(|| "unavailable".to_string(), format_bytes);
         install_ui::done_untrusted(&format!(
-            "Done · pruned {} link entr{} + {} object{} ({}) in {}",
+            "Done · pruned {} link entr{} + {} object{} + {} CAS materializations + {} CAS trees + {} CAS blobs ({} logical; {} physical free-space increase) in {}",
             summary.link_entries_orphaned.len(),
             if summary.link_entries_orphaned.len() == 1 {
                 "y"
@@ -880,14 +1124,21 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
             } else {
                 "s"
             },
+            summary.cas_materialized_entries_orphaned.len(),
+            summary.cas_tree_files_orphaned.len(),
+            summary.cas_blob_files_orphaned.len(),
             format_bytes(summary.bytes_freed_or_eligible),
+            physical,
             elapsed,
         ));
     } else {
         install_ui::phase_untrusted(&format!(
-            "{} orphan link entries, {} orphan objects ({} eligible to free; pass --apply to remove)",
+            "{} orphan link entries, {} orphan objects, {} orphan CAS materializations, {} orphan CAS trees, {} orphan CAS blobs ({} eligible to free; pass --apply to remove)",
             summary.link_entries_orphaned.len(),
             summary.object_entries_orphaned.len(),
+            summary.cas_materialized_entries_orphaned.len(),
+            summary.cas_tree_files_orphaned.len(),
+            summary.cas_blob_files_orphaned.len(),
             format_bytes(summary.bytes_freed_or_eligible),
         ));
     }
@@ -1017,6 +1268,34 @@ fn emit_json(summary: &PruneSummary) {
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
+        "cas_trees_total": summary.cas_trees_total,
+        "cas_tree_files_orphaned": summary
+            .cas_tree_files_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "cas_blobs_total": summary.cas_blobs_total,
+        "cas_blob_files_orphaned": summary
+            .cas_blob_files_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "cas_source_record_files_orphaned": summary
+            .cas_source_record_files_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "cas_source_validation_files_orphaned": summary
+            .cas_source_validation_files_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+        "cas_materialized_total": summary.cas_materialized_total,
+        "cas_materialized_entries_orphaned": summary
+            .cas_materialized_entries_orphaned
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
         "compat_islands_total": summary.compat_islands_total,
         "compat_islands_orphaned": summary
             .compat_islands_orphaned
@@ -1030,6 +1309,8 @@ fn emit_json(summary: &PruneSummary) {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
         "bytes_freed_or_eligible": summary.bytes_freed_or_eligible,
+        "logical_bytes_freed_or_eligible": summary.bytes_freed_or_eligible,
+        "observed_physical_bytes_freed": summary.observed_physical_bytes_freed,
         "registry_missing": summary.registry_missing,
         "registry_corrupt": summary.registry_corrupt,
         "registry_corrupt_reason": summary.registry_corrupt_reason,
@@ -1194,6 +1475,58 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn one_prune_plan_reports_v2_and_v3_orphans_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_home = dir.path().join("lpm-home");
+        std::fs::create_dir_all(&lpm_home).unwrap();
+        let root = LpmRoot::from_dir(&lpm_home);
+        let v2 = V2Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V2);
+        let v3 = V2Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V3);
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        for (store, name, seed) in [
+            (&v2, "v2-orphan", b"prune/v2".as_slice()),
+            (&v3, "v3-orphan", b"prune/v3".as_slice()),
+        ] {
+            let sri = synthetic_sri(seed);
+            write_object(store, &sri);
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: key_for(name, "1.0.0"),
+                    source_sri: sri.clone(),
+                    object_dir: store.paths().object_dir(&sri).unwrap(),
+                    deps: Vec::new(),
+                    platform: Arc::new(sample_meta_platform()),
+                })
+                .unwrap();
+        }
+
+        let summary =
+            run_all_virtual_stores_locked(&root, &v2, &v3, &PruneFlags::default(), None).unwrap();
+
+        assert_eq!(summary.link_entries_total, 2);
+        assert_eq!(summary.link_entries_orphaned.len(), 2);
+        assert!(summary.cas_trees_total > 0);
+        assert!(summary.cas_blobs_total > 0);
+    }
+
+    #[test]
+    fn prune_tombstone_sweep_removes_crash_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let tombstones = dir.path().join(".prune-tombstones");
+        let leftover = tombstones.join("stale-entry.0000000000000001");
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("partial"), b"partial").unwrap();
+
+        sweep_prune_tombstones(&tombstones).unwrap();
+
+        assert!(tombstones.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
     fn compat_island_prune_evicts_incomplete_and_stale_islands() {
         let tmp = tempfile::tempdir().unwrap();
         let compat_root = tmp.path().join("compat");
@@ -1301,6 +1634,7 @@ mod tests {
                 ..PruneFlags::default()
             },
             None,
+            true,
         )
         .unwrap();
 
@@ -1676,7 +2010,7 @@ mod tests {
             apply: true,
             ..PruneFlags::default()
         };
-        let summary = run_locked(&root, &store, &flags, None).unwrap();
+        let summary = run_locked(&root, &store, &flags, None, true).unwrap();
 
         assert_eq!(
             summary.tombstones_swept, 0,

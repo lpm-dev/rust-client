@@ -12,8 +12,9 @@ use crate::{PackageStore, read_stored_integrity};
 pub struct InstalledPackageBaseline {
     /// Absolute path to the package directory whose contents match the
     /// extracted tarball. Under v1 this is `<store>/v1/<safe>@<ver>/`;
-    /// under v2 this is `<store>/v2/links/<graph-key>/node_modules/<name>/`
-    /// (the link's clonefile-materialized copy of the object-addressed
+    /// under a virtual store this is
+    /// `<store>/v{2,3}/links/<graph-key>/node_modules/<name>/`
+    /// (the link's independently materialized copy of the object-addressed
     /// bytes).
     pub package_dir: PathBuf,
     /// Absolute path to a directory holding the **pristine,
@@ -24,9 +25,9 @@ pub struct InstalledPackageBaseline {
     ///   pristine because patches mutate the project-private wrapper
     ///   at `<project>/.lpm/<seg>/node_modules/<name>/`, not the
     ///   store itself.
-    /// - Under v2, points at `<store>/v2/objects/<sri-segment>/`. The
-    ///   v2 link entry at `package_dir` is the patch destination —
-    ///   reading baselines from `package_dir` under v2 would re-feed
+    /// - Under v2/v3, points at the store's immutable object projection. The
+    ///   link entry at `package_dir` is the patch destination —
+    ///   reading baselines from `package_dir` would re-feed
     ///   already-patched bytes to a second `apply_patch` and break
     ///   re-install idempotency.
     ///
@@ -34,7 +35,7 @@ pub struct InstalledPackageBaseline {
     /// ADD/DELETE-hunk existence checks) MUST consult this field
     /// rather than `package_dir` to stay correct under both layouts.
     pub pristine_dir: PathBuf,
-    /// SRI string of the source tarball — `meta.source_sri` under v2,
+    /// SRI string of the source tarball — `meta.source_sri` under v2/v3,
     /// `<package_dir>/.integrity` under v1.
     pub integrity: String,
     /// Which store the lookup hit. Callers that need to read sentinel
@@ -48,11 +49,11 @@ pub struct InstalledPackageBaseline {
 pub enum PackageBaselineLayout {
     /// Package found at `<store>/v1/<safe>@<ver>/`.
     V1,
-    /// Package found at `<store>/v2/links/<graph-key>/node_modules/<name>/`.
+    /// Package found in a v2 or v3 graph-keyed virtual-store link entry.
     V2,
 }
 
-/// Invocation-local index over the v2 store's link entries, keyed by
+/// Invocation-local index over the v2 and v3 link entries, keyed by
 /// `(name, version)`.
 ///
 /// Built once per `lpm rebuild` / `lpm approve-scripts` /
@@ -75,7 +76,7 @@ pub enum PackageBaselineLayout {
 ///
 /// Construction is best-effort: malformed sidecars are silently
 /// skipped. An empty index is cheap and safe — callers on stores
-/// with no v2 entries get an empty map and pay only the v1 fallback.
+/// with no virtual-store entries get an empty map and pay only the v1 fallback.
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
     by_coords: HashMap<(String, String), InstalledPackageBaseline>,
@@ -99,14 +100,14 @@ impl V2BaselineIndex {
     /// project's store dir.
     ///
     /// **The walk.** Every entry under `<project>/node_modules/`
-    /// that resolves to `<lpm_root>/store/v2/links/<key>/...` is a
+    /// that resolves to a v2 or v3 `links/<key>/...` entry is a
     /// seed. From each seed link entry's [`LinkMeta::deps`], the
     /// dep's link-entry directory name is reconstructed
     /// (`{safe_name}@{version}+{first16hex}`) and visited too.
     /// Repeated until a fixed point is reached.
     ///
     /// **Safety.** Any sidecar that fails to parse, any symlink that
-    /// points outside the v2 store, any non-symlink entry, and any
+    /// points outside both virtual stores, any non-symlink entry, and any
     /// reachable link entry whose `node_modules/<pkg>/` is missing
     /// is silently skipped. Each skip is logged at `tracing::debug!`
     /// so a malformed install surfaces under `RUST_LOG=debug`
@@ -114,18 +115,29 @@ impl V2BaselineIndex {
     ///
     /// **Fallback contract.** When the project has no `node_modules/`
     /// (fresh checkout, never installed), or every symlink resolves
-    /// outside the v2 store (pure-v1 install), this returns an empty
+    /// outside both virtual stores (pure-v1 install), this returns an empty
     /// index. Callers route through
     /// [`find_installed_package_baseline_indexed`] which falls
     /// through to the v1 lookup on miss — same behavior as a
     /// freshly-built [`Self::build`] empty index.
-    pub fn for_project(
-        project_dir: &Path,
-        lpm_root: &lpm_common::LpmRoot,
-    ) -> Result<Self, LpmError> {
+    pub fn for_project(project_dir: &Path, lpm_root: &lpm_common::LpmRoot) -> Self {
+        let mut merged = Self::default();
+        for version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
+            let store = crate::v2::Store::from_lpm_root_for_version(lpm_root, version);
+            let partial = Self::for_project_store(project_dir, &store);
+            for (key, baseline) in partial.by_coords {
+                merged.by_coords.entry(key).or_insert(baseline);
+            }
+            for (key, baseline) in partial.by_integrity {
+                merged.by_integrity.entry(key).or_insert(baseline);
+            }
+        }
+        merged
+    }
+
+    fn for_project_store(project_dir: &Path, store_v2: &crate::v2::Store) -> Self {
         use {HashSet, VecDeque};
 
-        let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let links_root = store_v2.paths().links_root();
         let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
         let mut by_integrity: HashMap<String, InstalledPackageBaseline> = HashMap::new();
@@ -267,16 +279,16 @@ impl V2BaselineIndex {
             }
         }
 
-        Ok(Self {
+        Self {
             by_coords,
             by_integrity,
-        })
+        }
     }
 
-    /// Walk every v2 link entry under `lpm_root` once and produce an
+    /// Walk every virtual-store link entry under `lpm_root` once and produce an
     /// invocation-local lookup index.
     ///
-    /// Returns `Ok(empty)` when v2 is empty or absent — callers should
+    /// Returns `Ok(empty)` when both virtual stores are empty or absent — callers should
     /// always succeed-then-fall-back via [`Self::lookup`], not gate on
     /// emptiness.
     ///
@@ -287,35 +299,31 @@ impl V2BaselineIndex {
     /// `lpm rebuild` / `lpm approve-scripts` and any other read of
     /// project-side script state.
     pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
-        let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
         let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
         let mut by_integrity: HashMap<String, InstalledPackageBaseline> = HashMap::new();
-        for (link_dir, meta) in store_v2.iter_link_entries()? {
-            let key = (meta.name.clone(), meta.version.clone());
-            let package_dir = link_dir.join("node_modules").join(&meta.name);
-            if !package_dir.exists() {
-                // Sidecar present but link entry missing the package
-                // dir — corrupt entry. Skip and let any later valid
-                // entry for the same coords win, mirroring
-                // `find_installed_package_baseline`.
-                continue;
+        for version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
+            let store_v2 = crate::v2::Store::from_lpm_root_for_version(lpm_root, version);
+            for (link_dir, meta) in store_v2.iter_link_entries()? {
+                let key = (meta.name.clone(), meta.version.clone());
+                let package_dir = link_dir.join("node_modules").join(&meta.name);
+                if !package_dir.exists() {
+                    continue;
+                }
+                let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
+                    Ok(p) if p.exists() => p,
+                    _ => package_dir.clone(),
+                };
+                let baseline = InstalledPackageBaseline {
+                    package_dir,
+                    pristine_dir,
+                    integrity: meta.source_sri.clone(),
+                    layout: PackageBaselineLayout::V2,
+                };
+                by_integrity
+                    .entry(meta.source_sri)
+                    .or_insert_with(|| baseline.clone());
+                by_coords.entry(key).or_insert(baseline);
             }
-            let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
-                Ok(p) if p.exists() => p,
-                _ => package_dir.clone(),
-            };
-            let baseline = InstalledPackageBaseline {
-                package_dir,
-                pristine_dir,
-                integrity: meta.source_sri.clone(),
-                layout: PackageBaselineLayout::V2,
-            };
-            by_integrity
-                .entry(meta.source_sri)
-                .or_insert_with(|| baseline.clone());
-            // Coordinate lookup retains its legacy first-match semantics,
-            // while the integrity index keeps distinct source bytes.
-            by_coords.entry(key).or_insert(baseline);
         }
         Ok(Self {
             by_coords,
@@ -445,8 +453,8 @@ fn link_dir_from_compatibility_target(
 }
 
 /// Index-aware variant of [`find_installed_package_baseline`]. Hits
-/// the pre-built [`V2BaselineIndex`] for v2 in O(1); falls back to
-/// the same v1 lookup as the legacy helper on a v2 miss. Returns
+/// the pre-built [`V2BaselineIndex`] for v2/v3 in O(1); falls back to
+/// the same v1 lookup as the legacy helper on a virtual-store miss. Returns
 /// `None` when neither store has the package — same shape as the
 /// `Result<Option<…>, _>` of the legacy call, except construction
 /// errors are absorbed at index-build time so per-package callers
@@ -477,7 +485,7 @@ pub fn find_installed_package_baseline_indexed(
 
 /// Resolve an indexed baseline using the source integrity when available.
 ///
-/// An integrity-qualified v2 miss does not fall back to a coordinate-only v2
+/// An integrity-qualified virtual-store miss does not fall back to a coordinate-only
 /// match because that could select different bytes from another registry.
 /// The v1 fallback is accepted only when its recorded integrity matches.
 pub fn find_installed_package_baseline_by_identity_indexed(
@@ -511,18 +519,18 @@ pub fn find_installed_package_baseline_by_identity_indexed(
 }
 
 /// Resolve a package's installed source bytes + integrity in a
-/// store-version-agnostic way. **Prefers v2** (the active default);
-/// falls back to v1 if no v2 link entry matches.
+/// store-version-agnostic way. Prefers the default v2 store, then v3, and falls back to
+/// v1 if no virtual-store link entry matches.
 ///
 /// Designed for downstream commands that read package metadata or
 /// source files post-install — `lpm patch`, `lpm patch-commit`,
 /// `lpm rebuild`, `lpm approve-scripts --show-scripts` — which must
-/// not blindly call [`PackageStore::package_dir`] (v1-only) under v2
+/// not blindly call [`PackageStore::package_dir`] (v1-only) under virtual-store
 /// installs.
 ///
 /// **Multi-source-same-coords:** when two distinct sources share
 /// `(name, version)` and produce different graph keys, this helper
-/// picks the lexicographically smallest matching v2 link entry.
+/// picks the lexicographically smallest matching virtual-store link entry.
 ///
 /// The lex sort buys **reproducibility, not plant-attack defense.**
 /// Across runs, across filesystems (read_dir is inode-order on
@@ -544,7 +552,7 @@ pub fn find_installed_package_baseline(
     name: &str,
     version: &str,
 ) -> Result<Option<InstalledPackageBaseline>, LpmError> {
-    // v2 first — the active default. Iterating link entries reads
+    // Virtual stores first, default before experimental. Iterating link entries reads
     // each sidecar `.lpm-link-meta.json`; the iterator gracefully
     // skips malformed entries so a corrupt sibling never blocks a
     // valid match.
@@ -552,16 +560,19 @@ pub fn find_installed_package_baseline(
     // Collect-and-sort by link_dir path so the first match is
     // deterministic across runs and across filesystems (read_dir
     // order is inode-order on ext4/APFS and undefined elsewhere).
-    let store_v2 = crate::v2::Store::from_lpm_root(lpm_root);
-    let mut entries: Vec<(PathBuf, _)> = store_v2.iter_link_entries()?.collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    for (link_dir, meta) in entries {
-        if meta.name == name && meta.version == version {
-            let package_dir = link_dir.join("node_modules").join(name);
-            if package_dir.exists() {
+    for store_version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
+        let store_v2 = crate::v2::Store::from_lpm_root_for_version(lpm_root, store_version);
+        let mut entries: Vec<(PathBuf, _)> = store_v2.iter_link_entries()?.collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (link_dir, meta) in entries {
+            if meta.name == name && meta.version == version {
+                let package_dir = link_dir.join("node_modules").join(name);
+                if !package_dir.exists() {
+                    continue;
+                }
                 // Derive the pristine object dir from the source SRI.
-                // v2 populates link entries via clonefile from
-                // `objects/<sri>/`, so for a well-formed install the
+                // Virtual stores populate link entries from an immutable
+                // source tree, so for a well-formed install the
                 // object dir is always derivable AND present on disk.
                 //
                 // **Defensive aliasing.** If `sri_to_segment` can't
@@ -585,9 +596,6 @@ pub fn find_installed_package_baseline(
                     layout: PackageBaselineLayout::V2,
                 }));
             }
-            // The sidecar pointed at us, but the materialized package
-            // dir is missing — corrupt link entry. Continue scanning
-            // for another link that might satisfy the request.
         }
     }
     // v1 fallback — older installs, the migration grace window, or
@@ -667,7 +675,7 @@ mod tests {
     /// Construction against an empty `~/.lpm/` directory yields an
     /// empty index. Lookup against any coords returns `None` so the
     /// index-aware helper falls through to v1 cleanly. This is the
-    /// "no v2 store at all" case (pure-v1 test fixtures, fresh
+    /// "no virtual store at all" case (pure-v1 test fixtures, fresh
     /// install populated v1 only).
     #[test]
     fn v2_baseline_index_empty_when_no_v2_links() {
@@ -677,8 +685,8 @@ mod tests {
         assert!(index.lookup("nonexistent", "1.0.0").is_none());
     }
 
-    /// A populated v2 store yields a hit through the indexed lookup.
-    /// This is the hot path for `lpm rebuild` on a v2-default install.
+    /// A populated virtual store yields a hit through the indexed lookup.
+    /// This is the hot path for `lpm rebuild` on default installs.
     #[test]
     fn v2_baseline_index_hits_populated_link_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -719,11 +727,53 @@ mod tests {
             "indexed pristine_dir must point at the populated objects/<sri>/"
         );
         // Different by design under v2 — pristine_dir is the immutable
-        // object dir; package_dir is the link entry's clonefile copy.
+        // object dir; package_dir is the independently materialized link entry.
         assert_ne!(
             hit.package_dir, hit.pristine_dir,
             "v2 entries must surface a distinct pristine_dir"
         );
+    }
+
+    #[test]
+    fn installed_package_baseline_prefers_default_v2_when_both_virtual_stores_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let v2 = V2Store::from_lpm_root(&lpm_root);
+        let v3 = V2Store::from_lpm_root_v3(&lpm_root);
+        let v2_sri = synthetic_sri(b"default-v2-baseline");
+        let v3_sri = synthetic_sri(b"experimental-v3-baseline");
+
+        for (store, sri, marker) in [
+            (&v2, &v2_sri, b"v2".as_slice()),
+            (&v3, &v3_sri, b"v3".as_slice()),
+        ] {
+            let object_dir = write_object(
+                store,
+                sri,
+                &[
+                    (
+                        "package.json",
+                        b"{\"name\":\"dual-store\",\"version\":\"1.0.0\"}",
+                    ),
+                    ("marker", marker),
+                ],
+            );
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: std::sync::Arc::new(sample_key("dual-store", "1.0.0")),
+                    source_sri: sri.clone(),
+                    object_dir,
+                    deps: vec![],
+                    platform: std::sync::Arc::new(sample_meta_platform()),
+                })
+                .unwrap();
+        }
+
+        let baseline = find_installed_package_baseline(&lpm_root, "dual-store", "1.0.0")
+            .unwrap()
+            .expect("one of the virtual stores must provide the package");
+
+        assert_eq!(baseline.integrity, v2_sri);
     }
 
     /// `find_installed_package_baseline_indexed` falls through to v1
@@ -805,6 +855,7 @@ mod tests {
                 version: "1.0.0".into(),
                 source_sri: format!("sha512-stub-{suffix}"),
                 object_path: format!("objects/sha512-stub-{suffix}"),
+                tree_digest: None,
                 deps: vec![],
                 platform: std::sync::Arc::new(LinkMetaPlatform {
                     os: "darwin".into(),
@@ -844,7 +895,7 @@ mod tests {
 
         // The project-scoped index MUST land on the patched entry
         // because that's where project A's symlink resolves to. This
-        let project_index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let project_index = V2BaselineIndex::for_project(&project, &lpm_root);
         let project_hit = project_index
             .lookup("lodash", "1.0.0")
             .expect("project-scoped index must resolve the package");
@@ -892,6 +943,7 @@ mod tests {
             version: "1.0.0".into(),
             source_sri: "sha512-stub-cli-tool".into(),
             object_path: "objects/sha512-stub-cli-tool".into(),
+            tree_digest: None,
             deps: vec![],
             platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
@@ -919,7 +971,7 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink(&compat_pkg, nm.join("cli-tool")).unwrap();
 
-        let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let index = V2BaselineIndex::for_project(&project, &lpm_root);
         let hit = index
             .lookup("cli-tool", "1.0.0")
             .expect("compatibility root symlink must seed the owning link entry");
@@ -970,6 +1022,7 @@ mod tests {
             version: "2.0.0".into(),
             source_sri: "sha512-stub-tslib".into(),
             object_path: "objects/sha512-stub-tslib".into(),
+            tree_digest: None,
             deps: vec![],
             platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
@@ -1002,6 +1055,7 @@ mod tests {
             version: "1.0.0".into(),
             source_sri: "sha512-stub-consumer".into(),
             object_path: "objects/sha512-stub-consumer".into(),
+            tree_digest: None,
             deps: vec![LinkMetaDep {
                 local: "tslib".into(),
                 target_graph_key: tslib_full,
@@ -1028,7 +1082,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let index = V2BaselineIndex::for_project(&project, &lpm_root);
         let consumer_hit = index.lookup("consumer", "1.0.0").unwrap();
         assert!(
             consumer_hit
@@ -1081,6 +1135,7 @@ mod tests {
             version: "1.0.0".into(),
             source_sri: "sha512-stub-scoped".into(),
             object_path: "objects/sha512-stub-scoped".into(),
+            tree_digest: None,
             deps: vec![],
             platform: std::sync::Arc::new(LinkMetaPlatform {
                 os: "darwin".into(),
@@ -1101,7 +1156,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = V2BaselineIndex::for_project(&project, &lpm_root).unwrap();
+        let index = V2BaselineIndex::for_project(&project, &lpm_root);
         let hit = index
             .lookup("@scope/pkg", "1.0.0")
             .expect("scoped direct dependency must seed the project-scoped index");

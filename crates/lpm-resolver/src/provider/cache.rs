@@ -453,7 +453,7 @@ impl LpmDependencyProvider {
     pub(super) fn insert_and_notify(&self, key: CanonicalKey, info: CachedPackageInfo) {
         insert_or_merge_cached_package_info(&self.cache, key.clone(), Arc::new(info));
         self.available_versions_cache
-            .borrow_mut()
+            .lock()
             .retain(|package, _| CanonicalKey::from(package) != key);
         if let Some(n) = self.notify_map.get(&key) {
             n.notify_waiters();
@@ -468,7 +468,7 @@ impl LpmDependencyProvider {
     pub(super) fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
-        if let Some(cached) = self.available_versions_cache.borrow().get(package) {
+        if let Some(cached) = self.available_versions_cache.lock().get(package) {
             return cached.clone();
         }
         let key = CanonicalKey::from(package);
@@ -487,7 +487,7 @@ impl LpmDependencyProvider {
                     .collect()
             };
         self.available_versions_cache
-            .borrow_mut()
+            .lock()
             .insert(package.clone(), versions.clone());
         versions
     }
@@ -514,7 +514,7 @@ impl LpmDependencyProvider {
         available: &[NpmVersion],
     ) -> Ranges<NpmVersion> {
         let key = (pkg.clone(), npm_range.raw().to_string());
-        if let Some(cached) = self.range_cache.borrow().get(&key) {
+        if let Some(cached) = self.range_cache.lock().get(&key) {
             return cached.clone();
         }
         let latest_version = if npm_range.is_latest_tag() {
@@ -527,7 +527,7 @@ impl LpmDependencyProvider {
         };
         let computed =
             npm_range.to_pubgrub_ranges_with_latest_bound(available, latest_version.as_ref());
-        self.range_cache.borrow_mut().insert(key, computed.clone());
+        self.range_cache.lock().insert(key, computed.clone());
         computed
     }
 

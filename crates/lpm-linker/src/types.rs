@@ -31,18 +31,18 @@ pub struct FinalizeResult {
 }
 /// Linking strategy for node_modules.
 ///
-/// The default is [`Hoisted`]. With the v2 store, both modes symlink
-/// project `node_modules/<dep>` entries into shared
-/// `~/.lpm/store/v2/links/<graph-key>/` materializations, so warm
+/// The default is [`Hoisted`]. With the virtual store, both modes symlink
+/// project `node_modules/<dep>` entries into shared graph-keyed
+/// materializations, so warm
 /// installs are equivalent while hoisted keeps npm-compatible root
 /// links for declared dependencies.
 ///
 /// `Hoisted` gives users:
 ///
 /// - Faster cold installs on large fixtures.
-/// - Same warm-install shape as isolated with v2 store links.
+/// - Same warm-install shape as isolated with virtual-store links.
 /// - npm-compatible root links for declared dependencies while keeping
-///   v2 transitives inside their shared link entries instead of
+///   transitives inside their shared link entries instead of
 ///   flattening every transitive to the project root.
 ///
 /// [`Isolated`] remains a valid opt-in via `LPM_LINKER=isolated`,

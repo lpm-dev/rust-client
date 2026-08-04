@@ -15,17 +15,11 @@ pub(crate) fn build_project_v2_baseline_index(
     project_dir: &Path,
     lpm_root: &lpm_common::LpmRoot,
     store_version: lpm_store::StoreVersion,
-) -> Option<lpm_store::V2BaselineIndex> {
-    if store_version != lpm_store::StoreVersion::V2 {
-        return Some(lpm_store::V2BaselineIndex::default());
+) -> lpm_store::V2BaselineIndex {
+    if !store_version.uses_virtual_store() {
+        return lpm_store::V2BaselineIndex::default();
     }
-    match lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root) {
-        Ok(index) => Some(index),
-        Err(e) => {
-            tracing::debug!("failed to build v2 baseline index: {e}");
-            None
-        }
-    }
+    lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root)
 }
 
 pub(crate) fn find_project_baseline(
@@ -137,7 +131,7 @@ impl PackageInventory {
         let mut project_cache = ProjectAuditCache::read(&discovery.project_root);
 
         let lpm_root = lpm_common::LpmRoot::from_env().ok();
-        let baseline_index = lpm_root.as_ref().and_then(|root| {
+        let baseline_index = lpm_root.as_ref().map(|root| {
             build_project_v2_baseline_index(&discovery.project_root, root, store_version)
         });
 

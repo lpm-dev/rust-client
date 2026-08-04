@@ -341,19 +341,28 @@ pub async fn run(
     // covers both legacy layouts; we surface this as a warn so it
     // doesn't read as healthy.
     let layout = lpm_linker::LayoutPaths::for_project(project_dir);
-    // — pass the v2 links root so the health probe can
+    // Pass both virtual-store link roots so the health probe can
     // recognize a virtual-store install (no `.lpm/wrappers/` and no
     // `.lpm/hoisted/metadata.json`, but project-side `node_modules/`
-    // symlinks pointing into `~/.lpm/store/v2/links/`). On a system
+    // symlinks pointing into the active global store). On a system
     // where `LpmRoot::from_env` fails (extremely rare; no $HOME and
     // no $LPM_HOME), the check degrades to legacy v1-only detection.
-    let v2_links_root = lpm_common::LpmRoot::from_env()
+    let virtual_links_roots = lpm_common::LpmRoot::from_env()
         .ok()
-        .map(|root| lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root());
+        .map_or_else(Vec::new, |root| {
+            vec![
+                lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root(),
+                lpm_store::v2::StoreV2Paths::from_lpm_root_v3(&root).links_root(),
+            ]
+        });
+    let virtual_links_root_refs = virtual_links_roots
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect::<Vec<_>>();
     if layout.needs_layout_migration() {
         checks.push(Check::warn(&doctor_catalog::NODE_MODULES_LEGACY_LAYOUT, "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",));
     } else {
-        match layout.install_appears_healthy_with_v2(v2_links_root.as_deref()) {
+        match layout.install_appears_healthy_with_virtual_roots(&virtual_links_root_refs) {
             lpm_linker::InstallHealth::Healthy {
                 layout: lpm_linker::LinkerLayout::Isolated,
             } => {
@@ -375,7 +384,7 @@ pub async fn run(
             } => {
                 checks.push(Check::pass(
                     &doctor_catalog::NODE_MODULES_VIRTUAL_HEALTHY,
-                    "symlinks into ~/.lpm/store/v2/links/",
+                    "symlinks into the global virtual store",
                 ));
             }
             lpm_linker::InstallHealth::Healthy {
@@ -401,24 +410,35 @@ pub async fn run(
         }
     }
 
-    // === V2 store orphan stats (Extended) ===
+    // === Virtual-store orphan stats (Extended) ===
     //
     // (preplan). Cheap but cross-project
     // hygiene rather than core breakage — only surface under `--all`.
-    // Walks `~/.lpm/store/v2/links/<*>/.lpm-link-meta.json` sidecars
+    // Walks v2 and v3 `.lpm-link-meta.json` sidecars
     // + the registered-projects set, surfaces a count of orphans not
     // reachable from any project.
     if all && let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
-        let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
-        let plan = crate::commands::cache_prune::compute_prune_plan(
-            &lpm_root,
-            &v2_store,
-            &crate::commands::cache::PruneFlags::default(),
-            None,
-        );
-        if let Ok(plan) = plan {
-            let orphan_links = plan.link_entries_orphaned.len();
-            let orphan_objects = plan.object_entries_orphaned.len();
+        let mut orphan_links = 0usize;
+        let mut orphan_objects = 0usize;
+        let mut orphan_bytes = 0u64;
+        let mut plans_valid = true;
+        for version in [lpm_store::StoreVersion::V2, lpm_store::StoreVersion::V3] {
+            let store = lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, version);
+            match crate::commands::cache_prune::compute_prune_plan(
+                &lpm_root,
+                &store,
+                &crate::commands::cache::PruneFlags::default(),
+                None,
+            ) {
+                Ok(plan) => {
+                    orphan_links += plan.link_entries_orphaned.len();
+                    orphan_objects += plan.object_entries_orphaned.len();
+                    orphan_bytes = orphan_bytes.saturating_add(plan.bytes_freed_or_eligible);
+                }
+                Err(_) => plans_valid = false,
+            }
+        }
+        if plans_valid {
             if orphan_links == 0 && orphan_objects == 0 {
                 checks.push(Check::pass(&doctor_catalog::V2_STORE_ORPHANS, "no orphans"));
             } else {
@@ -429,7 +449,7 @@ pub async fn run(
                          ({}); run: lpm cache prune --apply",
                         if orphan_links == 1 { "" } else { "s" },
                         if orphan_objects == 1 { "" } else { "s" },
-                        lpm_common::format_bytes(plan.bytes_freed_or_eligible),
+                        lpm_common::format_bytes(orphan_bytes),
                     ),
                 ));
             }
@@ -437,7 +457,6 @@ pub async fn run(
     }
 
     // 6. Lockfile? (Fast — load-bearing for install)
-    let lockfile = project_dir.join("lpm.lock");
     checks.extend(check_lockfile_state(project_dir));
 
     // 6b. .gitattributes hygiene (Extended) — git-side correctness for
@@ -447,8 +466,7 @@ pub async fn run(
     }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)
-    if lockfile.exists()
-        && pkg_json_path.exists()
+    if pkg_json_path.exists()
         && let Some(sync_check) = check_deps_in_sync(project_dir)
     {
         checks.push(sync_check);

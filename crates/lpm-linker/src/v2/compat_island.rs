@@ -197,7 +197,7 @@ pub(super) fn manifest_needs_bin_compatibility(content: &[u8]) -> bool {
 
 pub(super) fn create_project_compatibility_links(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     compatibility_bin_names: &[String],
@@ -282,7 +282,7 @@ fn build_compat_island_at(
 #[cfg(not(target_os = "macos"))]
 fn create_project_compatibility_links_in_place(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
@@ -313,7 +313,7 @@ fn create_project_compatibility_links_in_place(
 #[cfg(target_os = "macos")]
 fn create_project_compatibility_links_store_cached(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     entries: &[CompatibilityEntry<'_>],
@@ -403,7 +403,7 @@ fn ensure_store_compat_island(
         )
         .map_err(|e| {
             LpmError::Store(format!(
-                "v2 linker: failed to write island completion sentinel: {e}"
+                "virtual-store linker: failed to write island completion sentinel: {e}"
             ))
         })
     })();
@@ -423,7 +423,7 @@ fn ensure_store_compat_island(
         Err(error) => {
             let _ = std::fs::remove_dir_all(&tmp);
             Err(LpmError::Store(format!(
-                "v2 linker: failed to publish store compatibility island {}: {error}",
+                "virtual-store linker: failed to publish store compatibility island {}: {error}",
                 store_island.display()
             )))
         }
@@ -469,54 +469,56 @@ fn clone_or_copy_island_tree(src: &Path, dst: &Path) -> Result<(), LpmError> {
     copy_tree_preserving_symlinks(src, dst)
 }
 
-/// Cross-volume fallback: copy a directory tree, hardlinking regular files
-/// and recreating symlinks verbatim so the island's relative sibling edges
-/// survive.
+/// Cross-volume fallback: copy a directory tree with independent regular-file
+/// inodes and recreate symlinks verbatim so the island's relative sibling
+/// edges survive.
 #[cfg(target_os = "macos")]
 fn copy_tree_preserving_symlinks(src: &Path, dst: &Path) -> Result<(), LpmError> {
     std::fs::create_dir_all(dst).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to create island dir {}: {e}",
+            "virtual-store linker: failed to create island dir {}: {e}",
             dst.display()
         ))
     })?;
     let read = std::fs::read_dir(src).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to read island {}: {e}",
+            "virtual-store linker: failed to read island {}: {e}",
             src.display()
         ))
     })?;
     for entry in read {
         let entry = entry.map_err(|e| {
-            LpmError::Store(format!("v2 linker: failed to enumerate island entry: {e}"))
+            LpmError::Store(format!(
+                "virtual-store linker: failed to enumerate island entry: {e}"
+            ))
         })?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
         let file_type = entry.file_type().map_err(|e| {
             LpmError::Store(format!(
-                "v2 linker: failed to stat island entry {}: {e}",
+                "virtual-store linker: failed to stat island entry {}: {e}",
                 src_path.display()
             ))
         })?;
         if file_type.is_symlink() {
             let target = std::fs::read_link(&src_path).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to read island symlink {}: {e}",
+                    "virtual-store linker: failed to read island symlink {}: {e}",
                     src_path.display()
                 ))
             })?;
             std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to recreate island symlink {}: {e}",
+                    "virtual-store linker: failed to recreate island symlink {}: {e}",
                     dst_path.display()
                 ))
             })?;
         } else if file_type.is_dir() {
             copy_tree_preserving_symlinks(&src_path, &dst_path)?;
-        } else if file_type.is_file() && std::fs::hard_link(&src_path, &dst_path).is_err() {
+        } else if file_type.is_file() {
             std::fs::copy(&src_path, &dst_path).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to copy island file {}: {e}",
+                    "virtual-store linker: failed to copy island file {}: {e}",
                     src_path.display()
                 ))
             })?;
@@ -530,7 +532,7 @@ pub(super) fn normalize_compatibility_bin_names(bin_names: &[String]) -> Vec<Str
     let mut normalized = Vec::with_capacity(bin_names.len());
     for name in bin_names {
         if !is_safe_root_link_name(name) {
-            tracing::warn!("v2 linker: ignoring unsafe compatibility bin name {name:?}");
+            tracing::warn!("virtual-store linker: ignoring unsafe compatibility bin name {name:?}");
             continue;
         }
         if seen.insert(name.clone()) {
@@ -541,7 +543,7 @@ pub(super) fn normalize_compatibility_bin_names(bin_names: &[String]) -> Vec<Str
 }
 
 fn collect_compatibility_roots_for_bins<'a>(
-    targets: &'a [V2Target],
+    targets: &'a [Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
     requested_bins: &[String],
@@ -568,7 +570,7 @@ fn collect_compatibility_roots_for_bins<'a>(
             Ok(content) => content,
             Err(error) => {
                 tracing::debug!(
-                    "v2 linker: skipping compatibility bin scan for {}: failed to read {}: {error}",
+                    "virtual-store linker: skipping compatibility bin scan for {}: failed to read {}: {error}",
                     v2t.target.name,
                     pkg_json_path.display()
                 );
@@ -584,7 +586,7 @@ fn collect_compatibility_roots_for_bins<'a>(
             Ok(None) => continue,
             Err(error) => {
                 tracing::debug!(
-                    "v2 linker: skipping compatibility bin scan for {}: failed to parse package.json: {error}",
+                    "virtual-store linker: skipping compatibility bin scan for {}: failed to parse package.json: {error}",
                     v2t.target.name
                 );
                 continue;
@@ -603,10 +605,10 @@ fn collect_compatibility_roots_for_bins<'a>(
                     .iter()
                     .any(|(cmd_name, _)| requested.contains(cmd_name.as_str()))
                 {
-                    roots.push(v2t);
+                    roots.push(v2t.as_ref());
                 }
             }
-            None => roots.push(v2t),
+            None => roots.push(v2t.as_ref()),
         }
     }
     roots
@@ -614,13 +616,13 @@ fn collect_compatibility_roots_for_bins<'a>(
 
 fn collect_compatibility_entries<'a>(
     roots: Vec<&'a V2Target>,
-    targets: &'a [V2Target],
+    targets: &'a [Arc<V2Target>],
     key_map: &KeyMap,
 ) -> Result<Vec<CompatibilityEntry<'a>>, LpmError> {
     let mut targets_by_key_dir: HashMap<String, &V2Target> = HashMap::with_capacity(targets.len());
     for v2t in targets {
         if let Some(key) = key_map.get_for(&v2t.target) {
-            targets_by_key_dir.insert(key.dir_name().to_string(), v2t);
+            targets_by_key_dir.insert(key.dir_name().to_string(), v2t.as_ref());
         }
     }
 
@@ -630,7 +632,7 @@ fn collect_compatibility_entries<'a>(
     while let Some(v2t) = queue.pop_front() {
         let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
             LpmError::Store(format!(
-                "v2 linker: missing graph key for compatibility package {}@{}",
+                "virtual-store linker: missing graph key for compatibility package {}@{}",
                 v2t.target.name, v2t.target.version
             ))
         })?;
@@ -641,7 +643,7 @@ fn collect_compatibility_entries<'a>(
         for (_local, dep_key) in compatibility_dependency_links(&v2t.target, key_map)? {
             let dep_target = targets_by_key_dir.get(dep_key.dir_name()).ok_or_else(|| {
                 LpmError::Store(format!(
-                    "v2 linker: compatibility dependency {} for {}@{} is missing from install set",
+                    "virtual-store linker: compatibility dependency {} for {}@{} is missing from install set",
                     dep_key.dir_name(),
                     v2t.target.name,
                     v2t.target.version
@@ -665,7 +667,7 @@ fn compatibility_dependency_links(
     for dep in &target.dependencies {
         if !is_safe_root_link_name(&dep.local) {
             tracing::warn!(
-                "v2 linker: skipping unsafe compatibility dependency local name {:?} for {}@{}",
+                "virtual-store linker: skipping unsafe compatibility dependency local name {:?} for {}@{}",
                 dep.local,
                 target.name,
                 target.version
@@ -676,7 +678,7 @@ fn compatibility_dependency_links(
             .get_for_dependency(dep)
             .ok_or_else(|| {
                 LpmError::Store(format!(
-                    "v2 linker: compatibility dep {}=>{}@{} of {}@{} has no resolved graph key",
+                    "virtual-store linker: compatibility dep {}=>{}@{} of {}@{} has no resolved graph key",
                     dep.local,
                     dep.target_name,
                     dep.graph_key_value(),
@@ -693,7 +695,7 @@ fn compatibility_dependency_links(
     for (peer_name, peer_version) in &target.peers {
         if !is_safe_root_link_name(peer_name) {
             tracing::warn!(
-                "v2 linker: skipping unsafe compatibility peer local name {:?} for {}@{}",
+                "virtual-store linker: skipping unsafe compatibility peer local name {:?} for {}@{}",
                 peer_name,
                 target.name,
                 target.version
@@ -730,14 +732,14 @@ fn ensure_real_dir_or_create(path: &Path, label: &str) -> Result<(), LpmError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir(path).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to create {label} at {}: {e}",
+                    "virtual-store linker: failed to create {label} at {}: {e}",
                     path.display()
                 ))
             })?;
             ensure_real_dir(path, label)
         }
         Err(error) => Err(LpmError::Store(format!(
-            "v2 linker: failed to inspect {label} at {}: {error}",
+            "virtual-store linker: failed to inspect {label} at {}: {error}",
             path.display()
         ))),
     }
@@ -753,14 +755,14 @@ fn remove_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError>
         }
         Err(error) => {
             return Err(LpmError::Store(format!(
-                "v2 linker: failed to inspect project node_modules/.lpm directory at {}: {error}",
+                "virtual-store linker: failed to inspect project node_modules/.lpm directory at {}: {error}",
                 lpm_dir.display()
             )));
         }
     };
     if is_symlink_or_junction(&metadata) {
         return Err(LpmError::Store(format!(
-            "v2 linker: refusing to clean compatibility directory through symlinked node_modules/.lpm at {}",
+            "virtual-store linker: refusing to clean compatibility directory through symlinked node_modules/.lpm at {}",
             lpm_dir.display()
         )));
     }
@@ -789,14 +791,14 @@ fn remove_legacy_project_compatibility_root(project_dir: &Path) -> Result<(), Lp
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(LpmError::Store(format!(
-                "v2 linker: failed to inspect legacy project .lpm directory at {}: {error}",
+                "virtual-store linker: failed to inspect legacy project .lpm directory at {}: {error}",
                 lpm_dir.display()
             )));
         }
     };
     if is_symlink_or_junction(&metadata) {
         return Err(LpmError::Store(format!(
-            "v2 linker: refusing to clean legacy compatibility directory through symlinked .lpm at {}",
+            "virtual-store linker: refusing to clean legacy compatibility directory through symlinked .lpm at {}",
             lpm_dir.display()
         )));
     }
@@ -819,7 +821,7 @@ fn reconcile_compatibility_root(
 ) -> Result<(), LpmError> {
     let entries = std::fs::read_dir(compatibility_root).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to read compatibility directory at {}: {e}",
+            "virtual-store linker: failed to read compatibility directory at {}: {e}",
             compatibility_root.display()
         ))
     })?;
@@ -854,7 +856,7 @@ fn ensure_compatibility_package_copy(
     if !source_package_dir.join("package.json").is_file() {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(LpmError::Store(format!(
-            "v2 linker: compatibility source package is missing at {}",
+            "virtual-store linker: compatibility source package is missing at {}",
             source_package_dir.display()
         )));
     }
@@ -869,7 +871,7 @@ fn ensure_compatibility_package_copy(
         Err(error) => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             Err(LpmError::Store(format!(
-                "v2 linker: failed to publish compatibility entry {} -> {}: {error}",
+                "virtual-store linker: failed to publish compatibility entry {} -> {}: {error}",
                 tmp_dir.display(),
                 final_dir.display()
             )))
@@ -896,7 +898,7 @@ fn create_compatibility_tmp_dir_with_mode(
 
     let parent = final_dir.parent().ok_or_else(|| {
         LpmError::Store(format!(
-            "v2 linker: compatibility path has no parent: {}",
+            "virtual-store linker: compatibility path has no parent: {}",
             final_dir.display()
         ))
     })?;
@@ -905,7 +907,7 @@ fn create_compatibility_tmp_dir_with_mode(
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
             LpmError::Store(format!(
-                "v2 linker: compatibility path has invalid final component: {}",
+                "virtual-store linker: compatibility path has invalid final component: {}",
                 final_dir.display()
             ))
         })?;
@@ -926,14 +928,14 @@ fn create_compatibility_tmp_dir_with_mode(
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(LpmError::Store(format!(
-                    "v2 linker: failed to create compatibility tmp dir at {}: {error}",
+                    "virtual-store linker: failed to create compatibility tmp dir at {}: {error}",
                     tmp.display()
                 )));
             }
         }
     }
     Err(LpmError::Store(format!(
-        "v2 linker: failed to allocate compatibility tmp dir for {}",
+        "virtual-store linker: failed to allocate compatibility tmp dir for {}",
         final_dir.display()
     )))
 }
@@ -987,7 +989,7 @@ fn sync_compatibility_entry_links(
     for (local, dep_key) in links {
         let Some(target_package_dir) = compatibility_links.package_dir_for_key(&dep_key) else {
             return Err(LpmError::Store(format!(
-                "v2 linker: compatibility link target {} for {}@{} was not materialized",
+                "virtual-store linker: compatibility link target {} for {}@{} was not materialized",
                 dep_key.dir_name(),
                 entry.target.target.name,
                 entry.target.target.version
@@ -1007,7 +1009,7 @@ fn reconcile_compatibility_node_modules(
 ) -> Result<(), LpmError> {
     let entries = std::fs::read_dir(node_modules).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to read compatibility node_modules at {}: {e}",
+            "virtual-store linker: failed to read compatibility node_modules at {}: {e}",
             node_modules.display()
         ))
     })?;
@@ -1042,7 +1044,7 @@ fn create_compatibility_sibling_link(
 ) -> Result<(), LpmError> {
     if !is_safe_root_link_name(local) {
         return Err(LpmError::Store(format!(
-            "v2 linker: unsafe compatibility sibling name {local:?}"
+            "virtual-store linker: unsafe compatibility sibling name {local:?}"
         )));
     }
     let link_path = node_modules.join(local);
@@ -1061,7 +1063,7 @@ fn create_compatibility_sibling_link(
     let relative_target = relative_compat_sibling_target(&link_path, target_package_dir);
     create_dir_symlink_or_junction(&relative_target, &link_path).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to create compatibility sibling {} -> {}: {e}",
+            "virtual-store linker: failed to create compatibility sibling {} -> {}: {e}",
             link_path.display(),
             target_package_dir.display()
         ))
@@ -1095,7 +1097,7 @@ fn write_compatibility_marker(
         compatibility_entry_dir(compatibility_root, &entry.key).join(COMPAT_META_FILENAME);
     std::fs::write(&marker_path, compatibility_marker(entry)).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to write compatibility marker at {}: {e}",
+            "virtual-store linker: failed to write compatibility marker at {}: {e}",
             marker_path.display()
         ))
     })
@@ -1111,7 +1113,7 @@ fn compatibility_marker(entry: &CompatibilityEntry<'_>) -> String {
 
 fn rewire_project_roots_to_compat(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     key_map: &KeyMap,
     compatibility_links: &CompatibilityLinks,
 ) -> Result<(), LpmError> {
@@ -1137,7 +1139,7 @@ fn rewire_project_roots_to_compat(
             }
             create_dir_symlink_or_junction(package_dir, &link_path).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to rewire project root {} -> {}: {e}",
+                    "virtual-store linker: failed to rewire project root {} -> {}: {e}",
                     link_path.display(),
                     package_dir.display()
                 ))
@@ -1157,4 +1159,32 @@ fn compatibility_node_modules_dir(compatibility_root: &Path, key: &GraphKey) -> 
 
 fn compatibility_package_dir(compatibility_root: &Path, key: &GraphKey) -> PathBuf {
     compatibility_node_modules_dir(compatibility_root, key).join(key.name())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::copy_tree_preserving_symlinks;
+
+    #[test]
+    fn compatibility_island_copy_fallback_uses_independent_file_inodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&source).unwrap();
+        let source_file = source.join("package.json");
+        std::fs::write(&source_file, b"original").unwrap();
+
+        copy_tree_preserving_symlinks(&source, &destination).unwrap();
+
+        let destination_file = destination.join("package.json");
+        assert_ne!(
+            std::fs::metadata(&source_file).unwrap().ino(),
+            std::fs::metadata(&destination_file).unwrap().ino(),
+            "project compatibility files must not hardlink the store cache"
+        );
+        std::fs::write(destination_file, b"modified").unwrap();
+        assert_eq!(std::fs::read(source_file).unwrap(), b"original");
+    }
 }

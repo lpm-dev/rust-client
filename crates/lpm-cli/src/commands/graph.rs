@@ -32,15 +32,13 @@ pub async fn run(
     }
 
     // Load lockfile
-    let lockfile_path = project_dir.join("lpm.lock");
-    let lockfile = if lockfile_path.exists() {
-        lpm_lockfile::Lockfile::read_from_file(&lockfile_path)
-            .map_err(|e| LpmError::Script(format!("failed to read lockfile: {e}")))?
-    } else {
-        return Err(LpmError::Script(
-            "no lpm.lock found. Run `lpm install` first to generate the lockfile.".into(),
-        ));
-    };
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .map_err(|e| {
+            LpmError::Script(format!(
+                "no usable lpm.lock found. Run `lpm install` first: {e}"
+            ))
+        })?
+        .lockfile;
 
     // Read package.json once, reuse for both direct deps and root name
     let pkg_json_path = project_dir.join("package.json");

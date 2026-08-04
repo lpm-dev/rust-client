@@ -28,7 +28,11 @@ impl TreeManifestProvider for WalkerTreeProvider<'_> {
         &'a self,
         canonical: &'a CanonicalKey,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>> + 'a>,
+        Box<
+            dyn std::future::Future<Output = Result<Arc<CachedPackageInfo>, ResolveError>>
+                + Send
+                + 'a,
+        >,
     > {
         Box::pin(async move {
             ensure_manifest(
@@ -155,6 +159,12 @@ pub async fn resolve_greedy_with_options_and_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip_all,
+    name = "resolve_greedy",
+    level = "debug",
+    fields(n_deps = root_dependencies.dependencies.len())
+)]
 pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     client: Arc<RegistryClient>,
     root_dependencies: crate::resolve::RootDependencies,
@@ -169,11 +179,6 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
 ) -> Result<ResolveResult, ResolveError> {
-    let _span = tracing::debug_span!(
-        "resolve_greedy",
-        n_deps = root_dependencies.dependencies.len()
-    )
-    .entered();
     let pass_start = Instant::now();
 
     // Reset profiling accumulators. We measure greedy work in `pubgrub_ms`
@@ -210,7 +215,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     // process them (and their children, which may themselves declare
     // peers — caught by the next iteration). Termination: both
     // task_queue and peer_requirements empty after a single pass.
-    let tree_status_cache = super::tree_policy::TreeStatusCache::default();
+    let mut tree_status_cache = super::tree_policy::TreeStatusCache::default();
     loop {
         // Inner: drain task_queue exactly as before.
         while let Some(edge) = state.task_queue.pop_front() {
@@ -239,7 +244,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
                 &info,
                 &policy,
                 &tree_provider,
-                &tree_status_cache,
+                &mut tree_status_cache,
             )
             .await;
             process_edge_with_preferred(&edge, &info, preferred, &mut state)?;

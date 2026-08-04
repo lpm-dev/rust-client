@@ -666,10 +666,17 @@ fn collect_bundled_dependencies(
         return Ok(());
     }
 
-    let links_root = lpm_common::LpmRoot::from_env()
+    let links_roots = lpm_common::LpmRoot::from_env()
         .ok()
-        .map(|root| lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root())
-        .and_then(|root| root.canonicalize().ok());
+        .map_or_else(Vec::new, |root| {
+            [
+                lpm_store::v2::StoreV2Paths::from_lpm_root(&root).links_root(),
+                lpm_store::v2::StoreV2Paths::from_lpm_root_v3(&root).links_root(),
+            ]
+            .into_iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect()
+        });
     let wrappers_root = project_dir
         .join(".lpm")
         .join("wrappers")
@@ -679,7 +686,7 @@ fn collect_bundled_dependencies(
         project_dir,
         canonical_project_root,
         wrappers_root: wrappers_root.as_deref(),
-        links_root: links_root.as_deref(),
+        links_roots: &links_roots,
         packed: std::collections::HashMap::with_capacity(names.len()),
         active_roots: std::collections::HashSet::with_capacity(names.len()),
         result,
@@ -691,7 +698,7 @@ fn collect_bundled_dependencies(
             &name,
             canonical_project_root,
             wrappers_root.as_deref(),
-            links_root.as_deref(),
+            &links_roots,
         )?
         .ok_or_else(|| {
             LpmError::Registry(format!(
@@ -780,7 +787,7 @@ fn resolve_installed_dependency(
     name: &str,
     canonical_project_root: &Path,
     wrappers_root: Option<&Path>,
-    links_root: Option<&Path>,
+    links_roots: &[PathBuf],
 ) -> Result<Option<ResolvedDependency>, LpmError> {
     let mut candidates = Vec::with_capacity(2);
     if let Some(parent) = parent_package {
@@ -801,7 +808,7 @@ fn resolve_installed_dependency(
             ))
         })?;
         if !canonical.starts_with(canonical_project_root)
-            && links_root.is_none_or(|root| !canonical.starts_with(root))
+            && !links_roots.iter().any(|root| canonical.starts_with(root))
         {
             return Err(LpmError::Registry(format!(
                 "bundled dependency `{name}` resolves outside the verified project and LPM store roots: {}",
@@ -810,7 +817,7 @@ fn resolve_installed_dependency(
         }
         if metadata.file_type().is_symlink()
             && !wrappers_root.is_some_and(|root| canonical.starts_with(root))
-            && !links_root.is_some_and(|root| canonical.starts_with(root))
+            && !links_roots.iter().any(|root| canonical.starts_with(root))
         {
             return Err(LpmError::Registry(format!(
                 "bundled dependency `{name}` uses an unverified project symlink: {}",
@@ -851,7 +858,7 @@ struct BundledDependencyCollector<'a> {
     project_dir: &'a Path,
     canonical_project_root: &'a Path,
     wrappers_root: Option<&'a Path>,
-    links_root: Option<&'a Path>,
+    links_roots: &'a [PathBuf],
     packed: std::collections::HashMap<String, PathBuf>,
     active_roots: std::collections::HashSet<PathBuf>,
     result: &'a mut Vec<TarballCandidate>,
@@ -942,7 +949,7 @@ impl BundledDependencyCollector<'_> {
                 &child,
                 self.canonical_project_root,
                 self.wrappers_root,
-                self.links_root,
+                self.links_roots,
             )?;
             let Some(source) = source else {
                 if required {
@@ -1847,16 +1854,21 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn bundled_dependency_supports_the_v2_isolated_links_layout() {
+    fn assert_bundled_dependency_supports_virtual_links_layout(
+        store_version: lpm_store::StoreVersion,
+    ) {
         use std::os::unix::fs::symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let lpm_home = dir.path().join("lpm-home");
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
-        let store_paths =
-            lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_common::LpmRoot::from_dir(&lpm_home));
+        let lpm_root = lpm_common::LpmRoot::from_dir(&lpm_home);
+        let store_paths = match store_version {
+            lpm_store::StoreVersion::V3 => lpm_store::v2::StoreV2Paths::from_lpm_root_v3(&lpm_root),
+            lpm_store::StoreVersion::V2 => lpm_store::v2::StoreV2Paths::from_lpm_root(&lpm_root),
+            lpm_store::StoreVersion::V1 => unreachable!("v1 has no virtual links layout"),
+        };
         let package_root = store_paths
             .links_root()
             .join("foo@1.0.0+0000000000000000")
@@ -1889,6 +1901,18 @@ mod tests {
             tarball_contents(&tarball)["package/node_modules/foo/index.js"],
             b"isolated"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_dependency_supports_the_default_v2_isolated_links_layout() {
+        assert_bundled_dependency_supports_virtual_links_layout(lpm_store::StoreVersion::V2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundled_dependency_supports_the_experimental_v3_isolated_links_layout() {
+        assert_bundled_dependency_supports_virtual_links_layout(lpm_store::StoreVersion::V3);
     }
 
     #[cfg(unix)]

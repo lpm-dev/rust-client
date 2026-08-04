@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lpm_common::LpmError;
 use lpm_common::symlink::{
@@ -21,7 +22,7 @@ pub(super) fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
     if v1_wrappers.exists() {
         std::fs::remove_dir_all(&v1_wrappers).map_err(|e| {
             LpmError::Store(format!(
-                "v2 linker: failed to wipe legacy v1 wrappers at {}: {e}",
+                "virtual-store linker: failed to wipe legacy v1 wrappers at {}: {e}",
                 v1_wrappers.display()
             ))
         })?;
@@ -31,7 +32,7 @@ pub(super) fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
     if hoisted.exists() {
         std::fs::remove_dir_all(&hoisted).map_err(|e| {
             LpmError::Store(format!(
-                "v2 linker: failed to wipe legacy hoisted state at {}: {e}",
+                "virtual-store linker: failed to wipe legacy hoisted state at {}: {e}",
                 hoisted.display()
             ))
         })?;
@@ -41,7 +42,7 @@ pub(super) fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
 
 pub(super) fn reconcile_project_node_modules(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     self_package_name: Option<&str>,
     preserve_internal_lpm_dir: bool,
 ) -> Result<(), LpmError> {
@@ -62,7 +63,7 @@ pub(super) fn reconcile_project_node_modules(
 
     let entries = std::fs::read_dir(&nm).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to read project node_modules at {}: {e}",
+            "virtual-store linker: failed to read project node_modules at {}: {e}",
             nm.display()
         ))
     })?;
@@ -106,7 +107,7 @@ pub(super) fn reconcile_scoped_root_dir(
 ) -> Result<(), LpmError> {
     let entries = std::fs::read_dir(scope_dir).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to read scoped node_modules dir at {}: {e}",
+            "virtual-store linker: failed to read scoped node_modules dir at {}: {e}",
             scope_dir.display()
         ))
     })?;
@@ -128,7 +129,7 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
     }
     remove_path_entry(path).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to remove {label} at {}: {e}",
+            "virtual-store linker: failed to remove {label} at {}: {e}",
             path.display()
         ))
     })
@@ -138,7 +139,7 @@ pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), 
 /// into the v2 store's link package dirs.
 pub(super) fn create_root_symlinks(
     project_dir: &Path,
-    targets: &[V2Target],
+    targets: &[Arc<V2Target>],
     store: &Store,
     key_map: &KeyMap,
 ) -> Result<usize, LpmError> {
@@ -157,7 +158,7 @@ pub(super) fn create_root_symlinks(
         }
         let key = key_map.get_for(&v2t.target).ok_or_else(|| {
             LpmError::Store(format!(
-                "v2 linker: missing graph key for {}@{} during root-symlink pass",
+                "virtual-store linker: missing graph key for {}@{} during root-symlink pass",
                 v2t.target.name, v2t.target.version
             ))
         })?;
@@ -193,7 +194,7 @@ pub(super) fn create_root_symlinks(
                     }
                     Err(e) => {
                         return Err(LpmError::Store(format!(
-                            "v2 linker: failed to create root symlink {} → {}: {e}",
+                            "virtual-store linker: failed to create root symlink {} → {}: {e}",
                             link_path.display(),
                             target_path.display()
                         )));
@@ -252,7 +253,7 @@ pub(super) fn root_link_names(target: &LinkTarget) -> Vec<String> {
                 true
             } else {
                 tracing::warn!(
-                    "v2 linker: rejecting unsafe root_link_name {name:?} for {}@{} \
+                    "virtual-store linker: rejecting unsafe root_link_name {name:?} for {}@{} \
                      — contains path separator, traversal, or null byte",
                     target.name,
                     target.version
@@ -276,7 +277,9 @@ pub(super) fn is_direct(target: &LinkTarget) -> bool {
 /// same name took the spot).
 pub(super) fn create_self_ref(project_dir: &Path, self_name: &str) -> Result<bool, LpmError> {
     if !is_safe_root_link_name(self_name) {
-        tracing::warn!("v2 linker: skipping self-reference for unsafe package name: {self_name:?}");
+        tracing::warn!(
+            "virtual-store linker: skipping self-reference for unsafe package name: {self_name:?}"
+        );
         return Ok(false);
     }
 
@@ -288,7 +291,7 @@ pub(super) fn create_self_ref(project_dir: &Path, self_name: &str) -> Result<boo
     ensure_link_parent_dir(&nm, &link_path, "self-reference")?;
     create_dir_symlink_or_junction(project_dir, &link_path).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to create self-ref symlink {} → {}: {e}",
+            "virtual-store linker: failed to create self-ref symlink {} → {}: {e}",
             link_path.display(),
             project_dir.display()
         ))
@@ -300,7 +303,7 @@ pub(super) fn ensure_node_modules_dir(project_dir: &Path) -> Result<PathBuf, Lpm
     let nm = project_dir.join("node_modules");
     std::fs::create_dir_all(&nm).map_err(|e| {
         LpmError::Store(format!(
-            "v2 linker: failed to create project node_modules at {}: {e}",
+            "virtual-store linker: failed to create project node_modules at {}: {e}",
             nm.display()
         ))
     })?;
@@ -315,7 +318,7 @@ pub(super) fn ensure_link_parent_dir(
 ) -> Result<(), LpmError> {
     let Some(parent) = link_path.parent() else {
         return Err(LpmError::Store(format!(
-            "v2 linker: {label} path has no parent: {}",
+            "virtual-store linker: {label} path has no parent: {}",
             link_path.display()
         )));
     };
@@ -327,19 +330,19 @@ pub(super) fn ensure_link_parent_dir(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(parent).map_err(|e| {
                 LpmError::Store(format!(
-                    "v2 linker: failed to create {label} parent at {}: {e}",
+                    "virtual-store linker: failed to create {label} parent at {}: {e}",
                     parent.display()
                 ))
             })?;
             ensure_real_dir(parent, label)
         }
         Err(error) => Err(LpmError::Store(format!(
-            "v2 linker: failed to inspect {label} parent at {}: {error}",
+            "virtual-store linker: failed to inspect {label} parent at {}: {error}",
             parent.display()
         ))),
     }
 }
 
 pub(super) fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> {
-    ensure_real_dir_with_prefix(path, label, "v2 linker: ")
+    ensure_real_dir_with_prefix(path, label, "virtual-store linker: ")
 }

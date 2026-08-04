@@ -207,3 +207,98 @@ fn doctor_fix_json_envelope_carries_fixes_applied_array() {
         "doctor --fix --json on the seeded project must report at least one fix, got: {envelope}",
     );
 }
+
+#[test]
+fn workspace_member_doctor_uses_its_projection_and_repairs_root_lockfile_hygiene() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "doctor-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"doctor-app","version":"1.0.0","private":true,"dependencies":{"member-only":"^1.0.0"}}"#,
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{"name":"doctor-sibling","version":"1.0.0","private":true}"#,
+    );
+    let app_dir = project.path().join("packages/app");
+    std::fs::create_dir_all(app_dir.join("node_modules")).unwrap();
+    std::fs::create_dir_all(app_dir.join(".lpm/hoisted")).unwrap();
+    std::fs::write(
+        app_dir.join(".lpm/hoisted/metadata.json"),
+        r#"{"version":1,"members":{},"packages":{}}"#,
+    )
+    .unwrap();
+
+    let mut app_projection = lpm_lockfile::Lockfile::new();
+    app_projection.add_package(lpm_lockfile::LockedPackage {
+        name: "member-only".into(),
+        version: "1.0.0".into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
+        ..Default::default()
+    });
+    let mut sibling_projection = lpm_lockfile::Lockfile::new();
+    sibling_projection.add_package(lpm_lockfile::LockedPackage {
+        name: "sibling-only".into(),
+        version: "1.0.0".into(),
+        source: Some("registry+https://registry.npmjs.org".into()),
+        ..Default::default()
+    });
+    let mut root_lockfile = lpm_lockfile::Lockfile::new();
+    root_lockfile
+        .absorb_importer("packages/app", app_projection)
+        .unwrap();
+    root_lockfile
+        .absorb_importer("packages/sibling", sibling_projection)
+        .unwrap();
+    root_lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .unwrap();
+    project.write_file("lpm.lockb", "obsolete union binary cache");
+
+    let output = lpm_doctor_offline(&project)
+        .current_dir(&app_dir)
+        .arg("--json")
+        .arg("doctor")
+        .arg("--all")
+        .arg("--fix")
+        .arg("--yes")
+        .output()
+        .expect("run doctor from workspace member");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "workspace doctor must emit JSON: {error}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        });
+    let codes = envelope["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|check| check["code"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(codes.contains("lockfile_present"), "{envelope:#}");
+    assert!(!codes.contains("lockfile_missing"), "{envelope:#}");
+    assert!(codes.contains("deps_sync_clean"), "{envelope:#}");
+    assert!(!codes.contains("deps_sync_drift"), "{envelope:#}");
+
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "doctor must remove an obsolete binary cache that cannot represent workspace projections"
+    );
+    assert!(
+        project
+            .read_file(".gitattributes")
+            .contains("lpm.lockb binary")
+    );
+    assert!(!app_dir.join("lpm.lock").exists());
+    assert!(!app_dir.join("lpm.lockb").exists());
+    assert!(!app_dir.join(".gitattributes").exists());
+}

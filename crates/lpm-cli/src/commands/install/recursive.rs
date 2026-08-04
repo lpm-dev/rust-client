@@ -20,15 +20,12 @@ struct AutomaticWorkspaceInstallPolicy {
     offline: bool,
     force: bool,
     explicit_concurrency: bool,
-    share_local_source_populations: bool,
     root_resolve_ahead_eligible: bool,
 }
 
 impl AutomaticWorkspaceInstallPolicy {
     fn parallel_replay(self) -> bool {
-        self.targets_need_materialization
-            && !self.explicit_concurrency
-            && self.lockfile_replay_ready
+        !self.explicit_concurrency && self.lockfile_replay_ready
     }
 
     fn parallel_fresh(self) -> bool {
@@ -41,7 +38,6 @@ impl AutomaticWorkspaceInstallPolicy {
             && !self.offline
             && !self.force
             && !self.explicit_concurrency
-            && self.share_local_source_populations
             && self.root_resolve_ahead_eligible;
         if !eligible {
             return WORKSPACE_INSTALL_DEFAULT_CONCURRENCY;
@@ -89,11 +85,14 @@ pub(crate) struct RecursiveInstallOptions {
 
 struct WorkspaceInstallTarget {
     name: String,
+    importer: String,
     path: PathBuf,
     kind: &'static str,
     lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle,
     dependency_count: usize,
+    has_registry_resolution_roots: bool,
     resolve_ahead_eligible: bool,
+    has_workspace_dependents: bool,
     // Indices of targets that must complete before this one starts:
     // workspace dependency edges, the sequential chain between
     // script-bearing targets, and (for the root) every member.
@@ -102,6 +101,7 @@ struct WorkspaceInstallTarget {
 
 struct WorkspaceInstallOutcome {
     name: String,
+    importer: String,
     path: PathBuf,
     kind: &'static str,
     duration_ms: u64,
@@ -126,22 +126,7 @@ pub(crate) async fn run_recursive_workspace_install(
     fail_if_no_match: bool,
     options: RecursiveInstallOptions,
 ) -> Result<(), LpmError> {
-    let workspace = lpm_workspace::discover_workspace(cwd)
-        .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))?
-        .ok_or_else(|| {
-            LpmError::Script(
-                "`--recursive` requires a workspace. Run `lpm install` without `--recursive` \
-                 for a standalone project."
-                    .into(),
-            )
-        })?;
-    let mut targets = select_workspace_install_targets(
-        &workspace,
-        filters,
-        filter_prod,
-        changed_files_ignore_pattern,
-        test_pattern,
-    )?;
+    let workspace_root = discover_recursive_workspace(cwd)?.root;
     let timing_detail_mode = TimingDetailMode::from_env();
     let _registry_timing_scope = if options.timing {
         Some(lpm_registry::timing::command_scope().await)
@@ -154,267 +139,428 @@ pub(crate) async fn run_recursive_workspace_install(
         None
     };
 
-    if targets.is_empty() {
-        if fail_if_no_match {
-            return Err(LpmError::Script(
-                "no workspace packages matched the filter (--fail-if-no-match)".into(),
-            ));
+    let workspace_lock = lpm_common::project_install_lock(&workspace_root);
+    lpm_common::with_exclusive_lock_async(workspace_lock, async {
+        let workspace = discover_recursive_workspace(cwd)?;
+        if workspace.root != workspace_root {
+            return Err(LpmError::Script(format!(
+                "workspace root changed while waiting for the install transaction ({} -> {}); \
+                 retry the command",
+                workspace_root.display(),
+                workspace.root.display(),
+            )));
         }
+        let mut targets = select_workspace_install_targets(
+            &workspace,
+            filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
+        )?;
+        let legacy_importers = workspace
+            .members
+            .iter()
+            .map(|member| {
+                workspace_lockfile::importer_key(&workspace.root, &member.path)
+                    .map(|importer| (importer, member.path.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if targets.is_empty() {
+            if fail_if_no_match {
+                return Err(LpmError::Script(
+                    "no workspace packages matched the filter (--fail-if-no-match)".into(),
+                ));
+            }
+            emit_workspace_install_report(
+                &workspace.root,
+                &[],
+                options.json_output,
+                options.timing,
+                timing_detail_mode,
+                0,
+            );
+            return Ok(());
+        }
+
+        let workspace_lockfile_coordinator =
+            Arc::new(workspace_lockfile::WorkspaceLockfileCoordinator::new(
+                &workspace.root,
+                &legacy_importers,
+            )?);
+        let workspace_project_state_coordinator =
+            Arc::new(workspace_project_state::WorkspaceProjectStateCoordinator::new(targets.len()));
+        let root_target_index = targets.iter().position(|target| target.kind == "root");
+        let root_provider_fingerprint = root_target_index
+            .and_then(|_| {
+                workspace_lockfile_coordinator
+                    .projection(".")
+                    .ok()
+                    .and_then(|lockfile| {
+                        workspace_resolution::root_provider_fingerprint_from_projection(
+                            &workspace.root,
+                            &lockfile,
+                        )
+                    })
+            })
+            .map(Arc::<str>::from);
+        let targets_need_materialization = workspace_targets_need_materialization(&targets);
+        let lockfile_replay_ready = workspace_targets_are_lockfile_replay_ready(
+            &workspace,
+            &targets,
+            &options,
+            &workspace_lockfile_coordinator,
+            root_provider_fingerprint.as_deref(),
+        );
+        let unshared_local_source_roots = scripted_local_source_provider_roots(&targets);
+        let explicit_concurrency =
+            explicit_workspace_install_concurrency(options.workspace_concurrency).is_some();
+        let automatic_policy = AutomaticWorkspaceInstallPolicy {
+            target_count: targets.len(),
+            dependency_count: targets.iter().fold(0usize, |total, target| {
+                total.saturating_add(target.dependency_count)
+            }),
+            targets_need_materialization,
+            lockfile_replay_ready,
+            offline: options.offline,
+            force: options.force,
+            explicit_concurrency,
+            root_resolve_ahead_eligible: root_target_index
+                .is_some_and(|index| targets[index].resolve_ahead_eligible),
+        };
+        let automatic_parallel_replay = automatic_policy.parallel_replay();
+        let automatic_parallel_fresh = automatic_policy.parallel_fresh();
+        let automatic_fresh_concurrency = automatic_policy.fresh_concurrency();
+        let resolve_ahead = !lockfile_replay_ready
+            && !options.offline
+            && !options.force
+            && !explicit_concurrency
+            && !automatic_parallel_fresh
+            && targets.len() > 1
+            && targets
+                .iter()
+                .all(|target| !target.lifecycle.has_scripts() && target.resolve_ahead_eligible);
+        let mut workspace_union_participants = if !lockfile_replay_ready
+            && !options.offline
+            && !options.force
+            && !workspace.root.join(lpm_lockfile::LOCKFILE_NAME).exists()
+            && targets
+                .iter()
+                .all(|target| !target.path.join(lpm_lockfile::LOCKFILE_NAME).exists())
+        {
+            targets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, target)| {
+                    (target.has_registry_resolution_roots
+                        && !target.lifecycle.has_scripts()
+                        && target.resolve_ahead_eligible)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if let Some(root_index) = root_target_index
+            && root_requires_serialized_provider_resolution(
+                &targets[root_index],
+                workspace_union_participants.contains(&root_index),
+            )
+        {
+            tracing::debug!(
+                reason = "root-provider-not-union-eligible",
+                "workspace union resolution disabled"
+            );
+            workspace_union_participants.clear();
+        }
+        let workspace_union_enabled = workspace_union_participants.len() > 1;
+        let release_age_reference_unix = workspace_resolution::current_unix_timestamp();
+        let root_provider_coordinator = root_target_index
+            .filter(|index| {
+                !workspace_union_enabled
+                    && !resolve_ahead
+                    && !lockfile_replay_ready
+                    && !options.offline
+                    && !targets[*index].lifecycle.has_scripts()
+                    && targets[*index].resolve_ahead_eligible
+            })
+            .map(|_| {
+                Arc::new(
+                    workspace_resolution::WorkspaceRootProviderCoordinator::new_at_unix(
+                        release_age_reference_unix,
+                    ),
+                )
+            });
+        let concurrency = resolve_workspace_install_concurrency(
+            options.workspace_concurrency,
+            targets.len(),
+            automatic_parallel_replay || automatic_parallel_fresh,
+            if automatic_parallel_fresh {
+                automatic_fresh_concurrency
+            } else {
+                WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY
+            },
+        );
+        let resolution_concurrency = automatic_workspace_resolution_concurrency(
+            targets.len(),
+            std::thread::available_parallelism()
+                .map(NonZeroUsize::get)
+                .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY),
+        );
+        tracing::debug!(
+            concurrency,
+            effective_resolution_concurrency = if workspace_union_enabled {
+                workspace_union_participants.len()
+            } else if resolve_ahead {
+                resolution_concurrency
+            } else {
+                0
+            },
+            resolve_ahead,
+            workspace_union_enabled,
+            root_provider_serialized = root_provider_coordinator.is_some(),
+            lockfile_replay_ready,
+            share_object_validations = targets_need_materialization,
+            share_local_source_populations = true,
+            unshared_local_source_count = unshared_local_source_roots.len(),
+            workspace_resource_pools = true,
+            automatic_parallel_replay,
+            automatic_parallel_fresh,
+            "selected recursive workspace install concurrency"
+        );
+        let materialization_coordinator = Arc::new(
+            workspace_materialization::WorkspaceMaterializationCoordinator::new(
+                unshared_local_source_roots,
+            ),
+        );
+        let mut resolution_task_indices = vec![None; targets.len()];
+        let resolution_coordinator = if workspace_union_enabled {
+            for (task_index, target_index) in
+                workspace_union_participants.iter().copied().enumerate()
+            {
+                resolution_task_indices[target_index] = Some(task_index);
+            }
+            let union_root_index =
+                root_target_index.and_then(|root_index| resolution_task_indices[root_index]);
+            Some(Arc::new(
+                workspace_resolution::WorkspaceResolutionCoordinator::new_union_at_unix(
+                    workspace_union_participants.len(),
+                    union_root_index,
+                    release_age_reference_unix,
+                ),
+            ))
+        } else if resolve_ahead {
+            for (index, task_index) in resolution_task_indices.iter_mut().enumerate() {
+                *task_index = Some(index);
+            }
+            Some(Arc::new(match root_target_index {
+                Some(root_index) => {
+                    workspace_resolution::WorkspaceResolutionCoordinator::new_with_root_at_unix(
+                        targets.len(),
+                        resolution_concurrency,
+                        root_index,
+                        release_age_reference_unix,
+                    )
+                }
+                None => workspace_resolution::WorkspaceResolutionCoordinator::new_at_unix(
+                    targets.len(),
+                    resolution_concurrency,
+                    release_age_reference_unix,
+                ),
+            }))
+        } else {
+            None
+        };
+        let workspace_client = (!options.offline && targets.len() > 1)
+            .then(|| client.clone_with_metadata_memory_cache());
+        let client = workspace_client.as_ref().unwrap_or(client);
+        let workspace_root = workspace.root.clone();
+        let started = Instant::now();
+        let lpm_root = lpm_common::LpmRoot::from_env()?;
+        let options = Arc::new(options);
+        let workspace_freshness_cache =
+            Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
+        let scheduler = async {
+            let mut active_workspace = Arc::new(workspace);
+            let target_count = targets.len();
+            let scheduling_order = workspace_target_scheduling_order(
+                &targets,
+                resolution_coordinator.is_some() || root_provider_coordinator.is_some(),
+            );
+            let mut plans: Vec<Option<WorkspaceInstallTarget>> =
+                targets.drain(..).map(Some).collect();
+            let mut done = vec![false; target_count];
+            let mut started_at = vec![None::<Instant>; target_count];
+            let mut outcomes: Vec<Option<WorkspaceInstallOutcome>> =
+                (0..target_count).map(|_| None).collect();
+            let mut in_flight: JoinSet<(usize, Result<TargetTaskResult, LpmError>)> =
+                JoinSet::new();
+            let mut first_error: Option<LpmError> = None;
+
+            loop {
+                if first_error.is_none() {
+                    let workspace_union_incomplete = workspace_union_enabled
+                        && workspace_union_participants
+                            .iter()
+                            .any(|index| !done[*index]);
+                    for &index in &scheduling_order {
+                        if workspace_union_incomplete && resolution_task_indices[index].is_none() {
+                            continue;
+                        }
+                        let root_provider_pending = root_provider_coordinator.is_some()
+                            && root_target_index.is_some_and(|root_index| !done[root_index]);
+                        let scheduler_limit = if root_provider_pending {
+                            1
+                        } else if resolution_coordinator.is_some() {
+                            target_count
+                        } else {
+                            concurrency
+                        };
+                        if in_flight.len() >= scheduler_limit {
+                            break;
+                        }
+                        let ready = plans[index].as_ref().is_some_and(|plan| {
+                            if root_provider_pending {
+                                root_target_index == Some(index)
+                            } else {
+                                resolution_task_indices[index].is_some()
+                                    || plan.schedule_after.iter().all(|dep| done[*dep])
+                            }
+                        });
+                        if !ready {
+                            continue;
+                        }
+                        let plan = plans[index].take().expect("ready target plan present");
+                        started_at[index] = Some(Instant::now());
+                        spawn_workspace_target_install(
+                            &mut in_flight,
+                            index,
+                            plan,
+                            client,
+                            &lpm_root,
+                            Arc::clone(&active_workspace),
+                            Arc::clone(&options),
+                            Arc::clone(&materialization_coordinator),
+                            Arc::clone(&workspace_lockfile_coordinator),
+                            Arc::clone(&workspace_project_state_coordinator),
+                            resolution_task_indices[index].and_then(|task_index| {
+                                resolution_coordinator
+                                    .as_ref()
+                                    .map(|coordinator| (Arc::clone(coordinator), task_index))
+                            }),
+                            root_provider_coordinator.as_ref().map(Arc::clone),
+                            Arc::clone(&workspace_freshness_cache),
+                            root_provider_fingerprint.as_ref().map(Arc::clone),
+                            &mut outcomes,
+                        );
+                    }
+                }
+
+                let Some(joined) = in_flight.join_next().await else {
+                    break;
+                };
+                match joined {
+                    Ok((index, Ok(result))) => {
+                        done[index] = true;
+                        if let Some(refreshed) = result.refreshed_workspace {
+                            active_workspace = refreshed;
+                        }
+                        let outcome = outcomes[index]
+                            .as_mut()
+                            .expect("outcome slot initialized at spawn");
+                        outcome.duration_ms = started_at[index]
+                            .map(|start| duration_ms(start.elapsed()))
+                            .unwrap_or_default();
+                        outcome.report = result.report;
+                    }
+                    Ok((index, Err(error))) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        outcomes[index] = None;
+                        if resolution_coordinator.is_some() {
+                            in_flight.abort_all();
+                        }
+                    }
+                    Err(join_error) => {
+                        if first_error.is_none() && !join_error.is_cancelled() {
+                            first_error = Some(LpmError::Script(format!(
+                                "workspace install worker failed: {join_error}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(outcomes.into_iter().flatten().collect::<Vec<_>>()),
+            }
+        };
+        let outcomes = match scheduler.await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                return Err(rollback_workspace_project_state(
+                    &workspace_project_state_coordinator,
+                    error,
+                ));
+            }
+        };
+        let required_importers = outcomes
+            .iter()
+            .map(|outcome| outcome.importer.clone())
+            .collect::<Vec<_>>();
+        let lockfile_committed = match workspace_lockfile_coordinator.commit(&required_importers) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return Err(rollback_workspace_project_state(
+                    &workspace_project_state_coordinator,
+                    error,
+                ));
+            }
+        };
+        workspace_project_state_coordinator.commit();
+        if lockfile_committed {
+            workspace_lockfile::remove_member_lockfiles(&legacy_importers);
+        }
+
         emit_workspace_install_report(
-            &workspace.root,
-            &[],
+            &workspace_root,
+            &outcomes,
             options.json_output,
             options.timing,
             timing_detail_mode,
-            0,
+            duration_ms(started.elapsed()),
         );
-        return Ok(());
+        Ok(())
+    })
+    .await
+}
+
+fn rollback_workspace_project_state(
+    coordinator: &workspace_project_state::WorkspaceProjectStateCoordinator,
+    error: LpmError,
+) -> LpmError {
+    let rollback_errors = coordinator.rollback();
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        LpmError::Script(format!(
+            "{error}; workspace project-state rollback incomplete: {}",
+            rollback_errors.join("; ")
+        ))
     }
+}
 
-    let root_target_index = targets.iter().position(|target| target.kind == "root");
-    let root_provider_fingerprint = root_target_index
-        .and_then(|_| {
-            workspace_resolution::root_provider_fingerprint_from_lockfile(&workspace.root)
-        })
-        .map(Arc::<str>::from);
-    let targets_need_materialization = workspace_targets_need_materialization(&targets);
-    let lockfile_replay_ready = workspace_targets_are_lockfile_replay_ready(
-        &workspace,
-        &targets,
-        &options,
-        root_provider_fingerprint.as_deref(),
-    );
-    let share_local_source_populations = workspace_allows_shared_local_source_populations(&targets);
-    let explicit_concurrency =
-        explicit_workspace_install_concurrency(options.workspace_concurrency).is_some();
-    let automatic_policy = AutomaticWorkspaceInstallPolicy {
-        target_count: targets.len(),
-        dependency_count: targets.iter().fold(0usize, |total, target| {
-            total.saturating_add(target.dependency_count)
-        }),
-        targets_need_materialization,
-        lockfile_replay_ready,
-        offline: options.offline,
-        force: options.force,
-        explicit_concurrency,
-        share_local_source_populations,
-        root_resolve_ahead_eligible: root_target_index
-            .is_some_and(|index| targets[index].resolve_ahead_eligible),
-    };
-    let automatic_parallel_replay = automatic_policy.parallel_replay();
-    let automatic_parallel_fresh = automatic_policy.parallel_fresh();
-    let automatic_fresh_concurrency = automatic_policy.fresh_concurrency();
-    let resolve_ahead = !lockfile_replay_ready
-        && !options.offline
-        && !options.force
-        && !explicit_concurrency
-        && !automatic_parallel_fresh
-        && targets.len() > 1
-        && targets
-            .iter()
-            .all(|target| !target.lifecycle.has_scripts() && target.resolve_ahead_eligible);
-    let release_age_reference_unix = workspace_resolution::current_unix_timestamp();
-    let root_provider_coordinator = root_target_index
-        .filter(|index| {
-            !resolve_ahead
-                && !lockfile_replay_ready
-                && !options.offline
-                && share_local_source_populations
-                && !targets[*index].lifecycle.has_scripts()
-                && targets[*index].resolve_ahead_eligible
-        })
-        .map(|_| {
-            Arc::new(
-                workspace_resolution::WorkspaceRootProviderCoordinator::new_at_unix(
-                    release_age_reference_unix,
-                ),
+fn discover_recursive_workspace(cwd: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
+    lpm_workspace::discover_workspace(cwd)
+        .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))?
+        .ok_or_else(|| {
+            LpmError::Script(
+                "`--recursive` requires a workspace. Run `lpm install` without `--recursive` \
+                 for a standalone project."
+                    .into(),
             )
-        });
-    let concurrency = resolve_workspace_install_concurrency(
-        options.workspace_concurrency,
-        targets.len(),
-        automatic_parallel_replay || automatic_parallel_fresh,
-        if automatic_parallel_fresh {
-            automatic_fresh_concurrency
-        } else {
-            WORKSPACE_INSTALL_AUTOMATIC_MAX_CONCURRENCY
-        },
-    );
-    let resolution_concurrency = automatic_workspace_resolution_concurrency(
-        targets.len(),
-        std::thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY),
-    );
-    tracing::debug!(
-        concurrency,
-        effective_resolution_concurrency = if resolve_ahead {
-            resolution_concurrency
-        } else {
-            0
-        },
-        resolve_ahead,
-        root_provider_serialized = root_provider_coordinator.is_some(),
-        lockfile_replay_ready,
-        share_object_validations = targets_need_materialization,
-        share_local_source_populations,
-        workspace_resource_pools = true,
-        automatic_parallel_replay,
-        automatic_parallel_fresh,
-        "selected recursive workspace install concurrency"
-    );
-    let materialization_coordinator = Arc::new(
-        workspace_materialization::WorkspaceMaterializationCoordinator::new(
-            share_local_source_populations,
-        ),
-    );
-    let resolution_coordinator = resolve_ahead.then(|| {
-        Arc::new(match root_target_index {
-            Some(root_index) => {
-                workspace_resolution::WorkspaceResolutionCoordinator::new_with_root_at_unix(
-                    targets.len(),
-                    resolution_concurrency,
-                    root_index,
-                    release_age_reference_unix,
-                )
-            }
-            None => workspace_resolution::WorkspaceResolutionCoordinator::new_at_unix(
-                targets.len(),
-                resolution_concurrency,
-                release_age_reference_unix,
-            ),
         })
-    });
-    let workspace_client =
-        (!options.offline && targets.len() > 1).then(|| client.clone_with_metadata_memory_cache());
-    let client = workspace_client.as_ref().unwrap_or(client);
-    let workspace_root = workspace.root.clone();
-    let workspace_lock = lpm_common::project_install_lock(&workspace_root);
-    let started = Instant::now();
-    let lpm_root = lpm_common::LpmRoot::from_env()?;
-    let options = Arc::new(options);
-    let workspace_freshness_cache =
-        Arc::new(crate::workspace_discovery_cache::WorkspaceFreshnessCache::default());
-    // The install pipeline future is !Send (the fused resolver keeps
-    // single-threaded caches), so concurrent targets run on a LocalSet.
-    // Downloads, extraction, and link tasks are spawned onto the
-    // multi-thread pool from inside each pipeline, so the heavy work
-    // still fans out across cores; only per-target orchestration and
-    // resolver CPU share this thread.
-    let local_tasks = tokio::task::LocalSet::new();
-    let scheduler = local_tasks.run_until(async {
-        let mut active_workspace = Arc::new(workspace);
-        let target_count = targets.len();
-        let scheduling_order = workspace_target_scheduling_order(
-            &targets,
-            resolution_coordinator.is_some() || root_provider_coordinator.is_some(),
-        );
-        let mut plans: Vec<Option<WorkspaceInstallTarget>> = targets.drain(..).map(Some).collect();
-        let mut done = vec![false; target_count];
-        let mut started_at = vec![None::<Instant>; target_count];
-        let mut outcomes: Vec<Option<WorkspaceInstallOutcome>> =
-            (0..target_count).map(|_| None).collect();
-        let mut in_flight: JoinSet<(usize, Result<TargetTaskResult, LpmError>)> = JoinSet::new();
-        let mut first_error: Option<LpmError> = None;
-
-        loop {
-            if first_error.is_none() {
-                for &index in &scheduling_order {
-                    let root_provider_pending = root_provider_coordinator.is_some()
-                        && root_target_index.is_some_and(|root_index| !done[root_index]);
-                    let scheduler_limit = if root_provider_pending {
-                        1
-                    } else if resolution_coordinator.is_some() {
-                        target_count
-                    } else {
-                        concurrency
-                    };
-                    if in_flight.len() >= scheduler_limit {
-                        break;
-                    }
-                    let ready = plans[index].as_ref().is_some_and(|plan| {
-                        if root_provider_pending {
-                            root_target_index == Some(index)
-                        } else {
-                            resolution_coordinator.is_some()
-                                || plan.schedule_after.iter().all(|dep| done[*dep])
-                        }
-                    });
-                    if !ready {
-                        continue;
-                    }
-                    let plan = plans[index].take().expect("ready target plan present");
-                    started_at[index] = Some(Instant::now());
-                    spawn_workspace_target_install(
-                        &mut in_flight,
-                        index,
-                        plan,
-                        client,
-                        &lpm_root,
-                        Arc::clone(&active_workspace),
-                        Arc::clone(&options),
-                        Arc::clone(&materialization_coordinator),
-                        resolution_coordinator.as_ref().map(Arc::clone),
-                        root_provider_coordinator.as_ref().map(Arc::clone),
-                        Arc::clone(&workspace_freshness_cache),
-                        root_provider_fingerprint.as_ref().map(Arc::clone),
-                        &mut outcomes,
-                    );
-                }
-            }
-
-            let Some(joined) = in_flight.join_next().await else {
-                break;
-            };
-            match joined {
-                Ok((index, Ok(result))) => {
-                    done[index] = true;
-                    if let Some(refreshed) = result.refreshed_workspace {
-                        active_workspace = refreshed;
-                    }
-                    let outcome = outcomes[index]
-                        .as_mut()
-                        .expect("outcome slot initialized at spawn");
-                    outcome.duration_ms = started_at[index]
-                        .map(|start| duration_ms(start.elapsed()))
-                        .unwrap_or_default();
-                    outcome.report = result.report;
-                }
-                Ok((index, Err(error))) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                    outcomes[index] = None;
-                    if resolution_coordinator.is_some() {
-                        in_flight.abort_all();
-                    }
-                }
-                Err(join_error) => {
-                    if first_error.is_none() && !join_error.is_cancelled() {
-                        first_error = Some(LpmError::Script(format!(
-                            "workspace install worker failed: {join_error}"
-                        )));
-                    }
-                }
-            }
-        }
-
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(outcomes.into_iter().flatten().collect::<Vec<_>>()),
-        }
-    });
-    let outcomes = lpm_common::with_exclusive_lock_async(workspace_lock, scheduler).await?;
-
-    emit_workspace_install_report(
-        &workspace_root,
-        &outcomes,
-        options.json_output,
-        options.timing,
-        timing_detail_mode,
-        duration_ms(started.elapsed()),
-    );
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -429,7 +575,14 @@ fn spawn_workspace_target_install(
     materialization_coordinator: Arc<
         workspace_materialization::WorkspaceMaterializationCoordinator,
     >,
-    resolution_coordinator: Option<Arc<workspace_resolution::WorkspaceResolutionCoordinator>>,
+    workspace_lockfile_coordinator: Arc<workspace_lockfile::WorkspaceLockfileCoordinator>,
+    workspace_project_state_coordinator: Arc<
+        workspace_project_state::WorkspaceProjectStateCoordinator,
+    >,
+    resolution_task: Option<(
+        Arc<workspace_resolution::WorkspaceResolutionCoordinator>,
+        usize,
+    )>,
     root_provider_coordinator: Option<Arc<workspace_resolution::WorkspaceRootProviderCoordinator>>,
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
@@ -437,6 +590,7 @@ fn spawn_workspace_target_install(
 ) {
     outcomes[index] = Some(WorkspaceInstallOutcome {
         name: plan.name.clone(),
+        importer: plan.importer.clone(),
         path: plan.path.clone(),
         kind: plan.kind,
         duration_ms: 0,
@@ -444,8 +598,9 @@ fn spawn_workspace_target_install(
     });
     let client = client.clone_with_config();
     let lpm_root = lpm_root.clone();
-    in_flight.spawn_local(async move {
+    in_flight.spawn(assert_send(async move {
         let is_root = plan.kind == "root";
+        let importer = Arc::<str>::from(plan.importer.as_str());
         let install = run_workspace_target_install(
             plan,
             client,
@@ -464,12 +619,27 @@ fn spawn_workspace_target_install(
             }
         };
         let install = workspace_materialization::scope(materialization_coordinator, install);
-        let result = match resolution_coordinator {
-            Some(coordinator) => workspace_resolution::scope(coordinator, index, install).await,
+        let install = workspace_lockfile::scope(workspace_lockfile_coordinator, importer, install);
+        let install = workspace_project_state::scope(
+            workspace_project_state_coordinator,
+            index,
+            Box::pin(install),
+        );
+        let result = match resolution_task {
+            Some((coordinator, task_index)) => {
+                workspace_resolution::scope(coordinator, task_index, install).await
+            }
             None => install.await,
         };
         (index, result)
-    });
+    }));
+}
+
+fn assert_send<F>(future: F) -> F
+where
+    F: std::future::Future + Send,
+{
+    future
 }
 
 async fn run_workspace_target_install(
@@ -508,7 +678,7 @@ async fn run_workspace_target_install(
     };
 
     let capture = options.json_output.then(report_capture::new_capture);
-    let install = run_with_options_with_lpm_root(
+    let install = assert_send(run_with_options_with_lpm_root(
         &client,
         &plan.path,
         options.json_output,
@@ -543,7 +713,7 @@ async fn run_workspace_target_install(
         options.json_output,
         false,
         lpm_root,
-    );
+    ));
     match &capture {
         Some(capture) => {
             crate::workspace_discovery_cache::scope(
@@ -682,10 +852,33 @@ fn workspace_targets_need_materialization(targets: &[WorkspaceInstallTarget]) ->
         .any(|target| !target.path.join("node_modules").is_dir())
 }
 
-fn workspace_allows_shared_local_source_populations(targets: &[WorkspaceInstallTarget]) -> bool {
-    targets
-        .iter()
-        .all(|target| target.kind == "root" || !target.lifecycle.has_scripts())
+fn scripted_local_source_provider_roots(targets: &[WorkspaceInstallTarget]) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(targets.len());
+    for target in targets {
+        if target.kind == "root"
+            || !target.has_workspace_dependents
+            || !target.lifecycle.has_scripts()
+        {
+            continue;
+        }
+        roots.push(
+            target
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| target.path.clone()),
+        );
+    }
+    roots
+}
+
+fn root_requires_serialized_provider_resolution(
+    root: &WorkspaceInstallTarget,
+    participates_in_union: bool,
+) -> bool {
+    root.dependency_count > 0
+        && !participates_in_union
+        && !root.lifecycle.has_scripts()
+        && root.resolve_ahead_eligible
 }
 
 fn package_install_dependency_count(package: &lpm_workspace::PackageJson) -> usize {
@@ -697,10 +890,33 @@ fn package_install_dependency_count(package: &lpm_workspace::PackageJson) -> usi
         .saturating_add(package.peer_dependencies.len())
 }
 
+fn package_declares_dependency(package: &lpm_workspace::PackageJson, name: &str) -> bool {
+    package.dependencies.contains_key(name)
+        || package.dev_dependencies.contains_key(name)
+        || package.optional_dependencies.contains_key(name)
+        || package.peer_dependencies.contains_key(name)
+}
+
+fn package_has_registry_resolution_roots(
+    package: &lpm_workspace::PackageJson,
+    workspace: &lpm_workspace::Workspace,
+) -> bool {
+    let mut dependencies = manifest_install_deps(package);
+    normalize_jsr_manifest_deps(&mut dependencies).is_ok()
+        && lpm_workspace::resolve_catalog_protocol(
+            &mut dependencies,
+            &workspace.root_package.catalogs,
+        )
+        .is_ok()
+        && extract_workspace_protocol_deps(&mut dependencies, workspace).is_ok()
+        && !dependencies.is_empty()
+}
+
 fn workspace_targets_are_lockfile_replay_ready(
     workspace: &lpm_workspace::Workspace,
     targets: &[WorkspaceInstallTarget],
     options: &RecursiveInstallOptions,
+    lockfile_coordinator: &workspace_lockfile::WorkspaceLockfileCoordinator,
     root_provider_fingerprint: Option<&str>,
 ) -> bool {
     if options.force
@@ -717,6 +933,18 @@ fn workspace_targets_are_lockfile_replay_ready(
     };
     let global_auto_install_peers = global_config.get_bool("auto-install-peers");
 
+    if lockfile_coordinator
+        .preload_existing_projection_metadata(
+            &targets
+                .iter()
+                .map(|target| target.importer.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .is_err()
+    {
+        return false;
+    }
+
     let mut packages_by_path = HashMap::with_capacity(workspace.members.len() + 1);
     packages_by_path.insert(workspace.root.as_path(), &workspace.root_package);
     for member in &workspace.members {
@@ -727,13 +955,19 @@ fn workspace_targets_are_lockfile_replay_ready(
         let Some(package) = packages_by_path.get(target.path.as_path()).copied() else {
             return false;
         };
-        target_lockfile_is_replay_ready(
-            workspace,
-            &target.path,
-            package,
-            global_auto_install_peers,
-            root_provider_fingerprint,
-        )
+        lockfile_coordinator
+            .with_projection_packages(&target.importer, |lockfile, packages| {
+                target_lockfile_is_replay_ready(
+                    workspace,
+                    &target.path,
+                    package,
+                    &lockfile,
+                    packages,
+                    global_auto_install_peers,
+                    root_provider_fingerprint,
+                )
+            })
+            .unwrap_or(false)
     })
 }
 
@@ -741,6 +975,8 @@ fn target_lockfile_is_replay_ready(
     workspace: &lpm_workspace::Workspace,
     project_dir: &Path,
     package: &lpm_workspace::PackageJson,
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
     global_auto_install_peers: Option<bool>,
     root_provider_fingerprint: Option<&str>,
 ) -> bool {
@@ -752,18 +988,14 @@ fn target_lockfile_is_replay_ready(
         return false;
     }
 
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
-        return false;
-    };
     let auto_install_peers = package
         .lpm
         .as_ref()
         .and_then(|lpm| lpm.auto_install_peers)
         .or(global_auto_install_peers)
         .unwrap_or(true);
-    if lockfile_needs_peer_state_repair(&lockfile, auto_install_peers)
-        || lockfile_needs_dependency_engine_repair(&lockfile)
+    if lockfile_needs_peer_state_repair(lockfile, auto_install_peers)
+        || lockfile_needs_dependency_engine_repair(lockfile)
     {
         return false;
     }
@@ -815,14 +1047,17 @@ fn target_lockfile_is_replay_ready(
         return false;
     }
 
-    lockfile_satisfies_fast_path(
-        &lockfile,
+    super::lockfile::lockfile_satisfies_fast_path_with_packages(
+        lockfile,
+        packages,
         project_dir,
         &deps,
         &catalog_resolutions,
         Some(workspace),
-        false,
-        false,
+        super::lockfile::LockfileReplayPolicy {
+            accept_unsafe_sources: false,
+            emit_warnings: false,
+        },
     )
 }
 
@@ -914,16 +1149,29 @@ fn select_workspace_install_targets(
                 .name
                 .clone()
                 .unwrap_or_else(|| graph.members[id].name.clone()),
+            importer: workspace_lockfile::importer_key(&workspace.root, &member.path)?,
             path: member.path.clone(),
             kind: "member",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
                 &member.package,
             ),
             dependency_count: package_install_dependency_count(&member.package),
+            has_registry_resolution_roots: package_has_registry_resolution_roots(
+                &member.package,
+                workspace,
+            ),
             resolve_ahead_eligible: package_allows_resolution_ahead(
                 &member.package,
                 &workspace.root_package.catalogs,
             ),
+            has_workspace_dependents: graph.reverse_edges[id]
+                .iter()
+                .any(|dependent| selected.contains(dependent))
+                || (!filtered
+                    && package_declares_dependency(
+                        &workspace.root_package,
+                        &graph.members[id].name,
+                    )),
             schedule_after: if workspace_edges_usable {
                 graph.edges[id]
                     .iter()
@@ -962,16 +1210,22 @@ fn select_workspace_install_targets(
                 .name
                 .clone()
                 .unwrap_or_else(|| "(workspace root)".into()),
+            importer: ".".to_string(),
             path: workspace.root.clone(),
             kind: "root",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(
                 &workspace.root_package,
             ),
             dependency_count: package_install_dependency_count(&workspace.root_package),
+            has_registry_resolution_roots: package_has_registry_resolution_roots(
+                &workspace.root_package,
+                workspace,
+            ),
             resolve_ahead_eligible: package_allows_resolution_ahead(
                 &workspace.root_package,
                 &workspace.root_package.catalogs,
             ),
+            has_workspace_dependents: false,
             schedule_after,
         });
     }
@@ -1365,6 +1619,17 @@ mod tests {
     }
 
     #[test]
+    fn recursive_workspace_install_parallelizes_replay_when_targets_are_materialized() {
+        let policy = AutomaticWorkspaceInstallPolicy {
+            targets_need_materialization: false,
+            lockfile_replay_ready: true,
+            ..large_fresh_workspace_policy()
+        };
+
+        assert!(policy.parallel_replay());
+    }
+
+    #[test]
     fn recursive_workspace_install_parallelizes_large_safe_fresh_workspaces() {
         let policy = large_fresh_workspace_policy();
 
@@ -1435,13 +1700,37 @@ mod tests {
     }
 
     #[test]
-    fn recursive_workspace_install_keeps_script_bearing_fresh_workspaces_sequential() {
-        let policy = AutomaticWorkspaceInstallPolicy {
-            share_local_source_populations: false,
-            ..large_fresh_workspace_policy()
-        };
+    fn recursive_workspace_install_keeps_non_union_scripted_leaf_parallel() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = workspace_with_scripted_member(directory.path(), false);
+        let targets = select_workspace_install_targets(&workspace, &[], &[], &[], &[]).unwrap();
+        let policy = large_fresh_workspace_policy();
 
-        assert!(!policy.parallel_fresh());
+        assert_eq!(
+            (
+                scripted_local_source_provider_roots(&targets).is_empty(),
+                policy.parallel_fresh(),
+            ),
+            (true, true),
+        );
+    }
+
+    #[test]
+    fn recursive_workspace_scripted_provider_disables_sharing_for_its_source_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = workspace_with_scripted_member(directory.path(), true);
+        let targets = select_workspace_install_targets(&workspace, &[], &[], &[], &[]).unwrap();
+
+        assert_eq!(
+            scripted_local_source_provider_roots(&targets),
+            vec![
+                directory
+                    .path()
+                    .join("packages/provider")
+                    .canonicalize()
+                    .unwrap()
+            ],
+        );
     }
 
     #[test]
@@ -1454,18 +1743,32 @@ mod tests {
         let member = workspace_target("member", "member", &package);
         let root = workspace_target("root", "root", &scripted_root_package);
         let targets = [member, root];
-        let policy = AutomaticWorkspaceInstallPolicy {
-            share_local_source_populations: workspace_allows_shared_local_source_populations(
-                &targets,
-            ),
-            ..large_fresh_workspace_policy()
-        };
+        let policy = large_fresh_workspace_policy();
 
         assert!(policy.parallel_fresh());
         assert_eq!(
             workspace_target_scheduling_order(&targets, false),
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn recursive_workspace_scripted_root_does_not_disable_union_resolution_for_eligible_members() {
+        let mut root_package = replay_ready_package();
+        root_package
+            .scripts
+            .insert("prepare".to_string(), "node prepare.js".to_string());
+        let root = workspace_target("root", "root", &root_package);
+
+        assert!(!root_requires_serialized_provider_resolution(&root, false));
+    }
+
+    #[test]
+    fn recursive_workspace_scriptless_nonparticipant_root_keeps_serialized_provider_resolution() {
+        let root = workspace_target("root", "root", &replay_ready_package());
+
+        assert!(root_requires_serialized_provider_resolution(&root, false));
+        assert!(!root_requires_serialized_provider_resolution(&root, true));
     }
 
     #[test]
@@ -1621,36 +1924,25 @@ mod tests {
     #[test]
     fn recursive_workspace_install_rejects_missing_lockfile_for_automatic_parallelism() {
         let directory = tempfile::tempdir().expect("create workspace temp directory");
-        let package = replay_ready_package();
-        let workspace = replay_ready_workspace(directory.path(), package.clone());
+        let coordinator =
+            workspace_lockfile::WorkspaceLockfileCoordinator::new(directory.path(), &[])
+                .expect("initialize workspace lockfile coordinator");
 
-        assert!(!target_lockfile_is_replay_ready(
-            &workspace,
-            directory.path(),
-            &package,
-            None,
-            None,
-        ));
+        assert!(coordinator.projection(".").is_err());
     }
 
     #[test]
     fn recursive_workspace_install_rejects_malformed_lockfile_for_automatic_parallelism() {
         let directory = tempfile::tempdir().expect("create workspace temp directory");
-        let package = replay_ready_package();
-        let workspace = replay_ready_workspace(directory.path(), package.clone());
         std::fs::write(
             directory.path().join(lpm_lockfile::LOCKFILE_NAME),
             "not a lockfile\n",
         )
         .expect("write malformed lockfile");
 
-        assert!(!target_lockfile_is_replay_ready(
-            &workspace,
-            directory.path(),
-            &package,
-            None,
-            None,
-        ));
+        assert!(
+            workspace_lockfile::WorkspaceLockfileCoordinator::new(directory.path(), &[]).is_err()
+        );
     }
 
     #[test]
@@ -1659,11 +1951,15 @@ mod tests {
         let package = replay_ready_package();
         let workspace = replay_ready_workspace(directory.path(), package.clone());
         write_replay_ready_lockfile(directory.path(), &package, "^4.16.0");
+        let lockfile = read_replay_ready_lockfile(directory.path());
+        let packages = lockfile.packages.iter().collect::<Vec<_>>();
 
         assert!(!target_lockfile_is_replay_ready(
             &workspace,
             directory.path(),
             &package,
+            &lockfile,
+            &packages,
             None,
             None,
         ));
@@ -1675,11 +1971,42 @@ mod tests {
         let package = replay_ready_package();
         let workspace = replay_ready_workspace(directory.path(), package.clone());
         write_replay_ready_lockfile(directory.path(), &package, "^4.17.0");
+        let lockfile = read_replay_ready_lockfile(directory.path());
+        let packages = lockfile.packages.iter().collect::<Vec<_>>();
 
         assert!(target_lockfile_is_replay_ready(
             &workspace,
             directory.path(),
             &package,
+            &lockfile,
+            &packages,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn recursive_workspace_preflight_uses_the_preloaded_lockfile_after_file_removal() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let package = replay_ready_package();
+        let workspace = replay_ready_workspace(directory.path(), package.clone());
+        write_replay_ready_lockfile(directory.path(), &package, "^4.17.0");
+        let coordinator =
+            workspace_lockfile::WorkspaceLockfileCoordinator::new(directory.path(), &[])
+                .expect("preload workspace lockfile");
+        std::fs::remove_file(directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("remove lockfile after preload");
+        let preloaded = coordinator
+            .projection(".")
+            .expect("project preloaded root importer");
+        let packages = preloaded.packages.iter().collect::<Vec<_>>();
+
+        assert!(target_lockfile_is_replay_ready(
+            &workspace,
+            directory.path(),
+            &package,
+            &preloaded,
+            &packages,
             None,
             None,
         ));
@@ -1714,7 +2041,6 @@ mod tests {
             offline: false,
             force: false,
             explicit_concurrency: false,
-            share_local_source_populations: true,
             root_resolve_ahead_eligible: true,
         }
     }
@@ -1725,11 +2051,14 @@ mod tests {
     ) -> WorkspaceInstallTarget {
         WorkspaceInstallTarget {
             name: "replay-ready".to_string(),
+            importer: ".".to_string(),
             path: path.to_path_buf(),
             kind: "root",
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
             dependency_count: package_install_dependency_count(package),
+            has_registry_resolution_roots: package_install_dependency_count(package) > 0,
             resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
+            has_workspace_dependents: false,
             schedule_after: Vec::new(),
         }
     }
@@ -1741,11 +2070,14 @@ mod tests {
     ) -> WorkspaceInstallTarget {
         WorkspaceInstallTarget {
             name: path.to_string(),
+            importer: if kind == "root" { "." } else { path }.to_string(),
             path: PathBuf::from(path),
             kind,
             lifecycle: crate::commands::root_lifecycle::RootProjectLifecycle::from_package(package),
             dependency_count: package_install_dependency_count(package),
+            has_registry_resolution_roots: package_install_dependency_count(package) > 0,
             resolve_ahead_eligible: package_allows_resolution_ahead(package, &package.catalogs),
+            has_workspace_dependents: false,
             schedule_after: Vec::new(),
         }
     }
@@ -1770,6 +2102,50 @@ mod tests {
             root: root.to_path_buf(),
             root_package: package,
             members: Vec::new(),
+        }
+    }
+
+    fn workspace_with_scripted_member(
+        root: &Path,
+        provider_has_consumer: bool,
+    ) -> lpm_workspace::Workspace {
+        let provider_path = root.join("packages/provider");
+        let consumer_path = root.join("packages/consumer");
+        std::fs::create_dir_all(&provider_path).unwrap();
+        std::fs::create_dir_all(&consumer_path).unwrap();
+
+        let mut provider = lpm_workspace::PackageJson {
+            name: Some("provider".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..lpm_workspace::PackageJson::default()
+        };
+        provider
+            .scripts
+            .insert("postinstall".to_string(), "node -e 0".to_string());
+        let mut consumer = lpm_workspace::PackageJson {
+            name: Some("consumer".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..lpm_workspace::PackageJson::default()
+        };
+        if provider_has_consumer {
+            consumer
+                .dependencies
+                .insert("provider".to_string(), "workspace:*".to_string());
+        }
+
+        lpm_workspace::Workspace {
+            root: root.to_path_buf(),
+            root_package: lpm_workspace::PackageJson::default(),
+            members: vec![
+                lpm_workspace::WorkspaceMember {
+                    path: provider_path,
+                    package: provider,
+                },
+                lpm_workspace::WorkspaceMember {
+                    path: consumer_path,
+                    package: consumer,
+                },
+            ],
         }
     }
 
@@ -1812,5 +2188,10 @@ mod tests {
         lockfile
             .write_to_file(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
             .expect("write replay-ready lockfile");
+    }
+
+    fn read_replay_ready_lockfile(project_dir: &Path) -> lpm_lockfile::Lockfile {
+        lpm_lockfile::Lockfile::read_fast(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("read replay-ready lockfile")
     }
 }

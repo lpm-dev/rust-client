@@ -856,7 +856,7 @@ mod tests {
             GraphKey::derive(&consumer_with_react_19),
             "peer-version divergence MUST split link entries — without this, \
              two projects pinning different react majors would share a \
-             single materialization of the consumer's bytes and the v2 \
+             single materialization of the consumer's bytes and the virtual-store \
              store would silently corrupt cross-project peer isolation"
         );
     }
@@ -911,7 +911,7 @@ mod tests {
             "an installed-with-patch wrapper MUST be distinct from an \
              unpatched wrapper of the same coords — without this, \
              project A's patched bytes leak into project B via shared \
-             v2 link materialization"
+             virtual-store link materialization"
         );
     }
 

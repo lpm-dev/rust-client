@@ -109,19 +109,17 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let started = Instant::now();
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !lockfile_path.exists() {
-        return Err(LpmError::NotFound(
-            "no lpm.lock found. Run `lpm install` before `lpm fetch`.".into(),
-        ));
-    }
-
     let target_platform = match platform {
         Some(raw) => FetchPlatform::parse(raw)?,
         None => FetchPlatform::current(),
     };
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read lpm.lock: {e}")))?;
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .map_err(|e| {
+            LpmError::NotFound(format!(
+                "no usable lpm.lock found. Run `lpm install` before `lpm fetch`: {e}"
+            ))
+        })?
+        .lockfile;
 
     let mut targets = Vec::with_capacity(lockfile.packages.len());
     let mut results = Vec::new();
@@ -230,25 +228,29 @@ pub async fn run(
 }
 
 fn v2_store_for_fetch(lpm_root: &LpmRoot) -> Result<Option<Arc<lpm_store::v2::Store>>, LpmError> {
-    if !lpm_store::StoreVersion::from_env().is_v2() {
+    let store_version = lpm_store::StoreVersion::from_env();
+    if !store_version.uses_virtual_store() {
         return Ok(None);
     }
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     Ok(Some(configured_v2_store_for_fetch(
         lpm_root,
         &global_config,
+        store_version,
     )?))
 }
 
 fn configured_v2_store_for_fetch(
     lpm_root: &LpmRoot,
     global_config: &crate::commands::config::GlobalConfig,
+    store_version: lpm_store::StoreVersion,
 ) -> Result<Arc<lpm_store::v2::Store>, LpmError> {
     let object_integrity_policy =
         crate::commands::config::resolve_object_integrity_policy(global_config)?;
     Ok(Arc::new(
-        lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+        lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
             lpm_root,
+            store_version,
             object_integrity_policy,
         ),
     ))
@@ -793,7 +795,9 @@ mod tests {
         );
         let global_config = crate::commands::config::GlobalConfig::from_table(table);
 
-        let store = configured_v2_store_for_fetch(&lpm_root, &global_config).unwrap();
+        let store =
+            configured_v2_store_for_fetch(&lpm_root, &global_config, lpm_store::StoreVersion::V2)
+                .unwrap();
 
         assert_eq!(
             store.object_integrity_policy(),

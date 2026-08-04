@@ -196,14 +196,14 @@ pub(crate) struct InstallArgs {
     #[arg(long)]
     pub(crate) unverified_provenance_all: bool,
 
-    /// Linking mode: `hoisted` (default — v2 hoisted virtual-store layout)
+    /// Linking mode: `hoisted` (default virtual-store layout)
     /// or `isolated` (pnpm-style strict isolation).
     /// Both materialize as project `node_modules/<dep>` symlinks
-    /// into the global virtual store at `~/.lpm/store/v2/links/`,
+    /// into the active global virtual store (v2 by default),
     /// so warm-install latency is identical between modes; the
     /// distinction is whether transitive deps are hoisted within shared
     /// link entries (hoisted) or only through each consumer's own siblings
-    /// (isolated). v2 hoisted mode does not flatten every transitive to
+    /// (isolated). Hoisted mode does not flatten every transitive to
     /// the project root. Unknown values are rejected by clap at parse
     /// time. Overrides `package.json > lpm > linker`,
     /// `~/.lpm/config.toml > linker`, and `LPM_LINKER`.

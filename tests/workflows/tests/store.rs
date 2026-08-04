@@ -206,6 +206,7 @@ fn store_verify_on_empty_store_reports_zero_entries() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("verify --json must be valid JSON: {e}\n---\n{stdout}"));
 
+    insta::assert_json_snapshot!("store_verify_empty_json_envelope", envelope);
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["entries_verified"], serde_json::json!(0));
     assert_eq!(envelope["corrupted"], serde_json::json!(0));
@@ -342,6 +343,14 @@ fn store_verify_deep_fails_when_lockfile_is_unreadable() {
     assert_eq!(
         envelope["check_kind"],
         serde_json::json!("lockfile_marker_consistency")
+    );
+    assert_eq!(
+        envelope["legacy_check_kind"],
+        serde_json::json!("lockfile_marker_consistency")
+    );
+    assert_eq!(
+        envelope["cas"]["check_kind"],
+        serde_json::json!("content_hash")
     );
     let issues = envelope["issues"]
         .as_array()

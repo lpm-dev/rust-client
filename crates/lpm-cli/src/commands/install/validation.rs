@@ -17,7 +17,7 @@ impl FrozenLockfileMode {
         match self {
             Self::Always => true,
             Self::Never => false,
-            Self::Auto => lockfile_path.exists() && install_running_in_ci(),
+            Self::Auto => workspace_lockfile::exists(lockfile_path) && install_running_in_ci(),
         }
     }
 }
@@ -117,6 +117,7 @@ pub(super) fn importer_snapshot_for_current_manifest(
         peer_dependency_rules_fingerprint: peer_rules_fingerprint(pkg),
         auto_install_peers: Some(auto_install_peers),
         workspace_root_peer_providers_fingerprint: None,
+        ..lpm_lockfile::ImporterSnapshot::default()
     }
 }
 
@@ -143,8 +144,10 @@ pub(super) fn validate_install_lockfile_state(
         current_importer_patch_fingerprint,
         input.auto_install_peers,
     );
-    let lockfile_for_validation = if input.lockfile_path.exists() || input.frozen_lockfile_active {
-        match lpm_lockfile::Lockfile::read_fast(input.lockfile_path) {
+    let lockfile_for_validation = if workspace_lockfile::exists(input.lockfile_path)
+        || input.frozen_lockfile_active
+    {
+        match workspace_lockfile::read_metadata_shared(input.lockfile_path) {
             Ok(lockfile) => Some(lockfile),
             Err(e) if input.frozen_lockfile_active => {
                 return Err(LpmError::Registry(format!(
@@ -218,7 +221,7 @@ pub(super) fn validate_install_lockfile_state(
         .and_then(|lockfile| lockfile.importers.get("."))
         != Some(&current_importer_snapshot);
     let prior_verified_provenance = lockfile_for_validation
-        .map(|lockfile| lockfile.provenance)
+        .map(|lockfile| lockfile.provenance.clone())
         .unwrap_or_default();
 
     Ok(LockfileValidationState {

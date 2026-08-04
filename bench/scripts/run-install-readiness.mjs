@@ -464,8 +464,10 @@ function extractLpmMetrics(json) {
   const { metadata, attribution: metadataAttribution, routes: metadataRoutes, versionDocs } =
     lpmMetadataMetrics(json);
   const fetchBreakdown = at(json, ['timing', 'fetch_breakdown']);
-  const fetchOverlap = at(json, ['timing', 'detail', 'fetch', 'overlap']);
+  const fetchDetail = at(json, ['timing', 'detail', 'fetch']);
+  const fetchOverlap = fetchDetail?.overlap;
   const fetchOverlapBreakdown = fetchOverlap?.breakdown;
+  const reusableValidation = fetchDetail?.v2_reusable_validation;
   const firewall =
     at(json, ['timing', 'firewall']) ?? at(json, ['timing', 'detail', 'security', 'firewall']);
   const firewallClient = firewall?.client;
@@ -613,6 +615,24 @@ function extractLpmMetrics(json) {
     fetch_source_scan_max_ns: fetchSourceScanMaxNs,
     fetch_source_scan_sum_ms: nsToMs(fetchSourceScanSumNs),
     fetch_finalize_sum_ms: breakdownStat(fetchBreakdown, 'finalize', 'sum_ms'),
+    cas_source_record_read_count: finiteNumber(reusableValidation?.cas_source_record_read_count),
+    cas_source_record_read_ms: finiteNumber(reusableValidation?.cas_source_record_read_ms),
+    cas_manifest_read_count: finiteNumber(reusableValidation?.cas_manifest_read_count),
+    cas_manifest_read_ms: finiteNumber(reusableValidation?.cas_manifest_read_ms),
+    cas_manifest_validate_ms: finiteNumber(reusableValidation?.cas_manifest_validate_ms),
+    cas_blob_stat_count: finiteNumber(reusableValidation?.cas_blob_stat_count),
+    cas_blob_stat_cache_hit_count: finiteNumber(
+      reusableValidation?.cas_blob_stat_cache_hit_count,
+    ),
+    cas_blob_stat_ms: finiteNumber(reusableValidation?.cas_blob_stat_ms),
+    cas_source_validation_read_count: finiteNumber(
+      reusableValidation?.cas_source_validation_read_count,
+    ),
+    cas_source_validation_read_ms: finiteNumber(
+      reusableValidation?.cas_source_validation_read_ms,
+    ),
+    cas_blob_rehash_count: finiteNumber(reusableValidation?.cas_blob_rehash_count),
+    cas_blob_rehash_ms: finiteNumber(reusableValidation?.cas_blob_rehash_ms),
     fetch_overlap_selected_count: finiteNumber(fetchOverlap?.selected_count),
     fetch_overlap_dispatched_count: finiteNumber(fetchOverlap?.dispatched_count),
     fetch_overlap_completed_count: finiteNumber(fetchOverlap?.completed_count),
@@ -1007,6 +1027,18 @@ function summarizeMetrics(rows) {
     'fetch_source_scan_max_ns',
     'fetch_source_scan_sum_ms',
     'fetch_finalize_sum_ms',
+    'cas_source_record_read_count',
+    'cas_source_record_read_ms',
+    'cas_manifest_read_count',
+    'cas_manifest_read_ms',
+    'cas_manifest_validate_ms',
+    'cas_blob_stat_count',
+    'cas_blob_stat_cache_hit_count',
+    'cas_blob_stat_ms',
+    'cas_source_validation_read_count',
+    'cas_source_validation_read_ms',
+    'cas_blob_rehash_count',
+    'cas_blob_rehash_ms',
     'fetch_overlap_selected_count',
     'fetch_overlap_dispatched_count',
     'fetch_overlap_completed_count',

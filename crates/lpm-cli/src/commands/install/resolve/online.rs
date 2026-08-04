@@ -70,7 +70,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) streaming_metrics: lpm_resolver::StreamingBfsMetrics,
     pub(in crate::commands::install) initial_batch_ms: u128,
     pub(in crate::commands::install) resolver_stage_timing: lpm_resolver::StageTiming,
-    pub(in crate::commands::install) fast_path_lockfile: Option<lpm_lockfile::Lockfile>,
+    pub(in crate::commands::install) fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
     pub(in crate::commands::install) lockfile_peer_context_authoritative: bool,
     pub(in crate::commands::install) needs_binary_upgrade: bool,
     pub(in crate::commands::install) wf_setup_ms: u128,
@@ -196,7 +196,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let streaming_metrics = lpm_resolver::StreamingBfsMetrics::new();
     let mut initial_batch_ms: u128 = 0;
     let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
-    let mut fast_path_lockfile: Option<lpm_lockfile::Lockfile> = None;
+    let mut fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>> = None;
     let mut lockfile_peer_context_authoritative = false;
     let mut needs_binary_upgrade = false;
     let wf_setup_ms = start.elapsed().as_millis();
@@ -386,26 +386,43 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     } else {
                         None
                     };
-                    let res = lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
-                        arc_client.clone(),
-                        resolver_root_dependencies.clone(),
-                        override_set.clone(),
-                        route_table.clone(),
-                        npm_fanout,
-                        (!resolve_ahead).then_some(spec_tx),
-                        shared_cache,
-                        auto_install_peers,
-                        !omit_policy.optional,
-                        resolver_policy.clone(),
-                        selected_package_tx,
-                        workspace_resolution::resolver_fact_cache_for_importer(&route_table),
-                        workspace_resolution::resolver_metadata_concurrency_for_importer(
-                            &route_table,
+                    let union_result = workspace_resolution::resolve_workspace_union(
+                        workspace_resolution::WorkspaceUnionRequest {
+                            client: arc_client.clone(),
+                            root_dependencies: resolver_root_dependencies.clone(),
+                            overrides: override_set.clone(),
+                            route_table: route_table.clone(),
                             npm_fanout,
-                        ),
+                            shared_cache: Arc::clone(&shared_cache),
+                            auto_install_peers,
+                            include_optional_dependencies: !omit_policy.optional,
+                            policy: resolver_policy.clone(),
+                        },
                     )
-                    .await
-                    .map_err(crate::resolver_error::resolver_error_to_lpm);
+                    .await?;
+                    let res = match union_result {
+                        Some(result) => Ok(result),
+                        None => lpm_resolver::resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
+                            arc_client.clone(),
+                            resolver_root_dependencies.clone(),
+                            override_set.clone(),
+                            route_table.clone(),
+                            npm_fanout,
+                            (!resolve_ahead).then_some(spec_tx),
+                            shared_cache,
+                            auto_install_peers,
+                            !omit_policy.optional,
+                            resolver_policy.clone(),
+                            selected_package_tx,
+                            workspace_resolution::resolver_fact_cache_for_importer(&route_table),
+                            workspace_resolution::resolver_metadata_concurrency_for_importer(
+                                &route_table,
+                                npm_fanout,
+                            ),
+                        )
+                        .await
+                        .map_err(crate::resolver_error::resolver_error_to_lpm),
+                    };
 
                     speculation_join = Some(SpeculationJoin {
                         producer: None,

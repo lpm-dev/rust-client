@@ -152,6 +152,18 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "promotes certificate and key staging files that were themselves installed by the shared secure writer",
     ),
     (
+        "crates/lpm-cli/src/commands/cache_prune.rs::remove_via_prune_tombstone",
+        "moves an orphan into a randomized tombstone before recursive deletion",
+    ),
+    (
+        "crates/lpm-cli/src/commands/install/workspace_project_state.rs::move_to_backup",
+        "moves project-owned install state into an exclusively created rollback directory before replacement",
+    ),
+    (
+        "crates/lpm-cli/src/commands/install/workspace_project_state.rs::rollback_inner",
+        "restores complete project-owned paths from the transaction's exclusively created rollback directory",
+    ),
+    (
         "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
         "NamedTempFile exclusively creates a randomized sibling before persist",
     ),
@@ -276,12 +288,20 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "writes are inside an object staging directory that is published as a directory transaction",
     ),
     (
-        "crates/lpm-store/src/v2/store.rs::populate_object_from_v1",
+        "crates/lpm-store/src/v2/store.rs::populate_object_from_existing_tree",
         "writes are inside an object staging directory that is published as a directory transaction",
     ),
     (
         "crates/lpm-store/src/v2/store.rs::populate_link_entry_inner",
         "publishes a complete link-entry directory after staging",
+    ),
+    (
+        "crates/lpm-store/src/v3/cas.rs::quarantine_entry",
+        "moves a corrupt CAS entry to a randomized quarantine path without rewriting its contents",
+    ),
+    (
+        "crates/lpm-store/src/v3/cas.rs::replace_with_hardlink",
+        "swaps a duplicate object file for its validated CAS hardlink with a randomized rollback backup",
     ),
     (
         "crates/lpm-tunnel/src/webhook_log.rs::perform_rotation",

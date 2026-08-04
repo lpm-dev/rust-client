@@ -5,11 +5,11 @@ use crate::doctor_catalog;
 use super::check::Check;
 
 pub(super) fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
-    let lockfile = project_dir.join("lpm.lock");
-    let lockb_path = project_dir.join("lpm.lockb");
     let mut checks = Vec::new();
 
-    if lockfile.exists() {
+    if let Ok(project) = lpm_lockfile::Lockfile::read_for_project(project_dir) {
+        let lockfile = project.path;
+        let lockb_path = lockfile.with_extension("lockb");
         checks.push(Check::pass(&doctor_catalog::LOCKFILE_PRESENT, "lpm.lock"));
 
         let lockfile_data = lpm_lockfile::Lockfile::read_from_file(&lockfile).ok();
@@ -75,10 +75,16 @@ pub(super) fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
 
 /// Check .gitattributes state: exists and has lpm.lockb binary marker.
 pub(super) fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
-    let lockfile = project_dir.join("lpm.lock");
-    let lockb_path = project_dir.join("lpm.lockb");
-    let ga_path = project_dir.join(".gitattributes");
     let mut checks = Vec::new();
+    let Ok(project) = lpm_lockfile::Lockfile::read_for_project(project_dir) else {
+        return checks;
+    };
+    let lockfile = project.path;
+    let lockb_path = lockfile.with_extension("lockb");
+    let ga_path = lockfile
+        .parent()
+        .unwrap_or(project_dir)
+        .join(".gitattributes");
 
     if lockb_path.exists() || lockfile.exists() {
         if ga_path.exists() {
@@ -109,10 +115,9 @@ pub(super) fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
 
 /// Fix: reconcile `lpm.lockb` with `lpm.lock`.
 pub(super) fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
-    let lock_path = project_dir.join("lpm.lock");
-    if !lock_path.exists() {
-        return Err("lpm.lock not found — cannot reconcile lpm.lockb".into());
-    }
+    let lock_path = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .map_err(|_| "lpm.lock not found — cannot reconcile lpm.lockb".to_string())?
+        .path;
     let lf = lpm_lockfile::Lockfile::read_from_file(&lock_path)
         .map_err(|e| format!("read lpm.lock failed: {e}"))?;
     lf.write_all(&lock_path)
@@ -121,7 +126,11 @@ pub(super) fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
 
 /// Fix: ensure `.gitattributes` marks `lpm.lockb` as binary.
 pub(super) fn fix_gitattributes(project_dir: &Path) -> Result<(), String> {
-    lpm_lockfile::ensure_gitattributes(project_dir)
+    let root = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .ok()
+        .and_then(|project| project.path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| project_dir.to_path_buf());
+    lpm_lockfile::ensure_gitattributes(&root)
         .map_err(|e| format!(".gitattributes update failed: {e}"))
 }
 
@@ -131,14 +140,14 @@ pub(super) fn fix_gitattributes(project_dir: &Path) -> Result<(), String> {
 /// Detects "lockfile out of date" drift.
 pub(super) fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
     let pkg_json_path = project_dir.join("package.json");
-    let lockfile_path = project_dir.join("lpm.lock");
-
     let pkg_content =
         lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .ok()?;
     let pkg: serde_json::Value = serde_json::from_str(&pkg_content).ok()?;
 
-    let lockfile = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).ok()?;
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .ok()?
+        .lockfile;
 
     // Collect all dep names from package.json
     let mut declared_deps: Vec<String> = Vec::new();

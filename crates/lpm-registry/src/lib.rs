@@ -22,7 +22,7 @@ pub use npmrc::{
     NpmrcConfig, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,
     TaggedBool, TaggedPath, TaggedRoot, TlsOverrides,
 };
-pub use route::{NpmrcLoadErrors, RouteMode, RouteTable, UpstreamRoute};
+pub use route::{NpmrcLoadErrors, RouteMode, RouteTable, UpstreamRoute, WorkspaceResolutionKey};
 pub use tls_identity::{
     EnvThenTtyPassphrase, KEY_PASSPHRASE_ENV, LoadedIdentity, PassphraseCache, PassphraseProvider,
     load_identity,

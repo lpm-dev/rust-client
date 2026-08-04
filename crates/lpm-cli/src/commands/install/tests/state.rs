@@ -4,13 +4,15 @@
 /// package.json, lpm.lock, node_modules/, .lpm/install-hash.
 fn setup_installed_project(dir: &std::path::Path) {
     let pkg = r#"{"name":"test","dependencies":{"lodash":"^4.0.0"}}"#;
-    let lock = "[packages]\nname = \"lodash\"\nversion = \"4.17.21\"\n";
 
     std::fs::write(dir.join("package.json"), pkg).unwrap();
-    std::fs::write(dir.join("lpm.lock"), lock).unwrap();
+    lpm_lockfile::Lockfile::default()
+        .write_all(&dir.join(lpm_lockfile::LOCKFILE_NAME))
+        .unwrap();
     std::fs::create_dir_all(dir.join("node_modules")).unwrap();
 
-    let hash = crate::install_state::compute_install_hash(pkg, lock);
+    let lock = crate::commands::install::workspace_lockfile::active_lockfile_content(dir);
+    let hash = crate::install_state::compute_install_hash(pkg, &lock);
     std::fs::create_dir_all(dir.join(".lpm")).unwrap();
     std::fs::write(dir.join(".lpm").join("install-hash"), &hash).unwrap();
 }
@@ -41,13 +43,13 @@ fn fast_exit_allows_v2_compatibility_root() {
     )
     .unwrap();
     let pkg = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
-    let lock = std::fs::read_to_string(dir.path().join("lpm.lock")).unwrap();
+    let lock = crate::commands::install::workspace_lockfile::active_lockfile_content(dir.path());
     let hash = crate::install_state::compute_install_hash(&pkg, &lock);
     std::fs::write(dir.path().join(".lpm").join("install-hash"), hash).unwrap();
 
     assert!(
         crate::install_state::check_install_state(dir.path()).up_to_date,
-        "v2 compatibility islands must not look like legacy v1 wrapper state"
+        "virtual-store compatibility islands must not look like legacy v1 wrapper state"
     );
 }
 
@@ -75,11 +77,9 @@ fn fast_exit_fails_when_lockfile_changed() {
     setup_installed_project(dir.path());
 
     // Simulate lockfile update
-    std::fs::write(
-        dir.path().join("lpm.lock"),
-        "[packages]\nname = \"lodash\"\nversion = \"4.17.22\"\n",
-    )
-    .unwrap();
+    lpm_lockfile::Lockfile::new_with_resolver("changed-test-resolver")
+        .write_all(&dir.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .unwrap();
 
     assert!(
         !crate::install_state::check_install_state(dir.path()).up_to_date,

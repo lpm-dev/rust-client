@@ -2,7 +2,7 @@
 
 mod support;
 
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, workspace_projection_project};
 
 fn seed_project() -> TempProject {
     let project = TempProject::empty(
@@ -52,6 +52,28 @@ fn seed_project() -> TempProject {
         }"#,
     );
     project
+}
+
+#[test]
+fn licenses_from_workspace_member_exclude_sibling_lockfile_projection() {
+    let project = workspace_projection_project();
+    let mut command = lpm(&project);
+    command.current_dir(project.path().join("packages/app"));
+    let output = command
+        .args(["licenses", "--json"])
+        .output()
+        .expect("run licenses from workspace member");
+
+    assert!(
+        output.status.success(),
+        "member licenses must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("licenses stdout must be valid JSON");
+    assert!(package_scope(&envelope, "app-only").is_some());
+    assert!(package_scope(&envelope, "sibling-only").is_none());
 }
 
 #[test]

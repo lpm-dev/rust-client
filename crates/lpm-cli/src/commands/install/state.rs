@@ -7,11 +7,7 @@ pub(super) fn write_post_install_hash(
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
-    let lock = lpm_common::read_text_file_capped(
-        &project_dir.join("lpm.lock"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    )
-    .unwrap_or_default();
+    let lock = workspace_lockfile::active_lockfile_content(project_dir);
     let dependency_engine_key = dependency_engine_policy.freshness_key(&lock);
     let node_runtime_fingerprint = match dependency_engine_key.as_str() {
         "none" | "legacy" => None,
@@ -45,11 +41,7 @@ fn write_post_install_hash_with_context(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .unwrap_or_default();
-    let lock = lpm_common::read_text_file_capped(
-        &project_dir.join("lpm.lock"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    )
-    .unwrap_or_default();
+    let lock = workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v10(
@@ -248,7 +240,7 @@ pub(super) async fn run_install_freshness_phase(
             input.security_analysis_policy,
         );
     let setup_install_state_ms = setup_state_t.elapsed().as_millis();
-    let compatibility_bins_ready = !input.store_version.is_v2()
+    let compatibility_bins_ready = !input.store_version.uses_virtual_store()
         || input.compatibility_bin_names.is_empty()
         || lpm_linker::v2::project_compatibility_bins_ready(
             input.project_dir,
@@ -273,7 +265,7 @@ pub(super) async fn run_install_freshness_phase(
             .and_then(|(lockfile_deps, workspace_deps_filtered)| {
                 if workspace_deps_filtered
                     && lockfile_deps.is_empty()
-                    && lpm_lockfile::Lockfile::exists(input.lockfile_path)
+                    && workspace_lockfile::exists(input.lockfile_path)
                 {
                     return Some(Vec::new());
                 }
@@ -468,8 +460,8 @@ pub(super) fn source_analysis_caches_are_current(
 
     let store_v1 = PackageStore::from_root(lpm_root);
     let store_v2 = store_version
-        .is_v2()
-        .then(|| lpm_store::v2::Store::from_lpm_root(lpm_root));
+        .uses_virtual_store()
+        .then(|| lpm_store::v2::Store::from_lpm_root_for_version(lpm_root, store_version));
     let mut checked = HashSet::with_capacity(packages.len());
     for package in packages {
         let package_dir = if let Some(store_v2) = store_v2.as_ref() {
@@ -599,8 +591,13 @@ fn dependency_engine_freshness_key_for_state(
         return decision.key;
     }
 
-    let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
-    policy.freshness_key(&lockfile)
+    if workspace_lockfile::active() {
+        let lockfile = workspace_lockfile::active_lockfile_content(project_dir);
+        policy.freshness_key(&lockfile)
+    } else {
+        let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
+        policy.freshness_key(&lockfile)
+    }
 }
 
 struct CachedDependencyEngineState<'a> {
@@ -699,12 +696,16 @@ pub(super) fn materialize_empty_install_artifacts(
     lockfile
         .importers
         .insert(".".to_string(), current_importer_snapshot.clone());
-    lockfile
-        .write_all(&lockfile_path)
-        .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
+    if !workspace_lockfile::stage(&lockfile) {
+        lockfile
+            .write_all(&lockfile_path)
+            .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
+    }
 
-    lpm_lockfile::ensure_gitattributes(project_dir)
-        .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+    if !workspace_lockfile::active() {
+        lpm_lockfile::ensure_gitattributes(project_dir)
+            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+    }
 
     std::fs::create_dir_all(project_dir.join("node_modules")).map_err(LpmError::Io)?;
     Ok(())

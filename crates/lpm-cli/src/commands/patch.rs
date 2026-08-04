@@ -67,28 +67,26 @@ pub async fn run_patch(project_dir: &Path, input: &str, json_output: bool) -> Re
 /// exercise `lpm patch <name>@<exact>` on projects with no lockfile,
 /// and that capability must be preserved).
 fn read_lockfile_for_patch_selector(project_dir: &Path) -> Result<Lockfile, LpmError> {
-    let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !Lockfile::exists(&lock_path) {
-        return Err(LpmError::Script(
+    match Lockfile::read_for_project(project_dir) {
+        Ok(project) => Ok(project.lockfile),
+        Err(lpm_lockfile::LockfileError::NotFound(_)) => Err(LpmError::Script(
             "bare-name and semver-range selectors require a project lockfile. \
              Run `lpm install` first, or pass an exact pin like \
              `lpm patch <name>@<version>`."
                 .into(),
-        ));
+        )),
+        Err(error) => Err(LpmError::Script(format!(
+            "failed to read project lockfile: {error}"
+        ))),
     }
-    Lockfile::read_from_file(&lock_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read project lockfile at {lock_path:?}: {e}"
-        ))
-    })
 }
 
 async fn run_patch_inner(name: String, version: String, json_output: bool) -> Result<(), LpmError> {
     // Lookup goes
     // through `find_installed_package_baseline`, which prefers the
-    // v2 virtual store (default) and falls back to v1.
+    // default v2, then experimental v3, and falls back to v1.
     // Pre-fix this called `store.has_package(...)` (v1-only), which
-    // always returned false under v2 → "not in the global store".
+    // always returned false under virtual stores → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;
     let baseline =
         find_installed_package_baseline(&lpm_root, &name, &version)?.ok_or_else(|| {
@@ -98,7 +96,7 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
             ))
         })?;
     // Seed the staging copy from
-    // the PRISTINE bytes — `objects/<sri>/` under v2, or the v1 store
+    // the PRISTINE bytes — the virtual-store object projection, or the v1 store
     // dir (which v1 patches never mutate). Reading `package_dir` on
     // an already-patched v2 link entry would seed the staging dir
     // with previously-applied edits, defeating the workflow.
@@ -295,21 +293,49 @@ async fn run_patch_commit_inner(
     //    so the file is portable across platforms.
     let safe_key = key.replace('/', "__");
     let patches_dir = project_dir.join("patches");
+    let patches_dir_existed = patches_dir.exists();
     std::fs::create_dir_all(&patches_dir).map_err(LpmError::Io)?;
     let patch_file_rel = format!("patches/{safe_key}.patch");
     let patch_file_abs = project_dir.join(&patch_file_rel);
+    let project_dirs = [project_dir.to_path_buf()];
+    let mutation =
+        crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
+            project_dir,
+            &project_dirs,
+            async {
+                let pkg_json_path = project_dir.join("package.json");
+                let lockfile_path =
+                    crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+                let lockfile_binary_path = lockfile_path.with_extension("lockb");
+                let gitattributes_path = lockfile_path.with_file_name(".gitattributes");
+                let install_hash_path = project_dir.join(".lpm").join("install-hash");
+                let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                    &[pkg_json_path.as_path()],
+                    &[
+                        patch_file_abs.as_path(),
+                        lockfile_path.as_path(),
+                        lockfile_binary_path.as_path(),
+                        gitattributes_path.as_path(),
+                    ],
+                    &[install_hash_path.as_path()],
+                )?;
 
-    lpm_common::write_file_atomic(&patch_file_abs, generated.diff.as_bytes())
-        .map_err(LpmError::Io)?;
-
-    // 6. Update package.json — JSON Value mutation pattern, mirror of
-    //    add.rs. Roll back the patch file write if package.json fails.
-    if let Err(e) = update_package_json_patches(project_dir, key, &patch_file_rel, &integrity) {
-        let _ = std::fs::remove_file(&patch_file_abs);
-        return Err(e);
+                lpm_common::write_file_atomic(&patch_file_abs, generated.diff.as_bytes())
+                    .map_err(LpmError::Io)?;
+                update_package_json_patches(project_dir, key, &patch_file_rel, &integrity)?;
+                let lockfile_updated =
+                    upsert_lockfile_patch_record(project_dir, key, &patch_file_rel, &integrity)?;
+                crate::commands::install::workspace_lockfile::commit_manifest_transaction(
+                    transaction,
+                );
+                Ok(lockfile_updated)
+            },
+        )
+        .await;
+    if mutation.is_err() && !patches_dir_existed {
+        let _ = std::fs::remove_dir(&patches_dir);
     }
-    let lockfile_updated =
-        upsert_lockfile_patch_record(project_dir, key, &patch_file_rel, &integrity)?;
+    let lockfile_updated = mutation?;
 
     // 7. Clean up the staging dir on success. Best-effort — we don't
     //    fail the command if cleanup hiccups.
@@ -369,12 +395,49 @@ pub async fn run_patch_remove(
     keep_file: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let outcome = remove_package_json_patches(project_dir, selectors, dry_run, keep_file)?;
-    let removed_keys: BTreeSet<String> = outcome.removed.iter().map(|r| r.key.clone()).collect();
-    let lockfile_updated = if dry_run {
-        false
+    let (outcome, lockfile_updated) = if dry_run {
+        (
+            remove_package_json_patches(project_dir, selectors, true, keep_file)?,
+            false,
+        )
     } else {
-        remove_lockfile_patch_records(project_dir, &removed_keys)?
+        let project_dirs = [project_dir.to_path_buf()];
+        crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
+            project_dir,
+            &project_dirs,
+            async {
+                let plan =
+                    plan_package_json_patch_removal(project_dir, selectors, false, keep_file)?;
+                let pkg_json_path = project_dir.join("package.json");
+                let lockfile_path =
+                    crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+                let lockfile_binary_path = lockfile_path.with_extension("lockb");
+                let gitattributes_path = lockfile_path.with_file_name(".gitattributes");
+                let install_hash_path = project_dir.join(".lpm").join("install-hash");
+                let mut optional = Vec::with_capacity(plan.files_to_delete.len() + 3);
+                optional.push(lockfile_path.as_path());
+                optional.push(lockfile_binary_path.as_path());
+                optional.push(gitattributes_path.as_path());
+                optional.extend(plan.files_to_delete.values().map(PathBuf::as_path));
+                let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                    &[pkg_json_path.as_path()],
+                    &optional,
+                    &[install_hash_path.as_path()],
+                )?;
+                let outcome = apply_package_json_patch_removal(project_dir, plan)?;
+                let removed_keys = outcome
+                    .removed
+                    .iter()
+                    .map(|removal| removal.key.clone())
+                    .collect();
+                let lockfile_updated = remove_lockfile_patch_records(project_dir, &removed_keys)?;
+                crate::commands::install::workspace_lockfile::commit_manifest_transaction(
+                    transaction,
+                );
+                Ok((outcome, lockfile_updated))
+            },
+        )
+        .await?
     };
 
     if json_output {
@@ -459,12 +522,32 @@ struct PatchRemovalOutcome {
     removed: Vec<PatchRemoval>,
 }
 
+struct PatchRemovalPlan {
+    outcome: PatchRemovalOutcome,
+    manifest: serde_json::Value,
+    files_to_delete: BTreeMap<String, PathBuf>,
+}
+
 fn remove_package_json_patches(
     project_dir: &Path,
     selectors: &[String],
     dry_run: bool,
     keep_file: bool,
 ) -> Result<PatchRemovalOutcome, LpmError> {
+    let plan = plan_package_json_patch_removal(project_dir, selectors, dry_run, keep_file)?;
+    if dry_run {
+        Ok(plan.outcome)
+    } else {
+        apply_package_json_patch_removal(project_dir, plan)
+    }
+}
+
+fn plan_package_json_patch_removal(
+    project_dir: &Path,
+    selectors: &[String],
+    dry_run: bool,
+    keep_file: bool,
+) -> Result<PatchRemovalPlan, LpmError> {
     if selectors.is_empty() {
         return Err(LpmError::Script(
             "patch-remove requires at least one selector".into(),
@@ -544,23 +627,35 @@ fn remove_package_json_patches(
 
     if !dry_run {
         remove_patch_entries_from_value(&mut value, &requested)?;
-        write_package_json_value(project_dir, &value)?;
-
-        let mut delete_errors = Vec::new();
-        for (rel, abs) in files_to_delete {
-            if let Err(e) = std::fs::remove_file(&abs) {
-                delete_errors.push(format!("{rel}: {e}"));
-            }
-        }
-        if !delete_errors.is_empty() {
-            return Err(LpmError::Script(format!(
-                "removed patch entries from package.json, but failed to delete patch file(s): {}",
-                delete_errors.join(", ")
-            )));
-        }
     }
 
-    Ok(PatchRemovalOutcome { removed: removals })
+    Ok(PatchRemovalPlan {
+        outcome: PatchRemovalOutcome { removed: removals },
+        manifest: value,
+        files_to_delete,
+    })
+}
+
+fn apply_package_json_patch_removal(
+    project_dir: &Path,
+    plan: PatchRemovalPlan,
+) -> Result<PatchRemovalOutcome, LpmError> {
+    write_package_json_value(project_dir, &plan.manifest)?;
+
+    let mut delete_errors = Vec::new();
+    for (rel, abs) in plan.files_to_delete {
+        if let Err(e) = std::fs::remove_file(&abs) {
+            delete_errors.push(format!("{rel}: {e}"));
+        }
+    }
+    if !delete_errors.is_empty() {
+        return Err(LpmError::Script(format!(
+            "removed patch entries from package.json, but failed to delete patch file(s): {}",
+            delete_errors.join(", ")
+        )));
+    }
+
+    Ok(plan.outcome)
 }
 
 fn resolve_patch_remove_selector(
@@ -734,17 +829,16 @@ fn upsert_lockfile_patch_record(
     patch_file_rel: &str,
     integrity: &str,
 ) -> Result<bool, LpmError> {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if !lockfile_path.exists() {
-        return Ok(false);
-    }
-
-    let mut lockfile = Lockfile::read_from_file(&lockfile_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read {} while recording patch checksum: {e}",
-            lockfile_path.display()
-        ))
-    })?;
+    let mut lockfile = match crate::commands::install::workspace_lockfile::read_project(project_dir)
+    {
+        Ok(lockfile) => lockfile,
+        Err(lpm_lockfile::LockfileError::NotFound(_)) => return Ok(false),
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read lpm.lock while recording patch checksum: {error}"
+            )));
+        }
+    };
     lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
     lockfile.patches.insert(
         key.to_string(),
@@ -754,17 +848,19 @@ fn upsert_lockfile_patch_record(
             original_integrity: integrity.to_string(),
         },
     );
-    lockfile.write_all(&lockfile_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to write {} after recording patch checksum: {e}",
-            lockfile_path.display()
-        ))
-    })?;
-    lpm_lockfile::ensure_gitattributes(project_dir).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to ensure .gitattributes after recording patch checksum: {e}"
-        ))
-    })?;
+    let lockfile_path = crate::commands::install::workspace_lockfile::write(project_dir, lockfile)
+        .map_err(|e| {
+            LpmError::Script(format!(
+                "failed to write lpm.lock after recording patch checksum: {e}"
+            ))
+        })?;
+    lpm_lockfile::ensure_gitattributes(lockfile_path.parent().unwrap_or(project_dir)).map_err(
+        |e| {
+            LpmError::Script(format!(
+                "failed to ensure .gitattributes after recording patch checksum: {e}"
+            ))
+        },
+    )?;
     Ok(true)
 }
 
@@ -772,17 +868,20 @@ fn remove_lockfile_patch_records(
     project_dir: &Path,
     removed_keys: &BTreeSet<String>,
 ) -> Result<bool, LpmError> {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    if removed_keys.is_empty() || !lockfile_path.exists() {
+    if removed_keys.is_empty() {
         return Ok(false);
     }
 
-    let mut lockfile = Lockfile::read_from_file(&lockfile_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read {} while removing patch checksum records: {e}",
-            lockfile_path.display()
-        ))
-    })?;
+    let mut lockfile = match crate::commands::install::workspace_lockfile::read_project(project_dir)
+    {
+        Ok(lockfile) => lockfile,
+        Err(lpm_lockfile::LockfileError::NotFound(_)) => return Ok(false),
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to read lpm.lock while removing patch records: {error}"
+            )));
+        }
+    };
     let before = lockfile.patches.len();
     for key in removed_keys {
         lockfile.patches.remove(key);
@@ -792,17 +891,19 @@ fn remove_lockfile_patch_records(
     }
 
     lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
-    lockfile.write_all(&lockfile_path).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to write {} after removing patch checksum records: {e}",
-            lockfile_path.display()
-        ))
-    })?;
-    lpm_lockfile::ensure_gitattributes(project_dir).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to ensure .gitattributes after removing patch checksum records: {e}"
-        ))
-    })?;
+    let lockfile_path = crate::commands::install::workspace_lockfile::write(project_dir, lockfile)
+        .map_err(|e| {
+            LpmError::Script(format!(
+                "failed to write lpm.lock after removing patch records: {e}"
+            ))
+        })?;
+    lpm_lockfile::ensure_gitattributes(lockfile_path.parent().unwrap_or(project_dir)).map_err(
+        |e| {
+            LpmError::Script(format!(
+                "failed to ensure .gitattributes after removing patch checksum records: {e}"
+            ))
+        },
+    )?;
     Ok(true)
 }
 

@@ -124,12 +124,12 @@ pub(super) fn build_v2_targets(
         }
         .ok_or_else(|| {
             LpmError::Registry(format!(
-                "v2 install: missing source SRI for {}@{}",
+                "virtual-store install: missing source SRI for {}@{}",
                 target.name, target.version
             ))
         })?;
         v2_targets.push(lpm_linker::v2::V2Target {
-            target: target.clone(),
+            target: Arc::new(target.clone()),
             source_sri: sri,
             verified_object_integrity: None,
             fresh_object: None,
@@ -151,9 +151,10 @@ pub(super) fn relink_bins_after_lifecycle_build(
     compatibility_bin_names: &[String],
     store_version: lpm_store::StoreVersion,
 ) -> Result<usize, LpmError> {
-    let result = if store_version.is_v2() {
-        let store_v2 = lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+    let result = if store_version.uses_virtual_store() {
+        let store_v2 = lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
             lpm_root,
+            store_version,
             object_integrity_policy,
         );
         let v2_targets = build_v2_targets(packages, link_targets)?;
@@ -232,9 +233,7 @@ pub(super) async fn prepare_v2_link_tasks(
     let mut linked_count = 0usize;
     let started = Instant::now();
     for handle in handles {
-        let task = handle
-            .await
-            .map_err(|error| LpmError::Registry(format!("v2 link task panicked: {error}")))??;
+        let task = handle.wait().await?;
         let package_display = timing_detail_mode
             .trace()
             .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
@@ -320,7 +319,7 @@ pub(super) async fn run_online_link_phase(
             materialized: materialized_all,
         }
     } else if v2_mode {
-        let store_v2 = store_v2.expect("v2_mode implies v2 store handle is available");
+        let store_v2 = store_v2.expect("v2_mode implies virtual-store store handle is available");
         let v2_targets = build_v2_targets(packages, link_targets)?;
 
         if v2_event_driven {
@@ -478,9 +477,10 @@ pub(super) async fn run_link_and_finish(
         .collect::<Result<_, _>>()?;
 
     let link_start = Instant::now();
-    let mut link_result = if store_version.is_v2() {
-        let store_v2 = lpm_store::v2::Store::from_lpm_root_with_object_integrity_policy(
+    let mut link_result = if store_version.uses_virtual_store() {
+        let store_v2 = lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
             lpm_root,
+            store_version,
             object_integrity_policy,
         );
         let v2_targets = build_v2_targets(&packages, &link_targets)?;
@@ -587,11 +587,11 @@ pub(super) async fn run_link_and_finish(
         all_trusted_for_auto_build,
         effective_policy,
     );
-    let baseline_index = if store_version == lpm_store::StoreVersion::V2 {
+    let baseline_index = if store_version.uses_virtual_store() {
         Some(lpm_store::V2BaselineIndex::for_project(
             project_dir,
             lpm_root,
-        )?)
+        ))
     } else {
         None
     };

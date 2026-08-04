@@ -17,6 +17,37 @@ use support::{
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+fn read_project_lockfile(project: &TempProject, relative: &str) -> lpm_lockfile::Lockfile {
+    lpm_lockfile::Lockfile::read_for_project(&project.path().join(relative))
+        .unwrap_or_else(|error| panic!("read lockfile projection for {relative:?}: {error}"))
+        .lockfile
+}
+
+fn find_v3_blob_with_contents(project: &TempProject, expected: &[u8]) -> std::path::PathBuf {
+    let blobs_root = project.home().join(".lpm/store/v3/blobs/blake3");
+    for shard in std::fs::read_dir(&blobs_root)
+        .unwrap_or_else(|error| panic!("read CAS blob root {}: {error}", blobs_root.display()))
+    {
+        let shard = shard.expect("read CAS blob shard entry").path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&shard)
+            .unwrap_or_else(|error| panic!("read CAS blob shard {}: {error}", shard.display()))
+        {
+            let path = entry.expect("read CAS blob entry").path();
+            if path.is_file() && std::fs::read(&path).is_ok_and(|bytes| bytes == expected) {
+                return path;
+            }
+        }
+    }
+    panic!(
+        "v3 CAS blob with {} expected bytes was not found under {}",
+        expected.len(),
+        blobs_root.display()
+    );
+}
+
 // ─── No package.json ─────────────────────────────────────────────
 
 #[test]
@@ -3276,7 +3307,8 @@ async fn install_experimental_spike_live_graph_links_file_source_with_transitive
 }
 
 #[tokio::test]
-async fn install_experimental_spike_live_graph_links_workspace_member_source() {
+async fn install_experimental_spike_live_graph_links_workspace_member_source_without_persisting_lockfile()
+ {
     let project = TempProject::empty(
         r#"{
   "name": "spike-live-workspace-source",
@@ -3328,6 +3360,10 @@ async fn install_experimental_spike_live_graph_links_workspace_member_source() {
     assert_eq!(parity["matches"], serde_json::json!(true));
     assert_eq!(parity["candidate_count"], serde_json::json!(1));
     assert_eq!(parity["baseline_count"], serde_json::json!(1));
+    assert!(
+        !project.file_exists("lpm.lock"),
+        "experimental benchmark-only install must not persist a workspace lockfile"
+    );
 
     let require_member = std::process::Command::new("node")
         .current_dir(project.path())
@@ -4403,7 +4439,7 @@ async fn install_offline_firewall_enforce_uses_public_lockfile_source_when_npmrc
 }
 
 #[tokio::test]
-async fn install_offline_with_v2_store_relinks_from_object_store() {
+async fn install_offline_with_default_v2_store_relinks_from_object_store() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("is-number", "7.0.0");
     mock.with_package("is-number", "7.0.0", &tarball).await;
@@ -4454,14 +4490,407 @@ async fn install_offline_with_v2_store_relinks_from_object_store() {
 
     assert!(
         offline.status.success(),
-        "offline v2 install must use the v2 object store, not the v1 package path\nstdout: {}\nstderr: {}",
+        "offline v2 install must reuse the default object store\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&offline.stdout),
         String::from_utf8_lossy(&offline.stderr)
     );
     assertions::assert_in_node_modules(project.path(), "is-number");
     assert!(
+        project.home().join(".lpm/store/v2").is_dir(),
+        "default online and offline installs must populate the v2 store"
+    );
+    assert!(
         !project.home().join(".lpm/store/v1").exists(),
         "default online and offline installs must not write the v1 store"
+    );
+    assert!(
+        !project.home().join(".lpm/store/v3").exists(),
+        "default online and offline installs must not activate the experimental v3 store"
+    );
+}
+
+#[tokio::test]
+async fn install_explicit_v3_lazily_migrates_v2_object_offline_without_rewriting_lockfiles() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-v2-to-v3-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let seeded = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed the v2 store");
+    assert!(
+        seeded.status.success(),
+        "v2 seed install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let sri = compute_integrity(&tarball);
+    let v2_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let v2_object = v2_store.paths().object_dir(&sri).unwrap();
+    let v2_bytes = std::fs::read(v2_object.join("index.js")).expect("read seeded v2 object");
+    let lock_before = std::fs::read(project.path().join("lpm.lock")).expect("read lpm.lock");
+    let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
+    let requests_before = mock.tarball_request_count("is-number", "7.0.0").await;
+    assert_eq!(requests_before, 1, "v2 seed must download one tarball");
+
+    let migrated = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline v2-to-v3 migration");
+    assert!(
+        migrated.status.success(),
+        "explicit v3 install must migrate the v2 object without network access\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&migrated.stdout),
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+
+    let v3_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v3"));
+    let v3_object = v3_store.paths().object_dir(&sri).unwrap();
+    assert_eq!(
+        std::fs::read(v3_object.join("index.js")).expect("read migrated v3 object"),
+        v2_bytes,
+        "lazy migration must preserve extracted package bytes"
+    );
+    assert_eq!(
+        std::fs::read(v2_object.join("index.js")).expect("read retained v2 object"),
+        v2_bytes,
+        "lazy migration must not mutate the v2 store"
+    );
+    assert_eq!(
+        mock.tarball_request_count("is-number", "7.0.0").await,
+        requests_before,
+        "lazy migration must not redownload the tarball"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).expect("read migrated lpm.lock"),
+        lock_before,
+        "v2-to-v3 migration must keep lpm.lock byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        lockb_before,
+        "v2-to-v3 migration must keep a supported lpm.lockb byte-identical and preserve absence when importer metadata requires TOML"
+    );
+    assertions::assert_in_node_modules(project.path(), "is-number");
+}
+
+#[tokio::test]
+async fn install_default_v2_lazily_migrates_v3_object_offline_without_rewriting_lockfiles() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("is-number", "7.0.0");
+    mock.with_package("is-number", "7.0.0", &tarball).await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-v3-to-v2-migration",
+        "version": "1.0.0",
+        "dependencies": {
+            "is-number": "7.0.0"
+        }
+    }"#,
+    );
+
+    let seeded = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to seed the v3 store");
+    assert!(
+        seeded.status.success(),
+        "v3 seed install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+
+    let sri = compute_integrity(&tarball);
+    let v3_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v3"));
+    let v3_object = v3_store.paths().object_dir(&sri).unwrap();
+    let v3_bytes = std::fs::read(v3_object.join("index.js")).expect("read seeded v3 object");
+    let lock_before = std::fs::read(project.path().join("lpm.lock")).expect("read lpm.lock");
+    let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
+    let requests_before = mock.tarball_request_count("is-number", "7.0.0").await;
+    assert_eq!(requests_before, 1, "v3 seed must download one tarball");
+
+    let migrated = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env_remove("LPM_STORE_VERSION")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline v3-to-v2 migration");
+    assert!(
+        migrated.status.success(),
+        "default v2 install must migrate the v3 object without network access\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&migrated.stdout),
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+
+    let v2_store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let v2_object = v2_store.paths().object_dir(&sri).unwrap();
+    assert_eq!(
+        std::fs::read(v2_object.join("index.js")).expect("read migrated v2 object"),
+        v3_bytes,
+        "rollback migration must preserve extracted package bytes"
+    );
+    assert_eq!(
+        std::fs::read(v3_object.join("index.js")).expect("read retained v3 object"),
+        v3_bytes,
+        "rollback migration must not mutate the v3 store"
+    );
+    assert_eq!(
+        mock.tarball_request_count("is-number", "7.0.0").await,
+        requests_before,
+        "rollback migration must not redownload the tarball"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).expect("read migrated lpm.lock"),
+        lock_before,
+        "v3-to-v2 migration must keep lpm.lock byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        lockb_before,
+        "v3-to-v2 migration must keep a supported lpm.lockb byte-identical and preserve absence when importer metadata requires TOML"
+    );
+    assertions::assert_in_node_modules(project.path(), "is-number");
+}
+
+#[tokio::test]
+async fn store_verify_deep_detects_same_size_v3_blob_tampering() {
+    let mock = MockRegistry::start().await;
+    let clean_bytes = b"same-size-clean";
+    let tarball =
+        make_tarball_with_files("cas-deep-verify", "1.0.0", &[("payload.bin", clean_bytes)]);
+    mock.with_package("cas-deep-verify", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "cas-deep-verify-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "cas-deep-verify": "1.0.0"
+        }
+    }"#,
+    );
+
+    let installed = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install v3 deep-verification fixture");
+    assert!(
+        installed.status.success(),
+        "v3 fixture install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+
+    let blob = find_v3_blob_with_contents(&project, clean_bytes);
+    std::fs::write(&blob, b"same-size-dirty").expect("tamper v3 CAS blob");
+    let verified = lpm(&project)
+        .args(["--json", "store", "verify", "--deep"])
+        .output()
+        .expect("run deep store verification");
+    assert!(
+        !verified.status.success(),
+        "deep verification must reject same-size CAS tampering\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&verified.stdout).expect("deep verification failure must emit JSON");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(
+        envelope["cas"]["blob_integrity_recomputed"],
+        serde_json::json!(true)
+    );
+    assert!(
+        envelope["issues"]
+            .as_array()
+            .expect("issues must be an array")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|issue| issue.contains("v3 CAS") && issue.contains("failed integrity validation")),
+        "deep verification must identify the corrupt CAS blob: {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn cache_prune_keeps_shared_v3_blob_until_its_last_package_reference_is_removed() {
+    let mock = MockRegistry::start().await;
+    let shared_bytes = b"shared-cas-payload";
+    let first_tarball =
+        make_tarball_with_files("cas-first", "1.0.0", &[("shared.bin", shared_bytes)]);
+    let second_tarball =
+        make_tarball_with_files("cas-second", "1.0.0", &[("shared.bin", shared_bytes)]);
+    mock.with_package("cas-first", "1.0.0", &first_tarball)
+        .await;
+    mock.with_package("cas-second", "1.0.0", &second_tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "cas-last-reference-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "cas-first": "1.0.0",
+            "cas-second": "1.0.0"
+        }
+    }"#,
+    );
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install shared CAS fixture");
+    assert!(
+        initial.status.success(),
+        "shared CAS fixture install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let shared_blob = find_v3_blob_with_contents(&project, shared_bytes);
+
+    project.write_file(
+        "package.json",
+        r#"{
+        "name": "cas-last-reference-project",
+        "version": "1.0.0",
+        "dependencies": {
+            "cas-second": "1.0.0"
+        }
+    }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove prior links before relinking one package");
+    let one_reference = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("remove the first package reference");
+    assert!(
+        one_reference.status.success(),
+        "install after removing first reference failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&one_reference.stdout),
+        String::from_utf8_lossy(&one_reference.stderr)
+    );
+    let first_prune = lpm(&project)
+        .args([
+            "cache",
+            "prune",
+            "--apply",
+            "--project",
+            project.path().to_str().expect("project path must be UTF-8"),
+            "--json",
+        ])
+        .output()
+        .expect("prune after removing first reference");
+    assert!(
+        first_prune.status.success(),
+        "first-reference prune failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first_prune.stdout),
+        String::from_utf8_lossy(&first_prune.stderr)
+    );
+    assert!(
+        shared_blob.is_file(),
+        "a blob shared by a reachable package must survive prune"
+    );
+
+    project.write_file(
+        "package.json",
+        r#"{
+        "name": "cas-last-reference-project",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove prior links before relinking an empty project");
+    let no_references = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v3")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("remove the last package reference");
+    assert!(
+        no_references.status.success(),
+        "install after removing last reference failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&no_references.stdout),
+        String::from_utf8_lossy(&no_references.stderr)
+    );
+    let last_prune = lpm(&project)
+        .args([
+            "cache",
+            "prune",
+            "--apply",
+            "--project",
+            project.path().to_str().expect("project path must be UTF-8"),
+            "--json",
+        ])
+        .output()
+        .expect("prune after removing last reference");
+    assert!(
+        last_prune.status.success(),
+        "last-reference prune failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&last_prune.stdout),
+        String::from_utf8_lossy(&last_prune.stderr)
+    );
+    assert!(
+        !shared_blob.exists(),
+        "the shared blob must be deleted after its last package reference is removed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&last_prune.stdout),
+        String::from_utf8_lossy(&last_prune.stderr)
     );
 }
 
@@ -4981,7 +5410,7 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
 
     assert!(
         output.status.success(),
-        "default install should succeed with shipped v2/direct defaults\nstdout: {}\nstderr: {}",
+        "default install should succeed with the shipped v2 layout\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -4992,7 +5421,7 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
         .expect("installed package should have filesystem metadata");
     assert!(
         metadata.file_type().is_symlink(),
-        "shipped default layout should expose root packages as v2 symlinks, not v1 real dirs"
+        "shipped default layout should expose root packages as virtual-store symlinks, not v1 real dirs"
     );
     assert!(
         !project.path().join(".lpm/wrappers").exists(),
@@ -5005,6 +5434,14 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
     assert!(
         !project.home().join(".lpm/store/v1").exists(),
         "shipped v2 layout should not populate the v1 store"
+    );
+    assert!(
+        project.home().join(".lpm/store/v2").is_dir(),
+        "shipped v2 layout should populate the v2 store"
+    );
+    assert!(
+        !project.home().join(".lpm/store/v3").exists(),
+        "shipped v2 layout should not populate the experimental v3 store"
     );
 }
 
@@ -9533,8 +9970,7 @@ async fn recursive_workspace_install_and_offline_replay_preserve_member_github_d
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
-        .expect("workspace root lockfile should parse");
+    let lockfile = read_project_lockfile(&project, "");
     let git_package = lockfile
         .packages
         .iter()
@@ -11074,7 +11510,7 @@ fn workspace_repeat_project() -> TempProject {
 }
 
 #[test]
-fn recursive_frozen_replay_accepts_dependency_free_workspace_member_lockfile() {
+fn recursive_frozen_replay_accepts_dependency_free_workspace_importer() {
     let project = TempProject::empty(
         r#"{
   "name": "recursive-empty-member",
@@ -11113,17 +11549,11 @@ fn recursive_frozen_replay_accepts_dependency_free_workspace_member_lockfile() {
         String::from_utf8_lossy(&first.stderr),
     );
 
-    let empty_lockfile_path = project.path().join("packages/empty-member/lpm.lock");
-    let mut empty_lockfile = lpm_lockfile::Lockfile::read_from_file(&empty_lockfile_path)
-        .expect("dependency-free member lockfile should parse");
+    let empty_lockfile = read_project_lockfile(&project, "packages/empty-member");
     assert!(
         empty_lockfile.importers.contains_key("."),
-        "new dependency-free lockfiles must record their importer snapshot",
+        "dependency-free workspace projections must record their importer snapshot",
     );
-    empty_lockfile.importers.clear();
-    empty_lockfile
-        .write_all(&empty_lockfile_path)
-        .expect("write legacy dependency-free lockfile shape");
 
     let replay = lpm_with_registry(&project, "http://127.0.0.1:1")
         .args([
@@ -11203,9 +11633,7 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
         String::from_utf8_lossy(&first.stderr),
     );
 
-    let docs_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("docs/lpm.lock"))
-            .expect("docs lockfile should parse");
+    let docs_lockfile = read_project_lockfile(&project, "docs");
     assert!(
         docs_lockfile.packages.iter().any(|package| {
             package.name == "workspace-lib"
@@ -11213,10 +11641,7 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
         }),
         "docs lockfile should capture the workspace package selected for the peer",
     );
-    let member_lockfile = lpm_lockfile::Lockfile::read_from_file(
-        &project.path().join("packages/workspace-lib/lpm.lock"),
-    )
-    .expect("workspace member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "packages/workspace-lib");
     assert!(
         member_lockfile.packages.iter().any(|package| {
             package.name == "workspace-lib" && package.source.as_deref() == Some("directory+.")
@@ -11310,9 +11735,7 @@ fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
         String::from_utf8_lossy(&replay.stderr),
     );
 
-    let lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("playground/minify/lpm.lock"))
-            .expect("aliased workspace member lockfile should parse");
+    let lockfile = read_project_lockfile(&project, "playground/minify");
     assert!(
         lockfile.packages.iter().any(|package| {
             package.name == "@test/minify"
@@ -11369,9 +11792,7 @@ fn recursive_lockfile_records_canonical_alias_for_transitive_file_workspace_memb
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("packages/app/lpm.lock"))
-            .expect("app lockfile should parse");
+    let lockfile = read_project_lockfile(&project, "packages/app");
     let host = lockfile
         .packages
         .iter()
@@ -11447,9 +11868,7 @@ async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() 
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let consumer = member_lockfile
         .packages
         .iter()
@@ -11545,9 +11964,7 @@ async fn recursive_workspace_root_local_dependency_satisfies_member_transitive_p
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let provider = member_lockfile
         .packages
         .iter()
@@ -11663,9 +12080,7 @@ async fn recursive_workspace_root_local_dependency_closure_satisfies_member_tran
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let consumer = member_lockfile
         .packages
         .iter()
@@ -11922,8 +12337,7 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
         String::from_utf8_lossy(&second.stderr),
     );
 
-    let root_lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
-        .expect("root lockfile should parse");
+    let root_lockfile = read_project_lockfile(&project, "");
     assert!(
         root_lockfile
             .packages
@@ -11937,9 +12351,7 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
             .map(|package| package.version.as_str())
             .collect::<Vec<_>>(),
     );
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let consumer = member_lockfile
         .packages
         .iter()
@@ -12110,9 +12522,7 @@ async fn recursive_workspace_root_provider_closure_preserves_root_override_conte
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let provider = member_lockfile
         .packages
         .iter()
@@ -12190,9 +12600,7 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
         String::from_utf8_lossy(&install.stderr),
     );
 
-    let member_lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&project.path().join("app/lpm.lock"))
-            .expect("member lockfile should parse");
+    let member_lockfile = read_project_lockfile(&project, "app");
     let provider = member_lockfile
         .packages
         .iter()
@@ -12682,6 +13090,78 @@ async fn recursive_install_does_not_commit_any_importer_when_preparation_fails()
 }
 
 #[tokio::test]
+async fn recursive_install_rolls_back_non_union_importer_when_later_importer_fails() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-non-union-rollback-root",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "valid-dependency": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/union-participant/package.json",
+        r#"{
+  "name": "union-participant",
+  "version": "1.0.0",
+  "dependencies": { "valid-dependency": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/a-stateful/package.json",
+        r#"{
+  "name": "a-stateful",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file(
+        "packages/a-stateful/.lpm/install-hash",
+        "original-install-hash",
+    );
+    project.write_file(
+        "packages/z-failing/package.json",
+        r#"{
+  "name": "z-failing",
+  "version": "1.0.0",
+  "dependencies": {
+    "a-stateful": "workspace:*",
+    "missing-local": "file:./missing.tgz"
+  }
+}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    let valid_tarball = make_tarball("valid-dependency", "1.0.0");
+    mock.with_package("valid-dependency", "1.0.0", &valid_tarball)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive install with a later non-union failure");
+
+    assert!(
+        !output.status.success(),
+        "recursive install must fail for the missing local tarball\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("packages/a-stateful/.lpm/install-hash"))
+            .expect("read restored install hash"),
+        "original-install-hash",
+        "a successful non-union importer must roll back when a later importer fails"
+    );
+}
+
+#[tokio::test]
 async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
     fn workspace_fixture() -> TempProject {
         let project = TempProject::empty(
@@ -12717,13 +13197,7 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
     }
 
     fn lockfile_bytes(project: &TempProject) -> Vec<Vec<u8>> {
-        ["lpm.lock", "packages/a/lpm.lock", "packages/b/lpm.lock"]
-            .into_iter()
-            .map(|path| {
-                std::fs::read(project.path().join(path))
-                    .unwrap_or_else(|error| panic!("read {path}: {error}"))
-            })
-            .collect()
+        vec![std::fs::read(project.path().join("lpm.lock")).expect("read workspace lockfile")]
     }
 
     let mock = MockRegistry::start().await;
@@ -12791,12 +13265,7 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
     let resolve_ahead_report: serde_json::Value =
         serde_json::from_slice(&resolve_ahead_output.stdout)
             .expect("resolve-ahead install must emit JSON");
-    assert_eq!(
-        resolve_ahead_report["counts"]["authoritative_fetch_candidate_count"].as_u64(),
-        Some(0),
-        "the workspace-shared waterfall must materialize selected artifacts before importer classification"
-    );
-
+    assert_eq!(resolve_ahead_report["success"], true);
     assert_eq!(
         lockfile_bytes(&resolve_ahead),
         lockfile_bytes(&sequential),
@@ -12839,13 +13308,7 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
     }
 
     fn lockfile_bytes(project: &TempProject) -> Vec<Vec<u8>> {
-        ["lpm.lock", "packages/a/lpm.lock"]
-            .into_iter()
-            .map(|path| {
-                std::fs::read(project.path().join(path))
-                    .unwrap_or_else(|error| panic!("read {path}: {error}"))
-            })
-            .collect()
+        vec![std::fs::read(project.path().join("lpm.lock")).expect("read workspace lockfile")]
     }
 
     let mock = MockRegistry::start().await;
@@ -12954,8 +13417,9 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
         cold_root_lock.contains("dependencies = [\"shared-dependency@1.0.0\"]"),
         "the explicit root constraint must govern the overlapping transitive edge"
     );
-    let cold_member_lock = std::fs::read_to_string(project.path().join("packages/a/lpm.lock"))
-        .expect("read cold member lockfile");
+    let cold_member_lock = read_project_lockfile(&project, "packages/a")
+        .to_toml()
+        .expect("serialize cold member projection");
     assert!(
         cold_member_lock.contains("version = \"1.1.0\""),
         "the broad member fixture must select the newest shared dependency"

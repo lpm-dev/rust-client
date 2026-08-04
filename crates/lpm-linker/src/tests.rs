@@ -1649,6 +1649,42 @@ fn workspace_member_link_allows_a_missing_publish_directory_target() {
 
 #[cfg(unix)]
 #[test]
+fn workspace_member_link_is_idempotent_across_concurrent_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let node_modules = root.path().join("project/node_modules");
+    let member_source = root.path().join("packages/library");
+    std::fs::create_dir_all(&node_modules).unwrap();
+    std::fs::create_dir_all(&member_source).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let node_modules = &node_modules;
+            let member_source = &member_source;
+            handles.push(scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    link_workspace_member(node_modules, "@fixture/library", member_source)?;
+                }
+                Ok::<_, lpm_common::LpmError>(())
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+    });
+
+    let link = node_modules.join("@fixture/library");
+    assert_eq!(
+        std::fs::canonicalize(link).unwrap(),
+        member_source.canonicalize().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn workspace_member_link_rejects_symlinked_node_modules_root() {
     let root = tempfile::tempdir().unwrap();
     let project_dir = root.path().join("project");

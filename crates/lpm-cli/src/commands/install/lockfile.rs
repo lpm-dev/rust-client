@@ -9,8 +9,8 @@ use super::*;
 ///
 /// The parsed `Lockfile` is returned alongside the install packages so
 /// the install driver can patch `LockedPackage.tarball` and re-emit
-/// the lockfile on the generalized-writeback path (
-/// Change 3) without re-parsing. The `needs_binary_upgrade` flag
+/// the lockfile on the generalized-writeback path without re-parsing.
+/// The `needs_binary_upgrade` flag
 /// tells the driver whether a rewrite is needed even when no URL
 /// diverged (e.g., pre-existing v1 `lpm.lockb` on disk, or missing
 /// entirely — migration completes on first fast-path install
@@ -24,10 +24,9 @@ use super::*;
 /// itself doesn't normally write the lockfile).
 pub(super) struct LockfileFastPath {
     pub(super) packages: Vec<InstallPackage>,
-    /// Parsed lockfile. Owned by the caller so
-    /// `LockedPackage.tarball` fields can be patched with post-fetch
-    /// URLs before `write_all` is called on the writeback path.
-    pub(super) lockfile: lpm_lockfile::Lockfile,
+    /// Shared parsed lockfile. The writeback path clones it lazily only when
+    /// fields actually need to change.
+    pub(super) lockfile: Arc<lpm_lockfile::Lockfile>,
     /// True when the v2 `lpm.lockb` was missing or opened with
     /// `UnsupportedVersion`. Triggers a writeback even when no URL
     /// diverged — otherwise the migration from a v1 binary (or no
@@ -170,7 +169,7 @@ pub(super) struct OnlineLockfileWritePhaseInput<'a> {
     pub(super) verified_provenance:
         &'a std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
     pub(super) frozen_lockfile_active: bool,
-    pub(super) fast_path_lockfile: Option<lpm_lockfile::Lockfile>,
+    pub(super) fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
     pub(super) fresh_urls: &'a HashMap<String, String>,
     pub(super) needs_binary_upgrade: bool,
     pub(super) json_output: bool,
@@ -201,8 +200,10 @@ pub(super) fn run_online_lockfile_write_phase(
             input.lockfile_path,
             "write",
         )?);
-        lpm_lockfile::ensure_gitattributes(input.project_dir)
-            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+        if !workspace_lockfile::active() {
+            lpm_lockfile::ensure_gitattributes(input.project_dir)
+                .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
+        }
         return Ok(result);
     }
 
@@ -314,7 +315,7 @@ pub(super) fn locked_package_from_install_package(
 }
 
 fn rewrite_fast_path_lockfile_if_needed(
-    mut lockfile: lpm_lockfile::Lockfile,
+    mut lockfile: Arc<lpm_lockfile::Lockfile>,
     lockfile_path: &Path,
     current_lockfile_patches: &lpm_lockfile::LockfilePatches,
     current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
@@ -330,22 +331,38 @@ fn rewrite_fast_path_lockfile_if_needed(
         schema_version_changed: lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION,
     };
 
-    if reasons.importer_snapshot_changed
-        || reasons.patch_records_changed
-        || reasons.schema_version_changed
-    {
-        lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
-        lockfile.patches = current_lockfile_patches.clone();
-        lockfile
-            .importers
-            .insert(".".to_string(), current_importer_snapshot.clone());
-    }
-
     if !reasons.requires_write() {
         return Ok(None);
     }
 
-    patch_fresh_tarball_urls(&mut lockfile, fresh_urls);
+    if workspace_lockfile::active() {
+        let root_resolutions = lockfile.root_resolutions.clone();
+        lockfile = workspace_lockfile::read_full_shared(lockfile_path).map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to materialize workspace lockfile projection for writeback: {error}"
+            ))
+        })?;
+        Arc::make_mut(&mut lockfile).root_resolutions = root_resolutions;
+    }
+
+    if reasons.importer_snapshot_changed
+        || reasons.patch_records_changed
+        || reasons.schema_version_changed
+        || !fresh_urls.is_empty()
+    {
+        let lockfile = Arc::make_mut(&mut lockfile);
+        if reasons.importer_snapshot_changed
+            || reasons.patch_records_changed
+            || reasons.schema_version_changed
+        {
+            lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+            lockfile.patches = current_lockfile_patches.clone();
+            lockfile
+                .importers
+                .insert(".".to_string(), current_importer_snapshot.clone());
+        }
+        patch_fresh_tarball_urls(lockfile, fresh_urls);
+    }
     let write_ms = write_lockfile_and_measure(&lockfile, lockfile_path, "rewrite")?;
     emit_fast_path_lockfile_rewrite_notice(json_output, reasons);
     Ok(Some(write_ms))
@@ -403,6 +420,9 @@ fn write_lockfile_and_measure(
     verb: &str,
 ) -> Result<u128, LpmError> {
     let lockfile_write_start = Instant::now();
+    if workspace_lockfile::stage(lockfile) {
+        return Ok(lockfile_write_start.elapsed().as_millis());
+    }
     lockfile
         .write_all(lockfile_path)
         .map_err(|e| LpmError::Registry(format!("failed to {verb} lockfile: {e}")))?;
@@ -623,11 +643,12 @@ pub(super) fn prepare_lockfile_drift_state(input: LockfileDriftInput<'_>) -> Loc
         );
     }
 
-    let pre_install_direct_versions = if lockfile_path.exists() {
-        lpm_lockfile::Lockfile::read_fast(lockfile_path)
-            .ok()
-            .map(|lf| collect_locked_direct_versions(pkg, &lf))
-            .unwrap_or_default()
+    let pre_install_direct_versions = if workspace_lockfile::exists(lockfile_path) {
+        workspace_lockfile::with_package_rows(lockfile_path, |lockfile, packages| {
+            collect_locked_direct_versions_from_rows(pkg, &lockfile, packages)
+        })
+        .ok()
+        .unwrap_or_default()
     } else {
         HashMap::new()
     };
@@ -868,10 +889,11 @@ pub(super) async fn run_offline_install_phase(
 
     let store =
         PackageStore::from_root_with_security_analysis_policy(lpm_root, security_analysis_policy);
-    let requested_v2_mode = store_version.is_v2();
+    let requested_v2_mode = store_version.uses_virtual_store();
     let store_v2 = requested_v2_mode.then(|| {
-        lpm_store::v2::Store::from_lpm_root_with_policies(
+        lpm_store::v2::Store::from_lpm_root_for_version_with_policies(
             lpm_root,
+            store_version,
             object_integrity_policy,
             security_analysis_policy,
         )
@@ -1235,8 +1257,24 @@ pub(super) fn package_matches_catalog_resolution(
             .is_some_and(|names| names.iter().any(|name| name == package_name))
 }
 
+#[cfg(test)]
 pub(super) fn lockfile_catalog_snapshots_match_current(
     lockfile: &lpm_lockfile::Lockfile,
+    deps: &HashMap<String, String>,
+    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+) -> bool {
+    let packages = lockfile.packages.iter().collect::<Vec<_>>();
+    lockfile_catalog_snapshots_match_current_with_packages(
+        lockfile,
+        &packages,
+        deps,
+        catalog_resolutions,
+    )
+}
+
+fn lockfile_catalog_snapshots_match_current_with_packages(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
 ) -> bool {
@@ -1270,9 +1308,13 @@ pub(super) fn lockfile_catalog_snapshots_match_current(
             let requested_spec = deps
                 .get(package_name)
                 .map_or(resolution.specifier.as_str(), String::as_str);
-            let Some(locked_package) =
-                select_locked_root_package(lockfile, package_name, target, requested_spec)
-            else {
+            let Some(locked_package) = select_locked_root_package_from_rows(
+                lockfile,
+                packages,
+                package_name,
+                target,
+                requested_spec,
+            ) else {
                 return false;
             };
             if locked_package.version != entry.version {
@@ -1308,6 +1350,15 @@ pub(crate) fn select_locked_package_for_requested_spec<'a>(
     target: &str,
     requested_spec: &str,
 ) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let packages = lockfile.packages.iter().collect::<Vec<_>>();
+    select_locked_package_for_requested_spec_from_rows(&packages, target, requested_spec)
+}
+
+fn select_locked_package_for_requested_spec_from_rows<'a>(
+    packages: &[&'a lpm_lockfile::LockedPackage],
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
     let requested_range = requested_range_for_locked_lookup(requested_spec)
         .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
     let mut first_match: Option<&lpm_lockfile::LockedPackage> = None;
@@ -1315,12 +1366,10 @@ pub(crate) fn select_locked_package_for_requested_spec<'a>(
         None;
     let mut best_any: Option<(lpm_resolver::NpmVersion, &lpm_lockfile::LockedPackage)> = None;
 
-    let start = lockfile
-        .packages
-        .partition_point(|pkg| pkg.name.as_str() < target);
-    let end = start + lockfile.packages[start..].partition_point(|pkg| pkg.name.as_str() == target);
+    let start = packages.partition_point(|pkg| pkg.name.as_str() < target);
+    let end = start + packages[start..].partition_point(|pkg| pkg.name.as_str() == target);
 
-    for candidate in &lockfile.packages[start..end] {
+    for &candidate in &packages[start..end] {
         if first_match.is_none() {
             first_match = Some(candidate);
         }
@@ -1358,11 +1407,22 @@ pub(crate) fn select_locked_root_package<'a>(
     target: &str,
     requested_spec: &str,
 ) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let packages = lockfile.packages.iter().collect::<Vec<_>>();
+    select_locked_root_package_from_rows(lockfile, &packages, local_name, target, requested_spec)
+}
+
+fn select_locked_root_package_from_rows<'a>(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&'a lpm_lockfile::LockedPackage],
+    local_name: &str,
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
     if let Some(selection) = lockfile.root_resolutions.get(local_name) {
         if selection.package != target {
             return None;
         }
-        return lockfile.packages.iter().find(|package| {
+        return packages.iter().copied().find(|package| {
             package.name == selection.package
                 && package.version == selection.version
                 && package.source == selection.source
@@ -1372,9 +1432,9 @@ pub(crate) fn select_locked_root_package<'a>(
     let requested_range = requested_range_for_locked_lookup(requested_spec)
         .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
     let mut candidate = None;
-    for package in lockfile
-        .packages
+    for package in packages
         .iter()
+        .copied()
         .filter(|package| package.name == target)
     {
         if let Some(range) = requested_range.as_ref() {
@@ -1460,9 +1520,10 @@ fn select_resolved_package_for_requested_spec<'a>(
         .or(first_match)
 }
 
-pub(super) fn collect_locked_direct_versions(
+fn collect_locked_direct_versions_from_rows(
     pkg: &lpm_workspace::PackageJson,
     lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
 ) -> HashMap<String, String> {
     let mut versions = HashMap::with_capacity(pkg.dependencies.len() + pkg.dev_dependencies.len());
 
@@ -1473,7 +1534,7 @@ pub(super) fn collect_locked_direct_versions(
             .cloned()
             .unwrap_or_else(|| local.clone());
         if let Some(candidate) =
-            select_locked_package_for_requested_spec(lockfile, &target, requested_spec)
+            select_locked_package_for_requested_spec_from_rows(packages, &target, requested_spec)
         {
             versions
                 .entry(target)
@@ -1772,18 +1833,17 @@ pub(super) fn filter_dependency_engine_packages(
     Ok(skipped)
 }
 
-pub(super) fn lockfile_satisfies_fast_path(
+pub(super) fn lockfile_satisfies_fast_path_with_packages(
     lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
     lockfile_dir: &Path,
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     workspace: Option<&lpm_workspace::Workspace>,
-    accept_unsafe_sources: bool,
-    emit_warnings: bool,
+    policy: LockfileReplayPolicy,
 ) -> bool {
-    if emit_warnings {
-        let insecure_count = lockfile
-            .packages
+    if policy.emit_warnings {
+        let insecure_count = packages
             .iter()
             .filter(|package| {
                 package.source.as_deref().is_some_and(|source| {
@@ -1802,14 +1862,14 @@ pub(super) fn lockfile_satisfies_fast_path(
         }
     }
 
-    for package in &lockfile.packages {
+    for &package in packages {
         if let Some(source) = package.source.as_deref()
             && !lpm_lockfile::is_safe_source(source)
         {
-            if accept_unsafe_sources
+            if policy.accept_unsafe_sources
                 || online_local_source_is_allowed(package, lockfile_dir, deps, workspace)
             {
-                if emit_warnings {
+                if policy.emit_warnings {
                     tracing::debug!(
                         "package {}@{} validated non-registry source {} for lockfile replay",
                         package.name,
@@ -1819,7 +1879,7 @@ pub(super) fn lockfile_satisfies_fast_path(
                 }
                 continue;
             }
-            if emit_warnings {
+            if policy.emit_warnings {
                 tracing::warn!(
                     "package {}@{} has unsafe source URL: {} — skipping lockfile fast path",
                     package.name,
@@ -1831,8 +1891,13 @@ pub(super) fn lockfile_satisfies_fast_path(
         }
     }
 
-    if !lockfile_catalog_snapshots_match_current(lockfile, deps, catalog_resolutions) {
-        if emit_warnings {
+    if !lockfile_catalog_snapshots_match_current_with_packages(
+        lockfile,
+        packages,
+        deps,
+        catalog_resolutions,
+    ) {
+        if policy.emit_warnings {
             tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
         }
         return false;
@@ -1843,8 +1908,10 @@ pub(super) fn lockfile_satisfies_fast_path(
             .root_aliases
             .get(local)
             .map_or(local.as_str(), String::as_str);
-        if select_locked_root_package(lockfile, local, target, requested_spec).is_none() {
-            if emit_warnings {
+        if select_locked_root_package_from_rows(lockfile, packages, local, target, requested_spec)
+            .is_none()
+        {
+            if policy.emit_warnings {
                 tracing::debug!(
                     "lockfile miss: {local} (resolved target {target}) not found, re-resolving"
                 );
@@ -1854,6 +1921,12 @@ pub(super) fn lockfile_satisfies_fast_path(
     }
 
     true
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LockfileReplayPolicy {
+    pub(super) accept_unsafe_sources: bool,
+    pub(super) emit_warnings: bool,
 }
 
 pub(super) fn online_local_source_is_allowed(
@@ -1952,22 +2025,58 @@ pub(super) fn try_lockfile_fast_path(
     // unconditionally rejected the lockfile entry.
     accept_unsafe_sources: bool,
 ) -> Option<LockfileFastPath> {
-    if !lpm_lockfile::Lockfile::exists(lockfile_path) {
+    if !workspace_lockfile::exists(lockfile_path) {
         return None;
     }
 
-    let mut lockfile = lpm_lockfile::Lockfile::read_fast(lockfile_path).ok()?;
+    workspace_lockfile::with_package_rows(lockfile_path, |mut lockfile, package_rows| {
+        try_lockfile_fast_path_from_rows(
+            &mut lockfile,
+            package_rows,
+            TryLockfileFastPathRowsInput {
+                lockfile_path,
+                deps,
+                catalog_resolutions,
+                workspace,
+                client,
+                gate_stats,
+                accept_unsafe_sources,
+            },
+        )
+    })
+    .ok()
+    .flatten()
+}
 
-    let needs_binary_upgrade = binary_lockfile_needs_writeback(lockfile_path, &lockfile);
+struct TryLockfileFastPathRowsInput<'a> {
+    lockfile_path: &'a Path,
+    deps: &'a HashMap<String, String>,
+    catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    workspace: Option<&'a lpm_workspace::Workspace>,
+    client: &'a RegistryClient,
+    gate_stats: &'a GateStats,
+    accept_unsafe_sources: bool,
+}
 
-    if !lockfile_satisfies_fast_path(
-        &lockfile,
-        lockfile_path.parent()?,
-        deps,
-        catalog_resolutions,
-        workspace,
-        accept_unsafe_sources,
-        true,
+fn try_lockfile_fast_path_from_rows(
+    lockfile: &mut Arc<lpm_lockfile::Lockfile>,
+    package_rows: &[&lpm_lockfile::LockedPackage],
+    input: TryLockfileFastPathRowsInput<'_>,
+) -> Option<LockfileFastPath> {
+    let needs_binary_upgrade = !workspace_lockfile::active()
+        && binary_lockfile_needs_writeback(input.lockfile_path, lockfile);
+
+    if !lockfile_satisfies_fast_path_with_packages(
+        lockfile,
+        package_rows,
+        input.lockfile_path.parent()?,
+        input.deps,
+        input.catalog_resolutions,
+        input.workspace,
+        LockfileReplayPolicy {
+            accept_unsafe_sources: input.accept_unsafe_sources,
+            emit_warnings: true,
+        },
     ) {
         return None;
     }
@@ -2005,13 +2114,19 @@ pub(super) fn try_lockfile_fast_path(
         k
     };
     let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
-    for (local, requested_spec) in deps {
+    for (local, requested_spec) in input.deps {
         let target = lockfile
             .root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        let lp = select_locked_root_package(&lockfile, local, &target, requested_spec)?;
+        let lp = select_locked_root_package_from_rows(
+            lockfile,
+            package_rows,
+            local,
+            &target,
+            requested_spec,
+        )?;
         let selected = lpm_lockfile::LockedRootResolution {
             package: lp.name.clone(),
             version: lp.version.clone(),
@@ -2021,10 +2136,11 @@ pub(super) fn try_lockfile_fast_path(
             .entry(root_link_key(lp))
             .or_default()
             .push(local.clone());
-        lockfile
-            .root_resolutions
-            .entry(local.clone())
-            .or_insert(selected);
+        if !lockfile.root_resolutions.contains_key(local) {
+            Arc::make_mut(lockfile)
+                .root_resolutions
+                .insert(local.clone(), selected);
+        }
     }
     // surface lockfile-recorded ambient peer installs
     // (auto-installed peers from the cold resolve) at the project's
@@ -2039,11 +2155,13 @@ pub(super) fn try_lockfile_fast_path(
     // Dedup against `deps.keys()` matches the cold-resolve writer:
     // if the user later moves the auto-installed peer into their
     // `dependencies`, we don't want a double-link entry.
-    for ambient in &lockfile.ambient_peer_installs {
-        if deps.contains_key(ambient) {
+    let ambient_peer_installs = lockfile.ambient_peer_installs.clone();
+    for ambient in &ambient_peer_installs {
+        if input.deps.contains_key(ambient) {
             continue;
         }
-        let lp = select_locked_root_package(&lockfile, ambient, ambient, "*")?;
+        let lp =
+            select_locked_root_package_from_rows(lockfile, package_rows, ambient, ambient, "*")?;
         let selected = lpm_lockfile::LockedRootResolution {
             package: lp.name.clone(),
             version: lp.version.clone(),
@@ -2053,19 +2171,20 @@ pub(super) fn try_lockfile_fast_path(
         if !entry.iter().any(|l| l == ambient) {
             entry.push(ambient.clone());
         }
-        lockfile
-            .root_resolutions
-            .entry(ambient.clone())
-            .or_insert(selected);
+        if !lockfile.root_resolutions.contains_key(ambient) {
+            Arc::make_mut(lockfile)
+                .root_resolutions
+                .insert(ambient.clone(), selected);
+        }
     }
     for locals in root_link_map.values_mut() {
         locals.sort();
     }
 
     // Convert locked packages to InstallPackage
-    let packages: Vec<InstallPackage> = lockfile
-        .packages
+    let packages: Vec<InstallPackage> = package_rows
         .iter()
+        .copied()
         .map(|lp| {
             let is_lpm = lp.name.starts_with("@lpm.dev/");
 
@@ -2119,7 +2238,7 @@ pub(super) fn try_lockfile_fast_path(
                 .collect();
 
             let root_link_names = root_link_map.get(&root_link_key(lp)).cloned();
-            let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
+            let is_direct = install_package_is_direct(root_link_names.as_deref(), input.deps);
 
             InstallPackage {
                 name: lp.name.clone(),
@@ -2151,7 +2270,7 @@ pub(super) fn try_lockfile_fast_path(
                 tarball_url: match lp.source_kind() {
                     Some(Ok(lpm_lockfile::Source::Git { url })) => github_archive_url(&url).ok(),
                     _ => lp.tarball.as_deref().and_then(|url| {
-                        match evaluate_cached_url(url, client) {
+                        match evaluate_cached_url(url, input.client) {
                             GateDecision::Accepted => Some(url.to_string()),
                             GateDecision::RejectedScheme => {
                                 // Writer never emits scheme-unsafe URLs,
@@ -2160,7 +2279,8 @@ pub(super) fn try_lockfile_fast_path(
                                 // with shape/origin — makes corrupt-
                                 // lockfile signals observable instead of
                                 // trace-log-only.
-                                gate_stats
+                                input
+                                    .gate_stats
                                     .scheme_mismatch
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(
@@ -2172,7 +2292,8 @@ pub(super) fn try_lockfile_fast_path(
                                 None
                             }
                             GateDecision::RejectedShape => {
-                                gate_stats
+                                input
+                                    .gate_stats
                                     .shape_mismatch
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(
@@ -2190,7 +2311,8 @@ pub(super) fn try_lockfile_fast_path(
                                 // lookup against the mirror. The writeback
                                 // trigger ( Change 3) will persist the
                                 // rebased URLs on the next install.
-                                gate_stats
+                                input
+                                    .gate_stats
                                     .origin_mismatch
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 None
@@ -2205,7 +2327,7 @@ pub(super) fn try_lockfile_fast_path(
 
     Some(LockfileFastPath {
         packages,
-        lockfile,
+        lockfile: Arc::clone(lockfile),
         needs_binary_upgrade,
     })
 }

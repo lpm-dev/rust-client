@@ -430,20 +430,19 @@ async fn install_default_policy_prints_approve_scripts_hint_after_done_summary()
 }
 
 #[tokio::test]
-async fn install_default_policy_blocks_postinstall_scripts_under_v2_store() {
+async fn install_default_policy_blocks_postinstall_scripts_under_default_v2_store() {
     let project = empty_project_with_dep("scripted-pkg");
     let mock = MockRegistry::start().await;
     mount_scripted_pkg(&mock, "scripted-pkg").await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_STORE_VERSION", "v2")
         .args(["install"])
         .output()
-        .expect("failed to run lpm install under v2 store");
+        .expect("failed to run lpm install under the default v2 store");
 
     assert!(
         output.status.success(),
-        "install with default policy on a scripted package must succeed under v2 store (deny just skips scripts)\nstdout: {}\nstderr: {}",
+        "install with default policy on a scripted package must succeed under v2 (deny just skips scripts)\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -458,7 +457,7 @@ async fn install_default_policy_blocks_postinstall_scripts_under_v2_store() {
         combined.contains("approve-scripts")
             || combined.contains("lifecycle script")
             || combined.contains("scripts"),
-        "default-deny install under v2 store must mention the script-policy hint, got:\n{combined}",
+        "default-deny install under v2 must mention the script-policy hint, got:\n{combined}",
     );
 }
 

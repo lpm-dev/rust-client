@@ -24,8 +24,9 @@
 //!     .mcp.lock                   ← coordinates MCP refresh, execution, and cleanup
 //!   engines/                      ← managed engine installs with preserved layouts
 //!   store/
-//!     v2/                         ← default virtual store (objects, links, builds)
-//!     v1/                         ← explicit rollback + upgrade compatibility
+//!     v2/                         ← default virtual store
+//!     v3/                         ← experimental file-CAS virtual store
+//!     v1/                         ← explicit legacy rollback + upgrade compatibility
 //!     .gc.lock                    ← serializes `store gc`
 //!   global/
 //!     manifest.toml               ← [packages.*] active + [pending.*] in-flight + [aliases] + [tombstones]

@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+parking_lot = { workspace = true }
 ahash = "0.8"
 time = { version = "0.3", features = ["parsing"] }
 
@@ -29,6 +30,7 @@ bench-internals = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 wiremock = "0.6"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }

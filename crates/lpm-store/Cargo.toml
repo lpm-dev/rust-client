@@ -20,6 +20,7 @@ blake3 = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
@@ -29,8 +30,11 @@ subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
 # Phase 66 Phase 4a: clonefile syscall on macOS for v2 link-entry
-# population. Linux + Windows fall back to hardlink + copy.
+# population. Linux and Windows use reflinks or independent copies for writable trees.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -38,6 +42,7 @@ flate2 = "1"
 tar = "0.4"
 serde_json = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+filetime = { workspace = true }
 
 [[bench]]
 name = "store_paths"

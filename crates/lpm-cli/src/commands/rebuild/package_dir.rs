@@ -9,21 +9,21 @@ pub(super) fn live_package_dir(
     store_path: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> std::path::PathBuf {
-    // — production v2 store handle resolves once per
+    // The production virtual-store handle resolves once per
     // call from the active `~/.lpm/`. Tests use the
-    // [`live_package_dir_with_v2`] seam directly with a synthetic
+    // [`live_package_dir_with_v2`] compatibility seam with a synthetic
     // store rooted in a tempdir, so the env-coupled wrapper here
     // stays simple.
-    let v2_store = lpm_common::LpmRoot::from_env()
-        .ok()
-        .map(|root| lpm_store::v2::Store::from_lpm_root(&root));
+    let virtual_store = lpm_common::LpmRoot::from_env().ok().map(|root| {
+        lpm_store::v2::Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::from_env())
+    });
     live_package_dir_with_v2(
         project_dir,
         name,
         version,
         wrapper_id,
         store_path,
-        v2_store.as_ref(),
+        virtual_store.as_ref(),
         baseline_index,
     )
 }
@@ -79,10 +79,11 @@ pub(super) fn live_package_dir_with_v2(
     // version conflicts (a different version nested under a parent
     // would not be found by this probe), but covers the common case.
     //
-    // Under v2 mode the project's `node_modules/<name>` may point at
+    // Under virtual-store mode the project's `node_modules/<name>` may point at
     // a project-local compatibility copy for direct-bin runtime
     // behavior. Lifecycle scripts must mutate the store link entry
-    // instead, so compatibility copies fall through to the indexed v2
+    // instead, so compatibility copies fall through to the indexed
+    // virtual-store
     // lookup below.
     let hoisted = nm.join(name);
     if hoisted.is_dir() {
@@ -92,12 +93,12 @@ pub(super) fn live_package_dir_with_v2(
         }
     }
 
-    // — v2 store walk for transitive lifecycle scripts.
-    // Direct deps under v2 are covered by the previous branch via the
+    // Virtual-store walk for transitive lifecycle scripts.
+    // Direct deps are covered by the previous branch via the
     // project-side symlink; transitives have no project-root symlink,
     // so without a store walk they'd fall through to the pathological
-    // store_path fallback (which under v2 isn't even meaningful — v2
-    // doesn't populate v1's `~/.lpm/store/v1/<pkg>/<version>/`).
+    // store_path fallback (which isn't meaningful for a virtual store,
+    // because it doesn't populate v1's package directory layout).
     //
     // Authoritative path: consult the project-scoped
     // `V2BaselineIndex`. Its BFS over `LinkMeta.deps` reaches every
@@ -128,14 +129,15 @@ pub(super) fn live_package_dir_with_v2(
     store_path.to_path_buf()
 }
 
-/// resolve the live per-package directory AND
-/// detach hardlinks so a lifecycle script's writes can't propagate
-/// to the global content-addressable store.
+/// Resolve the live per-package directory and detach any shared inodes
+/// left by legacy or externally-created layouts before lifecycle writes.
 ///
 /// Composes [`live_package_dir`] (which only finds the path) with
 /// [`lpm_linker::detach_package_hardlinks`] (which breaks shared
-/// inodes on Linux; no-op elsewhere). The single entry point is the
-/// load-bearing safety boundary for the rebuild loop, and exposing
+/// inodes on Linux and is a no-op elsewhere). Current v2/v3 link
+/// entries already use independent writable inodes; retaining this
+/// pass makes the safety boundary robust to older layouts. The single
+/// entry point is the load-bearing safety boundary for the rebuild loop, and exposing
 /// it as a function lets the test suite assert the composition end-
 /// to-end without spinning up the full async [`run`] machinery.
 ///
@@ -144,18 +146,16 @@ pub(super) fn live_package_dir_with_v2(
 /// equality, which would silently miss a future [`live_package_dir`]
 /// change that produced a structurally-different fallback anywhere
 /// under `~/.lpm/store/`. The semantic guard rejects canonical store
-/// bytes while allowing v2 link entries under `store/v2/links/`,
-/// because those entries are the mutable package directories scripts
-/// are supposed to build in.
+/// bytes while allowing virtual-store link entries under
+/// `store/v{2,3}/links/`, because those entries are the mutable package
+/// directories scripts are supposed to build in.
 ///
 /// Before this guard, the function returned `Ok(store_path)` whenever
-/// the live probe fell through to the v1/object store. The caller then
-/// chdir'd into the store for the lifecycle script — which, on macOS
-/// (clonefile, CoW) was a silent corruption of the canonical bytes on
-/// first write, and on Linux (hardlinks) skipped the detach so the
-/// script ran against shared inodes. The guard closes that hole while
-/// preserving v2's intended lifecycle location:
-/// `store/v2/links/<key>/node_modules/<pkg>`.
+/// the live probe fell through to a canonical store path. The caller then
+/// chdir'd into immutable source bytes for the lifecycle script, so any
+/// direct write silently corrupted the source for future installs. The
+/// guard closes that hole while preserving the intended lifecycle
+/// locations under `store/v{2,3}/links/<key>/node_modules/<pkg>`.
 ///
 /// Returns the layout-aware live directory on success, or a human-
 /// readable failure string on detach error or unlinked-package
@@ -180,15 +180,17 @@ pub(super) fn prepare_live_package_dir(
         baseline_index,
     );
 
-    let is_v2_link_entry = path_resolves_under(&live, &v2_links_root(store_root));
-    if !is_v2_link_entry && path_lives_in_protected_store_area(&live, store_root) {
+    let is_virtual_link_entry = ["v2", "v3"]
+        .iter()
+        .any(|version| path_resolves_under(&live, &virtual_links_root(store_root, version)));
+    if !is_virtual_link_entry && path_lives_in_protected_store_area(&live, store_root) {
         return Err(format!(
             "package {pkg_name}@{pkg_version} not linked into project — \
              refusing to run lifecycle script inside the store. \
              Run `lpm install` to materialize the wrapper tree, then retry."
         ));
     }
-    if !is_v2_link_entry && path_is_symlink(&live) {
+    if !is_virtual_link_entry && path_is_symlink(&live) {
         return Err(format!(
             "package {pkg_name}@{pkg_version} resolved to a symlinked lifecycle directory at {}",
             live.display()
@@ -223,10 +225,10 @@ fn path_is_symlink(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
-fn v2_links_root(store_root: &Path) -> PathBuf {
+fn virtual_links_root(store_root: &Path, version: &str) -> PathBuf {
     let mut root = PathBuf::with_capacity(store_root.as_os_str().len() + 9);
     root.push(store_root);
-    root.push("v2");
+    root.push(version);
     root.push("links");
     root
 }

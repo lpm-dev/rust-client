@@ -252,7 +252,7 @@ async fn tarball_url_install_trust_on_first_use_lands_in_cas_path() {
     .expect("tarball install must succeed");
     assert!(
         fresh_object.is_none(),
-        "v1 tarball install must not report a v2 fresh object"
+        "v1 tarball install must not report a virtual-store fresh object"
     );
 
     // Returned SRI matches an independent SHA-512 of the bytes.
@@ -340,7 +340,7 @@ async fn tarball_url_install_v2_extracts_object() {
     let (computed_sri, _, _, fresh_object) =
         fetch_and_store_tarball_url(&client, &store, Some(&store_v2), &pkg, 0, permit, &None)
             .await
-            .expect("v2 tarball install must succeed");
+            .expect("virtual-store tarball install must succeed");
 
     assert_eq!(computed_sri, expected_sri);
     assert!(
@@ -348,11 +348,11 @@ async fn tarball_url_install_v2_extracts_object() {
             .reusable_object_dir(&computed_sri)
             .unwrap()
             .is_some(),
-        "v2 tarball install must populate the object store"
+        "virtual-store tarball install must populate the object store"
     );
     assert!(
         fresh_object.is_some(),
-        "v2 tarball install must return the freshly extracted object"
+        "virtual-store tarball install must return the freshly extracted object"
     );
     assert_eq!(semaphore.available_permits(), 1);
 }
@@ -431,7 +431,7 @@ async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
         &None,
     )
     .await
-    .expect("v2 tarball install must accept matching sha256 declarations");
+    .expect("virtual-store tarball install must accept matching sha256 declarations");
 
     assert_eq!(computed_sri, canonical_sri);
     assert!(
@@ -439,11 +439,11 @@ async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
             .reusable_object_dir(&computed_sri)
             .unwrap()
             .is_some(),
-        "v2 object lookups must use the canonical sha512 SRI"
+        "virtual-store object lookups must use the canonical sha512 SRI"
     );
     assert!(
         fresh_object.is_some(),
-        "v2 sha256-declared tarballs must still produce a fresh object for event-driven linking"
+        "virtual-store sha256-declared tarballs must still produce a fresh object for event-driven linking"
     );
 }
 
@@ -619,7 +619,7 @@ async fn speculative_v2_download_extracts_object() {
         ManagedInstallAccounting,
     )
     .await
-    .expect("speculative v2 download must succeed");
+    .expect("speculative virtual-store download must succeed");
     assert_eq!(outcome, SpeculativeFetchOutcome::Stored);
 
     assert!(
@@ -627,7 +627,7 @@ async fn speculative_v2_download_extracts_object() {
             .reusable_object_dir(&expected_sri)
             .unwrap()
             .is_some(),
-        "speculation must populate the v2 object store"
+        "speculation must populate the virtual-store object store"
     );
     assert_eq!(semaphore.available_permits(), 1);
 }

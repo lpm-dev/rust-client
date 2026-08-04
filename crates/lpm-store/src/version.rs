@@ -3,12 +3,11 @@
 /// Threaded through the install pipeline so a single env-var probe at
 /// the top of `lpm install` decides whether the run materializes to
 /// v1 (`<HOME>/.lpm/store/v1/...` + `<project>/.lpm/wrappers/...`) or
-/// v2 (`<HOME>/.lpm/store/v2/{objects,links}/...` with project
+/// v2/v3 (`<HOME>/.lpm/store/v{2,3}/{objects,links}/...` with project
 /// `node_modules/<dep>` symlinks pointing into `links/<graph-key>/`).
 ///
-/// **v2 is the default.** v1 stays available as an explicit downgrade
-/// via `LPM_STORE_VERSION=v1` for users who hit a v2 regression and
-/// need to roll back without redownloading lpm-rs.
+/// **v2 is the default.** v3 stays available as an explicit experimental
+/// mode and v1 remains the downgrade path via `LPM_STORE_VERSION`.
 ///
 /// Read once per install via [`StoreVersion::from_env`] so a single
 /// invocation is internally consistent — flipping the env mid-install
@@ -20,12 +19,17 @@ pub enum StoreVersion {
     /// Selected only via explicit `LPM_STORE_VERSION=v1`
     /// (downgrade-rollback path).
     V1,
-    /// Virtual-store layout — canonical bytes at
+    /// Default virtual-store layout — canonical bytes at
     /// `<HOME>/.lpm/store/v2/objects/<sri>/`, per-context wrappers at
     /// `<HOME>/.lpm/store/v2/links/<graph-key>/`. Project
-    /// `node_modules/<dep>` is a symlink into the link entry. Default.
+    /// `node_modules/<dep>` is a symlink into the link entry.
     #[default]
     V2,
+    /// Experimental file-CAS virtual-store layout rooted at
+    /// `<HOME>/.lpm/store/v3/`.
+    /// Package link trees retain independent writable inodes while object
+    /// files share immutable content-and-mode blobs.
+    V3,
 }
 
 impl StoreVersion {
@@ -38,10 +42,10 @@ impl StoreVersion {
     ///
     /// Recognized values:
     /// - Unset, empty, or `v2`/`2` → `V2` (default).
-    /// - `v1`/`1` → `V1` (explicit downgrade-rollback for users
-    ///   hitting a v2 regression).
+    /// - `v3`/`3` selects the experimental file-CAS layout.
+    /// - `v1`/`1` selects the downgrade path.
     /// - Anything else → `V2` + a warning trace, so a typo doesn't
-    ///   silently activate v1.
+    ///   silently activate an experimental or legacy layout.
     ///
     /// Trimmed and lowercased for ergonomics.
     pub fn from_env() -> Self {
@@ -59,10 +63,11 @@ impl StoreVersion {
         let normalized = raw.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "" | "v2" | "2" => Self::V2,
+            "v3" | "3" => Self::V3,
             "v1" | "1" => Self::V1,
             other => {
                 tracing::warn!(
-                    "{}={other:?} not recognized; falling back to v2 (valid: v1, v2)",
+                    "{}={other:?} not recognized; falling back to v2 (valid: v1, v2, v3)",
                     Self::ENV_VAR
                 );
                 Self::V2
@@ -74,6 +79,11 @@ impl StoreVersion {
     pub fn is_v2(self) -> bool {
         matches!(self, Self::V2)
     }
+
+    /// Whether this version uses the graph-keyed virtual-store pipeline.
+    pub fn uses_virtual_store(self) -> bool {
+        matches!(self, Self::V2 | Self::V3)
+    }
 }
 
 impl std::fmt::Display for StoreVersion {
@@ -81,6 +91,7 @@ impl std::fmt::Display for StoreVersion {
         match self {
             Self::V1 => f.write_str("v1"),
             Self::V2 => f.write_str("v2"),
+            Self::V3 => f.write_str("v3"),
         }
     }
 }
@@ -103,13 +114,20 @@ mod tests {
     }
 
     #[test]
-    fn store_version_parse_recognizes_v2_aliases() {
-        for s in ["", "v2", "V2", "2", "  V2  ", "v2\n"] {
+    fn store_version_parse_recognizes_v3_aliases() {
+        for s in ["v3", "V3", "3", "  V3  ", "v3\n"] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
-                StoreVersion::V2,
-                "input {s:?} should resolve to v2"
+                StoreVersion::V3,
+                "input {s:?} should resolve to v3"
             );
+        }
+    }
+
+    #[test]
+    fn store_version_parse_recognizes_v2_default_aliases() {
+        for s in ["", "v2", "V2", "2", "  v2  "] {
+            assert_eq!(StoreVersion::parse(Some(s)), StoreVersion::V2);
         }
     }
 
@@ -126,7 +144,7 @@ mod tests {
 
     #[test]
     fn store_version_parse_unknown_falls_back_to_v2() {
-        for s in ["v3", "v2x", "true", "yes", "on", "junk"] {
+        for s in ["v4", "v3x", "true", "yes", "on", "junk"] {
             assert_eq!(
                 StoreVersion::parse(Some(s)),
                 StoreVersion::V2,
@@ -139,11 +157,15 @@ mod tests {
     fn store_version_is_v2_predicate() {
         assert!(StoreVersion::V2.is_v2());
         assert!(!StoreVersion::V1.is_v2());
+        assert!(!StoreVersion::V3.is_v2());
+        assert!(StoreVersion::V2.uses_virtual_store());
+        assert!(StoreVersion::V3.uses_virtual_store());
+        assert!(!StoreVersion::V1.uses_virtual_store());
     }
 
     #[test]
     fn store_version_display_round_trips_through_parse() {
-        for v in [StoreVersion::V1, StoreVersion::V2] {
+        for v in [StoreVersion::V1, StoreVersion::V2, StoreVersion::V3] {
             let rendered = format!("{v}");
             assert_eq!(StoreVersion::parse(Some(&rendered)), v);
         }

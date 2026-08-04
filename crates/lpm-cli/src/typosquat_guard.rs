@@ -477,9 +477,10 @@ fn locked_in_every_root(name: &str, roots: &[BTreeSet<String>]) -> bool {
     !roots.is_empty() && roots.iter().all(|locked| locked.contains(name))
 }
 
-fn locked_direct_names(project_dir: &Path) -> BTreeSet<String> {
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let Ok(lockfile) = lpm_lockfile::Lockfile::read_fast(&lockfile_path) else {
+pub(crate) fn locked_direct_names(project_dir: &Path) -> BTreeSet<String> {
+    let Ok(lockfile) =
+        crate::commands::install::workspace_lockfile::read_project_metadata_shared(project_dir)
+    else {
         return BTreeSet::new();
     };
     let Some(importer) = lockfile.importers.get(".") else {

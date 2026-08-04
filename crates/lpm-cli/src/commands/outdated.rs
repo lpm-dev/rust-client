@@ -77,12 +77,9 @@ pub async fn run(
         return Ok(());
     }
 
-    let lockfile_path = project_dir.join("lpm.lock");
-    let lockfile = if lockfile_path.exists() {
-        lpm_lockfile::Lockfile::read_fast(&lockfile_path).ok()
-    } else {
-        None
-    };
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
+        .ok()
+        .map(|project| project.lockfile);
     let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
         project_dir,
         None,

@@ -110,22 +110,16 @@ pub(crate) fn describe_rules_with_isolation(
         rules.push((PathBuf::from(p), RuleAccess::Read));
     }
 
-    // Read-only project baseline. The package's own deps live under
-    // either the isolated wrapper tree (`{project}/.lpm/wrappers/`)
-    // or the hoisted layout (`{project}/.lpm/hoisted/` + flat
-    // `node_modules/`). All variants are reachable via this rule
-    // under LPM's default linker strategy (clonefile on macOS,
-    // hardlink on Linux — both place dep content inside the project
-    // tree, so the rule matches path-locally). The rule grants the
-    // entire `project_dir` subtree, which covers every active and
-    // legacy variant uniformly. The fallback symlink path would
-    // cross into `~/.lpm/store/` which this rule doesn't cover;
-    // widening to `store_root` would expose every other package
-    // the user has installed. Two remediations exist for that corner:
-    // switch to hardlink, or widen reads with an explicit store rule.
     if build_cache_isolation {
+        // Virtual-store packages live below
+        // `store/v{2,3}/links/<key>/node_modules/`. Grant the owning
+        // `node_modules` directory so the package can read its sibling
+        // dependencies without exposing the rest of the global store.
         rules.push((package_dependency_root(spec), RuleAccess::Read));
     } else {
+        // The normal sandbox may read the project tree. The live package
+        // directory receives its own rule below because virtual-store
+        // package bytes can resolve outside the project through symlinks.
         rules.push((spec.project_dir.clone(), RuleAccess::Read));
     }
     // NVM-installed toolchain. Only added if the host has a matching

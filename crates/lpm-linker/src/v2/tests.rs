@@ -94,7 +94,7 @@ fn write_local_source_object(store: &V2Store, sri: &str, source_dir: &Path) -> P
 
 fn target(name: &str, version: &str, sri: &str, is_direct: bool) -> V2Target {
     V2Target {
-        target: LinkTarget {
+        target: Arc::new(LinkTarget {
             name: name.into(),
             version: version.into(),
             store_path: PathBuf::new(), // unused under v2
@@ -106,7 +106,7 @@ fn target(name: &str, version: &str, sri: &str, is_direct: bool) -> V2Target {
             materialization: crate::Materialization::CasBacked,
             peers: Vec::new(),
             patch_fingerprint: None,
-        },
+        }),
         source_sri: sri.into(),
         verified_object_integrity: None,
         fresh_object: None,
@@ -297,7 +297,8 @@ fn link_packages_v2_resolves_dep_via_key_map() {
     );
 
     let mut consumer = target("consumer", "0.1.0", &cons_sri, true);
-    consumer.target.dependencies = vec![LinkDependency::registry("lib", "1.2.3")];
+    Arc::make_mut(&mut consumer.target).dependencies =
+        vec![LinkDependency::registry("lib", "1.2.3")];
     let lib = target("lib", "1.2.3", &lib_sri, false);
 
     let result = link_packages_v2(
@@ -373,7 +374,7 @@ fn link_packages_v2_deduplicates_identical_dependency_slots() {
 
     let dependency = LinkDependency::registry("shared-peer", "1.0.0");
     let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer.target.dependencies = vec![dependency.clone(), dependency];
+    Arc::make_mut(&mut consumer.target).dependencies = vec![dependency.clone(), dependency];
 
     let result = link_packages_v2(
         &project,
@@ -432,7 +433,7 @@ fn link_packages_v2_rejects_conflicting_dependency_slots() {
     );
 
     let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer.target.dependencies = vec![
+    Arc::make_mut(&mut consumer.target).dependencies = vec![
         LinkDependency::new("shared-slot", "first", "1.0.0", None),
         LinkDependency::new("shared-slot", "second", "1.0.0", None),
     ];
@@ -488,7 +489,8 @@ fn link_packages_v2_nests_same_name_dependency_inside_package_node_modules() {
     );
 
     let mut current = target("pangea-lib", "4.0.521", &current_sri, true);
-    current.target.dependencies = vec![LinkDependency::registry("pangea-lib", "2.12.192")];
+    Arc::make_mut(&mut current.target).dependencies =
+        vec![LinkDependency::registry("pangea-lib", "2.12.192")];
     let legacy = target("pangea-lib", "2.12.192", &legacy_sri, false);
 
     let result = link_packages_v2(
@@ -564,8 +566,9 @@ fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() 
     );
 
     let mut next = target("next", "16.2.4", &next_sri, true);
-    next.target.dependencies = vec![LinkDependency::registry("@swc/helpers", "0.5.0")];
-    next.target.peers = vec![
+    Arc::make_mut(&mut next.target).dependencies =
+        vec![LinkDependency::registry("@swc/helpers", "0.5.0")];
+    Arc::make_mut(&mut next.target).peers = vec![
         ("react".to_string(), "19.2.5".to_string()),
         ("react-dom".to_string(), "19.2.5".to_string()),
     ];
@@ -610,7 +613,7 @@ fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() 
     );
     assert!(
         !next_real.starts_with(&store_root),
-        "Next's root realpath must not point straight into the global v2 store",
+        "Next's root realpath must not point straight into the global virtual-store store",
     );
 
     let compat_node_modules = next_real
@@ -632,7 +635,7 @@ fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() 
         );
         assert!(
             !package_real.starts_with(&store_root),
-            "{package} must not resolve straight into the global v2 store",
+            "{package} must not resolve straight into the global virtual-store store",
         );
     }
 
@@ -677,7 +680,8 @@ fn store_cached_compat_island_is_reused_across_node_modules_removal() {
 
     let make_targets = || {
         let mut tool = target("tool", "1.0.0", &tool_sri, true);
-        tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
+        Arc::make_mut(&mut tool.target).dependencies =
+            vec![LinkDependency::registry("helper", "1.0.0")];
         vec![tool, target("helper", "1.0.0", &helper_sri, false)]
     };
 
@@ -815,7 +819,8 @@ fn link_packages_v2_compatibility_island_prefers_declared_dependency_context() {
     );
 
     let mut server = target("dev-server", "1.0.0", &server_sri, true);
-    server.target.dependencies = vec![LinkDependency::registry("shared", "1.0.0")];
+    Arc::make_mut(&mut server.target).dependencies =
+        vec![LinkDependency::registry("shared", "1.0.0")];
     let delegated_cli = target("delegated-cli", "1.0.0", &cli_sri, true);
     let shared_dep = target("shared", "1.0.0", &shared_dep_sri, false);
     let shared_root = target("shared", "2.0.0", &shared_root_sri, true);
@@ -928,7 +933,8 @@ fn plain_install_links_bins_but_skips_compat_island() {
     );
 
     let mut tool = target("tool", "1.0.0", &tool_sri, true);
-    tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
+    Arc::make_mut(&mut tool.target).dependencies =
+        vec![LinkDependency::registry("helper", "1.0.0")];
 
     let result = link_packages_v2(
         &project,
@@ -1002,7 +1008,8 @@ fn link_packages_v2_materializes_direct_bin_without_unrelated_direct_deps() {
     );
 
     let mut tool = target("tool", "1.0.0", &tool_sri, true);
-    tool.target.dependencies = vec![LinkDependency::registry("helper", "1.0.0")];
+    Arc::make_mut(&mut tool.target).dependencies =
+        vec![LinkDependency::registry("helper", "1.0.0")];
 
     let result = link_packages_v2_with_compatibility_bin_names(
         &project,
@@ -1182,7 +1189,7 @@ fn finalize_existing_link_entries_refreshes_compatibility_copy_after_generated_b
     let link_pkg = store
         .find_link_package_dir("tool", "1.0.0")
         .unwrap()
-        .expect("initial link must populate the v2 link entry");
+        .expect("initial link must populate the virtual-store link entry");
     let generated_bin = link_pkg.join("bin").join("tool.js");
     std::fs::create_dir_all(generated_bin.parent().unwrap()).unwrap();
     std::fs::write(&generated_bin, b"#!/usr/bin/env node\n").unwrap();
@@ -1238,7 +1245,7 @@ fn link_packages_v2_skips_dependency_local_name_with_traversal() {
     );
 
     let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer.target.dependencies = vec![LinkDependency::new(
+    Arc::make_mut(&mut consumer.target).dependencies = vec![LinkDependency::new(
         "../../../../escape",
         "debug",
         "1.0.0",
@@ -1293,10 +1300,11 @@ fn link_packages_v2_supports_local_source_dep_edges() {
         );
 
     let mut consumer = target("external-reentry", "1.0.0", &consumer_sri, true);
-    consumer.target.dependencies = vec![LinkDependency::registry("@smoke/cycle-b", "1.0.0")];
+    Arc::make_mut(&mut consumer.target).dependencies =
+        vec![LinkDependency::registry("@smoke/cycle-b", "1.0.0")];
 
     let mut local = target("@smoke/cycle-b", "1.0.0", &local_sri, false);
-    local.target.materialization = crate::Materialization::DirectorySource;
+    Arc::make_mut(&mut local.target).materialization = crate::Materialization::DirectorySource;
 
     let result = link_packages_v2(
         &project,
@@ -1339,7 +1347,7 @@ fn link_packages_v2_supports_local_source_dep_edges() {
             .unwrap()
             .file_type()
             .is_symlink(),
-        "local-source entrypoints must be real files so Node resolves deps from the v2 link entry"
+        "local-source entrypoints must be real files so Node resolves deps from the virtual-store link entry"
     );
 }
 
@@ -1370,7 +1378,7 @@ fn link_packages_v2_wipes_legacy_v1_wrappers() {
 
     assert!(
         !project.join(".lpm").join("wrappers").exists(),
-        "v2 linker must wipe legacy v1 wrapper tree"
+        "virtual-store linker must wipe legacy v1 wrapper tree"
     );
 }
 
@@ -1429,7 +1437,7 @@ fn link_packages_v2_with_explicit_root_link_names() {
     );
 
     let mut t = target("a", "1.0.0", &sri, true);
-    t.target.root_link_names = Some(vec![]);
+    Arc::make_mut(&mut t.target).root_link_names = Some(vec![]);
     let result = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
     assert_eq!(result.symlinked, 0);
     assert!(!project.join("node_modules").join("a").exists());
@@ -1562,7 +1570,7 @@ fn link_packages_v2_missing_dep_key_surfaces_error() {
     );
     let mut t = target("c", "1.0.0", &sri, true);
     // Dep 'phantom@9.9.9' has no matching LinkTarget in the set.
-    t.target.dependencies = vec![LinkDependency::registry("phantom", "9.9.9")];
+    Arc::make_mut(&mut t.target).dependencies = vec![LinkDependency::registry("phantom", "9.9.9")];
 
     let err = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap_err();
     let msg = format!("{err}");
@@ -1791,7 +1799,7 @@ fn link_packages_v2_hoisted_mode_accepts_targets_with_peer_context() {
     );
 
     let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer.target.peers = vec![("react".into(), "18.3.1".into())];
+    Arc::make_mut(&mut consumer.target).peers = vec![("react".into(), "18.3.1".into())];
     let react = target("react", "18.3.1", &react_sri, false);
 
     let result = link_packages_v2(
@@ -1845,7 +1853,7 @@ fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
     let project_18 = tmp.path().join("project-18");
     std::fs::create_dir_all(&project_18).unwrap();
     let mut consumer_18 = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer_18.target.peers = vec![("react".into(), "18.3.1".into())];
+    Arc::make_mut(&mut consumer_18.target).peers = vec![("react".into(), "18.3.1".into())];
     let result_18 = link_packages_v2(
         &project_18,
         vec![consumer_18, target("react", "18.3.1", &react_18_sri, false)],
@@ -1858,7 +1866,7 @@ fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
     let project_19 = tmp.path().join("project-19");
     std::fs::create_dir_all(&project_19).unwrap();
     let mut consumer_19 = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer_19.target.peers = vec![("react".into(), "19.0.0".into())];
+    Arc::make_mut(&mut consumer_19.target).peers = vec![("react".into(), "19.0.0".into())];
     let result_19 = link_packages_v2(
         &project_19,
         vec![consumer_19, target("react", "19.0.0", &react_19_sri, false)],
@@ -1882,7 +1890,7 @@ fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
         .expect("consumer materialized with react 19");
     assert_ne!(
         consumer_dest_18, consumer_dest_19,
-        "hoisted v2 link entries must include peer pinning when peer siblings are materialized"
+        "hoisted virtual-store link entries must include peer pinning when peer siblings are materialized"
     );
 }
 
@@ -1923,9 +1931,9 @@ fn link_packages_v2_resolves_multi_source_same_coords_with_source_edges() {
 
     let registry_x = target("x", "1.0.0", &registry_sri, true);
     let mut source_x = target("x", "1.0.0", &source_sri, false);
-    source_x.target.wrapper_id = Some("t-bbbbbbbbbbbbbbbb".into());
+    Arc::make_mut(&mut source_x.target).wrapper_id = Some("t-bbbbbbbbbbbbbbbb".into());
     let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
-    consumer.target.dependencies = vec![LinkDependency::new(
+    Arc::make_mut(&mut consumer.target).dependencies = vec![LinkDependency::new(
         "x",
         "x",
         "1.0.0",
@@ -2015,7 +2023,7 @@ fn link_packages_v2_isolates_patched_install_from_unpatched() {
     std::fs::create_dir_all(&proj_b).unwrap();
 
     let mut t_a = target("lodash", "1.0.0", &sri, true);
-    t_a.target.patch_fingerprint = Some("p-aaaaaaaaaaaaaaaa".into());
+    Arc::make_mut(&mut t_a.target).patch_fingerprint = Some("p-aaaaaaaaaaaaaaaa".into());
     let t_b = target("lodash", "1.0.0", &sri, true); // unpatched
 
     let r_a = link_packages_v2(&proj_a, vec![t_a], &store, LinkerMode::Isolated, None).unwrap();
@@ -2085,9 +2093,9 @@ fn link_packages_v2_shares_link_entry_for_byte_identical_patches() {
     std::fs::create_dir_all(&proj_b).unwrap();
 
     let mut t_a = target("lodash", "1.0.0", &sri, true);
-    t_a.target.patch_fingerprint = Some("p-1234567890abcdef".into());
+    Arc::make_mut(&mut t_a.target).patch_fingerprint = Some("p-1234567890abcdef".into());
     let mut t_b = target("lodash", "1.0.0", &sri, true);
-    t_b.target.patch_fingerprint = Some("p-1234567890abcdef".into());
+    Arc::make_mut(&mut t_b.target).patch_fingerprint = Some("p-1234567890abcdef".into());
 
     let r_a = link_packages_v2(&proj_a, vec![t_a], &store, LinkerMode::Isolated, None).unwrap();
     let r_b = link_packages_v2(&proj_b, vec![t_b], &store, LinkerMode::Isolated, None).unwrap();
@@ -2301,8 +2309,8 @@ impl Drop for NofileLimitGuard {
 
 /// A package whose `bin` map keys a shim with a path-traversal
 /// name must be skipped. v1's hoisted emitter has enforced this
-/// since the validators were introduced; v2 (the default store
-/// version) was the gap a malicious package could exploit to
+/// since the validators were introduced; the v2 emitter was the gap
+/// a malicious package could exploit to
 /// shadow `/usr/bin` entries via `node_modules/.bin/`.
 #[test]
 fn v2_skips_bin_shim_when_bin_name_contains_path_traversal() {
@@ -2480,7 +2488,7 @@ fn link_packages_v2_reuses_up_to_date_bin_shim_on_warm_rerun() {
             .mode()
             & 0o777,
         0o644,
-        "v2 bin shim creation must not chmod the shared link entry target"
+        "virtual-store bin shim creation must not chmod the shared link entry target"
     );
     let first_content = std::fs::read_to_string(&shim).expect("shim should be a wrapper file");
     let first_inode = shim.symlink_metadata().expect("shim metadata").ino();
@@ -2664,7 +2672,7 @@ fn link_packages_v2_skips_root_symlink_when_name_contains_traversal() {
     );
 
     let mut t = target("safe", "1.0.0", &sri, true);
-    t.target.root_link_names = Some(vec!["../escape".into(), "safe".into()]);
+    Arc::make_mut(&mut t.target).root_link_names = Some(vec!["../escape".into(), "safe".into()]);
 
     let result = link_packages_v2(&project, vec![t], &store, LinkerMode::Isolated, None).unwrap();
 
@@ -2756,6 +2764,6 @@ fn link_v2_finalize_replaces_symlinked_scope_parent_before_root_symlink_write() 
         .unwrap();
     assert!(
         symlink_points_to(&root_link, &store.paths().link_package_dir(key)),
-        "scoped root link should point at the v2 link package dir",
+        "scoped root link should point at the virtual-store link package dir",
     );
 }

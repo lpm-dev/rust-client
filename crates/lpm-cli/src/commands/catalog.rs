@@ -134,15 +134,9 @@ fn list_catalog_entries(cwd: &Path, unused_only: bool, json_output: bool) -> Res
 
 fn show_resolved_catalog_entries(cwd: &Path, json_output: bool) -> Result<(), LpmError> {
     let context = load_catalog_context(cwd)?;
-    let lockfile_path = context.root_dir.join("lpm.lock");
-    let lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).map_err(|error| {
-        LpmError::Registry(format!(
-            "failed to read catalog snapshot from {}: {error}. Run `lpm install` first.",
-            lockfile_path.display()
-        ))
-    })?;
+    let catalogs = resolved_catalog_snapshots(&context.root_dir)?;
 
-    let missing = missing_catalog_snapshot_references(&context.references, &lockfile.catalogs);
+    let missing = missing_catalog_snapshot_references(&context.references, &catalogs);
     if !missing.is_empty() {
         return Err(LpmError::Registry(format!(
             "lpm.lock is missing resolved catalog snapshots for {}. Run `lpm install` to refresh the lockfile.",
@@ -151,7 +145,7 @@ fn show_resolved_catalog_entries(cwd: &Path, json_output: bool) -> Result<(), Lp
     }
 
     let mut entries = Vec::new();
-    for (catalog, packages) in &lockfile.catalogs {
+    for (catalog, packages) in &catalogs {
         for (package, entry) in packages {
             entries.push(ResolvedCatalogEntryReport {
                 catalog: catalog.clone(),
@@ -174,6 +168,39 @@ fn show_resolved_catalog_entries(cwd: &Path, json_output: bool) -> Result<(), Lp
         print_resolved_catalog_entries(&entries);
         Ok(())
     }
+}
+
+fn resolved_catalog_snapshots(root_dir: &Path) -> Result<lpm_lockfile::CatalogSnapshots, LpmError> {
+    let path = root_dir.join(lpm_lockfile::LOCKFILE_NAME);
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&path).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to read catalog snapshot from {}: {error}. Run `lpm install` first.",
+            path.display()
+        ))
+    })?;
+    let is_union = !lockfile.workspace_packages.is_empty()
+        || lockfile.importers.keys().any(|importer| importer != ".");
+    if !is_union {
+        return Ok(lockfile.catalogs);
+    }
+
+    let mut catalogs = lpm_lockfile::CatalogSnapshots::new();
+    for (importer, snapshot) in &lockfile.importers {
+        for (catalog, packages) in &snapshot.catalog_resolutions {
+            let merged = catalogs.entry(catalog.clone()).or_default();
+            for (package, entry) in packages {
+                if let Some(existing) = merged.get(package)
+                    && existing != entry
+                {
+                    return Err(LpmError::Registry(format!(
+                        "lpm.lock has conflicting resolved catalog snapshots for {catalog}/{package} across workspace importers (including {importer})"
+                    )));
+                }
+                merged.insert(package.clone(), entry.clone());
+            }
+        }
+    }
+    Ok(catalogs)
 }
 
 fn missing_catalog_snapshot_references(
