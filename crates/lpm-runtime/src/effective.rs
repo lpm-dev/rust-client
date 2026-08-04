@@ -8,13 +8,11 @@
 //!
 //! Resolution order:
 //!
-//! 1. If the project pins a Node version (`lpm.json > runtime.node`,
-//!    `package.json > engines.node`, `.nvmrc`, `.node-version`) AND a
-//!    managed runtime under `~/.lpm/runtimes/node/` satisfies that pin,
-//!    use the managed version.
+//! 1. If the project selects a Node version (`lpm.json > runtime.node`,
+//!    `.nvmrc`, `.node-version`) and a managed runtime under
+//!    `~/.lpm/runtimes/node/` satisfies that selector, use the managed version.
 //! 2. Else, fall back to the system `node --version` from `PATH`.
-//! 3. Else, return [`Effective::Unknown`] — the engine check should
-//!    skip rather than fail when no Node is available at all.
+//! 3. Else, return [`Effective::Unknown`].
 //!
 //! The pin-but-not-yet-installed case intentionally falls through to
 //! the system Node: that mirrors npm's behavior (compare engines.node
@@ -39,8 +37,7 @@ pub enum Effective {
     /// No managed runtime matched (or no pin exists). `node --version`
     /// from `PATH` will be invoked.
     System { version: String },
-    /// No managed runtime matched and `node` is not on `PATH`. The
-    /// engine check should skip — there's nothing to validate against.
+    /// No managed runtime matched and `node` is not on `PATH`.
     Unknown,
 }
 
@@ -95,16 +92,16 @@ pub fn resolve_effective_node_version(project_dir: &Path) -> detect::DetectionRe
     Ok(resolve_inner(detect::detect_node_version(project_dir)?))
 }
 
-/// Variant for callers that have already parsed `package.json`'s
-/// `engines` block. Skips the duplicate disk read in [`detect`].
+/// Compatibility shim for callers that already parsed `package.json`.
+///
+/// The `engines` map is intentionally ignored because `engines.node` can only
+/// validate the effective runtime; it cannot select one.
+#[deprecated(note = "use resolve_effective_node_version; engines.node does not select a runtime")]
 pub fn resolve_effective_node_version_with_engines(
     project_dir: &Path,
-    engines: &HashMap<String, String>,
+    _engines: &HashMap<String, String>,
 ) -> detect::DetectionResult<Effective> {
-    Ok(resolve_inner(detect::detect_node_version_with_engines(
-        project_dir,
-        engines,
-    )?))
+    resolve_effective_node_version(project_dir)
 }
 
 /// Resolve effective Node and fingerprint the selected executable.
@@ -112,13 +109,23 @@ pub fn resolve_effective_node_version_with_engines(
 /// System Node is executed once to obtain its version. The fingerprint uses
 /// only the selected executable's path and filesystem metadata, so subsequent
 /// freshness checks can probe it without spawning Node.
-pub fn resolve_effective_node_with_fingerprint_with_engines(
+pub fn resolve_effective_node_with_fingerprint(
     project_dir: &Path,
-    engines: &HashMap<String, String>,
 ) -> detect::DetectionResult<EffectiveNodeResolution> {
     Ok(resolve_detected_node_with_fingerprint(
-        detect::detect_node_version_with_engines(project_dir, engines)?,
+        detect::detect_node_version(project_dir)?,
     ))
+}
+
+/// Compatibility shim that ignores `engines` during runtime selection.
+#[deprecated(
+    note = "use resolve_effective_node_with_fingerprint; engines.node does not select a runtime"
+)]
+pub fn resolve_effective_node_with_fingerprint_with_engines(
+    project_dir: &Path,
+    _engines: &HashMap<String, String>,
+) -> detect::DetectionResult<EffectiveNodeResolution> {
+    resolve_effective_node_with_fingerprint(project_dir)
 }
 
 /// Resolve and fingerprint an already-detected Node requirement.
@@ -131,14 +138,22 @@ pub fn resolve_detected_node_with_fingerprint(
 /// Fingerprint the Node executable LPM would select without executing it.
 ///
 /// Returns `None` when no concrete executable can be identified. Managed
-/// runtime selection still follows project pins and installed runtime state.
-pub fn probe_effective_node_fingerprint_with_engines(
+/// runtime selection still follows project selectors and installed runtime state.
+pub fn probe_effective_node_fingerprint(
     project_dir: &Path,
-    engines: &HashMap<String, String>,
 ) -> detect::DetectionResult<Option<String>> {
     Ok(probe_detected_node_fingerprint(
-        detect::detect_node_version_with_engines(project_dir, engines)?,
+        detect::detect_node_version(project_dir)?,
     ))
+}
+
+/// Compatibility shim that ignores `engines` during runtime selection.
+#[deprecated(note = "use probe_effective_node_fingerprint; engines.node does not select a runtime")]
+pub fn probe_effective_node_fingerprint_with_engines(
+    project_dir: &Path,
+    _engines: &HashMap<String, String>,
+) -> detect::DetectionResult<Option<String>> {
+    probe_effective_node_fingerprint(project_dir)
 }
 
 /// Fingerprint the executable selected for an already-detected Node requirement.
@@ -172,14 +187,14 @@ impl SelectedNode {
 }
 
 fn selected_node(detected: Option<detect::DetectedNodeVersion>) -> SelectedNode {
-    if let Some(detected) = detected {
+    if let Some(detected) = detected.filter(detect::DetectedRuntimeVersion::is_runtime_selector) {
         let installed = node::list_installed().unwrap_or_default();
         if let Some(version) = node::find_matching_installed(&detected.spec, &installed)
             && let Ok(executable) = node::node_binary_path(&version)
         {
             return SelectedNode::Managed {
                 version,
-                source: detected.source.to_string(),
+                source: detected.source_label(),
                 executable,
             };
         }
@@ -413,20 +428,31 @@ mod tests {
     }
 
     #[test]
-    fn pin_without_managed_runtime_falls_through_to_system() {
-        // Project pins node@99.0.0 — no managed runtime exists for
-        // that. The helper must not crash; it should fall through to
-        // the system Node (or Unknown if none is on PATH).
+    fn selector_without_managed_runtime_falls_through_to_system() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
-            dir.path().join("package.json"),
-            r#"{"engines": {"node": "99.0.0"}}"#,
+            dir.path().join("lpm.json"),
+            r#"{"runtime": {"node": "99.0.0"}}"#,
         )
         .unwrap();
         let result = resolve_effective_node_version(dir.path()).unwrap();
         assert!(!matches!(
             result,
             Effective::Managed { ref version, .. } if version == "99.0.0"
+        ));
+    }
+
+    #[test]
+    fn package_json_engine_constraint_cannot_select_managed_node() {
+        let detected = detect::DetectedRuntimeVersion {
+            runtime: detect::RuntimeKind::Node,
+            spec: ">=18".to_string(),
+            source: detect::VersionSource::PackageJsonEngines,
+        };
+
+        assert!(matches!(
+            selected_node(Some(detected)),
+            SelectedNode::System { .. }
         ));
     }
 

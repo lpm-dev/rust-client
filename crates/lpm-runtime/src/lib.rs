@@ -81,6 +81,9 @@ pub async fn ensure_detected_runtimes(
     let mut install_context = RuntimeInstallContext::default();
     let mut statuses = Vec::with_capacity(detected.len());
     for runtime in detected {
+        if !runtime.is_runtime_selector() {
+            continue;
+        }
         statuses.push(ensure_one_runtime(runtime, &mut install_context).await);
     }
     statuses
@@ -138,7 +141,7 @@ async fn ensure_one_runtime(
     install_context: &mut RuntimeInstallContext,
 ) -> RuntimeStatus {
     let runtime = detected.runtime;
-    let source = detected.source.to_string();
+    let source = detected.source_label();
     let spec = &detected.spec;
 
     if let Err(e) = validate_version_spec(runtime, spec) {
@@ -388,5 +391,23 @@ fn clean_lookup_spec(runtime: detect::RuntimeKind, spec: &str) -> String {
             .trim_start_matches('>')
             .to_string(),
         detect::RuntimeKind::Bun => bun::normalize_spec(spec),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn package_json_engine_constraint_is_ignored_by_runtime_ensurer() {
+        let detected = detect::DetectedRuntimeVersion {
+            runtime: detect::RuntimeKind::Node,
+            spec: ">=18".to_string(),
+            source: detect::VersionSource::PackageJsonEngines,
+        };
+
+        let statuses = ensure_detected_runtimes(vec![detected]).await;
+
+        assert!(statuses.is_empty());
     }
 }

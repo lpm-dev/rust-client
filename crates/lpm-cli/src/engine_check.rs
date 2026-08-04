@@ -34,7 +34,7 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
-use lpm_runtime::detect::{DetectedNodeVersion, detect_node_version_with_engines};
+use lpm_runtime::detect::{DetectedNodeVersion, detect_node_version};
 use lpm_runtime::effective::{
     Effective, EffectiveNodeResolution, probe_detected_node_fingerprint,
     resolve_detected_node_with_fingerprint,
@@ -79,7 +79,12 @@ impl DependencyEnginePolicy {
     fn check_node_requirement(&self, required: &str, source: String) -> Result<(), Mismatch> {
         let effective = self.effective_node();
         let Some(actual) = effective.version() else {
-            return Ok(());
+            return Err(Mismatch {
+                required: required.to_string(),
+                actual: "not found on PATH; select one explicitly (for example, `lpm use node@22`)"
+                    .to_string(),
+                source: format!("{source} (compatibility constraint)"),
+            });
         };
         let source = format!("{source} (compared against {})", effective.source_label());
         match version_satisfies(required, actual) {
@@ -195,7 +200,7 @@ pub(crate) fn prepare_dependency_policy(
         return Ok(DependencyEnginePolicy::new(None, false, json_output));
     };
     let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
-    let detected_node = detect_node_version_with_engines(&root_dir, &root_pkg.engines)?;
+    let detected_node = detect_node_version(&root_dir)?;
     let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
     enforce_root_with_policy(&root_pkg, &policy)?;
     Ok(policy)
@@ -229,6 +234,35 @@ pub fn enforce(
     prepare_dependency_policy(start_dir, cli_no_engine_strict, json_output).map(|_| ())
 }
 
+/// Validate the effective Node selected for script execution against the
+/// workspace root's `package.json > engines.node` compatibility constraint.
+pub(crate) fn enforce_node_for_run(
+    start_dir: &Path,
+    detected_node: Option<DetectedNodeVersion>,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let Some((_, root_pkg)) = resolve_root_package(start_dir)? else {
+        return Ok(());
+    };
+    let Some(required) = root_pkg.engines.get("node") else {
+        return Ok(());
+    };
+    let engine_strict = engine_strict_config::resolve_for_root(false, &root_pkg);
+    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
+    let result = policy.check_node_requirement(required, "package.json > engines.node".to_string());
+
+    if !engine_strict {
+        if let Err(mismatch) = result
+            && !json_output
+        {
+            output::warn(&format!("{mismatch} (engine-strict disabled, ignoring)"));
+        }
+        return Ok(());
+    }
+
+    result.map_err(|mismatch| mismatch.into_error("node"))
+}
+
 /// Variant that takes the already-resolved root + manifest. Use this
 /// at call sites that have parsed the workspace themselves to avoid a
 /// second discovery pass.
@@ -238,7 +272,7 @@ pub fn enforce_with_root(
     engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let detected_node = detect_node_version_with_engines(root_dir, &root_pkg.engines)?;
+    let detected_node = detect_node_version(root_dir)?;
     let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
     enforce_root_with_policy(root_pkg, &policy)
 }
@@ -488,20 +522,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = enforce_with_root(dir.path(), &pkg, true, true).unwrap_err();
         assert!(matches!(err, LpmError::EngineMismatch { .. }));
-    }
-
-    #[test]
-    fn node_engine_with_no_node_at_all_skips() {
-        // engines.node = ">=22" but no managed runtime AND no
-        // system Node would mean Effective::Unknown → skip.
-        // We can't reliably make `node` absent on a dev machine, so
-        // this test only confirms that "absent engines.node" is OK.
-        let pkg = PackageJson {
-            engines: engines(&[("lpm", ">=0.1.0")]),
-            ..Default::default()
-        };
-        let dir = tempdir().unwrap();
-        assert!(enforce_with_root(dir.path(), &pkg, true, true).is_ok());
     }
 
     #[test]

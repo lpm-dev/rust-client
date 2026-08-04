@@ -20,6 +20,22 @@ pub async fn ensure_runtime(project_dir: &Path) -> Result<ManagedRuntimeHint, Lp
     Ok(ensure_detected_runtimes(detected).await)
 }
 
+/// Apply managed runtime selectors, then validate the selected Node against
+/// `package.json > engines.node` without treating that constraint as a selector.
+pub async fn prepare_runtime(
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<ManagedRuntimeHint, LpmError> {
+    let detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+    let detected_node = detected
+        .iter()
+        .find(|runtime| runtime.runtime == lpm_runtime::detect::RuntimeKind::Node)
+        .cloned();
+    let hint = ensure_detected_runtimes(detected).await;
+    crate::engine_check::enforce_node_for_run(project_dir, detected_node, json_output)?;
+    Ok(hint)
+}
+
 /// Ensure already-detected managed runtimes are available before running scripts.
 ///
 /// This preserves the runtime status UI and PATH hint while allowing callers to

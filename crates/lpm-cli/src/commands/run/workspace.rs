@@ -1,6 +1,6 @@
 use super::format::{format_run_failure_detail, format_workspace_member_scripts_header};
 use super::parallel::run_tasks_parallel;
-use super::runtime::ensure_runtime;
+use super::runtime::prepare_runtime;
 use super::sequential::run_tasks_sequential;
 use super::task::{reject_direct_hidden_scripts, run_task};
 use crate::install_ui;
@@ -47,7 +47,7 @@ pub async fn run_workspace(
 
     // Capture the root hint so members without their own version pin can
     // inherit it; members with local pins still resolve themselves.
-    let root_hint = Arc::new(ensure_runtime(project_dir).await?);
+    let root_hint = Arc::new(prepare_runtime(project_dir, json_output).await?);
 
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?

@@ -528,19 +528,19 @@ pub async fn run(
         if let Some(ver) = matched_managed {
             checks.push(Check::pass(
                 &doctor_catalog::NODE_MANAGED_MATCH,
-                &format!("v{ver} (managed, from {})", det.source),
+                &format!("v{ver} (managed, from {})", det.source_label()),
             ));
         } else if let Some(sys) = &system_node {
             checks.push(Check::warn(&doctor_catalog::NODE_PINNED_UNMET, &format!(
 					"{sys} (system) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
-					det.source
+					det.source_label()
 				),));
         } else {
             checks.push(Check::fail(
                 &doctor_catalog::NODE_MISSING_PINNED,
                 &format!(
                     "not found — pinned {spec} from {}. Run: lpm use node@{clean}",
-                    det.source
+                    det.source_label()
                 ),
             ));
         }
