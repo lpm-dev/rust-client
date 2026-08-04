@@ -2747,6 +2747,21 @@ impl MockRegistry {
         latest_version: &str,
         versions: &[(&str, serde_json::Value, Option<Vec<u8>>)],
     ) -> &Self {
+        let metadata = self
+            .mount_full_package_metadata_routes(name, latest_version, versions)
+            .await;
+        self.with_batch_metadata(vec![metadata]).await
+    }
+
+    /// Mount per-package metadata and tarball routes without installing a
+    /// batch-metadata responder, returning the metadata for a caller-owned
+    /// combined batch fixture.
+    pub async fn mount_full_package_metadata_routes(
+        &self,
+        name: &str,
+        latest_version: &str,
+        versions: &[(&str, serde_json::Value, Option<Vec<u8>>)],
+    ) -> serde_json::Value {
         let mut versions_map = serde_json::Map::new();
         let mut times_map = serde_json::Map::new();
 
@@ -2759,7 +2774,7 @@ impl MockRegistry {
                 // the resolver's preflight doesn't reject the version
                 // record. The actual fetch will 404 before integrity is
                 // checked.
-                None => "sha512-missing".to_string(),
+                None => compute_integrity(b"missing tarball fixture"),
             };
             if bytes_opt.is_some() {
                 self.register_tarball_integrity(name, v, integrity.clone());
@@ -2815,12 +2830,7 @@ impl MockRegistry {
             .mount(&self.server)
             .await;
 
-        // Mirror the same metadata onto the batch-metadata POST so the
-        // install pipeline's resolver-batch path resolves identically
-        // to the candidate selector's GET path.
-        self.with_batch_metadata(vec![metadata]).await;
-
-        self
+        metadata
     }
 
     /// Mount caller-built package metadata plus tarballs for the listed versions.
