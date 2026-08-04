@@ -69,6 +69,8 @@ pub(crate) fn object_integrity_policy_from_env() -> ObjectIntegrityPolicy {
 pub(crate) struct TreeSnapshot {
     pub(crate) schema: u32,
     pub(crate) content_integrity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) layout_content_integrity: Option<String>,
     pub(crate) metadata_integrity: String,
 }
 
@@ -853,6 +855,10 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
         return None;
     }
     if !valid_sha256_integrity(&snapshot.content_integrity)
+        || snapshot
+            .layout_content_integrity
+            .as_deref()
+            .is_some_and(|integrity| !valid_sha256_integrity(integrity))
         || !valid_sha256_integrity(&snapshot.metadata_integrity)
     {
         return None;
@@ -880,10 +886,33 @@ pub(crate) fn write_tree_snapshot(
     dir: &Path,
     integrities: &TreeIntegrities,
 ) -> Result<(), LpmError> {
+    write_tree_snapshot_fields(dir, &integrities.content, None, &integrities.metadata)
+}
+
+pub(crate) fn write_tree_snapshot_with_layout_content(
+    dir: &Path,
+    source_content_integrity: &str,
+    layout_integrities: &TreeIntegrities,
+) -> Result<(), LpmError> {
+    write_tree_snapshot_fields(
+        dir,
+        source_content_integrity,
+        Some(&layout_integrities.content),
+        &layout_integrities.metadata,
+    )
+}
+
+fn write_tree_snapshot_fields(
+    dir: &Path,
+    content_integrity: &str,
+    layout_content_integrity: Option<&str>,
+    metadata_integrity: &str,
+) -> Result<(), LpmError> {
     let snapshot = TreeSnapshot {
         schema: TREE_SNAPSHOT_SCHEMA_VERSION,
-        content_integrity: integrities.content.clone(),
-        metadata_integrity: integrities.metadata.clone(),
+        content_integrity: content_integrity.to_owned(),
+        layout_content_integrity: layout_content_integrity.map(str::to_owned),
+        metadata_integrity: metadata_integrity.to_owned(),
     };
     let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
         LpmError::Store(format!(

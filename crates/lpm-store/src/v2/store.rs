@@ -33,7 +33,7 @@ use super::integrity::{
     object_integrity_policy_from_env, read_object_integrity, read_tree_snapshot,
     remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
     tree_snapshot_matches, write_object_integrity_for_policy, write_tree_snapshot,
-    write_tree_snapshot_best_effort,
+    write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
 };
 use super::local_source::{
     LocalSourceFingerprint, compute_local_source_fingerprint, local_source_snapshot_matches,
@@ -2657,18 +2657,24 @@ fn populate_into(
     timings.symlink_ms = symlink_start.elapsed().as_millis();
 
     let snapshot_start = std::time::Instant::now();
-    let package_metadata_integrity = match (materialized_metadata_integrity, package_tree_changed) {
-        (Some(integrity), false) => integrity,
-        _ => compute_tree_metadata_integrity(&pkg_dir)?,
-    };
-    write_tree_snapshot(
-        tmp_dir,
-        &TreeIntegrities {
-            content: object_integrity.into_owned(),
-            metadata: package_metadata_integrity,
-            stats: ObjectTreeStats::default(),
-        },
-    )?;
+    let object_integrity = object_integrity.into_owned();
+    if package_tree_changed {
+        let layout_integrities = compute_object_tree_integrities(&pkg_dir)?;
+        write_tree_snapshot_with_layout_content(tmp_dir, &object_integrity, &layout_integrities)?;
+    } else {
+        let package_metadata_integrity = match materialized_metadata_integrity {
+            Some(integrity) => integrity,
+            None => compute_tree_metadata_integrity(&pkg_dir)?,
+        };
+        write_tree_snapshot(
+            tmp_dir,
+            &TreeIntegrities {
+                content: object_integrity,
+                metadata: package_metadata_integrity,
+                stats: ObjectTreeStats::default(),
+            },
+        )?;
+    }
     timings.snapshot_ms = snapshot_start.elapsed().as_millis();
 
     // Stage the sidecar BEFORE the rename so the published entry is
@@ -2872,6 +2878,19 @@ fn link_entry_is_reusable(
     let actual = compute_object_tree_integrities(&package_dir)?;
     if actual.content == expected.as_ref() {
         write_tree_snapshot_best_effort(dir, &actual);
+        return Ok(true);
+    }
+    if read_tree_snapshot(dir).is_some_and(|snapshot| {
+        snapshot.content_integrity == expected.as_ref()
+            && snapshot.layout_content_integrity.as_deref() == Some(actual.content.as_str())
+    }) {
+        if let Err(error) = write_tree_snapshot_with_layout_content(dir, expected.as_ref(), &actual)
+        {
+            tracing::debug!(
+                target = %dir.display(),
+                "virtual store: failed to refresh link layout snapshot: {error}"
+            );
+        }
         return Ok(true);
     }
     if source_policy_uses_source_integrity(object_dir, policy)
