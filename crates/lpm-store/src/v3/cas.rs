@@ -2552,7 +2552,11 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
         }
         #[cfg(not(unix))]
-        let _ = mode;
+        {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(mode & 0o222 == 0);
+            fs::set_permissions(path, permissions).unwrap();
+        }
     }
 
     #[test]
@@ -2592,7 +2596,11 @@ mod tests {
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
         write_file(&first.join("cli.js"), b"same", 0o644);
-        write_file(&second.join("cli.js"), b"same", 0o755);
+        #[cfg(unix)]
+        let distinct_mode = 0o755;
+        #[cfg(not(unix))]
+        let distinct_mode = 0o444;
+        write_file(&second.join("cli.js"), b"same", distinct_mode);
 
         cas.ingest_object_tree(&first, "sha512-first", false)
             .unwrap();
