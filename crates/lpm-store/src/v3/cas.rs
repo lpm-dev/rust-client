@@ -838,6 +838,13 @@ impl FileCas {
         self.ensure_materialized_entry(&record.tree_digest, &manifest)
     }
 
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "the cross-platform API is fallible on macOS without adding I/O elsewhere"
+        )
+    )]
     pub(crate) fn link_materialization_source(
         &self,
         object_dir: &Path,
