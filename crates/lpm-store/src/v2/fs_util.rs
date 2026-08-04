@@ -170,7 +170,7 @@ pub(crate) fn materialize_into_portable_with_integrity(
     materialize_into_portable_with_integrity_inner(src, dst, has_local_source_sentinel(src))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn materialize_into_portable_with_integrity_and_symlink_policy(
     src: &Path,
     dst: &Path,

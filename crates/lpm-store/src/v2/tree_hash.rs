@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, is_symlink_or_junction};
 use sha2::{Digest, Sha256};
 
 use super::integrity::{OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME};
@@ -270,7 +270,32 @@ fn hash_object_tree_dir_inner(
         let metadata = entry.metadata;
         let file_type = metadata.file_type();
         let mut path_pushed = false;
-        let result = if file_type.is_dir() {
+        let result = if is_symlink_or_junction(&metadata) {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.symlink_count = stats.symlink_count.saturating_add(1);
+            }
+            path.push(&entry_name);
+            path_pushed = true;
+            let target = std::fs::read_link(&path).map_err(|e| {
+                LpmError::Store(format!(
+                    "failed to read virtual-store object symlink {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut target_bytes = Vec::new();
+            push_os_str_bytes(&mut target_bytes, target.as_os_str());
+            if let Some(hasher) = content_hasher.as_deref_mut() {
+                hash_object_tree_record(hasher, b"symlink", relative.as_slice(), &target_bytes);
+            }
+            hash_tree_metadata_record(
+                metadata_hasher,
+                b"symlink",
+                relative.as_slice(),
+                &metadata,
+                &target_bytes,
+            );
+            Ok(())
+        } else if file_type.is_dir() {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.dir_count = stats.dir_count.saturating_add(1);
             }
@@ -306,31 +331,6 @@ fn hash_object_tree_dir_inner(
                 path_pushed = true;
                 hash_object_file(hasher, relative.as_slice(), &path, &metadata)?;
             }
-            Ok(())
-        } else if file_type.is_symlink() {
-            if let Some(stats) = stats.as_deref_mut() {
-                stats.symlink_count = stats.symlink_count.saturating_add(1);
-            }
-            path.push(&entry_name);
-            path_pushed = true;
-            let target = std::fs::read_link(&path).map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to read virtual-store object symlink {}: {e}",
-                    path.display()
-                ))
-            })?;
-            let mut target_bytes = Vec::new();
-            push_os_str_bytes(&mut target_bytes, target.as_os_str());
-            if let Some(hasher) = content_hasher.as_deref_mut() {
-                hash_object_tree_record(hasher, b"symlink", relative.as_slice(), &target_bytes);
-            }
-            hash_tree_metadata_record(
-                metadata_hasher,
-                b"symlink",
-                relative.as_slice(),
-                &metadata,
-                &target_bytes,
-            );
             Ok(())
         } else {
             path.push(&entry_name);

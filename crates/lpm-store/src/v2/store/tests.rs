@@ -3,11 +3,9 @@ use crate::v2::finalize_permits::{FinalizePermitLimiter, parse_v2_finalize_permi
 #[cfg(unix)]
 use crate::v2::fs_util::{
     copy_dir_recursively, create_tmp_dir_locked, ensure_store_tier_dir_locked,
+    materialize_into_portable_with_integrity_and_symlink_policy,
 };
-use crate::v2::fs_util::{
-    materialize_into_portable_with_integrity,
-    materialize_into_portable_with_integrity_and_symlink_policy, tmp_sibling,
-};
+use crate::v2::fs_util::{materialize_into_portable_with_integrity, tmp_sibling};
 use crate::v2::graph_key::{GraphKeyInputs, LinkerModeTag, PeerEntry};
 use crate::v2::integrity::{
     OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME, has_local_source_sentinel,
@@ -17,6 +15,7 @@ use crate::v2::integrity::{
     write_tree_snapshot,
 };
 use crate::v2::link_meta::LinkMetaPlatform;
+#[cfg(unix)]
 use crate::v2::local_source::local_source_fingerprint_path;
 use crate::v2::platform::PlatformTuple;
 #[cfg(target_os = "macos")]
@@ -1004,6 +1003,28 @@ fn tree_metadata_integrity_ignores_symlink_target_file_metadata() {
     assert_eq!(
         before, after,
         "metadata hashing must stat the symlink itself, not the target file"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn tree_metadata_integrity_ignores_junction_target_file_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_dir = dir.path().join("object");
+    let target_dir = dir.path().join("outside-target");
+    std::fs::create_dir_all(&object_dir).unwrap();
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let target_file = target_dir.join("index.js");
+    std::fs::write(&target_file, b"x").unwrap();
+    create_dir_symlink(&target_dir, &object_dir.join("linked")).unwrap();
+
+    let before = compute_tree_metadata_integrity(&object_dir).unwrap();
+    std::fs::write(target_file, b"changed-target-content").unwrap();
+    let after = compute_tree_metadata_integrity(&object_dir).unwrap();
+
+    assert_eq!(
+        before, after,
+        "metadata hashing must stat the junction itself, not its target tree"
     );
 }
 
