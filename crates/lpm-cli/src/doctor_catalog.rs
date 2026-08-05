@@ -865,6 +865,30 @@ pub static LPM_JSON_UNREADABLE: CheckEntry = CheckEntry {
 // Runtime
 // ──────────────────────────────────────────────────────────────────
 
+pub static NODE_ENGINE_COMPATIBLE: CheckEntry = CheckEntry {
+    code: "node_engine_compatible",
+    name: "Node.js engine compatibility",
+    category: Category::Runtime,
+    tier: Tier::Fast,
+    description: "The effective Node runtime satisfies package.json > engines.node.",
+    when_fires: "A Node engine constraint is declared and the effective runtime satisfies it.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static NODE_ENGINE_MISMATCH: CheckEntry = CheckEntry {
+    code: "node_engine_mismatch",
+    name: "Node.js engine compatibility",
+    category: Category::Runtime,
+    tier: Tier::Fast,
+    description: "The effective Node runtime does not satisfy package.json > engines.node.",
+    when_fires: "A Node engine constraint is declared and the selected managed or PATH runtime violates it.",
+    remediation: "Select a compatible runtime, relax engines.node, or disable engine strictness in project or user configuration.",
+    possible_severities: &[Severity::Fail, Severity::Warn],
+    auto_fix: None,
+};
+
 pub static NODE_MANAGED_MATCH: CheckEntry = CheckEntry {
     code: "node_managed_match",
     name: "Node.js",
@@ -1954,6 +1978,8 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &LPM_JSON_NOT_OBJECT,
     &LPM_JSON_UNREADABLE,
     // Runtime
+    &NODE_ENGINE_COMPATIBLE,
+    &NODE_ENGINE_MISMATCH,
     &NODE_MANAGED_MATCH,
     &NODE_PINNED_UNMET,
     &NODE_MISSING_PINNED,

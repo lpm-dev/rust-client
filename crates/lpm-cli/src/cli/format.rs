@@ -655,6 +655,12 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             required,
             actual,
             from,
+        }
+        | lpm_common::LpmError::RunEngineMismatch {
+            engine,
+            required,
+            actual,
+            from,
         } => {
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
                 "Engine version mismatch",

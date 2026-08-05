@@ -335,3 +335,190 @@ fn run_no_auto_install_only_blocks_explicit_runtime_selector_installation() {
         "engines.node entered the auto-install path:\n{combined}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn run_workspace_rejects_member_runtime_that_violates_root_node_engine() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "runtime-selection-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "runtime-selection-app",
+            "version": "1.0.0",
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    project.write_file("packages/app/.nvmrc", "18.0.0\n");
+    install_fake_managed_node(&project, "18.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "node-version", "--all"])
+        .output()
+        .expect("run workspace member with conflicting runtime selector");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "workspace member ran with an incompatible Node:\n{combined}"
+    );
+    assert!(
+        combined.contains(">=22") && combined.contains("18.0.0") && combined.contains(".nvmrc"),
+        "member runtime mismatch did not identify the constraint and selector:\n{combined}"
+    );
+}
+
+#[test]
+fn doctor_reports_node_engine_mismatch_for_incompatible_system_runtime() {
+    let project = node_version_project("^20");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor with incompatible system Node");
+    let json = support::assertions::parse_json_output(&output.stdout);
+    let engine_check = json["checks"]
+        .as_array()
+        .expect("doctor checks must be an array")
+        .iter()
+        .find(|check| check["code"] == "node_engine_mismatch")
+        .unwrap_or_else(|| panic!("doctor omitted node engine mismatch: {json}"));
+
+    assert_eq!(
+        engine_check["severity"], "fail",
+        "unexpected check: {engine_check}"
+    );
+    assert!(
+        engine_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("^20") && detail.contains("v22.0.0")),
+        "doctor mismatch lacks required and actual versions: {engine_check}"
+    );
+}
+
+#[test]
+fn doctor_reports_node_engine_compatibility_for_matching_system_runtime() {
+    let project = node_version_project("^20");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.19.0");
+
+    let output = command
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor with compatible system Node");
+    let json = support::assertions::parse_json_output(&output.stdout);
+    let engine_check = json["checks"]
+        .as_array()
+        .expect("doctor checks must be an array")
+        .iter()
+        .find(|check| check["code"] == "node_engine_compatible")
+        .unwrap_or_else(|| panic!("doctor omitted node engine compatibility: {json}"));
+
+    assert_eq!(
+        engine_check["severity"], "pass",
+        "unexpected check: {engine_check}"
+    );
+}
+
+#[test]
+fn doctor_warns_for_node_engine_mismatch_when_strictness_is_disabled() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "runtime-selection-doctor-soft-engine",
+            "version": "1.0.0",
+            "engines": {"node": "^20"},
+            "lpm": {"engineStrict": false}
+        }"#,
+    );
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor with a soft engine mismatch");
+    let json = support::assertions::parse_json_output(&output.stdout);
+    let engine_check = json["checks"]
+        .as_array()
+        .expect("doctor checks must be an array")
+        .iter()
+        .find(|check| check["code"] == "node_engine_mismatch")
+        .unwrap_or_else(|| panic!("doctor omitted soft node engine mismatch: {json}"));
+
+    assert_eq!(
+        engine_check["severity"], "warn",
+        "unexpected check: {engine_check}"
+    );
+}
+
+#[test]
+fn run_missing_node_suggests_selector_compatible_with_engine_range() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "runtime-selection-compatible-hint",
+            "version": "1.0.0",
+            "engines": {"node": "^20"},
+            "scripts": {"probe": "echo should-not-run"}
+        }"#,
+    );
+    let empty_path = project.home().join("empty-path-compatible-hint");
+    std::fs::create_dir_all(&empty_path).expect("create empty PATH directory");
+
+    let output = lpm(&project)
+        .env("PATH", &empty_path)
+        .env("LPM_NO_AUTO_INSTALL", "1")
+        .args(["run", "probe"])
+        .output()
+        .expect("run without Node for a bounded engine range");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "missing Node did not fail:\n{combined}"
+    );
+    assert!(
+        combined.contains("lpm use node@20"),
+        "diagnostic did not suggest a compatible selector:\n{combined}"
+    );
+    assert!(
+        !combined.contains("lpm use node@22"),
+        "diagnostic suggested an incompatible selector:\n{combined}"
+    );
+}
+
+#[test]
+fn run_engine_mismatch_help_only_mentions_supported_opt_outs() {
+    let project = node_version_project(">=18");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "16.0.0");
+
+    let output = command
+        .args(["run", "node-version"])
+        .output()
+        .expect("run with an engine mismatch");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "engine mismatch did not fail:\n{combined}"
+    );
+    assert!(
+        !combined.contains("--no-engine-strict"),
+        "run diagnostic advertised an unsupported flag:\n{combined}"
+    );
+    assert!(
+        combined.contains("engineStrict") && combined.contains("engine-strict"),
+        "run diagnostic omitted supported project and user opt-outs:\n{combined}"
+    );
+}

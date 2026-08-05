@@ -45,6 +45,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const LOCKFILE_NODE_ENGINE_NEEDLE: &str = "node-engine = ";
+const DEFAULT_NODE_SELECTOR_HINT: &str = "22";
+const NEUTRAL_NODE_SELECTOR_HINT: &str = "<matching-version>";
+
+pub(crate) struct RootNodeEngineRequirement {
+    pub(crate) required: String,
+    pub(crate) engine_strict: bool,
+}
 
 pub(crate) struct DependencyEnginePolicy {
     engine_strict: bool,
@@ -79,10 +86,12 @@ impl DependencyEnginePolicy {
     fn check_node_requirement(&self, required: &str, source: String) -> Result<(), Mismatch> {
         let effective = self.effective_node();
         let Some(actual) = effective.version() else {
+            let selector = compatible_node_selector_hint(required);
             return Err(Mismatch {
                 required: required.to_string(),
-                actual: "not found on PATH; select one explicitly (for example, `lpm use node@22`)"
-                    .to_string(),
+                actual: format!(
+                    "not found on PATH; select one explicitly (for example, `lpm use node@{selector}`)"
+                ),
                 source: format!("{source} (compatibility constraint)"),
             });
         };
@@ -241,17 +250,16 @@ pub(crate) fn enforce_node_for_run(
     detected_node: Option<DetectedNodeVersion>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let Some((_, root_pkg)) = resolve_root_package(start_dir)? else {
+    let Some(requirement) = resolve_root_node_engine_requirement(start_dir)? else {
         return Ok(());
     };
-    let Some(required) = root_pkg.engines.get("node") else {
-        return Ok(());
-    };
-    let engine_strict = engine_strict_config::resolve_for_root(false, &root_pkg);
-    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
-    let result = policy.check_node_requirement(required, "package.json > engines.node".to_string());
+    let policy = DependencyEnginePolicy::new(detected_node, requirement.engine_strict, json_output);
+    let result = policy.check_node_requirement(
+        &requirement.required,
+        "package.json > engines.node".to_string(),
+    );
 
-    if !engine_strict {
+    if !requirement.engine_strict {
         if let Err(mismatch) = result
             && !json_output
         {
@@ -260,7 +268,22 @@ pub(crate) fn enforce_node_for_run(
         return Ok(());
     }
 
-    result.map_err(|mismatch| mismatch.into_error("node"))
+    result.map_err(|mismatch| mismatch.into_run_error("node"))
+}
+
+pub(crate) fn resolve_root_node_engine_requirement(
+    start_dir: &Path,
+) -> Result<Option<RootNodeEngineRequirement>, LpmError> {
+    let Some((_, root_pkg)) = resolve_root_package(start_dir)? else {
+        return Ok(None);
+    };
+    let Some(required) = root_pkg.engines.get("node") else {
+        return Ok(None);
+    };
+    Ok(Some(RootNodeEngineRequirement {
+        required: required.clone(),
+        engine_strict: engine_strict_config::resolve_for_root(false, &root_pkg),
+    }))
 }
 
 /// Variant that takes the already-resolved root + manifest. Use this
@@ -343,8 +366,8 @@ fn resolve_root_package(start_dir: &Path) -> Result<Option<(PathBuf, PackageJson
     Ok(Some((start_dir.to_path_buf(), pkg)))
 }
 
-/// Internal mismatch description. Converted to `LpmError::EngineMismatch`
-/// at the boundary, with the engine name plugged in.
+/// Internal mismatch description. Converted to the command-appropriate
+/// structured engine mismatch at the boundary.
 struct Mismatch {
     required: String,
     actual: String,
@@ -364,6 +387,15 @@ impl std::fmt::Display for Mismatch {
 impl Mismatch {
     fn into_error(self, engine: &str) -> LpmError {
         LpmError::EngineMismatch {
+            engine: engine.to_string(),
+            required: self.required,
+            actual: self.actual,
+            from: self.source,
+        }
+    }
+
+    fn into_run_error(self, engine: &str) -> LpmError {
+        LpmError::RunEngineMismatch {
             engine: engine.to_string(),
             required: self.required,
             actual: self.actual,
@@ -400,12 +432,42 @@ fn check_lpm_engine(engines: &HashMap<String, String>) -> Result<(), Mismatch> {
 /// check satisfaction. Returns the inner `Result` from semver parsing
 /// so the caller can surface unparseable constraints distinctly from
 /// failed matches.
-fn version_satisfies(required: &str, actual: &str) -> Result<bool, String> {
+pub(crate) fn version_satisfies(required: &str, actual: &str) -> Result<bool, String> {
     let req = lpm_semver::VersionReq::parse(required)
         .map_err(|e| format!("could not parse range '{required}': {e}"))?;
     let version = lpm_semver::Version::parse(actual)
         .map_err(|e| format!("could not parse version '{actual}': {e}"))?;
     Ok(req.matches(&version))
+}
+
+fn compatible_node_selector_hint(required: &str) -> String {
+    let Ok(requirement) = lpm_semver::VersionReq::parse(required) else {
+        return NEUTRAL_NODE_SELECTOR_HINT.to_string();
+    };
+
+    for major in [DEFAULT_NODE_SELECTOR_HINT, "24", "20", "18", "16"] {
+        let Ok(candidate) = lpm_semver::Version::parse(&format!("{major}.999.999")) else {
+            continue;
+        };
+        if requirement.matches(&candidate) {
+            return major.to_string();
+        }
+    }
+
+    for token in required.split(|character: char| character.is_whitespace() || character == '|') {
+        let candidate = token.trim_matches(|character| {
+            matches!(character, '<' | '>' | '=' | '^' | '~' | ',' | '(' | ')')
+        });
+        let candidate = candidate.strip_prefix('v').unwrap_or(candidate);
+        let Ok(version) = lpm_semver::Version::parse(candidate) else {
+            continue;
+        };
+        if requirement.matches(&version) {
+            return candidate.to_string();
+        }
+    }
+
+    NEUTRAL_NODE_SELECTOR_HINT.to_string()
 }
 
 /// Emit one stderr warning per [`lpm_workspace::ManifestCompatIssue`]
@@ -449,6 +511,34 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn compatible_node_selector_prefers_default_for_open_lower_bound() {
+        assert_eq!(compatible_node_selector_hint(">=18"), "22");
+    }
+
+    #[test]
+    fn compatible_node_selector_uses_caret_major() {
+        assert_eq!(compatible_node_selector_hint("^20"), "20");
+    }
+
+    #[test]
+    fn compatible_node_selector_uses_wildcard_major() {
+        assert_eq!(compatible_node_selector_hint("20.x"), "20");
+    }
+
+    #[test]
+    fn compatible_node_selector_stays_below_upper_bound() {
+        assert_eq!(compatible_node_selector_hint("<22"), "20");
+    }
+
+    #[test]
+    fn compatible_node_selector_uses_neutral_hint_for_invalid_range() {
+        assert_eq!(
+            compatible_node_selector_hint("not-a-range"),
+            "<matching-version>"
+        );
     }
 
     #[test]

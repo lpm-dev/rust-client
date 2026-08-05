@@ -36,9 +36,7 @@ use self::lockfile::{
 };
 use self::manifest::check_manifest_compat;
 use self::policy::check_policy_extensions;
-use self::runtime::{
-    extract_node_spec_from_detail, get_system_bun_version, get_system_node_version,
-};
+use self::runtime::{extract_node_spec_from_detail, get_system_bun_version};
 use self::script_policy::check_script_policy_surface;
 use self::sigstore::check_sigstore_verify_posture;
 use self::storage::{auth_storage_check, vault_storage_check};
@@ -512,8 +510,56 @@ pub async fn run(
 
     // 8. Node.js version
     let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
+    let effective_node = lpm_runtime::effective::resolve_effective_node_version(project_dir)?;
+    let effective_version = effective_node
+        .version()
+        .map(|version| format!("v{version}"));
+
+    if let Some(requirement) =
+        crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
+        && let Some(actual) = effective_node.version()
+    {
+        let source = effective_node.source_label();
+        match crate::engine_check::version_satisfies(&requirement.required, actual) {
+            Ok(true) => checks.push(Check::pass(
+                &doctor_catalog::NODE_ENGINE_COMPATIBLE,
+                &format!(
+                    "v{actual} from {source} satisfies package.json > engines.node {}",
+                    requirement.required
+                ),
+            )),
+            Ok(false) => {
+                let detail = format!(
+                    "v{actual} from {source} does not satisfy package.json > engines.node {}",
+                    requirement.required
+                );
+                if requirement.engine_strict {
+                    checks.push(Check::fail(&doctor_catalog::NODE_ENGINE_MISMATCH, &detail));
+                } else {
+                    checks.push(Check::warn(
+                        &doctor_catalog::NODE_ENGINE_MISMATCH,
+                        &format!("{detail} (engine-strict disabled, ignoring)"),
+                    ));
+                }
+            }
+            Err(error) => {
+                let detail = format!(
+                    "could not validate package.json > engines.node {} against v{actual} from {source}: {error}",
+                    requirement.required
+                );
+                if requirement.engine_strict {
+                    checks.push(Check::fail(&doctor_catalog::NODE_ENGINE_MISMATCH, &detail));
+                } else {
+                    checks.push(Check::warn(
+                        &doctor_catalog::NODE_ENGINE_MISMATCH,
+                        &format!("{detail} (engine-strict disabled, ignoring)"),
+                    ));
+                }
+            }
+        }
+    }
+
     if let Some(ref det) = detected {
-        let system_node = get_system_node_version(project_dir)?;
         let managed_versions = lpm_runtime::node::list_installed().unwrap_or_default();
 
         let spec = &det.spec;
@@ -530,7 +576,7 @@ pub async fn run(
                 &doctor_catalog::NODE_MANAGED_MATCH,
                 &format!("v{ver} (managed, from {})", det.source_label()),
             ));
-        } else if let Some(sys) = &system_node {
+        } else if let Some(sys) = &effective_version {
             checks.push(Check::warn(&doctor_catalog::NODE_PINNED_UNMET, &format!(
 					"{sys} (system) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
 					det.source_label()
@@ -545,8 +591,7 @@ pub async fn run(
             ));
         }
     } else {
-        let sys = get_system_node_version(project_dir)?;
-        if let Some(v) = sys {
+        if let Some(v) = effective_version {
             checks.push(Check::pass(
                 &doctor_catalog::NODE_SYSTEM_UNPINNED,
                 &format!("{v} (system, no version pinned)"),
