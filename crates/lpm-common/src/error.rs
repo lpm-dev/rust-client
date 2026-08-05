@@ -428,6 +428,15 @@ pub enum LpmError {
     )]
     Store(String),
 
+    #[error("project layout error: {0}")]
+    #[diagnostic(
+        code(lpm::project_layout),
+        help(
+            "If project `node_modules` is a symlink or directory junction, run `lpm doctor --fix`. Otherwise, replace the file with a real directory. Then run `lpm install` again."
+        )
+    )]
+    ProjectLayout(String),
+
     /// Script failed with captured output (used by buffered/prefixed parallel modes
     /// to preserve output for post-failure display).
     #[error("script exited with code {code}")]
@@ -658,6 +667,7 @@ impl LpmError {
             LpmError::Cert(_) => "cert",
             LpmError::Tunnel(_) => "tunnel",
             LpmError::Store(_) => "store",
+            LpmError::ProjectLayout(_) => "project_layout",
             LpmError::ExitCode(_) => "exit_code",
             LpmError::Io(_) => "io",
             LpmError::Json(_) => "json",
@@ -854,6 +864,7 @@ mod tests {
             LpmError::Cert("x".into()),
             LpmError::Tunnel("x".into()),
             LpmError::Store("x".into()),
+            LpmError::ProjectLayout("x".into()),
             LpmError::ExitCode(1),
             LpmError::Io(std::io::Error::other("x")),
             LpmError::Json(serde_json::from_str::<serde_json::Value>("bad").unwrap_err()),
@@ -944,6 +955,17 @@ mod tests {
     }
 
     #[test]
+    fn project_layout_help_recommends_replacing_node_modules_without_store_cleanup() {
+        let error = LpmError::ProjectLayout("x".into());
+        let help = error.help().unwrap().to_string();
+
+        assert!(help.contains("lpm doctor --fix"), "help: {help}");
+        assert!(help.contains("real directory"), "help: {help}");
+        assert!(!help.contains("store clean"), "help: {help}");
+        assert!(!help.contains("cache prune"), "help: {help}");
+    }
+
+    #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
         assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
@@ -1014,6 +1036,10 @@ mod tests {
             "invalid_package_name"
         );
         assert_eq!(LpmError::Store("x".into()).error_code(), "store");
+        assert_eq!(
+            LpmError::ProjectLayout("x".into()).error_code(),
+            "project_layout"
+        );
         assert_eq!(
             LpmError::Resolution(Box::new(resolution_error_context())).error_code(),
             "resolution_failed"

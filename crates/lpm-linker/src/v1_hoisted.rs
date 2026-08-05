@@ -7,8 +7,8 @@ use crate::platform::validate_cmd_path;
 use crate::platform::{make_bin_target_executable, relative_symlink_target_from_parent};
 use crate::types::{LinkResult, LinkTarget, MaterializedPackage};
 use crate::validation::{
-    ensure_child_dir, ensure_real_dir, filter_node_modules_entry_name, is_valid_self_ref_name,
-    validate_bin_name, validate_bin_target,
+    ensure_child_dir, ensure_project_node_modules_dir, filter_node_modules_entry_name,
+    is_valid_self_ref_name, validate_bin_name, validate_bin_target,
 };
 use lpm_common::{LpmError, is_symlink_or_junction, remove_path_entry};
 use std::collections::{BTreeMap, HashMap};
@@ -88,6 +88,7 @@ pub fn link_packages_hoisted(
 ) -> Result<LinkResult, LpmError> {
     let layout = LayoutPaths::for_project(project_dir);
     let node_modules = project_dir.join("node_modules");
+    ensure_project_node_modules_dir(&node_modules)?;
 
     // Hoisted state lives under `<project>/.lpm/hoisted/`, so
     // `node_modules/.lpm/` is legacy debris for this mode. During a
@@ -104,9 +105,6 @@ pub fn link_packages_hoisted(
             }
         }
     }
-
-    std::fs::create_dir_all(&node_modules)?;
-    ensure_real_dir(&node_modules, "node_modules")?;
 
     // Hoisted-symmetry: bootstrap the project-local hoisted state
     // directory so the metadata write at the bottom of this function

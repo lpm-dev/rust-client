@@ -26,6 +26,10 @@ pub(crate) fn install_running_in_ci() -> bool {
     crate::install_state::ci_env_is_truthy()
 }
 
+pub(super) fn validate_project_layout(project_dir: &Path) -> Result<(), LpmError> {
+    lpm_linker::validate_project_node_modules(project_dir)
+}
+
 pub(super) struct LockfileValidationInput<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) lockfile_path: &'a Path,

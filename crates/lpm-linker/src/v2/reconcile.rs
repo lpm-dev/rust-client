@@ -12,7 +12,8 @@ use super::V2Target;
 use super::keymap::KeyMap;
 use crate::LinkTarget;
 use crate::validation::{
-    ensure_real_dir_with_prefix, is_safe_node_modules_entry_name as is_safe_root_link_name,
+    ensure_project_node_modules_dir, ensure_real_dir_with_prefix,
+    is_safe_node_modules_entry_name as is_safe_root_link_name,
 };
 
 /// Wipe legacy project link state so the v2 install starts clean.
@@ -301,13 +302,7 @@ pub(super) fn create_self_ref(project_dir: &Path, self_name: &str) -> Result<boo
 
 pub(super) fn ensure_node_modules_dir(project_dir: &Path) -> Result<PathBuf, LpmError> {
     let nm = project_dir.join("node_modules");
-    std::fs::create_dir_all(&nm).map_err(|e| {
-        LpmError::Store(format!(
-            "virtual-store linker: failed to create project node_modules at {}: {e}",
-            nm.display()
-        ))
-    })?;
-    ensure_real_dir(&nm, "project node_modules")?;
+    ensure_project_node_modules_dir(&nm)?;
     Ok(nm)
 }
 

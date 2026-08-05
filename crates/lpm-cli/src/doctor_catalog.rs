@@ -533,6 +533,18 @@ pub static NODE_MODULES_VIRTUAL_HEALTHY: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static NODE_MODULES_SYMLINKED: CheckEntry = CheckEntry {
+    code: "node_modules_symlinked",
+    name: "node_modules",
+    category: Category::ProjectState,
+    tier: Tier::Fast,
+    description: "The project-level `node_modules` path is a symlink or directory junction, which LPM does not write through.",
+    when_fires: "`<project>/node_modules` resolves through a symlink or directory junction instead of being a real directory.",
+    remediation: "Run `lpm doctor --fix` to replace only the link entry. Then run `lpm install`. You can also remove the link manually.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: Some("lpm doctor --fix"),
+};
+
 pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
     code: "v2_store_orphans",
     name: "virtual store",
@@ -1962,6 +1974,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &NODE_MODULES_ISOLATED_HEALTHY,
     &NODE_MODULES_HOISTED_HEALTHY,
     &NODE_MODULES_VIRTUAL_HEALTHY,
+    &NODE_MODULES_SYMLINKED,
     &NODE_MODULES_MIXED_LAYOUT,
     &NODE_MODULES_NO_STORE,
     &NODE_MODULES_LEGACY_LAYOUT,

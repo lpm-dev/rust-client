@@ -41,6 +41,96 @@ pub(crate) fn ensure_real_dir(path: &Path, label: &str) -> Result<(), LpmError> 
     ensure_real_dir_with_prefix(path, label, "")
 }
 
+/// Make sure that a project can use a real `node_modules` directory.
+///
+/// This function does not create the directory. A missing path is valid.
+pub fn validate_project_node_modules(project_dir: &Path) -> Result<(), LpmError> {
+    let node_modules = project_dir.join("node_modules");
+    match node_modules.symlink_metadata() {
+        Ok(metadata) => validate_project_node_modules_metadata(&node_modules, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(node_modules_io_error("inspect", &node_modules, error)),
+    }
+}
+
+/// Create a project `node_modules` directory or make sure that it is real.
+pub fn ensure_project_node_modules(project_dir: &Path) -> Result<(), LpmError> {
+    ensure_project_node_modules_dir(&project_dir.join("node_modules"))
+}
+
+pub(crate) fn ensure_project_node_modules_dir(path: &Path) -> Result<(), LpmError> {
+    match path.symlink_metadata() {
+        Ok(metadata) => validate_project_node_modules_metadata(path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let parent = path.parent().ok_or_else(|| {
+                        node_modules_io_error(
+                            "create",
+                            path,
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "node_modules path has no parent directory",
+                            ),
+                        )
+                    })?;
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        node_modules_io_error("create parent directory for", path, error)
+                    })?;
+                    validate_project_node_modules_creation(path, std::fs::create_dir(path))
+                }
+                result => validate_project_node_modules_creation(path, result),
+            }
+        }
+        Err(error) => Err(node_modules_io_error("inspect", path, error)),
+    }
+}
+
+fn validate_project_node_modules_creation(
+    path: &Path,
+    result: std::io::Result<()>,
+) -> Result<(), LpmError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = path
+                .symlink_metadata()
+                .map_err(|error| node_modules_io_error("inspect", path, error))?;
+            validate_project_node_modules_metadata(path, &metadata)
+        }
+        Err(error) => Err(node_modules_io_error("create", path, error)),
+    }
+}
+
+fn node_modules_io_error(action: &str, path: &Path, error: std::io::Error) -> LpmError {
+    LpmError::Io(std::io::Error::new(
+        error.kind(),
+        format!(
+            "failed to {action} project node_modules at {}: {error}",
+            path.display()
+        ),
+    ))
+}
+
+fn validate_project_node_modules_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), LpmError> {
+    if is_symlink_or_junction(metadata) {
+        return Err(LpmError::ProjectLayout(format!(
+            "project node_modules must be a real directory, but {} is a symlink or directory junction",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(LpmError::ProjectLayout(format!(
+            "project node_modules must be a directory, but {} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_real_dir_with_prefix(
     path: &Path,
     label: &str,

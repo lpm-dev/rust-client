@@ -357,7 +357,16 @@ pub async fn run(
         .iter()
         .map(std::path::PathBuf::as_path)
         .collect::<Vec<_>>();
-    if layout.needs_layout_migration() {
+    let node_modules = project_dir.join("node_modules");
+    let node_modules_is_symlink = node_modules
+        .symlink_metadata()
+        .is_ok_and(|metadata| lpm_common::is_symlink_or_junction(&metadata));
+    if node_modules_is_symlink {
+        checks.push(Check::fail(
+            &doctor_catalog::NODE_MODULES_SYMLINKED,
+            "is a symlink or directory junction — run: lpm doctor --fix, then run: lpm install",
+        ));
+    } else if layout.needs_layout_migration() {
         checks.push(Check::warn(&doctor_catalog::NODE_MODULES_LEGACY_LAYOUT, "legacy wrapper layout detected — run: lpm install (one-time migration to .lpm/wrappers/)",));
     } else {
         match layout.install_appears_healthy_with_virtual_roots(&virtual_links_root_refs) {
@@ -744,6 +753,17 @@ pub async fn run(
             // the outer loop only enters `--fix` when there's something
             // to fix.
             match check.code() {
+                "node_modules_symlinked" => {
+                    if !json_output {
+                        install_ui::phase("fixing: replacing the project node_modules link");
+                    }
+                    match replace_project_node_modules_link(project_dir) {
+                        Ok(()) => fixes_applied.push(
+                            "replaced project node_modules link with a real directory".into(),
+                        ),
+                        Err(e) => render_autofix_failed("replace project node_modules link", &e),
+                    }
+                }
                 "node_modules_missing"
                 | "node_modules_no_store"
                 | "node_modules_legacy_layout"
@@ -1040,4 +1060,18 @@ fn render_autofix_failed(action: &str, error: &impl std::fmt::Display) {
         lpm_common::sanitize_terminal_inline(action),
         lpm_common::sanitize_terminal_inline(&error)
     ));
+}
+
+fn replace_project_node_modules_link(project_dir: &Path) -> Result<(), LpmError> {
+    let node_modules = project_dir.join("node_modules");
+    lpm_common::remove_symlink_or_junction_entry(&node_modules).map_err(|error| {
+        LpmError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to remove the project node_modules link at {}: {error}",
+                node_modules.display()
+            ),
+        ))
+    })?;
+    lpm_linker::ensure_project_node_modules(project_dir)
 }
