@@ -25,6 +25,7 @@ pub enum ServiceStatus {
     Starting,
     WaitingForDep(String),
     Ready,
+    ReadinessFailed(String),
     Crashed(i32),
     Stopped,
 }
@@ -839,6 +840,7 @@ pub fn run_services(
         }
 
         // Wait for all services in this group to be ready
+        let mut readiness_failure = None;
         for (name, handle) in handles {
             match handle.join() {
                 Ok(Ok(readiness)) => {
@@ -861,31 +863,22 @@ pub fn run_services(
                         ServiceStatus::Ready,
                     );
                 }
-                Ok(Err(e)) => {
-                    if service_exit_status(&children, &name).is_some() {
-                        startup_interrupted = true;
-                        break;
-                    }
-
-                    // Readiness timeout is a warning, not a fatal error.
-                    // The service process is still running — it may just be slow.
-                    // Print the error but continue so the browser opens and the
-                    // user can see the actual state in their browser.
+                Ok(Err(error)) => {
+                    let display_error = sanitize_terminal_inline(&error).into_owned();
                     ui_service_status(
                         RESET,
                         &name,
-                        YELLOW,
-                        "!",
-                        &format!("not ready - {}", sanitize_terminal_inline(&e)),
+                        RED,
+                        "✗",
+                        &format!("readiness failed - {display_error}"),
                     );
-                    // Still mark as Ready — the service is running, just slow to respond.
-                    // Timeout is a warning, not a state change to Crashed.
                     send_status(
                         &options.event_tx,
                         &service_names,
                         &name,
-                        ServiceStatus::Ready,
+                        ServiceStatus::ReadinessFailed(display_error),
                     );
+                    readiness_failure.get_or_insert((name, error));
                 }
                 Err(_) => {
                     ui_service_status(RESET, &name, RED, "✗", "readiness check panicked");
@@ -898,6 +891,15 @@ pub fn run_services(
                     }
                 }
             }
+        }
+
+        if let Some((name, error)) = readiness_failure {
+            shutdown_state.store(1, Ordering::Relaxed);
+            shutdown_children_ordered(&children, false, Some(&groups));
+            std::mem::forget(children_guard);
+            return Err(LpmError::Script(format!(
+                "service '{name}' failed readiness: {error}"
+            )));
         }
 
         if startup_interrupted {
@@ -2547,12 +2549,31 @@ mod tests {
 
     #[test]
     fn restarted_service_does_not_report_ready_after_readiness_failure() {
+        let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
+        drop(ready_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("restart-readiness.js"),
+            format!(
+                r#"
+const fs = require('fs');
+if (!fs.existsSync('ready-once')) {{
+  fs.writeFileSync('ready-once', 'ready');
+  require('http').createServer((_request, response) => response.end('ok'))
+    .listen({ready_port}, '127.0.0.1');
+}}
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        )
+        .unwrap();
         let mut services = HashMap::new();
         services.insert(
             "worker".to_string(),
             ServiceConfig {
-                command: "node -e \"setInterval(() => {}, 1000)\"".to_string(),
-                ready_url: Some("http://127.0.0.1:0".to_string()),
+                command: "node restart-readiness.js".to_string(),
+                ready_url: Some(format!("http://127.0.0.1:{ready_port}")),
                 ready_timeout: 1,
                 ..Default::default()
             },
@@ -2565,17 +2586,25 @@ mod tests {
             event_tx: Some(event_tx),
             ..Default::default()
         };
-        let dir = tempfile::TempDir::new().unwrap();
         let project_dir = dir.path().to_path_buf();
         let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
 
-        std::thread::sleep(Duration::from_millis(1_500));
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                }) => break,
+                Ok(_) => {}
+                Err(error) => panic!("initial service did not become ready: {error}"),
+            }
+        }
         cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
         std::thread::sleep(Duration::from_millis(1_500));
         cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
         let result = handle.join().unwrap();
 
-        let ready_count = event_rx
+        let additional_ready_count = event_rx
             .try_iter()
             .filter(|event| {
                 matches!(
@@ -2589,13 +2618,13 @@ mod tests {
             .count();
         assert!(result.is_ok(), "orchestrator failed: {result:?}");
         assert_eq!(
-            ready_count, 1,
-            "only the initial warning path may report Ready; the failed restart must not"
+            additional_ready_count, 0,
+            "a failed restart must not emit another Ready status"
         );
     }
 
     #[test]
-    fn reassigned_service_does_not_report_ready_from_stale_occupied_port() {
+    fn reassigned_service_fails_readiness_instead_of_using_stale_occupied_port() {
         let occupied_port = crate::ports::find_available_port(49000).unwrap();
         let occupied_listener = std::net::TcpListener::bind(("127.0.0.1", occupied_port)).unwrap();
 
@@ -2610,40 +2639,33 @@ mod tests {
             },
         );
 
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let options = OrchestratorOptions {
-            command_rx: Some(cmd_rx),
             event_tx: Some(event_tx),
             ..Default::default()
         };
         let dir = tempfile::TempDir::new().unwrap();
 
-        let handle = std::thread::spawn(move || run_services(dir.path(), &services, options));
-
-        let early_ready = event_rx
-            .recv_timeout(std::time::Duration::from_millis(400))
-            .ok();
-
-        let _ = cmd_tx.send(OrchestratorCommand::StopAll);
-
-        let result = handle.join().unwrap();
+        let result = run_services(dir.path(), &services, options);
+        let statuses: Vec<ServiceStatus> = event_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                OrchestratorEvent::StatusChange { status, .. } => Some(status),
+                OrchestratorEvent::ServiceLog { .. } => None,
+            })
+            .collect();
 
         drop(occupied_listener);
 
         assert!(
-            result.is_ok(),
-            "orchestrator should still exit cleanly: {result:?}"
+            result.is_err(),
+            "unowned reassigned port must fail startup: {result:?}"
         );
         assert!(
-            !matches!(
-                early_ready,
-                Some(OrchestratorEvent::StatusChange {
-                    status: ServiceStatus::Ready,
-                    ..
-                })
-            ),
-            "service should not be reported Ready from an unrelated occupied original port"
+            !statuses
+                .iter()
+                .any(|status| matches!(status, ServiceStatus::Ready)),
+            "service must not be Ready from an unrelated occupied original port: {statuses:?}"
         );
     }
 }

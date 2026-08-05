@@ -10,6 +10,7 @@ pub enum ServiceStatus {
     Starting,
     WaitingForDep(String),
     Ready,
+    ReadinessFailed(String),
     Crashed(String),
     Stopped,
 }
@@ -20,6 +21,7 @@ impl ServiceStatus {
             ServiceStatus::Starting => "○",
             ServiceStatus::WaitingForDep(_) => "⟳",
             ServiceStatus::Ready => "●",
+            ServiceStatus::ReadinessFailed(_) => "✖",
             ServiceStatus::Crashed(_) => "✖",
             ServiceStatus::Stopped => "■",
         }
@@ -30,6 +32,7 @@ impl ServiceStatus {
             ServiceStatus::Starting => "starting".into(),
             ServiceStatus::WaitingForDep(dep) => format!("waiting for {dep}"),
             ServiceStatus::Ready => "ready".into(),
+            ServiceStatus::ReadinessFailed(error) => format!("readiness failed: {error}"),
             ServiceStatus::Crashed(msg) => format!("crashed: {msg}"),
             ServiceStatus::Stopped => "stopped".into(),
         }
@@ -215,6 +218,13 @@ mod tests {
         app.set_service_port("test", 5174);
 
         assert_eq!(app.services[0].port, Some(5174));
+    }
+
+    #[test]
+    fn readiness_failure_has_a_distinct_dashboard_label() {
+        let status = ServiceStatus::ReadinessFailed("timed out".to_string());
+
+        assert_eq!(status.label(), "readiness failed: timed out");
     }
 
     #[test]

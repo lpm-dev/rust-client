@@ -504,6 +504,59 @@ server.listen(port, '127.0.0.1', () => {
     );
 }
 
+#[test]
+fn dev_readiness_timeout_stops_before_starting_dependents() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "dev-readiness-timeout",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "db": {
+                    "command": "node slow-service.js",
+                    "readyUrl": "http://127.0.0.1:0/health",
+                    "readyTimeout": 1
+                },
+                "api": {
+                    "command": "node dependent.js",
+                    "dependsOn": ["db"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("slow-service.js", "setTimeout(() => {}, 2500);\n");
+    project.write_file(
+        "dependent.js",
+        "require('fs').writeFileSync('dependent-started', 'started');\n",
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run lpm dev with a readiness timeout");
+
+    assert!(
+        !output.status.success(),
+        "readiness timeout must fail startup\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !project.file_exists("dependent-started"),
+        "a dependent must not start after its dependency fails readiness"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("service 'db' failed readiness")
+            && stderr.contains("timed out waiting for http://127.0.0.1:0/health (1s)"),
+        "error must identify the service and readiness target\nstderr:\n{stderr}"
+    );
+}
+
 #[tokio::test]
 async fn dev_auto_compat_materializes_project_local_entrypoint_for_framework_bins() {
     for case in FRAMEWORK_BIN_CASES {
