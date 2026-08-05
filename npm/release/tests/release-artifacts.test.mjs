@@ -44,6 +44,30 @@ test("CI and release Alpine smokes share one immutable Node image pin", () => {
   assert.deepEqual(releasePins, ciPins);
 });
 
+test("Windows release builds keep enough timeout headroom for signing", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const target = "          - target: x86_64-pc-windows-msvc";
+  const targetStart = releaseWorkflow.indexOf(target);
+  const nextTarget = releaseWorkflow.indexOf("\n          - target:", targetStart + target.length);
+
+  assert.notEqual(targetStart, -1, "missing Windows release target");
+
+  const windowsTarget = releaseWorkflow.slice(
+    targetStart,
+    nextTarget === -1 ? releaseWorkflow.length : nextTarget,
+  );
+  const timeout = windowsTarget.match(/^\s+timeout_minutes:\s*(\d+)\s*$/m);
+
+  assert.ok(timeout, "missing Windows release timeout");
+  assert.ok(
+    Number(timeout[1]) >= 60,
+    `Windows release timeout must be at least 60 minutes, found ${timeout[1]}`,
+  );
+});
+
 test("npm publish workflow treats release tarballs as local filesystem paths", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(
