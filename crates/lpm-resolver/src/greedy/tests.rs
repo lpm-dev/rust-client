@@ -1762,6 +1762,21 @@ fn override_set(key: &str, target: &str) -> OverrideSet {
 }
 
 #[test]
+fn apply_override_target_greedy_rejects_release_age_blocked_target() {
+    let canonical = CanonicalKey::npm("release-age-override-target");
+    let mut info = mk_info(&["2.0.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "2.0.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let target = OverrideTarget::PinnedVersion {
+        raw: "2.0.0".to_string(),
+        version: NpmVersion::parse("2.0.0").unwrap(),
+    };
+
+    assert!(apply_override_target_greedy(&canonical, &info, &target, &policy).is_none());
+}
+
+#[test]
 fn process_edge_applies_name_selector_override() {
     // `lpm.overrides: { "lodash": "3.10.1" }` — every lodash
     // resolution is forced to 3.10.1, even when the consumer's

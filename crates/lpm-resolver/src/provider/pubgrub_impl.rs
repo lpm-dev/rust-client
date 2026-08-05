@@ -60,26 +60,13 @@ impl LpmDependencyProvider {
         &self,
         package: &ResolverPackage,
         target: &OverrideTarget,
-    ) -> Option<NpmVersion> {
+    ) -> Result<NpmVersion, OverrideTargetRejection> {
         let key = CanonicalKey::from(package);
-        let info = self.cache.get(&key)?;
+        let Some(info) = self.cache.get(&key) else {
+            return Err(OverrideTargetRejection::NotPublished);
+        };
         let info = info.value();
-        let candidate_allowed =
-            |version: &NpmVersion| version_allowed_by_policy(&key, info, version, &self.policy);
-
-        match target {
-            OverrideTarget::PinnedVersion { version, .. } => (info.versions.contains(version)
-                && candidate_allowed(version))
-            .then(|| version.clone()),
-            OverrideTarget::Range {
-                range: target_range,
-                ..
-            } => info
-                .versions
-                .iter()
-                .find(|version| target_range.satisfies(version) && candidate_allowed(version))
-                .cloned(),
-        }
+        select_override_target(&key, info, target, &self.policy)
     }
 }
 
@@ -184,40 +171,44 @@ impl DependencyProvider for LpmDependencyProvider {
                 .find_match(&canonical, natural_ver, parent_ctx)
             {
                 // Apply the override target to produce the forced version.
-                if let Some(forced) = self.apply_override_target(package, &entry.target) {
-                    if forced != *natural_ver {
-                        let hit = OverrideHit {
-                            raw_key: entry.raw_key.clone(),
-                            source: entry.source,
-                            package: canonical.clone(),
-                            from_version: natural_ver.to_string(),
-                            to_version: forced.to_string(),
-                            via_parent: parent_ctx.map(str::to_string),
-                        };
-                        tracing::debug!(
-                            "override applied: {} {} → {} (via {})",
-                            hit.package,
-                            hit.from_version,
-                            hit.to_version,
-                            hit.source_display()
-                        );
-                        self.overrides.record_hit(hit);
-                    } else {
-                        tracing::debug!(
-                            "override already satisfied: {} {} (via {})",
+                match self.apply_override_target(package, &entry.target) {
+                    Ok(forced) => {
+                        if forced != *natural_ver {
+                            let hit = OverrideHit {
+                                raw_key: entry.raw_key.clone(),
+                                source: entry.source,
+                                package: canonical.clone(),
+                                from_version: natural_ver.to_string(),
+                                to_version: forced.to_string(),
+                                via_parent: parent_ctx.map(str::to_string),
+                            };
+                            tracing::debug!(
+                                "override applied: {} {} → {} (via {})",
+                                hit.package,
+                                hit.from_version,
+                                hit.to_version,
+                                hit.source_display()
+                            );
+                            self.overrides.record_hit(hit);
+                        } else {
+                            tracing::debug!(
+                                "override already satisfied: {} {} (via {})",
+                                canonical,
+                                forced,
+                                entry.source_display()
+                            );
+                        }
+                        return Ok(Some(forced));
+                    }
+                    Err(rejection) => {
+                        tracing::warn!(
+                            "override {} could not select target {} for {}: {}",
+                            entry.raw_key,
+                            entry.target.raw(),
                             canonical,
-                            forced,
-                            entry.source_display()
+                            rejection,
                         );
                     }
-                    return Ok(Some(forced));
-                } else {
-                    tracing::warn!(
-                        "override {} could not select eligible target {} for {}",
-                        entry.raw_key,
-                        entry.target.raw(),
-                        canonical
-                    );
                 }
             }
         }

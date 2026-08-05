@@ -221,6 +221,7 @@ fn doctor_list_includes_typescript_codes_from_tranche_1() {
 fn doctor_list_includes_manifest_compat_codes() {
     let codes = read_catalog_codes();
     for code in [
+        "unsupported_override_values",
         "pnpm_overrides_drift",
         "pnpm_patches_drift",
         "pnpm_peer_rules_drift",

@@ -28,8 +28,8 @@
 
 mod support;
 
-use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+use support::{TempProject, lpm, lpm_with_registry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -411,6 +411,137 @@ async fn workspace_member_inherits_root_override() {
     .expect("read inherited override target manifest");
     let installed: serde_json::Value = serde_json::from_str(&manifest).expect("parse manifest");
     assert_eq!(installed["version"], "1.0.0");
+}
+
+#[tokio::test]
+async fn install_override_does_not_bypass_minimum_release_age() {
+    use chrono::SecondsFormat;
+
+    let mock = MockRegistry::start().await;
+    let package = "override-policy-target";
+    let forced_version = "2.0.0";
+    let natural_version = "1.0.0";
+    let forced_tarball = make_tarball(package, forced_version);
+    let natural_tarball = make_tarball(package, natural_version);
+    let fresh = (chrono::Utc::now() - chrono::Duration::hours(212))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let old = (chrono::Utc::now() - chrono::Duration::hours(400))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": forced_version },
+        "versions": {
+            (forced_version): {
+                "name": package,
+                "version": forced_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package, forced_version),
+                    "integrity": compute_integrity(&forced_tarball),
+                },
+                "dependencies": {}
+            },
+            (natural_version): {
+                "name": package,
+                "version": natural_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package, natural_version),
+                    "integrity": compute_integrity(&natural_tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            (forced_version): fresh,
+            (natural_version): old,
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[
+            (forced_version, forced_tarball),
+            (natural_version, natural_tarball),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "policy-gated-override",
+  "version": "1.0.0",
+  "dependencies": {{ "{package}": "^1.0.0" }},
+  "lpm": {{ "overrides": {{ "{package}": "{forced_version}" }} }}
+}}"#,
+    ));
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--min-release-age=1080000",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn policy-gated override install");
+    assert!(
+        output.status.success(),
+        "policy-gated override install must fall back successfully\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read policy-gated override lockfile");
+    assert!(
+        lockfile
+            .packages
+            .iter()
+            .any(|entry| entry.name == package && entry.version == natural_version)
+            && !lockfile
+                .packages
+                .iter()
+                .any(|entry| entry.name == package && entry.version == forced_version),
+        "minimumReleaseAge must keep the eligible natural selection"
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        stderr.contains("blocked by minimumReleaseAge"),
+        "override warning must identify the release-age policy block:\n{stderr}"
+    );
+}
+
+#[test]
+fn install_warns_when_nested_top_level_override_value_is_ignored() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "nested-override-warning",
+  "version": "1.0.0",
+  "dependencies": {},
+  "overrides": {
+    "path-scurry": { "lru-cache": "^11.0.0" }
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn install with nested override");
+    assert!(
+        output.status.success(),
+        "unsupported nested override must not invalidate the rest of package.json"
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        stderr.contains("`overrides`")
+            && stderr.contains("path-scurry")
+            && stderr.contains("nested object"),
+        "install must warn that the nested override value was ignored:\n{stderr}"
+    );
 }
 
 // ─── Fail-closed parsing ────────────────────────────────────────────────

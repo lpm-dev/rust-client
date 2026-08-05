@@ -19,33 +19,7 @@ pub(super) fn apply_override_target_greedy(
     target: &OverrideTarget,
     policy: &ResolverPolicy,
 ) -> Option<NpmVersion> {
-    let candidate_allowed = |version: &NpmVersion| {
-        matches!(
-            release_age_status_for_version(canonical, info, version, policy),
-            ReleaseTimeStatus::Allowed
-        ) && (!policy.trust_policy().is_no_downgrade()
-            || trust_downgrade_violation(info, version).is_none())
-            && (info.platform.is_empty()
-                || info
-                    .platform
-                    .get(&version.to_string())
-                    .is_none_or(crate::provider::is_platform_compatible))
-    };
-
-    match target {
-        OverrideTarget::PinnedVersion { version, .. } => {
-            (info.versions.contains(version) && candidate_allowed(version)).then(|| version.clone())
-        }
-        // Cached versions are newest-first, so the first eligible match wins.
-        OverrideTarget::Range {
-            range: target_range,
-            ..
-        } => info
-            .versions
-            .iter()
-            .find(|version| target_range.satisfies(version) && candidate_allowed(version))
-            .cloned(),
-    }
+    select_override_target(canonical, info, target, policy).ok()
 }
 
 pub(super) enum PolicyBlock {

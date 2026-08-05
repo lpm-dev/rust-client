@@ -1,7 +1,5 @@
 use super::deps::enqueue_child_deps;
-use super::policy::{
-    PolicyBlock, apply_override_target_greedy, handle_no_version, handle_policy_blocked,
-};
+use super::policy::{PolicyBlock, handle_no_version, handle_policy_blocked};
 use super::prelude::*;
 use super::state::{ResolveState, ResolvedNodeBuilder};
 use super::types::{Edge, NodeId};
@@ -98,13 +96,8 @@ pub(super) fn process_edge_with_preferred(
             .find_match(&canonical_name, &natural, parent_ctx_ref)
         {
             Some(entry) => {
-                match apply_override_target_greedy(
-                    &edge.canonical,
-                    info,
-                    &entry.target,
-                    &state.policy,
-                ) {
-                    Some(forced) => {
+                match select_override_target(&edge.canonical, info, &entry.target, &state.policy) {
+                    Ok(forced) => {
                         let hit = (forced != natural).then(|| OverrideHit {
                             raw_key: entry.raw_key.clone(),
                             source: entry.source,
@@ -134,12 +127,13 @@ pub(super) fn process_edge_with_preferred(
                             hit,
                         })
                     }
-                    None => {
+                    Err(rejection) => {
                         tracing::warn!(
-                            "override {} could not select eligible target {} for {}",
+                            "override {} could not select target {} for {}: {}",
                             entry.raw_key,
                             entry.target.raw(),
-                            canonical_name
+                            canonical_name,
+                            rejection,
                         );
                         None
                     }

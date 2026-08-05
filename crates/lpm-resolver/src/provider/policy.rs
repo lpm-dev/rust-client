@@ -1,5 +1,41 @@
 use super::prelude::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OverrideTargetRejection {
+    NotPublished,
+    ReleaseAge {
+        remaining_secs: u64,
+        minimum_secs: u64,
+    },
+    MissingReleaseTime,
+    TrustPolicy(String),
+    PlatformIncompatible,
+}
+
+impl std::fmt::Display for OverrideTargetRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPublished => formatter.write_str("no published version matches the target"),
+            Self::ReleaseAge {
+                remaining_secs,
+                minimum_secs,
+            } => write!(
+                formatter,
+                "blocked by minimumReleaseAge; {remaining_secs}s remaining (minimumReleaseAge={minimum_secs}s)"
+            ),
+            Self::MissingReleaseTime => formatter.write_str(
+                "blocked because strict minimumReleaseAge policy requires publish-time metadata",
+            ),
+            Self::TrustPolicy(reason) => {
+                write!(formatter, "blocked by trust-policy no-downgrade: {reason}")
+            }
+            Self::PlatformIncompatible => {
+                formatter.write_str("incompatible with the current OS/CPU/libc")
+            }
+        }
+    }
+}
+
 pub(crate) fn release_age_status_for_version(
     package: &CanonicalKey,
     info: &CachedPackageInfo,
@@ -109,4 +145,69 @@ pub(super) fn version_allowed_by_policy(
         ReleaseTimeStatus::Allowed
     ) && (!policy.trust_policy().is_no_downgrade()
         || trust_downgrade_violation(info, version).is_none())
+}
+
+pub(crate) fn select_override_target(
+    package: &CanonicalKey,
+    info: &CachedPackageInfo,
+    target: &OverrideTarget,
+    policy: &ResolverPolicy,
+) -> Result<NpmVersion, OverrideTargetRejection> {
+    let candidate_rejection = |version: &NpmVersion| {
+        match release_age_status_for_version(package, info, version, policy) {
+            ReleaseTimeStatus::Allowed => {}
+            ReleaseTimeStatus::TooNew { remaining_secs } => {
+                return Some(OverrideTargetRejection::ReleaseAge {
+                    remaining_secs,
+                    minimum_secs: policy.minimum_release_age_secs(),
+                });
+            }
+            ReleaseTimeStatus::Missing => {
+                return Some(OverrideTargetRejection::MissingReleaseTime);
+            }
+        }
+        if policy.trust_policy().is_no_downgrade()
+            && let Some(reason) = trust_downgrade_violation(info, version)
+        {
+            return Some(OverrideTargetRejection::TrustPolicy(reason));
+        }
+        if !info.platform.is_empty()
+            && info
+                .platform
+                .get(&version.to_string())
+                .is_some_and(|metadata| !super::platform::is_platform_compatible(metadata))
+        {
+            return Some(OverrideTargetRejection::PlatformIncompatible);
+        }
+        None
+    };
+
+    match target {
+        OverrideTarget::PinnedVersion { version, .. } => {
+            if !info.versions.contains(version) {
+                return Err(OverrideTargetRejection::NotPublished);
+            }
+            if let Some(rejection) = candidate_rejection(version) {
+                return Err(rejection);
+            }
+            Ok(version.clone())
+        }
+        OverrideTarget::Range {
+            range: target_range,
+            ..
+        } => {
+            let mut first_rejection = None;
+            for version in &info.versions {
+                if !target_range.satisfies(version) {
+                    continue;
+                }
+                if let Some(rejection) = candidate_rejection(version) {
+                    first_rejection.get_or_insert(rejection);
+                    continue;
+                }
+                return Ok(version.clone());
+            }
+            Err(first_rejection.unwrap_or(OverrideTargetRejection::NotPublished))
+        }
+    }
 }

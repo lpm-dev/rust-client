@@ -1804,6 +1804,18 @@ pub static POLICY_FORCE_SECURITY_FLOOR: CheckEntry = CheckEntry {
 // owned by `lpm-workspace`. No duplication; updates to the workspace
 // const flow through automatically.
 
+pub static UNSUPPORTED_OVERRIDE_VALUES: CheckEntry = CheckEntry {
+    code: lpm_workspace::UNSUPPORTED_OVERRIDE_VALUES_META.code,
+    name: lpm_workspace::UNSUPPORTED_OVERRIDE_VALUES_META.name,
+    category: Category::ManifestCompat,
+    tier: Tier::Extended,
+    description: lpm_workspace::UNSUPPORTED_OVERRIDE_VALUES_META.description,
+    when_fires: lpm_workspace::UNSUPPORTED_OVERRIDE_VALUES_META.when_fires,
+    remediation: lpm_workspace::UNSUPPORTED_OVERRIDE_VALUES_META.remediation,
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static PNPM_OVERRIDES_DRIFT: CheckEntry = CheckEntry {
     code: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.code,
     name: lpm_workspace::PNPM_OVERRIDES_DRIFT_META.name,
@@ -1892,6 +1904,7 @@ pub static ENGINES_BUN_IGNORED: CheckEntry = CheckEntry {
 /// `lpm_workspace::MANIFEST_COMPAT_CATALOG`). Used by the runtime
 /// adapter in `commands::doctor` to look up the typed entry by code.
 pub static MANIFEST_COMPAT_ENTRIES: &[&CheckEntry] = &[
+    &UNSUPPORTED_OVERRIDE_VALUES,
     &PNPM_OVERRIDES_DRIFT,
     &PNPM_PATCHES_DRIFT,
     &PNPM_PEER_RULES_DRIFT,
