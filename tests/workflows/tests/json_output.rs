@@ -287,6 +287,9 @@ async fn doctor_json_surfaces_manifest_compat_issues_with_stable_codes() {
                 "npm": ">=10",
                 "pnpm": ">=9"
             },
+            "overrides": {
+                "path-scurry": { "lru-cache": "^11.0.0" }
+            },
             "pnpm": {
                 "overrides": { "lodash": "^4.17.21" },
                 "patchedDependencies": { "react@18.0.0": "patches/react.patch" }
@@ -302,9 +305,10 @@ async fn doctor_json_surfaces_manifest_compat_issues_with_stable_codes() {
     let json = parse_json_output(&output.stdout);
     let checks = json["checks"].as_array().expect("checks must be an array");
 
-    // Every drift / ignored-engine code lands as its own check entry
-    // with severity = warn and the matching stable code.
+    // Every compatibility code lands as its own check entry with
+    // severity = warn and the matching stable code.
     for code in [
+        "unsupported_override_values",
         "pnpm_overrides_drift",
         "pnpm_patches_drift",
         "engines_npm_ignored",

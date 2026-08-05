@@ -94,6 +94,17 @@ pub struct ManifestCompatCatalogEntry {
 // that point at this prose without duplicating it. The slice
 // [`MANIFEST_COMPAT_CATALOG`] iterates these in stable order.
 
+/// Catalog entry for `unsupported_override_values`.
+pub const UNSUPPORTED_OVERRIDE_VALUES_META: ManifestCompatCatalogEntry =
+    ManifestCompatCatalogEntry {
+        code: "unsupported_override_values",
+        name: "Manifest compat: override value shapes",
+        description: "Top-level `overrides` or `resolutions` values that LPM cannot apply because they are not version strings.",
+        when_fires: "A top-level override field is not an object, or an entry uses a nested object, array, number, boolean, or null value.",
+        remediation: "Use string targets and parent selectors such as `parent>dependency`; LPM does not apply npm's nested-object override values.",
+        possible_severities: &["warn"],
+    };
+
 /// Catalog entry for `pnpm_overrides_drift`.
 pub const PNPM_OVERRIDES_DRIFT_META: ManifestCompatCatalogEntry = ManifestCompatCatalogEntry {
     code: "pnpm_overrides_drift",
@@ -173,6 +184,7 @@ pub const ENGINES_BUN_IGNORED_META: ManifestCompatCatalogEntry = ManifestCompatC
 /// `manifest_compat_issues()` so a side-by-side comparison stays
 /// reviewable.
 pub static MANIFEST_COMPAT_CATALOG: &[ManifestCompatCatalogEntry] = &[
+    UNSUPPORTED_OVERRIDE_VALUES_META,
     PNPM_OVERRIDES_DRIFT_META,
     PNPM_PATCHES_DRIFT_META,
     PNPM_PEER_RULES_DRIFT_META,
@@ -195,9 +207,11 @@ impl PackageJson {
     ///   the code without parsing wording.
     ///
     /// Issues are returned in stable order:
-    /// 1. `pnpm_overrides_drift`
-    /// 2. `pnpm_patches_drift`
-    /// 3. `engines_<pm>_ignored` (npm, pnpm, yarn, bun in that order)
+    /// 1. `unsupported_override_values`
+    /// 2. `pnpm_overrides_drift`
+    /// 3. `pnpm_patches_drift`
+    /// 4. `pnpm_peer_rules_drift`
+    /// 5. `engines_<pm>_ignored` (npm, pnpm, yarn, bun in that order)
     ///
     /// Detectors are diff-aware where it makes sense (`pnpm_overrides`
     /// stays silent once `lpm.overrides` covers every entry) and
@@ -205,6 +219,9 @@ impl PackageJson {
     /// (`engines.<pm>` — LPM never enforces those by design).
     pub fn manifest_compat_issues(&self) -> Vec<ManifestCompatIssue> {
         let mut issues = Vec::new();
+        if let Some(i) = detect_unsupported_override_values(self) {
+            issues.push(i);
+        }
         if let Some(i) = detect_pnpm_overrides_drift(self) {
             issues.push(i);
         }
@@ -217,6 +234,29 @@ impl PackageJson {
         issues.extend(detect_engines_other_pm_ignored(self));
         issues
     }
+}
+
+fn detect_unsupported_override_values(pkg: &PackageJson) -> Option<ManifestCompatIssue> {
+    if pkg.unsupported_override_values.is_empty() {
+        return None;
+    }
+    let mut entries = pkg.unsupported_override_values.clone();
+    entries.sort();
+
+    Some(ManifestCompatIssue {
+        code: "unsupported_override_values",
+        severity: ManifestCompatSeverity::Warn,
+        detail: format!(
+            "package.json has {} top-level `overrides` or `resolutions` value{} that LPM ignores: {}",
+            entries.len(),
+            if entries.len() == 1 { "" } else { "s" },
+            preview(&entries),
+        ),
+        remediation: "use string targets and parent selectors such as `parent>dependency`. \
+                      LPM does not apply npm's nested-object override values."
+            .into(),
+        entries,
+    })
 }
 
 /// Detector: `pnpm.overrides` has entries (or value shapes) whose
@@ -606,6 +646,36 @@ mod tests {
         assert!(
             issues.is_empty(),
             "expected no compat issues for a plain manifest; got {issues:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_override_values_list_ignored_keys_and_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "nested-overrides",
+                "overrides": {
+                    "path-scurry": { "lru-cache": "^11.0.0" }
+                },
+                "resolutions": {
+                    "react": ["18.0.0"]
+                }
+            }"#,
+        );
+
+        let pkg = read_package_json(&dir.path().join("package.json")).unwrap();
+        let issues = pkg.manifest_compat_issues();
+        let issue = issue_with_code(&issues, "unsupported_override_values")
+            .expect("unsupported override values must produce a compatibility warning");
+
+        assert_eq!(
+            issue.entries,
+            vec![
+                "`overrides.path-scurry` (nested object)".to_string(),
+                "`resolutions.react` (array)".to_string(),
+            ]
         );
     }
 

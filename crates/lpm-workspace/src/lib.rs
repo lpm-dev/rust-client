@@ -25,7 +25,7 @@ pub use compat::{
     ENGINES_BUN_IGNORED_META, ENGINES_NPM_IGNORED_META, ENGINES_PNPM_IGNORED_META,
     ENGINES_YARN_IGNORED_META, MANIFEST_COMPAT_CATALOG, ManifestCompatCatalogEntry,
     ManifestCompatIssue, ManifestCompatSeverity, PNPM_OVERRIDES_DRIFT_META,
-    PNPM_PATCHES_DRIFT_META, PNPM_PEER_RULES_DRIFT_META,
+    PNPM_PATCHES_DRIFT_META, PNPM_PEER_RULES_DRIFT_META, UNSUPPORTED_OVERRIDE_VALUES_META,
 };
 pub use discovery::{
     Workspace, WorkspaceMember, collect_all_dependencies, discover_workspace, find_project_root,

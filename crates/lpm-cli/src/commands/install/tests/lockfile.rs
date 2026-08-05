@@ -111,6 +111,75 @@ fn prepare_override_resolution_state_resolves_catalog_backed_override_maps() {
     assert_eq!(catalog_resolutions.len(), 3);
 }
 
+#[test]
+fn prepare_override_resolution_state_inherits_root_maps_with_member_precedence() {
+    let mut root_package = lpm_workspace::PackageJson {
+        overrides: HashMap::from([
+            ("root-npm".to_string(), "1.0.0".to_string()),
+            ("shared-npm".to_string(), "1.0.0".to_string()),
+        ]),
+        resolutions: HashMap::from([
+            ("root-yarn".to_string(), "1.0.0".to_string()),
+            ("shared-yarn".to_string(), "1.0.0".to_string()),
+        ]),
+        ..Default::default()
+    };
+    root_package.lpm = Some(lpm_workspace::LpmConfig {
+        overrides: HashMap::from([
+            ("root-lpm".to_string(), "1.0.0".to_string()),
+            ("shared-lpm".to_string(), "1.0.0".to_string()),
+        ]),
+        ..Default::default()
+    });
+    let workspace = lpm_workspace::Workspace {
+        root: std::path::PathBuf::from("/workspace"),
+        root_package,
+        members: Vec::new(),
+    };
+    let mut member_package = lpm_workspace::PackageJson {
+        overrides: HashMap::from([("shared-npm".to_string(), "2.0.0".to_string())]),
+        resolutions: HashMap::from([("shared-yarn".to_string(), "2.0.0".to_string())]),
+        ..Default::default()
+    };
+    member_package.lpm = Some(lpm_workspace::LpmConfig {
+        overrides: HashMap::from([("shared-lpm".to_string(), "2.0.0".to_string())]),
+        ..Default::default()
+    });
+    let mut catalog_resolutions = Vec::new();
+
+    let state = prepare_override_resolution_state(OverrideResolutionInput {
+        package: &member_package,
+        workspace: Some(&workspace),
+        catalog_resolutions: &mut catalog_resolutions,
+    })
+    .expect("workspace override maps should merge");
+
+    assert_eq!(
+        state.lpm_overrides.get("root-lpm").map(String::as_str),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        state.lpm_overrides.get("shared-lpm").map(String::as_str),
+        Some("2.0.0")
+    );
+    assert_eq!(
+        state.overrides.get("root-npm").map(String::as_str),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        state.overrides.get("shared-npm").map(String::as_str),
+        Some("2.0.0")
+    );
+    assert_eq!(
+        state.resolutions.get("root-yarn").map(String::as_str),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        state.resolutions.get("shared-yarn").map(String::as_str),
+        Some("2.0.0")
+    );
+}
+
 fn catalog_resolution(
     package_name: &str,
     specifier: &str,

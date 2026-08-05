@@ -1,4 +1,3 @@
-use super::policy::apply_peer_override_target_greedy;
 use super::prelude::*;
 use super::state::ResolveState;
 use super::types::{DepBehavior, Edge, PeerConflictReport, PeerRequirement};
@@ -248,15 +247,18 @@ where
         else {
             continue;
         };
-        let Some(forced) =
-            apply_peer_override_target_greedy(canonical, &info, &entry.target, &state.policy)
-        else {
-            tracing::warn!(
-                "override {} could not select an eligible peer version for {}",
-                entry.raw_key,
-                canonical_name
-            );
-            continue;
+        let forced = match select_override_target(canonical, &info, &entry.target, &state.policy) {
+            Ok(forced) => forced,
+            Err(rejection) => {
+                tracing::warn!(
+                    "override {} could not select target {} for peer {}: {}",
+                    entry.raw_key,
+                    entry.target.raw(),
+                    canonical_name,
+                    rejection,
+                );
+                continue;
+            }
         };
         requirement.range = NpmRange::parse(&forced.to_string()).map_err(|error| {
             ResolveError::Internal(format!(

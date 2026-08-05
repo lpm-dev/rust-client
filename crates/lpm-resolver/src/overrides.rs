@@ -515,9 +515,14 @@ impl OverrideSet {
     }
 
     /// Record an applied override. Called from `choose_version` after
-    /// the resolver has decided to honor the entry. Idempotent on
-    /// (raw_key, source, package, from_version, to_version, via_parent).
+    /// the resolver changed the selected version. Unchanged selections are
+    /// omitted because reporting them as applied work is misleading.
+    /// Idempotent on (raw_key, source, package, from_version, to_version,
+    /// via_parent).
     pub fn record_hit(&self, hit: OverrideHit) {
+        if hit.from_version == hit.to_version {
+            return;
+        }
         let mut hits = self.hits.lock();
         if !hits.contains(&hit) {
             hits.push(hit);
@@ -1226,6 +1231,21 @@ mod tests {
         set.record_hit(hit);
         let hits = set.take_hits();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn record_hit_omits_unchanged_version_selection() {
+        let set = OverrideSet::parse(&map(&[("foo", "2.0.0")]), &map(&[]), &map(&[])).unwrap();
+        set.record_hit(OverrideHit {
+            raw_key: "foo".into(),
+            source: OverrideSource::LpmOverrides,
+            package: "foo".into(),
+            from_version: "2.0.0".into(),
+            to_version: "2.0.0".into(),
+            via_parent: Some("consumer".into()),
+        });
+
+        assert!(set.take_hits().is_empty());
     }
 
     #[test]

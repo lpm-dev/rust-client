@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use lpm_registry::{RegistryClient, RouteTable};
 
-use super::policy::apply_peer_override_target_greedy;
 use super::version::{VersionPick, find_best_version_with_policy};
 use super::{
     SharedMetadataConcurrency,
@@ -12,7 +11,9 @@ use super::{
 use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::CanonicalKey;
 use crate::policy::ResolverPolicy;
-use crate::provider::{CachedPackageInfo, SharedCache, is_platform_compatible};
+use crate::provider::{
+    CachedPackageInfo, SharedCache, is_platform_compatible, select_override_target,
+};
 use crate::ranges::NpmRange;
 use crate::resolve::{ResolveError, ResolveResult, ResolvedPackage, RootDependencies};
 use crate::specifier::Specifier;
@@ -806,14 +807,18 @@ fn apply_projected_peer_override(
     else {
         return Ok(Some(range));
     };
-    let Some(forced) = apply_peer_override_target_greedy(&canonical, info, &entry.target, policy)
-    else {
-        tracing::warn!(
-            "override {} could not select an eligible peer version for {}",
-            entry.raw_key,
-            target
-        );
-        return Ok(Some(range));
+    let forced = match select_override_target(&canonical, info, &entry.target, policy) {
+        Ok(forced) => forced,
+        Err(rejection) => {
+            tracing::warn!(
+                "override {} could not select target {} for peer {}: {}",
+                entry.raw_key,
+                entry.target.raw(),
+                target,
+                rejection,
+            );
+            return Ok(Some(range));
+        }
     };
     let forced_range = NpmRange::parse(&forced.to_string()).map_err(|error| {
         ResolveError::Internal(format!(

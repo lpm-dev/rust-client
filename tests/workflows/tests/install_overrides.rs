@@ -12,6 +12,12 @@
 //! 3. **Offline safety** — `--offline` cannot re-resolve, so any
 //!    drift between the persisted overrides-state and the current
 //!    `lpm.overrides` is a hard error rather than a silent stale-link.
+//! 4. **Replacement semantics** — an override replaces each consumer's
+//!    declared range, including when a transitive pin excludes the target.
+//! 5. **Workspace inheritance** — root overrides apply to every member;
+//!    member-local entries can refine the effective map.
+//! 6. **Truthful reporting** — unchanged selections are not reported as
+//!    applied overrides.
 //!
 //! In its own file (not appended to `install.rs`) because the helpers
 //! — `override_state_fingerprint` mirror, `seed_store_package`, lockfile/state
@@ -22,8 +28,8 @@
 
 mod support;
 
-use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
+use support::{TempProject, lpm, lpm_with_registry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -205,6 +211,337 @@ fn override_state_fingerprint(entries: &[(&str, &str, &str)]) -> String {
         hasher.update(b"\n");
     }
     format!("sha256-{:x}", hasher.finalize())
+}
+
+async fn mount_force_override_packages(mock: &MockRegistry) {
+    let target_metadata = mock
+        .mount_full_package_metadata_routes(
+            "override-target",
+            "2.0.0",
+            &[
+                (
+                    "2.0.0",
+                    serde_json::json!({}),
+                    Some(make_tarball("override-target", "2.0.0")),
+                ),
+                (
+                    "1.0.0",
+                    serde_json::json!({}),
+                    Some(make_tarball("override-target", "1.0.0")),
+                ),
+            ],
+        )
+        .await;
+    let consumer_metadata = mock
+        .mount_full_package_metadata_routes(
+            "override-consumer",
+            "1.0.0",
+            &[(
+                "1.0.0",
+                serde_json::json!({ "override-target": "1.0.0" }),
+                Some(make_tarball("override-consumer", "1.0.0")),
+            )],
+        )
+        .await;
+    mock.with_batch_metadata(vec![consumer_metadata, target_metadata])
+        .await;
+}
+
+fn install_without_optional_setup(
+    project: &TempProject,
+    registry_url: &str,
+) -> std::process::Output {
+    lpm_with_registry(project, registry_url)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install")
+}
+
+// ─── Online replacement semantics ─────────────────────────────────────
+
+#[tokio::test]
+async fn install_override_replaces_transitive_consumer_range() {
+    let mock = MockRegistry::start().await;
+    mount_force_override_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "force-transitive-override",
+  "version": "1.0.0",
+  "dependencies": { "override-consumer": "1.0.0" },
+  "lpm": { "overrides": { "override-target": "2.0.0" } }
+}"#,
+    );
+
+    let output = install_without_optional_setup(&project, &mock.url());
+    assert!(
+        output.status.success(),
+        "override install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read override lockfile");
+    assert!(
+        lockfile
+            .packages
+            .iter()
+            .any(|package| package.name == "override-target" && package.version == "2.0.0")
+            && !lockfile
+                .packages
+                .iter()
+                .any(|package| package.name == "override-target" && package.version == "1.0.0"),
+        "the override must replace the consumer's pinned range"
+    );
+}
+
+#[tokio::test]
+async fn install_override_summary_omits_unchanged_selection() {
+    let mock = MockRegistry::start().await;
+    mount_force_override_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "unchanged-override",
+  "version": "1.0.0",
+  "dependencies": { "override-target": "2.0.0" },
+  "lpm": { "overrides": { "override-target": "2.0.0" } }
+}"#,
+    );
+
+    let output = install_without_optional_setup(&project, &mock.url());
+    assert!(
+        output.status.success(),
+        "override install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    assert!(
+        !combined.contains("Applied 1 override") && !combined.contains("2.0.0 → 2.0.0"),
+        "an unchanged selection must not be reported as applied:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn install_json_omits_unchanged_override_selection() {
+    let mock = MockRegistry::start().await;
+    mount_force_override_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "unchanged-override-json",
+  "version": "1.0.0",
+  "dependencies": { "override-target": "2.0.0" },
+  "lpm": { "overrides": { "override-target": "2.0.0" } }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn JSON install");
+    assert!(
+        output.status.success(),
+        "JSON override install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("install stdout must be JSON");
+
+    assert_eq!(json["success"], true);
+    assert!(json.get("applied_overrides").is_none());
+}
+
+#[tokio::test]
+async fn workspace_member_inherits_root_override() {
+    let mock = MockRegistry::start().await;
+    mount_force_override_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "override-workspace",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "lpm": { "overrides": { "override-target": "1.0.0" } }
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+  "name": "override-app",
+  "version": "1.0.0",
+  "dependencies": { "override-target": "*" }
+}"#,
+    );
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command
+        .current_dir(project.path().join("packages/app"))
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ]);
+    let output = command.output().expect("spawn workspace member install");
+    assert!(
+        output.status.success(),
+        "workspace member install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let manifest = std::fs::read_to_string(
+        project
+            .path()
+            .join("packages/app/node_modules/override-target/package.json"),
+    )
+    .expect("read inherited override target manifest");
+    let installed: serde_json::Value = serde_json::from_str(&manifest).expect("parse manifest");
+    assert_eq!(installed["version"], "1.0.0");
+}
+
+#[tokio::test]
+async fn install_override_does_not_bypass_minimum_release_age() {
+    use chrono::SecondsFormat;
+
+    let mock = MockRegistry::start().await;
+    let package = "override-policy-target";
+    let forced_version = "2.0.0";
+    let natural_version = "1.0.0";
+    let forced_tarball = make_tarball(package, forced_version);
+    let natural_tarball = make_tarball(package, natural_version);
+    let fresh = (chrono::Utc::now() - chrono::Duration::hours(212))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let old = (chrono::Utc::now() - chrono::Duration::hours(400))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": forced_version },
+        "versions": {
+            (forced_version): {
+                "name": package,
+                "version": forced_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package, forced_version),
+                    "integrity": compute_integrity(&forced_tarball),
+                },
+                "dependencies": {}
+            },
+            (natural_version): {
+                "name": package,
+                "version": natural_version,
+                "dist": {
+                    "tarball": mock.tarball_url(package, natural_version),
+                    "integrity": compute_integrity(&natural_tarball),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            (forced_version): fresh,
+            (natural_version): old,
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[
+            (forced_version, forced_tarball),
+            (natural_version, natural_tarball),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "policy-gated-override",
+  "version": "1.0.0",
+  "dependencies": {{ "{package}": "^1.0.0" }},
+  "lpm": {{ "overrides": {{ "{package}": "{forced_version}" }} }}
+}}"#,
+    ));
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--min-release-age=1080000",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn policy-gated override install");
+    assert!(
+        output.status.success(),
+        "policy-gated override install must fall back successfully\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read policy-gated override lockfile");
+    assert!(
+        lockfile
+            .packages
+            .iter()
+            .any(|entry| entry.name == package && entry.version == natural_version)
+            && !lockfile
+                .packages
+                .iter()
+                .any(|entry| entry.name == package && entry.version == forced_version),
+        "minimumReleaseAge must keep the eligible natural selection"
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        stderr.contains("blocked by minimumReleaseAge"),
+        "override warning must identify the release-age policy block:\n{stderr}"
+    );
+}
+
+#[test]
+fn install_warns_when_nested_top_level_override_value_is_ignored() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "nested-override-warning",
+  "version": "1.0.0",
+  "dependencies": {},
+  "overrides": {
+    "path-scurry": { "lru-cache": "^11.0.0" }
+  }
+}"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn install with nested override");
+    assert!(
+        output.status.success(),
+        "unsupported nested override must not invalidate the rest of package.json"
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        stderr.contains("`overrides`")
+            && stderr.contains("path-scurry")
+            && stderr.contains("nested object"),
+        "install must warn that the nested override value was ignored:\n{stderr}"
+    );
 }
 
 // ─── Fail-closed parsing ────────────────────────────────────────────────

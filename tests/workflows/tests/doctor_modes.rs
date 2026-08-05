@@ -35,6 +35,7 @@ const EXTENDED_SENTINEL_CODES: &[&str] = &[
     "auth_valid",
     "auth_invalid",
     "auth_missing",
+    "unsupported_override_values",
     "pnpm_overrides_drift",
     "engines_npm_ignored",
     "engines_pnpm_ignored",

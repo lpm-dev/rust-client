@@ -41,7 +41,7 @@ pub struct PackageJson {
     pub optional_dependencies: HashMap<String, String>,
 
     /// npm overrides / yarn resolutions — force specific versions for
-    /// transitive deps.
+    /// direct and transitive dependencies.
     ///
     /// **Lossy deserialization.** The npm spec allows override values to
     /// be EITHER a string (`"axios": "^1.15.2"` — simple version pin) OR
@@ -57,18 +57,19 @@ pub struct PackageJson {
     /// consumer (security analysis, lifecycle scripts, etc.).
     ///
     /// The manifest normalizer keeps the simple `String`-valued
-    /// entries (which LPM CAN apply) and silently drops the
-    /// nested-object ones. When LPM's resolver gains nested-override
-    /// support, this can be promoted to a typed `OverrideValue` enum
-    /// and the readers updated. Until then, "permissive parse + drop
-    /// unsupported shapes" is the right trade-off because it preserves
-    /// the rest of the manifest's value.
+    /// entries and records unsupported shapes for install and doctor
+    /// compatibility warnings.
     pub overrides: HashMap<String, String>,
 
     /// Yarn-style resolutions (same purpose as overrides). Same
     /// lossy-string-map handling as `overrides`: yarn also supports
     /// nested resolution objects, which we drop during normalization.
     pub resolutions: HashMap<String, String>,
+
+    /// Top-level `overrides` and `resolutions` entries whose values are
+    /// not strings. The supported entries remain usable; compatibility
+    /// checks surface these ignored entries without rejecting the manifest.
+    pub unsupported_override_values: Vec<String>,
 
     pub workspaces: Option<WorkspacesConfig>,
 
@@ -129,6 +130,12 @@ fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, Str
         return Err("expected package.json object".to_string());
     };
 
+    let (overrides, mut unsupported_override_values) =
+        override_map_from_value("overrides", obj.get("overrides"));
+    let (resolutions, unsupported_resolutions) =
+        override_map_from_value("resolutions", obj.get("resolutions"));
+    unsupported_override_values.extend(unsupported_resolutions);
+
     Ok(PackageJson {
         name: string_field(obj, "name"),
         version: string_field(obj, "version"),
@@ -137,8 +144,9 @@ fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, Str
         peer_dependencies: lossy_string_map_from_value(obj.get("peerDependencies")),
         peer_dependencies_meta: peer_meta_map_from_value(obj.get("peerDependenciesMeta")),
         optional_dependencies: lossy_string_map_from_value(obj.get("optionalDependencies")),
-        overrides: lossy_string_map_from_value(obj.get("overrides")),
-        resolutions: lossy_string_map_from_value(obj.get("resolutions")),
+        overrides,
+        resolutions,
+        unsupported_override_values,
         workspaces: optional_typed_field(obj, "workspaces")?,
         publish_config: publish_config_from_value(obj.get("publishConfig")),
         lpm: optional_typed_field(obj, "lpm")?,
@@ -183,6 +191,43 @@ fn lossy_string_map_from_value(value: Option<&serde_json::Value>) -> HashMap<Str
                 .map(|string| (key.clone(), string.to_string()))
         })
         .collect()
+}
+
+fn override_map_from_value(
+    field: &str,
+    value: Option<&serde_json::Value>,
+) -> (HashMap<String, String>, Vec<String>) {
+    let Some(value) = value else {
+        return (HashMap::new(), Vec::new());
+    };
+    let Some(obj) = value.as_object() else {
+        return (
+            HashMap::new(),
+            vec![format!("`{field}` ({})", json_value_kind(value))],
+        );
+    };
+
+    let mut supported = HashMap::with_capacity(obj.len());
+    let mut unsupported = Vec::new();
+    for (key, value) in obj {
+        if let Some(target) = value.as_str() {
+            supported.insert(key.clone(), target.to_string());
+        } else {
+            unsupported.push(format!("`{field}.{key}` ({})", json_value_kind(value)));
+        }
+    }
+    (supported, unsupported)
+}
+
+fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "nested object",
+    }
 }
 
 fn lossy_nested_string_map_from_value(
@@ -790,7 +835,7 @@ mod tests {
         );
         assert_eq!(pkg.overrides.get("vite").map(String::as_str), Some("$vite"));
 
-        // Nested-object override is silently dropped (LPM doesn't apply nested overrides yet).
+        // Nested-object overrides are excluded from the applied string map.
         assert!(
             !pkg.overrides.contains_key("path-scurry"),
             "nested-object override entry must be dropped"
@@ -802,6 +847,13 @@ mod tests {
             Some("^4.17.21")
         );
         assert!(!pkg.resolutions.contains_key("deeply-nested"));
+        assert_eq!(
+            pkg.unsupported_override_values,
+            vec![
+                "`overrides.path-scurry` (nested object)".to_string(),
+                "`resolutions.deeply-nested` (nested object)".to_string(),
+            ]
+        );
 
         // Crucially, the rest of the manifest survives — strict parsing
         // rejected the entire manifest before reaching this point.

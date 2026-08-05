@@ -8,11 +8,12 @@ use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::pin::Pin;
 
-type SelectedVersion = (
-    String,
-    Option<lpm_resolver::PlatformMeta>,
-    Option<lpm_resolver::OverrideHit>,
-);
+struct SelectedVersion {
+    version: String,
+    platform: Option<lpm_resolver::PlatformMeta>,
+    override_hit: Option<lpm_resolver::OverrideHit>,
+    override_selected: bool,
+}
 
 pub(super) type ResolveFuture =
     Pin<Box<dyn Future<Output = Result<NodeResolution, LpmError>> + Send>>;
@@ -176,17 +177,21 @@ pub(super) fn select_or_reuse_node(
 
     let split_target = !override_set.split_targets().is_empty()
         && override_set.split_targets().contains(&request.target_name);
-    let Some((version, platform, override_hit)) =
-        select_version_from_info(&request, &info, override_set, resolver_policy)?
+    let Some(selected) = select_version_from_info(&request, &info, override_set, resolver_policy)?
     else {
         return Ok(None);
     };
-    let override_applied = override_hit.is_some();
+    let SelectedVersion {
+        version,
+        platform,
+        override_hit,
+        override_selected,
+    } = selected;
     if let Some(hit) = override_hit {
         override_set.record_hit(hit);
     }
     if !request.root {
-        if override_applied || split_target {
+        if override_selected || split_target {
             if package_version_exists(packages, &request.target_name, &version) {
                 return Ok(Some(ResolvedNode {
                     request,
@@ -272,20 +277,24 @@ fn select_version_from_info(
     })?;
     let canonical = lpm_resolver::CanonicalKey::from_dep_name(&request.target_name);
     let parent_canonical = request.parent.as_ref().map(|(name, _)| name.as_str());
-    let (selection, override_hit) =
-        lpm_resolver::experimental_select_version_with_policy_and_overrides(
-            &canonical,
-            info,
-            &range,
-            resolver_policy,
-            override_set,
-            parent_canonical,
-        );
-    match selection {
+    let outcome = lpm_resolver::experimental_select_version_with_policy_and_overrides_outcome(
+        &canonical,
+        info,
+        &range,
+        resolver_policy,
+        override_set,
+        parent_canonical,
+    );
+    match outcome.selection {
         lpm_resolver::ExperimentalVersionSelection::Picked(version) => {
             let version = version.to_string();
             let platform = info.platform.get(&version).cloned();
-            Ok(Some((version, platform, override_hit)))
+            Ok(Some(SelectedVersion {
+                version,
+                platform,
+                override_hit: outcome.override_hit,
+                override_selected: outcome.override_selected,
+            }))
         }
         lpm_resolver::ExperimentalVersionSelection::NoSatisfying => {
             if request.optional {
