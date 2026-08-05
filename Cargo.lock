@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-audit-corpus"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3189,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-auth"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-cert"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "dirs",
  "lpm-common",
@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-cli"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "aes-gcm",
  "assert_cmd",
@@ -3340,7 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-common"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3364,7 +3364,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-dashboard"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "crossterm",
  "lpm-common",
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-ecosystem-verifier"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "clap",
  "lpm-common",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "schemars",
  "serde",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-extractor"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "blake3",
  "criterion",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-global"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "chrono",
  "crc32fast",
@@ -3436,7 +3436,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-http"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "reqwest",
  "syn 2.0.117",
@@ -3444,7 +3444,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-inspect"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-linker"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "flate2",
  "libc",
@@ -3506,7 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-lockfile"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "criterion",
  "hex",
@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-migrate"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "glob",
  "lpm-common",
@@ -3537,7 +3537,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-network"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "crossterm",
  "if-addrs",
@@ -3552,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-plugin"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "filetime",
  "flate2",
@@ -3576,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-proxy"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "axum",
  "hyper",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-registry"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "base64",
  "dirs",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-resolver"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "ahash",
  "criterion",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-runner"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "dirs",
  "fd-lock",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-runtime"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "dirs",
  "flate2",
@@ -3717,7 +3717,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-sandbox"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "assert_cmd",
  "criterion",
@@ -3735,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-security"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "bytecount",
  "chrono",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-semver"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "lpm-common",
  "node-semver",
@@ -3770,7 +3770,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-store"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "base64",
  "blake3",
@@ -3799,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-task"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "flate2",
  "glob",
@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-triage-advisor"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -3838,7 +3838,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-tunnel"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3866,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-vault"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -3941,7 +3941,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-workspace"
-version = "0.71.0"
+version = "0.72.0"
 dependencies = [
  "glob",
  "lpm-common",
