@@ -1,21 +1,20 @@
-//! Resolve the "effective" Node.js version for a project — the version
-//! that LPM will actually invoke when scripts run.
+//! Resolve Node.js versions from managed-runtime selectors or an explicit
+//! script `PATH`.
 //!
 //! Used by the engine-strict gate (`crates/lpm-cli/src/engine_check.rs`)
-//! to validate `engines.node` against the version that will be picked
-//! up at script-execution time, rather than blindly trusting whatever
-//! happens to be on `PATH`.
+//! to validate `engines.node` against the first Node on the final script
+//! `PATH`, including project-local `node_modules/.bin` entries.
 //!
-//! Resolution order:
+//! Selector-based resolution order:
 //!
 //! 1. If the project selects a Node version (`lpm.json > runtime.node`,
 //!    `.nvmrc`, `.node-version`) and a managed runtime under
 //!    `~/.lpm/runtimes/node/` satisfies that selector, use the managed version.
-//! 2. Else, fall back to the system `node --version` from `PATH`.
+//! 2. Else, fall back to `node --version` from the inherited `PATH`.
 //! 3. Else, return [`Effective::Unknown`].
 //!
 //! The pin-but-not-yet-installed case intentionally falls through to
-//! the system Node: that mirrors npm's behavior (compare engines.node
+//! the inherited Node: that mirrors npm's behavior (compare engines.node
 //! against the running Node), and it gives the user a clear escape
 //! hatch — `lpm use node@<v>` first, then re-run install.
 
@@ -27,12 +26,11 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// What Node version LPM resolved as "effective" for this project.
+/// Node version resolved from managed-runtime selectors and inherited `PATH`.
 #[derive(Debug, Clone)]
 pub enum Effective {
     /// A managed runtime at `~/.lpm/runtimes/node/<version>/` matched
-    /// the project's pin. This version will be on `PATH` when scripts
-    /// run.
+    /// the project's pin.
     Managed { version: String, source: String },
     /// No managed runtime matched (or no pin exists). `node --version`
     /// from `PATH` will be invoked.
@@ -52,6 +50,25 @@ pub struct EffectiveNodeResolution {
     runtime_fingerprint: Option<String>,
 }
 
+/// Node version and executable fingerprint resolved from an explicit `PATH`.
+#[derive(Debug, Clone)]
+pub struct PathNodeResolution {
+    version: Option<String>,
+    runtime_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PathNodeIdentity {
+    canonical_executable: PathBuf,
+    runtime_fingerprint: String,
+}
+
+/// Reuses Node version probes for identical executables across script paths.
+#[derive(Debug, Default)]
+pub struct PathNodeVersionCache {
+    resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
+}
+
 impl EffectiveNodeResolution {
     /// Resolved Node version and source.
     pub fn effective(&self) -> &Effective {
@@ -61,6 +78,52 @@ impl EffectiveNodeResolution {
     /// Fingerprint of the selected executable, when one can be identified.
     pub fn runtime_fingerprint(&self) -> Option<&str> {
         self.runtime_fingerprint.as_deref()
+    }
+}
+
+impl PathNodeResolution {
+    /// Bare Node version without the leading `v`, when `node` is executable.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Fingerprint of the executable selected by `PATH`, when identifiable.
+    pub fn runtime_fingerprint(&self) -> Option<&str> {
+        self.runtime_fingerprint.as_deref()
+    }
+}
+
+impl PathNodeVersionCache {
+    /// Resolve Node from `path` as observed by a script running in `cwd`.
+    ///
+    /// Relative `PATH` entries are anchored to `cwd`. Version probes are reused
+    /// only when the canonical executable and its metadata fingerprint match.
+    pub fn resolve(&mut self, cwd: &Path, path: &OsStr) -> PathNodeResolution {
+        let executable_before = node_executable_in_path(cwd, path);
+        let identity_before = executable_before.as_deref().and_then(path_node_identity);
+        if let Some(cached) = identity_before
+            .as_ref()
+            .and_then(|identity| self.resolutions.get(identity))
+        {
+            return cached.clone();
+        }
+
+        let version = node_version_on_path(cwd, path, executable_before.as_deref());
+        let identity_after = node_executable_in_path(cwd, path)
+            .as_deref()
+            .and_then(path_node_identity);
+        let stable_identity =
+            identity_before.filter(|before| Some(before) == identity_after.as_ref());
+        let resolution = PathNodeResolution {
+            version,
+            runtime_fingerprint: stable_identity
+                .as_ref()
+                .map(|identity| identity.runtime_fingerprint.clone()),
+        };
+        if let Some(identity) = stable_identity {
+            self.resolutions.insert(identity, resolution.clone());
+        }
+        resolution
     }
 }
 
@@ -133,6 +196,21 @@ pub fn resolve_detected_node_with_fingerprint(
     detected: Option<detect::DetectedNodeVersion>,
 ) -> EffectiveNodeResolution {
     resolve_inner_with_fingerprint(detected)
+}
+
+/// Resolve and fingerprint the Node executable selected by a script's cwd and `PATH`.
+///
+/// The version probe uses the same command lookup rules as script execution.
+/// The fingerprint is retained only when the selected executable is unchanged
+/// across that probe.
+pub fn resolve_node_on_path_with_fingerprint(cwd: &Path, path: &OsStr) -> PathNodeResolution {
+    PathNodeVersionCache::default().resolve(cwd, path)
+}
+
+/// Fingerprint the Node executable selected by a script's cwd and `PATH`.
+pub fn probe_node_fingerprint_on_path(cwd: &Path, path: &OsStr) -> Option<String> {
+    let executable = node_executable_in_path(cwd, path)?;
+    path_node_identity(&executable).map(|identity| identity.runtime_fingerprint)
 }
 
 /// Fingerprint the Node executable LPM would select without executing it.
@@ -253,6 +331,29 @@ fn system_node_version_at(executable: &Path) -> Option<String> {
     parse_system_node_version(Command::new(executable).arg("--version").output().ok()?)
 }
 
+#[cfg(not(windows))]
+fn node_version_on_path(cwd: &Path, _path: &OsStr, executable: Option<&Path>) -> Option<String> {
+    parse_system_node_version(
+        Command::new(executable?)
+            .arg("--version")
+            .current_dir(cwd)
+            .output()
+            .ok()?,
+    )
+}
+
+#[cfg(windows)]
+fn node_version_on_path(cwd: &Path, path: &OsStr, _executable: Option<&Path>) -> Option<String> {
+    parse_system_node_version(
+        Command::new("cmd")
+            .args(["/D", "/S", "/C", "node --version"])
+            .current_dir(cwd)
+            .env("PATH", path)
+            .output()
+            .ok()?,
+    )
+}
+
 fn parse_system_node_version(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
@@ -268,21 +369,57 @@ fn parse_system_node_version(output: std::process::Output) -> Option<String> {
 
 fn system_node_executable() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    system_node_executable_in_path(&path)
+    node_executable_in_path(&std::env::current_dir().ok()?, &path)
 }
 
-fn system_node_executable_in_path(path: &OsStr) -> Option<PathBuf> {
+fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let executable_names = windows_node_executable_names();
+
+    #[cfg(windows)]
+    for executable_name in &executable_names {
+        let candidate = cwd.join(executable_name);
+        if executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+
     for dir in std::env::split_paths(path) {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        };
         #[cfg(windows)]
-        let candidate = dir.join("node.exe");
+        for executable_name in &executable_names {
+            let candidate = dir.join(executable_name);
+            if executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
         #[cfg(not(windows))]
         let candidate = dir.join("node");
 
+        #[cfg(not(windows))]
         if executable_file(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn windows_node_executable_names() -> Vec<std::ffi::OsString> {
+    let path_extensions =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let mut names = Vec::with_capacity(4);
+    names.extend(
+        path_extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| std::ffi::OsString::from(format!("node{extension}"))),
+    );
+    names
 }
 
 #[cfg(unix)]
@@ -300,6 +437,20 @@ fn executable_file(path: &Path) -> bool {
 
 fn executable_fingerprint(kind: &[u8], executable: &Path) -> Option<String> {
     let canonical = executable.canonicalize().ok()?;
+    executable_fingerprint_from_canonical(kind, &canonical)
+}
+
+fn path_node_identity(executable: &Path) -> Option<PathNodeIdentity> {
+    let canonical_executable = executable.canonicalize().ok()?;
+    let runtime_fingerprint =
+        executable_fingerprint_from_canonical(b"script-path\0", &canonical_executable)?;
+    Some(PathNodeIdentity {
+        canonical_executable,
+        runtime_fingerprint,
+    })
+}
+
+fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Option<String> {
     let metadata = canonical.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -495,14 +646,53 @@ mod tests {
         write_test_executable(&second, b"second");
         let path = std::env::join_paths([first_dir.path(), second_dir.path()]).unwrap();
 
-        assert_eq!(system_node_executable_in_path(&path), Some(first));
+        assert_eq!(
+            node_executable_in_path(first_dir.path(), &path),
+            Some(first)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_path_resolution_versions_and_fingerprints_first_node() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = test_node_path(first_dir.path());
+        let second = test_node_path(second_dir.path());
+        write_test_executable(&first, b"#!/bin/sh\necho v16.0.0\n");
+        write_test_executable(&second, b"#!/bin/sh\necho v22.0.0\n");
+        let path = std::env::join_paths([first_dir.path(), second_dir.path()]).unwrap();
+
+        let resolution = resolve_node_on_path_with_fingerprint(first_dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("16.0.0"));
+        assert_eq!(
+            resolution.runtime_fingerprint(),
+            probe_node_fingerprint_on_path(first_dir.path(), &path).as_deref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entries_resolve_from_script_working_directory() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let local = test_node_path(script_dir.path());
+        let fallback = test_node_path(fallback_dir.path());
+        write_test_executable(&local, b"#!/bin/sh\necho v18.0.0\n");
+        write_test_executable(&fallback, b"#!/bin/sh\necho v22.0.0\n");
+        let path = std::env::join_paths([Path::new("."), fallback_dir.path()]).unwrap();
+
+        let resolution = resolve_node_on_path_with_fingerprint(script_dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("18.0.0"));
     }
 
     #[test]
     fn missing_executable_has_no_reusable_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert!(system_node_executable_in_path(dir.path().as_os_str()).is_none());
+        assert!(node_executable_in_path(dir.path(), dir.path().as_os_str()).is_none());
     }
 
     #[test]

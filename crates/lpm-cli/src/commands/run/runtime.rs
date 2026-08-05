@@ -1,6 +1,7 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::bin_path::ManagedRuntimeHint;
+use lpm_runtime::effective::PathNodeVersionCache;
 use std::path::Path;
 
 fn runtime_display_name(runtime: &str) -> &str {
@@ -27,13 +28,43 @@ pub async fn prepare_runtime(
     json_output: bool,
 ) -> Result<ManagedRuntimeHint, LpmError> {
     let detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
-    let detected_node = detected
-        .iter()
-        .find(|runtime| runtime.runtime == lpm_runtime::detect::RuntimeKind::Node)
-        .cloned();
     let hint = ensure_detected_runtimes(detected).await;
-    crate::engine_check::enforce_node_for_run(project_dir, detected_node, json_output)?;
+    validate_runtime(project_dir, &hint, json_output)?;
     Ok(hint)
+}
+
+/// Validate the Node resolved from the exact PATH constructed for scripts.
+pub fn validate_runtime(
+    project_dir: &Path,
+    hint: &ManagedRuntimeHint,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let Some(requirement) = crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
+    else {
+        return Ok(());
+    };
+    let script_path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, hint)?;
+    let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
+        project_dir,
+        std::ffi::OsStr::new(&script_path),
+    );
+    crate::engine_check::enforce_resolved_node_for_run(requirement, effective_node, json_output)
+}
+
+/// Validate a workspace member while reusing probes for shared Node executables.
+pub fn validate_runtime_with_cache(
+    project_dir: &Path,
+    hint: &ManagedRuntimeHint,
+    json_output: bool,
+    node_versions: &mut PathNodeVersionCache,
+) -> Result<(), LpmError> {
+    let Some(requirement) = crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
+    else {
+        return Ok(());
+    };
+    let script_path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, hint)?;
+    let effective_node = node_versions.resolve(project_dir, std::ffi::OsStr::new(&script_path));
+    crate::engine_check::enforce_resolved_node_for_run(requirement, effective_node, json_output)
 }
 
 /// Ensure already-detected managed runtimes are available before running scripts.
@@ -85,7 +116,7 @@ pub async fn ensure_detected_runtimes(
                 source,
             } => {
                 install_ui::warn_line(crate::install_ui::terminal_line!(
-                    "{} requires {} {}, but it's not installed. Using system {}.",
+                    "{} requires {} {}, but it's not installed. Using the first {} on script PATH.",
                     source,
                     runtime_display_name(runtime.as_str()),
                     install_ui::yellow(&spec),

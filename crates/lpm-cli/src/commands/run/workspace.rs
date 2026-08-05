@@ -1,6 +1,6 @@
 use super::format::{format_run_failure_detail, format_workspace_member_scripts_header};
 use super::parallel::run_tasks_parallel;
-use super::runtime::prepare_runtime;
+use super::runtime::{ensure_runtime, validate_runtime_with_cache};
 use super::sequential::run_tasks_sequential;
 use super::task::{reject_direct_hidden_scripts, run_task};
 use crate::install_ui;
@@ -47,7 +47,7 @@ pub async fn run_workspace(
 
     // Capture the root hint so members without their own version pin can
     // inherit it; members with local pins still resolve themselves.
-    let root_hint = Arc::new(prepare_runtime(project_dir, json_output).await?);
+    let root_hint = Arc::new(ensure_runtime(project_dir).await?);
 
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
@@ -116,11 +116,38 @@ pub async fn run_workspace(
         return Ok(());
     }
 
+    let runnable_members: Vec<bool> = ws_graph
+        .members
+        .iter()
+        .enumerate()
+        .map(|(idx, member)| {
+            target_set.contains(&idx) && workspace_member_has_requested_task(&member.path, scripts)
+        })
+        .collect();
     let mut member_runtime_hints = vec![Arc::clone(&root_hint); ws_graph.members.len()];
-    for idx in target_set.iter().copied() {
+    let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
+    for idx in levels
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|idx| runnable_members[*idx])
+    {
         let member_dir = &ws_graph.members[idx].path;
         if lpm_runtime::detect::detect_node_version(member_dir)?.is_some() {
-            member_runtime_hints[idx] = Arc::new(prepare_runtime(member_dir, json_output).await?);
+            member_runtime_hints[idx] = Arc::new(ensure_runtime(member_dir).await?);
+            validate_runtime_with_cache(
+                member_dir,
+                member_runtime_hints[idx].as_ref(),
+                json_output,
+                &mut node_versions,
+            )?;
+        } else {
+            validate_runtime_with_cache(
+                member_dir,
+                root_hint.as_ref(),
+                json_output,
+                &mut node_versions,
+            )?;
         }
     }
 
@@ -251,6 +278,34 @@ pub async fn run_workspace(
     }
 }
 
+fn workspace_member_has_requested_task(member_dir: &Path, scripts: &[String]) -> bool {
+    let pkg_json_path = member_dir.join("package.json");
+    let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path) else {
+        return false;
+    };
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(member_dir)
+        .ok()
+        .flatten();
+    has_requested_task(
+        &pkg,
+        lpm_config.as_ref().map(|config| &config.tasks),
+        scripts,
+    )
+}
+
+fn has_requested_task(
+    pkg: &lpm_workspace::PackageJson,
+    tasks: Option<&std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>>,
+    scripts: &[String],
+) -> bool {
+    scripts.iter().any(|script| {
+        pkg.scripts.contains_key(script)
+            || tasks
+                .and_then(|tasks| tasks.get(script))
+                .is_some_and(|task| task.command.is_some() || !task.depends_on.is_empty())
+    })
+}
+
 /// Execute scripts in a single workspace package with task-graph awareness.
 ///
 /// Returns `Some(true)` on success, `Some(false)` on failure, `None` if
@@ -294,13 +349,7 @@ fn run_workspace_package(
         .map(|c| c.tasks.clone())
         .unwrap_or_default();
 
-    let has_any = scripts.iter().any(|s| {
-        pkg.scripts.contains_key(s)
-            || tasks
-                .get(s)
-                .is_some_and(|tc| tc.command.is_some() || !tc.depends_on.is_empty())
-    });
-    if !has_any {
+    if !has_requested_task(&pkg, Some(&tasks), scripts) {
         return None;
     }
 

@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/run_runtime.rs
+expression: engine_check
+---
+{
+  "code": "node_engine_compatible",
+  "check": "Node.js engine compatibility",
+  "passed": true,
+  "severity": "pass",
+  "detail": "v20.19.0 from script PATH satisfies package.json > engines.node ^20"
+}

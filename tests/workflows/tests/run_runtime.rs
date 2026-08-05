@@ -32,6 +32,83 @@ fn install_fake_managed_node(project: &TempProject, version: &str) {
         .expect("mark managed Node executable");
 }
 
+fn install_fake_project_node(project: &TempProject, version: &str) {
+    let binary = if cfg!(windows) {
+        project.path().join("node_modules/.bin/node.cmd")
+    } else {
+        project.path().join("node_modules/.bin/node")
+    };
+    std::fs::create_dir_all(binary.parent().expect("project Node has a parent"))
+        .expect("create project Node bin directory");
+    let script = if cfg!(windows) {
+        format!("@echo off\r\necho v{version}\r\n")
+    } else {
+        format!("#!/bin/sh\necho v{version}\n")
+    };
+    std::fs::write(&binary, script).expect("write project Node binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("mark project Node executable");
+    }
+}
+
+fn install_fake_member_root_node(project: &TempProject, member_dir: &str, version: &str) {
+    let binary = if cfg!(windows) {
+        project.path().join(member_dir).join("node.cmd")
+    } else {
+        project.path().join(member_dir).join("node")
+    };
+    let script = if cfg!(windows) {
+        format!("@echo off\r\necho v{version}\r\n")
+    } else {
+        format!("#!/bin/sh\necho v{version}\n")
+    };
+    std::fs::write(&binary, script).expect("write member-root Node binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("mark member-root Node executable");
+    }
+}
+
+#[cfg(unix)]
+fn configure_counting_fake_node(
+    command: &mut assert_cmd::Command,
+    project: &TempProject,
+    version: &str,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = project.home().join("counting-node-bin");
+    let counter = project.home().join("node-version-probe-count");
+    std::fs::create_dir_all(&bin_dir).expect("create counting Node bin directory");
+    let binary = bin_dir.join("node");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\ncount=0\nif [ -f \"$LPM_NODE_PROBE_COUNT\" ]; then count=$(cat \"$LPM_NODE_PROBE_COUNT\"); fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$LPM_NODE_PROBE_COUNT\"\necho v{version}\n"
+        ),
+    )
+    .expect("write counting Node binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("mark counting Node executable");
+
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
+    command
+        .env(
+            "PATH",
+            std::env::join_paths(paths).expect("construct PATH with counting Node"),
+        )
+        .env("LPM_NODE_PROBE_COUNT", &counter);
+    counter
+}
+
 fn command_output_text(output: &std::process::Output) -> String {
     format!(
         "{}{}",
@@ -405,6 +482,7 @@ fn doctor_reports_node_engine_mismatch_for_incompatible_system_runtime() {
             .is_some_and(|detail| detail.contains("^20") && detail.contains("v22.0.0")),
         "doctor mismatch lacks required and actual versions: {engine_check}"
     );
+    insta::assert_json_snapshot!("doctor_node_engine_mismatch", engine_check);
 }
 
 #[test]
@@ -429,6 +507,7 @@ fn doctor_reports_node_engine_compatibility_for_matching_system_runtime() {
         engine_check["severity"], "pass",
         "unexpected check: {engine_check}"
     );
+    insta::assert_json_snapshot!("doctor_node_engine_compatible", engine_check);
 }
 
 #[test]
@@ -460,6 +539,7 @@ fn doctor_warns_for_node_engine_mismatch_when_strictness_is_disabled() {
         engine_check["severity"], "warn",
         "unexpected check: {engine_check}"
     );
+    insta::assert_json_snapshot!("doctor_node_engine_mismatch_warning", engine_check);
 }
 
 #[test]
@@ -520,5 +600,352 @@ fn run_engine_mismatch_help_only_mentions_supported_opt_outs() {
     assert!(
         combined.contains("engineStrict") && combined.contains("engine-strict"),
         "run diagnostic omitted supported project and user opt-outs:\n{combined}"
+    );
+}
+
+#[test]
+fn run_validates_node_from_project_bin_before_executing_script() {
+    let project = node_version_project(">=18");
+    install_fake_project_node(&project, "16.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "node-version"])
+        .output()
+        .expect("run with a project-local Node binary");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "project-local Node bypassed engine validation:\n{combined}"
+    );
+    assert!(
+        combined.contains("16.0.0") && combined.contains(">=18"),
+        "engine mismatch did not use the project-local Node:\n{combined}"
+    );
+}
+
+#[test]
+fn doctor_validates_node_from_project_bin() {
+    let project = node_version_project(">=18");
+    install_fake_project_node(&project, "16.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["doctor", "--json"])
+        .output()
+        .expect("run doctor with a project-local Node binary");
+    let json = support::assertions::parse_json_output(&output.stdout);
+    let engine_check = json["checks"]
+        .as_array()
+        .expect("doctor checks must be an array")
+        .iter()
+        .find(|check| check["code"] == "node_engine_mismatch")
+        .unwrap_or_else(|| panic!("doctor omitted project-local Node mismatch: {json}"));
+
+    assert_eq!(engine_check["severity"], "fail");
+    assert!(
+        engine_check["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("v16.0.0") && detail.contains(">=18")),
+        "doctor mismatch did not use the project-local Node: {engine_check}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_runtime_preflight_follows_topological_order() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "runtime-preflight-order-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file(
+        "packages/core/package.json",
+        r#"{
+            "name": "runtime-preflight-core",
+            "version": "1.0.0",
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    project.write_file("packages/core/lpm.json", r#"{"runtime":{"node":"20.0.0"}}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "runtime-preflight-app",
+            "version": "1.0.0",
+            "dependencies": {"runtime-preflight-core": "workspace:*"},
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    project.write_file("packages/app/lpm.json", r#"{"runtime":{"node":"18.0.0"}}"#);
+    install_fake_managed_node(&project, "18.0.0");
+    install_fake_managed_node(&project, "20.0.0");
+
+    for attempt in 0..12 {
+        let mut command = lpm(&project);
+        configure_fake_node(&mut command, &project, "22.0.0");
+        let output = command
+            .args(["run", "node-version", "--all"])
+            .output()
+            .expect("preflight workspace runtimes");
+        let combined = command_output_text(&output);
+
+        assert!(
+            !output.status.success(),
+            "workspace preflight unexpectedly succeeded on attempt {attempt}:\n{combined}"
+        );
+        assert!(
+            combined.contains("20.0.0") && !combined.contains("actual 18.0.0"),
+            "workspace preflight did not fail on the dependency first on attempt {attempt}:\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn workspace_validates_project_bin_node_for_member_without_selector() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "member-project-node-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "member-project-node-app",
+            "version": "1.0.0",
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    let member_node = if cfg!(windows) {
+        project
+            .path()
+            .join("packages/app/node_modules/.bin/node.cmd")
+    } else {
+        project.path().join("packages/app/node_modules/.bin/node")
+    };
+    std::fs::create_dir_all(member_node.parent().expect("member Node has a parent"))
+        .expect("create member Node bin directory");
+    let script = if cfg!(windows) {
+        "@echo off\r\necho v18.0.0\r\n"
+    } else {
+        "#!/bin/sh\necho v18.0.0\n"
+    };
+    std::fs::write(&member_node, script).expect("write member Node binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&member_node, std::fs::Permissions::from_mode(0o755))
+            .expect("mark member Node executable");
+    }
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "node-version", "--all"])
+        .output()
+        .expect("preflight member project Node");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "member project Node bypassed workspace preflight:\n{combined}"
+    );
+    assert!(
+        combined.contains("18.0.0") && combined.contains(">=22"),
+        "member project Node mismatch was not reported:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_skips_runtime_preflight_for_member_without_requested_task() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "skip-runtime-preflight-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "skip-runtime-preflight-app",
+            "version": "1.0.0",
+            "scripts": {"test": "echo app-tested"}
+        }"#,
+    );
+    project.write_file(
+        "packages/docs/package.json",
+        r#"{
+            "name": "skip-runtime-preflight-docs",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file("packages/docs/lpm.json", r#"{"runtime":{"node":"18.0.0"}}"#);
+    install_fake_managed_node(&project, "18.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "test", "--all"])
+        .output()
+        .expect("run only members defining the requested task");
+    let combined = command_output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "skipped member aborted runtime preflight:\n{combined}"
+    );
+    assert!(
+        combined.contains("app-tested") && !combined.contains("Using Node.js 18.0.0"),
+        "skipped member was prepared or runnable member did not execute:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_resolves_relative_path_node_from_member_script_cwd() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "relative-node-path-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "relative-node-path-app",
+            "version": "1.0.0",
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    install_fake_member_root_node(&project, "packages/app", "18.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let paths = [
+        std::path::PathBuf::from("."),
+        project.home().join("fake-node-bin"),
+    ]
+    .into_iter()
+    .chain(std::env::split_paths(&existing_path));
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).expect("construct PATH with relative member lookup"),
+    );
+
+    let output = command
+        .args(["run", "node-version", "--all"])
+        .output()
+        .expect("validate relative PATH from the member cwd");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "member cwd Node bypassed engine validation:\n{combined}"
+    );
+    assert!(
+        combined.contains("18.0.0") && combined.contains(">=22"),
+        "member cwd mismatch did not report the executed Node:\n{combined}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn workspace_resolves_windows_current_directory_node_before_path() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "windows-cwd-node-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "windows-cwd-node-app",
+            "version": "1.0.0",
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    install_fake_member_root_node(&project, "packages/app", "18.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "node-version", "--all"])
+        .output()
+        .expect("validate Windows current-directory Node lookup");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "member current-directory Node bypassed engine validation:\n{combined}"
+    );
+    assert!(
+        combined.contains("18.0.0") && combined.contains(">=22"),
+        "Windows cwd mismatch did not report the executed Node:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_probes_shared_node_executable_once_during_preflight() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "shared-node-probe-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    for member in ["app", "docs", "shared"] {
+        project.write_file(
+            &format!("packages/{member}/package.json"),
+            &format!(
+                r#"{{
+                    "name": "shared-node-probe-{member}",
+                    "version": "1.0.0",
+                    "scripts": {{"test": "echo {member}-tested"}}
+                }}"#
+            ),
+        );
+    }
+    let mut command = lpm(&project);
+    let counter = configure_counting_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "test", "--all"])
+        .output()
+        .expect("preflight members sharing one Node executable");
+    let combined = command_output_text(&output);
+
+    assert!(output.status.success(), "workspace run failed:\n{combined}");
+    assert_eq!(
+        std::fs::read_to_string(counter)
+            .expect("read Node probe count")
+            .trim(),
+        "1",
+        "shared Node was probed more than once:\n{combined}"
     );
 }

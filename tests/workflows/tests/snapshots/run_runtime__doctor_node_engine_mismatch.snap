@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/run_runtime.rs
+expression: engine_check
+---
+{
+  "code": "node_engine_mismatch",
+  "check": "Node.js engine compatibility",
+  "passed": false,
+  "severity": "fail",
+  "detail": "v22.0.0 from script PATH does not satisfy package.json > engines.node ^20"
+}

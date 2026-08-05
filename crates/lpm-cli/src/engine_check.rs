@@ -34,13 +34,12 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
-use lpm_runtime::detect::{DetectedNodeVersion, detect_node_version};
 use lpm_runtime::effective::{
-    Effective, EffectiveNodeResolution, probe_detected_node_fingerprint,
-    resolve_detected_node_with_fingerprint,
+    PathNodeResolution, probe_node_fingerprint_on_path, resolve_node_on_path_with_fingerprint,
 };
 use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -56,36 +55,53 @@ pub(crate) struct RootNodeEngineRequirement {
 pub(crate) struct DependencyEnginePolicy {
     engine_strict: bool,
     json_output: bool,
-    detected_node: Option<DetectedNodeVersion>,
-    effective_node: OnceLock<EffectiveNodeResolution>,
+    script_cwd: PathBuf,
+    script_path: OsString,
+    effective_node: OnceLock<PathNodeResolution>,
 }
 
 impl DependencyEnginePolicy {
     fn new(
-        detected_node: Option<DetectedNodeVersion>,
+        script_cwd: PathBuf,
+        script_path: OsString,
         engine_strict: bool,
         json_output: bool,
     ) -> Self {
         Self {
             engine_strict,
             json_output,
-            detected_node,
+            script_cwd,
+            script_path,
             effective_node: OnceLock::new(),
         }
     }
 
-    fn effective_node(&self) -> &Effective {
-        self.effective_node_resolution().effective()
+    fn with_resolved_node(
+        effective_node: PathNodeResolution,
+        engine_strict: bool,
+        json_output: bool,
+    ) -> Self {
+        Self {
+            engine_strict,
+            json_output,
+            script_cwd: PathBuf::new(),
+            script_path: OsString::new(),
+            effective_node: OnceLock::from(effective_node),
+        }
     }
 
-    fn effective_node_resolution(&self) -> &EffectiveNodeResolution {
-        self.effective_node
-            .get_or_init(|| resolve_detected_node_with_fingerprint(self.detected_node.clone()))
+    fn effective_node_version(&self) -> Option<&str> {
+        self.effective_node_resolution().version()
+    }
+
+    fn effective_node_resolution(&self) -> &PathNodeResolution {
+        self.effective_node.get_or_init(|| {
+            resolve_node_on_path_with_fingerprint(&self.script_cwd, &self.script_path)
+        })
     }
 
     fn check_node_requirement(&self, required: &str, source: String) -> Result<(), Mismatch> {
-        let effective = self.effective_node();
-        let Some(actual) = effective.version() else {
+        let Some(actual) = self.effective_node_version() else {
             let selector = compatible_node_selector_hint(required);
             return Err(Mismatch {
                 required: required.to_string(),
@@ -95,7 +111,7 @@ impl DependencyEnginePolicy {
                 source: format!("{source} (compatibility constraint)"),
             });
         };
-        let source = format!("{source} (compared against {})", effective.source_label());
+        let source = format!("{source} (compared against script PATH)");
         match version_satisfies(required, actual) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Mismatch {
@@ -166,12 +182,12 @@ impl DependencyEnginePolicy {
     }
 
     pub(crate) fn constrained_freshness_key(&self) -> String {
-        let version = self.effective_node().version().unwrap_or("unknown");
+        let version = self.effective_node_version().unwrap_or("unknown");
         format!("{}:{version}", u8::from(self.engine_strict))
     }
 
     pub(crate) fn probe_node_runtime_fingerprint(&self) -> Option<String> {
-        probe_detected_node_fingerprint(self.detected_node.clone())
+        probe_node_fingerprint_on_path(&self.script_cwd, &self.script_path)
     }
 
     pub(crate) fn resolved_node_runtime_fingerprint(&self) -> Option<&str> {
@@ -206,11 +222,17 @@ pub(crate) fn prepare_dependency_policy(
     json_output: bool,
 ) -> Result<DependencyEnginePolicy, LpmError> {
     let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
-        return Ok(DependencyEnginePolicy::new(None, false, json_output));
+        return Ok(DependencyEnginePolicy::new(
+            start_dir.to_path_buf(),
+            OsString::new(),
+            false,
+            json_output,
+        ));
     };
     let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
-    let detected_node = detect_node_version(&root_dir)?;
-    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
+    let script_path = lpm_runner::bin_path::build_path_with_bins(&root_dir)?;
+    let policy =
+        DependencyEnginePolicy::new(root_dir, script_path.into(), engine_strict, json_output);
     enforce_root_with_policy(&root_pkg, &policy)?;
     Ok(policy)
 }
@@ -243,17 +265,17 @@ pub fn enforce(
     prepare_dependency_policy(start_dir, cli_no_engine_strict, json_output).map(|_| ())
 }
 
-/// Validate the effective Node selected for script execution against the
-/// workspace root's `package.json > engines.node` compatibility constraint.
-pub(crate) fn enforce_node_for_run(
-    start_dir: &Path,
-    detected_node: Option<DetectedNodeVersion>,
+/// Validate a resolved script Node against an engine requirement.
+pub(crate) fn enforce_resolved_node_for_run(
+    requirement: RootNodeEngineRequirement,
+    effective_node: PathNodeResolution,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let Some(requirement) = resolve_root_node_engine_requirement(start_dir)? else {
-        return Ok(());
-    };
-    let policy = DependencyEnginePolicy::new(detected_node, requirement.engine_strict, json_output);
+    let policy = DependencyEnginePolicy::with_resolved_node(
+        effective_node,
+        requirement.engine_strict,
+        json_output,
+    );
     let result = policy.check_node_requirement(
         &requirement.required,
         "package.json > engines.node".to_string(),
@@ -295,8 +317,13 @@ pub fn enforce_with_root(
     engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let detected_node = detect_node_version(root_dir)?;
-    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
+    let script_path = lpm_runner::bin_path::build_path_with_bins(root_dir)?;
+    let policy = DependencyEnginePolicy::new(
+        root_dir.to_path_buf(),
+        script_path.into(),
+        engine_strict,
+        json_output,
+    );
     enforce_root_with_policy(root_pkg, &policy)
 }
 
@@ -739,7 +766,7 @@ mod tests {
 
     #[test]
     fn legacy_lockfile_uses_migration_freshness_without_resolving_node() {
-        let policy = DependencyEnginePolicy::new(None, true, true);
+        let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
 
         assert_eq!(policy.freshness_key("lockfile-version = 5\n"), "legacy");
         assert!(policy.effective_node.get().is_none());
@@ -747,7 +774,7 @@ mod tests {
 
     #[test]
     fn current_unconstrained_lockfile_preserves_existing_freshness() {
-        let policy = DependencyEnginePolicy::new(None, true, true);
+        let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
         let lockfile = format!("lockfile-version = {}\n", lpm_lockfile::LOCKFILE_VERSION);
 
         assert_eq!(policy.freshness_key(&lockfile), "none");
@@ -756,7 +783,7 @@ mod tests {
 
     #[test]
     fn unknown_node_version_is_never_reused_from_fingerprint_cache() {
-        let policy = DependencyEnginePolicy::new(None, true, true);
+        let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
 
         assert!(!policy.can_reuse_constrained_freshness_key("1:unknown"));
     }

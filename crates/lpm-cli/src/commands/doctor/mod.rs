@@ -510,7 +510,11 @@ pub async fn run(
 
     // 8. Node.js version
     let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
-    let effective_node = lpm_runtime::effective::resolve_effective_node_version(project_dir)?;
+    let script_path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
+    let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
+        project_dir,
+        std::ffi::OsStr::new(&script_path),
+    );
     let effective_version = effective_node
         .version()
         .map(|version| format!("v{version}"));
@@ -519,7 +523,7 @@ pub async fn run(
         crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
         && let Some(actual) = effective_node.version()
     {
-        let source = effective_node.source_label();
+        let source = "script PATH";
         match crate::engine_check::version_satisfies(&requirement.required, actual) {
             Ok(true) => checks.push(Check::pass(
                 &doctor_catalog::NODE_ENGINE_COMPATIBLE,
@@ -578,7 +582,7 @@ pub async fn run(
             ));
         } else if let Some(sys) = &effective_version {
             checks.push(Check::warn(&doctor_catalog::NODE_PINNED_UNMET, &format!(
-					"{sys} (system) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
+					"{sys} (script PATH) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
 					det.source_label()
 				),));
         } else {
@@ -594,7 +598,7 @@ pub async fn run(
         if let Some(v) = effective_version {
             checks.push(Check::pass(
                 &doctor_catalog::NODE_SYSTEM_UNPINNED,
-                &format!("{v} (system, no version pinned)"),
+                &format!("{v} (script PATH, no version pinned)"),
             ));
         } else {
             checks.push(Check::fail(
