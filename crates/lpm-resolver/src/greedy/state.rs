@@ -402,11 +402,11 @@ pub(super) struct ResolveState {
     pub(super) root_aliases: HashMap<String, String>,
     /// Parsed override set. [`process_edge`] consults
     /// `overrides.find_match` against (canonical, natural_version,
-    /// parent_ctx) for every edge whose canonical satisfies a non-empty
-    /// range; on hit, [`apply_override_target_greedy`] produces the forced
-    /// version and an [`OverrideHit`] is recorded. `take_hits()` drains the
-    /// trace into `ResolveResult.applied_overrides` at the tail of each
-    /// resolver arm.
+    /// parent_ctx) for every edge with a natural selection; on hit,
+    /// [`apply_override_target_greedy`] produces the forced version and an
+    /// [`OverrideHit`] is recorded if that version changed. `take_hits()`
+    /// drains the trace into `ResolveResult.applied_overrides` at the tail of
+    /// each resolver arm.
     pub(super) overrides: OverrideSet,
     /// Per-consumer record of every `peerDependencies` entry observed during
     /// the walk. **Collected here, never enqueued onto [`Self::task_queue`].**

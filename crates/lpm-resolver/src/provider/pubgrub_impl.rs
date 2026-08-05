@@ -52,63 +52,33 @@ impl LpmDependencyProvider {
         None
     }
 
-    /// Apply an [`OverrideTarget`] against the consumer's PubGrub `range`
-    /// to produce a final forced version.
+    /// Apply an [`OverrideTarget`] to produce a final forced version.
     ///
-    /// - `PinnedVersion` returns the pinned version verbatim, but ONLY if it
-    ///   satisfies the consumer's declared range — never picking a version the
-    ///   consumer didn't ask for and silently pretending it works. Out-of-range
-    ///   pinned targets return `None` so [`Self::choose_version`] surfaces them
-    ///   as a debug-level warning.
-    /// - `Range` intersects the override range with the consumer range
-    ///   (via the cache's available versions list for THIS package)
-    ///   and picks the newest match. A `^2.0.0` override means "use the
-    ///   newest 2.x", not "force `2.0.0`".
+    /// The override replaces the consumer's declared range. Resolver security
+    /// policy still applies to the selected version.
     pub(super) fn apply_override_target(
         &self,
         package: &ResolverPackage,
         target: &OverrideTarget,
-        range: &Ranges<NpmVersion>,
     ) -> Option<NpmVersion> {
+        let key = CanonicalKey::from(package);
+        let info = self.cache.get(&key)?;
+        let info = info.value();
+        let candidate_allowed =
+            |version: &NpmVersion| version_allowed_by_policy(&key, info, version, &self.policy);
+
         match target {
-            OverrideTarget::PinnedVersion { version, .. } => {
-                let key = CanonicalKey::from(package);
-                let allowed = self.cache.get(&key).is_some_and(|info| {
-                    version_allowed_by_policy(&key, info.value(), version, &self.policy)
-                });
-                if range.contains(version) && allowed {
-                    Some(version.clone())
-                } else {
-                    None
-                }
-            }
+            OverrideTarget::PinnedVersion { version, .. } => (info.versions.contains(version)
+                && candidate_allowed(version))
+            .then(|| version.clone()),
             OverrideTarget::Range {
                 range: target_range,
                 ..
-            } => {
-                // Walk THIS package's cached versions only — cache is
-                // canonical-keyed, so split-context variants of the same
-                // canonical package share one entry — the override check
-                // is over the canonical version list.
-                let key = CanonicalKey::from(package);
-                let info = self.cache.get(&key)?;
-                let info = info.value();
-                for v in &info.versions {
-                    // versions are sorted newest-first, so the first
-                    // match is the newest match.
-                    if !range.contains(v) {
-                        continue;
-                    }
-                    if !target_range.satisfies(v) {
-                        continue;
-                    }
-                    if !version_allowed_by_policy(&key, info, v, &self.policy) {
-                        continue;
-                    }
-                    return Some(v.clone());
-                }
-                None
-            }
+            } => info
+                .versions
+                .iter()
+                .find(|version| target_range.satisfies(version) && candidate_allowed(version))
+                .cloned(),
         }
     }
 }
@@ -214,33 +184,36 @@ impl DependencyProvider for LpmDependencyProvider {
                 .find_match(&canonical, natural_ver, parent_ctx)
             {
                 // Apply the override target to produce the forced version.
-                if let Some(forced) = self.apply_override_target(package, &entry.target, range) {
-                    let hit = OverrideHit {
-                        raw_key: entry.raw_key.clone(),
-                        source: entry.source,
-                        package: canonical.clone(),
-                        from_version: natural_ver.to_string(),
-                        to_version: forced.to_string(),
-                        via_parent: parent_ctx.map(str::to_string),
-                    };
-                    tracing::debug!(
-                        "override applied: {} {} → {} (via {})",
-                        hit.package,
-                        hit.from_version,
-                        hit.to_version,
-                        hit.source_display()
-                    );
-                    self.overrides.record_hit(hit);
+                if let Some(forced) = self.apply_override_target(package, &entry.target) {
+                    if forced != *natural_ver {
+                        let hit = OverrideHit {
+                            raw_key: entry.raw_key.clone(),
+                            source: entry.source,
+                            package: canonical.clone(),
+                            from_version: natural_ver.to_string(),
+                            to_version: forced.to_string(),
+                            via_parent: parent_ctx.map(str::to_string),
+                        };
+                        tracing::debug!(
+                            "override applied: {} {} → {} (via {})",
+                            hit.package,
+                            hit.from_version,
+                            hit.to_version,
+                            hit.source_display()
+                        );
+                        self.overrides.record_hit(hit);
+                    } else {
+                        tracing::debug!(
+                            "override already satisfied: {} {} (via {})",
+                            canonical,
+                            forced,
+                            entry.source_display()
+                        );
+                    }
                     return Ok(Some(forced));
                 } else {
-                    // The override target didn't satisfy the consumer's
-                    // declared range — "irreconcilable override" case.
-                    // Leave the consumer's natural version in place and
-                    // let any downstream peer/SAT checks surface the
-                    // situation. We do NOT silently pretend the override
-                    // applied.
                     tracing::warn!(
-                        "override {} could not be satisfied: target {} is outside consumer range for {}",
+                        "override {} could not select eligible target {} for {}",
                         entry.raw_key,
                         entry.target.raw(),
                         canonical

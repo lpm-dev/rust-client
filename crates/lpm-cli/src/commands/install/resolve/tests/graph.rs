@@ -200,15 +200,11 @@ fn reusable_existing_version_does_not_reuse_for_root_package() {
 }
 
 #[test]
-fn select_or_reuse_node_honors_name_override_before_range_reuse() {
+fn select_or_reuse_node_keeps_unchanged_name_override_exact_before_range_reuse() {
     let mut packages = HashMap::new();
     packages.insert(
         ("dep".to_string(), "1.0.0".to_string()),
         fake_draft("dep", "1.0.0", &[]),
-    );
-    packages.insert(
-        ("dep".to_string(), "1.5.0".to_string()),
-        fake_draft("dep", "1.5.0", &[]),
     );
     let request = resolve_request_for_test(
         "dep",
@@ -231,8 +227,8 @@ fn select_or_reuse_node_honors_name_override_before_range_reuse() {
     .unwrap();
 
     assert_eq!(node.version, "1.5.0");
-    assert!(node.reused_existing);
-    assert_eq!(overrides.take_hits().len(), 1);
+    assert!(!node.reused_existing);
+    assert!(overrides.take_hits().is_empty());
 }
 
 #[test]

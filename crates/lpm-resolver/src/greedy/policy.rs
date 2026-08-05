@@ -2,95 +2,29 @@ use super::prelude::*;
 use super::state::ResolveState;
 use super::types::Edge;
 
-/// Apply an [`OverrideTarget`] against the consumer's range, walking THIS
-/// canonical's cached versions to produce a final forced version. Mirrors
+/// Apply an [`OverrideTarget`] against this canonical's cached versions to
+/// produce a final forced version. Mirrors
 /// [`crate::provider::LpmDependencyProvider::apply_override_target`]'s
 /// pubgrub-arm semantics:
 ///
-/// - `PinnedVersion` returns the pinned version verbatim, but ONLY if it
-///   satisfies the consumer's declared range. Out-of-range targets return
-///   `None` so the caller can fall through to the natural pick.
-/// - `Range` intersects the override range with the consumer range (over
-///   the cache's available versions list for THIS package) and picks the
-///   newest match. Platform-incompatible candidates are skipped; this can
-///   return `None` even when an in-range version exists if every candidate
-///   is filtered out.
+/// - `PinnedVersion` selects the exact published version.
+/// - `Range` selects the newest published version in the override range.
+///
+/// Resolver security and platform policies still apply. The dependency's
+/// declared range does not: replacing that range is the purpose of an
+/// override.
 pub(super) fn apply_override_target_greedy(
-    canonical: &CanonicalKey,
-    info: &CachedPackageInfo,
-    target: &OverrideTarget,
-    range: &NpmRange,
-    policy: &ResolverPolicy,
-) -> Option<NpmVersion> {
-    match target {
-        OverrideTarget::PinnedVersion { version, .. } => {
-            if range.satisfies_with_latest_bound(version, info.latest_version.as_ref())
-                && matches!(
-                    release_age_status_for_version(canonical, info, version, policy),
-                    ReleaseTimeStatus::Allowed
-                )
-                && (!policy.trust_policy().is_no_downgrade()
-                    || trust_downgrade_violation(info, version).is_none())
-            {
-                Some(version.clone())
-            } else {
-                None
-            }
-        }
-        OverrideTarget::Range {
-            range: target_range,
-            ..
-        } => {
-            // Versions are sorted newest-first by
-            // `parse_metadata_to_cache_info`, so the first match is
-            // the newest match — same contract as `find_best_version`.
-            for v in &info.versions {
-                if !range.satisfies_with_latest_bound(v, info.latest_version.as_ref()) {
-                    continue;
-                }
-                if !target_range.satisfies(v) {
-                    continue;
-                }
-                if !matches!(
-                    release_age_status_for_version(canonical, info, v, policy),
-                    ReleaseTimeStatus::Allowed
-                ) {
-                    continue;
-                }
-                if policy.trust_policy().is_no_downgrade()
-                    && trust_downgrade_violation(info, v).is_some()
-                {
-                    continue;
-                }
-                let platform_ok = info.platform.is_empty()
-                    || info
-                        .platform
-                        .get(&v.to_string())
-                        .is_none_or(crate::provider::is_platform_compatible);
-                if !platform_ok {
-                    continue;
-                }
-                return Some(v.clone());
-            }
-            None
-        }
-    }
-}
-
-pub(super) fn apply_peer_override_target_greedy(
     canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     target: &OverrideTarget,
     policy: &ResolverPolicy,
 ) -> Option<NpmVersion> {
     let candidate_allowed = |version: &NpmVersion| {
-        info.versions.contains(version)
-            && matches!(
-                release_age_status_for_version(canonical, info, version, policy),
-                ReleaseTimeStatus::Allowed
-            )
-            && (!policy.trust_policy().is_no_downgrade()
-                || trust_downgrade_violation(info, version).is_none())
+        matches!(
+            release_age_status_for_version(canonical, info, version, policy),
+            ReleaseTimeStatus::Allowed
+        ) && (!policy.trust_policy().is_no_downgrade()
+            || trust_downgrade_violation(info, version).is_none())
             && (info.platform.is_empty()
                 || info
                     .platform
@@ -100,12 +34,16 @@ pub(super) fn apply_peer_override_target_greedy(
 
     match target {
         OverrideTarget::PinnedVersion { version, .. } => {
-            candidate_allowed(version).then(|| version.clone())
+            (info.versions.contains(version) && candidate_allowed(version)).then(|| version.clone())
         }
-        OverrideTarget::Range { range, .. } => info
+        // Cached versions are newest-first, so the first eligible match wins.
+        OverrideTarget::Range {
+            range: target_range,
+            ..
+        } => info
             .versions
             .iter()
-            .find(|version| range.satisfies(version) && candidate_allowed(version))
+            .find(|version| target_range.satisfies(version) && candidate_allowed(version))
             .cloned(),
     }
 }

@@ -1409,6 +1409,50 @@ fn transitive_edge_prefers_a_satisfying_root_selection_over_its_newer_natural_ta
     assert_eq!(state.work_stats.edge_reuse_range_count, 1);
 }
 
+#[test]
+fn unchanged_override_selection_does_not_reuse_a_different_satisfying_root_version() {
+    let info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    let mut state = ResolveState::new(
+        HashMap::from([("shared".to_string(), "1.1.0".to_string())]),
+        OverrideSet::empty(),
+    );
+    state.seed_root_edges().unwrap();
+    let root_edge = state.task_queue.pop_front().unwrap();
+    process_edge(&root_edge, &info, &mut state).unwrap();
+    let root_shared_id = state.nodes[0].children[0].1;
+
+    state.overrides = override_set("shared", "1.0.0");
+    let parent_id = push_node(&mut state, CanonicalKey::npm("range-parent"), "1.0.0");
+    let transitive = Edge {
+        parent: parent_id,
+        local_name: "shared".to_string(),
+        canonical: CanonicalKey::npm("shared"),
+        range: NpmRange::parse("^1.0.0").unwrap(),
+        behavior: DepBehavior {
+            required: true,
+            peer: false,
+            optional: false,
+        },
+    };
+
+    process_edge_with_preferred(
+        &transitive,
+        &info,
+        Some(NpmVersion::parse("1.0.0").unwrap()),
+        &mut state,
+    )
+    .unwrap();
+
+    let selected_id = state.nodes[parent_id as usize].children[0].1;
+    assert_ne!(selected_id, root_shared_id);
+    assert_eq!(
+        state.nodes[selected_id as usize].version.to_string(),
+        "1.0.0"
+    );
+    assert_eq!(state.resolved[&CanonicalKey::npm("shared")].len(), 2);
+    assert!(state.overrides.take_hits().is_empty());
+}
+
 fn overlapping_range_targets(broad_first: bool) -> (String, String) {
     let info = mk_info(&["2.0.3", "1.0.1"], &[]);
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
@@ -1706,7 +1750,7 @@ fn process_edge_allocates_second_version_on_incompatible_range() {
 // path. Exercises three semantic surfaces of `OverrideSet::find_match`:
 //   - Name selectors (apply to every resolution of a canonical)
 //   - Path selectors (apply only via a specific parent)
-//   - Irreconcilable targets (out-of-range — fall back to natural)
+//   - Targets outside a consumer range (force the override target)
 
 /// Helper: build an OverrideSet from a single `lpm.overrides`
 /// entry. Path-selector tests use a separate path-key form via
@@ -1745,13 +1789,12 @@ fn process_edge_applies_name_selector_override() {
 }
 
 #[test]
-fn process_edge_range_target_picks_newest_in_intersection() {
-    // `lpm.overrides: { "lodash": "^3.0.0" }` — constrains the
-    // candidate set to 3.x and lets the resolver pick the newest
-    // match in the consumer's range × override range intersection.
+fn process_edge_range_target_replaces_consumer_range() {
+    // The override range replaces the consumer range, then selects the
+    // newest published version that satisfies the override.
     let info = mk_info(&["4.17.21", "3.10.1", "3.0.0"], &[]);
     let mut deps = HashMap::new();
-    deps.insert("lodash".to_string(), "*".to_string());
+    deps.insert("lodash".to_string(), "^4.0.0".to_string());
     let mut state = ResolveState::new(deps, override_set("lodash", "^3.0.0"));
     state.seed_root_edges().unwrap();
     while let Some(edge) = state.task_queue.pop_front() {
@@ -1763,20 +1806,15 @@ fn process_edge_range_target_picks_newest_in_intersection() {
     assert_eq!(
         lodash_entries[0].0.to_string(),
         "3.10.1",
-        "newest version in 3.x — consumer's `*` × override's `^3.0.0`"
+        "newest version in the override's 3.x range"
     );
 }
 
 #[test]
-fn process_edge_irreconcilable_override_falls_through_to_natural() {
-    // Pinned target is OUTSIDE the consumer's declared range. The
-    // resolver should fall through to the natural pick rather than
-    // silently picking a version the consumer never asked for. No
-    // OverrideHit is recorded — the override didn't take effect.
+fn process_edge_pinned_override_replaces_consumer_range() {
     let info = mk_info(&["4.17.21", "3.10.1"], &[]);
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), "^4.0.0".to_string());
-    // Override pin to 3.10.1 — outside ^4.0.0.
     let mut state = ResolveState::new(deps, override_set("lodash", "3.10.1"));
     state.seed_root_edges().unwrap();
     while let Some(edge) = state.task_queue.pop_front() {
@@ -1787,13 +1825,34 @@ fn process_edge_irreconcilable_override_falls_through_to_natural() {
     assert_eq!(lodash_entries.len(), 1);
     assert_eq!(
         lodash_entries[0].0.to_string(),
-        "4.17.21",
-        "irreconcilable override falls through to natural pick"
+        "3.10.1",
+        "the pinned override replaces the consumer's declared range"
     );
-    assert!(
-        state.overrides.take_hits().is_empty(),
-        "no OverrideHit when override didn't apply"
+    let hits = state.overrides.take_hits();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].from_version, "4.17.21");
+    assert_eq!(hits[0].to_version, "3.10.1");
+}
+
+#[test]
+fn process_edge_unpublished_override_target_falls_back_to_natural_version() {
+    let info = mk_info(&["4.17.21"], &[]);
+    let mut state = ResolveState::new(
+        HashMap::from([("lodash".to_string(), "^4.0.0".to_string())]),
+        override_set("lodash", "99.0.0"),
     );
+    state.seed_root_edges().unwrap();
+
+    let edge = state.task_queue.pop_front().unwrap();
+    process_edge(&edge, &info, &mut state).unwrap();
+
+    assert_eq!(
+        state.resolved[&CanonicalKey::npm("lodash")][0]
+            .0
+            .to_string(),
+        "4.17.21"
+    );
+    assert!(state.overrides.take_hits().is_empty());
 }
 
 #[test]

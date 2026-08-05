@@ -1024,22 +1024,39 @@ pub(super) struct OverrideResolutionState<'a> {
 pub(super) fn prepare_override_resolution_state<'a>(
     input: OverrideResolutionInput<'a>,
 ) -> Result<OverrideResolutionState<'a>, LpmError> {
-    let lpm_overrides_map = input
+    let empty_lpm_overrides = HashMap::new();
+    let package_lpm_overrides = input
         .package
         .lpm
         .as_ref()
-        .map(|lpm| lpm.overrides.clone())
-        .unwrap_or_default();
+        .map_or(&empty_lpm_overrides, |lpm| &lpm.overrides);
+    let root_lpm_overrides = input
+        .workspace
+        .and_then(|workspace| workspace.root_package.lpm.as_ref())
+        .map(|lpm| &lpm.overrides);
     let dependency_catalog_resolution_count = input.catalog_resolutions.len();
     let override_catalogs = input
         .workspace
         .map_or(&input.package.catalogs, |ws| &ws.root_package.catalogs);
-    let (lpm_overrides_map, lpm_override_catalog_resolutions) =
-        resolve_catalog_protocol_in_override_map(&lpm_overrides_map, override_catalogs)?;
-    let (overrides_map, npm_override_catalog_resolutions) =
-        resolve_catalog_protocol_in_override_map(&input.package.overrides, override_catalogs)?;
-    let (resolutions_map, resolution_catalog_resolutions) =
-        resolve_catalog_protocol_in_override_map(&input.package.resolutions, override_catalogs)?;
+    let (lpm_overrides_map, lpm_override_catalog_resolutions) = resolve_effective_override_map(
+        package_lpm_overrides,
+        root_lpm_overrides,
+        override_catalogs,
+    )?;
+    let (overrides_map, npm_override_catalog_resolutions) = resolve_effective_override_map(
+        &input.package.overrides,
+        input
+            .workspace
+            .map(|workspace| &workspace.root_package.overrides),
+        override_catalogs,
+    )?;
+    let (resolutions_map, resolution_catalog_resolutions) = resolve_effective_override_map(
+        &input.package.resolutions,
+        input
+            .workspace
+            .map(|workspace| &workspace.root_package.resolutions),
+        override_catalogs,
+    )?;
     let mut override_catalog_resolutions = Vec::new();
     extend_catalog_resolutions(
         &mut override_catalog_resolutions,
@@ -1074,6 +1091,37 @@ pub(super) fn prepare_override_resolution_state<'a>(
         dependency_catalog_resolution_count,
         override_set,
     })
+}
+
+fn resolve_effective_override_map<'a>(
+    package_overrides: &'a HashMap<String, String>,
+    root_overrides: Option<&'a HashMap<String, String>>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+) -> Result<OverrideCatalogResolution<'a>, LpmError> {
+    let Some(root_overrides) = root_overrides.filter(|root| !root.is_empty()) else {
+        return resolve_catalog_protocol_in_override_map(package_overrides, catalogs);
+    };
+    if package_overrides.is_empty() {
+        return resolve_catalog_protocol_in_override_map(root_overrides, catalogs);
+    }
+    if root_overrides == package_overrides {
+        return resolve_catalog_protocol_in_override_map(package_overrides, catalogs);
+    }
+
+    let mut effective = HashMap::with_capacity(root_overrides.len() + package_overrides.len());
+    effective.extend(
+        root_overrides
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    effective.extend(
+        package_overrides
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    let (resolved, catalog_resolutions) =
+        resolve_catalog_protocol_in_override_map(&effective, catalogs)?;
+    Ok((Cow::Owned(resolved.into_owned()), catalog_resolutions))
 }
 
 pub(super) fn resolve_catalog_protocol_in_override_map<'a>(

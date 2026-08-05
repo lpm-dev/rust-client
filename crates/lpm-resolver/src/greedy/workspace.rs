@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use lpm_registry::{RegistryClient, RouteTable};
 
-use super::policy::apply_peer_override_target_greedy;
+use super::policy::apply_override_target_greedy;
 use super::version::{VersionPick, find_best_version_with_policy};
 use super::{
     SharedMetadataConcurrency,
@@ -806,8 +806,7 @@ fn apply_projected_peer_override(
     else {
         return Ok(Some(range));
     };
-    let Some(forced) = apply_peer_override_target_greedy(&canonical, info, &entry.target, policy)
-    else {
+    let Some(forced) = apply_override_target_greedy(&canonical, info, &entry.target, policy) else {
         tracing::warn!(
             "override {} could not select an eligible peer version for {}",
             entry.raw_key,

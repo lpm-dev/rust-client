@@ -18,9 +18,10 @@
 //!   [`process_edge`]. Mirrors [`crate::provider::LpmDependencyProvider::choose_version`]'s
 //!   pubgrub-arm semantics: compute the natural version, look up
 //!   `OverrideSet::find_match` against (canonical, natural, parent_ctx),
-//!   apply the [`OverrideTarget`] against the consumer range, record an
-//!   [`OverrideHit`] on success, fall through to the natural version on
-//!   target/range mismatch (legacy "irreconcilable override" debug warn).
+//!   select from the [`OverrideTarget`] without constraining it to the
+//!   consumer range, and record an [`OverrideHit`] when the selected version
+//!   changes. An unavailable or policy-blocked target falls through to the
+//!   natural version.
 //!   `OverrideSet::split_targets` informs reuse-vs-allocate so two parents
 //!   forcing distinct versions split into independent nodes.
 //! - **npm-aliases** are passed through from the cache (the `aliases` map
@@ -108,6 +109,14 @@ pub enum ExperimentalVersionSelection {
 }
 
 #[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExperimentalVersionSelectionOutcome {
+    pub selection: ExperimentalVersionSelection,
+    pub override_hit: Option<OverrideHit>,
+    pub override_selected: bool,
+}
+
+#[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct ExperimentalMetadataFetchTimings {
     pub package: String,
@@ -173,36 +182,77 @@ pub fn experimental_select_version_with_policy_and_overrides(
     overrides: &OverrideSet,
     parent_canonical: Option<&str>,
 ) -> (ExperimentalVersionSelection, Option<OverrideHit>) {
+    let outcome = experimental_select_version_with_policy_and_overrides_outcome(
+        canonical,
+        info,
+        range,
+        policy,
+        overrides,
+        parent_canonical,
+    );
+    (outcome.selection, outcome.override_hit)
+}
+
+#[doc(hidden)]
+pub fn experimental_select_version_with_policy_and_overrides_outcome(
+    canonical: &CanonicalKey,
+    info: &CachedPackageInfo,
+    range: &NpmRange,
+    policy: &ResolverPolicy,
+    overrides: &OverrideSet,
+    parent_canonical: Option<&str>,
+) -> ExperimentalVersionSelectionOutcome {
     let natural_pick = version::find_best_version_with_policy(canonical, info, range, policy);
     if overrides.is_empty() {
-        return (natural_pick.into(), None);
+        return ExperimentalVersionSelectionOutcome {
+            selection: natural_pick.into(),
+            override_hit: None,
+            override_selected: false,
+        };
     }
 
     let natural = match &natural_pick {
         version::VersionPick::Picked(version) => version.clone(),
         version::VersionPick::NoSatisfying
         | version::VersionPick::BlockedByReleaseAge { .. }
-        | version::VersionPick::BlockedByTrustPolicy { .. } => return (natural_pick.into(), None),
+        | version::VersionPick::BlockedByTrustPolicy { .. } => {
+            return ExperimentalVersionSelectionOutcome {
+                selection: natural_pick.into(),
+                override_hit: None,
+                override_selected: false,
+            };
+        }
     };
 
     let canonical_name = canonical.to_string();
     let Some(entry) = overrides.find_match(&canonical_name, &natural, parent_canonical) else {
-        return (ExperimentalVersionSelection::Picked(natural), None);
+        return ExperimentalVersionSelectionOutcome {
+            selection: ExperimentalVersionSelection::Picked(natural),
+            override_hit: None,
+            override_selected: false,
+        };
     };
-    let Some(forced) =
-        policy::apply_override_target_greedy(canonical, info, &entry.target, range, policy)
+    let Some(forced) = policy::apply_override_target_greedy(canonical, info, &entry.target, policy)
     else {
-        return (ExperimentalVersionSelection::Picked(natural), None);
+        return ExperimentalVersionSelectionOutcome {
+            selection: ExperimentalVersionSelection::Picked(natural),
+            override_hit: None,
+            override_selected: false,
+        };
     };
-    let hit = OverrideHit {
+    let hit = (forced != natural).then(|| OverrideHit {
         raw_key: entry.raw_key.clone(),
         source: entry.source,
         package: canonical_name,
         from_version: natural.to_string(),
         to_version: forced.to_string(),
         via_parent: parent_canonical.map(str::to_string),
-    };
-    (ExperimentalVersionSelection::Picked(forced), Some(hit))
+    });
+    ExperimentalVersionSelectionOutcome {
+        selection: ExperimentalVersionSelection::Picked(forced),
+        override_hit: hit,
+        override_selected: true,
+    }
 }
 
 #[doc(hidden)]

@@ -17,9 +17,9 @@ use super::version::{VersionPick, find_best_version_with_policy};
 /// [`OverrideTarget`]. A successful override produces a forced version that
 /// becomes the dedupe target — reuse falls through to exact-version-match
 /// (so two parents forcing different versions allocate independent nodes),
-/// and the [`OverrideHit`] is recorded for the install summary. The
-/// empty-overrides hot path skips this entire branch with one
-/// [`OverrideSet::is_empty`] check (single-bool indirection, zero allocs).
+/// and a version-changing [`OverrideHit`] is recorded for the install summary.
+/// The empty-overrides hot path skips this entire branch with one
+/// [`OverrideSet::is_empty`] check (single-bool indirection, zero allocations).
 #[cfg(test)]
 pub(super) fn process_edge(
     edge: &Edge,
@@ -92,56 +92,68 @@ pub(super) fn process_edge_with_preferred(
     };
 
     let parent_ctx_ref = parent_ctx_owned.as_deref();
-    let override_outcome: Option<(NpmVersion, OverrideHit)> = match state.overrides.find_match(
-        &canonical_name,
-        &natural,
-        parent_ctx_ref,
-    ) {
-        Some(entry) => {
-            match apply_override_target_greedy(
-                &edge.canonical,
-                info,
-                &entry.target,
-                &edge.range,
-                &state.policy,
-            ) {
-                Some(forced) => {
-                    let hit = OverrideHit {
-                        raw_key: entry.raw_key.clone(),
-                        source: entry.source,
-                        package: canonical_name.clone(),
-                        from_version: natural.to_string(),
-                        to_version: forced.to_string(),
-                        via_parent: parent_ctx_ref.map(str::to_string),
-                    };
-                    tracing::debug!(
-                        "override applied: {} {} → {} (via {})",
-                        hit.package,
-                        hit.from_version,
-                        hit.to_version,
-                        hit.source_display()
-                    );
-                    Some((forced, hit))
-                }
-                None => {
-                    // Mirrors pubgrub arm's "irreconcilable override" warn:
-                    // target is outside the consumer range. We fall through
-                    // to the natural version — DO NOT silently pretend the
-                    // override applied. Fall through to the natural version.
-                    tracing::warn!(
-                        "override {} could not be satisfied: target {} is outside consumer range for {}",
-                        entry.raw_key,
-                        entry.target.raw(),
-                        canonical_name
-                    );
-                    None
+    let override_outcome: Option<OverrideSelection> =
+        match state
+            .overrides
+            .find_match(&canonical_name, &natural, parent_ctx_ref)
+        {
+            Some(entry) => {
+                match apply_override_target_greedy(
+                    &edge.canonical,
+                    info,
+                    &entry.target,
+                    &state.policy,
+                ) {
+                    Some(forced) => {
+                        let hit = (forced != natural).then(|| OverrideHit {
+                            raw_key: entry.raw_key.clone(),
+                            source: entry.source,
+                            package: canonical_name.clone(),
+                            from_version: natural.to_string(),
+                            to_version: forced.to_string(),
+                            via_parent: parent_ctx_ref.map(str::to_string),
+                        });
+                        if let Some(hit) = hit.as_ref() {
+                            tracing::debug!(
+                                "override applied: {} {} → {} (via {})",
+                                hit.package,
+                                hit.from_version,
+                                hit.to_version,
+                                hit.source_display()
+                            );
+                        } else {
+                            tracing::debug!(
+                                "override already satisfied: {} {} (via {})",
+                                canonical_name,
+                                forced,
+                                entry.source_display()
+                            );
+                        }
+                        Some(OverrideSelection {
+                            version: forced,
+                            hit,
+                        })
+                    }
+                    None => {
+                        tracing::warn!(
+                            "override {} could not select eligible target {} for {}",
+                            entry.raw_key,
+                            entry.target.raw(),
+                            canonical_name
+                        );
+                        None
+                    }
                 }
             }
-        }
-        None => None,
-    };
+            None => None,
+        };
 
     process_edge_inner(edge, info, Some((natural, override_outcome)), state)
+}
+
+struct OverrideSelection {
+    version: NpmVersion,
+    hit: Option<OverrideHit>,
 }
 
 fn edge_is_optional_in_context(edge: &Edge, state: &ResolveState) -> bool {
@@ -195,17 +207,14 @@ fn newest_satisfying_root_node(
 fn process_edge_inner(
     edge: &Edge,
     info: &CachedPackageInfo,
-    forced: Option<(NpmVersion, Option<(NpmVersion, OverrideHit)>)>,
+    forced: Option<(NpmVersion, Option<OverrideSelection>)>,
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
     let is_root_edge = edge.parent == 0;
 
-    let (target_version, override_hit): (NpmVersion, Option<OverrideHit>) = match forced {
-        Some((natural, Some((forced_v, hit)))) => {
-            let _ = natural;
-            (forced_v, Some(hit))
-        }
-        Some((natural, None)) => (natural, None),
+    let (target_version, override_selected, override_hit) = match forced {
+        Some((_natural, Some(selection))) => (selection.version, true, selection.hit),
+        Some((natural, None)) => (natural, false, None),
         None => {
             let version = match find_best_version_with_policy(
                 &edge.canonical,
@@ -240,7 +249,7 @@ fn process_edge_inner(
                     );
                 }
             };
-            (version, None)
+            (version, false, None)
         }
     };
 
@@ -287,7 +296,7 @@ fn process_edge_inner(
             .overrides
             .split_targets()
             .contains(&edge.canonical.to_string());
-    let must_exact_match = is_root_edge || override_hit.is_some() || split_gate;
+    let must_exact_match = is_root_edge || override_selected || split_gate;
     let root_id = if must_exact_match {
         None
     } else {

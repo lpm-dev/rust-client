@@ -28,12 +28,14 @@ pub(crate) fn metadata_fetch_detail_test_lock() -> &'static tokio::sync::Mutex<(
 pub use greedy::PeerConflictReport;
 pub use greedy::WorkspaceResolveOutcome;
 pub use greedy::{
-    ExperimentalMetadataFetchTimings, ExperimentalVersionSelection, SharedMetadataConcurrency,
+    ExperimentalMetadataFetchTimings, ExperimentalVersionSelection,
+    ExperimentalVersionSelectionOutcome, SharedMetadataConcurrency,
     experimental_fetch_cached_package_info_with_policy,
     experimental_fetch_cached_package_info_with_policy_and_timings,
     experimental_fetch_exact_cached_package_info_with_policy_and_timings,
     experimental_select_version_with_policy, experimental_select_version_with_policy_and_overrides,
-    resolve_greedy_fused, resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
+    experimental_select_version_with_policy_and_overrides_outcome, resolve_greedy_fused,
+    resolve_greedy_fused_with_cache, resolve_greedy_fused_with_cache_options,
     resolve_greedy_fused_with_cache_options_and_policy,
     resolve_greedy_fused_with_cache_options_and_policy_roots,
     resolve_greedy_fused_with_cache_options_policy_and_selected_events,

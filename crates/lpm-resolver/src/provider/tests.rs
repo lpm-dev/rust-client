@@ -980,9 +980,7 @@ fn choose_version_override_in_range_applies() {
 }
 
 #[test]
-fn choose_version_override_out_of_range_ignored() {
-    // Override specifies 3.0.0 but range requires ^4.0.0 → override ignored,
-    // newest matching version selected instead
+fn choose_version_pinned_override_replaces_consumer_range() {
     let pkg = ResolverPackage::npm("lodash");
     let info = make_info(&["4.17.21", "4.17.20", "3.0.0"], vec![], vec![], vec![]);
 
@@ -1000,22 +998,19 @@ fn choose_version_override_out_of_range_ignored() {
     let chosen = provider.choose_version(&pkg, &range).unwrap();
     assert_eq!(
         chosen.map(|v| v.to_string()),
-        Some("4.17.21".to_string()),
-        "out-of-range override should be ignored, newest matching version selected"
+        Some("3.0.0".to_string()),
+        "the pinned override replaces the consumer's declared range"
     );
 
-    // No override hit should be recorded for an out-of-range pinned target.
     let hits = provider.overrides.take_hits();
-    assert!(
-        hits.is_empty(),
-        "no hit should be recorded for out-of-range override"
-    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].from_version, "4.17.21");
+    assert_eq!(hits[0].to_version, "3.0.0");
 }
 
 #[test]
-fn choose_version_override_range_target_picks_newest_in_intersection() {
-    // `^2.0.0` override target should pick the newest 2.x in the
-    // consumer's range, not force a single version.
+fn choose_version_override_range_target_picks_newest_target_match() {
+    // `^2.0.0` selects the newest 2.x target rather than one fixed version.
     let pkg = ResolverPackage::npm("foo");
     let info = make_info(
         &["2.5.0", "2.4.0", "2.0.0", "1.0.0"],
@@ -1032,26 +1027,23 @@ fn choose_version_override_range_target_picks_newest_in_intersection() {
         .cache
         .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
-    // Consumer asks for `*` (any version). Without override → 2.5.0.
-    // With override `^2.0.0` → still 2.5.0 (newest in 2.x).
+    // Without the override, `*` selects 2.5.0. The override also selects
+    // 2.5.0, so this is a matched override with no effective version change.
     let range = NpmRange::parse("*")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
     let chosen = provider.choose_version(&pkg, &range).unwrap();
     assert_eq!(chosen.map(|v| v.to_string()), Some("2.5.0".to_string()));
 
-    // The hit should still be recorded — `from_version` and
-    // `to_version` are the same here because the override and the
-    // natural choice agree on 2.5.0, but the resolver still
-    // intersected with the override range.
     let hits = provider.overrides.take_hits();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].to_version, "2.5.0");
+    assert!(
+        hits.is_empty(),
+        "an override that does not change the selected version is not applied work"
+    );
 }
 
 #[test]
-fn choose_version_override_range_target_excludes_non_matching() {
-    // Consumer asks for `*` but override range `^2.0.0` excludes 3.x.
+fn choose_version_override_range_target_replaces_consumer_range() {
     let pkg = ResolverPackage::npm("foo");
     let info = make_info(&["3.0.0", "2.5.0", "2.0.0"], vec![], vec![], vec![]);
 
@@ -1063,18 +1055,41 @@ fn choose_version_override_range_target_excludes_non_matching() {
         .cache
         .insert(CanonicalKey::from(&pkg), Arc::new(info));
 
-    let range = NpmRange::parse("*")
+    let range = NpmRange::parse("^3.0.0")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
     let chosen = provider.choose_version(&pkg, &range).unwrap();
-    // 3.0.0 is the natural choice but the override range constrains
-    // to 2.x — 2.5.0 wins.
     assert_eq!(chosen.map(|v| v.to_string()), Some("2.5.0".to_string()));
 
     let hits = provider.overrides.take_hits();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].from_version, "3.0.0");
     assert_eq!(hits[0].to_version, "2.5.0");
+}
+
+#[test]
+fn choose_version_unpublished_override_target_falls_back_to_natural_version() {
+    let pkg = ResolverPackage::npm("foo");
+    let info = make_info(&["2.0.0"], vec![], vec![], vec![]);
+
+    let client = Arc::new(RegistryClient::new());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let provider = LpmDependencyProvider::new(client, rt.handle().clone(), HashMap::new())
+        .with_overrides(override_set_with("foo", "99.0.0"));
+    provider
+        .cache
+        .insert(CanonicalKey::from(&pkg), Arc::new(info));
+
+    let range = NpmRange::parse("^2.0.0")
+        .unwrap()
+        .to_pubgrub_ranges(&provider.available_versions(&pkg));
+    let chosen = provider.choose_version(&pkg, &range).unwrap();
+
+    assert_eq!(
+        chosen.map(|version| version.to_string()),
+        Some("2.0.0".to_string())
+    );
+    assert!(provider.overrides.take_hits().is_empty());
 }
 
 #[test]
@@ -1088,15 +1103,9 @@ fn choose_version_path_selector_only_applies_to_matching_parent() {
     // Available qar versions: 2.0.0, 1.2.0, 1.1.0.
     // Consumer range: `^1.0.0` → natural pick is 1.2.0 (newest 1.x).
     // Path selector range filter: `1` (= ^1.0.0) → matches 1.2.0.
-    // Target: `2.0.0` → forced because it's in `*`-target-range, but
-    // we need the consumer range to ALSO include 2.0.0 for the
-    // pinned target to apply. So consumer range must be `*`.
-    //
-    // Result design: consumer range `*`, override range filter
-    // narrows to 1.x. Natural is 2.0.0; selector filter `1`
-    // requires natural to satisfy `^1.0.0` — 2.0.0 doesn't, so the
-    // override is SKIPPED. To exercise the path selector path,
-    // shrink the available versions so the natural is in 1.x.
+    // The target replaces the consumer range, while the selector's `@1`
+    // filter still evaluates the natural version. The fixture keeps the
+    // natural version in 1.x so the selector matches.
     let qar_baz = ResolverPackage::npm("qar").with_context("baz");
     let qar_other = ResolverPackage::npm("qar").with_context("other");
     let info = make_info(&["1.5.0", "1.2.0", "1.1.0"], vec![], vec![], vec![]);
