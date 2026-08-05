@@ -1,23 +1,20 @@
-//! Resolve the "effective" Node.js version for a project — the version
-//! that LPM will actually invoke when scripts run.
+//! Resolve Node.js versions from managed-runtime selectors or an explicit
+//! script `PATH`.
 //!
 //! Used by the engine-strict gate (`crates/lpm-cli/src/engine_check.rs`)
-//! to validate `engines.node` against the version that will be picked
-//! up at script-execution time, rather than blindly trusting whatever
-//! happens to be on `PATH`.
+//! to validate `engines.node` against the first Node on the final script
+//! `PATH`, including project-local `node_modules/.bin` entries.
 //!
-//! Resolution order:
+//! Selector-based resolution order:
 //!
-//! 1. If the project pins a Node version (`lpm.json > runtime.node`,
-//!    `package.json > engines.node`, `.nvmrc`, `.node-version`) AND a
-//!    managed runtime under `~/.lpm/runtimes/node/` satisfies that pin,
-//!    use the managed version.
-//! 2. Else, fall back to the system `node --version` from `PATH`.
-//! 3. Else, return [`Effective::Unknown`] — the engine check should
-//!    skip rather than fail when no Node is available at all.
+//! 1. If the project selects a Node version (`lpm.json > runtime.node`,
+//!    `.nvmrc`, `.node-version`) and a managed runtime under
+//!    `~/.lpm/runtimes/node/` satisfies that selector, use the managed version.
+//! 2. Else, fall back to `node --version` from the inherited `PATH`.
+//! 3. Else, return [`Effective::Unknown`].
 //!
 //! The pin-but-not-yet-installed case intentionally falls through to
-//! the system Node: that mirrors npm's behavior (compare engines.node
+//! the inherited Node: that mirrors npm's behavior (compare engines.node
 //! against the running Node), and it gives the user a clear escape
 //! hatch — `lpm use node@<v>` first, then re-run install.
 
@@ -29,18 +26,16 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// What Node version LPM resolved as "effective" for this project.
+/// Node version resolved from managed-runtime selectors and inherited `PATH`.
 #[derive(Debug, Clone)]
 pub enum Effective {
     /// A managed runtime at `~/.lpm/runtimes/node/<version>/` matched
-    /// the project's pin. This version will be on `PATH` when scripts
-    /// run.
+    /// the project's pin.
     Managed { version: String, source: String },
     /// No managed runtime matched (or no pin exists). `node --version`
     /// from `PATH` will be invoked.
     System { version: String },
-    /// No managed runtime matched and `node` is not on `PATH`. The
-    /// engine check should skip — there's nothing to validate against.
+    /// No managed runtime matched and `node` is not on `PATH`.
     Unknown,
 }
 
@@ -55,6 +50,37 @@ pub struct EffectiveNodeResolution {
     runtime_fingerprint: Option<String>,
 }
 
+/// Node version and executable fingerprint resolved from an explicit `PATH`.
+#[derive(Debug, Clone)]
+pub struct PathNodeResolution {
+    version: Option<String>,
+    runtime_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PathNodeIdentity {
+    canonical_executable: PathBuf,
+    runtime_fingerprint: String,
+    context: PathNodeCacheContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PathNodeCacheContext {
+    WorkingDirectory(PathBuf),
+    LpmManaged,
+}
+
+/// Reuses Node version probes within the same script execution context.
+///
+/// Executables in LPM's managed Node store are context-independent and may be
+/// reused across working directories. Other executables are cached per cwd so
+/// version-manager shims can select different runtimes for different projects.
+#[derive(Debug, Default)]
+pub struct PathNodeVersionCache {
+    resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
+    managed_node_root: Option<PathBuf>,
+}
+
 impl EffectiveNodeResolution {
     /// Resolved Node version and source.
     pub fn effective(&self) -> &Effective {
@@ -64,6 +90,59 @@ impl EffectiveNodeResolution {
     /// Fingerprint of the selected executable, when one can be identified.
     pub fn runtime_fingerprint(&self) -> Option<&str> {
         self.runtime_fingerprint.as_deref()
+    }
+}
+
+impl PathNodeResolution {
+    /// Bare Node version without the leading `v`, when `node` is executable.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Fingerprint of the executable selected by `PATH`, when identifiable.
+    pub fn runtime_fingerprint(&self) -> Option<&str> {
+        self.runtime_fingerprint.as_deref()
+    }
+}
+
+impl PathNodeVersionCache {
+    /// Resolve Node from `path` as observed by a script running in `cwd`.
+    ///
+    /// Relative `PATH` entries are anchored to `cwd`. Version probes are reused
+    /// only when the canonical executable, metadata fingerprint, and execution
+    /// context match.
+    pub fn resolve(&mut self, cwd: &Path, path: &OsStr) -> PathNodeResolution {
+        if self.managed_node_root.is_none() {
+            self.managed_node_root = managed_node_root();
+        }
+        let managed_node_root = self.managed_node_root.as_deref();
+        let executable_before = node_executable_in_path(cwd, path);
+        let identity_before = executable_before
+            .as_deref()
+            .and_then(|executable| path_node_identity(executable, cwd, managed_node_root));
+        if let Some(cached) = identity_before
+            .as_ref()
+            .and_then(|identity| self.resolutions.get(identity))
+        {
+            return cached.clone();
+        }
+
+        let version = node_version_on_path(cwd, path, executable_before.as_deref());
+        let identity_after = node_executable_in_path(cwd, path)
+            .as_deref()
+            .and_then(|executable| path_node_identity(executable, cwd, managed_node_root));
+        let stable_identity =
+            identity_before.filter(|before| Some(before) == identity_after.as_ref());
+        let resolution = PathNodeResolution {
+            version,
+            runtime_fingerprint: stable_identity
+                .as_ref()
+                .map(|identity| identity.runtime_fingerprint.clone()),
+        };
+        if let Some(identity) = stable_identity {
+            self.resolutions.insert(identity, resolution.clone());
+        }
+        resolution
     }
 }
 
@@ -95,16 +174,16 @@ pub fn resolve_effective_node_version(project_dir: &Path) -> detect::DetectionRe
     Ok(resolve_inner(detect::detect_node_version(project_dir)?))
 }
 
-/// Variant for callers that have already parsed `package.json`'s
-/// `engines` block. Skips the duplicate disk read in [`detect`].
+/// Compatibility shim for callers that already parsed `package.json`.
+///
+/// The `engines` map is intentionally ignored because `engines.node` can only
+/// validate the effective runtime; it cannot select one.
+#[deprecated(note = "use resolve_effective_node_version; engines.node does not select a runtime")]
 pub fn resolve_effective_node_version_with_engines(
     project_dir: &Path,
-    engines: &HashMap<String, String>,
+    _engines: &HashMap<String, String>,
 ) -> detect::DetectionResult<Effective> {
-    Ok(resolve_inner(detect::detect_node_version_with_engines(
-        project_dir,
-        engines,
-    )?))
+    resolve_effective_node_version(project_dir)
 }
 
 /// Resolve effective Node and fingerprint the selected executable.
@@ -112,13 +191,23 @@ pub fn resolve_effective_node_version_with_engines(
 /// System Node is executed once to obtain its version. The fingerprint uses
 /// only the selected executable's path and filesystem metadata, so subsequent
 /// freshness checks can probe it without spawning Node.
-pub fn resolve_effective_node_with_fingerprint_with_engines(
+pub fn resolve_effective_node_with_fingerprint(
     project_dir: &Path,
-    engines: &HashMap<String, String>,
 ) -> detect::DetectionResult<EffectiveNodeResolution> {
     Ok(resolve_detected_node_with_fingerprint(
-        detect::detect_node_version_with_engines(project_dir, engines)?,
+        detect::detect_node_version(project_dir)?,
     ))
+}
+
+/// Compatibility shim that ignores `engines` during runtime selection.
+#[deprecated(
+    note = "use resolve_effective_node_with_fingerprint; engines.node does not select a runtime"
+)]
+pub fn resolve_effective_node_with_fingerprint_with_engines(
+    project_dir: &Path,
+    _engines: &HashMap<String, String>,
+) -> detect::DetectionResult<EffectiveNodeResolution> {
+    resolve_effective_node_with_fingerprint(project_dir)
 }
 
 /// Resolve and fingerprint an already-detected Node requirement.
@@ -128,17 +217,40 @@ pub fn resolve_detected_node_with_fingerprint(
     resolve_inner_with_fingerprint(detected)
 }
 
+/// Resolve and fingerprint the Node executable selected by a script's cwd and `PATH`.
+///
+/// The version probe uses the same command lookup rules as script execution.
+/// The fingerprint is retained only when the selected executable is unchanged
+/// across that probe.
+pub fn resolve_node_on_path_with_fingerprint(cwd: &Path, path: &OsStr) -> PathNodeResolution {
+    PathNodeVersionCache::default().resolve(cwd, path)
+}
+
+/// Fingerprint the Node executable selected by a script's cwd and `PATH`.
+pub fn probe_node_fingerprint_on_path(cwd: &Path, path: &OsStr) -> Option<String> {
+    let executable = node_executable_in_path(cwd, path)?;
+    executable_fingerprint(b"script-path\0", &executable)
+}
+
 /// Fingerprint the Node executable LPM would select without executing it.
 ///
 /// Returns `None` when no concrete executable can be identified. Managed
-/// runtime selection still follows project pins and installed runtime state.
-pub fn probe_effective_node_fingerprint_with_engines(
+/// runtime selection still follows project selectors and installed runtime state.
+pub fn probe_effective_node_fingerprint(
     project_dir: &Path,
-    engines: &HashMap<String, String>,
 ) -> detect::DetectionResult<Option<String>> {
     Ok(probe_detected_node_fingerprint(
-        detect::detect_node_version_with_engines(project_dir, engines)?,
+        detect::detect_node_version(project_dir)?,
     ))
+}
+
+/// Compatibility shim that ignores `engines` during runtime selection.
+#[deprecated(note = "use probe_effective_node_fingerprint; engines.node does not select a runtime")]
+pub fn probe_effective_node_fingerprint_with_engines(
+    project_dir: &Path,
+    _engines: &HashMap<String, String>,
+) -> detect::DetectionResult<Option<String>> {
+    probe_effective_node_fingerprint(project_dir)
 }
 
 /// Fingerprint the executable selected for an already-detected Node requirement.
@@ -172,14 +284,14 @@ impl SelectedNode {
 }
 
 fn selected_node(detected: Option<detect::DetectedNodeVersion>) -> SelectedNode {
-    if let Some(detected) = detected {
+    if let Some(detected) = detected.filter(detect::DetectedRuntimeVersion::is_runtime_selector) {
         let installed = node::list_installed().unwrap_or_default();
         if let Some(version) = node::find_matching_installed(&detected.spec, &installed)
             && let Ok(executable) = node::node_binary_path(&version)
         {
             return SelectedNode::Managed {
                 version,
-                source: detected.source.to_string(),
+                source: detected.source_label(),
                 executable,
             };
         }
@@ -238,6 +350,29 @@ fn system_node_version_at(executable: &Path) -> Option<String> {
     parse_system_node_version(Command::new(executable).arg("--version").output().ok()?)
 }
 
+#[cfg(not(windows))]
+fn node_version_on_path(cwd: &Path, _path: &OsStr, executable: Option<&Path>) -> Option<String> {
+    parse_system_node_version(
+        Command::new(executable?)
+            .arg("--version")
+            .current_dir(cwd)
+            .output()
+            .ok()?,
+    )
+}
+
+#[cfg(windows)]
+fn node_version_on_path(cwd: &Path, path: &OsStr, _executable: Option<&Path>) -> Option<String> {
+    parse_system_node_version(
+        Command::new("cmd")
+            .args(["/D", "/S", "/C", "node --version"])
+            .current_dir(cwd)
+            .env("PATH", path)
+            .output()
+            .ok()?,
+    )
+}
+
 fn parse_system_node_version(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
@@ -253,21 +388,57 @@ fn parse_system_node_version(output: std::process::Output) -> Option<String> {
 
 fn system_node_executable() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    system_node_executable_in_path(&path)
+    node_executable_in_path(&std::env::current_dir().ok()?, &path)
 }
 
-fn system_node_executable_in_path(path: &OsStr) -> Option<PathBuf> {
+fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let executable_names = windows_node_executable_names();
+
+    #[cfg(windows)]
+    for executable_name in &executable_names {
+        let candidate = cwd.join(executable_name);
+        if executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+
     for dir in std::env::split_paths(path) {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            cwd.join(dir)
+        };
         #[cfg(windows)]
-        let candidate = dir.join("node.exe");
+        for executable_name in &executable_names {
+            let candidate = dir.join(executable_name);
+            if executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
         #[cfg(not(windows))]
         let candidate = dir.join("node");
 
+        #[cfg(not(windows))]
         if executable_file(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn windows_node_executable_names() -> Vec<std::ffi::OsString> {
+    let path_extensions =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let mut names = Vec::with_capacity(4);
+    names.extend(
+        path_extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| std::ffi::OsString::from(format!("node{extension}"))),
+    );
+    names
 }
 
 #[cfg(unix)]
@@ -285,6 +456,38 @@ fn executable_file(path: &Path) -> bool {
 
 fn executable_fingerprint(kind: &[u8], executable: &Path) -> Option<String> {
     let canonical = executable.canonicalize().ok()?;
+    executable_fingerprint_from_canonical(kind, &canonical)
+}
+
+fn path_node_identity(
+    executable: &Path,
+    cwd: &Path,
+    managed_node_root: Option<&Path>,
+) -> Option<PathNodeIdentity> {
+    let canonical_executable = executable.canonicalize().ok()?;
+    let runtime_fingerprint =
+        executable_fingerprint_from_canonical(b"script-path\0", &canonical_executable)?;
+    let context = if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
+        PathNodeCacheContext::LpmManaged
+    } else {
+        PathNodeCacheContext::WorkingDirectory(cwd.canonicalize().ok()?)
+    };
+    Some(PathNodeIdentity {
+        canonical_executable,
+        runtime_fingerprint,
+        context,
+    })
+}
+
+fn managed_node_root() -> Option<PathBuf> {
+    crate::node::runtimes_dir()
+        .ok()?
+        .join("node")
+        .canonicalize()
+        .ok()
+}
+
+fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Option<String> {
     let metadata = canonical.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -413,20 +616,31 @@ mod tests {
     }
 
     #[test]
-    fn pin_without_managed_runtime_falls_through_to_system() {
-        // Project pins node@99.0.0 — no managed runtime exists for
-        // that. The helper must not crash; it should fall through to
-        // the system Node (or Unknown if none is on PATH).
+    fn selector_without_managed_runtime_falls_through_to_system() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
-            dir.path().join("package.json"),
-            r#"{"engines": {"node": "99.0.0"}}"#,
+            dir.path().join("lpm.json"),
+            r#"{"runtime": {"node": "99.0.0"}}"#,
         )
         .unwrap();
         let result = resolve_effective_node_version(dir.path()).unwrap();
         assert!(!matches!(
             result,
             Effective::Managed { ref version, .. } if version == "99.0.0"
+        ));
+    }
+
+    #[test]
+    fn package_json_engine_constraint_cannot_select_managed_node() {
+        let detected = detect::DetectedRuntimeVersion {
+            runtime: detect::RuntimeKind::Node,
+            spec: ">=18".to_string(),
+            source: detect::VersionSource::PackageJsonEngines,
+        };
+
+        assert!(matches!(
+            selected_node(Some(detected)),
+            SelectedNode::System { .. }
         ));
     }
 
@@ -469,14 +683,53 @@ mod tests {
         write_test_executable(&second, b"second");
         let path = std::env::join_paths([first_dir.path(), second_dir.path()]).unwrap();
 
-        assert_eq!(system_node_executable_in_path(&path), Some(first));
+        assert_eq!(
+            node_executable_in_path(first_dir.path(), &path),
+            Some(first)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_path_resolution_versions_and_fingerprints_first_node() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = test_node_path(first_dir.path());
+        let second = test_node_path(second_dir.path());
+        write_test_executable(&first, b"#!/bin/sh\necho v16.0.0\n");
+        write_test_executable(&second, b"#!/bin/sh\necho v22.0.0\n");
+        let path = std::env::join_paths([first_dir.path(), second_dir.path()]).unwrap();
+
+        let resolution = resolve_node_on_path_with_fingerprint(first_dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("16.0.0"));
+        assert_eq!(
+            resolution.runtime_fingerprint(),
+            probe_node_fingerprint_on_path(first_dir.path(), &path).as_deref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entries_resolve_from_script_working_directory() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let local = test_node_path(script_dir.path());
+        let fallback = test_node_path(fallback_dir.path());
+        write_test_executable(&local, b"#!/bin/sh\necho v18.0.0\n");
+        write_test_executable(&fallback, b"#!/bin/sh\necho v22.0.0\n");
+        let path = std::env::join_paths([Path::new("."), fallback_dir.path()]).unwrap();
+
+        let resolution = resolve_node_on_path_with_fingerprint(script_dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("18.0.0"));
     }
 
     #[test]
     fn missing_executable_has_no_reusable_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
 
-        assert!(system_node_executable_in_path(dir.path().as_os_str()).is_none());
+        assert!(node_executable_in_path(dir.path(), dir.path().as_os_str()).is_none());
     }
 
     #[test]

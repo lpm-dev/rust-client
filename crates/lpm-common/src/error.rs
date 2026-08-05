@@ -513,6 +513,22 @@ pub enum LpmError {
         from: String,
     },
 
+    #[error("{engine} version {actual} does not satisfy required {required} (from {from})")]
+    #[diagnostic(
+        code(lpm::engine_mismatch),
+        help(
+            "Either select a matching runtime, relax the constraint in package.json > engines, \
+             set package.json > lpm > engineStrict = false, or set engine-strict = false in \
+             ~/.lpm/config.toml to skip the check."
+        )
+    )]
+    RunEngineMismatch {
+        engine: String,
+        required: String,
+        actual: String,
+        from: String,
+    },
+
     /// `lpm self-update` is in cooldown after a previous failed probe.
     /// Distinct from `Network` because the failure isn't a live network
     /// problem — it's a local cache decision to back off and not
@@ -653,7 +669,9 @@ impl LpmError {
                 "catalog_entry_invalid_recursive_definition"
             }
             LpmError::EnvValidation(_) => "env_validation",
-            LpmError::EngineMismatch { .. } => "engine_mismatch",
+            LpmError::EngineMismatch { .. } | LpmError::RunEngineMismatch { .. } => {
+                "engine_mismatch"
+            }
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
@@ -734,6 +752,21 @@ mod tests {
         let err = LpmError::Engine("version mismatch".to_string());
         let help = err.help().unwrap();
         assert!(help.to_string().contains("~/.lpm/engines"));
+    }
+
+    #[test]
+    fn run_engine_mismatch_help_uses_supported_configuration_opt_outs() {
+        let err = LpmError::RunEngineMismatch {
+            engine: "node".into(),
+            required: ">=20".into(),
+            actual: "18.0.0".into(),
+            from: "package.json > engines.node".into(),
+        };
+        let help = err.help().unwrap().to_string();
+
+        assert!(!help.contains("--no-engine-strict"), "help: {help}");
+        assert!(help.contains("engineStrict"), "help: {help}");
+        assert!(help.contains("engine-strict"), "help: {help}");
     }
 
     #[test]
@@ -839,6 +872,12 @@ mod tests {
                 required: ">=1.0.0".into(),
                 actual: "0.32.0".into(),
                 from: "package.json > engines.lpm".into(),
+            },
+            LpmError::RunEngineMismatch {
+                engine: "node".into(),
+                required: ">=20".into(),
+                actual: "18.0.0".into(),
+                from: "package.json > engines.node".into(),
             },
             LpmError::SelfUpdatePaused("x".into()),
             LpmError::SelfUpdateRateLimited("x".into()),
@@ -1006,6 +1045,16 @@ mod tests {
                 required: ">=1.0.0".into(),
                 actual: "0.32.0".into(),
                 from: "package.json > engines.lpm".into(),
+            }
+            .error_code(),
+            "engine_mismatch"
+        );
+        assert_eq!(
+            LpmError::RunEngineMismatch {
+                engine: "node".into(),
+                required: ">=20".into(),
+                actual: "18.0.0".into(),
+                from: "package.json > engines.node".into(),
             }
             .error_code(),
             "engine_mismatch"

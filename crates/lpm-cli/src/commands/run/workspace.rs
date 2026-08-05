@@ -1,6 +1,6 @@
 use super::format::{format_run_failure_detail, format_workspace_member_scripts_header};
 use super::parallel::run_tasks_parallel;
-use super::runtime::ensure_runtime;
+use super::runtime::{ensure_runtime, validate_runtime_with_cache};
 use super::sequential::run_tasks_sequential;
 use super::task::{reject_direct_hidden_scripts, run_task};
 use crate::install_ui;
@@ -116,6 +116,41 @@ pub async fn run_workspace(
         return Ok(());
     }
 
+    let runnable_members: Vec<bool> = ws_graph
+        .members
+        .iter()
+        .enumerate()
+        .map(|(idx, member)| {
+            target_set.contains(&idx) && workspace_member_has_requested_task(&member.path, scripts)
+        })
+        .collect();
+    let mut member_runtime_hints = vec![Arc::clone(&root_hint); ws_graph.members.len()];
+    let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
+    for idx in levels
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|idx| runnable_members[*idx])
+    {
+        let member_dir = &ws_graph.members[idx].path;
+        if lpm_runtime::detect::detect_node_version(member_dir)?.is_some() {
+            member_runtime_hints[idx] = Arc::new(ensure_runtime(member_dir).await?);
+            validate_runtime_with_cache(
+                member_dir,
+                member_runtime_hints[idx].as_ref(),
+                json_output,
+                &mut node_versions,
+            )?;
+        } else {
+            validate_runtime_with_cache(
+                member_dir,
+                root_hint.as_ref(),
+                json_output,
+                &mut node_versions,
+            )?;
+        }
+    }
+
     let total = target_set.len();
     let start = std::time::Instant::now();
     let succeeded = AtomicUsize::new(0);
@@ -151,7 +186,7 @@ pub async fn run_workspace(
                 parallel,
                 continue_on_error,
                 stream,
-                &root_hint,
+                member_runtime_hints[idx].as_ref(),
             );
             match ok {
                 Some(true) => {
@@ -173,7 +208,7 @@ pub async fn run_workspace(
                         let scripts_owned: Vec<String> = scripts.to_vec();
                         let args_owned: Vec<String> = extra_args.to_vec();
                         let mode_owned = env_mode.map(|s| s.to_string());
-                        let root_hint_clone = Arc::clone(&root_hint);
+                        let member_runtime_hint = Arc::clone(&member_runtime_hints[idx]);
 
                         std::thread::spawn(move || {
                             run_workspace_package(
@@ -186,7 +221,7 @@ pub async fn run_workspace(
                                 parallel,
                                 continue_on_error,
                                 stream,
-                                &root_hint_clone,
+                                member_runtime_hint.as_ref(),
                             )
                         })
                     })
@@ -243,6 +278,34 @@ pub async fn run_workspace(
     }
 }
 
+fn workspace_member_has_requested_task(member_dir: &Path, scripts: &[String]) -> bool {
+    let pkg_json_path = member_dir.join("package.json");
+    let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path) else {
+        return false;
+    };
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(member_dir)
+        .ok()
+        .flatten();
+    has_requested_task(
+        &pkg,
+        lpm_config.as_ref().map(|config| &config.tasks),
+        scripts,
+    )
+}
+
+fn has_requested_task(
+    pkg: &lpm_workspace::PackageJson,
+    tasks: Option<&std::collections::HashMap<String, lpm_runner::lpm_json::TaskConfig>>,
+    scripts: &[String],
+) -> bool {
+    scripts.iter().any(|script| {
+        pkg.scripts.contains_key(script)
+            || tasks
+                .and_then(|tasks| tasks.get(script))
+                .is_some_and(|task| task.command.is_some() || !task.depends_on.is_empty())
+    })
+}
+
 /// Execute scripts in a single workspace package with task-graph awareness.
 ///
 /// Returns `Some(true)` on success, `Some(false)` on failure, `None` if
@@ -262,7 +325,7 @@ fn run_workspace_package(
     parallel: bool,
     continue_on_error: bool,
     stream: bool,
-    root_hint: &ManagedRuntimeHint,
+    bin_hint: &ManagedRuntimeHint,
 ) -> Option<bool> {
     let pkg_json_path = member_dir.join("package.json");
     if !pkg_json_path.exists() {
@@ -286,13 +349,7 @@ fn run_workspace_package(
         .map(|c| c.tasks.clone())
         .unwrap_or_default();
 
-    let has_any = scripts.iter().any(|s| {
-        pkg.scripts.contains_key(s)
-            || tasks
-                .get(s)
-                .is_some_and(|tc| tc.command.is_some() || !tc.depends_on.is_empty())
-    });
-    if !has_any {
+    if !has_requested_task(&pkg, Some(&tasks), scripts) {
         return None;
     }
 
@@ -310,17 +367,6 @@ fn run_workspace_package(
 
     let task_count: usize = task_levels.iter().map(|l| l.len()).sum();
 
-    // If the member has its own Node.js version pin, let silent detection
-    // resolve at the member level. Otherwise inherit the workspace-root hint.
-    let bin_hint = match lpm_runtime::detect::detect_node_version(member_dir) {
-        Ok(Some(_)) => ManagedRuntimeHint::Unknown,
-        Ok(None) => root_hint.clone(),
-        Err(error) => {
-            install_ui::detail_line(format_run_failure_detail(member_name, error));
-            return Some(false);
-        }
-    };
-
     // Single task, no deps → simple run
     if task_count == 1 && scripts.len() == 1 {
         return match run_task(
@@ -329,7 +375,7 @@ fn run_workspace_package(
             extra_args,
             env_mode,
             &tasks,
-            &bin_hint,
+            bin_hint,
         ) {
             Ok(()) => Some(true),
             Err(e) => {
@@ -358,7 +404,7 @@ fn run_workspace_package(
             &tasks,
             lpm_config.as_ref(),
             false,
-            &bin_hint,
+            bin_hint,
             Some(&pkg.scripts),
         ))
     } else {
@@ -373,7 +419,7 @@ fn run_workspace_package(
             &tasks,
             lpm_config.as_ref(),
             false,
-            &bin_hint,
+            bin_hint,
             Some(&pkg.scripts),
         ))
     };

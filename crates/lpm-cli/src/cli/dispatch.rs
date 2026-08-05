@@ -2012,7 +2012,7 @@ async fn async_main() -> Result<()> {
                             .into(),
                     ));
                 }
-                let bin_hint = commands::run::ensure_runtime(&cwd).await?;
+                let bin_hint = commands::run::prepare_runtime(&cwd, cli.json).await?;
                 commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
             } else if workspace_mode {
                 // Workspace mode: run scripts across packages with task graph

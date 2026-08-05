@@ -34,54 +34,84 @@
 use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
-use lpm_runtime::detect::{DetectedNodeVersion, detect_node_version_with_engines};
 use lpm_runtime::effective::{
-    Effective, EffectiveNodeResolution, probe_detected_node_fingerprint,
-    resolve_detected_node_with_fingerprint,
+    PathNodeResolution, probe_node_fingerprint_on_path, resolve_node_on_path_with_fingerprint,
 };
 use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const LOCKFILE_NODE_ENGINE_NEEDLE: &str = "node-engine = ";
+const DEFAULT_NODE_SELECTOR_HINT: &str = "22";
+const NEUTRAL_NODE_SELECTOR_HINT: &str = "<matching-version>";
+
+pub(crate) struct RootNodeEngineRequirement {
+    pub(crate) required: String,
+    pub(crate) engine_strict: bool,
+}
 
 pub(crate) struct DependencyEnginePolicy {
     engine_strict: bool,
     json_output: bool,
-    detected_node: Option<DetectedNodeVersion>,
-    effective_node: OnceLock<EffectiveNodeResolution>,
+    script_cwd: PathBuf,
+    script_path: OsString,
+    effective_node: OnceLock<PathNodeResolution>,
 }
 
 impl DependencyEnginePolicy {
     fn new(
-        detected_node: Option<DetectedNodeVersion>,
+        script_cwd: PathBuf,
+        script_path: OsString,
         engine_strict: bool,
         json_output: bool,
     ) -> Self {
         Self {
             engine_strict,
             json_output,
-            detected_node,
+            script_cwd,
+            script_path,
             effective_node: OnceLock::new(),
         }
     }
 
-    fn effective_node(&self) -> &Effective {
-        self.effective_node_resolution().effective()
+    fn with_resolved_node(
+        effective_node: PathNodeResolution,
+        engine_strict: bool,
+        json_output: bool,
+    ) -> Self {
+        Self {
+            engine_strict,
+            json_output,
+            script_cwd: PathBuf::new(),
+            script_path: OsString::new(),
+            effective_node: OnceLock::from(effective_node),
+        }
     }
 
-    fn effective_node_resolution(&self) -> &EffectiveNodeResolution {
-        self.effective_node
-            .get_or_init(|| resolve_detected_node_with_fingerprint(self.detected_node.clone()))
+    fn effective_node_version(&self) -> Option<&str> {
+        self.effective_node_resolution().version()
+    }
+
+    fn effective_node_resolution(&self) -> &PathNodeResolution {
+        self.effective_node.get_or_init(|| {
+            resolve_node_on_path_with_fingerprint(&self.script_cwd, &self.script_path)
+        })
     }
 
     fn check_node_requirement(&self, required: &str, source: String) -> Result<(), Mismatch> {
-        let effective = self.effective_node();
-        let Some(actual) = effective.version() else {
-            return Ok(());
+        let Some(actual) = self.effective_node_version() else {
+            let selector = compatible_node_selector_hint(required);
+            return Err(Mismatch {
+                required: required.to_string(),
+                actual: format!(
+                    "not found on PATH; select one explicitly (for example, `lpm use node@{selector}`)"
+                ),
+                source: format!("{source} (compatibility constraint)"),
+            });
         };
-        let source = format!("{source} (compared against {})", effective.source_label());
+        let source = format!("{source} (compared against script PATH)");
         match version_satisfies(required, actual) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Mismatch {
@@ -152,12 +182,12 @@ impl DependencyEnginePolicy {
     }
 
     pub(crate) fn constrained_freshness_key(&self) -> String {
-        let version = self.effective_node().version().unwrap_or("unknown");
+        let version = self.effective_node_version().unwrap_or("unknown");
         format!("{}:{version}", u8::from(self.engine_strict))
     }
 
     pub(crate) fn probe_node_runtime_fingerprint(&self) -> Option<String> {
-        probe_detected_node_fingerprint(self.detected_node.clone())
+        probe_node_fingerprint_on_path(&self.script_cwd, &self.script_path)
     }
 
     pub(crate) fn resolved_node_runtime_fingerprint(&self) -> Option<&str> {
@@ -192,11 +222,17 @@ pub(crate) fn prepare_dependency_policy(
     json_output: bool,
 ) -> Result<DependencyEnginePolicy, LpmError> {
     let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
-        return Ok(DependencyEnginePolicy::new(None, false, json_output));
+        return Ok(DependencyEnginePolicy::new(
+            start_dir.to_path_buf(),
+            OsString::new(),
+            false,
+            json_output,
+        ));
     };
     let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
-    let detected_node = detect_node_version_with_engines(&root_dir, &root_pkg.engines)?;
-    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
+    let script_path = lpm_runner::bin_path::build_path_with_bins(&root_dir)?;
+    let policy =
+        DependencyEnginePolicy::new(root_dir, script_path.into(), engine_strict, json_output);
     enforce_root_with_policy(&root_pkg, &policy)?;
     Ok(policy)
 }
@@ -229,6 +265,49 @@ pub fn enforce(
     prepare_dependency_policy(start_dir, cli_no_engine_strict, json_output).map(|_| ())
 }
 
+/// Validate a resolved script Node against an engine requirement.
+pub(crate) fn enforce_resolved_node_for_run(
+    requirement: RootNodeEngineRequirement,
+    effective_node: PathNodeResolution,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let policy = DependencyEnginePolicy::with_resolved_node(
+        effective_node,
+        requirement.engine_strict,
+        json_output,
+    );
+    let result = policy.check_node_requirement(
+        &requirement.required,
+        "package.json > engines.node".to_string(),
+    );
+
+    if !requirement.engine_strict {
+        if let Err(mismatch) = result
+            && !json_output
+        {
+            output::warn(&format!("{mismatch} (engine-strict disabled, ignoring)"));
+        }
+        return Ok(());
+    }
+
+    result.map_err(|mismatch| mismatch.into_run_error("node"))
+}
+
+pub(crate) fn resolve_root_node_engine_requirement(
+    start_dir: &Path,
+) -> Result<Option<RootNodeEngineRequirement>, LpmError> {
+    let Some((_, root_pkg)) = resolve_root_package(start_dir)? else {
+        return Ok(None);
+    };
+    let Some(required) = root_pkg.engines.get("node") else {
+        return Ok(None);
+    };
+    Ok(Some(RootNodeEngineRequirement {
+        required: required.clone(),
+        engine_strict: engine_strict_config::resolve_for_root(false, &root_pkg),
+    }))
+}
+
 /// Variant that takes the already-resolved root + manifest. Use this
 /// at call sites that have parsed the workspace themselves to avoid a
 /// second discovery pass.
@@ -238,8 +317,13 @@ pub fn enforce_with_root(
     engine_strict: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let detected_node = detect_node_version_with_engines(root_dir, &root_pkg.engines)?;
-    let policy = DependencyEnginePolicy::new(detected_node, engine_strict, json_output);
+    let script_path = lpm_runner::bin_path::build_path_with_bins(root_dir)?;
+    let policy = DependencyEnginePolicy::new(
+        root_dir.to_path_buf(),
+        script_path.into(),
+        engine_strict,
+        json_output,
+    );
     enforce_root_with_policy(root_pkg, &policy)
 }
 
@@ -309,8 +393,8 @@ fn resolve_root_package(start_dir: &Path) -> Result<Option<(PathBuf, PackageJson
     Ok(Some((start_dir.to_path_buf(), pkg)))
 }
 
-/// Internal mismatch description. Converted to `LpmError::EngineMismatch`
-/// at the boundary, with the engine name plugged in.
+/// Internal mismatch description. Converted to the command-appropriate
+/// structured engine mismatch at the boundary.
 struct Mismatch {
     required: String,
     actual: String,
@@ -330,6 +414,15 @@ impl std::fmt::Display for Mismatch {
 impl Mismatch {
     fn into_error(self, engine: &str) -> LpmError {
         LpmError::EngineMismatch {
+            engine: engine.to_string(),
+            required: self.required,
+            actual: self.actual,
+            from: self.source,
+        }
+    }
+
+    fn into_run_error(self, engine: &str) -> LpmError {
+        LpmError::RunEngineMismatch {
             engine: engine.to_string(),
             required: self.required,
             actual: self.actual,
@@ -366,12 +459,42 @@ fn check_lpm_engine(engines: &HashMap<String, String>) -> Result<(), Mismatch> {
 /// check satisfaction. Returns the inner `Result` from semver parsing
 /// so the caller can surface unparseable constraints distinctly from
 /// failed matches.
-fn version_satisfies(required: &str, actual: &str) -> Result<bool, String> {
+pub(crate) fn version_satisfies(required: &str, actual: &str) -> Result<bool, String> {
     let req = lpm_semver::VersionReq::parse(required)
         .map_err(|e| format!("could not parse range '{required}': {e}"))?;
     let version = lpm_semver::Version::parse(actual)
         .map_err(|e| format!("could not parse version '{actual}': {e}"))?;
     Ok(req.matches(&version))
+}
+
+fn compatible_node_selector_hint(required: &str) -> String {
+    let Ok(requirement) = lpm_semver::VersionReq::parse(required) else {
+        return NEUTRAL_NODE_SELECTOR_HINT.to_string();
+    };
+
+    for major in [DEFAULT_NODE_SELECTOR_HINT, "24", "20", "18", "16"] {
+        let Ok(candidate) = lpm_semver::Version::parse(&format!("{major}.999.999")) else {
+            continue;
+        };
+        if requirement.matches(&candidate) {
+            return major.to_string();
+        }
+    }
+
+    for token in required.split(|character: char| character.is_whitespace() || character == '|') {
+        let candidate = token.trim_matches(|character| {
+            matches!(character, '<' | '>' | '=' | '^' | '~' | ',' | '(' | ')')
+        });
+        let candidate = candidate.strip_prefix('v').unwrap_or(candidate);
+        let Ok(version) = lpm_semver::Version::parse(candidate) else {
+            continue;
+        };
+        if requirement.matches(&version) {
+            return candidate.to_string();
+        }
+    }
+
+    NEUTRAL_NODE_SELECTOR_HINT.to_string()
 }
 
 /// Emit one stderr warning per [`lpm_workspace::ManifestCompatIssue`]
@@ -415,6 +538,34 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn compatible_node_selector_prefers_default_for_open_lower_bound() {
+        assert_eq!(compatible_node_selector_hint(">=18"), "22");
+    }
+
+    #[test]
+    fn compatible_node_selector_uses_caret_major() {
+        assert_eq!(compatible_node_selector_hint("^20"), "20");
+    }
+
+    #[test]
+    fn compatible_node_selector_uses_wildcard_major() {
+        assert_eq!(compatible_node_selector_hint("20.x"), "20");
+    }
+
+    #[test]
+    fn compatible_node_selector_stays_below_upper_bound() {
+        assert_eq!(compatible_node_selector_hint("<22"), "20");
+    }
+
+    #[test]
+    fn compatible_node_selector_uses_neutral_hint_for_invalid_range() {
+        assert_eq!(
+            compatible_node_selector_hint("not-a-range"),
+            "<matching-version>"
+        );
     }
 
     #[test]
@@ -488,20 +639,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = enforce_with_root(dir.path(), &pkg, true, true).unwrap_err();
         assert!(matches!(err, LpmError::EngineMismatch { .. }));
-    }
-
-    #[test]
-    fn node_engine_with_no_node_at_all_skips() {
-        // engines.node = ">=22" but no managed runtime AND no
-        // system Node would mean Effective::Unknown → skip.
-        // We can't reliably make `node` absent on a dev machine, so
-        // this test only confirms that "absent engines.node" is OK.
-        let pkg = PackageJson {
-            engines: engines(&[("lpm", ">=0.1.0")]),
-            ..Default::default()
-        };
-        let dir = tempdir().unwrap();
-        assert!(enforce_with_root(dir.path(), &pkg, true, true).is_ok());
     }
 
     #[test]
@@ -629,7 +766,7 @@ mod tests {
 
     #[test]
     fn legacy_lockfile_uses_migration_freshness_without_resolving_node() {
-        let policy = DependencyEnginePolicy::new(None, true, true);
+        let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
 
         assert_eq!(policy.freshness_key("lockfile-version = 5\n"), "legacy");
         assert!(policy.effective_node.get().is_none());
@@ -637,7 +774,7 @@ mod tests {
 
     #[test]
     fn current_unconstrained_lockfile_preserves_existing_freshness() {
-        let policy = DependencyEnginePolicy::new(None, true, true);
+        let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
         let lockfile = format!("lockfile-version = {}\n", lpm_lockfile::LOCKFILE_VERSION);
 
         assert_eq!(policy.freshness_key(&lockfile), "none");
@@ -646,7 +783,7 @@ mod tests {
 
     #[test]
     fn unknown_node_version_is_never_reused_from_fingerprint_cache() {
-        let policy = DependencyEnginePolicy::new(None, true, true);
+        let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
 
         assert!(!policy.can_reuse_constrained_freshness_key("1:unknown"));
     }

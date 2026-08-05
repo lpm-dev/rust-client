@@ -162,6 +162,9 @@ fn detect_managed_runtime_bins(
 fn detect_one_managed_runtime_bin(
     detected: &lpm_runtime::detect::DetectedRuntimeVersion,
 ) -> Option<String> {
+    if !detected.is_runtime_selector() {
+        return None;
+    }
     let (matched, bin_dir) = match detected.runtime {
         lpm_runtime::detect::RuntimeKind::Node => {
             let spec = detected
@@ -188,7 +191,7 @@ fn detect_one_managed_runtime_bin(
             "using managed {} {} (from {})",
             detected.runtime,
             matched,
-            detected.source
+            detected.source_label()
         );
         Some(bin_dir.to_string_lossy().to_string())
     } else {
