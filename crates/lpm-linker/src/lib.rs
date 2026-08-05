@@ -37,7 +37,9 @@ pub use v1_isolated::{
     cleanup_stale_entries, create_bin_links, link_finalize, link_one_package, link_packages,
     link_workspace_member,
 };
-pub use validation::validate_bin_name;
+pub use validation::{
+    ensure_project_node_modules, validate_bin_name, validate_project_node_modules,
+};
 
 #[cfg(test)]
 mod tests;

@@ -1700,12 +1700,35 @@ fn workspace_member_link_rejects_symlinked_node_modules_root() {
         .unwrap_err();
 
     assert!(
-        format!("{err}").contains("symlinked directory"),
-        "error should reject symlinked node_modules root, got: {err}",
+        matches!(&err, lpm_common::LpmError::ProjectLayout(message) if message.contains("is a symlink")),
+        "error should classify the symlink as a project layout problem, got: {err}",
     );
     assert!(
         outside.join("foo").symlink_metadata().is_err(),
         "workspace link must not be created through symlinked node_modules",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hoisted_mode_rejects_symlinked_node_modules_before_force_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("must-survive.txt"), "sentinel").unwrap();
+    std::os::unix::fs::symlink(&outside, project.join("node_modules")).unwrap();
+
+    let error = link_packages_hoisted(&project, &[], true, None).unwrap_err();
+
+    assert!(
+        matches!(&error, lpm_common::LpmError::ProjectLayout(message) if message.contains("is a symlink")),
+        "symlinked node_modules must be classified as a project layout problem: {error}",
+    );
+    assert!(
+        outside.join("must-survive.txt").exists(),
+        "forced hoisted cleanup must not mutate a rejected node_modules target: {error}",
     );
 }
 

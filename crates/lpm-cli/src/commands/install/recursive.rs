@@ -182,6 +182,13 @@ pub(crate) async fn run_recursive_workspace_install(
             return Ok(());
         }
 
+        validation::validate_project_layout(&workspace.root)?;
+        for target in &targets {
+            if target.path != workspace.root {
+                validation::validate_project_layout(&target.path)?;
+            }
+        }
+
         let workspace_lockfile_coordinator =
             Arc::new(workspace_lockfile::WorkspaceLockfileCoordinator::new(
                 &workspace.root,

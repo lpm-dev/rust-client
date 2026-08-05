@@ -45,6 +45,7 @@ pub use paths::{
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use symlink::{
     create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,
+    remove_symlink_or_junction_entry,
 };
 pub use terminal::{sanitize_for_terminal, sanitize_terminal_inline, sanitize_terminal_multiline};
 pub use utf8_bom::{strip_utf8_bom_bytes, strip_utf8_bom_str};

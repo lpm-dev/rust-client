@@ -87,6 +87,24 @@ pub fn remove_path_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Remove a symbolic link or directory junction without removing its target.
+///
+/// This function returns an error if `path` is not a link. It never removes a
+/// real directory recursively.
+pub fn remove_symlink_or_junction_entry(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !is_symlink_or_junction(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to remove a non-link filesystem entry at {}",
+                path.display()
+            ),
+        ));
+    }
+    remove_link(path, &metadata)
+}
+
 #[cfg(unix)]
 fn remove_link(path: &Path, _metadata: &std::fs::Metadata) -> std::io::Result<()> {
     std::fs::remove_file(path)
@@ -345,5 +363,39 @@ mod tests {
 
         assert!(link.symlink_metadata().is_err());
         assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"ok");
+    }
+}
+
+#[cfg(test)]
+mod entry_removal_tests {
+    use super::*;
+
+    #[test]
+    fn remove_symlink_or_junction_entry_preserves_the_link_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("marker"), b"ok").unwrap();
+        let link = dir.path().join("link");
+        create_dir_symlink_or_junction(&target, &link).unwrap();
+
+        remove_symlink_or_junction_entry(&link).unwrap();
+
+        assert!(link.symlink_metadata().is_err());
+        assert_eq!(std::fs::read(target.join("marker")).unwrap(), b"ok");
+    }
+
+    #[test]
+    fn remove_symlink_or_junction_entry_refuses_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_directory = dir.path().join("real-directory");
+        std::fs::create_dir(&real_directory).unwrap();
+        std::fs::write(real_directory.join("marker"), b"ok").unwrap();
+
+        let error = remove_symlink_or_junction_entry(&real_directory)
+            .expect_err("a real directory must never be removed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(real_directory.join("marker")).unwrap(), b"ok");
     }
 }

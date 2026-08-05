@@ -598,6 +598,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             diagnostic_lines("Tunnel error", Some(reason), error)
         }
         lpm_common::LpmError::Store(reason) => diagnostic_lines("Store error", Some(reason), error),
+        lpm_common::LpmError::ProjectLayout(reason) => {
+            diagnostic_lines("Project layout error", Some(reason), error)
+        }
         lpm_common::LpmError::ScriptWithOutput {
             code,
             stdout,
@@ -1152,6 +1155,47 @@ mod tests {
         assert!(
             plain.iter().all(|line| !line.contains("Error:")),
             "slim error rows must not include miette framing: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn slim_error_lines_render_project_layout_without_store_repair_guidance() {
+        let error = lpm_common::LpmError::ProjectLayout(
+            "project node_modules must be a real directory, but /repo/node_modules is a symlink"
+                .into(),
+        );
+
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(plain[0], "Project layout error");
+        assert_eq!(
+            plain[1],
+            "  reason project node_modules must be a real directory, but /repo/node_modules is a symlink"
+        );
+        assert!(
+            plain[2].contains("lpm doctor --fix"),
+            "project layout hint must explain the local repair: {plain:?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .all(|line| !line.contains("store clean") && !line.contains("cache prune")),
+            "project layout output must not recommend global store repair: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn project_layout_json_error_uses_a_dedicated_code() {
+        let error = lpm_common::LpmError::ProjectLayout("project node_modules is a symlink".into());
+
+        let envelope = json_error_value(&error);
+
+        assert_eq!(envelope["success"], serde_json::json!(false));
+        assert_eq!(envelope["error_code"], serde_json::json!("project_layout"));
+        assert_eq!(
+            envelope["error"],
+            serde_json::json!("project layout error: project node_modules is a symlink")
         );
     }
 

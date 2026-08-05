@@ -10,7 +10,7 @@ use crate::types::{
     OnePackageResult,
 };
 use crate::validation::{
-    ensure_child_dir, ensure_real_dir, filter_node_modules_entry_name,
+    ensure_child_dir, ensure_project_node_modules_dir, filter_node_modules_entry_name,
     is_safe_node_modules_entry_name, is_valid_self_ref_name, validate_bin_name,
     validate_bin_target,
 };
@@ -184,8 +184,7 @@ pub fn cleanup_stale_entries(project_dir: &Path, packages: &[LinkTarget]) -> Res
 
     // `node_modules/` and the wrapper root are disjoint paths, so each
     // gets its own create and validation step.
-    std::fs::create_dir_all(&node_modules)?;
-    ensure_real_dir(&node_modules, "node_modules")?;
+    ensure_project_node_modules_dir(&node_modules)?;
     std::fs::create_dir_all(&lpm_dir)?;
 
     // Layout schema version. Written best-effort — if the write fails
@@ -831,6 +830,8 @@ pub fn link_workspace_member(
             "refusing to link workspace member with unsafe name: {package_name:?}"
         )));
     }
+
+    ensure_project_node_modules_dir(node_modules_dir)?;
 
     let requested_source = if member_source_dir.is_absolute() {
         member_source_dir.to_path_buf()

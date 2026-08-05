@@ -83,8 +83,8 @@ pub use self::keymap::{GraphKeyCache, KeyMap};
 #[cfg(all(test, unix))]
 use self::reconcile::symlink_points_to;
 use self::reconcile::{
-    cleanup_v1_state, create_root_symlinks, create_self_ref, ensure_real_dir,
-    reconcile_project_node_modules,
+    cleanup_v1_state, create_root_symlinks, create_self_ref, ensure_node_modules_dir,
+    ensure_real_dir, reconcile_project_node_modules,
 };
 
 /// One LinkTarget plus the source SRI needed to resolve its v2 object
@@ -639,6 +639,7 @@ fn link_v2_finalize_inner(
     .entered();
     let augmented_slice = &plan.augmented_targets[..];
     let stage_timer = std::time::Instant::now();
+    ensure_node_modules_dir(project_dir)?;
     cleanup_v1_state(project_dir)?;
     reconcile_project_node_modules(project_dir, augmented_slice, self_package_name, true)?;
     let reconcile_ms = stage_timer.elapsed().as_millis();

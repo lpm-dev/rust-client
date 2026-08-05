@@ -2767,3 +2767,31 @@ fn link_v2_finalize_replaces_symlinked_scope_parent_before_root_symlink_write() 
         "scoped root link should point at the virtual-store link package dir",
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn link_v2_finalize_rejects_symlinked_node_modules_before_reconciliation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("must-survive.txt"), "sentinel").unwrap();
+    std::os::unix::fs::symlink(Path::new("../outside"), project.join("node_modules")).unwrap();
+
+    let plan = link_v2_prepare(&project, Vec::new(), &store, LinkerMode::Isolated).unwrap();
+    let error = match link_v2_finalize(&project, &plan, &store, None) {
+        Ok(_) => panic!("symlinked project node_modules must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(&error, LpmError::ProjectLayout(message) if message.contains("is a symlink")),
+        "symlinked node_modules must be classified as a project layout problem: {error}",
+    );
+    assert!(
+        outside.join("must-survive.txt").exists(),
+        "rejected project node_modules symlink must not be reconciled: {error}",
+    );
+}

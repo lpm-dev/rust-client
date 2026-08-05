@@ -412,6 +412,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     reserve_stdout: bool,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    validation::validate_project_layout(project_dir)?;
     let dependency_engine_policy = Arc::new(crate::engine_check::prepare_dependency_policy(
         project_dir,
         cli_no_engine_strict,
