@@ -32,6 +32,30 @@ fn install_fake_managed_node(project: &TempProject, version: &str) {
         .expect("mark managed Node executable");
 }
 
+#[cfg(unix)]
+fn install_counting_fake_managed_node(project: &TempProject, version: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = project
+        .home()
+        .join(".lpm/runtimes/node")
+        .join(version)
+        .join("bin/node");
+    let counter = project.home().join("managed-node-version-probe-count");
+    std::fs::create_dir_all(binary.parent().expect("managed Node has a parent"))
+        .expect("create managed Node bin directory");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\ncount=0\nif [ -f \"$LPM_NODE_PROBE_COUNT\" ]; then count=$(cat \"$LPM_NODE_PROBE_COUNT\"); fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$LPM_NODE_PROBE_COUNT\"\necho v{version}\n"
+        ),
+    )
+    .expect("write counting managed Node binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("mark managed Node executable");
+    counter
+}
+
 fn install_fake_project_node(project: &TempProject, version: &str) {
     let binary = if cfg!(windows) {
         project.path().join("node_modules/.bin/node.cmd")
@@ -76,37 +100,34 @@ fn install_fake_member_root_node(project: &TempProject, member_dir: &str, versio
     }
 }
 
-#[cfg(unix)]
-fn configure_counting_fake_node(
-    command: &mut assert_cmd::Command,
-    project: &TempProject,
-    version: &str,
-) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
+fn configure_cwd_sensitive_fake_node(command: &mut assert_cmd::Command, project: &TempProject) {
+    let bin_dir = project.home().join("cwd-sensitive-node-bin");
+    std::fs::create_dir_all(&bin_dir).expect("create cwd-sensitive Node bin directory");
+    let binary = if cfg!(windows) {
+        bin_dir.join("node.cmd")
+    } else {
+        bin_dir.join("node")
+    };
+    let script = if cfg!(windows) {
+        "@echo off\r\nfor %%I in (\"%CD%\") do set \"LPM_NODE_MEMBER=%%~nxI\"\r\nif \"%LPM_NODE_MEMBER%\"==\"a\" goto compatible\r\necho v18.0.0\r\nexit /b 0\r\n:compatible\r\necho v22.0.0\r\n"
+    } else {
+        "#!/bin/sh\nif [ \"$(basename \"$(pwd)\")\" = \"a\" ]; then\n  echo v22.0.0\nelse\n  echo v18.0.0\nfi\n"
+    };
+    std::fs::write(&binary, script).expect("write cwd-sensitive Node binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    let bin_dir = project.home().join("counting-node-bin");
-    let counter = project.home().join("node-version-probe-count");
-    std::fs::create_dir_all(&bin_dir).expect("create counting Node bin directory");
-    let binary = bin_dir.join("node");
-    std::fs::write(
-        &binary,
-        format!(
-            "#!/bin/sh\ncount=0\nif [ -f \"$LPM_NODE_PROBE_COUNT\" ]; then count=$(cat \"$LPM_NODE_PROBE_COUNT\"); fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$LPM_NODE_PROBE_COUNT\"\necho v{version}\n"
-        ),
-    )
-    .expect("write counting Node binary");
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-        .expect("mark counting Node executable");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("mark cwd-sensitive Node executable");
+    }
 
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
-    command
-        .env(
-            "PATH",
-            std::env::join_paths(paths).expect("construct PATH with counting Node"),
-        )
-        .env("LPM_NODE_PROBE_COUNT", &counter);
-    counter
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).expect("construct PATH with cwd-sensitive Node"),
+    );
 }
 
 fn command_output_text(output: &std::process::Output) -> String {
@@ -907,45 +928,90 @@ fn workspace_resolves_windows_current_directory_node_before_path() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn workspace_probes_shared_node_executable_once_during_preflight() {
+fn workspace_does_not_reuse_shared_node_shim_version_across_member_cwds() {
     let project = TempProject::empty(
         r#"{
-            "name": "shared-node-probe-workspace",
+            "name": "cwd-sensitive-node-workspace",
             "version": "1.0.0",
             "private": true,
             "workspaces": ["packages/*"],
             "engines": {"node": ">=22"}
         }"#,
     );
+    project.write_file(
+        "packages/a/package.json",
+        r#"{
+            "name": "cwd-sensitive-node-a",
+            "version": "1.0.0",
+            "scripts": {"test": "echo a-tested"}
+        }"#,
+    );
+    project.write_file(
+        "packages/b/package.json",
+        r#"{
+            "name": "cwd-sensitive-node-b",
+            "version": "1.0.0",
+            "dependencies": {"cwd-sensitive-node-a": "workspace:*"},
+            "scripts": {"test": "echo b-tested"}
+        }"#,
+    );
+    let mut command = lpm(&project);
+    configure_cwd_sensitive_fake_node(&mut command, &project);
+
+    let output = command
+        .args(["run", "test", "--all"])
+        .output()
+        .expect("preflight members sharing one cwd-sensitive Node shim");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success() && combined.contains("18.0.0") && combined.contains(">=22"),
+        "member B reused member A's cached Node version:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_reuses_lpm_managed_node_version_across_member_cwds() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "managed-node-probe-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"],
+            "engines": {"node": ">=22"}
+        }"#,
+    );
+    project.write_file("lpm.json", r#"{"runtime":{"node":"22.0.0"}}"#);
     for member in ["app", "docs", "shared"] {
         project.write_file(
             &format!("packages/{member}/package.json"),
             &format!(
                 r#"{{
-                    "name": "shared-node-probe-{member}",
+                    "name": "managed-node-probe-{member}",
                     "version": "1.0.0",
                     "scripts": {{"test": "echo {member}-tested"}}
                 }}"#
             ),
         );
     }
+    let counter = install_counting_fake_managed_node(&project, "22.0.0");
     let mut command = lpm(&project);
-    let counter = configure_counting_fake_node(&mut command, &project, "22.0.0");
+    command.env("LPM_NODE_PROBE_COUNT", &counter);
 
     let output = command
         .args(["run", "test", "--all"])
         .output()
-        .expect("preflight members sharing one Node executable");
+        .expect("preflight members sharing one LPM-managed Node executable");
     let combined = command_output_text(&output);
 
     assert!(output.status.success(), "workspace run failed:\n{combined}");
     assert_eq!(
         std::fs::read_to_string(counter)
-            .expect("read Node probe count")
+            .expect("read managed Node probe count")
             .trim(),
         "1",
-        "shared Node was probed more than once:\n{combined}"
+        "LPM-managed Node was probed more than once:\n{combined}"
     );
 }

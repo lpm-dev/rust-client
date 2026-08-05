@@ -61,12 +61,24 @@ pub struct PathNodeResolution {
 struct PathNodeIdentity {
     canonical_executable: PathBuf,
     runtime_fingerprint: String,
+    context: PathNodeCacheContext,
 }
 
-/// Reuses Node version probes for identical executables across script paths.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PathNodeCacheContext {
+    WorkingDirectory(PathBuf),
+    LpmManaged,
+}
+
+/// Reuses Node version probes within the same script execution context.
+///
+/// Executables in LPM's managed Node store are context-independent and may be
+/// reused across working directories. Other executables are cached per cwd so
+/// version-manager shims can select different runtimes for different projects.
 #[derive(Debug, Default)]
 pub struct PathNodeVersionCache {
     resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
+    managed_node_root: Option<PathBuf>,
 }
 
 impl EffectiveNodeResolution {
@@ -97,10 +109,17 @@ impl PathNodeVersionCache {
     /// Resolve Node from `path` as observed by a script running in `cwd`.
     ///
     /// Relative `PATH` entries are anchored to `cwd`. Version probes are reused
-    /// only when the canonical executable and its metadata fingerprint match.
+    /// only when the canonical executable, metadata fingerprint, and execution
+    /// context match.
     pub fn resolve(&mut self, cwd: &Path, path: &OsStr) -> PathNodeResolution {
+        if self.managed_node_root.is_none() {
+            self.managed_node_root = managed_node_root();
+        }
+        let managed_node_root = self.managed_node_root.as_deref();
         let executable_before = node_executable_in_path(cwd, path);
-        let identity_before = executable_before.as_deref().and_then(path_node_identity);
+        let identity_before = executable_before
+            .as_deref()
+            .and_then(|executable| path_node_identity(executable, cwd, managed_node_root));
         if let Some(cached) = identity_before
             .as_ref()
             .and_then(|identity| self.resolutions.get(identity))
@@ -111,7 +130,7 @@ impl PathNodeVersionCache {
         let version = node_version_on_path(cwd, path, executable_before.as_deref());
         let identity_after = node_executable_in_path(cwd, path)
             .as_deref()
-            .and_then(path_node_identity);
+            .and_then(|executable| path_node_identity(executable, cwd, managed_node_root));
         let stable_identity =
             identity_before.filter(|before| Some(before) == identity_after.as_ref());
         let resolution = PathNodeResolution {
@@ -210,7 +229,7 @@ pub fn resolve_node_on_path_with_fingerprint(cwd: &Path, path: &OsStr) -> PathNo
 /// Fingerprint the Node executable selected by a script's cwd and `PATH`.
 pub fn probe_node_fingerprint_on_path(cwd: &Path, path: &OsStr) -> Option<String> {
     let executable = node_executable_in_path(cwd, path)?;
-    path_node_identity(&executable).map(|identity| identity.runtime_fingerprint)
+    executable_fingerprint(b"script-path\0", &executable)
 }
 
 /// Fingerprint the Node executable LPM would select without executing it.
@@ -440,14 +459,32 @@ fn executable_fingerprint(kind: &[u8], executable: &Path) -> Option<String> {
     executable_fingerprint_from_canonical(kind, &canonical)
 }
 
-fn path_node_identity(executable: &Path) -> Option<PathNodeIdentity> {
+fn path_node_identity(
+    executable: &Path,
+    cwd: &Path,
+    managed_node_root: Option<&Path>,
+) -> Option<PathNodeIdentity> {
     let canonical_executable = executable.canonicalize().ok()?;
     let runtime_fingerprint =
         executable_fingerprint_from_canonical(b"script-path\0", &canonical_executable)?;
+    let context = if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
+        PathNodeCacheContext::LpmManaged
+    } else {
+        PathNodeCacheContext::WorkingDirectory(cwd.canonicalize().ok()?)
+    };
     Some(PathNodeIdentity {
         canonical_executable,
         runtime_fingerprint,
+        context,
     })
+}
+
+fn managed_node_root() -> Option<PathBuf> {
+    crate::node::runtimes_dir()
+        .ok()?
+        .join("node")
+        .canonicalize()
+        .ok()
 }
 
 fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Option<String> {
