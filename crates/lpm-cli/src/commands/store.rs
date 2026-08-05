@@ -6,6 +6,26 @@ use lpm_common::{
 use lpm_store::PackageStore;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum StoreCmd {
+    /// Verify the integrity and metadata of all store versions.
+    Verify {
+        /// Parse package.json files and validate package identity and integrity.
+        #[arg(long)]
+        deep: bool,
+
+        /// Refresh missing or stale package security caches.
+        #[arg(long)]
+        fix: bool,
+    },
+
+    /// Print the root directory of the shared package store.
+    Path,
+
+    /// Remove all data from every package store version.
+    Clean,
+}
+
 /// Manage the global content-addressable package store.
 ///
 /// Actions: verify, path, clean.
@@ -21,15 +41,15 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Reachability-aware orphan cleanup lives in `lpm cache prune` —
 /// `lpm store` covers integrity, listing the path, and the blunt wipe.
-pub async fn run(action: &str, deep: bool, fix: bool, json_output: bool) -> Result<(), LpmError> {
+pub async fn run(action: StoreCmd, json_output: bool) -> Result<(), LpmError> {
     let store = PackageStore::default_location()?;
     let root = LpmRoot::from_env()?;
 
     match action {
-        "verify" => with_shared_lock(root.store_lock(), || {
+        StoreCmd::Verify { deep, fix } => with_shared_lock(root.store_lock(), || {
             run_verify(&root, &store, deep, fix, json_output)
         }),
-        "path" => {
+        StoreCmd::Path => {
             let path = store.root().display().to_string();
             if json_output {
                 println!(
@@ -44,11 +64,7 @@ pub async fn run(action: &str, deep: bool, fix: bool, json_output: bool) -> Resu
             }
             Ok(())
         }
-        "clean" => with_exclusive_lock(root.store_lock(), || run_clean(&root, json_output)),
-        _ => Err(LpmError::Store(format!(
-            "unknown store action: {action}. Available: verify, path, clean. \
-             For reachability-aware orphan cleanup, use `lpm cache prune`."
-        ))),
+        StoreCmd::Clean => with_exclusive_lock(root.store_lock(), || run_clean(&root, json_output)),
     }
 }
 

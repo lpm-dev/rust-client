@@ -18,6 +18,26 @@ fn store_v1(project: &TempProject) -> std::path::PathBuf {
     store_root(project).join("v1")
 }
 
+fn assert_store_usage_error(output: &std::process::Output, command: &str, rejected_flag: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{command} must fail during argument parsing\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "human argument errors must keep stdout empty: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid command line") && stderr.contains(rejected_flag),
+        "{command} must identify {rejected_flag} as invalid:\n{stderr}",
+    );
+}
+
 fn v1_entry_dir(project: &TempProject, name: &str, version: &str) -> std::path::PathBuf {
     let safe_name = name.replace(['/', '\\'], "+");
     store_v1(project).join(format!("{safe_name}@{version}"))
@@ -182,6 +202,70 @@ fn store_path_json_envelope_carries_path() {
         store_root(&project).display().to_string(),
         "store path --json must report the isolated store root",
     );
+}
+
+#[test]
+fn store_path_rejects_fix_flag() {
+    let project = TempProject::empty(r#"{"name":"store-path-flags","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["store", "path", "--fix"])
+        .output()
+        .expect("run lpm store path --fix");
+
+    assert_store_usage_error(&output, "lpm store path --fix", "--fix");
+}
+
+#[test]
+fn store_path_rejects_deep_flag_with_json_usage_error() {
+    let project = TempProject::empty(r#"{"name":"store-path-flags","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "store", "path", "--deep"])
+        .output()
+        .expect("run lpm --json store path --deep");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid store flags must fail during argument parsing"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "JSON argument errors must keep stderr empty: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("invalid store flags must return one JSON envelope");
+    assert_eq!(envelope["schema_version"], serde_json::json!(1));
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("usage"));
+    assert_eq!(envelope["kind"], serde_json::json!("unknown_argument"));
+    assert_eq!(envelope["argument"], serde_json::json!("--deep"));
+}
+
+#[test]
+fn store_verify_rejects_deep_flag_before_subcommand() {
+    let project = TempProject::empty(r#"{"name":"store-verify-flags","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["store", "--deep", "verify"])
+        .output()
+        .expect("run lpm store --deep verify");
+
+    assert_store_usage_error(&output, "lpm store --deep verify", "--deep");
+}
+
+#[test]
+fn store_verify_rejects_fix_flag_before_subcommand() {
+    let project = TempProject::empty(r#"{"name":"store-verify-flags","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["store", "--fix", "verify"])
+        .output()
+        .expect("run lpm store --fix verify");
+
+    assert_store_usage_error(&output, "lpm store --fix verify", "--fix");
 }
 
 // ─── verify subcommand ────────────────────────────────────────────────
@@ -480,6 +564,42 @@ fn store_clean_on_empty_store_reports_idempotent_success() {
 }
 
 #[test]
+fn store_clean_rejects_deep_flag_without_removing_entries() {
+    let project = TempProject::empty(r#"{"name":"store-clean-flags","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "kept", "1.0.0", true);
+    let entry = v1_entry_dir(&project, "kept", "1.0.0");
+
+    let output = lpm(&project)
+        .args(["store", "clean", "--deep"])
+        .output()
+        .expect("run lpm store clean --deep");
+
+    assert_store_usage_error(&output, "lpm store clean --deep", "--deep");
+    assert!(
+        entry.exists(),
+        "argument rejection must prevent store cleanup"
+    );
+}
+
+#[test]
+fn store_clean_rejects_fix_flag_without_removing_entries() {
+    let project = TempProject::empty(r#"{"name":"store-clean-flags","version":"1.0.0"}"#);
+    seed_v1_entry(&project, "kept", "1.0.0", true);
+    let entry = v1_entry_dir(&project, "kept", "1.0.0");
+
+    let output = lpm(&project)
+        .args(["store", "clean", "--fix"])
+        .output()
+        .expect("run lpm store clean --fix");
+
+    assert_store_usage_error(&output, "lpm store clean --fix", "--fix");
+    assert!(
+        entry.exists(),
+        "argument rejection must prevent store cleanup"
+    );
+}
+
+#[test]
 fn store_clean_wipes_v1_and_v2_directories() {
     let project = TempProject::empty(r#"{"name":"store-clean","version":"1.0.0"}"#);
 
@@ -553,7 +673,7 @@ fn store_clean_human_uses_slim_completion() {
 }
 
 #[test]
-fn store_unknown_action_fails_with_helpful_message() {
+fn store_unknown_action_fails_at_parser_with_store_help_hint() {
     let project = TempProject::empty(r#"{"name":"store-unknown","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -561,14 +681,39 @@ fn store_unknown_action_fails_with_helpful_message() {
         .output()
         .expect("failed to run lpm store bogus");
 
-    assert!(
-        !output.status.success(),
-        "unknown store action must exit non-zero"
-    );
+    assert_eq!(output.status.code(), Some(2));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("verify") && stderr.contains("clean") && stderr.contains("path"),
-        "stderr must list valid actions, got:\n{stderr}"
+        stderr.contains("unrecognized subcommand 'no-such-action'")
+            && stderr.contains("Run `lpm store --help`"),
+        "stderr must identify the invalid action and point to store help, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn store_help_scopes_verify_flags_to_verify_subcommand() {
+    let project = TempProject::empty(r#"{"name":"store-help","version":"1.0.0"}"#);
+
+    let store_help = lpm(&project)
+        .args(["store", "--help"])
+        .output()
+        .expect("run lpm store --help");
+    assert!(store_help.status.success());
+    let store_stdout = String::from_utf8_lossy(&store_help.stdout);
+    assert!(
+        !store_stdout.contains("--deep") && !store_stdout.contains("--fix"),
+        "parent store help must not advertise verify-only flags:\n{store_stdout}"
+    );
+
+    let verify_help = lpm(&project)
+        .args(["store", "verify", "--help"])
+        .output()
+        .expect("run lpm store verify --help");
+    assert!(verify_help.status.success());
+    let verify_stdout = String::from_utf8_lossy(&verify_help.stdout);
+    assert!(
+        verify_stdout.contains("--deep") && verify_stdout.contains("--fix"),
+        "verify help must advertise both verification flags:\n{verify_stdout}"
     );
 }

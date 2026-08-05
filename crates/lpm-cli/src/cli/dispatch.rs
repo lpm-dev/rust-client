@@ -1718,12 +1718,8 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Store(args) => {
-            let lifecycle_args::StoreArgs {
-                action,
-                deep,
-                fix,
-            } = args;
-            commands::store::run(&action, deep, fix, cli.json).await
+            let lifecycle_args::StoreArgs { action } = args;
+            commands::store::run(action, cli.json).await
         }
         Commands::Catalog(args) => {
             let lifecycle_args::CatalogArgs {
