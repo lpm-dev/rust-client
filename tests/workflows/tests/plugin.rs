@@ -7,7 +7,7 @@ use support::{TempProject, lpm};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const ROLLDOWN_UPDATE_VERSION: &str = "1.2.3";
+const ROLLDOWN_UPDATE_VERSION: &str = "1.2.4";
 
 fn plugin_root(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("plugins")
@@ -152,7 +152,7 @@ async fn mount_rolldown_update_graph(server: &MockServer) {
         ("bin/cli.mjs", b"#!/usr/bin/env node\n"),
         (
             "package.json",
-            br#"{"name":"rolldown","version":"1.2.3","bin":{"rolldown":"./bin/cli.mjs"}}"#,
+            br#"{"name":"rolldown","version":"1.2.4","bin":{"rolldown":"./bin/cli.mjs"}}"#,
         ),
     ]);
     let pluginutils_tarball = create_test_tarball(&[(
@@ -171,7 +171,7 @@ async fn mount_rolldown_update_graph(server: &MockServer) {
         ("binding.node", b"binding-bytes"),
     ]);
 
-    let root_path = "/rolldown/-/rolldown-1.2.3.tgz";
+    let root_path = "/rolldown/-/rolldown-1.2.4.tgz";
     let pluginutils_path = "/@rolldown/pluginutils/-/pluginutils-1.1.0.tgz";
     let oxc_types_path = "/@oxc-project/types/-/types-0.143.0.tgz";
     let binding_path = format!(
@@ -306,7 +306,7 @@ fn plugin_list_json_reports_installed_versions_and_known_latest_versions() {
     let rolldown = plugin_entry(plugins, "rolldown");
     assert_eq!(rolldown["installed"], serde_json::json!([]));
     assert_eq!(rolldown["current"], serde_json::json!("not installed"));
-    assert_eq!(rolldown["latest"], serde_json::json!("1.2.2"));
+    assert_eq!(rolldown["latest"], serde_json::json!("1.2.3"));
 
     insta::assert_json_snapshot!("plugin_list_json_one_installed_plugin", envelope);
 }

@@ -34,7 +34,7 @@ expression: envelope
       "kind": "plugin",
       "installed": [],
       "current": "not installed",
-      "latest": "1.2.2",
+      "latest": "1.2.3",
       "status": "not installed",
       "outdated": false,
       "update_supported": true,
