@@ -3,6 +3,12 @@ use super::types::{OriginKey, RegistryTarget, TaggedBool, TaggedPath, TaggedRoot
 use lpm_common::{TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy)]
+pub(super) enum CredentialPolicy<'a> {
+    Accept,
+    Refuse { warning: &'a str },
+}
+
 impl NpmrcConfig {
     /// Parse a single `.npmrc` file's textual content as one layer.
     /// Auth buffers are populated but **not** resolved — call
@@ -54,7 +60,26 @@ impl NpmrcConfig {
         is_project_layer: bool,
         env_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::parse_layer_with_credential_policy(
+            content,
+            source_label,
+            source_dir,
+            is_project_layer,
+            CredentialPolicy::Accept,
+            env_lookup,
+        )
+    }
+
+    pub(super) fn parse_layer_with_credential_policy(
+        content: &str,
+        source_label: &str,
+        source_dir: Option<&Path>,
+        is_project_layer: bool,
+        credential_policy: CredentialPolicy<'_>,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let mut cfg = NpmrcConfig::default();
+        let mut emitted_credential_refusal = false;
 
         // Strip leading UTF-8 BOM if present. Some Windows editors save
         // .npmrc with one and npm tolerates it.
@@ -74,6 +99,17 @@ impl NpmrcConfig {
                 continue;
             };
             let key = line[..eq_idx].trim();
+
+            if npmrc_key_is_credential(key)
+                && let CredentialPolicy::Refuse { warning } = credential_policy
+            {
+                if !emitted_credential_refusal {
+                    cfg.security_warnings.push(warning.to_string());
+                    emitted_credential_refusal = true;
+                }
+                continue;
+            }
+
             let raw_value = line[eq_idx + 1..].trim();
             let value = strip_surrounding_quotes(raw_value);
 
@@ -129,6 +165,23 @@ impl NpmrcConfig {
         cfg.finalize();
         cfg
     }
+}
+
+fn npmrc_key_is_credential(key: &str) -> bool {
+    if matches!(key, "_authToken" | "_auth" | "_username" | "_password") {
+        return true;
+    }
+
+    let Some(rest) = key.strip_prefix("//") else {
+        return false;
+    };
+    let Some(split_idx) = rest.rfind("/:") else {
+        return false;
+    };
+    matches!(
+        &rest[split_idx + 2..],
+        "_authToken" | "_auth" | "_username" | "_password"
+    )
 }
 
 /// Strip surrounding single or double quotes from a value, if any.

@@ -1229,33 +1229,29 @@ fn parse_npmrc_token() -> Result<Option<String>, String> {
 
 /// Parse a single .npmrc file for the npm registry auth token.
 ///
-/// On Unix, refuses to surface the token when the file's mode is more
-/// permissive than `0o600` — a world-readable `.npmrc` in a cloned
-/// repo could otherwise steer npm auth toward a token chosen by the
-/// repo's author (the M6 hazard). The previous pre-fix behaviour
-/// only emitted a `tracing::warn` and still returned the token, which
-/// hid the risk in default-quiet logs.
+/// On Unix, refuses to surface the token when group or other permission bits
+/// are set. The content and mode come from the same opened file descriptor.
 fn parse_npmrc_file(path: &std::path::Path) -> Result<Option<String>, String> {
-    let content =
-        match lpm_common::read_text_file_capped(path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES) {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        };
+    let (content, _file_metadata) = match lpm_common::read_text_file_capped_with_metadata(
+        path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(opened_file) => opened_file,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path)
-            && (meta.permissions().mode() & 0o777) > 0o600
-        {
+        let permissions = _file_metadata.permissions();
+        if !lpm_common::permissions_are_owner_only(&permissions) {
             tracing::warn!(
-                ".npmrc at {} has permissive mode {:o} (>0o600); \
-                 refusing to use its auth token to defeat hostile-repo \
-                 attacks. Run `chmod 600 {}` to restore the token \
-                 source.",
+                ".npmrc at {} has mode {:04o}, which grants group or other access; \
+                 refusing to use its auth token. Run `chmod 600 {}` to restore \
+                 this credential source.",
                 path.display(),
-                meta.permissions().mode() & 0o777,
+                permissions.mode() & 0o777,
                 path.display(),
             );
             return Ok(None);
@@ -3623,6 +3619,39 @@ mod tests {
             parse_npmrc_file(&path).unwrap().as_deref(),
             Some("legit_token"),
             "0o600 perms must allow the token surface",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_npmrc_file_refuses_token_when_owner_and_other_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".npmrc");
+        std::fs::write(&path, "//registry.npmjs.org/:_authToken=exposed_token\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o404)).unwrap();
+
+        assert!(
+            parse_npmrc_file(&path).unwrap().is_none(),
+            "an other-readable file must not supply credentials",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_npmrc_file_accepts_token_with_owner_only_0o700_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".npmrc");
+        std::fs::write(&path, "//registry.npmjs.org/:_authToken=private_token\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            parse_npmrc_file(&path).unwrap().as_deref(),
+            Some("private_token"),
+            "owner-only permissions must allow credentials",
         );
     }
 }

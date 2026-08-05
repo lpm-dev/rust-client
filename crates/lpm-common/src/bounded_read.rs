@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -69,6 +69,13 @@ impl From<BoundedReadError> for crate::error::LpmError {
 /// Symlinks retain normal `File::open` behavior and the limit applies to the
 /// opened target.
 pub fn read_file_capped(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
+    read_file_capped_with_metadata(path, limit).map(|(bytes, _)| bytes)
+}
+
+fn read_file_capped_with_metadata(
+    path: &Path,
+    limit: u64,
+) -> Result<(Vec<u8>, Metadata), BoundedReadError> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -95,16 +102,40 @@ pub fn read_file_capped(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadE
         });
     }
 
-    read_opened_file_capped(&mut file, path, limit)
+    let bytes = read_opened_file_capped(&mut file, path, limit)?;
+    Ok((bytes, metadata))
 }
 
 /// Read a bounded local file and validate it as UTF-8 text.
 pub fn read_text_file_capped(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
-    let bytes = read_file_capped(path, limit)?;
-    String::from_utf8(bytes).map_err(|source| BoundedReadError::InvalidUtf8 {
-        path: path.to_path_buf(),
-        source: source.utf8_error(),
-    })
+    read_text_file_capped_with_metadata(path, limit).map(|(content, _)| content)
+}
+
+/// Read a bounded UTF-8 text file and return metadata from the opened file.
+///
+/// The metadata and content come from the same file descriptor. Callers can
+/// therefore make security decisions about the file that supplied the bytes,
+/// even if the path is a symlink or is replaced concurrently.
+pub fn read_text_file_capped_with_metadata(
+    path: &Path,
+    limit: u64,
+) -> Result<(String, Metadata), BoundedReadError> {
+    let (bytes, metadata) = read_file_capped_with_metadata(path, limit)?;
+    String::from_utf8(bytes)
+        .map_err(|source| BoundedReadError::InvalidUtf8 {
+            path: path.to_path_buf(),
+            source: source.utf8_error(),
+        })
+        .map(|content| (content, metadata))
+}
+
+/// Return whether a Unix mode denies all group and other permissions.
+#[cfg(unix)]
+#[inline]
+pub fn permissions_are_owner_only(permissions: &std::fs::Permissions) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    permissions.mode() & 0o077 == 0
 }
 
 fn read_opened_file_capped<R: Read>(
@@ -222,6 +253,46 @@ mod tests {
         assert!(matches!(error, BoundedReadError::InvalidUtf8 { .. }));
         assert!(!error.to_string().contains("TOP_SECRET"));
         assert!(!format!("{error:?}").contains("TOP_SECRET"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_read_only_mode_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(!permissions_are_owner_only(
+            &std::fs::Permissions::from_mode(0o004)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_and_other_read_mode_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(!permissions_are_owner_only(
+            &std::fs::Permissions::from_mode(0o404)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_read_write_mode_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(permissions_are_owner_only(
+            &std::fs::Permissions::from_mode(0o600)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_full_access_mode_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(permissions_are_owner_only(
+            &std::fs::Permissions::from_mode(0o700)
+        ));
     }
 
     #[cfg(unix)]
