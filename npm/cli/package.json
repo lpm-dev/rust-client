@@ -1,6 +1,6 @@
 {
   "name": "@lpm-registry/cli",
-  "version": "0.71.0",
+  "version": "0.72.0",
   "description": "LPM CLI native binary installer for npm",
   "repository": {
     "type": "git",
@@ -26,12 +26,12 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@lpm-registry/cli-darwin-arm64": "0.71.0",
-    "@lpm-registry/cli-darwin-x64": "0.71.0",
-    "@lpm-registry/cli-linux-arm64": "0.71.0",
-    "@lpm-registry/cli-linux-x64": "0.71.0",
-    "@lpm-registry/cli-linux-x64-musl": "0.71.0",
-    "@lpm-registry/cli-win32-x64": "0.71.0"
+    "@lpm-registry/cli-darwin-arm64": "0.72.0",
+    "@lpm-registry/cli-darwin-x64": "0.72.0",
+    "@lpm-registry/cli-linux-arm64": "0.72.0",
+    "@lpm-registry/cli-linux-x64": "0.72.0",
+    "@lpm-registry/cli-linux-x64-musl": "0.72.0",
+    "@lpm-registry/cli-win32-x64": "0.72.0"
   },
   "type": "module",
   "engines": {
