@@ -364,7 +364,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary: lpm-win32-x64.exe
-            timeout_minutes: 30
+            timeout_minutes: 60
 
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
