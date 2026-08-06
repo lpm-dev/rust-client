@@ -1,0 +1,15 @@
+---
+source: tests/workflows/tests/auth_lifecycle.rs
+expression: json
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error_code": "credential_import_rejected",
+  "error": {
+    "code": "CREDENTIAL_IMPORT_REJECTED",
+    "message": "cannot save CI_JOB_TOKEN for `lpm login --gitlab --save-env-token`",
+    "command": "lpm login --gitlab --save-env-token",
+    "source": "CI_JOB_TOKEN"
+  }
+}

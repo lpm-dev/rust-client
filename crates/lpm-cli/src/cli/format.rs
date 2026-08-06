@@ -1,9 +1,9 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use miette::Diagnostic as _;
 
 use crate::{auth, install_ui};
 
-use super::args::Cli;
+use super::args::{Cli, Commands};
 use super::helpers::{args_for_cli_parse, argv_requests_json, clap_help_hint_from_argv};
 
 pub(super) fn parse_cli_or_exit() -> Cli {
@@ -11,7 +11,12 @@ pub(super) fn parse_cli_or_exit() -> Cli {
     let json_output = argv_requests_json(&args);
     let help_hint = clap_help_hint_from_argv(&args);
     match Cli::try_parse_from(args) {
-        Ok(cli) => cli,
+        Ok(cli) => {
+            if let Some(error) = post_parse_error(&cli) {
+                exit_with_clap_error(error, json_output, help_hint);
+            }
+            cli
+        }
         Err(error) => exit_with_clap_error(error, json_output, help_hint),
     }
 }
@@ -42,6 +47,24 @@ where
                 .to_str()
                 .is_some_and(|value| value.starts_with("--registry=") || value.starts_with("-r"))
     })
+}
+
+fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
+    let Some(Commands::Login(args)) = &cli.command else {
+        return None;
+    };
+    if !args.save_env_token || args.token.is_none() {
+        return None;
+    }
+
+    let mut command = Cli::command();
+    let login = command
+        .find_subcommand_mut("login")
+        .expect("login command must exist");
+    Some(login.error(
+        clap::error::ErrorKind::ArgumentConflict,
+        "the argument '--save-env-token' cannot be used with '--token <TOKEN>'",
+    ))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -213,6 +236,33 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
             "error_code": error.error_code(),
             "error": {
                 "code": "UNSUPPORTED_AUTH_SOURCE",
+                "message": error.to_string(),
+                "command": command,
+                "source": auth_source,
+            }
+        }),
+        lpm_common::LpmError::CredentialImportUnavailable { command, expected } => {
+            serde_json::json!({
+                "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+                "success": false,
+                "error_code": error.error_code(),
+                "error": {
+                    "code": "CREDENTIAL_IMPORT_UNAVAILABLE",
+                    "message": error.to_string(),
+                    "command": command,
+                    "expected": expected,
+                }
+            })
+        }
+        lpm_common::LpmError::CredentialImportRejected {
+            command,
+            auth_source,
+        } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": "CREDENTIAL_IMPORT_REJECTED",
                 "message": error.to_string(),
                 "command": command,
                 "source": auth_source,
@@ -514,6 +564,27 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         } => {
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
                 "Unsupported authentication source",
+            ))];
+            push_detail(&mut lines, "command", install_ui::yellow(command));
+            push_detail(&mut lines, "source", install_ui::yellow(auth_source));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::CredentialImportUnavailable { command, expected } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Environment credential is not available",
+            ))];
+            push_detail(&mut lines, "command", install_ui::yellow(command));
+            push_detail(&mut lines, "expected", install_ui::yellow(expected));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::CredentialImportRejected {
+            command,
+            auth_source,
+        } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Credential cannot be saved",
             ))];
             push_detail(&mut lines, "command", install_ui::yellow(command));
             push_detail(&mut lines, "source", install_ui::yellow(auth_source));
@@ -1127,6 +1198,23 @@ fn clap_help_hint(error: &clap::Error, fallback: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_token_conflicts_with_login_environment_import() {
+        let cli = Cli::try_parse_from([
+            "lpm",
+            "--token",
+            "github-token",
+            "login",
+            "--github",
+            "--save-env-token",
+        ])
+        .expect("clap parses a global token before post-parse validation");
+
+        let error = post_parse_error(&cli)
+            .expect("global --token and --save-env-token must be rejected together");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn setup_ci_registry_flag_scan_detects_every_explicit_form() {

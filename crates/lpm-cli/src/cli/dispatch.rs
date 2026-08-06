@@ -1525,13 +1525,14 @@ async fn async_main() -> Result<()> {
                 gitlab,
                 login_registry,
                 token,
+                save_env_token,
             } = args;
             if npm {
                 commands::third_party_login::run_npm(token, cli.json).await
             } else if github {
-                commands::third_party_login::run_github(token, cli.json)
+                commands::third_party_login::run_github(token, save_env_token, cli.json)
             } else if gitlab {
-                commands::third_party_login::run_gitlab(token, cli.json)
+                commands::third_party_login::run_gitlab(token, save_env_token, cli.json)
             } else if let Some(url) = login_registry.as_deref() {
                 commands::third_party_login::run_custom(url, token, cli.json)
             } else {

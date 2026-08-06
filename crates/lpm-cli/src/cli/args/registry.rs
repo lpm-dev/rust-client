@@ -141,6 +141,18 @@ pub(crate) struct StageArgs {
 }
 
 #[derive(Args)]
+#[command(
+    group(
+        clap::ArgGroup::new("login_target")
+            .args(["npm", "github", "gitlab", "login_registry"])
+            .multiple(false)
+    ),
+    group(
+        clap::ArgGroup::new("environment_import_target")
+            .args(["github", "gitlab"])
+            .multiple(false)
+    )
+)]
 pub(crate) struct LoginArgs {
     /// Log in to npm registry with npm web auth.
     #[arg(long)]
@@ -161,6 +173,10 @@ pub(crate) struct LoginArgs {
     /// Explicit token fallback for npm, GitHub Packages, GitLab Packages, or a custom registry.
     #[arg(long)]
     pub(crate) token: Option<String>,
+
+    /// Save GITHUB_TOKEN or GITLAB_TOKEN to secure storage.
+    #[arg(long, conflicts_with = "token", requires = "environment_import_target")]
+    pub(crate) save_env_token: bool,
 }
 
 #[derive(Args)]

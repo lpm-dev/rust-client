@@ -1649,6 +1649,342 @@ fn login_gitlab_with_explicit_token_under_json_stores_fallback_token() {
     assert_eq!(credentials[GITLAB_REGISTRY_URL], "gitlab-fallback-token");
 }
 
+#[test]
+fn login_github_with_environment_token_reports_transient_auth_without_storing_it() {
+    let project = TempProject::empty(r#"{"name":"login-gh-env","version":"1.0.0"}"#);
+    let secret = "github-environment-secret";
+
+    let output = lpm(&project)
+        .env("GITHUB_TOKEN", secret)
+        .args(["--json", "login", "--github"])
+        .output()
+        .expect("failed to run lpm --json login --github with GITHUB_TOKEN");
+
+    assert!(
+        output.status.success(),
+        "GitHub environment login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("env:GITHUB_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(false));
+    assert_eq!(json["storage_backend"], serde_json::Value::Null);
+    assert_eq!(json["storage_degraded"], serde_json::json!(false));
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "transient GitHub environment login must not create credential storage"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+
+    insta::assert_json_snapshot!("login_github_environment_token_is_transient", json);
+}
+
+#[test]
+fn login_gitlab_with_environment_token_reports_transient_auth_without_storing_it() {
+    let project = TempProject::empty(r#"{"name":"login-gitlab-env","version":"1.0.0"}"#);
+    let secret = "gitlab-environment-secret";
+
+    let output = lpm(&project)
+        .env("GITLAB_TOKEN", secret)
+        .args(["--json", "login", "--gitlab"])
+        .output()
+        .expect("failed to run lpm --json login --gitlab with GITLAB_TOKEN");
+
+    assert!(
+        output.status.success(),
+        "GitLab environment login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("env:GITLAB_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(false));
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "transient GitLab environment login must not create credential storage"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+}
+
+#[test]
+fn login_gitlab_with_ci_job_token_reports_transient_auth_without_storing_it() {
+    let project = TempProject::empty(r#"{"name":"login-gitlab-ci-env","version":"1.0.0"}"#);
+    let secret = "gitlab-ci-job-secret";
+
+    let output = lpm(&project)
+        .env("CI_JOB_TOKEN", secret)
+        .args(["--json", "login", "--gitlab"])
+        .output()
+        .expect("failed to run lpm --json login --gitlab with CI_JOB_TOKEN");
+
+    assert!(
+        output.status.success(),
+        "GitLab CI job login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("env:CI_JOB_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(false));
+    assert!(
+        !credentials_path(project.home()).exists(),
+        "transient GitLab CI job login must not create credential storage"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+}
+
+#[test]
+fn login_gitlab_prefers_gitlab_token_over_ci_job_token() {
+    let project = TempProject::empty(r#"{"name":"login-gitlab-env-precedence","version":"1.0.0"}"#);
+    let gitlab_secret = "gitlab-preferred-secret";
+    let ci_secret = "gitlab-ci-lower-priority-secret";
+
+    let output = lpm(&project)
+        .env("GITLAB_TOKEN", gitlab_secret)
+        .env("CI_JOB_TOKEN", ci_secret)
+        .args(["--json", "login", "--gitlab"])
+        .output()
+        .expect("failed to run lpm --json login --gitlab with both environment tokens");
+
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("env:GITLAB_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(false));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(gitlab_secret));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(ci_secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(gitlab_secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(ci_secret));
+}
+
+#[test]
+fn login_github_explicit_token_overrides_environment_token() {
+    let project =
+        TempProject::empty(r#"{"name":"login-gh-explicit-precedence","version":"1.0.0"}"#);
+    let environment_secret = "github-lower-priority-secret";
+    let explicit_secret = "github-explicit-secret";
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .env("GITHUB_TOKEN", environment_secret)
+        .args(["--json", "login", "--github", "--token", explicit_secret])
+        .output()
+        .expect("failed to run explicit GitHub login with GITHUB_TOKEN set");
+
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("explicit-token"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+    assert_eq!(
+        read_credentials(project.home())[GITHUB_REGISTRY_URL],
+        explicit_secret
+    );
+    for secret in [environment_secret, explicit_secret] {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+}
+
+#[test]
+fn login_github_save_env_token_rejects_global_token_before_storage() {
+    let project =
+        TempProject::empty(r#"{"name":"login-gh-global-token-conflict","version":"1.0.0"}"#);
+    let explicit_secret = "github-global-explicit-secret";
+    let environment_secret = "github-global-environment-secret";
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .env("GITHUB_TOKEN", environment_secret)
+        .args([
+            "--json",
+            "--token",
+            explicit_secret,
+            "login",
+            "--github",
+            "--save-env-token",
+        ])
+        .output()
+        .expect("failed to run conflicting global token import");
+
+    assert!(!output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], serde_json::json!("usage"));
+    assert_eq!(json["kind"], serde_json::json!("argument_conflict"));
+    assert_eq!(read_credentials(project.home()), serde_json::json!({}));
+    for secret in [explicit_secret, environment_secret] {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    }
+}
+
+#[test]
+fn login_github_save_env_token_persists_environment_credential() {
+    let project = TempProject::empty(r#"{"name":"login-gh-env-import","version":"1.0.0"}"#);
+    let secret = "github-import-secret";
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .env("GITHUB_TOKEN", secret)
+        .args(["--json", "login", "--github", "--save-env-token"])
+        .output()
+        .expect("failed to import GITHUB_TOKEN");
+
+    assert!(
+        output.status.success(),
+        "GitHub environment import should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("env:GITHUB_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+    assert_eq!(
+        read_credentials(project.home())[GITHUB_REGISTRY_URL],
+        secret
+    );
+    let encrypted = std::fs::read_to_string(credentials_path(project.home()))
+        .expect("encrypted credential file should exist");
+    assert!(!encrypted.contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+}
+
+#[test]
+fn login_gitlab_save_env_token_persists_environment_credential() {
+    let project = TempProject::empty(r#"{"name":"login-gitlab-env-import","version":"1.0.0"}"#);
+    let secret = "gitlab-import-secret";
+    write_credentials_store(project.home(), &serde_json::json!({}));
+
+    let output = lpm(&project)
+        .env("GITLAB_TOKEN", secret)
+        .args(["--json", "login", "--gitlab", "--save-env-token"])
+        .output()
+        .expect("failed to import GITLAB_TOKEN");
+
+    assert!(
+        output.status.success(),
+        "GitLab environment import should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("env:GITLAB_TOKEN"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+    assert_eq!(
+        read_credentials(project.home())[GITLAB_REGISTRY_URL],
+        secret
+    );
+    let encrypted = std::fs::read_to_string(credentials_path(project.home()))
+        .expect("encrypted credential file should exist");
+    assert!(!encrypted.contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+}
+
+#[test]
+fn login_gitlab_save_env_token_rejects_ci_job_token_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"login-gitlab-ci-import","version":"1.0.0"}"#);
+    let secret = "gitlab-ci-rejected-secret";
+    write_credentials_store(
+        project.home(),
+        &serde_json::json!({ GITLAB_REGISTRY_URL: "stored-token-before-import" }),
+    );
+
+    let output = lpm(&project)
+        .env("CI_JOB_TOKEN", secret)
+        .args(["--json", "login", "--gitlab", "--save-env-token"])
+        .output()
+        .expect("failed to run rejected CI_JOB_TOKEN import");
+
+    assert!(!output.status.success(), "CI_JOB_TOKEN import must fail");
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(
+        json["error_code"],
+        serde_json::json!("credential_import_rejected")
+    );
+    assert_eq!(
+        read_credentials(project.home())[GITLAB_REGISTRY_URL],
+        "stored-token-before-import"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+
+    insta::assert_json_snapshot!("login_gitlab_rejects_ci_job_token_import", json);
+}
+
+#[test]
+fn login_github_save_env_token_requires_github_token_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"login-gh-env-import-missing","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--github", "--save-env-token"])
+        .output()
+        .expect("failed to run GitHub environment import without GITHUB_TOKEN");
+
+    assert!(!output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(
+        json["error_code"],
+        serde_json::json!("credential_import_unavailable")
+    );
+    assert_eq!(json["error"]["expected"], serde_json::json!("GITHUB_TOKEN"));
+    assert!(!credentials_path(project.home()).exists());
+}
+
+#[test]
+fn login_gitlab_save_env_token_requires_gitlab_token_without_mutation() {
+    let project =
+        TempProject::empty(r#"{"name":"login-gitlab-env-import-missing","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--gitlab", "--save-env-token"])
+        .output()
+        .expect("failed to run GitLab environment import without GITLAB_TOKEN");
+
+    assert!(!output.status.success());
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(
+        json["error_code"],
+        serde_json::json!("credential_import_unavailable")
+    );
+    assert_eq!(json["error"]["expected"], serde_json::json!("GITLAB_TOKEN"));
+    assert!(!credentials_path(project.home()).exists());
+}
+
+#[test]
+fn login_github_with_stored_token_reports_persistent_auth_source() {
+    let project = TempProject::empty(r#"{"name":"login-gh-stored","version":"1.0.0"}"#);
+    write_credentials_store(
+        project.home(),
+        &serde_json::json!({ GITHUB_REGISTRY_URL: "github-stored-secret" }),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "login", "--github"])
+        .output()
+        .expect("failed to run lpm --json login --github with stored token");
+
+    assert!(
+        output.status.success(),
+        "stored GitHub login should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["source"], serde_json::json!("stored"));
+    assert_eq!(json["stored"], serde_json::json!(true));
+    assert_eq!(
+        json["storage_backend"],
+        serde_json::json!("encrypted_file_fallback")
+    );
+    assert_eq!(json["storage_degraded"], serde_json::json!(true));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("github-stored-secret"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("github-stored-secret"));
+}
+
 #[cfg(unix)]
 #[test]
 fn login_github_with_gh_auth_under_json_does_not_store_cli_token() {

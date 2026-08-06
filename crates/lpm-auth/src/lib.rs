@@ -31,6 +31,7 @@ use aes_gcm::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
@@ -179,6 +180,73 @@ pub struct RegistryAuthStatus {
 struct StoredToken {
     token: String,
     backend: AuthStorageBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThirdPartyCredentialSource {
+    GithubEnvironment,
+    GitlabEnvironment,
+    GitlabCiJob,
+    GithubCli,
+    GitlabCli,
+    Stored(AuthStorageBackend),
+}
+
+impl ThirdPartyCredentialSource {
+    pub fn as_json_value(self) -> &'static str {
+        match self {
+            Self::GithubEnvironment => "env:GITHUB_TOKEN",
+            Self::GitlabEnvironment => "env:GITLAB_TOKEN",
+            Self::GitlabCiJob => "env:CI_JOB_TOKEN",
+            Self::GithubCli => "gh",
+            Self::GitlabCli => "glab",
+            Self::Stored(_) => "stored",
+        }
+    }
+
+    pub fn is_stored(self) -> bool {
+        matches!(self, Self::Stored(_))
+    }
+
+    pub fn storage_status(self) -> AuthStorageStatus {
+        match self {
+            Self::Stored(backend) => AuthStorageStatus::from_backend(backend),
+            _ => AuthStorageStatus::none(),
+        }
+    }
+
+    fn registry_status(self) -> &'static str {
+        match self {
+            Self::GithubEnvironment => "configured (env: GITHUB_TOKEN)",
+            Self::GitlabEnvironment => "configured (env: GITLAB_TOKEN)",
+            Self::GitlabCiJob => "configured (env: CI_JOB_TOKEN)",
+            Self::GithubCli => "available (gh auth)",
+            Self::GitlabCli => "available (glab auth)",
+            Self::Stored(backend) => backend.registry_status_label(),
+        }
+    }
+}
+
+pub struct ResolvedThirdPartyCredential {
+    token: SecretString,
+    source: ThirdPartyCredentialSource,
+}
+
+impl ResolvedThirdPartyCredential {
+    fn new(token: String, source: ThirdPartyCredentialSource) -> Self {
+        Self {
+            token: SecretString::from(token),
+            source,
+        }
+    }
+
+    pub fn source(&self) -> ThirdPartyCredentialSource {
+        self.source
+    }
+
+    pub fn with_exposed_token<T>(&self, operation: impl FnOnce(&str) -> T) -> T {
+        operation(self.token.expose_secret())
+    }
 }
 
 fn force_file_auth() -> bool {
@@ -425,13 +493,31 @@ const GITHUB_REGISTRY_URL: &str = "https://npm.pkg.github.com";
 ///
 /// Priority: `GITHUB_TOKEN` env → `gh auth token` → keychain(`npm.pkg.github.com`)
 pub fn get_github_token() -> Option<String> {
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
-        && !token.is_empty()
-    {
-        return Some(token);
-    }
+    resolve_github_credential().map(|credential| credential.with_exposed_token(str::to_owned))
+}
 
-    get_github_cli_token().or_else(|| get_stored_builtin_token(GITHUB_REGISTRY_URL))
+pub fn resolve_github_environment_credential() -> Option<ResolvedThirdPartyCredential> {
+    non_empty_environment_credential(
+        "GITHUB_TOKEN",
+        ThirdPartyCredentialSource::GithubEnvironment,
+    )
+}
+
+pub fn resolve_github_credential() -> Option<ResolvedThirdPartyCredential> {
+    resolve_github_environment_credential()
+        .or_else(|| {
+            get_github_cli_token().map(|token| {
+                ResolvedThirdPartyCredential::new(token, ThirdPartyCredentialSource::GithubCli)
+            })
+        })
+        .or_else(|| {
+            get_stored_builtin_token_with_backend(GITHUB_REGISTRY_URL).map(|stored| {
+                ResolvedThirdPartyCredential::new(
+                    stored.token,
+                    ThirdPartyCredentialSource::Stored(stored.backend),
+                )
+            })
+        })
 }
 
 /// Store a GitHub Packages token in the keychain.
@@ -466,27 +552,41 @@ pub fn get_gitlab_token() -> Option<String> {
 /// The GitLab CLI token is only used for `gitlab.com`. Self-managed GitLab
 /// instances keep the existing env/keychain/manual-token behavior.
 pub fn get_gitlab_token_for_host(gitlab_host: &str) -> Option<String> {
-    // GITLAB_TOKEN (personal access token / deploy token)
-    if let Ok(token) = std::env::var("GITLAB_TOKEN")
-        && !token.is_empty()
-    {
-        return Some(token);
-    }
+    resolve_gitlab_credential_for_host(gitlab_host)
+        .map(|credential| credential.with_exposed_token(str::to_owned))
+}
 
-    // CI_JOB_TOKEN (GitLab CI/CD automatic token)
-    if let Ok(token) = std::env::var("CI_JOB_TOKEN")
-        && !token.is_empty()
-    {
-        return Some(token);
-    }
+pub fn resolve_gitlab_environment_credential() -> Option<ResolvedThirdPartyCredential> {
+    non_empty_environment_credential(
+        "GITLAB_TOKEN",
+        ThirdPartyCredentialSource::GitlabEnvironment,
+    )
+    .or_else(|| {
+        non_empty_environment_credential("CI_JOB_TOKEN", ThirdPartyCredentialSource::GitlabCiJob)
+    })
+}
 
-    if is_default_gitlab_host(gitlab_host)
-        && let Some(token) = get_gitlab_cli_token()
-    {
-        return Some(token);
-    }
-
-    get_stored_builtin_token(GITLAB_REGISTRY_URL)
+pub fn resolve_gitlab_credential_for_host(
+    gitlab_host: &str,
+) -> Option<ResolvedThirdPartyCredential> {
+    resolve_gitlab_environment_credential()
+        .or_else(|| {
+            if is_default_gitlab_host(gitlab_host) {
+                get_gitlab_cli_token().map(|token| {
+                    ResolvedThirdPartyCredential::new(token, ThirdPartyCredentialSource::GitlabCli)
+                })
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            get_stored_builtin_token_with_backend(GITLAB_REGISTRY_URL).map(|stored| {
+                ResolvedThirdPartyCredential::new(
+                    stored.token,
+                    ThirdPartyCredentialSource::Stored(stored.backend),
+                )
+            })
+        })
 }
 
 /// Store a GitLab Packages token in the keychain.
@@ -510,6 +610,16 @@ fn get_stored_builtin_token(registry_url: &str) -> Option<String> {
 
 fn get_stored_builtin_token_with_backend(registry_url: &str) -> Option<StoredToken> {
     get_stored_access_token_with_backend(registry_url)
+}
+
+fn non_empty_environment_credential(
+    variable: &str,
+    source: ThirdPartyCredentialSource,
+) -> Option<ResolvedThirdPartyCredential> {
+    std::env::var(variable)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|token| ResolvedThirdPartyCredential::new(token, source))
 }
 
 fn get_stored_access_token_with_backend(registry_url: &str) -> Option<StoredToken> {
@@ -857,57 +967,21 @@ pub fn list_registry_auth_statuses() -> Vec<RegistryAuthStatus> {
         });
     }
 
-    // GitHub: env, host CLI, or keychain
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            result.push(RegistryAuthStatus {
-                name: "github.com".into(),
-                status: "configured (env: GITHUB_TOKEN)".into(),
-                storage: AuthStorageStatus::none(),
-            });
-        }
-    } else if get_github_cli_token().is_some() {
+    if let Some(credential) = resolve_github_credential() {
+        let source = credential.source();
         result.push(RegistryAuthStatus {
             name: "github.com".into(),
-            status: "available (gh auth)".into(),
-            storage: AuthStorageStatus::none(),
-        });
-    } else if let Some(stored) = get_stored_builtin_token_with_backend(GITHUB_REGISTRY_URL) {
-        result.push(RegistryAuthStatus {
-            name: "github.com".into(),
-            status: stored.backend.registry_status_label().into(),
-            storage: AuthStorageStatus::from_backend(stored.backend),
+            status: source.registry_status().into(),
+            storage: source.storage_status(),
         });
     }
 
-    // GitLab: env, host CLI, or keychain
-    if let Ok(token) = std::env::var("GITLAB_TOKEN") {
-        if !token.is_empty() {
-            result.push(RegistryAuthStatus {
-                name: "gitlab.com".into(),
-                status: "configured (env: GITLAB_TOKEN)".into(),
-                storage: AuthStorageStatus::none(),
-            });
-        }
-    } else if let Ok(token) = std::env::var("CI_JOB_TOKEN") {
-        if !token.is_empty() {
-            result.push(RegistryAuthStatus {
-                name: "gitlab.com".into(),
-                status: "configured (env: CI_JOB_TOKEN)".into(),
-                storage: AuthStorageStatus::none(),
-            });
-        }
-    } else if get_gitlab_cli_token().is_some() {
+    if let Some(credential) = resolve_gitlab_credential_for_host("https://gitlab.com") {
+        let source = credential.source();
         result.push(RegistryAuthStatus {
             name: "gitlab.com".into(),
-            status: "available (glab auth)".into(),
-            storage: AuthStorageStatus::none(),
-        });
-    } else if let Some(stored) = get_stored_builtin_token_with_backend(GITLAB_REGISTRY_URL) {
-        result.push(RegistryAuthStatus {
-            name: "gitlab.com".into(),
-            status: stored.backend.registry_status_label().into(),
-            storage: AuthStorageStatus::from_backend(stored.backend),
+            status: source.registry_status().into(),
+            storage: source.storage_status(),
         });
     }
 

@@ -13,7 +13,7 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
     if let Some(token) = token {
         return store_builtin_token(
             NPM_DISPLAY,
-            token,
+            &token,
             "explicit-token",
             json_output,
             true,
@@ -23,7 +23,7 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
     if let Some(token) = env_npm_token() {
         return store_builtin_token(
             NPM_DISPLAY,
-            token,
+            &token,
             "env:NPM_TOKEN",
             json_output,
             true,
@@ -72,11 +72,15 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
     Ok(())
 }
 
-pub fn run_github(token: Option<String>, json_output: bool) -> Result<(), LpmError> {
+pub fn run_github(
+    token: Option<String>,
+    save_env_token: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if let Some(token) = token {
         return store_builtin_token(
             GITHUB_DISPLAY,
-            token,
+            &token,
             "explicit-token",
             json_output,
             true,
@@ -84,28 +88,45 @@ pub fn run_github(token: Option<String>, json_output: bool) -> Result<(), LpmErr
         );
     }
 
-    if auth::get_github_cli_token().is_none() {
-        return Err(LpmError::Registry(
-            "GitHub Packages auth is not available. Run `gh auth login --hostname github.com`, pass `--token <token>`, or set GITHUB_TOKEN.".into(),
-        ));
+    if save_env_token {
+        let credential = auth::resolve_github_environment_credential().ok_or(
+            LpmError::CredentialImportUnavailable {
+                command: "lpm login --github --save-env-token",
+                expected: "GITHUB_TOKEN",
+            },
+        )?;
+        let source = credential.source();
+        return credential.with_exposed_token(|token| {
+            store_builtin_token(
+                GITHUB_DISPLAY,
+                token,
+                source.as_json_value(),
+                json_output,
+                true,
+                auth::set_github_token_with_backend,
+            )
+        });
     }
 
-    if json_output {
-        print_success_json(GITHUB_DISPLAY, "gh", false, None);
-    } else {
-        install_ui::done(
-            "GitHub Packages auth is available through GitHub CLI; no LPM token was stored",
-        );
-    }
+    let credential = auth::resolve_github_credential().ok_or_else(|| {
+        LpmError::Registry(
+            "GitHub Packages auth is not available. Set GITHUB_TOKEN, run `gh auth login --hostname github.com`, or pass `--token <token>`.".into(),
+        )
+    })?;
+    report_available_auth(GITHUB_DISPLAY, credential.source(), json_output);
 
     Ok(())
 }
 
-pub fn run_gitlab(token: Option<String>, json_output: bool) -> Result<(), LpmError> {
+pub fn run_gitlab(
+    token: Option<String>,
+    save_env_token: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if let Some(token) = token {
         return store_builtin_token(
             GITLAB_DISPLAY,
-            token,
+            &token,
             "explicit-token",
             json_output,
             true,
@@ -113,19 +134,40 @@ pub fn run_gitlab(token: Option<String>, json_output: bool) -> Result<(), LpmErr
         );
     }
 
-    if auth::get_gitlab_cli_token().is_none() {
-        return Err(LpmError::Registry(
-            "GitLab Packages auth is not available. Run `glab auth login`, pass `--token <token>`, or set GITLAB_TOKEN/CI_JOB_TOKEN.".into(),
-        ));
+    if save_env_token {
+        let credential = auth::resolve_gitlab_environment_credential().ok_or(
+            LpmError::CredentialImportUnavailable {
+                command: "lpm login --gitlab --save-env-token",
+                expected: "GITLAB_TOKEN",
+            },
+        )?;
+        let source = credential.source();
+        if source == auth::ThirdPartyCredentialSource::GitlabCiJob {
+            return Err(LpmError::CredentialImportRejected {
+                command: "lpm login --gitlab --save-env-token",
+                auth_source: "CI_JOB_TOKEN",
+            });
+        }
+        return credential.with_exposed_token(|token| {
+            store_builtin_token(
+                GITLAB_DISPLAY,
+                token,
+                source.as_json_value(),
+                json_output,
+                true,
+                auth::set_gitlab_token_with_backend,
+            )
+        });
     }
 
-    if json_output {
-        print_success_json(GITLAB_DISPLAY, "glab", false, None);
-    } else {
-        install_ui::done(
-            "GitLab Packages auth is available through GitLab CLI; no LPM token was stored",
-        );
-    }
+    let credential = auth::resolve_gitlab_credential_for_host("https://gitlab.com").ok_or_else(
+        || {
+            LpmError::Registry(
+                "GitLab Packages auth is not available. Set GITLAB_TOKEN or CI_JOB_TOKEN, run `glab auth login`, or pass `--token <token>`.".into(),
+            )
+        },
+    )?;
+    report_available_auth(GITLAB_DISPLAY, credential.source(), json_output);
 
     Ok(())
 }
@@ -160,7 +202,7 @@ pub fn run_custom(
 
     store_builtin_token(
         registry_url,
-        token,
+        &token,
         "explicit-token",
         json_output,
         false,
@@ -170,7 +212,7 @@ pub fn run_custom(
 
 fn store_builtin_token(
     registry_display: &str,
-    token: String,
+    token: &str,
     source: &str,
     json_output: bool,
     supports_otp_metadata: bool,
@@ -183,7 +225,7 @@ fn store_builtin_token(
     let metadata = token_metadata(registry_display, json_output, supports_otp_metadata);
     auth::clear_token_expiry(registry_display);
     let storage_backend =
-        store(&token).map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
+        store(token).map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
     let storage_status = auth::AuthStorageStatus::from_backend(storage_backend);
 
     if metadata.otp_required {
@@ -241,6 +283,37 @@ fn store_builtin_token(
     }
 
     Ok(())
+}
+
+fn report_available_auth(
+    registry_display: &str,
+    source: auth::ThirdPartyCredentialSource,
+    json_output: bool,
+) {
+    let storage_status = source.storage_status();
+    if json_output {
+        print_success_json(
+            registry_display,
+            source.as_json_value(),
+            source.is_stored(),
+            source.is_stored().then_some(storage_status),
+        );
+        return;
+    }
+
+    if source.is_stored() {
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Stored auth is available for {}",
+            install_ui::bold(registry_display),
+        ));
+        render_storage_backend(storage_status);
+    } else {
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Auth is available for {} through {}; no LPM token was stored",
+            install_ui::bold(registry_display),
+            install_ui::bold(source.as_json_value()),
+        ));
+    }
 }
 
 fn render_storage_backend(storage_status: auth::AuthStorageStatus) {
