@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::io::IsTerminal as _;
 use std::path::Path;
 
 use lpm_common::{LpmError, LpmRoot};
@@ -38,6 +40,77 @@ impl RuntimeInstallContext {
         self.platform
             .clone()
             .ok_or_else(|| LpmError::Script("runtime platform was not initialized".into()))
+    }
+}
+
+pub(super) fn confirm_before_apply(
+    checks: &[Check],
+    json_output: bool,
+    yes: bool,
+) -> Result<(), LpmError> {
+    let actions = planned_actions(checks)?;
+    if actions.is_empty() || yes {
+        return Ok(());
+    }
+    if json_output || !std::io::stdin().is_terminal() {
+        return Err(LpmError::Script(
+            "Automatic fixes require confirmation. Pass `--yes` in a non-interactive session."
+                .into(),
+        ));
+    }
+
+    install_ui::phase("Planned auto-fix actions");
+    for action in &actions {
+        install_ui::detail_untrusted(&format!("    {action}"));
+    }
+    install_ui::detail("");
+
+    let confirmed = cliclack::confirm("Apply these automatic fixes?")
+        .initial_value(false)
+        .interact()
+        .map_err(crate::prompt::prompt_err)?;
+    if confirmed {
+        Ok(())
+    } else {
+        Err(LpmError::Script(
+            "Automatic fixes were declined. No changes were made.".into(),
+        ))
+    }
+}
+
+fn planned_actions(checks: &[Check]) -> Result<Vec<String>, LpmError> {
+    let mut seen = HashSet::with_capacity(checks.len());
+    let mut actions = Vec::with_capacity(checks.len());
+
+    for check in checks {
+        if matches!(check.severity, Severity::Pass) {
+            continue;
+        }
+        if let Some(action) = check.entry.auto_fix {
+            let target = if action.requires_target() {
+                check.fix_target.as_ref()
+            } else {
+                None
+            };
+            if seen.insert((action, target)) {
+                actions.push(planned_action_label(action, check)?);
+            }
+        }
+    }
+
+    Ok(actions)
+}
+
+fn planned_action_label(action: DoctorFix, check: &Check) -> Result<String, LpmError> {
+    match action {
+        DoctorFix::ReplaceNodeModulesLink => Ok("replace the project node_modules link".into()),
+        DoctorFix::InstallNodeSpec | DoctorFix::InstallNode22 => {
+            Ok(format!("lpm use node@{}", target_node_spec(check)?))
+        }
+        DoctorFix::InstallBunSpec => Ok(format!("lpm use bun@{}", target_bun_spec(check)?)),
+        DoctorFix::ClaimTunnel => Ok(format!("lpm tunnel claim {}", target_tunnel_domain(check)?)),
+        DoctorFix::UpdatePlugin => Ok(format!("lpm plugin update {}", target_plugin_name(check)?)),
+        _ => Ok(action.label().into()),
     }
 }
 
@@ -294,5 +367,66 @@ mod tests {
         );
 
         assert_eq!(target_plugin_name(&check).unwrap(), "biome");
+    }
+
+    #[test]
+    fn planned_actions_deduplicate_actions_in_check_order() {
+        let checks = vec![
+            Check::warn(&doctor_catalog::LOCKFILE_BINARY_MISSING, "missing"),
+            Check::warn(&doctor_catalog::LOCKFILE_BINARY_STALE, "stale"),
+            Check::warn(&doctor_catalog::GITATTRIBUTES_MISSING, "missing"),
+        ];
+
+        assert_eq!(
+            planned_actions(&checks).unwrap(),
+            vec![
+                "reconcile lpm.lockb".to_string(),
+                "update .gitattributes".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_actions_keep_distinct_targets_for_one_action() {
+        let checks = vec![
+            Check::warn_with_fix_target(
+                &doctor_catalog::PLUGIN_UPDATE_AVAILABLE,
+                "biome update",
+                FixTarget::PluginName("biome".into()),
+            ),
+            Check::warn_with_fix_target(
+                &doctor_catalog::PLUGIN_UPDATE_AVAILABLE,
+                "oxlint update",
+                FixTarget::PluginName("oxlint".into()),
+            ),
+        ];
+
+        assert_eq!(
+            planned_actions(&checks).unwrap(),
+            vec![
+                "lpm plugin update biome".to_string(),
+                "lpm plugin update oxlint".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn confirmation_is_not_required_when_no_fixable_actions_exist() {
+        let checks = [Check::fail(
+            &doctor_catalog::REGISTRY_UNREACHABLE,
+            "offline",
+        )];
+
+        confirm_before_apply(&checks, true, false).unwrap();
+    }
+
+    #[test]
+    fn yes_bypasses_confirmation_for_noninteractive_fixes() {
+        let checks = [Check::warn(
+            &doctor_catalog::LOCKFILE_BINARY_MISSING,
+            "missing",
+        )];
+
+        confirm_before_apply(&checks, true, true).unwrap();
     }
 }

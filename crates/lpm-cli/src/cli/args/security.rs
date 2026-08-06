@@ -143,7 +143,9 @@ pub(crate) struct DoctorArgs {
     #[arg(long)]
     pub(crate) all: bool,
 
-    /// Auto-fix issues (install missing Node, run lpm install, run lpm fmt).
+    /// Apply supported automatic fixes after one confirmation.
+    ///
+    /// Non-interactive and JSON runs require `--yes` when a fix is available.
     ///
     /// Ignored when a subcommand is provided.
     #[arg(long)]

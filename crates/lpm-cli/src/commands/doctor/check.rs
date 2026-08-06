@@ -1,7 +1,7 @@
 use crate::doctor_catalog::{CheckEntry, DoctorFix, Severity};
 use crate::install_ui;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum FixTarget {
     NodeSpec(String),
     BunSpec(String),

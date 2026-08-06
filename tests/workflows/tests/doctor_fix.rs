@@ -229,6 +229,61 @@ fn doctor_fix_creates_gitattributes_when_lockfile_exists_without_it() {
 // ─── lockfile_binary_missing fix ──────────────────────────────────────
 
 #[test]
+fn doctor_fix_without_yes_in_noninteractive_session_refuses_before_mutation() {
+    let project = TempProject::empty(r#"{"name":"doctor-confirm","version":"1.0.0"}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+
+    let output = lpm_doctor_offline(&project)
+        .arg("doctor")
+        .arg("--fix")
+        .output()
+        .expect("failed to run lpm doctor --fix");
+
+    assert!(
+        !output.status.success(),
+        "non-interactive doctor --fix must require explicit confirmation"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--yes"),
+        "the refusal must explain how to confirm automatic fixes"
+    );
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "doctor must not apply a fix before confirmation"
+    );
+}
+
+#[test]
+fn doctor_fix_json_without_yes_emits_one_error_and_does_not_mutate() {
+    let project = TempProject::empty(r#"{"name":"doctor-confirm-json","version":"1.0.0"}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+
+    let output = lpm_doctor_offline(&project)
+        .args(["--json", "doctor", "--fix"])
+        .output()
+        .expect("failed to run lpm doctor --fix --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("doctor must emit one JSON error: {error}\n{stdout}"));
+
+    assert!(!output.status.success(), "the JSON refusal must fail");
+    assert_eq!(envelope["success"], false, "{envelope:#}");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("--yes")),
+        "the JSON error must explain how to confirm automatic fixes: {envelope:#}"
+    );
+    insta::assert_json_snapshot!("doctor_fix_requires_yes", envelope);
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "JSON mode must not apply a fix before confirmation"
+    );
+}
+
+#[test]
 fn doctor_fix_regenerates_binary_lockfile_when_toml_present() {
     let project = TempProject::empty(r#"{"name":"doctor-lockb","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
@@ -355,6 +410,7 @@ fn doctor_all_fix_prunes_store_entries_reported_as_orphaned() {
         .arg("doctor")
         .arg("--all")
         .arg("--fix")
+        .arg("--yes")
         .output()
         .expect("failed to run lpm doctor --all --fix --json");
     let stdout = String::from_utf8_lossy(&output.stdout);

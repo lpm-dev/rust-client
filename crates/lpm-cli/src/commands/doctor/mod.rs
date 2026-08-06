@@ -191,7 +191,7 @@ pub async fn run(
     json_output: bool,
     all: bool,
     fix: bool,
-    _yes: bool,
+    yes: bool,
 ) -> Result<(), LpmError> {
     let mut checks: Vec<Check> = Vec::new();
     let mut sweep_progress = if all && !json_output {
@@ -742,6 +742,7 @@ pub async fn run(
     }
 
     let fixes_applied = if fix {
+        self::fix::confirm_before_apply(&checks, json_output, yes)?;
         self::fix::apply(&checks, client, project_dir, json_output).await
     } else {
         Vec::new()
