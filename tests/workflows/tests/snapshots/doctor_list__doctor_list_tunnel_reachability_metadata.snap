@@ -1,0 +1,26 @@
+---
+source: tests/workflows/tests/doctor_list.rs
+expression: actual
+---
+{
+  "tunnel_active": {
+    "description": "The configured tunnel domain is claimed by your account and responds to a request.",
+    "when_fires": "Ownership lookup succeeds, and the reachability request returns a status other than 404.",
+    "remediation": "No action — informational pass."
+  },
+  "tunnel_idle": {
+    "description": "The configured tunnel domain is claimed by your account, but no tunnel is active.",
+    "when_fires": "Ownership lookup succeeds, and the reachability request returns 404.",
+    "remediation": "No action — informational pass."
+  },
+  "tunnel_unreachable": {
+    "description": "Your account owns the configured tunnel domain, but the domain did not respond.",
+    "when_fires": "Ownership lookup succeeds, but the HTTPS reachability request fails.",
+    "remediation": "Examine DNS and tunnel state. Then run `lpm doctor` again."
+  },
+  "tunnel_unverified": {
+    "description": "The registry request for tunnel domain ownership failed.",
+    "when_fires": "The registry ownership request fails.",
+    "remediation": "Run `lpm health`. Then run `lpm doctor` again."
+  }
+}

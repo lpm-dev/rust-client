@@ -246,6 +246,84 @@ fn doctor_list_filter_by_category_returns_subset() {
 }
 
 #[test]
+fn doctor_list_tunnel_reachability_metadata_matches_runtime_contract() {
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list", "--category", "tunnel"])
+        .output()
+        .expect("failed to run lpm doctor list --json --category tunnel");
+    assert!(
+        output.status.success(),
+        "doctor list failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_output(&output.stdout);
+    let relevant_codes = [
+        "tunnel_active",
+        "tunnel_idle",
+        "tunnel_unreachable",
+        "tunnel_unverified",
+    ];
+    let actual: BTreeMap<&str, serde_json::Value> = json["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|entry| {
+            let code = entry["code"].as_str()?;
+            relevant_codes.contains(&code).then(|| {
+                (
+                    code,
+                    serde_json::json!({
+                        "description": entry["description"],
+                        "when_fires": entry["when_fires"],
+                        "remediation": entry["remediation"],
+                    }),
+                )
+            })
+        })
+        .collect();
+
+    let expected = BTreeMap::from([
+        (
+            "tunnel_active",
+            serde_json::json!({
+                "description": "The configured tunnel domain is claimed by your account and responds to a request.",
+                "when_fires": "Ownership lookup succeeds, and the reachability request returns a status other than 404.",
+                "remediation": "No action — informational pass.",
+            }),
+        ),
+        (
+            "tunnel_idle",
+            serde_json::json!({
+                "description": "The configured tunnel domain is claimed by your account, but no tunnel is active.",
+                "when_fires": "Ownership lookup succeeds, and the reachability request returns 404.",
+                "remediation": "No action — informational pass.",
+            }),
+        ),
+        (
+            "tunnel_unreachable",
+            serde_json::json!({
+                "description": "Your account owns the configured tunnel domain, but the domain did not respond.",
+                "when_fires": "Ownership lookup succeeds, but the HTTPS reachability request fails.",
+                "remediation": "Examine DNS and tunnel state. Then run `lpm doctor` again.",
+            }),
+        ),
+        (
+            "tunnel_unverified",
+            serde_json::json!({
+                "description": "The registry request for tunnel domain ownership failed.",
+                "when_fires": "The registry ownership request fails.",
+                "remediation": "Run `lpm health`. Then run `lpm doctor` again.",
+            }),
+        ),
+    ]);
+
+    assert_eq!(actual, expected);
+    insta::assert_json_snapshot!("doctor_list_tunnel_reachability_metadata", actual);
+}
+
+#[test]
 fn doctor_list_includes_typescript_codes_from_tranche_1() {
     let codes = read_catalog_codes();
     for code in [
