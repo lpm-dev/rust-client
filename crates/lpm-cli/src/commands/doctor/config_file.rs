@@ -8,7 +8,7 @@ use super::check::Check;
 ///
 /// Checks:
 /// - Valid JSON syntax
-/// - Known top-level fields (runtime, env, tasks, tools, services, tunnel, publish, https)
+/// - Known top-level fields from the canonical generated schema
 /// - runtime.node is a valid version spec
 /// - tasks have valid structure (command, dependsOn, cache, outputs, inputs, env)
 /// - tools reference known managed tools
@@ -54,11 +54,8 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     let mut warnings: Vec<String> = Vec::new();
 
     // 2. Check for unknown top-level fields
-    let known_fields = [
-        "runtime", "env", "tasks", "tools", "services", "tunnel", "publish", "https",
-    ];
     for key in obj.keys() {
-        if !known_fields.contains(&key.as_str()) {
+        if !lpm_runner::lpm_json::is_supported_top_level_field(key) {
             warnings.push(format!("unknown field \"{key}\""));
         }
     }
