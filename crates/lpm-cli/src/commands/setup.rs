@@ -347,6 +347,7 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
         "  {}",
         "jobs:
     deploy:
+      runs-on: ubuntu-latest
       permissions:
         id-token: write
         contents: read

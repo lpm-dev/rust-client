@@ -183,6 +183,25 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
 }
 
 #[test]
+fn ci_setup_github_actions_emits_complete_job_with_default_runner() {
+    let project = TempProject::empty(r#"{"name":"ci-runner","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["setup", "ci", "github-actions"])
+        .output()
+        .expect("failed to run lpm setup ci github-actions");
+
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("jobs:\n    deploy:\n      runs-on: ubuntu-latest\n      permissions:"),
+        "GitHub Actions setup must emit a complete job with the default runner:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn ci_setup_github_actions_env_name_cannot_inject_terminal_rows() {
     let project = TempProject::empty(r#"{"name":"ci-controls","version":"1.0.0"}"#);
 
