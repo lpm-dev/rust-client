@@ -1,3 +1,4 @@
+mod effective;
 mod global_config;
 mod io;
 mod wizards;
@@ -20,6 +21,7 @@ pub(crate) use wizards::{
     TRUST_POLICY_KEY, TYPOSQUAT_GUARD_KEY, TyposquatGuardSelection, resolve_object_integrity_policy,
 };
 
+use effective::EffectiveConfig;
 use global_config::global_config_view_from_value;
 use io::{
     config_value_for_display, config_value_to_json, guard_generic_delete_against_force_floor,
@@ -479,26 +481,12 @@ pub async fn run(
             }
         }
         "list" | "ls" => {
-            let config = read_config(&config_path)?;
+            let current_dir = std::env::current_dir()?;
+            let config = EffectiveConfig::load(&current_dir)?;
             if json_output {
-                let mut json = serde_json::to_value(&config).unwrap_or(serde_json::json!({}));
-                if let Some(obj) = json.as_object_mut() {
-                    obj.insert("success".to_string(), serde_json::Value::Bool(true));
-                }
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                println!("{}", serde_json::to_string_pretty(&config.to_json())?);
             } else {
-                if let Some(table) = config.as_table() {
-                    if table.is_empty() {
-                        install_ui::warn("No configuration set");
-                    } else {
-                        for (k, v) in table {
-                            println!(
-                                "{}",
-                                crate::install_ui::terminal_line!("  {:<24} {}", k, v.to_string())
-                            );
-                        }
-                    }
-                }
+                config.print_human();
             }
         }
         _ => {

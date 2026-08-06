@@ -112,6 +112,14 @@ pub enum SavePrefix {
 }
 
 impl SavePrefix {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            SavePrefix::Caret => "^",
+            SavePrefix::Tilde => "~",
+            SavePrefix::Empty => "",
+        }
+    }
+
     /// Parse from a config / CLI string. Accepts `^`, `~`, and `""` only.
     /// Rejects `*` — wildcards are an explicit-per-package opt-in, not a
     /// default save policy.

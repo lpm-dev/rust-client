@@ -1,0 +1,215 @@
+---
+source: tests/workflows/tests/config.rs
+expression: snapshot
+---
+{
+  "success": true,
+  "action": "list",
+  "count": 34,
+  "entries": [
+    {
+      "key": "save-prefix",
+      "value": "^",
+      "source": "built-in default",
+      "group": "Dependency saving"
+    },
+    {
+      "key": "save-exact",
+      "value": false,
+      "source": "built-in default",
+      "group": "Dependency saving"
+    },
+    {
+      "key": "script-policy",
+      "value": "deny",
+      "source": "built-in default",
+      "group": "Lifecycle scripts"
+    },
+    {
+      "key": "triage-advisor",
+      "value": "none",
+      "source": "built-in default",
+      "group": "Lifecycle scripts"
+    },
+    {
+      "key": "sandbox.mode",
+      "value": "default",
+      "source": "built-in default",
+      "group": "Lifecycle scripts"
+    },
+    {
+      "key": "sandbox.allow-degraded",
+      "value": false,
+      "source": "built-in default",
+      "group": "Lifecycle scripts"
+    },
+    {
+      "key": "script-read-allow",
+      "value": [],
+      "source": "built-in default",
+      "group": "Lifecycle scripts"
+    },
+    {
+      "key": "max-sandbox-write-roots",
+      "value": [],
+      "source": "built-in default",
+      "group": "Lifecycle scripts"
+    },
+    {
+      "key": "minimum-release-age-secs",
+      "value": 86400,
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "release-age-policy",
+      "value": "direct",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "minimum-release-age-exclude",
+      "value": [],
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "sigstore.verify",
+      "value": "deny",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "sigstore.scope",
+      "value": "approved",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "sigstore.availability",
+      "value": "best-effort",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "signatures",
+      "value": false,
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "trust-policy",
+      "value": "off",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "typosquat-guard",
+      "value": "default",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.mode",
+      "value": "off",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.npm.policies.trusted_public_malicious_advisories",
+      "value": "block",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.npm.policies.lpm_ai_confirmed_malware",
+      "value": "block",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.npm.policies.lpm_ai_agent_control_surface",
+      "value": "warn",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.npm.policies.critical_vulnerability",
+      "value": "warn",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.npm.policies.lpm_ai_suspicious",
+      "value": "warn",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "integrity",
+      "value": "source",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "install-time-source-analysis",
+      "value": true,
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "fetch-lpm-security-insights",
+      "value": true,
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "engine-strict",
+      "value": true,
+      "source": "built-in default",
+      "group": "Installation"
+    },
+    {
+      "key": "strict-peer-dependencies",
+      "value": false,
+      "source": "built-in default",
+      "group": "Installation"
+    },
+    {
+      "key": "auto-install-peers",
+      "value": true,
+      "source": "built-in default",
+      "group": "Installation"
+    },
+    {
+      "key": "auto-install-lpm-skills",
+      "value": true,
+      "source": "built-in default",
+      "group": "Installation"
+    },
+    {
+      "key": "audit-after-install",
+      "value": false,
+      "source": "built-in default",
+      "group": "Installation"
+    },
+    {
+      "key": "linker",
+      "value": "hoisted",
+      "source": "built-in default",
+      "group": "Installation"
+    },
+    {
+      "key": "workspace-concurrency",
+      "value": "[available parallelism]",
+      "source": "built-in default",
+      "group": "Workspaces"
+    },
+    {
+      "key": "tunnel.relay-url",
+      "value": "wss://relay.lpm.fyi/connect",
+      "source": "built-in default",
+      "group": "Network"
+    }
+  ]
+}

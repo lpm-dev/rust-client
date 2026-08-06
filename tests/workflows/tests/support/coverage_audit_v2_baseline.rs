@@ -1079,16 +1079,21 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 46: lpm config list ──
     SurfaceV2 {
         id: 46,
-        scenarios: 1,
-        failure_modes_tested: &["JSON envelope reports all keys"],
-        failure_modes_known: &[
-            "empty config file returns empty object",
-            "config file with comments (JSON5 vs strict JSON)",
-            "list under a HOME that points to a non-writable mount",
+        scenarios: 7,
+        failure_modes_tested: &[
+            "empty user config reports every known effective key + source",
+            "project, user, and environment precedence sources",
+            "managed security floor sources",
+            "approved security posture sources",
+            "grouped human output",
+            "named policy extension expansion",
+            "malformed known value rejection",
+            "JSON envelope snapshot",
         ],
+        failure_modes_known: &["list under a HOME that points to a non-writable mount"],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 7)],
+        last_audited_at: "2026-08-06",
     },
     // ── id 47: lpm cache clean [subcat] ──
     SurfaceV2 {
