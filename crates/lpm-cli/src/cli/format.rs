@@ -218,6 +218,17 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "source": auth_source,
             }
         }),
+        lpm_common::LpmError::OtpRequired { command }
+        | lpm_common::LpmError::OtpInvalid { command } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": error.error_code().to_ascii_uppercase(),
+                "message": error.to_string(),
+                "command": command,
+            }
+        }),
         lpm_common::LpmError::TyposquatSuspected(context) => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -506,6 +517,22 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             ))];
             push_detail(&mut lines, "command", install_ui::yellow(command));
             push_detail(&mut lines, "source", install_ui::yellow(auth_source));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::OtpRequired { command } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "One-time password required",
+            ))];
+            push_detail(&mut lines, "command", install_ui::yellow(command));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::OtpInvalid { command } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Invalid or expired one-time password",
+            ))];
+            push_detail(&mut lines, "command", install_ui::yellow(command));
             push_diagnostic_help(&mut lines, error);
             lines
         }

@@ -1611,7 +1611,9 @@ async fn async_main() -> Result<()> {
                 commands::npmrc::run(&client, &cwd, registry_url, days, cli.json).await
             }
         },
-        Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
+        Commands::TokenRotate(args) => {
+            commands::token::run_rotate(&client, registry_url, args.otp, cli.json).await
+        }
         Commands::Outdated(args) => {
             let lifecycle_args::OutdatedArgs {
                 registry_only,

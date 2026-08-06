@@ -191,6 +191,13 @@ pub(crate) struct LogoutArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct TokenRotateArgs {
+    /// Six-digit authenticator code for an MFA-protected token.
+    #[arg(long, value_name = "CODE")]
+    pub(crate) otp: Option<String>,
+}
+
+#[derive(Args)]
 pub(crate) struct SetupArgs {
     #[command(subcommand)]
     pub(crate) action: SetupAction,

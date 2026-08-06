@@ -976,7 +976,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 40: lpm token-rotate ──
     SurfaceV2 {
         id: 40,
-        scenarios: 6,
+        scenarios: 16,
         failure_modes_tested: &[
             "replaces stored session token + expiry metadata",
             "human output reports secure storage and completion",
@@ -984,6 +984,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "explicit --token is rejected before network or storage changes",
             "CI-issued token is rejected before network or storage changes",
             "locally managed source predicate distinguishes all token sources",
+            "explicit OTP is validated and sent on the first request",
+            "malformed OTP is rejected before network or storage changes",
+            "OTP challenge returns stable JSON without clearing credentials",
+            "non-interactive OTP challenge instructs the user to pass --otp",
+            "rejected OTP returns stable JSON without clearing credentials",
+            "interactive OTP challenge uses a masked prompt and exactly one retry",
+            "non-OTP unauthorized response retains invalid-token cleanup",
         ],
         failure_modes_known: &[
             "rotation fails mid-store (partial-state recovery)",
@@ -994,7 +1001,9 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
             ("crates/lpm-auth/src/session.rs", 1),
-            ("tests/workflows/tests/token_rotate.rs", 5),
+            ("crates/lpm-cli/src/commands/token.rs", 3),
+            ("crates/lpm-cli/tests/token_rotate_interactive_tty.rs", 1),
+            ("tests/workflows/tests/token_rotate.rs", 11),
         ],
         last_audited_at: "2026-08-06",
     },

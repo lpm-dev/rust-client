@@ -341,6 +341,24 @@ pub enum LpmError {
         auth_source: &'static str,
     },
 
+    #[error("one-time password required for `{command}`")]
+    #[diagnostic(
+        code(lpm::otp_required),
+        help(
+            "Pass a fresh 6-digit authenticator code with `--otp <CODE>`, or run the command in an interactive terminal."
+        )
+    )]
+    OtpRequired { command: &'static str },
+
+    #[error("invalid or expired one-time password for `{command}`")]
+    #[diagnostic(
+        code(lpm::otp_invalid),
+        help(
+            "Get a fresh 6-digit code from your authenticator. Then retry the command or pass the code with `--otp <CODE>`."
+        )
+    )]
+    OtpInvalid { command: &'static str },
+
     #[error("forbidden: {0}")]
     #[diagnostic(
         code(lpm::forbidden),
@@ -663,6 +681,8 @@ impl LpmError {
             LpmError::AuthRequired => "auth_required",
             LpmError::SessionExpired => "session_expired",
             LpmError::UnsupportedAuthSource { .. } => "unsupported_auth_source",
+            LpmError::OtpRequired { .. } => "otp_required",
+            LpmError::OtpInvalid { .. } => "otp_invalid",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
             LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
@@ -842,6 +862,12 @@ mod tests {
                 command: "lpm token-rotate",
                 auth_source: "LPM_TOKEN",
             },
+            LpmError::OtpRequired {
+                command: "lpm token-rotate",
+            },
+            LpmError::OtpInvalid {
+                command: "lpm token-rotate",
+            },
             LpmError::Forbidden("x".into()),
             LpmError::NpmFirewallBlocked {
                 package: "is-number@7.0.0".into(),
@@ -985,6 +1011,20 @@ mod tests {
     #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(
+            LpmError::OtpRequired {
+                command: "lpm token-rotate",
+            }
+            .error_code(),
+            "otp_required"
+        );
+        assert_eq!(
+            LpmError::OtpInvalid {
+                command: "lpm token-rotate",
+            }
+            .error_code(),
+            "otp_invalid"
+        );
         assert_eq!(
             LpmError::UnsupportedAuthSource {
                 command: "lpm token-rotate",

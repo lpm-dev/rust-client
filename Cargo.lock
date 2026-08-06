@@ -3313,6 +3313,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "scrypt",
+ "secrecy",
  "serde",
  "serde_json",
  "sha1 0.10.6",

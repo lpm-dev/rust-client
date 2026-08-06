@@ -1,14 +1,35 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_registry::{RegistryClient, parse_capped_api_json};
+use secrecy::{ExposeSecret, SecretString};
+
+const COMMAND: &str = "lpm token-rotate";
+
+struct OtpCode(SecretString);
+
+impl OtpCode {
+    fn parse(value: String) -> Result<Self, LpmError> {
+        if is_valid_otp(&value) {
+            Ok(Self(SecretString::from(value)))
+        } else {
+            Err(LpmError::OtpInvalid { command: COMMAND })
+        }
+    }
+
+    fn expose(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
 
 /// Rotate the current token (create new, revoke old).
 pub async fn run_rotate(
     client: &RegistryClient,
     registry_url: &str,
+    otp: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
     require_locally_managed_auth(client)?;
+    let otp = otp.map(OtpCode::parse).transpose()?;
 
     if !json_output {
         install_ui::phase_line(crate::install_ui::terminal_line!(
@@ -17,13 +38,19 @@ pub async fn run_rotate(
         ));
     }
 
-    // The server handles rotation: POST creates new token and invalidates old
     let url = format!("{}/api/registry/-/token/rotate", registry_url);
 
-    let response = client.post_json_raw(&url, &serde_json::json!({})).await?;
-
-    let body: serde_json::Value =
-        parse_capped_api_json(response, "token rotation response").await?;
+    let body = match rotate_once(client, &url, otp.as_ref()).await {
+        Err(LpmError::OtpRequired { .. })
+            if otp.is_none()
+                && !json_output
+                && crate::commands::web_auth::terminal_is_interactive() =>
+        {
+            let prompted_otp = prompt_otp()?;
+            rotate_once(client, &url, Some(&prompted_otp)).await?
+        }
+        result => result?,
+    };
 
     if let Some(new_token) = body.get("token").and_then(|t| t.as_str()) {
         // Store the new token
@@ -90,7 +117,89 @@ fn require_locally_managed_auth(client: &RegistryClient) -> Result<(), LpmError>
     }
 
     Err(LpmError::UnsupportedAuthSource {
-        command: "lpm token-rotate",
+        command: COMMAND,
         auth_source: source.label(),
     })
+}
+
+async fn rotate_once(
+    client: &RegistryClient,
+    url: &str,
+    otp: Option<&OtpCode>,
+) -> Result<serde_json::Value, LpmError> {
+    let response = client
+        .post_json_raw_with_otp(url, &serde_json::json!({}), otp.map(OtpCode::expose))
+        .await?;
+    let status = response.status();
+    let body =
+        parse_capped_api_json::<serde_json::Value>(response, "token rotation response").await;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        if let Ok(body) = &body {
+            match body.get("code").and_then(serde_json::Value::as_str) {
+                Some("OTP_REQUIRED") => return Err(LpmError::OtpRequired { command: COMMAND }),
+                Some("OTP_INVALID") => return Err(LpmError::OtpInvalid { command: COMMAND }),
+                _ => {}
+            }
+        }
+        return Err(LpmError::AuthRequired);
+    }
+    let body = body?;
+    if !status.is_success() {
+        let error = body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        return Err(LpmError::Registry(format!(
+            "token rotation failed: {error}"
+        )));
+    }
+    Ok(body)
+}
+
+fn prompt_otp() -> Result<OtpCode, LpmError> {
+    let value = cliclack::password("Authenticator code (6 digits)")
+        .mask('*')
+        .validate(|input: &String| {
+            if is_valid_otp(input) {
+                Ok(())
+            } else {
+                Err("Enter a 6-digit code")
+            }
+        })
+        .interact()
+        .map_err(|error| LpmError::Registry(format!("OTP prompt failed: {error}")))?;
+    OtpCode::parse(value)
+}
+
+fn is_valid_otp(value: &str) -> bool {
+    value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn otp_code_accepts_exactly_six_ascii_digits() {
+        assert!(OtpCode::parse("012345".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn otp_code_rejects_non_digits_without_preserving_the_input_in_the_error() {
+        let input = "12secret";
+        let error = match OtpCode::parse(input.to_owned()) {
+            Ok(_) => panic!("non-digit OTP unexpectedly passed validation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.error_code(), "otp_invalid");
+        assert!(!error.to_string().contains(input));
+    }
+
+    #[test]
+    fn otp_code_rejects_non_six_digit_lengths() {
+        for input in ["", "12345", "1234567"] {
+            assert!(OtpCode::parse(input.to_owned()).is_err(), "input: {input}");
+        }
+    }
 }
