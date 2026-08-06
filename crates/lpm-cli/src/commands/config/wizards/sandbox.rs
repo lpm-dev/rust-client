@@ -10,21 +10,13 @@ pub(in crate::commands::config) async fn run_sandbox_wizard(
     let existing_cfg = read_config(config_path)?;
     let global = global_config_view_from_value(&existing_cfg);
     if let Some(v) = set {
-        if !SANDBOX_MODE_VALUES.contains(&v) {
-            return Err(LpmError::Registry(format!(
-                "invalid sandbox mode '{v}'; must be one of: {}",
-                SANDBOX_MODE_VALUES.join(" | ")
-            )));
-        }
-        let requested = ResolvedSandboxMode::parse_for_security_floor(v)
-            .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{v}'")))?;
-        crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
-        crate::security_approval::authorize_persistent_sandbox_mode(
-            requested,
+        apply_sandbox_mode(
+            config_path,
+            &global,
+            v,
             json_output,
             &format!("lpm config sandbox --set {v}"),
         )?;
-        persist_sandbox_mode(config_path, v)?;
         announce_sandbox_set(v, json_output);
         return Ok(());
     }
@@ -84,17 +76,39 @@ pub(in crate::commands::config) async fn run_sandbox_wizard(
         }
     }
 
-    let requested = ResolvedSandboxMode::parse_for_security_floor(new_value)
-        .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{new_value}'")))?;
-    crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
-    crate::security_approval::authorize_persistent_sandbox_mode(
-        requested,
+    apply_sandbox_mode(
+        config_path,
+        &global,
+        new_value,
         json_output,
         &format!("lpm config sandbox --set {new_value}"),
     )?;
-    persist_sandbox_mode(config_path, new_value)?;
     announce_sandbox_set(new_value, json_output);
     Ok(())
+}
+
+pub(in crate::commands::config) fn apply_sandbox_mode(
+    config_path: &std::path::Path,
+    global: &GlobalConfig,
+    value: &str,
+    json_output: bool,
+    proposed_command: &str,
+) -> Result<(), LpmError> {
+    if !SANDBOX_MODE_VALUES.contains(&value) {
+        return Err(LpmError::Registry(format!(
+            "invalid sandbox mode '{value}'; must be one of: {}",
+            SANDBOX_MODE_VALUES.join(" | ")
+        )));
+    }
+    let requested = ResolvedSandboxMode::parse_for_security_floor(value)
+        .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{value}'")))?;
+    crate::security_floor::reject_looser_sandbox_mode_write(global, requested)?;
+    crate::security_approval::authorize_persistent_sandbox_mode(
+        requested,
+        json_output,
+        proposed_command,
+    )?;
+    persist_sandbox_mode(config_path, value)
 }
 
 pub(in crate::commands::config) fn read_sandbox_mode(

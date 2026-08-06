@@ -6,14 +6,14 @@ pub(in crate::commands::config) const SIGSTORE_AVAILABILITY_VALUES: &[&str] =
     &["best-effort", "strict"];
 
 #[derive(Clone, Copy)]
-enum SigstoreSetting {
+pub(in crate::commands::config) enum SigstoreSetting {
     Verify,
     Scope,
     Availability,
 }
 
 impl SigstoreSetting {
-    fn key(self) -> &'static str {
+    pub(in crate::commands::config) fn key(self) -> &'static str {
         match self {
             Self::Verify => "verify",
             Self::Scope => "scope",
@@ -30,9 +30,10 @@ impl SigstoreSetting {
     }
 }
 
-struct SigstoreAssignment<'a> {
-    setting: SigstoreSetting,
-    value: &'a str,
+#[derive(Clone, Copy)]
+pub(in crate::commands::config) struct SigstoreAssignment<'a> {
+    pub(in crate::commands::config) setting: SigstoreSetting,
+    pub(in crate::commands::config) value: &'a str,
 }
 
 pub(in crate::commands::config) async fn run_sigstore_wizard(
@@ -44,8 +45,13 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
     let global = global_config_view_from_value(&existing_cfg);
     if let Some(raw) = set {
         let assignment = parse_sigstore_assignment(raw)?;
-        authorize_sigstore_assignment(&global, assignment.setting, assignment.value, json_output)?;
-        persist_sigstore_value(config_path, assignment.setting.key(), assignment.value)?;
+        apply_sigstore_assignment(
+            config_path,
+            &global,
+            assignment,
+            json_output,
+            &format!("lpm config sigstore --set {raw}"),
+        )?;
         announce_sigstore_set(assignment.setting.key(), assignment.value, json_output);
         return Ok(());
     }
@@ -117,8 +123,22 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
         }
     }
 
-    authorize_sigstore_assignment(&global, setting, new_value, json_output)?;
-    persist_sigstore_value(config_path, setting.key(), new_value)?;
+    let assignment = SigstoreAssignment {
+        setting,
+        value: new_value,
+    };
+    let proposed_value = if matches!(setting, SigstoreSetting::Verify) {
+        new_value.to_string()
+    } else {
+        format!("{}={new_value}", setting.key())
+    };
+    apply_sigstore_assignment(
+        config_path,
+        &global,
+        assignment,
+        json_output,
+        &format!("lpm config sigstore --set {proposed_value}"),
+    )?;
     announce_sigstore_set(setting.key(), new_value, json_output);
     Ok(())
 }
@@ -172,7 +192,9 @@ fn select_sigstore_value<'a>(
     }
 }
 
-fn parse_sigstore_assignment(raw: &str) -> Result<SigstoreAssignment<'_>, LpmError> {
+pub(in crate::commands::config) fn parse_sigstore_assignment(
+    raw: &str,
+) -> Result<SigstoreAssignment<'_>, LpmError> {
     let (setting, value) = match raw.split_once('=') {
         Some(("verify", value)) => (SigstoreSetting::Verify, value),
         Some(("scope", value)) => (SigstoreSetting::Scope, value),
@@ -194,22 +216,23 @@ fn parse_sigstore_assignment(raw: &str) -> Result<SigstoreAssignment<'_>, LpmErr
     Ok(SigstoreAssignment { setting, value })
 }
 
-fn authorize_sigstore_assignment(
+pub(in crate::commands::config) fn apply_sigstore_assignment(
+    config_path: &std::path::Path,
     global: &GlobalConfig,
-    setting: SigstoreSetting,
-    value: &str,
+    assignment: SigstoreAssignment<'_>,
     json_output: bool,
+    proposed_command: &str,
 ) -> Result<(), LpmError> {
-    if !matches!(setting, SigstoreSetting::Verify) {
-        return Ok(());
+    if matches!(assignment.setting, SigstoreSetting::Verify) {
+        let requested = parse_sigstore_enforce_mode(assignment.value)?;
+        crate::security_floor::reject_looser_sigstore_write(global, requested)?;
+        crate::security_approval::authorize_persistent_sigstore(
+            requested,
+            json_output,
+            proposed_command,
+        )?;
     }
-    let requested = parse_sigstore_enforce_mode(value)?;
-    crate::security_floor::reject_looser_sigstore_write(global, requested)?;
-    crate::security_approval::authorize_persistent_sigstore(
-        requested,
-        json_output,
-        &format!("lpm config sigstore --set {value}"),
-    )
+    persist_sigstore_value(config_path, assignment.setting.key(), assignment.value)
 }
 
 pub(in crate::commands::config) fn parse_sigstore_enforce_mode(

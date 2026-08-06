@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/config.rs
+expression: envelope
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error": "registry error: `lpm config set` cannot write nested section `policy` from one value. Edit `~/.lpm/config.toml` instead.",
+  "error_code": "registry"
+}

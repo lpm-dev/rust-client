@@ -48,8 +48,8 @@ pub(in crate::commands::config) use firewall::{
     FIREWALL_ENFORCE_HINT, FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT, FIREWALL_WIZARD_PROMPT,
 };
 pub(in crate::commands::config) use firewall::{
-    FIREWALL_GUIDED_MENU_LABEL, format_current_firewall_mode, parse_firewall_mode_selection,
-    persist_firewall_mode_in_config_value, read_firewall_mode, run_firewall_wizard,
+    FIREWALL_GUIDED_MENU_LABEL, apply_firewall_mode, format_current_firewall_mode,
+    parse_firewall_mode_selection, read_firewall_mode, run_firewall_wizard,
 };
 pub(crate) use integrity::resolve_object_integrity_policy;
 pub(in crate::commands::config) use integrity::{
@@ -75,7 +75,7 @@ pub(in crate::commands::config) use release_age::{
     read_release_age_policy_override, run_release_age_policy_wizard, run_release_age_wizard,
 };
 pub(in crate::commands::config) use sandbox::{
-    SANDBOX_MODE_VALUES, read_sandbox_mode, run_sandbox_wizard,
+    SANDBOX_MODE_VALUES, apply_sandbox_mode, read_sandbox_mode, run_sandbox_wizard,
 };
 #[cfg(test)]
 pub(in crate::commands::config) use scripts::persist_script_policy;
@@ -83,7 +83,8 @@ pub(in crate::commands::config) use scripts::run_scripts_wizard;
 pub(in crate::commands::config) use signatures::run_signatures_wizard;
 pub(in crate::commands::config) use sigstore::{
     SIGSTORE_AVAILABILITY_VALUES, SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES,
-    read_sigstore_availability, read_sigstore_scope, read_sigstore_verify, run_sigstore_wizard,
+    apply_sigstore_assignment, parse_sigstore_assignment, read_sigstore_availability,
+    read_sigstore_scope, read_sigstore_verify, run_sigstore_wizard,
 };
 pub(in crate::commands::config) use source_analysis::{
     read_install_time_source_analysis, run_source_analysis_wizard,

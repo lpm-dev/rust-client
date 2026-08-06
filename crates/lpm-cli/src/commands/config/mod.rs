@@ -29,21 +29,50 @@ use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY, RELEASE_AGE_KEY,
     RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES, SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES,
     SIGNATURES_KEY, SIGSTORE_AVAILABILITY_VALUES, SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES,
-    TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES, TRUST_POLICY_VALUES, format_bool_enabled,
+    TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES, TRUST_POLICY_VALUES, apply_firewall_mode,
+    apply_sandbox_mode, apply_sigstore_assignment, format_bool_enabled,
     format_current_firewall_mode, format_current_integrity_policy, format_current_lpm_skills,
     format_current_release_age, format_current_typosquat_guard, parse_config_bool,
-    parse_firewall_mode_selection, parse_integrity_policy_selection,
-    parse_typosquat_guard_selection, persist_firewall_mode_in_config_value,
-    read_auto_install_lpm_skills, read_bool_value, read_fetch_lpm_security_insights,
-    read_firewall_mode, read_install_time_source_analysis, read_integrity_policy,
-    read_release_age_override, read_release_age_policy_override, read_sandbox_mode,
-    read_sigstore_availability, read_sigstore_scope, read_sigstore_verify, read_string_value,
-    read_typosquat_guard_override, reject_looser_typosquat_guard_write, run_firewall_wizard,
-    run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard, run_lpm_skills_wizard,
-    run_release_age_policy_wizard, run_release_age_wizard, run_sandbox_wizard, run_scripts_wizard,
-    run_signatures_wizard, run_sigstore_wizard, run_source_analysis_wizard, run_triage_wizard,
-    run_trust_policy_wizard, run_typosquat_wizard, validate_trust_policy_value,
+    parse_firewall_mode_selection, parse_integrity_policy_selection, parse_sigstore_assignment,
+    parse_typosquat_guard_selection, read_auto_install_lpm_skills, read_bool_value,
+    read_fetch_lpm_security_insights, read_firewall_mode, read_install_time_source_analysis,
+    read_integrity_policy, read_release_age_override, read_release_age_policy_override,
+    read_sandbox_mode, read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
+    read_string_value, read_typosquat_guard_override, reject_looser_typosquat_guard_write,
+    run_firewall_wizard, run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard,
+    run_lpm_skills_wizard, run_release_age_policy_wizard, run_release_age_wizard,
+    run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard, run_sigstore_wizard,
+    run_source_analysis_wizard, run_triage_wizard, run_trust_policy_wizard, run_typosquat_wizard,
+    validate_trust_policy_value,
 };
+
+const NESTED_CONFIG_SECTIONS: [&str; 5] = ["sandbox", "sigstore", "firewall", "policy", "tunnel"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenericSetTarget {
+    Scalar,
+    Sandbox,
+    Sigstore,
+    Firewall,
+    UnsupportedNested,
+}
+
+fn generic_set_target(key: &str) -> GenericSetTarget {
+    match key {
+        "sandbox" => GenericSetTarget::Sandbox,
+        "sigstore" => GenericSetTarget::Sigstore,
+        "firewall" => GenericSetTarget::Firewall,
+        "policy" | "tunnel" => GenericSetTarget::UnsupportedNested,
+        _ if NESTED_CONFIG_SECTIONS.iter().any(|section| {
+            key.strip_prefix(section)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        }) =>
+        {
+            GenericSetTarget::UnsupportedNested
+        }
+        _ => GenericSetTarget::Scalar,
+    }
+}
 
 /// CLI configuration management.
 ///
@@ -170,6 +199,69 @@ pub async fn run(
             let value = value.ok_or_else(|| LpmError::Registry("missing value".into()))?;
             let mut config = read_config(&config_path)?;
             guard_generic_set_against_force_floor(&config, key, value)?;
+            match generic_set_target(key) {
+                GenericSetTarget::Sandbox => {
+                    let global = global_config_view_from_value(&config);
+                    apply_sandbox_mode(
+                        &config_path,
+                        &global,
+                        value,
+                        json_output,
+                        &format!("lpm config set {key} {value}"),
+                    )?;
+                    announce_generic_set(
+                        key,
+                        value,
+                        serde_json::json!({ "mode": value }),
+                        json_output,
+                    );
+                    return Ok(());
+                }
+                GenericSetTarget::Sigstore => {
+                    let assignment = parse_sigstore_assignment(value)?;
+                    let global = global_config_view_from_value(&config);
+                    apply_sigstore_assignment(
+                        &config_path,
+                        &global,
+                        assignment,
+                        json_output,
+                        &format!("lpm config set {key} {value}"),
+                    )?;
+                    announce_generic_set(
+                        key,
+                        value,
+                        serde_json::json!({
+                            (assignment.setting.key()): assignment.value,
+                        }),
+                        json_output,
+                    );
+                    return Ok(());
+                }
+                GenericSetTarget::Firewall => {
+                    let mode = parse_firewall_mode_selection(value)?;
+                    let global = global_config_view_from_value(&config);
+                    apply_firewall_mode(
+                        &config_path,
+                        &global,
+                        mode,
+                        json_output,
+                        &format!("lpm config set {key} {value}"),
+                    )?;
+                    announce_generic_set(
+                        key,
+                        value,
+                        serde_json::json!({ "mode": mode.as_str() }),
+                        json_output,
+                    );
+                    return Ok(());
+                }
+                GenericSetTarget::UnsupportedNested => {
+                    return Err(LpmError::Registry(format!(
+                        "`lpm config set` cannot write nested section `{key}` from one value. Edit `~/.lpm/config.toml` instead."
+                    )));
+                }
+                GenericSetTarget::Scalar => {}
+            }
             match key {
                 SCRIPT_POLICY_KEY => {
                     let requested = crate::script_policy_config::ScriptPolicy::parse(value)
@@ -195,9 +287,9 @@ pub async fn run(
                 }
                 RELEASE_AGE_POLICY_KEY => {
                     let requested = crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
+                    let global = global_config_view_from_value(&config);
                     crate::security_floor::reject_looser_release_age_policy_write(
-                        &global_config_view_from_value(&config),
-                        requested,
+                        &global, requested,
                     )?;
                     crate::security_approval::authorize_persistent_release_age_policy(
                         requested,
@@ -232,26 +324,9 @@ pub async fn run(
                         &format!("lpm config set {key} {}", requested.as_str()),
                     )?;
                 }
-                FIREWALL_CONFIG_SECTION => {
-                    let requested = parse_firewall_mode_selection(value)?;
-                    crate::security_floor::reject_looser_firewall_mode_write(
-                        &global_config_view_from_value(&config),
-                        requested,
-                    )?;
-                    crate::security_approval::authorize_persistent_npm_firewall_mode(
-                        requested,
-                        json_output,
-                        &format!("lpm config set {key} {}", requested.as_str()),
-                    )?;
-                }
                 _ => {}
             }
-            if key == FIREWALL_CONFIG_SECTION {
-                persist_firewall_mode_in_config_value(
-                    &mut config,
-                    parse_firewall_mode_selection(value)?,
-                )?;
-            } else if let Some(table) = config.as_table_mut() {
+            if let Some(table) = config.as_table_mut() {
                 if key == AUTO_INSTALL_LPM_SKILLS_KEY {
                     table.remove(LEGACY_NO_SKILLS_KEY);
                 }
@@ -294,57 +369,37 @@ pub async fn run(
                 }
             }
             write_config(&config_path, &config)?;
-            if json_output {
-                let value = if matches!(
-                    key,
-                    SIGNATURES_KEY
-                        | AUTO_INSTALL_LPM_SKILLS_KEY
-                        | FETCH_LPM_SECURITY_INSIGHTS_KEY
-                        | INSTALL_TIME_SOURCE_ANALYSIS_KEY
-                ) {
-                    serde_json::Value::Bool(
-                        parse_config_bool(value)
-                            .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?,
-                    )
-                } else if key == RELEASE_AGE_POLICY_KEY {
-                    serde_json::Value::String(
-                        crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
-                            .as_str()
-                            .to_string(),
-                    )
-                } else if key == INTEGRITY_KEY {
-                    serde_json::Value::String(
-                        parse_integrity_policy_selection(value)?
-                            .as_str()
-                            .to_string(),
-                    )
-                } else if key == TYPOSQUAT_GUARD_KEY {
-                    serde_json::Value::String(
-                        parse_typosquat_guard_selection(value)?.as_str().to_string(),
-                    )
-                } else if key == FIREWALL_CONFIG_SECTION {
-                    serde_json::json!({
-                        "mode": parse_firewall_mode_selection(value)?.as_str(),
-                    })
-                } else {
-                    serde_json::Value::String(value.to_string())
-                };
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "success": true,
-                        "action": "set",
-                        "key": key,
-                        "value": value,
-                    })
-                );
+            let json_value = if matches!(
+                key,
+                SIGNATURES_KEY
+                    | AUTO_INSTALL_LPM_SKILLS_KEY
+                    | FETCH_LPM_SECURITY_INSIGHTS_KEY
+                    | INSTALL_TIME_SOURCE_ANALYSIS_KEY
+            ) {
+                serde_json::Value::Bool(
+                    parse_config_bool(value)
+                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?,
+                )
+            } else if key == RELEASE_AGE_POLICY_KEY {
+                serde_json::Value::String(
+                    crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                        .as_str()
+                        .to_string(),
+                )
+            } else if key == INTEGRITY_KEY {
+                serde_json::Value::String(
+                    parse_integrity_policy_selection(value)?
+                        .as_str()
+                        .to_string(),
+                )
+            } else if key == TYPOSQUAT_GUARD_KEY {
+                serde_json::Value::String(
+                    parse_typosquat_guard_selection(value)?.as_str().to_string(),
+                )
             } else {
-                install_ui::done_line(crate::install_ui::terminal_line!(
-                    "Done · {} = {}",
-                    key,
-                    install_ui::section(&format!("\"{value}\""))
-                ));
-            }
+                serde_json::Value::String(value.to_string())
+            };
+            announce_generic_set(key, value, json_value, json_output);
         }
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
@@ -456,6 +511,29 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn announce_generic_set(
+    key: &str,
+    display_value: &str,
+    json_value: serde_json::Value,
+    json_output: bool,
+) {
+    if json_output {
+        let envelope = serde_json::json!({
+            "success": true,
+            "action": "set",
+            "key": key,
+            "value": json_value,
+        });
+        println!("{envelope}");
+    } else {
+        install_ui::done_line(crate::install_ui::terminal_line!(
+            "Done · {} = {}",
+            key,
+            install_ui::section(&format!("\"{display_value}\""))
+        ));
+    }
 }
 
 async fn run_guided_config_menu(

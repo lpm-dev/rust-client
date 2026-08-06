@@ -246,6 +246,207 @@ fn config_set_writes_value_into_isolated_home() {
 }
 
 #[test]
+fn generic_config_set_sandbox_preserves_nested_sibling_fields() {
+    let project = TempProject::empty(r#"{"name":"config-sandbox","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[sandbox]\nmode = \"default\"\nallow-degraded = true\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sandbox", "strict"])
+        .output()
+        .expect("failed to run generic sandbox config setter");
+
+    assert!(
+        output.status.success(),
+        "generic sandbox setter must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["action"], "set");
+    assert_eq!(envelope["key"], "sandbox");
+    assert_eq!(envelope["value"], serde_json::json!({ "mode": "strict" }));
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path(&project)).expect("read config after sandbox set"),
+    )
+    .expect("config must remain valid TOML");
+    let sandbox = config["sandbox"]
+        .as_table()
+        .expect("sandbox must remain a table");
+    assert_eq!(sandbox["mode"].as_str(), Some("strict"));
+    assert_eq!(sandbox["allow-degraded"].as_bool(), Some(true));
+
+    insta::assert_json_snapshot!("config_set_nested_sandbox_json_envelope", envelope);
+}
+
+#[test]
+fn generic_config_set_sigstore_preserves_nested_sibling_fields() {
+    let project = TempProject::empty(r#"{"name":"config-sigstore","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[sigstore]\nverify = \"deny\"\nscope = \"approved\"\navailability = \"best-effort\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sigstore", "scope=all"])
+        .output()
+        .expect("failed to run generic sigstore config setter");
+
+    assert!(
+        output.status.success(),
+        "generic sigstore setter must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["value"], serde_json::json!({ "scope": "all" }));
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path(&project)).expect("read config after sigstore set"),
+    )
+    .expect("config must remain valid TOML");
+    let sigstore = config["sigstore"]
+        .as_table()
+        .expect("sigstore must remain a table");
+    assert_eq!(sigstore["verify"].as_str(), Some("deny"));
+    assert_eq!(sigstore["scope"].as_str(), Some("all"));
+    assert_eq!(sigstore["availability"].as_str(), Some("best-effort"));
+}
+
+#[test]
+fn generic_config_set_firewall_preserves_nested_sibling_fields() {
+    let project = TempProject::empty(r#"{"name":"config-firewall","version":"1.0.0"}"#);
+    seed_config(&project, "[firewall]\nmode = \"off\"\nnote = \"keep-me\"\n");
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "firewall", "monitor"])
+        .output()
+        .expect("failed to run generic firewall config setter");
+
+    assert!(
+        output.status.success(),
+        "generic firewall setter must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["value"], serde_json::json!({ "mode": "monitor" }));
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path(&project)).expect("read config after firewall set"),
+    )
+    .expect("config must remain valid TOML");
+    let firewall = config["firewall"]
+        .as_table()
+        .expect("firewall must remain a table");
+    assert_eq!(firewall["mode"].as_str(), Some("monitor"));
+    assert_eq!(firewall["note"].as_str(), Some("keep-me"));
+}
+
+#[test]
+fn generic_config_set_policy_rejects_scalar_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-policy","version":"1.0.0"}"#);
+    let original = "[policy.extensions.fixture]\ncommand = [\"policy-fixture\"]\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "policy", "enforce"])
+        .output()
+        .expect("failed to run generic policy config setter");
+
+    assert!(!output.status.success(), "nested policy set must fail");
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cannot write nested section `policy`")),
+        "error must identify the unsupported section: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved policy config"),
+        original
+    );
+    insta::assert_json_snapshot!("config_set_nested_policy_rejected", envelope);
+}
+
+#[test]
+fn generic_config_set_tunnel_rejects_scalar_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-tunnel","version":"1.0.0"}"#);
+    let original = "[tunnel]\nrelay-url = \"wss://relay.example.test/connect\"\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "tunnel", "replacement"])
+        .output()
+        .expect("failed to run generic tunnel config setter");
+
+    assert!(!output.status.success(), "nested tunnel set must fail");
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved tunnel config"),
+        original
+    );
+}
+
+#[test]
+fn generic_config_set_sandbox_rejects_invalid_mode_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-sandbox-invalid","version":"1.0.0"}"#);
+    let original = "[sandbox]\nmode = \"strict\"\nallow-degraded = false\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sandbox", "unrestricted"])
+        .output()
+        .expect("failed to run generic sandbox config setter");
+
+    assert!(!output.status.success(), "invalid sandbox mode must fail");
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("default | strict | none")),
+        "error must list valid sandbox modes: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved sandbox config"),
+        original
+    );
+}
+
+#[test]
+fn generic_config_set_sandbox_uses_security_approval_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-sandbox-approval","version":"1.0.0"}"#);
+    let original = "[sandbox]\nmode = \"strict\"\nallow-degraded = false\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sandbox", "none"])
+        .output()
+        .expect("failed to run generic sandbox config setter");
+
+    let envelope = assertions::assert_security_approval_required(&output);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes
+                .iter()
+                .any(|scope| scope.as_str() == Some("sandbox-none"))),
+        "generic setter must request the sandbox-none scope: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved sandbox config"),
+        original
+    );
+}
+
+#[test]
 fn config_set_signatures_true_persists_boolean() {
     let project = TempProject::empty(r#"{"name":"config-signatures","version":"1.0.0"}"#);
 

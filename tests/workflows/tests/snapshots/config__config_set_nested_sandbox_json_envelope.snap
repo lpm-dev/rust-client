@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/config.rs
+expression: envelope
+---
+{
+  "success": true,
+  "action": "set",
+  "key": "sandbox",
+  "value": {
+    "mode": "strict"
+  }
+}
