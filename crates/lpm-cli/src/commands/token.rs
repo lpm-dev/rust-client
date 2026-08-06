@@ -8,6 +8,8 @@ pub async fn run_rotate(
     registry_url: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    require_locally_managed_auth(client)?;
+
     if !json_output {
         install_ui::phase_line(crate::install_ui::terminal_line!(
             "Rotating {} token",
@@ -76,4 +78,19 @@ pub async fn run_rotate(
     }
 
     Ok(())
+}
+
+fn require_locally_managed_auth(client: &RegistryClient) -> Result<(), LpmError> {
+    let source = client
+        .session()
+        .and_then(|session| session.current_source())
+        .ok_or(LpmError::AuthRequired)?;
+    if source.is_locally_managed() {
+        return Ok(());
+    }
+
+    Err(LpmError::UnsupportedAuthSource {
+        command: "lpm token-rotate",
+        auth_source: source.label(),
+    })
 }

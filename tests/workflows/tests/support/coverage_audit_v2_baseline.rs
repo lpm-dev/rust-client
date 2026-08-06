@@ -976,8 +976,15 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 40: lpm token-rotate ──
     SurfaceV2 {
         id: 40,
-        scenarios: 1,
-        failure_modes_tested: &["replaces stored session token + expiry metadata"],
+        scenarios: 6,
+        failure_modes_tested: &[
+            "replaces stored session token + expiry metadata",
+            "human output reports secure storage and completion",
+            "LPM_TOKEN is rejected before network or storage changes",
+            "explicit --token is rejected before network or storage changes",
+            "CI-issued token is rejected before network or storage changes",
+            "locally managed source predicate distinguishes all token sources",
+        ],
         failure_modes_known: &[
             "rotation fails mid-store (partial-state recovery)",
             "concurrent rotation on same registry",
@@ -985,8 +992,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rotation against a registry that returns 5xx",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/token_rotate.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[
+            ("crates/lpm-auth/src/session.rs", 1),
+            ("tests/workflows/tests/token_rotate.rs", 5),
+        ],
+        last_audited_at: "2026-08-06",
     },
     // ── id 41: lpm setup ci npmrc (.npmrc CI gen) ──
     SurfaceV2 {

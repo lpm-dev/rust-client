@@ -329,6 +329,18 @@ pub enum LpmError {
     )]
     SessionExpired,
 
+    #[error("unsupported authentication source for `{command}`: {auth_source}")]
+    #[diagnostic(
+        code(lpm::unsupported_auth_source),
+        help(
+            "Remove the external token before you retry. Run `lpm login` to use local secure storage. In CI, rotate the token in the dashboard and update the secret store."
+        )
+    )]
+    UnsupportedAuthSource {
+        command: &'static str,
+        auth_source: &'static str,
+    },
+
     #[error("forbidden: {0}")]
     #[diagnostic(
         code(lpm::forbidden),
@@ -650,6 +662,7 @@ impl LpmError {
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
             LpmError::SessionExpired => "session_expired",
+            LpmError::UnsupportedAuthSource { .. } => "unsupported_auth_source",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
             LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
@@ -825,6 +838,10 @@ mod tests {
             },
             LpmError::AuthRequired,
             LpmError::SessionExpired,
+            LpmError::UnsupportedAuthSource {
+                command: "lpm token-rotate",
+                auth_source: "LPM_TOKEN",
+            },
             LpmError::Forbidden("x".into()),
             LpmError::NpmFirewallBlocked {
                 package: "is-number@7.0.0".into(),
@@ -968,6 +985,14 @@ mod tests {
     #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(
+            LpmError::UnsupportedAuthSource {
+                command: "lpm token-rotate",
+                auth_source: "LPM_TOKEN",
+            }
+            .error_code(),
+            "unsupported_auth_source"
+        );
         assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
         assert_eq!(
             LpmError::ArtifactUnavailable(Box::new(ArtifactUnavailableErrorContext {
