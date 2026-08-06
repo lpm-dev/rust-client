@@ -3,11 +3,13 @@
 //! Starts multiple dev services with dependency ordering, readiness checks,
 //! cross-service env injection, colored output, and graceful shutdown.
 
+mod recovery;
+
 use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
 use crate::lpm_json::ServiceConfig;
 use crate::{ports, ready, service_graph};
 use lpm_common::{LocalTarget, LpmError, sanitize_terminal_inline};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -31,6 +33,7 @@ pub enum ServiceStatus {
 }
 
 /// Event sent from the orchestrator to the dashboard (or any observer).
+#[derive(Debug)]
 pub enum OrchestratorEvent {
     /// A line of output from a service.
     ServiceLog {
@@ -181,6 +184,24 @@ fn ui_readiness_timing(duration: Option<Duration>) -> String {
     duration
         .map(|duration| format!(" ({})", ui_paint(GREEN, &ui_format_duration(duration))))
         .unwrap_or_default()
+}
+
+fn send_status(
+    event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    service_names: &[String],
+    name: &str,
+    status: ServiceStatus,
+) {
+    if let Some(tx) = event_tx {
+        let service_index = service_names
+            .iter()
+            .position(|service_name| service_name == name)
+            .unwrap_or(0);
+        let _ = tx.send(OrchestratorEvent::StatusChange {
+            service_index,
+            status,
+        });
+    }
 }
 
 /// Safely resolve a service `cwd` relative to the project root.
@@ -710,23 +731,10 @@ pub fn run_services(
     let children_clone = children.clone();
     ctrlc_handler(shutdown_state_clone, children_clone);
 
-    // Helper: send a StatusChange event to the dashboard (if connected).
-    let send_status = |event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
-                       service_names: &[String],
-                       name: &str,
-                       status: ServiceStatus| {
-        if let Some(tx) = event_tx {
-            let index = service_names.iter().position(|n| n == name).unwrap_or(0);
-            let _ = tx.send(OrchestratorEvent::StatusChange {
-                service_index: index,
-                status,
-            });
-        }
-    };
-
     // Start services in dependency order
     let mut startup_interrupted = false;
     let mut service_endpoints = ServiceEndpointMap::with_capacity(port_map.len());
+    let mut initial_ready = HashSet::with_capacity(active_services.len());
 
     for group in &groups {
         if shutdown_state.load(Ordering::Relaxed) > 0 {
@@ -846,7 +854,7 @@ pub fn run_services(
                 Ok(Ok(readiness)) => {
                     if service_exit_status(&children, &name).is_some() {
                         startup_interrupted = true;
-                        break;
+                        continue;
                     }
 
                     if let Some(mut endpoint) = readiness.endpoint {
@@ -862,6 +870,7 @@ pub fn run_services(
                         &name,
                         ServiceStatus::Ready,
                     );
+                    initial_ready.insert(name);
                 }
                 Ok(Err(error)) => {
                     let display_error = sanitize_terminal_inline(&error).into_owned();
@@ -920,443 +929,24 @@ pub fn run_services(
         }
     }
 
-    // Track restart backoff per service: name → (attempt_count, last_crash_time)
-    let mut restart_state: HashMap<String, (u32, std::time::Instant)> = HashMap::new();
-
-    // Pending restarts: name → Instant when restart should happen
-    let mut pending_restarts: HashMap<String, std::time::Instant> = HashMap::new();
-
-    // Wait for all children to exit (or Ctrl+C)
-    loop {
-        if shutdown_state.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-
-        // Check if any child has exited
-        let mut all_done = true;
-        let mut to_restart: Vec<String> = Vec::new();
-        let mut crashed_no_restart: Vec<String> = Vec::new();
-        {
-            let mut locked = children.lock();
-            for (name, child) in locked.iter_mut() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let color = color_map.get(name.as_str()).unwrap_or(&RESET);
-                        if status.success() {
-                            ui_service_note(color, name, "exited");
-                            send_status(
-                                &options.event_tx,
-                                &service_names,
-                                name,
-                                ServiceStatus::Stopped,
-                            );
-                        } else {
-                            let code = status.code().unwrap_or(-1);
-                            let config = active_services.get(name);
-                            let should_restart = config.is_some_and(|c| c.restart);
-
-                            if should_restart && shutdown_state.load(Ordering::Relaxed) == 0 {
-                                to_restart.push(name.clone());
-                                ui_service_status(
-                                    RESET,
-                                    name,
-                                    YELLOW,
-                                    "!",
-                                    &format!("crashed (exit {code}), restarting..."),
-                                );
-                                send_status(
-                                    &options.event_tx,
-                                    &service_names,
-                                    name,
-                                    ServiceStatus::Crashed(code),
-                                );
-                            } else {
-                                ui_service_status(
-                                    RESET,
-                                    name,
-                                    RED,
-                                    "✗",
-                                    &format!("crashed (exit {code})"),
-                                );
-                                send_status(
-                                    &options.event_tx,
-                                    &service_names,
-                                    name,
-                                    ServiceStatus::Crashed(code),
-                                );
-                                crashed_no_restart.push(name.clone());
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        all_done = false; // Still running
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-
-        // Stop transitive dependents of crashed (non-restarting) services
-        for crashed_name in &crashed_no_restart {
-            let dependents = service_graph::transitive_dependents(crashed_name, &active_services);
-            if !dependents.is_empty() {
-                let mut locked = children.lock();
-                for dep_name in &dependents {
-                    if let Some(pos) = locked.iter().position(|(n, _)| n == dep_name) {
-                        let (name, mut child) = locked.remove(pos);
-                        let _ = ports::terminate_child_process_tree(&mut child);
-                        tracing::warn!("stopped {name} (depends on crashed {crashed_name})");
-                        ui_service_status(
-                            RESET,
-                            &name,
-                            RED,
-                            "✗",
-                            &format!(
-                                "stopped (depends on crashed {})",
-                                sanitize_terminal_inline(crashed_name)
-                            ),
-                        );
-                        send_status(
-                            &options.event_tx,
-                            &service_names,
-                            &name,
-                            ServiceStatus::Stopped,
-                        );
-                    }
-                    // Also cancel any pending restart for the dependent
-                    pending_restarts.remove(dep_name);
-                }
-            }
-        }
-
-        // Schedule restarts with exponential backoff (non-blocking)
-        for name in to_restart {
-            all_done = false;
-            if pending_restarts.contains_key(&name) {
-                continue;
-            }
-
-            let (attempts, last_crash) = restart_state
-                .entry(name.clone())
-                .or_insert((0, std::time::Instant::now()));
-
-            // Reset backoff if service was stable for 60+ seconds
-            if last_crash.elapsed().as_secs() > 60 {
-                *attempts = 0;
-            }
-
-            *attempts += 1;
-            *last_crash = std::time::Instant::now();
-
-            // Max restart attempts
-            if *attempts > MAX_RESTART_ATTEMPTS {
-                let color = color_map.get(name.as_str()).unwrap_or(&RESET);
-                ui_service_status(
-                    color,
-                    &name,
-                    RED,
-                    "✗",
-                    &format!(
-                        "exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed"
-                    ),
-                );
-                tracing::error!(
-                    "{name} exceeded max restart attempts ({MAX_RESTART_ATTEMPTS}), marking as permanently failed"
-                );
-                send_status(
-                    &options.event_tx,
-                    &service_names,
-                    &name,
-                    ServiceStatus::Stopped,
-                );
-                // Stop dependents of this permanently-failed service
-                let dependents = service_graph::transitive_dependents(&name, &active_services);
-                if !dependents.is_empty() {
-                    let mut locked = children.lock();
-                    for dep_name in &dependents {
-                        if let Some(pos) = locked.iter().position(|(n, _)| n == dep_name) {
-                            let (dname, mut child) = locked.remove(pos);
-                            let _ = ports::terminate_child_process_tree(&mut child);
-                            tracing::warn!(
-                                "stopped {dname} (depends on permanently failed {name})"
-                            );
-                            ui_service_status(
-                                RESET,
-                                &dname,
-                                RED,
-                                "✗",
-                                &format!(
-                                    "stopped (depends on permanently failed {})",
-                                    sanitize_terminal_inline(&name)
-                                ),
-                            );
-                            send_status(
-                                &options.event_tx,
-                                &service_names,
-                                &dname,
-                                ServiceStatus::Stopped,
-                            );
-                        }
-                        pending_restarts.remove(dep_name);
-                    }
-                }
-                continue;
-            }
-
-            // Non-blocking backoff — schedule restart for later instead of sleeping
-            let delay_secs = std::cmp::min(1u64 << (*attempts - 1), 30);
-            let color = color_map.get(name.as_str()).unwrap_or(&RESET);
-            ui_service_status(
-                color,
-                &name,
-                YELLOW,
-                "!",
-                &format!(
-                    "restarting in {delay_secs}s (attempt {attempts}/{MAX_RESTART_ATTEMPTS})..."
-                ),
-            );
-            let restart_at = std::time::Instant::now() + std::time::Duration::from_secs(delay_secs);
-            pending_restarts.insert(name, restart_at);
-        }
-
-        // Process pending restarts whose delay has elapsed
-        let now = std::time::Instant::now();
-        let ready_restarts: Vec<String> = pending_restarts
-            .iter()
-            .filter(|(_, restart_at)| now >= **restart_at)
-            .map(|(name, _)| name.clone())
-            .collect();
-
-        for name in ready_restarts {
-            pending_restarts.remove(&name);
-            all_done = false;
-
-            if shutdown_state.load(Ordering::Relaxed) > 0 {
-                break;
-            }
-
-            // Respawn the service
-            send_status(
-                &options.event_tx,
-                &service_names,
-                &name,
-                ServiceStatus::Starting,
-            );
-            if let Some(config) = active_services.get(&name) {
-                let (shell, flag) = if cfg!(windows) {
-                    ("cmd", "/C")
-                } else {
-                    ("sh", "-c")
-                };
-                let cwd = if let Some(ref sub) = config.cwd {
-                    match safe_resolve_cwd(project_dir, sub) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let error = e.to_string();
-                            ui_service_status(
-                                RESET,
-                                &name,
-                                RED,
-                                "✗",
-                                &format!("failed to restart: {}", sanitize_terminal_inline(&error)),
-                            );
-                            continue;
-                        }
-                    }
-                } else {
-                    project_dir.to_path_buf()
-                };
-
-                let mut env = dotenv.clone();
-                env.extend(config.env.clone());
-                if let Some(svc_cross_env) = cross_env.get(&name) {
-                    env.extend(svc_cross_env.clone());
-                }
-                if let Some(&port) = port_map.get(&name) {
-                    env.insert("PORT".to_string(), port.to_string());
-                }
-                let service_command =
-                    command_with_managed_port(&config.command, &cwd, port_map.get(&name).copied());
-                let assigned_port = port_map.get(&name).copied();
-                let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
-
-                let mut cmd = Command::new(shell);
-                cmd.arg(flag)
-                    .arg(&service_command)
-                    .current_dir(&cwd)
-                    .env("PATH", &path)
-                    .envs(&env)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                for (key, value) in &options.extra_envs {
-                    cmd.env(key, value);
-                }
-
-                let color = color_map.get(name.as_str()).unwrap_or(&RESET);
-                match cmd.spawn() {
-                    Ok(new_child) => {
-                        let child_pid = new_child.id();
-                        let mut locked = children.lock();
-                        // Remove old dead entry
-                        locked.retain(|(n, _)| n != &name);
-                        locked.push((name.clone(), new_child));
-                        drop(locked);
-
-                        // Spawn output readers for the restarted process.
-                        // The old reader threads are safe — their stdout/stderr streams are
-                        // EOF'd when the old process exits, causing the BufReader iterator to
-                        // return None and the thread to exit naturally. There is a brief overlap
-                        // window but no data corruption or resource leak.
-                        let service_index =
-                            service_names.iter().position(|n| n == &name).unwrap_or(0);
-                        let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
-                        spawn_output_readers(
-                            &name,
-                            color,
-                            service_index,
-                            &children,
-                            &shutdown_state,
-                            &options.event_tx,
-                            Some(endpoint_tx),
-                        );
-
-                        let ready_result =
-                            wait_for_initial_service_readiness(InitialReadinessOptions {
-                                service_dir: &cwd,
-                                root_pid: child_pid,
-                                baseline: listener_baseline.as_ref(),
-                                assigned_port,
-                                candidates: &endpoint_rx,
-                                ready_url: config.ready_url.clone(),
-                                ready_port: service_ready_port(config, assigned_port),
-                                timeout_secs: config.ready_timeout,
-                            });
-
-                        match ready_result {
-                            Ok(mut readiness) => {
-                                if service_exit_status(&children, &name).is_some() {
-                                    continue;
-                                }
-
-                                if let Some(ref mut endpoint) = readiness.endpoint {
-                                    endpoint.service = Some(name.clone());
-                                }
-                                if let (Some(callback), Some(endpoint)) =
-                                    (&options.on_endpoint_changed, readiness.endpoint)
-                                {
-                                    callback(endpoint)?;
-                                }
-
-                                let timing = ui_readiness_timing(readiness.duration);
-                                ui_service_status(
-                                    color,
-                                    &name,
-                                    GREEN,
-                                    "✓",
-                                    &format!("restarted{timing}"),
-                                );
-                                send_status(
-                                    &options.event_tx,
-                                    &service_names,
-                                    &name,
-                                    ServiceStatus::Ready,
-                                );
-                            }
-                            Err(error) => {
-                                ui_service_status(
-                                    RESET,
-                                    &name,
-                                    YELLOW,
-                                    "!",
-                                    &format!(
-                                        "restarted but not ready - {}",
-                                        sanitize_terminal_inline(&error)
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let error = e.to_string();
-                        ui_service_status(
-                            RESET,
-                            &name,
-                            RED,
-                            "✗",
-                            &format!("failed to restart: {}", sanitize_terminal_inline(&error)),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Process commands from the dashboard (non-blocking).
-        // Also detects channel disconnection (all senders dropped) as a shutdown
-        // signal — this is defense-in-depth so the orchestrator stops cleanly even
-        // if the caller exits without sending an explicit StopAll.
-        if let Some(ref cmd_rx) = options.command_rx {
-            loop {
-                match cmd_rx.try_recv() {
-                    Ok(OrchestratorCommand::StopAll) => {
-                        shutdown_state.store(1, Ordering::Relaxed);
-                        break;
-                    }
-                    Ok(OrchestratorCommand::StopService(idx)) => {
-                        if let Some(name) = service_names.get(idx) {
-                            let mut locked = children.lock();
-                            if let Some(pos) = locked.iter().position(|(n, _)| n == name) {
-                                let (sname, mut child) = locked.remove(pos);
-                                let _ = ports::terminate_child_process_tree(&mut child);
-                                ui_service_status(RESET, &sname, YELLOW, "!", "stopped by user");
-                                send_status(
-                                    &options.event_tx,
-                                    &service_names,
-                                    &sname,
-                                    ServiceStatus::Stopped,
-                                );
-                            }
-                            pending_restarts.remove(name);
-                        }
-                    }
-                    Ok(OrchestratorCommand::RestartService(idx)) => {
-                        if let Some(name) = service_names.get(idx).cloned() {
-                            // Kill the current instance if running
-                            {
-                                let mut locked = children.lock();
-                                if let Some(pos) = locked.iter().position(|(n, _)| n == &name) {
-                                    let (_, mut child) = locked.remove(pos);
-                                    let _ = ports::terminate_child_process_tree(&mut child);
-                                }
-                            }
-                            // Schedule immediate restart
-                            pending_restarts.insert(name.clone(), std::time::Instant::now());
-                            // Reset backoff counter for user-initiated restarts
-                            restart_state.remove(&name);
-                            all_done = false;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // All senders dropped — controller exited. Shut down gracefully.
-                        shutdown_state.store(1, Ordering::Relaxed);
-                        break;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                }
-            }
-        }
-
-        // Still have pending restarts — keep loop alive
-        if !pending_restarts.is_empty() {
-            all_done = false;
-        }
-
-        if all_done {
-            break;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
+    recovery::supervise_services(recovery::RecoveryContext {
+        project_dir,
+        active_services: &active_services,
+        groups: &groups,
+        path: &path,
+        dotenv: &dotenv,
+        cross_env: &cross_env,
+        port_map: &port_map,
+        color_map: &color_map,
+        service_names: &service_names,
+        initial_ready: &initial_ready,
+        children: &children,
+        shutdown_state: &shutdown_state,
+        event_tx: &options.event_tx,
+        command_rx: options.command_rx.as_ref(),
+        on_endpoint_changed: options.on_endpoint_changed.as_ref(),
+        extra_envs: &options.extra_envs,
+    })?;
 
     // Normal cleanup (guard will also cleanup on panic/early exit via Drop)
     let force = shutdown_state.load(Ordering::Relaxed) >= 2;
@@ -2432,29 +2022,34 @@ mod tests {
             ..Default::default()
         };
         let dir = tempfile::TempDir::new().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
 
-        // Restart service 0, then StopAll
-        let cmd_tx_clone = cmd_tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = cmd_tx_clone.send(OrchestratorCommand::RestartService(0));
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
-        });
-
-        let _ = run_services(dir.path(), &services, options);
-
-        // Verify we got a second Starting status (the restart)
         let mut starting_count = 0;
-        while let Ok(event) = event_rx.try_recv() {
-            if let OrchestratorEvent::StatusChange {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while starting_count < 1 && std::time::Instant::now() < deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
                 status: ServiceStatus::Starting,
                 ..
-            } = event
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
             {
                 starting_count += 1;
             }
         }
+        cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
+        while starting_count < 2 && std::time::Instant::now() < deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
+                status: ServiceStatus::Starting,
+                ..
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                starting_count += 1;
+            }
+        }
+        cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = handle.join().unwrap();
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
         assert!(
             starting_count >= 2,
             "should emit Starting at least twice (initial + restart), got {starting_count}"
@@ -2474,28 +2069,34 @@ mod tests {
             ..Default::default()
         };
         let dir = tempfile::TempDir::new().unwrap();
-
-        let cmd_tx_clone = cmd_tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = cmd_tx_clone.send(OrchestratorCommand::RestartService(0));
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
-        });
-
-        let _ = run_services(dir.path(), &services, options);
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
 
         let mut ready_count = 0;
-        while let Ok(event) = event_rx.try_recv() {
-            if let OrchestratorEvent::StatusChange {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while ready_count < 1 && std::time::Instant::now() < deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
                 status: ServiceStatus::Ready,
                 ..
-            } = event
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
             {
                 ready_count += 1;
             }
         }
+        cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
+        while ready_count < 2 && std::time::Instant::now() < deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
+                status: ServiceStatus::Ready,
+                ..
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                ready_count += 1;
+            }
+        }
+        cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = handle.join().unwrap();
 
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
         assert!(
             ready_count >= 2,
             "should emit Ready at least twice (initial + restart), got {ready_count}"
@@ -2548,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn restarted_service_does_not_report_ready_after_readiness_failure() {
+    fn restarted_service_retries_after_readiness_failure_without_reporting_ready() {
         let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let ready_port = ready_listener.local_addr().unwrap().port();
         drop(ready_listener);
@@ -2590,7 +2191,7 @@ setInterval(() => {{}}, 1000);
         let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
 
         loop {
-            match event_rx.recv_timeout(Duration::from_secs(5)) {
+            match event_rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(OrchestratorEvent::StatusChange {
                     status: ServiceStatus::Ready,
                     ..
@@ -2600,26 +2201,66 @@ setInterval(() => {{}}, 1000);
             }
         }
         cmd_tx.send(OrchestratorCommand::RestartService(0)).unwrap();
-        std::thread::sleep(Duration::from_millis(1_500));
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let mut restart_events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(event) = event_rx.recv_timeout(Duration::from_millis(100)) {
+                restart_events.push(event);
+                let starting_count = restart_events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            OrchestratorEvent::StatusChange {
+                                status: ServiceStatus::Starting,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                if starting_count >= 2 {
+                    break;
+                }
+            }
+        }
         cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
         let result = handle.join().unwrap();
 
-        let additional_ready_count = event_rx
-            .try_iter()
-            .filter(|event| {
-                matches!(
+        restart_events.extend(event_rx.try_iter());
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert!(
+            restart_events.iter().any(|event| matches!(
+                event,
+                OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::ReadinessFailed(_),
+                    ..
+                }
+            )),
+            "a failed restart must emit ReadinessFailed: {restart_events:?}"
+        );
+        assert!(
+            restart_events
+                .iter()
+                .filter(|event| matches!(
                     event,
                     OrchestratorEvent::StatusChange {
-                        status: ServiceStatus::Ready,
+                        status: ServiceStatus::Starting,
                         ..
                     }
-                )
-            })
-            .count();
-        assert!(result.is_ok(), "orchestrator failed: {result:?}");
-        assert_eq!(
-            additional_ready_count, 0,
-            "a failed restart must not emit another Ready status"
+                ))
+                .count()
+                >= 2,
+            "a readiness failure must schedule another restart: {restart_events:?}"
+        );
+        assert!(
+            !restart_events.iter().any(|event| matches!(
+                event,
+                OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                }
+            )),
+            "a failed restart must not emit Ready: {restart_events:?}"
         );
     }
 
