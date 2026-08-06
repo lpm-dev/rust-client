@@ -301,8 +301,16 @@ fn config_get_signatures_json_returns_boolean() {
             String::from_utf8_lossy(&output.stdout)
         )
     });
-    assert_eq!(envelope["success"], serde_json::json!(true));
-    assert_eq!(envelope["signatures"], serde_json::json!(true));
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "signatures",
+            "value": true,
+            "found": true,
+        })
+    );
 }
 
 #[test]
@@ -434,8 +442,16 @@ fn config_get_release_age_policy_returns_stored_value() {
             String::from_utf8_lossy(&output.stdout)
         )
     });
-    assert_eq!(envelope["success"], serde_json::json!(true));
-    assert_eq!(envelope["release-age-policy"], serde_json::json!("strict"));
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "release-age-policy",
+            "value": "strict",
+            "found": true,
+        })
+    );
 }
 
 #[test]
@@ -593,13 +609,95 @@ fn config_get_json_returns_existing_value() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("config get --json must be valid JSON: {e}\n---\n{stdout}"));
 
-    assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(
-        envelope["registry"],
-        serde_json::json!("https://registry.example.test")
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "registry",
+            "value": "https://registry.example.test",
+            "found": true,
+        })
     );
 
     insta::assert_json_snapshot!("config_get_json_envelope_single_key", envelope);
+}
+
+#[test]
+fn config_get_missing_key_json_returns_stable_envelope() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "get", "registry", "--json"])
+        .output()
+        .expect("failed to run lpm config get --json for a missing key");
+
+    assert!(
+        output.status.success(),
+        "lpm config get --json failed for a missing key:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("config get --json must return JSON for a missing key: {error}\n---\n{stdout}")
+    });
+
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "registry",
+            "value": null,
+            "found": false,
+        })
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "config get --json must not write human output to stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    insta::assert_json_snapshot!("config_get_json_envelope_missing_key", envelope);
+}
+
+#[test]
+fn config_get_json_preserves_special_characters_in_missing_key() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    let key = "registry\"\\path\n⚠";
+
+    let output = lpm(&project)
+        .args(["config", "get", key, "--json"])
+        .output()
+        .expect("failed to run lpm config get --json with a special-character key");
+
+    assert!(
+        output.status.success(),
+        "lpm config get --json failed with a special-character key:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "config get --json must escape a special-character key: {error}\n---\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": key,
+            "value": null,
+            "found": false,
+        })
+    );
 }
 
 #[test]

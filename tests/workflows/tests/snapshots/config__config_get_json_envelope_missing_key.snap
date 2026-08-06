@@ -6,6 +6,6 @@ expression: envelope
   "success": true,
   "action": "get",
   "key": "registry",
-  "value": "https://registry.example.test",
-  "found": true
+  "value": null,
+  "found": false
 }

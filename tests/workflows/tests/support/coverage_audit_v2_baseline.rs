@@ -1029,17 +1029,16 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 43: lpm config get ──
     SurfaceV2 {
         id: 43,
-        scenarios: 1,
-        failure_modes_tested: &["JSON returns existing value"],
-        failure_modes_known: &[
-            "nonexistent key error",
-            "config file parse error",
-            "symlink config path",
-            "get of a key with embedded JSON-special characters",
+        scenarios: 3,
+        failure_modes_tested: &[
+            "JSON returns existing value",
+            "missing key returns found false with null value",
+            "JSON preserves a key with embedded special characters",
         ],
+        failure_modes_known: &["config file parse error", "symlink config path"],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 3)],
+        last_audited_at: "2026-08-06",
     },
     // ── id 44: lpm config set ──
     SurfaceV2 {

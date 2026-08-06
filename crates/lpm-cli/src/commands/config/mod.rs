@@ -145,22 +145,23 @@ pub async fn run(
         "get" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let config = read_config(&config_path)?;
-            if let Some(val) = config.get(key) {
-                if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "success": true,
-                            key: config_value_to_json(val),
-                        }))
-                        .unwrap()
-                    );
-                } else if let Some(raw) = val.as_str() {
+            let value = config.get(key);
+            if json_output {
+                let envelope = serde_json::json!({
+                    "success": true,
+                    "action": "get",
+                    "key": key,
+                    "value": value.map_or(serde_json::Value::Null, config_value_to_json),
+                    "found": value.is_some(),
+                });
+                println!("{}", serde_json::to_string_pretty(&envelope)?);
+            } else if let Some(value) = value {
+                if let Some(raw) = value.as_str() {
                     println!("{}", lpm_common::sanitize_terminal_inline(raw));
                 } else {
-                    println!("{}", config_value_for_display(val));
+                    println!("{}", config_value_for_display(value));
                 }
-            } else if !json_output {
+            } else {
                 install_ui::warn_untrusted(&format!("{key} is not set"));
             }
         }
