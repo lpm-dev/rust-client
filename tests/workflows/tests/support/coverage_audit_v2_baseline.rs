@@ -2612,10 +2612,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 119: lpm tunnel <port> (start) ──
     SurfaceV2 {
         id: 119,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "tunnel help emits action summary",
             "tunnel <port> without auth under --json emits error envelope on stdout",
+            "invalid bare domain suggests the supported positional domain syntax",
         ],
         failure_modes_known: &[
             "tunnel service connection failure",
@@ -2624,8 +2625,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tunnel under a HOME that has never been paired",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 3)],
+        last_audited_at: "2026-08-06",
     },
     // ── id 120: lpm tunnel claim / unclaim / list / domains ──
     SurfaceV2 {
