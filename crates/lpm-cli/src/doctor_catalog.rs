@@ -1425,9 +1425,9 @@ pub static GLOBAL_MANIFEST_VALID: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.json` parses and is structurally valid.",
-    when_fires: "Manifest exists and is well-formed.",
-    remediation: "No action — informational pass.",
+    description: "`~/.lpm/global/manifest.toml` contains valid TOML and valid global install records.",
+    when_fires: "The manifest exists, parses as TOML, uses a supported schema, and passes structural validation.",
+    remediation: "No action is necessary.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
@@ -1437,9 +1437,9 @@ pub static GLOBAL_MANIFEST_ABSENT: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "No global install manifest is present (no global installs yet).",
-    when_fires: "`~/.lpm/global/` is empty or missing.",
-    remediation: "No action — informational pass.",
+    description: "The global install manifest does not exist.",
+    when_fires: "`~/.lpm/global/manifest.toml` does not exist.",
+    remediation: "No action is necessary.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
@@ -1449,27 +1449,21 @@ pub static GLOBAL_MANIFEST_CORRUPT: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.json` is unreadable or malformed.",
-    when_fires: "JSON parse error or schema mismatch.",
-    remediation: "Inspect and repair, or reinstall affected globals.",
+    description: "LPM cannot read `~/.lpm/global/manifest.toml` as a supported TOML manifest.",
+    when_fires: "The file is unreadable, is not valid UTF-8 or TOML, or uses a newer schema version.",
+    remediation: "Repair `~/.lpm/global/manifest.toml`, or reinstall the affected global packages.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
 
-/// L38: TOML-parseable manifest with structurally invalid rows —
-/// `packages.*.root` outside the `installs/<name>@<version>` shape,
-/// alias rows pointing at non-existent packages or non-declared bins,
-/// tombstones outside the same shape. Pre-fix the doctor only checked
-/// parseability, and downstream `lpm global list --verbose` would
-/// happily `dir_size()` on escaped paths.
 pub static GLOBAL_MANIFEST_STRUCTURALLY_INVALID: CheckEntry = CheckEntry {
     code: "global_manifest_structurally_invalid",
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.toml` parses as TOML but carries structurally invalid rows: `packages.*.root` outside the `installs/<name>@<version>` shape, alias rows pointing at non-existent packages or non-declared bins, or tombstones with the same shape violation.",
-    when_fires: "Manifest TOML is valid but one or more rows fail the L47 `validated_install_root_relative` shape check, or an alias row dangles.",
-    remediation: "Inspect `~/.lpm/global/manifest.toml`; fix the offending rows by hand or reinstall the affected globals.",
+    description: "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+    when_fires: "The manifest parses, but a record fails global install validation.",
+    remediation: "Repair the affected records, or reinstall the affected global packages.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };

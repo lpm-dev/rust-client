@@ -324,6 +324,84 @@ fn doctor_list_tunnel_reachability_metadata_matches_runtime_contract() {
 }
 
 #[test]
+fn doctor_list_global_manifest_metadata_matches_toml_contract() {
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list", "--category", "global"])
+        .output()
+        .expect("failed to run lpm doctor list --json --category global");
+    assert!(
+        output.status.success(),
+        "doctor list failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_output(&output.stdout);
+    let relevant_codes = [
+        "global_manifest_absent",
+        "global_manifest_corrupt",
+        "global_manifest_structurally_invalid",
+        "global_manifest_valid",
+    ];
+    let actual: BTreeMap<&str, serde_json::Value> = json["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|entry| {
+            let code = entry["code"].as_str()?;
+            relevant_codes.contains(&code).then(|| {
+                (
+                    code,
+                    serde_json::json!({
+                        "description": entry["description"],
+                        "when_fires": entry["when_fires"],
+                        "remediation": entry["remediation"],
+                    }),
+                )
+            })
+        })
+        .collect();
+
+    let expected = BTreeMap::from([
+        (
+            "global_manifest_absent",
+            serde_json::json!({
+                "description": "The global install manifest does not exist.",
+                "when_fires": "`~/.lpm/global/manifest.toml` does not exist.",
+                "remediation": "No action is necessary.",
+            }),
+        ),
+        (
+            "global_manifest_corrupt",
+            serde_json::json!({
+                "description": "LPM cannot read `~/.lpm/global/manifest.toml` as a supported TOML manifest.",
+                "when_fires": "The file is unreadable, is not valid UTF-8 or TOML, or uses a newer schema version.",
+                "remediation": "Repair `~/.lpm/global/manifest.toml`, or reinstall the affected global packages.",
+            }),
+        ),
+        (
+            "global_manifest_structurally_invalid",
+            serde_json::json!({
+                "description": "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+                "when_fires": "The manifest parses, but a record fails global install validation.",
+                "remediation": "Repair the affected records, or reinstall the affected global packages.",
+            }),
+        ),
+        (
+            "global_manifest_valid",
+            serde_json::json!({
+                "description": "`~/.lpm/global/manifest.toml` contains valid TOML and valid global install records.",
+                "when_fires": "The manifest exists, parses as TOML, uses a supported schema, and passes structural validation.",
+                "remediation": "No action is necessary.",
+            }),
+        ),
+    ]);
+
+    assert_eq!(actual, expected);
+    insta::assert_json_snapshot!("doctor_list_global_manifest_metadata", actual);
+}
+
+#[test]
 fn doctor_list_includes_typescript_codes_from_tranche_1() {
     let codes = read_catalog_codes();
     for code in [
