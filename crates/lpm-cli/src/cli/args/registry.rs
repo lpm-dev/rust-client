@@ -319,9 +319,9 @@ pub(crate) enum SetupAction {
         /// Setup target: npmrc, github-actions, gitlab.
         target: Option<String>,
 
-        /// Environment name for workflow snippets.
-        #[arg(long, default_value = "production")]
-        env: String,
+        /// Environment name for workflow snippets (default: production).
+        #[arg(long)]
+        env: Option<String>,
 
         /// Override the registry URL for `.npmrc` (default: current `--registry` or `LPM_REGISTRY_URL`).
         #[arg(short = 'r', long)]

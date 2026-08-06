@@ -105,6 +105,37 @@ fn setup_ci_keeps_its_registry_short_flag() {
 }
 
 #[test]
+fn setup_ci_env_distinguishes_default_from_explicit_production() {
+    let default = Cli::try_parse_from(["lpm", "setup", "ci", "github-actions"])
+        .expect("setup ci default env must parse");
+    let explicit = Cli::try_parse_from([
+        "lpm",
+        "setup",
+        "ci",
+        "github-actions",
+        "--env",
+        "production",
+    ])
+    .expect("setup ci explicit env must parse");
+
+    let Some(Commands::Setup(registry::SetupArgs {
+        action: registry::SetupAction::Ci { env: default, .. },
+    })) = default.command
+    else {
+        panic!("expected default setup ci command");
+    };
+    let Some(Commands::Setup(registry::SetupArgs {
+        action: registry::SetupAction::Ci { env: explicit, .. },
+    })) = explicit.command
+    else {
+        panic!("expected explicit setup ci command");
+    };
+
+    assert_eq!(default, None);
+    assert_eq!(explicit.as_deref(), Some("production"));
+}
+
+#[test]
 fn audit_level_rejects_unknown_severity() {
     let error = match Cli::try_parse_from(["lpm", "audit", "--level", "severe"]) {
         Ok(_) => panic!("unknown audit severity must fail during argument parsing"),

@@ -701,3 +701,36 @@ fn setup_ci_json_reports_file_backed_storage_backend_for_stored_token() {
     );
     assert_eq!(envelope["storage_degraded"], serde_json::json!(true));
 }
+
+#[test]
+fn setup_ci_npmrc_rejects_explicit_env_without_writing_dot_npmrc() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["--json", "setup", "ci", "npmrc", "--env", "production"])
+        .output()
+        .expect("failed to run lpm setup ci npmrc with --env");
+
+    assert!(
+        !output.status.success(),
+        "setup ci npmrc must reject explicit --env"
+    );
+    assert!(
+        !project.file_exists(".npmrc"),
+        "rejected --env must not write .npmrc"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("setup ci npmrc error must be JSON: {error}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["error_code"], serde_json::json!("script"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("--env") && error.contains("npmrc")),
+        "error must identify the irrelevant flag and target: {envelope}"
+    );
+    insta::assert_json_snapshot!("setup_ci_npmrc_rejects_env_json", envelope);
+}

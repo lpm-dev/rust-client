@@ -30,6 +30,20 @@ where
     })
 }
 
+pub(super) fn argv_has_setup_ci_registry_flag<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: Into<std::ffi::OsString>,
+{
+    args.into_iter().skip(1).any(|arg| {
+        let arg = arg.into();
+        arg == "--registry"
+            || arg
+                .to_str()
+                .is_some_and(|value| value.starts_with("--registry=") || value.starts_with("-r"))
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SlimErrorLine {
     Failed(install_ui::TerminalLine),
@@ -1060,6 +1074,36 @@ fn clap_help_hint(error: &clap::Error, fallback: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_ci_registry_flag_scan_detects_every_explicit_form() {
+        for args in [
+            vec!["lpm", "--registry", "https://registry.example"],
+            vec!["lpm", "--registry=https://registry.example"],
+            vec![
+                "lpm",
+                "setup",
+                "ci",
+                "npmrc",
+                "-r",
+                "https://registry.example",
+            ],
+            vec!["lpm", "setup", "ci", "npmrc", "-rhttps://registry.example"],
+        ] {
+            assert!(argv_has_setup_ci_registry_flag(args));
+        }
+    }
+
+    #[test]
+    fn setup_ci_registry_flag_scan_ignores_argv_without_registry_flags() {
+        assert!(!argv_has_setup_ci_registry_flag([
+            "lpm",
+            "setup",
+            "ci",
+            "github-actions"
+        ]));
+    }
+
     fn plain_slim_line(line: &SlimErrorLine) -> String {
         let raw = match line {
             SlimErrorLine::Failed(message) | SlimErrorLine::Detail(message) => message,
