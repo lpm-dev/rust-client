@@ -37,6 +37,7 @@ chrono = { workspace = true }
 rcgen = { version = "0.13", features = ["pem"] }
 reqwest = { workspace = true }
 lpm-runtime = { path = "../../crates/lpm-runtime" }
+lpm-plugin = { path = "../../crates/lpm-plugin" }
 lpm-common = { path = "../../crates/lpm-common" }
 lpm-registry = { path = "../../crates/lpm-registry" }
 lpm-linker = { path = "../../crates/lpm-linker" }

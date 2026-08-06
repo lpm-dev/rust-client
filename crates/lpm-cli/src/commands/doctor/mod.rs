@@ -8,6 +8,7 @@ use std::path::Path;
 
 mod check;
 mod config_file;
+mod fix;
 mod global;
 mod install_fix;
 mod local_sources;
@@ -25,18 +26,14 @@ mod tooling;
 mod tunnel;
 mod workspace;
 
-use self::check::{Check, format_doctor_issue_summary_colored};
+use self::check::{Check, FixTarget, format_doctor_issue_summary_colored};
 use self::config_file::validate_lpm_json;
 use self::global::check_global_installs;
-use self::install_fix::run_doctor_install;
 use self::local_sources::check_local_source_paths;
-use self::lockfile::{
-    check_deps_in_sync, check_gitattributes_state, check_lockfile_state, fix_binary_lockfile,
-    fix_gitattributes,
-};
+use self::lockfile::{check_deps_in_sync, check_gitattributes_state, check_lockfile_state};
 use self::manifest::check_manifest_compat;
 use self::policy::check_policy_extensions;
-use self::runtime::{extract_node_spec_from_detail, get_system_bun_version};
+use self::runtime::get_system_bun_version;
 use self::script_policy::check_script_policy_surface;
 use self::sigstore::check_sigstore_verify_posture;
 use self::storage::{auth_storage_check, vault_storage_check};
@@ -197,7 +194,6 @@ pub async fn run(
     _yes: bool,
 ) -> Result<(), LpmError> {
     let mut checks: Vec<Check> = Vec::new();
-    let mut fixes_applied: Vec<String> = Vec::new();
     let mut sweep_progress = if all && !json_output {
         Some(install_ui::spin("Running doctor --all checks"))
     } else {
@@ -590,17 +586,22 @@ pub async fn run(
                 &format!("v{ver} (managed, from {})", det.source_label()),
             ));
         } else if let Some(sys) = &effective_version {
-            checks.push(Check::warn(&doctor_catalog::NODE_PINNED_UNMET, &format!(
-					"{sys} (script PATH) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
-					det.source_label()
-				),));
+            checks.push(Check::warn_with_fix_target(
+                &doctor_catalog::NODE_PINNED_UNMET,
+                &format!(
+                    "{sys} (script PATH) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
+                    det.source_label()
+                ),
+                FixTarget::NodeSpec(clean.to_string()),
+            ));
         } else {
-            checks.push(Check::fail(
+            checks.push(Check::fail_with_fix_target(
                 &doctor_catalog::NODE_MISSING_PINNED,
                 &format!(
                     "not found — pinned {spec} from {}. Run: lpm use node@{clean}",
                     det.source_label()
                 ),
+                FixTarget::NodeSpec(clean.to_string()),
             ));
         }
     } else {
@@ -610,9 +611,10 @@ pub async fn run(
                 &format!("{v} (script PATH, no version pinned)"),
             ));
         } else {
-            checks.push(Check::fail(
+            checks.push(Check::fail_with_fix_target(
                 &doctor_catalog::NODE_MISSING_UNPINNED,
                 "not found — run: lpm use node@22",
+                FixTarget::NodeSpec("22".into()),
             ));
         }
     }
@@ -630,20 +632,22 @@ pub async fn run(
                 &format!("{ver} (managed, from {})", det.source),
             ));
         } else if let Some(sys) = &system_bun {
-            checks.push(Check::warn(
+            checks.push(Check::warn_with_fix_target(
                 &doctor_catalog::BUN_PINNED_UNMET,
                 &format!(
                     "{sys} (system) — pinned {spec} from {} not installed. Run: lpm use bun@{clean}",
                     det.source
                 ),
+                FixTarget::BunSpec(clean),
             ));
         } else {
-            checks.push(Check::fail(
+            checks.push(Check::fail_with_fix_target(
                 &doctor_catalog::BUN_MISSING_PINNED,
                 &format!(
                     "not found — pinned {spec} from {}. Run: lpm use bun@{clean}",
                     det.source
                 ),
+                FixTarget::BunSpec(clean),
             ));
         }
     }
@@ -737,174 +741,11 @@ pub async fn run(
         progress.settle();
     }
 
-    // === Auto-fix (runs before output so JSON includes fixes_applied) ===
-    if fix {
-        if !json_output {
-            install_ui::phase("Running auto-fix");
-        }
-
-        let mut install_ran = false;
-
-        for check in &checks {
-            // Auto-fix dispatch keys on the stable `code` field so
-            // wording tweaks to `name` / `detail` never silently break
-            // a fix branch. Each branch handles the codes that share a
-            // remediation; passing-state codes never reach here because
-            // the outer loop only enters `--fix` when there's something
-            // to fix.
-            match check.code() {
-                "node_modules_symlinked" => {
-                    if !json_output {
-                        install_ui::phase("fixing: replacing the project node_modules link");
-                    }
-                    match replace_project_node_modules_link(project_dir) {
-                        Ok(()) => fixes_applied.push(
-                            "replaced project node_modules link with a real directory".into(),
-                        ),
-                        Err(e) => render_autofix_failed("replace project node_modules link", &e),
-                    }
-                }
-                "node_modules_missing"
-                | "node_modules_no_store"
-                | "node_modules_legacy_layout"
-                | "node_modules_mixed_layout"
-                    if !install_ran =>
-                {
-                    if !json_output {
-                        install_ui::phase("fixing: lpm install");
-                    }
-                    match run_doctor_install(client, project_dir).await {
-                        Ok(()) => {
-                            fixes_applied.push("lpm install".into());
-                            install_ran = true;
-                        }
-                        Err(e) => render_autofix_failed("lpm install", &e),
-                    }
-                }
-                "node_pinned_unmet" | "node_missing_pinned" | "node_missing_unpinned" => {
-                    if let Some(spec) = extract_node_spec_from_detail(&check.detail) {
-                        if !json_output {
-                            install_ui::phase_untrusted(&format!(
-                                "fixing: lpm use node@{}",
-                                lpm_common::sanitize_terminal_inline(&spec)
-                            ));
-                        }
-                        let http_client = lpm_http::client_builder()
-                            .timeout(std::time::Duration::from_secs(60))
-                            .build()
-                            .map_err(|e| LpmError::Network(format!("{e}")))?;
-                        let platform = lpm_runtime::platform::Platform::current()?;
-                        let releases = lpm_runtime::node::fetch_index(&http_client).await;
-                        if let Ok(releases) = releases
-                            && let Some(release) =
-                                lpm_runtime::node::resolve_version(&releases, &spec)
-                        {
-                            match lpm_runtime::download::install_node(
-                                &http_client,
-                                &release,
-                                &platform,
-                            )
-                            .await
-                            {
-                                Ok(ver) => fixes_applied.push(format!("installed node {ver}")),
-                                Err(e) => render_autofix_failed("node install", &e),
-                            }
-                        }
-                    }
-                }
-                "fmt_unformatted" | "fmt_other_issue" => {
-                    if !json_output {
-                        install_ui::phase("fixing: lpm fmt");
-                    }
-                    let result = crate::commands::tools::fmt(project_dir, &[], false, false).await;
-                    match result {
-                        Ok(()) => fixes_applied.push("lpm fmt".into()),
-                        Err(e) => render_autofix_failed("lpm fmt", &e),
-                    }
-                }
-                "lockfile_missing" if !install_ran => {
-                    if !json_output {
-                        install_ui::phase("fixing: lpm install (generates lockfile)");
-                    }
-                    match run_doctor_install(client, project_dir).await {
-                        Ok(()) => {
-                            fixes_applied.push("lpm install (lockfile)".into());
-                            install_ran = true;
-                        }
-                        Err(e) => render_autofix_failed("lpm install", &e),
-                    }
-                }
-                "deps_sync_drift" if !install_ran => {
-                    if !json_output {
-                        install_ui::phase("fixing: lpm install (sync lockfile)");
-                    }
-                    match run_doctor_install(client, project_dir).await {
-                        Ok(()) => {
-                            fixes_applied.push("lpm install (deps sync)".into());
-                            install_ran = true;
-                        }
-                        Err(e) => render_autofix_failed("lpm install", &e),
-                    }
-                }
-                "lockfile_binary_stale" | "lockfile_binary_corrupt" | "lockfile_binary_missing" => {
-                    if !json_output {
-                        install_ui::phase("fixing: reconciling lpm.lockb with lpm.lock");
-                    }
-                    match fix_binary_lockfile(project_dir) {
-                        Ok(()) => fixes_applied.push("reconciled lpm.lockb".into()),
-                        Err(e) => render_autofix_failed("reconcile lpm.lockb", &e),
-                    }
-                }
-                "gitattributes_missing" | "gitattributes_lockb_unmarked" => {
-                    if !json_output {
-                        install_ui::phase(
-                            "fixing: ensuring .gitattributes marks lpm.lockb as binary",
-                        );
-                    }
-                    match fix_gitattributes(project_dir) {
-                        Ok(()) => fixes_applied.push("updated .gitattributes".into()),
-                        Err(e) => render_autofix_failed("update .gitattributes", &e),
-                    }
-                }
-                "tunnel_not_claimed" => {
-                    // Extract domain from detail: "acme-api.lpm.llc — not claimed ..."
-                    if let Some(domain) = check.detail.split(" —").next() {
-                        let domain = domain.trim();
-                        if !json_output {
-                            install_ui::phase_untrusted(&format!(
-                                "fixing: lpm tunnel claim {}",
-                                lpm_common::sanitize_terminal_inline(domain)
-                            ));
-                        }
-                        match client.tunnel_claim(domain, None).await {
-                            Ok(_) => {
-                                fixes_applied.push(format!("claimed tunnel domain {domain}"));
-                            }
-                            Err(e) => render_autofix_failed("tunnel claim", &e),
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if !json_output {
-            if fixes_applied.is_empty() {
-                install_ui::phase("no auto-fixable issues found");
-            } else {
-                install_ui::done_untrusted(&format!(
-                    "applied {} fix(es): {}",
-                    fixes_applied.len(),
-                    fixes_applied.join(", ")
-                ));
-                install_ui::detail_line(crate::install_ui::terminal_line!(
-                    "  {} Run {} to verify fixes.",
-                    install_ui::dim("hint"),
-                    install_ui::yellow("lpm doctor")
-                ));
-            }
-        }
-    }
+    let fixes_applied = if fix {
+        self::fix::apply(&checks, client, project_dir, json_output).await
+    } else {
+        Vec::new()
+    };
 
     // Tier-leak tripwire: in fast mode, every emitted check MUST
     // carry `Tier::Fast` — block-level gates above are the source of

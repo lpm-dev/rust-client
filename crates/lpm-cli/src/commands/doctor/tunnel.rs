@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::doctor_catalog;
 use lpm_registry::RegistryClient;
 
-use super::check::Check;
+use super::check::{Check, FixTarget};
 
 /// Check tunnel domain configuration from lpm.json.
 ///
@@ -138,9 +138,10 @@ pub(super) async fn check_tunnel_domain(
             let owned = result["ownedByYou"].as_bool().unwrap_or(false);
 
             if !found {
-                checks.push(Check::warn(
+                checks.push(Check::warn_with_fix_target(
                     &doctor_catalog::TUNNEL_NOT_CLAIMED,
                     &format!("{domain} — not claimed. Run: lpm tunnel claim {domain}"),
+                    FixTarget::TunnelDomain(domain),
                 ));
                 return checks;
             }

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::doctor_catalog;
 
-use super::check::Check;
+use super::check::{Check, FixTarget};
 
 /// Run a tool command with a 30-second timeout.
 /// Returns (stdout, stderr, exit_code) or None on timeout/error.
@@ -276,12 +276,13 @@ pub(super) async fn check_plugins() -> Vec<Check> {
                 &format!("{}: v{current} (up to date)", def.name),
             ));
         } else {
-            checks.push(Check::warn(
+            checks.push(Check::warn_with_fix_target(
                 &doctor_catalog::PLUGIN_UPDATE_AVAILABLE,
                 &format!(
                     "{}: v{current} → v{latest} available — run: lpm plugin update {}",
                     def.name, def.name,
                 ),
+                FixTarget::PluginName(def.name.to_string()),
             ));
         }
     }

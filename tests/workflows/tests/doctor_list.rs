@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -114,6 +114,49 @@ fn doctor_list_each_entry_has_required_fields() {
             "auto_fix must be null or string; got: {auto}"
         );
     }
+}
+
+#[test]
+fn doctor_list_auto_fix_metadata_matches_every_supported_runtime_action() {
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list"])
+        .output()
+        .expect("failed to run lpm doctor list --json");
+    let json = parse_json_output(&output.stdout);
+    let actual: BTreeMap<&str, &str> = json["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|entry| Some((entry["code"].as_str()?, entry["auto_fix"].as_str()?)))
+        .collect();
+    let expected = BTreeMap::from([
+        ("bun_missing_pinned", "lpm use bun@<spec>"),
+        ("bun_pinned_unmet", "lpm use bun@<spec>"),
+        ("deps_sync_drift", "lpm install"),
+        ("fmt_other_issue", "lpm fmt"),
+        ("fmt_unformatted", "lpm fmt"),
+        ("gitattributes_lockb_unmarked", "update .gitattributes"),
+        ("gitattributes_missing", "update .gitattributes"),
+        ("lockfile_binary_corrupt", "reconcile lpm.lockb"),
+        ("lockfile_binary_missing", "reconcile lpm.lockb"),
+        ("lockfile_binary_stale", "reconcile lpm.lockb"),
+        ("lockfile_missing", "lpm install"),
+        ("node_missing_pinned", "lpm use node@<spec>"),
+        ("node_missing_unpinned", "lpm use node@22"),
+        ("node_modules_legacy_layout", "lpm install"),
+        ("node_modules_missing", "lpm install"),
+        ("node_modules_mixed_layout", "lpm install"),
+        ("node_modules_no_store", "lpm install"),
+        ("node_modules_symlinked", "lpm doctor --fix"),
+        ("node_pinned_unmet", "lpm use node@<spec>"),
+        ("plugin_update_available", "lpm plugin update <name>"),
+        ("tunnel_not_claimed", "lpm tunnel claim <domain>"),
+        ("v2_store_orphans", "lpm cache prune --apply"),
+    ]);
+
+    assert_eq!(actual, expected);
+    insta::assert_json_snapshot!("doctor_list_auto_fix_actions", actual);
 }
 
 #[test]

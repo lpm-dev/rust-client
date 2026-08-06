@@ -3915,6 +3915,7 @@ dependencies = [
  "lpm-inspect",
  "lpm-linker",
  "lpm-lockfile",
+ "lpm-plugin",
  "lpm-registry",
  "lpm-runner",
  "lpm-runtime",
