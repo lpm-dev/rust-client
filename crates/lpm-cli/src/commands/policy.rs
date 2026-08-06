@@ -6,6 +6,7 @@ use crate::commands::install::policy_extensions::{
 };
 use clap::Subcommand;
 use lpm_common::{LpmError, sanitize_for_terminal};
+use lpm_semver::Version;
 use std::path::Path;
 
 pub(crate) const POLICY_EXTENSIONS_NOT_CONFIGURED_CODE: &str = "policy_extensions_not_configured";
@@ -304,6 +305,7 @@ async fn run_test(
     package: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let (name, version) = parse_exact_package_candidate(package)?;
     let configs = load_policy_extension_configs_checked()?;
     let config = configs
         .iter()
@@ -311,7 +313,6 @@ async fn run_test(
         .ok_or_else(|| {
             LpmError::Script(format!("policy extension `{extension}` is not configured"))
         })?;
-    let (name, version) = parse_exact_package_candidate(package)?;
     let outcome = run_policy_extension_test(config, project_dir, &name, &version).await?;
 
     if json_output {
@@ -445,7 +446,7 @@ fn policy_decision_counts(
 
 fn parse_exact_package_candidate(spec: &str) -> Result<(String, String), LpmError> {
     let split = spec.rfind('@').filter(|index| *index > 0).ok_or_else(|| {
-        LpmError::Script(
+        LpmError::InvalidVersion(
             "`lpm policy test --package` requires an exact package candidate like react@19.0.0"
                 .to_string(),
         )
@@ -453,11 +454,30 @@ fn parse_exact_package_candidate(spec: &str) -> Result<(String, String), LpmErro
     let (name, version_with_at) = spec.split_at(split);
     let version = &version_with_at[1..];
     if name.is_empty() || version.is_empty() {
-        return Err(LpmError::Script(
+        return Err(LpmError::InvalidVersion(
             "`lpm policy test --package` requires non-empty package name and version".to_string(),
         ));
     }
+    let numeric_version = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version);
+    let version = if is_major_minor_version(numeric_version) {
+        Version::parse(&format!("{numeric_version}.0"))?
+    } else {
+        Version::parse(version)?
+    };
     Ok((name.to_string(), version.to_string()))
+}
+
+fn is_major_minor_version(version: &str) -> bool {
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|byte| byte.is_ascii_digit())
+        && minor.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn validate_policy_extension_command_available(
@@ -500,9 +520,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_exact_package_candidate_accepts_prerelease_and_build_metadata() {
+        let (_, version) = parse_exact_package_candidate("react@19.0.0-rc.1+build.5").unwrap();
+
+        assert_eq!(version, "19.0.0-rc.1+build.5");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_normalizes_v_prefix() {
+        let (_, version) = parse_exact_package_candidate("react@v19.0.0").unwrap();
+
+        assert_eq!(version, "19.0.0");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_normalizes_partial_version() {
+        let (_, version) = parse_exact_package_candidate("react@19.0").unwrap();
+
+        assert_eq!(version, "19.0.0");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_rejects_dist_tag() {
+        let err = parse_exact_package_candidate("react@latest").unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_version");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_rejects_caret_range() {
+        let err = parse_exact_package_candidate("react@^19.0.0").unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_version");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_rejects_tilde_range() {
+        let err = parse_exact_package_candidate("react@~19.0.0").unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_version");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_rejects_wildcard() {
+        let err = parse_exact_package_candidate("react@19.x").unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_version");
+    }
+
+    #[test]
+    fn parse_exact_package_candidate_rejects_malformed_version() {
+        let err = parse_exact_package_candidate("react@19..0").unwrap_err();
+
+        assert_eq!(err.error_code(), "invalid_version");
+    }
+
+    #[test]
     fn parse_exact_package_candidate_rejects_missing_version() {
         let err = parse_exact_package_candidate("@scope/pkg").unwrap_err();
 
-        assert!(err.to_string().contains("requires an exact package"));
+        assert_eq!(err.error_code(), "invalid_version");
     }
 }

@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/policy_extensions.rs
+expression: json
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error": "invalid version: latest: Failed to parse version.",
+  "error_code": "invalid_version"
+}
