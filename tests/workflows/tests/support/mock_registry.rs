@@ -1472,7 +1472,7 @@ impl MockRegistry {
     /// (the mock's `.expect(1)` only fires if every `body_string_contains`
     /// gate matches the actual request body).
     ///
-    /// Eight parameters is intentional — the test-fixture call sites in
+    /// Nine parameters is intentional — the test-fixture call sites in
     /// `env_vault.rs` are documentation-as-test for what the CLI sends.
     /// Converting to an options struct hides the per-field intent at the
     /// call site, which is the opposite of what these tests want.
@@ -1482,6 +1482,7 @@ impl MockRegistry {
         bearer_token: &str,
         vault_id: &str,
         repo: &str,
+        repository_id: &str,
         branches: &[&str],
         envs: &[&str],
         workflows: &[&str],
@@ -1491,7 +1492,10 @@ impl MockRegistry {
             .and(path("/api/vault/oidc/policies"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .and(body_string_contains(format!("\"subject\":\"repo:{repo}\"")));
+            .and(body_string_contains(format!("\"subject\":\"repo:{repo}\"")))
+            .and(body_string_contains(format!(
+                "\"repositoryId\":\"{repository_id}\""
+            )));
 
         for branch in branches {
             mock = mock.and(body_string_contains(format!("\"{branch}\"")));

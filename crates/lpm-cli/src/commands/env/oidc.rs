@@ -1,4 +1,19 @@
+use super::github::{github_api_url, validate_repository, validate_repository_id};
 use super::prelude::*;
+
+const GITHUB_API_VERSION: &str = "2022-11-28";
+const GITHUB_OIDC_USER_AGENT: &str = "lpm-env-oidc";
+
+struct GitHubRepositoryIdentity {
+    id: String,
+    full_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRepositoryResponse {
+    id: u64,
+    full_name: String,
+}
 
 /// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production [--events=push,workflow_dispatch] [--allow-forks]`
 pub(super) async fn vars_oidc(
@@ -42,9 +57,11 @@ fn print_oidc_help() {
 fn print_oidc_allow_help() {
     println!(
         r#"Usage:
-  lpm env oidc allow --provider=github --repo=<owner/repo> --workflow=.github/workflows/<file>.yml --branch=<list> --env=<list> [--events=<list>] [--allow-forks]
+  lpm env oidc allow --provider=github --repo=<owner/repo> [--repository-id=<numeric-id>] --workflow=.github/workflows/<file>.yml --branch=<list> --env=<list> [--events=<list>] [--allow-forks]
 
   lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=<list> --env=<list>
+
+The CLI looks up the immutable ID for a public GitHub repository. For a private repository, set GITHUB_TOKEN or GH_TOKEN, or pass --repository-id.
 
 This command replaces the policy's complete allowlists. Run `lpm env oidc list` first, then supply every branch, environment, workflow, and event that should remain allowed."#
     );
@@ -58,6 +75,7 @@ pub(super) async fn vars_oidc_allow(
 ) -> Result<(), LpmError> {
     let mut provider = "github";
     let mut repo: Option<&str> = None;
+    let mut repository_id: Option<&str> = None;
     let mut project_id: Option<&str> = None;
     let mut branches: Vec<String> = vec!["main".to_string()];
     let mut envs: Vec<String> = Vec::new();
@@ -71,6 +89,8 @@ pub(super) async fn vars_oidc_allow(
             provider = v;
         } else if let Some(v) = arg.strip_prefix("--repo=") {
             repo = Some(v);
+        } else if let Some(v) = arg.strip_prefix("--repository-id=") {
+            repository_id = Some(v);
         } else if let Some(v) = arg.strip_prefix("--project-id=") {
             project_id = Some(v);
         } else if let Some(v) = arg.strip_prefix("--branch=") {
@@ -97,7 +117,7 @@ pub(super) async fn vars_oidc_allow(
         ));
     }
 
-    let (subject, identity_label) = match provider {
+    let (subject, identity_label, repository_id) = match provider {
         "github" => {
             if project_id.is_some() {
                 return Err(LpmError::Script(
@@ -112,19 +132,7 @@ pub(super) async fn vars_oidc_allow(
                         .into(),
                 )
             })?;
-            let valid_repo = repo.split_once('/').is_some_and(|(owner, repository)| {
-                !owner.is_empty()
-                    && !repository.is_empty()
-                    && !repository.contains('/')
-                    && !repo
-                        .chars()
-                        .any(|character| character.is_whitespace() || character == ':')
-            });
-            if !valid_repo {
-                return Err(LpmError::Script(
-                    "--repo must be exactly <owner>/<repository>".into(),
-                ));
-            }
+            validate_repository(repo, "--repo")?;
             if workflows.is_empty() {
                 return Err(LpmError::Script(
                     "missing --workflow flag. GitHub policies require \
@@ -146,13 +154,23 @@ pub(super) async fn vars_oidc_allow(
             if !events_supplied {
                 events.push("push".to_string());
             }
-            (format!("repo:{repo}"), format!("repository {repo}"))
+            let identity = resolve_github_repository_identity(repo, repository_id).await?;
+            (
+                format!("repo:{}", identity.full_name),
+                format!("repository {}", identity.full_name),
+                Some(identity.id),
+            )
         }
         "gitlab" => {
-            if repo.is_some() || !workflows.is_empty() || events_supplied || allow_forks {
+            if repo.is_some()
+                || repository_id.is_some()
+                || !workflows.is_empty()
+                || events_supplied
+                || allow_forks
+            {
                 return Err(LpmError::Script(
-                    "GitLab OIDC policies do not accept GitHub-only --repo, --workflow, \
-                     --events, or --allow-forks flags"
+                    "GitLab OIDC policies do not accept GitHub-only --repo, --repository-id, \
+                     --workflow, --events, or --allow-forks flags"
                         .into(),
                 ));
             }
@@ -173,6 +191,7 @@ pub(super) async fn vars_oidc_allow(
             (
                 format!("project:{project_id}"),
                 format!("project ID {project_id}"),
+                None,
             )
         }
         unknown => {
@@ -222,19 +241,23 @@ pub(super) async fn vars_oidc_allow(
     let client = lpm_http::client_builder()
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
+    let mut policy_body = serde_json::json!({
+        "vaultId": vault_id,
+        "provider": provider,
+        "subject": subject,
+        "allowedBranches": branches,
+        "allowedEnvironments": envs,
+        "allowedWorkflows": workflows,
+        "allowedEvents": events,
+        "allowForks": allow_forks,
+    });
+    if let Some(repository_id) = &repository_id {
+        policy_body["repositoryId"] = serde_json::Value::String(repository_id.clone());
+    }
     let response = client
         .post(format!("{registry_url}/api/vault/oidc/policies"))
         .bearer_auth(&auth_token)
-        .json(&serde_json::json!({
-            "vaultId": vault_id,
-            "provider": provider,
-            "subject": subject,
-            "allowedBranches": branches,
-            "allowedEnvironments": envs,
-            "allowedWorkflows": workflows,
-            "allowedEvents": events,
-            "allowForks": allow_forks,
-        }))
+        .json(&policy_body)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -290,6 +313,82 @@ pub(super) async fn vars_oidc_allow(
     }
 
     Ok(())
+}
+
+async fn resolve_github_repository_identity(
+    repository: &str,
+    explicit_id: Option<&str>,
+) -> Result<GitHubRepositoryIdentity, LpmError> {
+    if let Some(repository_id) = explicit_id {
+        validate_repository_id(repository_id)?;
+        return Ok(GitHubRepositoryIdentity {
+            id: repository_id.to_string(),
+            full_name: repository.to_string(),
+        });
+    }
+
+    let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to build GitHub repository lookup client: {error}"
+            ))
+        })?;
+    let mut request = client
+        .get(format!(
+            "{}/repos/{repository}",
+            github_api_url()?.trim_end_matches('/')
+        ))
+        .header(reqwest::header::USER_AGENT, GITHUB_OIDC_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
+    if let Some(token) = github_api_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|error| {
+        LpmError::Network(format!(
+            "GitHub repository ID lookup failed: {}",
+            lpm_http::display_error(&error)
+        ))
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let remediation = if matches!(status.as_u16(), 403 | 429) {
+            "Set GITHUB_TOKEN or GH_TOKEN, or pass --repository-id=<numeric-id>."
+        } else {
+            "For a private repository, set GITHUB_TOKEN or GH_TOKEN, or pass --repository-id=<numeric-id>."
+        };
+        return Err(LpmError::Script(format!(
+            "GitHub repository ID lookup for {repository} failed with HTTP {status}. {remediation}"
+        )));
+    }
+
+    let response_identity: GitHubRepositoryResponse =
+        super::response::parse_capped_platform_json(response).await?;
+    let repository_id = response_identity.id.to_string();
+    validate_repository_id(&repository_id)?;
+    validate_repository(&response_identity.full_name, "GitHub repository name")?;
+    if !response_identity.full_name.eq_ignore_ascii_case(repository) {
+        return Err(LpmError::Script(format!(
+            "GitHub returned repository {} while {repository} was requested",
+            response_identity.full_name
+        )));
+    }
+    Ok(GitHubRepositoryIdentity {
+        id: repository_id,
+        full_name: response_identity.full_name,
+    })
+}
+
+fn github_api_token() -> Option<String> {
+    ["GITHUB_TOKEN", "GH_TOKEN"].into_iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn oidc_escrow_setup_error(step: &str, error: &str) -> LpmError {
@@ -370,6 +469,11 @@ pub(super) async fn vars_oidc_list(
     for policy in policies.unwrap() {
         let provider = policy["provider"].as_str().unwrap_or("?");
         let subject = policy["subject"].as_str().unwrap_or("?");
+        let identity = match (provider, policy["repositoryId"].as_str()) {
+            ("github", Some(id)) => format!("{subject} (repository ID {id})"),
+            ("github", None) => format!("{subject} (repository ID missing, update required)"),
+            _ => subject.to_string(),
+        };
         let branches = render_strings(&policy["allowedBranches"]);
         let envs = render_strings(&policy["allowedEnvironments"]);
         let workflows = render_strings(&policy["allowedWorkflows"]);
@@ -389,7 +493,7 @@ pub(super) async fn vars_oidc_list(
             install_ui::terminal_line!(
                 "  {} {}\n      branches:  [{}]\n      envs:      [{}]\n      workflows: [{}]\n      events:    [{}]{}",
                 install_ui::bold(provider),
-                subject,
+                identity,
                 bb,
                 ee,
                 ww,

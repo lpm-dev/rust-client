@@ -8,20 +8,22 @@ use lpm_env::EnvSchema;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
+use super::super::github::{
+    github_api_url, split_repository, validate_repository, validate_repository_id,
+};
+
 use super::{
     LocalPlatformValues, MutationKind, MutationOutcome, PLATFORM_TIMEOUT, PlatformApplyError,
     PlatformDiff, PlatformPushResult, PlatformState, PlatformVariable, VariableScope,
     append_platform_error_context, read_platform_response,
 };
 
-const GITHUB_API_URL: &str = "https://api.github.com";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_USER_AGENT: &str = "lpm-env-github-actions";
 const GITHUB_VALUE_NAME_MAX_CHARS: usize = 100;
 const GITHUB_VALUE_MAX_BYTES: usize = 48 * 1024;
 const GITHUB_PAGE_SIZE: usize = 100;
 const GITHUB_MAX_PAGES: usize = 20;
-const GITHUB_REPOSITORY_MAX_CHARS: usize = 140;
 const GITHUB_ENVIRONMENT_MAX_CHARS: usize = 255;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,7 +101,7 @@ impl GitHubActionsClient {
         token: String,
         config: GitHubActionsConnectionConfig,
     ) -> Result<Self, LpmError> {
-        validate_repository(&config.repository)?;
+        validate_repository(&config.repository, "--repository")?;
         validate_repository_id(&config.repository_id)?;
         if let Some(environment) = &config.environment {
             validate_environment(environment)?;
@@ -132,7 +134,7 @@ impl GitHubActionsClient {
         environment: Option<String>,
         linked_env: Option<String>,
     ) -> Result<Self, LpmError> {
-        validate_repository(repository)?;
+        validate_repository(repository, "--repository")?;
         if let Some(environment) = &environment {
             validate_environment(environment)?;
         }
@@ -784,52 +786,6 @@ fn validate_value_name(name: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn validate_repository(repository: &str) -> Result<(), LpmError> {
-    if repository.chars().count() > GITHUB_REPOSITORY_MAX_CHARS {
-        return Err(LpmError::Script(format!(
-            "--repository must be at most {GITHUB_REPOSITORY_MAX_CHARS} characters"
-        )));
-    }
-    let (owner, name) = split_repository(repository)
-        .ok_or_else(|| LpmError::Script("--repository must use the owner/name format".into()))?;
-    let valid_owner = owner
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        && !owner.starts_with('-')
-        && !owner.ends_with('-');
-    let valid_name = name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'));
-    if !valid_owner || !valid_name {
-        return Err(LpmError::Script(
-            "--repository contains characters GitHub does not accept".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn split_repository(repository: &str) -> Option<(&str, &str)> {
-    let (owner, name) = repository.split_once('/')?;
-    if owner.is_empty() || name.is_empty() || name.contains('/') {
-        return None;
-    }
-    Some((owner, name))
-}
-
-fn validate_repository_id(repository_id: &str) -> Result<(), LpmError> {
-    if repository_id.is_empty()
-        || repository_id.len() > 20
-        || repository_id.starts_with('0')
-        || !repository_id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(LpmError::Script(
-            "GitHub Actions repository ID must be a positive decimal integer of at most 20 digits"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_environment(environment: &str) -> Result<(), LpmError> {
     if environment.is_empty()
         || environment.chars().count() > GITHUB_ENVIRONMENT_MAX_CHARS
@@ -863,50 +819,6 @@ fn pagination_limit_error(namespace: &str) -> LpmError {
     LpmError::Script(format!(
         "GitHub Actions returned more than {GITHUB_MAX_PAGES} pages of {namespace}; refusing an unbounded sync"
     ))
-}
-
-fn github_api_url() -> Result<String, LpmError> {
-    if !cfg!(any(debug_assertions, feature = "acceptance-test-hooks")) {
-        return Ok(GITHUB_API_URL.into());
-    }
-    let Some(candidate) = std::env::var_os("LPM_ACCEPTANCE_GITHUB_API_BASE_URL") else {
-        return Ok(GITHUB_API_URL.into());
-    };
-    if std::env::var("ACCEPTANCE_RUN_ID")
-        .ok()
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        return Ok(GITHUB_API_URL.into());
-    }
-    let candidate = candidate.to_string_lossy();
-    let parsed = reqwest::Url::parse(&candidate)
-        .map_err(|error| LpmError::Script(format!("invalid acceptance GitHub URL: {error}")))?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(LpmError::Script(
-            "the acceptance GitHub URL must not contain credentials".into(),
-        ));
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(LpmError::Script(
-            "the acceptance GitHub URL must not contain a query or fragment".into(),
-        ));
-    }
-    if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-        return Err(LpmError::Script(
-            "the acceptance GitHub URL must use a loopback host".into(),
-        ));
-    }
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(LpmError::Script(
-            "the acceptance GitHub URL must use HTTP or HTTPS".into(),
-        ));
-    }
-    if !matches!(parsed.path(), "" | "/") {
-        return Err(LpmError::Script(
-            "the acceptance GitHub URL must not contain a path".into(),
-        ));
-    }
-    Ok(candidate.trim_end_matches('/').to_string())
 }
 
 fn github_api_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -> LpmError {
@@ -1223,7 +1135,7 @@ mod tests {
 
         assert_eq!(
             github_api_url().expect("resolve GitHub URL"),
-            GITHUB_API_URL
+            "https://api.github.com"
         );
     }
 

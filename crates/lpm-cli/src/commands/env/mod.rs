@@ -2,6 +2,7 @@
 
 mod auth;
 mod ci;
+mod github;
 mod inventory;
 mod local;
 mod oidc;
