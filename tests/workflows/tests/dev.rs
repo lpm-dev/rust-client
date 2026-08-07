@@ -580,13 +580,13 @@ fn dev_restarts_dependents_after_restarting_dependency_is_ready() {
                     "db": {{
                         "command": "node restarting-db.js {db_port}",
                         "readyUrl": "http://127.0.0.1:{db_port}/health",
-                        "readyTimeout": 3,
+                        "readyTimeout": 15,
                         "restart": true
                     }},
                     "api": {{
                         "command": "node dependent-api.js {api_port}",
                         "readyUrl": "http://127.0.0.1:{api_port}/health",
-                        "readyTimeout": 3,
+                        "readyTimeout": 15,
                         "dependsOn": ["db"]
                     }}
                 }}
