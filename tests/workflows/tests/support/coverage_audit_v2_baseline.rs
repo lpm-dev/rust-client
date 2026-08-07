@@ -894,13 +894,25 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 36: lpm login --github / --gitlab ──
     SurfaceV2 {
         id: 36,
-        scenarios: 7,
+        scenarios: 19,
         failure_modes_tested: &[
             "OIDC setup snippet contract (cli-binary)",
-            "login --github --json without --token emits error envelope (directs to github.com tokens)",
-            "login --gitlab --json without --token emits error envelope (directs to gitlab.com tokens)",
+            "login --github --json without an available source emits error envelope",
+            "login --gitlab --json without an available source emits error envelope",
             "login --github --json with --token stores fallback token",
             "login --gitlab --json with --token stores fallback token",
+            "GITHUB_TOKEN satisfies login without storage and snapshots the JSON contract",
+            "GITLAB_TOKEN satisfies login without storage",
+            "CI_JOB_TOKEN satisfies login without storage",
+            "GITLAB_TOKEN takes precedence over CI_JOB_TOKEN",
+            "explicit GitHub token takes precedence over GITHUB_TOKEN",
+            "global --token conflicts with --save-env-token before storage",
+            "--save-env-token stores GITHUB_TOKEN through secure storage",
+            "--save-env-token stores GITLAB_TOKEN through secure storage",
+            "--save-env-token rejects CI_JOB_TOKEN without mutation and snapshots the JSON error",
+            "GitHub environment import without GITHUB_TOKEN fails without mutation",
+            "GitLab environment import without GITLAB_TOKEN fails without mutation",
+            "stored GitHub token satisfies login and reports its storage backend",
             "login --github --json with gh auth avoids storing copied token",
             "login --gitlab --json with glab auth avoids storing copied token",
         ],
@@ -909,12 +921,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "gitlab PAT expiry warning",
             "OIDC issuer DNS failure mid-flow",
         ],
-        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
-            ("tests/workflows/tests/auth_lifecycle.rs", 6),
+            ("tests/workflows/tests/auth_lifecycle.rs", 18),
             ("crates/lpm-cli/tests/oidc_setup_snippet_contract.rs", 1),
         ],
-        last_audited_at: "2026-05-29",
+        last_audited_at: "2026-08-06",
     },
     // ── id 37: lpm login --login-registry <URL> ──
     SurfaceV2 {
@@ -976,8 +988,22 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 40: lpm token-rotate ──
     SurfaceV2 {
         id: 40,
-        scenarios: 1,
-        failure_modes_tested: &["replaces stored session token + expiry metadata"],
+        scenarios: 16,
+        failure_modes_tested: &[
+            "replaces stored session token + expiry metadata",
+            "human output reports secure storage and completion",
+            "LPM_TOKEN is rejected before network or storage changes",
+            "explicit --token is rejected before network or storage changes",
+            "CI-issued token is rejected before network or storage changes",
+            "locally managed source predicate distinguishes all token sources",
+            "explicit OTP is validated and sent on the first request",
+            "malformed OTP is rejected before network or storage changes",
+            "OTP challenge returns stable JSON without clearing credentials",
+            "non-interactive OTP challenge instructs the user to pass --otp",
+            "rejected OTP returns stable JSON without clearing credentials",
+            "interactive OTP challenge uses a masked prompt and exactly one retry",
+            "non-OTP unauthorized response retains invalid-token cleanup",
+        ],
         failure_modes_known: &[
             "rotation fails mid-store (partial-state recovery)",
             "concurrent rotation on same registry",
@@ -985,8 +1011,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "rotation against a registry that returns 5xx",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/token_rotate.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[
+            ("crates/lpm-auth/src/session.rs", 1),
+            ("crates/lpm-cli/src/commands/token.rs", 3),
+            ("crates/lpm-cli/tests/token_rotate_interactive_tty.rs", 1),
+            ("tests/workflows/tests/token_rotate.rs", 11),
+        ],
+        last_audited_at: "2026-08-06",
     },
     // ── id 41: lpm setup ci npmrc (.npmrc CI gen) ──
     SurfaceV2 {
@@ -1029,17 +1060,16 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 43: lpm config get ──
     SurfaceV2 {
         id: 43,
-        scenarios: 1,
-        failure_modes_tested: &["JSON returns existing value"],
-        failure_modes_known: &[
-            "nonexistent key error",
-            "config file parse error",
-            "symlink config path",
-            "get of a key with embedded JSON-special characters",
+        scenarios: 3,
+        failure_modes_tested: &[
+            "JSON returns existing value",
+            "missing key returns found false with null value",
+            "JSON preserves a key with embedded special characters",
         ],
+        failure_modes_known: &["config file parse error", "symlink config path"],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 3)],
+        last_audited_at: "2026-08-06",
     },
     // ── id 44: lpm config set ──
     SurfaceV2 {
@@ -1080,16 +1110,21 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 46: lpm config list ──
     SurfaceV2 {
         id: 46,
-        scenarios: 1,
-        failure_modes_tested: &["JSON envelope reports all keys"],
-        failure_modes_known: &[
-            "empty config file returns empty object",
-            "config file with comments (JSON5 vs strict JSON)",
-            "list under a HOME that points to a non-writable mount",
+        scenarios: 7,
+        failure_modes_tested: &[
+            "empty user config reports every known effective key + source",
+            "project, user, and environment precedence sources",
+            "managed security floor sources",
+            "approved security posture sources",
+            "grouped human output",
+            "named policy extension expansion",
+            "malformed known value rejection",
+            "JSON envelope snapshot",
         ],
+        failure_modes_known: &["list under a HOME that points to a non-writable mount"],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 7)],
+        last_audited_at: "2026-08-06",
     },
     // ── id 47: lpm cache clean [subcat] ──
     SurfaceV2 {
@@ -2608,10 +2643,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 119: lpm tunnel <port> (start) ──
     SurfaceV2 {
         id: 119,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "tunnel help emits action summary",
             "tunnel <port> without auth under --json emits error envelope on stdout",
+            "invalid bare domain suggests the supported positional domain syntax",
         ],
         failure_modes_known: &[
             "tunnel service connection failure",
@@ -2620,8 +2656,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "tunnel under a HOME that has never been paired",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 2)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/dev_tunnel.rs", 3)],
+        last_audited_at: "2026-08-06",
     },
     // ── id 120: lpm tunnel claim / unclaim / list / domains ──
     SurfaceV2 {

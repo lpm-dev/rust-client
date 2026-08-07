@@ -597,7 +597,7 @@ fn policy_test_sends_package_candidate_to_named_extension() {
             "test",
             "fixture",
             "--package",
-            "react@19.0.0",
+            "react@v19.0",
             "--json",
         ])
         .output()
@@ -627,6 +627,79 @@ fn policy_test_sends_package_candidate_to_named_extension() {
     assert_eq!(request["event"], "package.candidate");
     assert_eq!(request["packages"][0]["name"], "react");
     assert_eq!(request["packages"][0]["version"], "19.0.0");
+}
+
+#[test]
+fn policy_test_rejects_dist_tag_before_starting_extension() {
+    let project = TempProject::empty(r#"{"name":"policy-test-invalid","version":"1.0.0"}"#);
+    let request_log = project.path().join("policy-test-invalid-request.json");
+    write_policy_extension_config(
+        &project,
+        &policy_extension_command(&[
+            "--action",
+            "allow",
+            "--log",
+            request_log.to_str().expect("utf-8 temp path"),
+        ]),
+        "enforce",
+        None,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "policy",
+            "test",
+            "fixture",
+            "--package",
+            "react@latest",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run lpm policy test");
+
+    assert!(
+        !output.status.success(),
+        "policy test must reject a dist-tag\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error_code"], "invalid_version");
+    assert!(
+        !request_log.exists(),
+        "invalid versions must be rejected before the extension starts"
+    );
+    insta::assert_json_snapshot!("policy_test_json_rejects_dist_tag", json);
+}
+
+#[test]
+fn policy_test_rejects_invalid_version_before_loading_configuration() {
+    let project = TempProject::empty(r#"{"name":"policy-test-order","version":"1.0.0"}"#);
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).expect("create isolated lpm home");
+    std::fs::write(lpm_dir.join("config.toml"), "[invalid").expect("write invalid config");
+
+    let output = lpm(&project)
+        .args([
+            "policy",
+            "test",
+            "fixture",
+            "--package",
+            "react@latest",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run lpm policy test");
+
+    assert!(
+        !output.status.success(),
+        "policy test must reject a dist-tag\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], "invalid_version");
 }
 
 #[test]

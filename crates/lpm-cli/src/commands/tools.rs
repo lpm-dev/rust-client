@@ -121,6 +121,15 @@ pub async fn fmt(
     finish_tool_outcome("fmt", outcome, json_output)
 }
 
+/// Apply project formatting for doctor without writing a nested command
+/// response or forwarding the formatter's stdout into doctor's JSON.
+pub(crate) async fn fmt_for_doctor(project_dir: &Path) -> Result<(), LpmError> {
+    let version = read_tool_version(project_dir, "biome");
+    let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), true).await?;
+    let biome_args = build_biome_args(&[], false);
+    run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Capture)?.into_result()
+}
+
 /// Build the biome args vector — extracted so the workspace path can call it
 /// per-member without duplicating the `--write` / default-`.` logic.
 fn build_biome_args(args: &[String], check: bool) -> Vec<String> {

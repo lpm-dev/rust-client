@@ -32,14 +32,22 @@
 
 #![allow(dead_code)]
 
+use aes_gcm::{
+    Aes256Gcm, KeyInit,
+    aead::{Aead, generic_array::GenericArray},
+};
 use base64::Engine;
 use lpm_registry::{DistInfo, PackageMetadata, VersionMetadata};
+use rand::RngCore;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 use wiremock::matchers::{method, path as match_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+const TEST_AUTH_ENCRYPTION_KEY: &str =
+    "cli-binary-test-auth-key-0123456789abcdefghijklmnopqrstuvwxyz";
 
 #[derive(Clone)]
 pub struct MockPackageVersion {
@@ -182,6 +190,37 @@ pub fn parse_json_stdout(stdout: &str) -> serde_json::Value {
     serde_json::from_str(trimmed).unwrap_or_else(|error| {
         panic!("failed to parse JSON stdout: {error}; raw stdout={trimmed:?}")
     })
+}
+
+/// Seed one encrypted, file-backed LPM credential under an isolated test home.
+pub fn seed_lpm_token(home: &Path, registry_url: &str, token: &str) {
+    let lpm_dir = home.join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).expect("create test auth directory");
+    std::fs::write(lpm_dir.join(".key"), TEST_AUTH_ENCRYPTION_KEY).expect("write test auth key");
+    std::fs::write(lpm_dir.join(".salt"), [7_u8; 32]).expect("write test auth salt");
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(TEST_AUTH_ENCRYPTION_KEY.as_bytes());
+    hasher.update([7_u8; 32]);
+    let key = hasher.finalize();
+    let cipher = Aes256Gcm::new_from_slice(&key).expect("initialize test auth cipher");
+
+    let mut iv = [0_u8; 12];
+    rand::thread_rng().fill_bytes(&mut iv);
+    let nonce = GenericArray::from_slice(&iv);
+    let plaintext = serde_json::json!({ registry_url: token }).to_string();
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .expect("encrypt test credential");
+    let tag_start = ciphertext.len() - 16;
+    let (encrypted, auth_tag) = ciphertext.split_at(tag_start);
+    let encoded = format!(
+        "{}:{}:{}",
+        base64::engine::general_purpose::STANDARD.encode(iv),
+        base64::engine::general_purpose::STANDARD.encode(auth_tag),
+        base64::engine::general_purpose::STANDARD.encode(encrypted),
+    );
+    std::fs::write(lpm_dir.join(".credentials"), encoded).expect("write test credential");
 }
 
 /// Path component for the mock-registry tarball route.

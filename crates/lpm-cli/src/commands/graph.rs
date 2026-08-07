@@ -3,6 +3,7 @@ use crate::install_ui;
 use crate::overrides_state;
 use lpm_common::LpmError;
 use std::collections::{HashSet, VecDeque};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// Run the `lpm graph` command.
@@ -158,26 +159,30 @@ pub async fn run(
 
     // Handle --why
     if let Some(target) = why {
+        let stdout = std::io::stdout();
+        let mut output = BufWriter::new(stdout.lock());
         if json_output {
-            let output = graph_render::render_why_json(
+            graph_render::write_why_json(
+                &mut output,
                 &graph,
                 target,
                 overrides_state.as_ref(),
                 patch_state.as_ref(),
             )
             .map_err(|e| LpmError::Script(format!("failed to serialize graph why JSON: {e}")))?;
-            println!("{output}");
         } else {
-            print!(
-                "{}",
-                graph_render::render_why(
-                    &graph,
-                    target,
-                    overrides_state.as_ref(),
-                    patch_state.as_ref()
-                )
-            );
+            graph_render::write_why(
+                &mut output,
+                &graph,
+                target,
+                overrides_state.as_ref(),
+                patch_state.as_ref(),
+            )
+            .map_err(|e| LpmError::Script(format!("failed to write graph why output: {e}")))?;
         }
+        output
+            .flush()
+            .map_err(|e| LpmError::Script(format!("failed to write graph why output: {e}")))?;
         return Ok(());
     }
 

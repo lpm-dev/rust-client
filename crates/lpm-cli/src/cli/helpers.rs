@@ -253,7 +253,11 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // `store verify` needs the manifest settled so the walker sees
         // the right per-package state. `cache prune` covers the
         // reachability-aware union (which is itself listed below).
-        Commands::Store(args) if args.action == "verify" => true,
+        Commands::Store(args)
+            if matches!(&args.action, commands::store::StoreCmd::Verify { .. }) =>
+        {
+            true
+        }
         // `cache prune --apply` walks every globally-installed package's
         // lockfile + sweeps deferred tombstones — the manifest must be
         // settled before either step runs.

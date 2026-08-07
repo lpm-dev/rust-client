@@ -141,6 +141,18 @@ pub(crate) struct StageArgs {
 }
 
 #[derive(Args)]
+#[command(
+    group(
+        clap::ArgGroup::new("login_target")
+            .args(["npm", "github", "gitlab", "login_registry"])
+            .multiple(false)
+    ),
+    group(
+        clap::ArgGroup::new("environment_import_target")
+            .args(["github", "gitlab"])
+            .multiple(false)
+    )
+)]
 pub(crate) struct LoginArgs {
     /// Log in to npm registry with npm web auth.
     #[arg(long)]
@@ -161,6 +173,10 @@ pub(crate) struct LoginArgs {
     /// Explicit token fallback for npm, GitHub Packages, GitLab Packages, or a custom registry.
     #[arg(long)]
     pub(crate) token: Option<String>,
+
+    /// Save GITHUB_TOKEN or GITLAB_TOKEN to secure storage.
+    #[arg(long, conflicts_with = "token", requires = "environment_import_target")]
+    pub(crate) save_env_token: bool,
 }
 
 #[derive(Args)]
@@ -188,6 +204,13 @@ pub(crate) struct LogoutArgs {
     /// Log out from a custom npm-compatible registry.
     #[arg(long = "logout-registry", value_name = "URL")]
     pub(crate) logout_registry: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct TokenRotateArgs {
+    /// Six-digit authenticator code for an MFA-protected token.
+    #[arg(long, value_name = "CODE")]
+    pub(crate) otp: Option<String>,
 }
 
 #[derive(Args)]
@@ -319,9 +342,9 @@ pub(crate) enum SetupAction {
         /// Setup target: npmrc, github-actions, gitlab.
         target: Option<String>,
 
-        /// Environment name for workflow snippets.
-        #[arg(long, default_value = "production")]
-        env: String,
+        /// Environment name for workflow snippets (default: production).
+        #[arg(long)]
+        env: Option<String>,
 
         /// Override the registry URL for `.npmrc` (default: current `--registry` or `LPM_REGISTRY_URL`).
         #[arg(short = 'r', long)]

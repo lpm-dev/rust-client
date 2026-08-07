@@ -107,7 +107,7 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
 
             let status_color = match &svc.status {
                 ServiceStatus::Ready => Color::Green,
-                ServiceStatus::Crashed(_) => Color::Red,
+                ServiceStatus::ReadinessFailed(_) | ServiceStatus::Crashed(_) => Color::Red,
                 ServiceStatus::Starting | ServiceStatus::WaitingForDep(_) => Color::Yellow,
                 ServiceStatus::Stopped => Color::DarkGray,
             };

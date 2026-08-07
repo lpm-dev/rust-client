@@ -61,10 +61,6 @@ fn iso8601_n_secs_ago(n_secs: i64) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn global_root(project: &TempProject) -> std::path::PathBuf {
-    project.home().join(".lpm").join("global")
-}
-
 fn seed_global_package_with_source(
     project: &TempProject,
     package: &str,
@@ -904,7 +900,7 @@ fn uninstall_g_unknown_package_matches_global_remove_error_path() {
 fn global_update_dry_run_on_empty_manifest_succeeds_without_writing_manifest() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
 
-    let manifest_path = global_root(&project).join("manifest.json");
+    let manifest_path = isolated_lpm_root(&project).global_manifest();
 
     let output = lpm(&project)
         .args([
@@ -930,7 +926,7 @@ fn global_update_dry_run_on_empty_manifest_succeeds_without_writing_manifest() {
     // dry-run MUST NOT write a populated manifest.
     assert!(
         !manifest_path.exists(),
-        "dry-run must not create global manifest.json, but it exists at {}",
+        "dry-run must not create the global manifest, but it exists at {}",
         manifest_path.display(),
     );
 }

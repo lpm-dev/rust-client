@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/config.rs
+expression: envelope
+---
+{
+  "success": true,
+  "action": "get",
+  "key": "registry",
+  "value": null,
+  "found": false
+}

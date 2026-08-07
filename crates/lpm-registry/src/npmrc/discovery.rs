@@ -1,5 +1,8 @@
 use super::config::NpmrcConfig;
-use lpm_common::{BoundedReadError, NPMRC_FILE_SIZE_CAP_BYTES, read_text_file_capped};
+use super::parse::CredentialPolicy;
+use lpm_common::{
+    BoundedReadError, NPMRC_FILE_SIZE_CAP_BYTES, read_text_file_capped_with_metadata,
+};
 use std::path::{Path, PathBuf};
 
 impl NpmrcConfig {
@@ -92,13 +95,44 @@ impl NpmrcConfig {
     ) -> Self {
         let mut acc = NpmrcConfig::default();
         for (idx, path) in paths.iter().enumerate() {
-            match read_text_file_capped(path, NPMRC_FILE_SIZE_CAP_BYTES) {
-                Ok(content) => {
+            match read_text_file_capped_with_metadata(path, NPMRC_FILE_SIZE_CAP_BYTES) {
+                Ok((content, file_metadata)) => {
                     let label = path.display().to_string();
                     let source_dir = path.parent();
                     let is_project = Some(idx) == project_layer_index;
-                    let layer = NpmrcConfig::parse_layer_with_options(
-                        &content, &label, source_dir, is_project, env_lookup,
+
+                    #[cfg(unix)]
+                    let credential_refusal_warning = {
+                        use std::os::unix::fs::PermissionsExt;
+
+                        let permissions = file_metadata.permissions();
+                        (!lpm_common::permissions_are_owner_only(&permissions)).then(|| {
+                            format!(
+                                "{label}: .npmrc mode {:04o} grants group or other access; \
+                                 refused credential fields from this layer. Non-secret routing and \
+                                 TLS settings remain active. Run `chmod 600 {}` to enable credentials",
+                                permissions.mode() & 0o777,
+                                path.display(),
+                            )
+                        })
+                    };
+                    #[cfg(not(unix))]
+                    let credential_refusal_warning: Option<String> = {
+                        let _ = file_metadata;
+                        None
+                    };
+
+                    let credential_policy = match credential_refusal_warning.as_deref() {
+                        Some(warning) => CredentialPolicy::Refuse { warning },
+                        None => CredentialPolicy::Accept,
+                    };
+                    let layer = NpmrcConfig::parse_layer_with_credential_policy(
+                        &content,
+                        &label,
+                        source_dir,
+                        is_project,
+                        credential_policy,
+                        env_lookup,
                     );
                     acc.merge_over(layer);
                 }
@@ -348,7 +382,19 @@ mod tests {
     fn write_npmrc(dir: &Path, content: &str) -> PathBuf {
         let path = dir.join(".npmrc");
         fs::write(&path, content).expect("write npmrc");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("restrict npmrc permissions");
+        }
         path
+    }
+
+    #[cfg(unix)]
+    fn set_npmrc_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set npmrc mode");
     }
 
     #[test]
@@ -406,6 +452,100 @@ mod tests {
         assert_eq!(cfg.scope_registries.len(), 2);
         assert!(cfg.scope_registries.contains_key("@a"));
         assert!(cfg.scope_registries.contains_key("@b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_layer_keeps_routing_and_refuses_every_credential_form() {
+        let dir = TempDir::new().unwrap();
+        let path = write_npmrc(
+            dir.path(),
+            "registry=https://npm.internal/\n\
+             //token.example/:_authToken=bearer\n\
+             //auth.example/:_auth=dXNlcjpwYXNz\n\
+             //pair.example/:_username=user\n\
+             //pair.example/:_password=cGFzcw==\n",
+        );
+        set_npmrc_mode(&path, 0o644);
+
+        let cfg = NpmrcConfig::load_from_paths(&[path], &no_env);
+
+        assert_eq!(
+            cfg.default_registry
+                .as_ref()
+                .map(|target| target.base_url.as_ref()),
+            Some("https://npm.internal"),
+            "non-secret routing must remain available"
+        );
+        assert!(
+            cfg.origin_auth.is_empty(),
+            "permissive files must not materialize credentials: {:?}",
+            cfg.origin_auth
+        );
+        assert_eq!(
+            cfg.security_warnings.len(),
+            1,
+            "one actionable warning must cover the refused layer: {:?}",
+            cfg.security_warnings
+        );
+        assert!(
+            cfg.security_warnings[0].contains("mode 0644")
+                && cfg.security_warnings[0].contains("chmod 600"),
+            "the warning must explain the mode and repair: {:?}",
+            cfg.security_warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_credential_is_refused_before_missing_env_validation() {
+        let dir = TempDir::new().unwrap();
+        let path = write_npmrc(
+            dir.path(),
+            "registry=https://npm.internal/\n//npm.internal/:_authToken=${MISSING_TOKEN}\n",
+        );
+        set_npmrc_mode(&path, 0o644);
+
+        let cfg = NpmrcConfig::load_from_paths(&[path], &no_env);
+
+        assert!(
+            cfg.errors.is_empty(),
+            "a refused credential must not evaluate its value: {:?}",
+            cfg.errors
+        );
+        assert!(cfg.origin_auth.is_empty());
+        assert_eq!(
+            cfg.default_registry
+                .as_ref()
+                .map(|target| target.base_url.as_ref()),
+            Some("https://npm.internal")
+        );
+        assert_eq!(cfg.security_warnings.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_higher_layer_cannot_override_secure_lower_credential() {
+        let lower = TempDir::new().unwrap();
+        let higher = TempDir::new().unwrap();
+        let lower_path = write_npmrc(lower.path(), "//npm.internal/:_authToken=secure-lower\n");
+        let higher_path = write_npmrc(
+            higher.path(),
+            "//npm.internal/:_authToken=insecure-higher\n",
+        );
+        set_npmrc_mode(&higher_path, 0o640);
+
+        let cfg = NpmrcConfig::load_from_paths(&[lower_path, higher_path], &no_env);
+        let auth = cfg
+            .auth_for_url("https://npm.internal/package")
+            .expect("secure lower credential must remain available");
+
+        match auth {
+            RegistryAuth::Bearer { token, .. } => {
+                assert_eq!(token.expose_secret(), "secure-lower");
+            }
+            other => panic!("expected bearer credential, got {other:?}"),
+        }
     }
 
     #[test]

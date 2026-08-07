@@ -11,6 +11,8 @@
 
 mod support;
 
+use std::fmt::Write as _;
+
 use support::TempProject;
 use support::lpm;
 use support::workspace_projection_project;
@@ -492,6 +494,44 @@ fn write_simple_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])
     project.write_file("lpm.lock", &toml);
 }
 
+fn dense_why_project(depth: usize) -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"dense-why","version":"1.0.0","dependencies":{"branch-0-a":"1.0.0","branch-0-b":"1.0.0"}}"#,
+    );
+    let mut lockfile = String::with_capacity(depth.saturating_mul(512));
+    lockfile.push_str("[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n");
+
+    for level in 0..depth {
+        for branch in ['a', 'b'] {
+            writeln!(
+                lockfile,
+                "[[packages]]\nname = \"branch-{level}-{branch}\"\nversion = \"1.0.0\"\ndependencies = [\"shared-{level}@1.0.0\"]\n"
+            )
+            .expect("write branch package");
+        }
+
+        if level + 1 == depth {
+            writeln!(
+                lockfile,
+                "[[packages]]\nname = \"shared-{level}\"\nversion = \"1.0.0\"\ndependencies = [\"target@1.0.0\"]\n"
+            )
+            .expect("write final shared package");
+        } else {
+            writeln!(
+                lockfile,
+                "[[packages]]\nname = \"shared-{level}\"\nversion = \"1.0.0\"\ndependencies = [\"branch-{}-a@1.0.0\", \"branch-{}-b@1.0.0\"]\n",
+                level + 1,
+                level + 1,
+            )
+            .expect("write shared package");
+        }
+    }
+
+    lockfile.push_str("[[packages]]\nname = \"target\"\nversion = \"1.0.0\"\n");
+    project.write_file("lpm.lock", &lockfile);
+    project
+}
+
 /// Write a synthetic `.lpm/overrides-state.json`. Mirrors what the
 /// install pipeline persists; lets these graph tests run without
 /// driving a real install.
@@ -655,6 +695,85 @@ fn why_top_level_json_matches_graph_why_json() {
         serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&why_out.stdout)))
             .expect("why stdout must be JSON");
     assert_eq!(why_json, graph_json);
+    assert_eq!(
+        graph_json["path_count"].as_u64(),
+        graph_json["paths"]
+            .as_array()
+            .map(|paths| paths.len() as u64)
+    );
+    insta::assert_json_snapshot!("why_json_envelope", graph_json);
+}
+
+#[test]
+fn why_commands_return_every_dense_graph_path_in_human_output() {
+    const DEPTH: usize = 7;
+    const EXPECTED_PATHS: usize = 1 << DEPTH;
+    let project = dense_why_project(DEPTH);
+
+    let graph_output = lpm(&project)
+        .args(["graph", "--why", "target"])
+        .output()
+        .expect("run lpm graph --why");
+    let why_output = lpm(&project)
+        .args(["why", "target"])
+        .output()
+        .expect("run lpm why");
+
+    assert!(
+        graph_output.status.success() && why_output.status.success(),
+        "both why commands must succeed\ngraph stderr:\n{}\nwhy stderr:\n{}",
+        String::from_utf8_lossy(&graph_output.stderr),
+        String::from_utf8_lossy(&why_output.stderr),
+    );
+    let graph_stdout = strip_ansi(&String::from_utf8_lossy(&graph_output.stdout));
+    let why_stdout = strip_ansi(&String::from_utf8_lossy(&why_output.stdout));
+    let rendered_paths = graph_stdout
+        .lines()
+        .filter(|line| line.starts_with("  ") && line.ends_with("target@1.0.0"))
+        .count();
+    assert_eq!(
+        (
+            graph_stdout == why_stdout,
+            graph_stdout.contains(&format!("required by {EXPECTED_PATHS} path(s)")),
+            rendered_paths,
+        ),
+        (true, true, EXPECTED_PATHS)
+    );
+}
+
+#[test]
+fn why_commands_return_every_dense_graph_path_in_json_output() {
+    const DEPTH: usize = 7;
+    const EXPECTED_PATHS: usize = 1 << DEPTH;
+    let project = dense_why_project(DEPTH);
+
+    let graph_output = lpm(&project)
+        .args(["--json", "graph", "--why", "target"])
+        .output()
+        .expect("run lpm graph --why --json");
+    let why_output = lpm(&project)
+        .args(["--json", "why", "target"])
+        .output()
+        .expect("run lpm why --json");
+
+    assert!(
+        graph_output.status.success() && why_output.status.success(),
+        "both JSON why commands must succeed\ngraph stderr:\n{}\nwhy stderr:\n{}",
+        String::from_utf8_lossy(&graph_output.stderr),
+        String::from_utf8_lossy(&why_output.stderr),
+    );
+    let graph_json: serde_json::Value =
+        serde_json::from_slice(&graph_output.stdout).expect("graph --why stdout must be JSON");
+    let why_json: serde_json::Value =
+        serde_json::from_slice(&why_output.stdout).expect("why stdout must be JSON");
+    assert_eq!(graph_json, why_json);
+    assert_eq!(
+        (
+            graph_json["path_count"].as_u64(),
+            graph_json["paths"].as_array().map(Vec::len),
+        ),
+        (Some(EXPECTED_PATHS as u64), Some(EXPECTED_PATHS))
+    );
 }
 
 #[test]

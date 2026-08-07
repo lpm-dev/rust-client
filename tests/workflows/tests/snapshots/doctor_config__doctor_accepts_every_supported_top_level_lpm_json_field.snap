@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/doctor_config.rs
+expression: config_check
+---
+{
+  "code": "lpm_json_valid",
+  "check": "lpm.json",
+  "passed": true,
+  "severity": "pass",
+  "detail": "valid"
+}

@@ -1,0 +1,26 @@
+---
+source: tests/workflows/tests/doctor_list.rs
+expression: actual
+---
+{
+  "global_manifest_absent": {
+    "description": "The global install manifest does not exist.",
+    "when_fires": "`~/.lpm/global/manifest.toml` does not exist.",
+    "remediation": "No action is necessary."
+  },
+  "global_manifest_corrupt": {
+    "description": "LPM cannot read `~/.lpm/global/manifest.toml` as a supported TOML manifest.",
+    "when_fires": "The file is unreadable, is not valid UTF-8 or TOML, or uses a newer schema version.",
+    "remediation": "Repair `~/.lpm/global/manifest.toml`, or reinstall the affected global packages."
+  },
+  "global_manifest_structurally_invalid": {
+    "description": "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+    "when_fires": "The manifest parses, but a record fails global install validation.",
+    "remediation": "Repair the affected records, or reinstall the affected global packages."
+  },
+  "global_manifest_valid": {
+    "description": "`~/.lpm/global/manifest.toml` contains valid TOML and valid global install records.",
+    "when_fires": "The manifest exists, parses as TOML, uses a supported schema, and passes structural validation.",
+    "remediation": "No action is necessary."
+  }
+}

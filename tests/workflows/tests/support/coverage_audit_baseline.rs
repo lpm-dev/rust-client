@@ -582,12 +582,16 @@ pub const SURFACES: &[SurfaceBaseline] = &[
     SurfaceBaseline {
         id: 40,
         name: "`lpm token-rotate`",
-        unit: false,
+        unit: true,
         integration: false,
         workflow: true,
-        cli_binary: false,
+        cli_binary: true,
         json_contract: JsonContractStatus::Covered,
-        references: &["tests/workflows/tests/token_rotate.rs"],
+        references: &[
+            "crates/lpm-cli/src/commands/token.rs",
+            "crates/lpm-cli/tests/token_rotate_interactive_tty.rs",
+            "tests/workflows/tests/token_rotate.rs",
+        ],
     },
     SurfaceBaseline {
         id: 41,

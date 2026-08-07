@@ -22,6 +22,15 @@ fn cache_path(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("update-check.json")
 }
 
+fn seed_available_update_notice(project: &TempProject) {
+    std::fs::create_dir_all(cache_path(project).parent().unwrap()).expect("mkdir ~/.lpm");
+    let payload = serde_json::json!({
+        "latest": "99999.0.0",
+        "lastCheck": now_secs(),
+    });
+    std::fs::write(cache_path(project), payload.to_string()).expect("seed update notice");
+}
+
 fn read_current_version(project: &TempProject) -> String {
     let output = lpm(project)
         .arg("--version")
@@ -56,6 +65,50 @@ fn npm_managed_lpm_path(project: &TempProject) -> std::path::PathBuf {
 }
 
 // ─── cache-hit "already on latest" ───────────────────────────────────
+
+#[test]
+fn no_update_check_suppresses_cached_notice_on_version_fast_path() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    seed_available_update_notice(&project);
+
+    let output = lpm(&project)
+        .arg("--version")
+        .output()
+        .expect("run lpm --version");
+
+    assert!(output.status.success(), "--version must succeed");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("Update available"),
+        "LPM_NO_UPDATE_CHECK must suppress cached notices on --version, got:\n{combined}"
+    );
+}
+
+#[test]
+fn no_update_check_suppresses_cached_notice_after_regular_command() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    seed_available_update_notice(&project);
+
+    let output = lpm(&project)
+        .args(["store", "path"])
+        .output()
+        .expect("run lpm store path");
+
+    assert!(output.status.success(), "store path must succeed");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("Update available"),
+        "LPM_NO_UPDATE_CHECK must suppress cached notices after commands, got:\n{combined}"
+    );
+}
 
 #[test]
 fn self_update_cache_hit_with_matching_latest_reports_up_to_date() {

@@ -393,69 +393,50 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             print_status_field("root", &root_value);
             println!();
             println!("{}", install_ui::section("effective floor"));
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "script policy")),
-                sourced_policy_value(
-                    &status.effective_floor.script_policy,
-                    status.floor_sources.script_policy
-                ),
+            print_effective_floor_field(
+                "script policy",
+                &status.effective_floor.script_policy,
+                status.floor_sources.script_policy,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "minimum release age")),
-                sourced_policy_value(
-                    &format_release_age(status.effective_floor.minimum_release_age_secs),
-                    status.floor_sources.minimum_release_age_secs
-                ),
+            print_effective_floor_field(
+                "minimum release age",
+                &format_release_age(status.effective_floor.minimum_release_age_secs),
+                status.floor_sources.minimum_release_age_secs,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "release age policy")),
-                sourced_policy_value(
-                    &status.effective_floor.release_age_policy,
-                    status.floor_sources.release_age_policy
-                ),
+            print_effective_floor_field(
+                "release age policy",
+                &status.effective_floor.release_age_policy,
+                status.floor_sources.release_age_policy,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "sandbox mode")),
-                sourced_policy_value(
-                    &status.effective_floor.sandbox_mode,
-                    status.floor_sources.sandbox_mode
-                ),
+            print_effective_floor_field(
+                "sandbox mode",
+                &status.effective_floor.sandbox_mode,
+                status.floor_sources.sandbox_mode,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "sandbox allow degraded")),
-                sourced_policy_value(
-                    &status.effective_floor.sandbox_allow_degraded.to_string(),
-                    status.floor_sources.sandbox_allow_degraded
-                ),
+            print_effective_floor_field(
+                "sandbox allow degraded",
+                bool_policy_value(status.effective_floor.sandbox_allow_degraded),
+                status.floor_sources.sandbox_allow_degraded,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "sigstore verify")),
-                sourced_policy_value(
-                    &status.effective_floor.sigstore_verify,
-                    status.floor_sources.sigstore_verify
-                ),
+            print_effective_floor_field(
+                "sigstore verify",
+                &status.effective_floor.sigstore_verify,
+                status.floor_sources.sigstore_verify,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "typosquat guard")),
-                sourced_policy_value(
-                    &status.effective_floor.typosquat_guard,
-                    status.floor_sources.typosquat_guard
-                ),
+            print_effective_floor_field(
+                "typosquat guard",
+                &status.effective_floor.typosquat_guard,
+                status.floor_sources.typosquat_guard,
             );
-            println!(
-                "  {} {}",
-                install_ui::dim(&format!("{:<24}", "npm firewall")),
-                sourced_policy_value(
-                    &status.effective_floor.firewall_mode,
-                    status.floor_sources.firewall_mode
-                ),
+            print_effective_floor_field(
+                "npm firewall",
+                &status.effective_floor.firewall_mode,
+                status.floor_sources.firewall_mode,
+            );
+            print_effective_floor_field(
+                "install-time source analysis",
+                bool_policy_value(status.effective_floor.install_time_source_analysis),
+                status.floor_sources.install_time_source_analysis,
             );
 
             println!();
@@ -698,6 +679,23 @@ fn sourced_policy_value(
     source: security_approval::PostureSourceKind,
 ) -> install_ui::TerminalLine {
     crate::install_ui::terminal_line!("{} {}", policy_value(value), source_suffix(source))
+}
+
+fn print_effective_floor_field(
+    label: &str,
+    value: &str,
+    source: security_approval::PostureSourceKind,
+) {
+    const LABEL_WIDTH: usize = 28;
+    println!(
+        "  {} {}",
+        install_ui::dim(&format!("{label:<width$}", width = LABEL_WIDTH)),
+        sourced_policy_value(value, source),
+    );
+}
+
+fn bool_policy_value(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
 fn format_release_age(secs: u64) -> String {

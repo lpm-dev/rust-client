@@ -18,7 +18,16 @@ fn write_project_npmrc(project: &TempProject, registry_url: &str) {
     project.write_file(
         ".npmrc",
         &format!("registry={registry_url}/\n//{host_no_scheme}/:_authToken={TOKEN}\n"),
-    )
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            project.path().join(".npmrc"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("restrict project npmrc permissions");
+    }
 }
 
 async fn mount_auth_required_npm_package(mock: &MockRegistry) {
@@ -99,6 +108,63 @@ async fn received_auth_headers(mock: &MockRegistry) -> Vec<Option<String>> {
                 .map(ToOwned::to_owned)
         })
         .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn json_routing_warns_when_permissive_npmrc_credentials_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(r#"{"name":"read-only-routing","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    write_project_npmrc(&project, &mock.url());
+    std::fs::set_permissions(
+        project.path().join(".npmrc"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("make project npmrc permissive");
+
+    let metadata = serde_json::json!({
+        "name": PACKAGE_NAME,
+        "dist-tags": { "latest": VERSION },
+        "versions": {
+            VERSION: {
+                "name": PACKAGE_NAME,
+                "version": VERSION,
+                "dist": {
+                    "tarball": format!("{}/{PACKAGE_NAME}-{VERSION}.tgz", mock.url()),
+                    "integrity": "sha512-unused"
+                }
+            }
+        },
+        "time": { VERSION: "2025-01-01T00:00:00.000Z" }
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/{PACKAGE_NAME}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env_remove("LPM_NPM_ROUTE")
+        .env_remove("LPM_TOKEN")
+        .args(["info", PACKAGE_NAME, "--json"])
+        .output()
+        .expect("run lpm info --json");
+
+    assert!(
+        output.status.success(),
+        "routing must remain usable after credential refusal; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(parse_json_output(&output.stdout)["success"], true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refus") && stderr.contains("chmod 600"),
+        "JSON mode must surface actionable credential refusal, got:\n{stderr}"
+    );
+    assert_eq!(received_auth_headers(&mock).await, vec![None]);
 }
 
 #[tokio::test]

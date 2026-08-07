@@ -723,16 +723,8 @@ pub(crate) struct CacheArgs {
 
 #[derive(Args)]
 pub(crate) struct StoreArgs {
-    /// Action: verify, path, clean.
-    pub(crate) action: String,
-
-    /// Deep verification: parse package.json and validate name/version consistency.
-    #[arg(long)]
-    pub(crate) deep: bool,
-
-    /// Auto-fix issues found during verify (e.g., refresh stale security caches).
-    #[arg(long)]
-    pub(crate) fix: bool,
+    #[command(subcommand)]
+    pub(crate) action: commands::store::StoreCmd,
 }
 
 #[derive(Args)]

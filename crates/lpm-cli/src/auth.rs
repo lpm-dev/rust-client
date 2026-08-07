@@ -11,16 +11,17 @@
 //! a rename pass.
 
 pub use lpm_auth::{
-    AuthStorageBackend, AuthStorageStatus, TokenSource, auth_storage_status,
-    check_token_expiry_warnings, clear_all_custom_registries, clear_custom_registry_token,
-    clear_github_token, clear_gitlab_token, clear_login_state, clear_npm_token, clear_token,
-    clear_token_expiry, get_custom_registry_token, get_github_cli_token, get_github_token,
-    get_gitlab_cli_token, get_gitlab_token_for_host, get_token, has_refresh_token,
-    has_stored_access_token, is_otp_required, list_registry_auth_statuses,
-    set_custom_registry_token_with_backend, set_github_token_with_backend,
-    set_gitlab_token_with_backend, set_npm_token_with_backend, set_otp_required,
-    set_refresh_token_with_backend, set_session_access_token_expiry, set_token_expiry,
-    set_token_with_backend, try_get_npm_token,
+    AuthStorageBackend, AuthStorageStatus, ThirdPartyCredentialSource, TokenSource,
+    auth_storage_status, check_token_expiry_warnings, clear_all_custom_registries,
+    clear_custom_registry_token, clear_github_token, clear_gitlab_token, clear_login_state,
+    clear_npm_token, clear_token, clear_token_expiry, get_custom_registry_token, get_github_token,
+    get_gitlab_token_for_host, get_token, has_refresh_token, has_stored_access_token,
+    is_otp_required, list_registry_auth_statuses, resolve_github_credential,
+    resolve_github_environment_credential, resolve_gitlab_credential_for_host,
+    resolve_gitlab_environment_credential, set_custom_registry_token_with_backend,
+    set_github_token_with_backend, set_gitlab_token_with_backend, set_npm_token_with_backend,
+    set_otp_required, set_refresh_token_with_backend, set_session_access_token_expiry,
+    set_token_expiry, set_token_with_backend, try_get_npm_token,
 };
 
 #[cfg(test)]

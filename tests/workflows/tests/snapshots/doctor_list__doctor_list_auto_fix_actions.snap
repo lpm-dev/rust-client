@@ -1,0 +1,28 @@
+---
+source: tests/workflows/tests/doctor_list.rs
+expression: actual
+---
+{
+  "bun_missing_pinned": "lpm use bun@<spec>",
+  "bun_pinned_unmet": "lpm use bun@<spec>",
+  "deps_sync_drift": "lpm install",
+  "fmt_other_issue": "lpm fmt",
+  "fmt_unformatted": "lpm fmt",
+  "gitattributes_lockb_unmarked": "update .gitattributes",
+  "gitattributes_missing": "update .gitattributes",
+  "lockfile_binary_corrupt": "reconcile lpm.lockb",
+  "lockfile_binary_missing": "reconcile lpm.lockb",
+  "lockfile_binary_stale": "reconcile lpm.lockb",
+  "lockfile_missing": "lpm install",
+  "node_missing_pinned": "lpm use node@<spec>",
+  "node_missing_unpinned": "lpm use node@22",
+  "node_modules_legacy_layout": "lpm install",
+  "node_modules_missing": "lpm install",
+  "node_modules_mixed_layout": "lpm install",
+  "node_modules_no_store": "lpm install",
+  "node_modules_symlinked": "lpm doctor --fix",
+  "node_pinned_unmet": "lpm use node@<spec>",
+  "plugin_update_available": "lpm plugin update <name>",
+  "tunnel_not_claimed": "lpm tunnel claim <domain>",
+  "v2_store_orphans": "lpm cache prune --apply"
+}

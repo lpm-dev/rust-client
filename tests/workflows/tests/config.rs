@@ -1,6 +1,6 @@
 mod support;
 
-use support::{TempProject, assertions, lpm};
+use support::{TempProject, assertions, lpm, write_signed_typosquat_guard_posture};
 
 fn config_path(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("config.toml")
@@ -246,6 +246,207 @@ fn config_set_writes_value_into_isolated_home() {
 }
 
 #[test]
+fn generic_config_set_sandbox_preserves_nested_sibling_fields() {
+    let project = TempProject::empty(r#"{"name":"config-sandbox","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[sandbox]\nmode = \"default\"\nallow-degraded = true\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sandbox", "strict"])
+        .output()
+        .expect("failed to run generic sandbox config setter");
+
+    assert!(
+        output.status.success(),
+        "generic sandbox setter must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["action"], "set");
+    assert_eq!(envelope["key"], "sandbox");
+    assert_eq!(envelope["value"], serde_json::json!({ "mode": "strict" }));
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path(&project)).expect("read config after sandbox set"),
+    )
+    .expect("config must remain valid TOML");
+    let sandbox = config["sandbox"]
+        .as_table()
+        .expect("sandbox must remain a table");
+    assert_eq!(sandbox["mode"].as_str(), Some("strict"));
+    assert_eq!(sandbox["allow-degraded"].as_bool(), Some(true));
+
+    insta::assert_json_snapshot!("config_set_nested_sandbox_json_envelope", envelope);
+}
+
+#[test]
+fn generic_config_set_sigstore_preserves_nested_sibling_fields() {
+    let project = TempProject::empty(r#"{"name":"config-sigstore","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[sigstore]\nverify = \"deny\"\nscope = \"approved\"\navailability = \"best-effort\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sigstore", "scope=all"])
+        .output()
+        .expect("failed to run generic sigstore config setter");
+
+    assert!(
+        output.status.success(),
+        "generic sigstore setter must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["value"], serde_json::json!({ "scope": "all" }));
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path(&project)).expect("read config after sigstore set"),
+    )
+    .expect("config must remain valid TOML");
+    let sigstore = config["sigstore"]
+        .as_table()
+        .expect("sigstore must remain a table");
+    assert_eq!(sigstore["verify"].as_str(), Some("deny"));
+    assert_eq!(sigstore["scope"].as_str(), Some("all"));
+    assert_eq!(sigstore["availability"].as_str(), Some("best-effort"));
+}
+
+#[test]
+fn generic_config_set_firewall_preserves_nested_sibling_fields() {
+    let project = TempProject::empty(r#"{"name":"config-firewall","version":"1.0.0"}"#);
+    seed_config(&project, "[firewall]\nmode = \"off\"\nnote = \"keep-me\"\n");
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "firewall", "monitor"])
+        .output()
+        .expect("failed to run generic firewall config setter");
+
+    assert!(
+        output.status.success(),
+        "generic firewall setter must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["value"], serde_json::json!({ "mode": "monitor" }));
+
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path(&project)).expect("read config after firewall set"),
+    )
+    .expect("config must remain valid TOML");
+    let firewall = config["firewall"]
+        .as_table()
+        .expect("firewall must remain a table");
+    assert_eq!(firewall["mode"].as_str(), Some("monitor"));
+    assert_eq!(firewall["note"].as_str(), Some("keep-me"));
+}
+
+#[test]
+fn generic_config_set_policy_rejects_scalar_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-policy","version":"1.0.0"}"#);
+    let original = "[policy.extensions.fixture]\ncommand = [\"policy-fixture\"]\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "policy", "enforce"])
+        .output()
+        .expect("failed to run generic policy config setter");
+
+    assert!(!output.status.success(), "nested policy set must fail");
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cannot write nested section `policy`")),
+        "error must identify the unsupported section: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved policy config"),
+        original
+    );
+    insta::assert_json_snapshot!("config_set_nested_policy_rejected", envelope);
+}
+
+#[test]
+fn generic_config_set_tunnel_rejects_scalar_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-tunnel","version":"1.0.0"}"#);
+    let original = "[tunnel]\nrelay-url = \"wss://relay.example.test/connect\"\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "tunnel", "replacement"])
+        .output()
+        .expect("failed to run generic tunnel config setter");
+
+    assert!(!output.status.success(), "nested tunnel set must fail");
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved tunnel config"),
+        original
+    );
+}
+
+#[test]
+fn generic_config_set_sandbox_rejects_invalid_mode_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-sandbox-invalid","version":"1.0.0"}"#);
+    let original = "[sandbox]\nmode = \"strict\"\nallow-degraded = false\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sandbox", "unrestricted"])
+        .output()
+        .expect("failed to run generic sandbox config setter");
+
+    assert!(!output.status.success(), "invalid sandbox mode must fail");
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("default | strict | none")),
+        "error must list valid sandbox modes: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved sandbox config"),
+        original
+    );
+}
+
+#[test]
+fn generic_config_set_sandbox_uses_security_approval_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-sandbox-approval","version":"1.0.0"}"#);
+    let original = "[sandbox]\nmode = \"strict\"\nallow-degraded = false\n";
+    seed_config(&project, original);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "set", "sandbox", "none"])
+        .output()
+        .expect("failed to run generic sandbox config setter");
+
+    let envelope = assertions::assert_security_approval_required(&output);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes
+                .iter()
+                .any(|scope| scope.as_str() == Some("sandbox-none"))),
+        "generic setter must request the sandbox-none scope: {envelope}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config_path(&project)).expect("read preserved sandbox config"),
+        original
+    );
+}
+
+#[test]
 fn config_set_signatures_true_persists_boolean() {
     let project = TempProject::empty(r#"{"name":"config-signatures","version":"1.0.0"}"#);
 
@@ -301,8 +502,16 @@ fn config_get_signatures_json_returns_boolean() {
             String::from_utf8_lossy(&output.stdout)
         )
     });
-    assert_eq!(envelope["success"], serde_json::json!(true));
-    assert_eq!(envelope["signatures"], serde_json::json!(true));
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "signatures",
+            "value": true,
+            "found": true,
+        })
+    );
 }
 
 #[test]
@@ -434,8 +643,16 @@ fn config_get_release_age_policy_returns_stored_value() {
             String::from_utf8_lossy(&output.stdout)
         )
     });
-    assert_eq!(envelope["success"], serde_json::json!(true));
-    assert_eq!(envelope["release-age-policy"], serde_json::json!("strict"));
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "release-age-policy",
+            "value": "strict",
+            "found": true,
+        })
+    );
 }
 
 #[test]
@@ -593,13 +810,95 @@ fn config_get_json_returns_existing_value() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("config get --json must be valid JSON: {e}\n---\n{stdout}"));
 
-    assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(
-        envelope["registry"],
-        serde_json::json!("https://registry.example.test")
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "registry",
+            "value": "https://registry.example.test",
+            "found": true,
+        })
     );
 
     insta::assert_json_snapshot!("config_get_json_envelope_single_key", envelope);
+}
+
+#[test]
+fn config_get_missing_key_json_returns_stable_envelope() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "get", "registry", "--json"])
+        .output()
+        .expect("failed to run lpm config get --json for a missing key");
+
+    assert!(
+        output.status.success(),
+        "lpm config get --json failed for a missing key:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("config get --json must return JSON for a missing key: {error}\n---\n{stdout}")
+    });
+
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": "registry",
+            "value": null,
+            "found": false,
+        })
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "config get --json must not write human output to stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    insta::assert_json_snapshot!("config_get_json_envelope_missing_key", envelope);
+}
+
+#[test]
+fn config_get_json_preserves_special_characters_in_missing_key() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    let key = "registry\"\\path\n⚠";
+
+    let output = lpm(&project)
+        .args(["config", "get", key, "--json"])
+        .output()
+        .expect("failed to run lpm config get --json with a special-character key");
+
+    assert!(
+        output.status.success(),
+        "lpm config get --json failed with a special-character key:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "config get --json must escape a special-character key: {error}\n---\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "success": true,
+            "action": "get",
+            "key": key,
+            "value": null,
+            "found": false,
+        })
+    );
 }
 
 #[test]
@@ -643,12 +942,8 @@ fn config_delete_removes_existing_key_and_preserves_other_entries() {
 }
 
 #[test]
-fn config_list_json_reports_all_keys() {
+fn config_list_json_reports_every_known_effective_key() {
     let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
-    seed_config(
-        &project,
-        "registry = \"https://registry.example.test\"\ncolor = \"always\"\n",
-    );
 
     let output = lpm(&project)
         .args(["config", "list", "--json"])
@@ -667,22 +962,165 @@ fn config_list_json_reports_all_keys() {
         .unwrap_or_else(|e| panic!("config list --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["action"], serde_json::json!("list"));
+    let entries = envelope["entries"]
+        .as_array()
+        .expect("config list --json must return an entries array");
+    let keys: Vec<&str> = entries
+        .iter()
+        .map(|entry| {
+            entry["key"]
+                .as_str()
+                .expect("each effective config entry must have a string key")
+        })
+        .collect();
     assert_eq!(
-        envelope["registry"],
-        serde_json::json!("https://registry.example.test")
+        keys,
+        [
+            "save-prefix",
+            "save-exact",
+            "script-policy",
+            "triage-advisor",
+            "sandbox.mode",
+            "sandbox.allow-degraded",
+            "script-read-allow",
+            "max-sandbox-write-roots",
+            "minimum-release-age-secs",
+            "release-age-policy",
+            "minimum-release-age-exclude",
+            "sigstore.verify",
+            "sigstore.scope",
+            "sigstore.availability",
+            "signatures",
+            "trust-policy",
+            "typosquat-guard",
+            "firewall.mode",
+            "firewall.npm.policies.trusted_public_malicious_advisories",
+            "firewall.npm.policies.lpm_ai_confirmed_malware",
+            "firewall.npm.policies.lpm_ai_agent_control_surface",
+            "firewall.npm.policies.critical_vulnerability",
+            "firewall.npm.policies.lpm_ai_suspicious",
+            "integrity",
+            "install-time-source-analysis",
+            "fetch-lpm-security-insights",
+            "engine-strict",
+            "strict-peer-dependencies",
+            "auto-install-peers",
+            "auto-install-lpm-skills",
+            "audit-after-install",
+            "linker",
+            "workspace-concurrency",
+            "tunnel.relay-url",
+        ]
     );
-    assert_eq!(envelope["color"], serde_json::json!("always"));
+    assert_eq!(envelope["count"], serde_json::json!(entries.len()));
+    assert!(entries.iter().all(|entry| {
+        entry["group"].is_string() && entry["source"].is_string() && !entry["value"].is_null()
+    }));
 
-    insta::assert_json_snapshot!("config_list_json_envelope_two_keys", envelope);
+    let mut snapshot = envelope;
+    let workspace_concurrency = snapshot["entries"]
+        .as_array_mut()
+        .and_then(|entries| {
+            entries
+                .iter_mut()
+                .find(|entry| entry["key"] == "workspace-concurrency")
+        })
+        .expect("workspace-concurrency must exist in the snapshot envelope");
+    workspace_concurrency["value"] = serde_json::json!("[available parallelism]");
+    insta::assert_json_snapshot!("config_list_json_effective_defaults", snapshot);
 }
 
 #[test]
-fn config_list_human_keeps_values_on_stdout() {
-    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+fn config_list_resolves_project_user_and_environment_sources() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "config-test",
+            "version": "1.0.0",
+            "lpm": {
+                "minimumReleaseAge": 172800,
+                "autoInstallPeers": false,
+                "strictPeerDependencies": true
+            }
+        }"#,
+    );
+    project.write_file(
+        "lpm.toml",
+        "save-prefix = \"~\"\n[workspace]\nconcurrency = 2\n[sandbox]\nmode = \"strict\"\n",
+    );
     seed_config(
         &project,
-        "registry = \"https://registry.example.test\"\ncolor = \"always\"\n",
+        "save-exact = true\nlinker = \"isolated\"\ncustom-future-key = \"kept\"\n",
     );
+
+    let output = lpm(&project)
+        .env("LPM_AUDIT_AFTER_INSTALL", "true")
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+
+    assert!(
+        output.status.success(),
+        "lpm config list --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("config list --json stdout must be valid JSON");
+    let entries = envelope["entries"]
+        .as_array()
+        .expect("config list --json must return an entries array");
+    let entry = |key: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .unwrap_or_else(|| panic!("missing effective config entry for {key}"))
+    };
+
+    assert_eq!(entry("save-prefix")["value"], serde_json::json!("~"));
+    assert_eq!(
+        entry("save-prefix")["source"],
+        serde_json::json!("lpm.toml")
+    );
+    assert_eq!(
+        entry("save-exact")["source"],
+        serde_json::json!("~/.lpm/config.toml")
+    );
+    assert_eq!(
+        entry("minimum-release-age-secs")["source"],
+        serde_json::json!("package.json > lpm")
+    );
+    assert_eq!(
+        entry("sandbox.mode")["source"],
+        serde_json::json!("lpm.toml")
+    );
+    assert_eq!(
+        entry("auto-install-peers")["source"],
+        serde_json::json!("package.json > lpm")
+    );
+    assert_eq!(
+        entry("strict-peer-dependencies")["source"],
+        serde_json::json!("package.json > lpm")
+    );
+    assert_eq!(
+        entry("workspace-concurrency")["source"],
+        serde_json::json!("lpm.toml")
+    );
+    assert_eq!(
+        entry("audit-after-install")["source"],
+        serde_json::json!("LPM_AUDIT_AFTER_INSTALL")
+    );
+    assert_eq!(
+        entry("custom-future-key")["source"],
+        serde_json::json!("~/.lpm/config.toml")
+    );
+}
+
+#[test]
+fn config_list_human_groups_effective_values_and_sources() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(&project, "[sigstore]\nverify = \"deny\"\nscope = \"all\"\n");
 
     let output = lpm(&project)
         .args(["config", "list"])
@@ -697,14 +1135,216 @@ fn config_list_human_keeps_values_on_stdout() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("registry") && stdout.contains("https://registry.example.test"),
-        "config list must render config rows to stdout, got:\n{stdout}",
-    );
+    assert!(stdout.contains("Dependency saving"));
+    assert!(stdout.contains("Lifecycle scripts"));
+    assert!(stdout.contains("Supply-chain security"));
+    assert!(stdout.contains("Installation"));
+    assert!(stdout.contains("Workspaces"));
+    assert!(stdout.contains("Network"));
+    assert!(stdout.contains("sigstore.verify"));
+    assert!(stdout.contains("~/.lpm/config.toml"));
+    assert!(stdout.contains("built-in default"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
         "config list must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn config_list_reports_managed_security_floor_sources() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    let policy_path = project.home().join(".lpm").join("security-policy.toml");
+    std::fs::create_dir_all(
+        policy_path
+            .parent()
+            .expect("policy path must have a parent"),
+    )
+    .expect("failed to create managed policy directory");
+    std::fs::write(
+        policy_path,
+        "script-policy = \"deny\"\n[sandbox]\nmode = \"strict\"\n",
+    )
+    .expect("failed to seed managed security policy");
+
+    let output = lpm(&project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+
+    assert!(
+        output.status.success(),
+        "lpm config list --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config list stdout must be JSON");
+    let entries = envelope["entries"]
+        .as_array()
+        .expect("config list --json must return entries");
+    let entry = |key: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .unwrap_or_else(|| panic!("missing effective config entry for {key}"))
+    };
+
+    assert_eq!(
+        entry("script-policy")["source"],
+        serde_json::json!("managed security policy")
+    );
+    assert_eq!(entry("sandbox.mode")["value"], serde_json::json!("strict"));
+    assert_eq!(
+        entry("sandbox.mode")["source"],
+        serde_json::json!("managed security policy")
+    );
+}
+
+#[test]
+fn config_list_reports_approved_security_posture_sources() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    write_signed_typosquat_guard_posture(&project, "off");
+
+    let output = lpm(&project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+
+    assert!(
+        output.status.success(),
+        "lpm config list --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config list stdout must be JSON");
+    let typosquat = envelope["entries"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["key"] == "typosquat-guard")
+        })
+        .expect("config list must include typosquat-guard");
+
+    assert_eq!(typosquat["value"], serde_json::json!("off"));
+    assert_eq!(
+        typosquat["source"],
+        serde_json::json!("approved security posture")
+    );
+}
+
+#[test]
+fn config_list_expands_named_policy_extension_fields() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        r#"
+[policy.extensions.local-feed]
+command = ["node", "--version"]
+mode = "enforce"
+on-error = "block"
+timeout-ms = 2500
+events = ["package.candidate"]
+
+[policy.extensions.defaults-feed]
+command = ["node", "--version"]
+
+[policy.extensions.paused-feed]
+enabled = false
+"#,
+    );
+
+    let output = lpm(&project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+
+    assert!(
+        output.status.success(),
+        "lpm config list --json failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("config list stdout must be JSON");
+    let entries = envelope["entries"]
+        .as_array()
+        .expect("config list --json must return entries");
+    let extension_keys: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry["key"]
+                .as_str()
+                .filter(|key| key.starts_with("policy.extensions."))
+        })
+        .collect();
+
+    assert_eq!(
+        extension_keys,
+        [
+            "policy.extensions.defaults-feed.enabled",
+            "policy.extensions.defaults-feed.command",
+            "policy.extensions.defaults-feed.mode",
+            "policy.extensions.defaults-feed.on-error",
+            "policy.extensions.defaults-feed.timeout-ms",
+            "policy.extensions.defaults-feed.events",
+            "policy.extensions.local-feed.enabled",
+            "policy.extensions.local-feed.command",
+            "policy.extensions.local-feed.mode",
+            "policy.extensions.local-feed.on-error",
+            "policy.extensions.local-feed.timeout-ms",
+            "policy.extensions.local-feed.events",
+            "policy.extensions.paused-feed.enabled",
+        ]
+    );
+
+    let entry = |key: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .unwrap_or_else(|| panic!("missing effective config entry for {key}"))
+    };
+    assert_eq!(
+        entry("policy.extensions.defaults-feed.enabled")["source"],
+        serde_json::json!("built-in default")
+    );
+    assert_eq!(
+        entry("policy.extensions.defaults-feed.command")["source"],
+        serde_json::json!("~/.lpm/config.toml")
+    );
+    for key in ["mode", "on-error", "timeout-ms", "events"] {
+        assert_eq!(
+            entry(&format!("policy.extensions.defaults-feed.{key}"))["source"],
+            serde_json::json!("built-in default"),
+            "omitted extension field {key} must report its default source"
+        );
+    }
+}
+
+#[test]
+fn config_list_rejects_a_malformed_known_value() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(&project, "minimum-release-age-secs = \"soon\"\n");
+
+    let output = lpm(&project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+
+    assert!(
+        !output.status.success(),
+        "config list must reject a malformed known value"
+    );
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "registry");
+    assert!(
+        envelope["error"].as_str().is_some_and(|error| {
+            error.contains("minimum-release-age-secs")
+                && error.contains("must be a non-negative integer")
+        }),
+        "config list must identify the malformed key and expected type: {envelope}"
     );
 }
 

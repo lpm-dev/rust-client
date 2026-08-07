@@ -226,16 +226,15 @@ impl VerdaccioProxyRegistry {
     }
 
     pub fn write_project_npmrc(&self, project_dir: &Path) {
-        std::fs::write(
-            project_dir.join(".npmrc"),
+        super::write_private_file(
+            &project_dir.join(".npmrc"),
             format!(
                 "registry={}/\n//{}/:_authToken={}\nalways-auth=true\n",
                 self.url(),
                 host_port(self.url()),
                 self.token,
             ),
-        )
-        .expect("failed to write project .npmrc for verdaccio proxy");
+        );
     }
 }
 

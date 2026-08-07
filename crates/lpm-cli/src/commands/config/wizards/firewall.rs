@@ -111,18 +111,48 @@ pub(in crate::commands::config) async fn run_firewall_wizard(
     }
 
     let existing_cfg = read_config(config_path)?;
-    crate::security_floor::reject_looser_firewall_mode_write(
+    apply_firewall_selection(
+        config_path,
         &global_config_view_from_value(&existing_cfg),
-        mode,
-    )?;
-    crate::security_approval::authorize_persistent_npm_firewall_mode(
-        mode,
+        selection,
         json_output,
         &format!("lpm config firewall --set {}", mode.as_str()),
     )?;
-    persist_firewall_selection(config_path, selection)?;
     announce_firewall_selection_set(selection, json_output);
     Ok(())
+}
+
+pub(in crate::commands::config) fn apply_firewall_mode(
+    config_path: &std::path::Path,
+    global: &GlobalConfig,
+    mode: NpmFirewallMode,
+    json_output: bool,
+    proposed_command: &str,
+) -> Result<(), LpmError> {
+    apply_firewall_selection(
+        config_path,
+        global,
+        FirewallWizardSelection::Mode(mode),
+        json_output,
+        proposed_command,
+    )
+}
+
+fn apply_firewall_selection(
+    config_path: &std::path::Path,
+    global: &GlobalConfig,
+    selection: FirewallWizardSelection,
+    json_output: bool,
+    proposed_command: &str,
+) -> Result<(), LpmError> {
+    let mode = selection.mode();
+    crate::security_floor::reject_looser_firewall_mode_write(global, mode)?;
+    crate::security_approval::authorize_persistent_npm_firewall_mode(
+        mode,
+        json_output,
+        proposed_command,
+    )?;
+    persist_firewall_selection(config_path, selection)
 }
 
 pub(in crate::commands::config) fn parse_firewall_mode_selection(

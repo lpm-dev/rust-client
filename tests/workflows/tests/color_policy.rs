@@ -36,6 +36,7 @@ fn version_fast_path_emits_no_ansi_under_no_color() {
 
     let output = lpm(&project)
         .args(["--version"])
+        .env_remove("LPM_NO_UPDATE_CHECK")
         .output()
         .expect("failed to run lpm --version");
 
@@ -63,6 +64,7 @@ fn version_emits_ansi_under_force_color() {
 
     let output = lpm(&project)
         .args(["--version"])
+        .env_remove("LPM_NO_UPDATE_CHECK")
         .env_remove("NO_COLOR")
         .env("FORCE_COLOR", "1")
         .output()
@@ -85,6 +87,7 @@ fn force_color_zero_disables_even_without_no_color() {
 
     let output = lpm(&project)
         .args(["--version"])
+        .env_remove("LPM_NO_UPDATE_CHECK")
         // Drop NO_COLOR so the only disable signal is FORCE_COLOR=0.
         // Pre-fix this was parsed as truthy and the notice still leaked.
         .env_remove("NO_COLOR")
@@ -116,6 +119,7 @@ fn color_flag_never_disables_under_force_color_one() {
     // pins the precedence regardless of which init path won.
     let output = lpm(&project)
         .args(["--color=never", "-V"])
+        .env_remove("LPM_NO_UPDATE_CHECK")
         .env_remove("NO_COLOR")
         .env("FORCE_COLOR", "1")
         .output()

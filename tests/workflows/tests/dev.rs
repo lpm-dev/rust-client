@@ -504,6 +504,152 @@ server.listen(port, '127.0.0.1', () => {
     );
 }
 
+#[test]
+fn dev_readiness_timeout_stops_before_starting_dependents() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "dev-readiness-timeout",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "db": {
+                    "command": "node slow-service.js",
+                    "readyUrl": "http://127.0.0.1:0/health",
+                    "readyTimeout": 1
+                },
+                "api": {
+                    "command": "node dependent.js",
+                    "dependsOn": ["db"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("slow-service.js", "setTimeout(() => {}, 2500);\n");
+    project.write_file(
+        "dependent.js",
+        "require('fs').writeFileSync('dependent-started', 'started');\n",
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run lpm dev with a readiness timeout");
+
+    assert!(
+        !output.status.success(),
+        "readiness timeout must fail startup\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !project.file_exists("dependent-started"),
+        "a dependent must not start after its dependency fails readiness"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("service 'db' failed readiness")
+            && stderr.contains("timed out waiting for http://127.0.0.1:0/health (1s)"),
+        "error must identify the service and readiness target\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn dev_restarts_dependents_after_restarting_dependency_is_ready() {
+    let db_listener = TcpListener::bind("127.0.0.1:0").expect("reserve database port");
+    let db_port = db_listener.local_addr().expect("read database port").port();
+    drop(db_listener);
+    let api_listener = TcpListener::bind("127.0.0.1:0").expect("reserve API port");
+    let api_port = api_listener.local_addr().expect("read API port").port();
+    drop(api_listener);
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "dev-dependency-restart",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+                "services": {{
+                    "db": {{
+                        "command": "node restarting-db.js {db_port}",
+                        "readyUrl": "http://127.0.0.1:{db_port}/health",
+                        "readyTimeout": 3,
+                        "restart": true
+                    }},
+                    "api": {{
+                        "command": "node dependent-api.js {api_port}",
+                        "readyUrl": "http://127.0.0.1:{api_port}/health",
+                        "readyTimeout": 3,
+                        "dependsOn": ["db"]
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    project.write_file(
+        "restarting-db.js",
+        r#"
+const fs = require('fs');
+const http = require('http');
+const port = Number(process.argv[2]);
+const countPath = 'db-start-count';
+const count = fs.existsSync(countPath)
+  ? Number(fs.readFileSync(countPath, 'utf8')) + 1
+  : 1;
+fs.writeFileSync(countPath, String(count));
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  const exitCode = count === 1 ? 1 : 0;
+  const lifetime = count === 1 ? 500 : 2500;
+  setTimeout(() => server.close(() => process.exit(exitCode)), lifetime);
+});
+"#,
+    );
+    project.write_file(
+        "dependent-api.js",
+        r#"
+const fs = require('fs');
+const http = require('http');
+const port = Number(process.argv[2]);
+const countPath = 'api-start-count';
+const count = fs.existsSync(countPath)
+  ? Number(fs.readFileSync(countPath, 'utf8')) + 1
+  : 1;
+fs.writeFileSync(countPath, String(count));
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  const lifetime = count === 1 ? 3500 : 1000;
+  setTimeout(() => server.close(() => process.exit(0)), lifetime);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run lpm dev with a restarting dependency");
+
+    assert!(
+        output.status.success(),
+        "recovered service graph must exit successfully\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("api-start-count"),
+        "2",
+        "the dependent must restart after its dependency recovers\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[tokio::test]
 async fn dev_auto_compat_materializes_project_local_entrypoint_for_framework_bins() {
     for case in FRAMEWORK_BIN_CASES {

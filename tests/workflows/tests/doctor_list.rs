@@ -12,7 +12,7 @@
 
 mod support;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -117,6 +117,49 @@ fn doctor_list_each_entry_has_required_fields() {
 }
 
 #[test]
+fn doctor_list_auto_fix_metadata_matches_every_supported_runtime_action() {
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list"])
+        .output()
+        .expect("failed to run lpm doctor list --json");
+    let json = parse_json_output(&output.stdout);
+    let actual: BTreeMap<&str, &str> = json["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|entry| Some((entry["code"].as_str()?, entry["auto_fix"].as_str()?)))
+        .collect();
+    let expected = BTreeMap::from([
+        ("bun_missing_pinned", "lpm use bun@<spec>"),
+        ("bun_pinned_unmet", "lpm use bun@<spec>"),
+        ("deps_sync_drift", "lpm install"),
+        ("fmt_other_issue", "lpm fmt"),
+        ("fmt_unformatted", "lpm fmt"),
+        ("gitattributes_lockb_unmarked", "update .gitattributes"),
+        ("gitattributes_missing", "update .gitattributes"),
+        ("lockfile_binary_corrupt", "reconcile lpm.lockb"),
+        ("lockfile_binary_missing", "reconcile lpm.lockb"),
+        ("lockfile_binary_stale", "reconcile lpm.lockb"),
+        ("lockfile_missing", "lpm install"),
+        ("node_missing_pinned", "lpm use node@<spec>"),
+        ("node_missing_unpinned", "lpm use node@22"),
+        ("node_modules_legacy_layout", "lpm install"),
+        ("node_modules_missing", "lpm install"),
+        ("node_modules_mixed_layout", "lpm install"),
+        ("node_modules_no_store", "lpm install"),
+        ("node_modules_symlinked", "lpm doctor --fix"),
+        ("node_pinned_unmet", "lpm use node@<spec>"),
+        ("plugin_update_available", "lpm plugin update <name>"),
+        ("tunnel_not_claimed", "lpm tunnel claim <domain>"),
+        ("v2_store_orphans", "lpm cache prune --apply"),
+    ]);
+
+    assert_eq!(actual, expected);
+    insta::assert_json_snapshot!("doctor_list_auto_fix_actions", actual);
+}
+
+#[test]
 fn doctor_list_filter_by_code_returns_single_entry() {
     let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
     let output = lpm(&project)
@@ -200,6 +243,162 @@ fn doctor_list_filter_by_category_returns_subset() {
     for entry in entries {
         assert_eq!(entry["category"], serde_json::json!("Tunnel"));
     }
+}
+
+#[test]
+fn doctor_list_tunnel_reachability_metadata_matches_runtime_contract() {
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list", "--category", "tunnel"])
+        .output()
+        .expect("failed to run lpm doctor list --json --category tunnel");
+    assert!(
+        output.status.success(),
+        "doctor list failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_output(&output.stdout);
+    let relevant_codes = [
+        "tunnel_active",
+        "tunnel_idle",
+        "tunnel_unreachable",
+        "tunnel_unverified",
+    ];
+    let actual: BTreeMap<&str, serde_json::Value> = json["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|entry| {
+            let code = entry["code"].as_str()?;
+            relevant_codes.contains(&code).then(|| {
+                (
+                    code,
+                    serde_json::json!({
+                        "description": entry["description"],
+                        "when_fires": entry["when_fires"],
+                        "remediation": entry["remediation"],
+                    }),
+                )
+            })
+        })
+        .collect();
+
+    let expected = BTreeMap::from([
+        (
+            "tunnel_active",
+            serde_json::json!({
+                "description": "The configured tunnel domain is claimed by your account and responds to a request.",
+                "when_fires": "Ownership lookup succeeds, and the reachability request returns a status other than 404.",
+                "remediation": "No action — informational pass.",
+            }),
+        ),
+        (
+            "tunnel_idle",
+            serde_json::json!({
+                "description": "The configured tunnel domain is claimed by your account, but no tunnel is active.",
+                "when_fires": "Ownership lookup succeeds, and the reachability request returns 404.",
+                "remediation": "No action — informational pass.",
+            }),
+        ),
+        (
+            "tunnel_unreachable",
+            serde_json::json!({
+                "description": "Your account owns the configured tunnel domain, but the domain did not respond.",
+                "when_fires": "Ownership lookup succeeds, but the HTTPS reachability request fails.",
+                "remediation": "Examine DNS and tunnel state. Then run `lpm doctor` again.",
+            }),
+        ),
+        (
+            "tunnel_unverified",
+            serde_json::json!({
+                "description": "The registry request for tunnel domain ownership failed.",
+                "when_fires": "The registry ownership request fails.",
+                "remediation": "Run `lpm health`. Then run `lpm doctor` again.",
+            }),
+        ),
+    ]);
+
+    assert_eq!(actual, expected);
+    insta::assert_json_snapshot!("doctor_list_tunnel_reachability_metadata", actual);
+}
+
+#[test]
+fn doctor_list_global_manifest_metadata_matches_toml_contract() {
+    let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "doctor", "list", "--category", "global"])
+        .output()
+        .expect("failed to run lpm doctor list --json --category global");
+    assert!(
+        output.status.success(),
+        "doctor list failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json = parse_json_output(&output.stdout);
+    let relevant_codes = [
+        "global_manifest_absent",
+        "global_manifest_corrupt",
+        "global_manifest_structurally_invalid",
+        "global_manifest_valid",
+    ];
+    let actual: BTreeMap<&str, serde_json::Value> = json["entries"]
+        .as_array()
+        .expect("entries must be an array")
+        .iter()
+        .filter_map(|entry| {
+            let code = entry["code"].as_str()?;
+            relevant_codes.contains(&code).then(|| {
+                (
+                    code,
+                    serde_json::json!({
+                        "description": entry["description"],
+                        "when_fires": entry["when_fires"],
+                        "remediation": entry["remediation"],
+                    }),
+                )
+            })
+        })
+        .collect();
+
+    let expected = BTreeMap::from([
+        (
+            "global_manifest_absent",
+            serde_json::json!({
+                "description": "The global install manifest does not exist.",
+                "when_fires": "`~/.lpm/global/manifest.toml` does not exist.",
+                "remediation": "No action is necessary.",
+            }),
+        ),
+        (
+            "global_manifest_corrupt",
+            serde_json::json!({
+                "description": "LPM cannot read `~/.lpm/global/manifest.toml` as a supported TOML manifest.",
+                "when_fires": "The file is unreadable, is not valid UTF-8 or TOML, or uses a newer schema version.",
+                "remediation": "Repair `~/.lpm/global/manifest.toml`, or reinstall the affected global packages.",
+            }),
+        ),
+        (
+            "global_manifest_structurally_invalid",
+            serde_json::json!({
+                "description": "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+                "when_fires": "The manifest parses, but a record fails global install validation.",
+                "remediation": "Repair the affected records, or reinstall the affected global packages.",
+            }),
+        ),
+        (
+            "global_manifest_valid",
+            serde_json::json!({
+                "description": "`~/.lpm/global/manifest.toml` contains valid TOML and valid global install records.",
+                "when_fires": "The manifest exists, parses as TOML, uses a supported schema, and passes structural validation.",
+                "remediation": "No action is necessary.",
+            }),
+        ),
+    ]);
+
+    assert_eq!(actual, expected);
+    insta::assert_json_snapshot!("doctor_list_global_manifest_metadata", actual);
 }
 
 #[test]

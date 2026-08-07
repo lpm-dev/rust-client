@@ -25,9 +25,12 @@ pub use atomic_write::replace_symlink_atomic;
 pub use atomic_write::{
     AtomicWriteOptions, write_file_atomic, write_file_atomic_with, write_file_atomic_with_options,
 };
+#[cfg(unix)]
+pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
     TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped, read_text_file_capped,
+    read_text_file_capped_with_metadata,
 };
 pub use error::{
     ArtifactUnavailableErrorContext, ArtifactUnavailableKind, LpmError, ResolutionErrorContext,

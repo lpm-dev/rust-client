@@ -30,6 +30,8 @@ pub enum DashboardEvent {
     PortAssigned { service: String, port: u16 },
     /// A webhook was captured by the tunnel.
     WebhookCaptured(Box<lpm_tunnel::webhook::CapturedWebhook>),
+    /// A fatal background error that must close the dashboard.
+    FatalError(String),
 }
 
 /// Command from the dashboard back to the orchestrator.
@@ -174,6 +176,7 @@ pub fn run_dashboard(
                 DashboardEvent::WebhookCaptured(webhook) => {
                     app.push_webhook(*webhook);
                 }
+                DashboardEvent::FatalError(error) => return Err(io::Error::other(error)),
             }
         }
     }

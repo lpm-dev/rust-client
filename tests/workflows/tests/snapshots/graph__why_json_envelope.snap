@@ -1,0 +1,19 @@
+---
+source: tests/workflows/tests/graph.rs
+assertion_line: 704
+expression: graph_json
+---
+{
+  "success": true,
+  "target": "lodash",
+  "found": true,
+  "path_count": 1,
+  "paths": [
+    [
+      "why-top-level@0.0.0",
+      "lodash@4.17.20"
+    ]
+  ],
+  "applied_overrides": [],
+  "applied_patches": []
+}

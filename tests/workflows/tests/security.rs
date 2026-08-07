@@ -128,6 +128,14 @@ fn security_status_json_defaults_to_project_target() {
         envelope["status"]["effective_floor"]["firewall_mode"],
         serde_json::json!("off")
     );
+    assert_eq!(
+        envelope["status"]["effective_floor"]["install_time_source_analysis"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        envelope["status"]["floor_sources"]["install_time_source_analysis"],
+        serde_json::json!("builtin-default")
+    );
 }
 
 #[test]
@@ -163,6 +171,33 @@ fn security_status_human_uses_slim_completion() {
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('◇'),
         "security status must not use cliclack gutter output, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn security_status_human_reports_install_time_source_analysis_and_source() {
+    let project = TempProject::empty(r#"{"name":"security-test","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["security", "status"])
+        .output()
+        .expect("failed to run lpm security status");
+
+    assert!(
+        output.status.success(),
+        "security status must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let source_analysis_row = stdout
+        .lines()
+        .find(|line| line.contains("install-time source analysis"));
+    assert!(
+        source_analysis_row
+            .is_some_and(|line| { line.contains("true") && line.contains("(builtin-default)") }),
+        "security status must show the install-time source analysis value and source, got:\n{stdout}",
     );
 }
 

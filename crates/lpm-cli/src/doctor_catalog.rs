@@ -82,6 +82,57 @@ impl fmt::Display for Severity {
     }
 }
 
+/// Runtime action executed by `lpm doctor --fix` for a catalog entry.
+///
+/// The catalog stores this enum instead of a display string so runtime
+/// dispatch must handle every action exhaustively. [`Self::label`] keeps
+/// the existing `auto_fix` JSON field stable for automation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DoctorFix {
+    ReplaceNodeModulesLink,
+    PruneStore,
+    InstallProject,
+    ReconcileBinaryLockfile,
+    UpdateGitAttributes,
+    InstallNodeSpec,
+    InstallNode22,
+    InstallBunSpec,
+    FormatProject,
+    ClaimTunnel,
+    UpdatePlugin,
+}
+
+impl DoctorFix {
+    /// Stable string emitted as `auto_fix` by `lpm doctor list --json`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReplaceNodeModulesLink => "lpm doctor --fix",
+            Self::PruneStore => "lpm cache prune --apply",
+            Self::InstallProject => "lpm install",
+            Self::ReconcileBinaryLockfile => "reconcile lpm.lockb",
+            Self::UpdateGitAttributes => "update .gitattributes",
+            Self::InstallNodeSpec => "lpm use node@<spec>",
+            Self::InstallNode22 => "lpm use node@22",
+            Self::InstallBunSpec => "lpm use bun@<spec>",
+            Self::FormatProject => "lpm fmt",
+            Self::ClaimTunnel => "lpm tunnel claim <domain>",
+            Self::UpdatePlugin => "lpm plugin update <name>",
+        }
+    }
+
+    /// Whether an emitted check must carry a structured runtime target.
+    pub const fn requires_target(self) -> bool {
+        matches!(
+            self,
+            Self::InstallNodeSpec
+                | Self::InstallNode22
+                | Self::InstallBunSpec
+                | Self::ClaimTunnel
+                | Self::UpdatePlugin
+        )
+    }
+}
+
 /// Doctor execution tier. Drives the `lpm doctor` vs `lpm doctor --all`
 /// split: fast-mode runs only `Tier::Fast` rows (zero network, zero
 /// subprocess except `node --version` for runtime detection), while
@@ -201,7 +252,7 @@ pub struct CheckEntry {
     pub possible_severities: &'static [Severity],
     /// `lpm doctor --fix` action, if there is one. None means the
     /// remediation is the user's call — e.g. logging in.
-    pub auto_fix: Option<&'static str>,
+    pub auto_fix: Option<DoctorFix>,
 }
 
 impl CheckEntry {
@@ -542,7 +593,7 @@ pub static NODE_MODULES_SYMLINKED: CheckEntry = CheckEntry {
     when_fires: "`<project>/node_modules` resolves through a symlink or directory junction instead of being a real directory.",
     remediation: "Run `lpm doctor --fix` to replace only the link entry. Then run `lpm install`. You can also remove the link manually.",
     possible_severities: &[Severity::Fail],
-    auto_fix: Some("lpm doctor --fix"),
+    auto_fix: Some(DoctorFix::ReplaceNodeModulesLink),
 };
 
 pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
@@ -554,7 +605,7 @@ pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
     when_fires: "After projects are deleted or move on disk; virtual stores grow across all projects on the machine until pruned.",
     remediation: "Run `lpm cache prune` for a dry-run preview, then `lpm cache prune --apply` to remove orphans.",
     possible_severities: &[Severity::Pass, Severity::Warn],
-    auto_fix: Some("lpm cache prune --apply"),
+    auto_fix: Some(DoctorFix::PruneStore),
 };
 
 pub static NODE_MODULES_MIXED_LAYOUT: CheckEntry = CheckEntry {
@@ -566,7 +617,7 @@ pub static NODE_MODULES_MIXED_LAYOUT: CheckEntry = CheckEntry {
     when_fires: "A linker mode switch left stale state behind.",
     remediation: "Re-run `lpm install` to converge on the configured linker layout.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm install"),
+    auto_fix: Some(DoctorFix::InstallProject),
 };
 
 pub static NODE_MODULES_NO_STORE: CheckEntry = CheckEntry {
@@ -578,7 +629,7 @@ pub static NODE_MODULES_NO_STORE: CheckEntry = CheckEntry {
     when_fires: "A non-LPM CLI tool wrote `node_modules/` (npm / pnpm / yarn / bun).",
     remediation: "Run `lpm install` to rebuild the layout under LPM CLI ownership.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm install"),
+    auto_fix: Some(DoctorFix::InstallProject),
 };
 
 pub static NODE_MODULES_LEGACY_LAYOUT: CheckEntry = CheckEntry {
@@ -590,7 +641,7 @@ pub static NODE_MODULES_LEGACY_LAYOUT: CheckEntry = CheckEntry {
     when_fires: "Legacy `node_modules/.lpm/` or `node_modules/.lpm-metadata.json` populated; the new `.lpm/wrappers/` is empty.",
     remediation: "Run `lpm install` to migrate to the current layout.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm install"),
+    auto_fix: Some(DoctorFix::InstallProject),
 };
 
 pub static NODE_MODULES_MISSING: CheckEntry = CheckEntry {
@@ -602,7 +653,7 @@ pub static NODE_MODULES_MISSING: CheckEntry = CheckEntry {
     when_fires: "The project has `package.json` but no `node_modules/`.",
     remediation: "Run `lpm install`.",
     possible_severities: &[Severity::Fail],
-    auto_fix: Some("lpm install"),
+    auto_fix: Some(DoctorFix::InstallProject),
 };
 
 pub static LOCKFILE_PRESENT: CheckEntry = CheckEntry {
@@ -626,7 +677,7 @@ pub static LOCKFILE_MISSING: CheckEntry = CheckEntry {
     when_fires: "Project has dependencies declared but no lockfile generated.",
     remediation: "Run `lpm install` — it generates the lockfile alongside `node_modules/`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm install"),
+    auto_fix: Some(DoctorFix::InstallProject),
 };
 
 pub static LOCKFILE_BINARY_VALID: CheckEntry = CheckEntry {
@@ -650,7 +701,7 @@ pub static LOCKFILE_BINARY_MISSING: CheckEntry = CheckEntry {
     when_fires: "Only the TOML lockfile is on disk and the graph fits the binary lockfile format.",
     remediation: "Run `lpm doctor --fix` to regenerate, or run `lpm install`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("reconcile lpm.lockb"),
+    auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
 };
 
 pub static LOCKFILE_BINARY_STALE: CheckEntry = CheckEntry {
@@ -662,7 +713,7 @@ pub static LOCKFILE_BINARY_STALE: CheckEntry = CheckEntry {
     when_fires: "TOML lockfile changed but the binary mirror was not regenerated, or stale binary bytes remain for a TOML-only graph.",
     remediation: "Run `lpm doctor --fix` to reconcile, or run `lpm install`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("reconcile lpm.lockb"),
+    auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
 };
 
 pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
@@ -674,7 +725,7 @@ pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
     when_fires: "Binary lockfile bytes are truncated, mis-versioned, or otherwise unreadable.",
     remediation: "Run `lpm doctor --fix` to reconcile from `lpm.lock`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("reconcile lpm.lockb"),
+    auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
 };
 
 pub static GITATTRIBUTES_LOCKB_MARKED: CheckEntry = CheckEntry {
@@ -698,7 +749,7 @@ pub static GITATTRIBUTES_LOCKB_UNMARKED: CheckEntry = CheckEntry {
     when_fires: "Repo has `.gitattributes` without the LPM CLI lockb rule.",
     remediation: "Add `lpm.lockb binary` to `.gitattributes` so git diffs treat the file correctly.",
     possible_severities: &[Severity::Warn],
-    auto_fix: None,
+    auto_fix: Some(DoctorFix::UpdateGitAttributes),
 };
 
 pub static GITATTRIBUTES_MISSING: CheckEntry = CheckEntry {
@@ -710,7 +761,7 @@ pub static GITATTRIBUTES_MISSING: CheckEntry = CheckEntry {
     when_fires: "`<project>/.gitattributes` is missing.",
     remediation: "Run `lpm init` or add `lpm.lockb binary` to a new `.gitattributes`.",
     possible_severities: &[Severity::Warn],
-    auto_fix: None,
+    auto_fix: Some(DoctorFix::UpdateGitAttributes),
 };
 
 pub static DEPS_SYNC_CLEAN: CheckEntry = CheckEntry {
@@ -734,7 +785,7 @@ pub static DEPS_SYNC_DRIFT: CheckEntry = CheckEntry {
     when_fires: "Declared deps were added or removed without rerunning `lpm install`.",
     remediation: "Run `lpm install` to reconcile.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm install"),
+    auto_fix: Some(DoctorFix::InstallProject),
 };
 
 pub static LOCAL_SOURCE_DIR_OK: CheckEntry = CheckEntry {
@@ -922,7 +973,7 @@ pub static NODE_PINNED_UNMET: CheckEntry = CheckEntry {
     when_fires: "Pin found, but no managed install matches; the first Node on script PATH may differ in patch / minor.",
     remediation: "Run `lpm use node@<version>` to install and pin the managed version.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm use node@<spec>"),
+    auto_fix: Some(DoctorFix::InstallNodeSpec),
 };
 
 pub static NODE_MISSING_PINNED: CheckEntry = CheckEntry {
@@ -934,7 +985,7 @@ pub static NODE_MISSING_PINNED: CheckEntry = CheckEntry {
     when_fires: "Pin found; no Node is reachable through the constructed script PATH.",
     remediation: "Run `lpm use node@<version>` to install the pinned version.",
     possible_severities: &[Severity::Fail],
-    auto_fix: Some("lpm use node@<spec>"),
+    auto_fix: Some(DoctorFix::InstallNodeSpec),
 };
 
 pub static NODE_SYSTEM_UNPINNED: CheckEntry = CheckEntry {
@@ -958,7 +1009,7 @@ pub static NODE_MISSING_UNPINNED: CheckEntry = CheckEntry {
     when_fires: "No Node is reachable through the constructed script PATH.",
     remediation: "Install Node via `lpm use node@22` (or your preferred version).",
     possible_severities: &[Severity::Fail],
-    auto_fix: Some("lpm use node@22"),
+    auto_fix: Some(DoctorFix::InstallNode22),
 };
 
 pub static BUN_MANAGED_MATCH: CheckEntry = CheckEntry {
@@ -982,7 +1033,7 @@ pub static BUN_PINNED_UNMET: CheckEntry = CheckEntry {
     when_fires: "Pin found in `lpm.json > runtime.bun`, but no managed install matches; system Bun may differ.",
     remediation: "Run `lpm use bun@<version>` to install and pin the managed version.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm use bun@<spec>"),
+    auto_fix: Some(DoctorFix::InstallBunSpec),
 };
 
 pub static BUN_MISSING_PINNED: CheckEntry = CheckEntry {
@@ -994,7 +1045,7 @@ pub static BUN_MISSING_PINNED: CheckEntry = CheckEntry {
     when_fires: "Pin found in `lpm.json > runtime.bun`; no system or managed Bun available.",
     remediation: "Run `lpm use bun@<version>` to install the pinned version.",
     possible_severities: &[Severity::Fail],
-    auto_fix: Some("lpm use bun@<spec>"),
+    auto_fix: Some(DoctorFix::InstallBunSpec),
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -1006,8 +1057,8 @@ pub static TUNNEL_ACTIVE: CheckEntry = CheckEntry {
     name: "Tunnel",
     category: Category::Tunnel,
     tier: Tier::Extended,
-    description: "A tunnel domain is configured and the registry confirms ownership.",
-    when_fires: "User authenticated, claim verified.",
+    description: "The configured tunnel domain is claimed by your account and responds to a request.",
+    when_fires: "Ownership lookup succeeds, and the reachability request returns a status other than 404.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -1018,9 +1069,9 @@ pub static TUNNEL_IDLE: CheckEntry = CheckEntry {
     name: "Tunnel",
     category: Category::Tunnel,
     tier: Tier::Extended,
-    description: "No tunnel domain is configured for this project.",
-    when_fires: "`lpm.json > tunnel.domain` is not set.",
-    remediation: "No action — informational pass. Configure a domain to enable `lpm dev --tunnel`.",
+    description: "The configured tunnel domain is claimed by your account, but no tunnel is active.",
+    when_fires: "Ownership lookup succeeds, and the reachability request returns 404.",
+    remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
@@ -1042,9 +1093,9 @@ pub static TUNNEL_UNVERIFIED: CheckEntry = CheckEntry {
     name: "Tunnel",
     category: Category::Tunnel,
     tier: Tier::Extended,
-    description: "Ownership of the tunnel domain could not be verified due to a transient registry error.",
-    when_fires: "Registry returned an unexpected status when checking the claim.",
-    remediation: "Retry; check `lpm health`.",
+    description: "The registry request for tunnel domain ownership failed.",
+    when_fires: "The registry ownership request fails.",
+    remediation: "Run `lpm health`. Then run `lpm doctor` again.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
@@ -1058,7 +1109,7 @@ pub static TUNNEL_NOT_CLAIMED: CheckEntry = CheckEntry {
     when_fires: "Registry reports no claim for the domain on this user.",
     remediation: "Run `lpm tunnel claim <domain>` (Pro/Org) or change the domain.",
     possible_severities: &[Severity::Warn],
-    auto_fix: None,
+    auto_fix: Some(DoctorFix::ClaimTunnel),
 };
 
 pub static TUNNEL_OWNED_BY_OTHER: CheckEntry = CheckEntry {
@@ -1078,9 +1129,9 @@ pub static TUNNEL_UNREACHABLE: CheckEntry = CheckEntry {
     name: "Tunnel",
     category: Category::Tunnel,
     tier: Tier::Extended,
-    description: "The registry could not be reached to verify the tunnel claim.",
-    when_fires: "Network timeout / DNS failure during claim probe.",
-    remediation: "Check network; retry `lpm doctor`.",
+    description: "Your account owns the configured tunnel domain, but the domain did not respond.",
+    when_fires: "Ownership lookup succeeds, but the HTTPS reachability request fails.",
+    remediation: "Examine DNS and tunnel state. Then run `lpm doctor` again.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -1254,7 +1305,7 @@ pub static FMT_UNFORMATTED: CheckEntry = CheckEntry {
     when_fires: "`biome format --check` exited non-zero with formatting issues.",
     remediation: "Run `lpm fmt` to apply formatting.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm fmt"),
+    auto_fix: Some(DoctorFix::FormatProject),
 };
 
 pub static FMT_OTHER_ISSUE: CheckEntry = CheckEntry {
@@ -1266,7 +1317,7 @@ pub static FMT_OTHER_ISSUE: CheckEntry = CheckEntry {
     when_fires: "Biome exited with an error not classified as plain unformatted code.",
     remediation: "Run `lpm fmt --check` to see the raw biome output.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm fmt"),
+    auto_fix: Some(DoctorFix::FormatProject),
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -1334,7 +1385,7 @@ pub static PLUGIN_UPDATE_AVAILABLE: CheckEntry = CheckEntry {
     when_fires: "Upstream probe returned a higher version than the installed one.",
     remediation: "Run `lpm plugin update <name>` to update.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some("lpm plugin update <name>"),
+    auto_fix: Some(DoctorFix::UpdatePlugin),
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -1374,9 +1425,9 @@ pub static GLOBAL_MANIFEST_VALID: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.json` parses and is structurally valid.",
-    when_fires: "Manifest exists and is well-formed.",
-    remediation: "No action — informational pass.",
+    description: "`~/.lpm/global/manifest.toml` contains valid TOML and valid global install records.",
+    when_fires: "The manifest exists, parses as TOML, uses a supported schema, and passes structural validation.",
+    remediation: "No action is necessary.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
@@ -1386,9 +1437,9 @@ pub static GLOBAL_MANIFEST_ABSENT: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "No global install manifest is present (no global installs yet).",
-    when_fires: "`~/.lpm/global/` is empty or missing.",
-    remediation: "No action — informational pass.",
+    description: "The global install manifest does not exist.",
+    when_fires: "`~/.lpm/global/manifest.toml` does not exist.",
+    remediation: "No action is necessary.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
@@ -1398,27 +1449,21 @@ pub static GLOBAL_MANIFEST_CORRUPT: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.json` is unreadable or malformed.",
-    when_fires: "JSON parse error or schema mismatch.",
-    remediation: "Inspect and repair, or reinstall affected globals.",
+    description: "LPM cannot read `~/.lpm/global/manifest.toml` as a supported TOML manifest.",
+    when_fires: "The file is unreadable, is not valid UTF-8 or TOML, or uses a newer schema version.",
+    remediation: "Repair `~/.lpm/global/manifest.toml`, or reinstall the affected global packages.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
 
-/// L38: TOML-parseable manifest with structurally invalid rows —
-/// `packages.*.root` outside the `installs/<name>@<version>` shape,
-/// alias rows pointing at non-existent packages or non-declared bins,
-/// tombstones outside the same shape. Pre-fix the doctor only checked
-/// parseability, and downstream `lpm global list --verbose` would
-/// happily `dir_size()` on escaped paths.
 pub static GLOBAL_MANIFEST_STRUCTURALLY_INVALID: CheckEntry = CheckEntry {
     code: "global_manifest_structurally_invalid",
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.toml` parses as TOML but carries structurally invalid rows: `packages.*.root` outside the `installs/<name>@<version>` shape, alias rows pointing at non-existent packages or non-declared bins, or tombstones with the same shape violation.",
-    when_fires: "Manifest TOML is valid but one or more rows fail the L47 `validated_install_root_relative` shape check, or an alias row dangles.",
-    remediation: "Inspect `~/.lpm/global/manifest.toml`; fix the offending rows by hand or reinstall the affected globals.",
+    description: "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+    when_fires: "The manifest parses, but a record fails global install validation.",
+    remediation: "Repair the affected records, or reinstall the affected global packages.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
@@ -2122,7 +2167,7 @@ impl InventoryRow {
             when_fires: entry.when_fires,
             remediation: entry.remediation,
             possible_severities,
-            auto_fix: entry.auto_fix,
+            auto_fix: entry.auto_fix.map(DoctorFix::label),
         }
     }
 }

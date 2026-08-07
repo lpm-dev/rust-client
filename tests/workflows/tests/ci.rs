@@ -183,6 +183,25 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
 }
 
 #[test]
+fn ci_setup_github_actions_emits_complete_job_with_default_runner() {
+    let project = TempProject::empty(r#"{"name":"ci-runner","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["setup", "ci", "github-actions"])
+        .output()
+        .expect("failed to run lpm setup ci github-actions");
+
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("jobs:\n    deploy:\n      runs-on: ubuntu-latest\n      permissions:"),
+        "GitHub Actions setup must emit a complete job with the default runner:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn ci_setup_github_actions_env_name_cannot_inject_terminal_rows() {
     let project = TempProject::empty(r#"{"name":"ci-controls","version":"1.0.0"}"#);
 
@@ -329,6 +348,125 @@ fn ci_setup_unknown_platform_under_json_emits_error_envelope_on_stdout() {
             .is_some_and(|s| s.contains("github-actions") && s.contains("gitlab")),
         "error must list valid platforms, got: {envelope}",
     );
+}
+
+#[test]
+fn ci_setup_workflow_targets_and_aliases_reject_registry_and_oidc_flags() {
+    let project = TempProject::empty(r#"{"name":"ci-flags","version":"1.0.0"}"#);
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "github-actions --oidc",
+            &["setup", "ci", "github-actions", "--oidc"],
+            "--oidc",
+        ),
+        (
+            "github --registry",
+            &[
+                "setup",
+                "ci",
+                "github",
+                "--registry",
+                "https://registry.example.test",
+            ],
+            "--registry",
+        ),
+        (
+            "gha -r",
+            &["setup", "ci", "gha", "-r", "https://registry.example.test"],
+            "--registry",
+        ),
+        (
+            "gitlab --oidc",
+            &["setup", "ci", "gitlab", "--oidc"],
+            "--oidc",
+        ),
+        (
+            "gitlab-ci --registry",
+            &[
+                "setup",
+                "ci",
+                "gitlab-ci",
+                "--registry",
+                "https://registry.example.test",
+            ],
+            "--registry",
+        ),
+        (
+            "global --registry",
+            &[
+                "--registry",
+                "https://registry.example.test",
+                "setup",
+                "ci",
+                "github-actions",
+            ],
+            "--registry",
+        ),
+    ];
+
+    for (case, args, rejected_flag) in cases {
+        let output = lpm(&project)
+            .args(*args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {case}: {error}"));
+
+        assert!(!output.status.success(), "{case} must fail");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "{case} must fail before it prints a workflow fragment"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(rejected_flag),
+            "{case} error must name {rejected_flag}, got:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn ci_setup_workflow_target_accepts_ambient_registry_configuration() {
+    let project = TempProject::empty(r#"{"name":"ci-flags","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", "https://registry.example.test")
+        .args(["setup", "ci", "github-actions"])
+        .output()
+        .expect("failed to run GitHub Actions setup with ambient registry configuration");
+
+    assert!(
+        output.status.success(),
+        "ambient registry configuration is not an explicit target flag:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("GitHub Actions OIDC Setup"),
+        "workflow target must still print its fragment"
+    );
+}
+
+#[test]
+fn ci_setup_workflow_flag_rejection_under_json_emits_stable_error() {
+    let project = TempProject::empty(r#"{"name":"ci-flags","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "setup", "ci", "github-actions", "--oidc"])
+        .output()
+        .expect("failed to run JSON GitHub Actions setup with --oidc");
+
+    assert!(!output.status.success(), "irrelevant --oidc must fail");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!("workflow flag rejection must emit JSON: {error}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["error_code"], serde_json::json!("script"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("--oidc") && error.contains("github-actions")),
+        "error must identify the irrelevant flag and target: {envelope}"
+    );
+    insta::assert_json_snapshot!("setup_ci_workflow_rejects_oidc_json", envelope);
 }
 
 #[test]

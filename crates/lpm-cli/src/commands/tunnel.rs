@@ -363,7 +363,7 @@ pub(crate) async fn run_start(
         install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("Example:"),
-            install_ui::yellow(&format!("lpm tunnel start --domain {d}.lpm.llc"))
+            install_ui::yellow(&format!("lpm tunnel start {d}.lpm.llc"))
         ));
         return Err(LpmError::Tunnel("missing base domain".into()));
     }

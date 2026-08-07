@@ -230,7 +230,7 @@ pub(crate) enum Commands {
 
     /// Rotate your auth token.
     #[command(name = "token-rotate")]
-    TokenRotate,
+    TokenRotate(registry::TokenRotateArgs),
 
     /// Check for newer versions of direct dependencies.
     ///

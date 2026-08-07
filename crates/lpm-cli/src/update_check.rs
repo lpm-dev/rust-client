@@ -24,6 +24,10 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 /// Read the cached update info and return a notice if outdated.
 /// This is instant (no network) — called before the command runs.
 pub fn read_cached_notice() -> Option<String> {
+    if update_checks_disabled() {
+        return None;
+    }
+
     let path = default_cache_path()?;
     let cache = read_cache_at(&path)?;
     let current = crate::build_version::version();
@@ -56,14 +60,12 @@ pub fn is_stale() -> bool {
 }
 
 pub fn should_spawn_background_check() -> bool {
-    should_spawn_background_check_for(
-        is_stale(),
-        std::env::var_os("LPM_NO_UPDATE_CHECK").is_some(),
-    )
+    !update_checks_disabled() && is_stale()
 }
 
-fn should_spawn_background_check_for(stale: bool, disabled: bool) -> bool {
-    stale && !disabled
+#[inline]
+fn update_checks_disabled() -> bool {
+    std::env::var_os("LPM_NO_UPDATE_CHECK").is_some()
 }
 
 /// Unconditionally refresh the update cache. Called by the hidden
@@ -106,11 +108,6 @@ mod tests {
     use super::*;
     use crate::release_lookup;
     use crate::release_lookup::UpdateCache;
-
-    #[test]
-    fn disabled_update_checks_never_spawn_a_background_child() {
-        assert!(!should_spawn_background_check_for(true, true));
-    }
 
     #[test]
     fn update_notice_versions_cannot_inject_terminal_rows_or_controls() {

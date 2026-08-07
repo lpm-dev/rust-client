@@ -4,12 +4,11 @@
 //! tree (terminal), DOT (Graphviz), Mermaid, JSON, stats, and HTML.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 
 use lpm_common::sanitize_terminal_inline;
-
-/// Maximum number of paths returned by `find_all_paths` / `dfs_paths` to prevent
-/// exponential blowup on diamond-heavy graphs.
-const MAX_PATHS: usize = 100;
+use serde::Serialize;
+use serde::ser::{SerializeSeq, SerializeStruct};
 
 /// A node in the dependency graph.
 #[derive(Debug, Clone)]
@@ -88,6 +87,9 @@ impl DepGraph {
                 _ => Registry::Unknown,
             };
 
+            let mut dependencies = pkg.dependencies.clone();
+            dependencies.sort_unstable();
+
             nodes.insert(
                 key.clone(),
                 DepNode {
@@ -98,18 +100,19 @@ impl DepGraph {
                     is_direct: direct_dep_names.contains(&pkg.name),
                     is_duplicate: false,
                     is_root: false,
-                    dependencies: pkg.dependencies.clone(),
+                    dependencies,
                 },
             );
         }
 
         // Create synthetic root node pointing to all direct deps
         let root_key = root_name.to_string();
-        let direct_dep_keys: Vec<String> = nodes
+        let mut direct_dep_keys: Vec<String> = nodes
             .iter()
             .filter(|(_, n)| n.is_direct)
             .map(|(k, _)| k.clone())
             .collect();
+        direct_dep_keys.sort_unstable();
 
         nodes.insert(
             root_key.clone(),
@@ -210,77 +213,111 @@ impl DepGraph {
         }
     }
 
-    /// Find all paths from any root to a package by name.
-    pub fn find_paths(&self, target_name: &str) -> Vec<Vec<String>> {
-        let target_keys: Vec<&String> = self
-            .nodes
-            .keys()
-            .filter(|k| {
-                k.split('@').next() == Some(target_name)
-                    || k.starts_with(&format!("{target_name}@"))
-            })
-            .collect();
+    fn path_summary(&self, target_name: &str) -> PathSummary {
+        let mut versions = HashSet::new();
+        let path_count = self.visit_paths(target_name, |path| {
+            if let Some(node) = path.last().and_then(|key| self.nodes.get(*key)) {
+                versions.insert(node.version.as_str());
+            }
+            true
+        });
 
-        if target_keys.is_empty() {
-            return vec![];
+        PathSummary {
+            path_count,
+            version_count: versions.len(),
         }
+    }
 
-        let mut all_paths = Vec::new();
+    fn visit_paths<'graph, F>(&'graph self, target_name: &str, visitor: F) -> usize
+    where
+        F: FnMut(&[&'graph str]) -> bool,
+    {
+        let mut roots: Vec<&str> = self.roots.iter().map(String::as_str).collect();
+        roots.sort_unstable();
 
-        for root_key in &self.roots {
+        let mut target_keys: Vec<&str> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.name == target_name)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        target_keys.sort_unstable();
+
+        let mut traversal = PathTraversal::new(self.stats.max_depth.max(1), visitor);
+
+        for root_key in roots {
             for target_key in &target_keys {
-                let mut paths = Vec::new();
-                let mut current_path = vec![root_key.clone()];
-                let mut visited = HashSet::new();
-                self.dfs_paths(
-                    root_key,
-                    target_key,
-                    &mut current_path,
-                    &mut visited,
-                    &mut paths,
-                );
-                all_paths.extend(paths);
+                traversal.reset(root_key);
+                if !self.dfs_paths(root_key, target_key, &mut traversal) {
+                    return traversal.path_count;
+                }
             }
         }
 
-        all_paths
+        traversal.path_count
     }
 
-    fn dfs_paths(
-        &self,
-        current: &str,
+    fn dfs_paths<'graph, F>(
+        &'graph self,
+        current: &'graph str,
         target: &str,
-        path: &mut Vec<String>,
-        visited: &mut HashSet<String>,
-        results: &mut Vec<Vec<String>>,
-    ) {
-        if results.len() >= MAX_PATHS {
-            return;
-        }
-
+        traversal: &mut PathTraversal<'graph, F>,
+    ) -> bool
+    where
+        F: FnMut(&[&'graph str]) -> bool,
+    {
         if current == target {
-            results.push(path.clone());
-            return;
+            traversal.path_count += 1;
+            return (traversal.visitor)(&traversal.path);
         }
 
-        if visited.contains(current) {
-            return;
+        if !traversal.visited.insert(current) {
+            return true;
         }
-        visited.insert(current.to_string());
 
         if let Some(node) = self.nodes.get(current) {
             for dep_key in &node.dependencies {
-                if results.len() >= MAX_PATHS {
-                    break;
+                traversal.path.push(dep_key);
+                if !self.dfs_paths(dep_key, target, traversal) {
+                    return false;
                 }
-                path.push(dep_key.clone());
-                self.dfs_paths(dep_key, target, path, visited, results);
-                path.pop();
+                traversal.path.pop();
             }
         }
 
-        visited.remove(current);
+        traversal.visited.remove(current);
+        true
     }
+}
+
+struct PathTraversal<'graph, F> {
+    path: Vec<&'graph str>,
+    visited: HashSet<&'graph str>,
+    path_count: usize,
+    visitor: F,
+}
+
+impl<'graph, F> PathTraversal<'graph, F> {
+    fn new(initial_capacity: usize, visitor: F) -> Self {
+        Self {
+            path: Vec::with_capacity(initial_capacity),
+            visited: HashSet::with_capacity(initial_capacity),
+            path_count: 0,
+            visitor,
+        }
+    }
+
+    fn reset(&mut self, root_key: &'graph str) {
+        self.path.clear();
+        self.path.push(root_key);
+        self.visited.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathSummary {
+    path_count: usize,
+    version_count: usize,
 }
 
 // ── Tree Renderer ──────────────────────────────────────────────────
@@ -842,80 +879,87 @@ pub fn render_stats(graph: &DepGraph) -> String {
 
 // ── Why Renderer ───────────────────────────────────────────────────
 
-pub fn render_why(
+pub fn write_why<W: Write>(
+    mut writer: W,
     graph: &DepGraph,
     target_name: &str,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
     patch_state: Option<&crate::patch_state::PatchState>,
-) -> String {
+) -> io::Result<()> {
     let target_display = sanitize_terminal_inline(target_name);
     let is_direct = graph
         .nodes
         .values()
         .any(|n| n.name == target_name && n.is_direct);
+    let summary = graph.path_summary(target_name);
 
-    let paths = graph.find_paths(target_name);
-
-    if paths.is_empty() {
-        return format!("{target_display} is not in your dependency tree.\n");
+    if summary.path_count == 0 {
+        writeln!(writer, "{target_display} is not in your dependency tree.")?;
+        return Ok(());
     }
-
-    let mut output = String::new();
 
     if is_direct {
-        output.push_str(&format!("{target_display} is a direct dependency.\n\n"));
+        writeln!(writer, "{target_display} is a direct dependency.\n")?;
     }
 
-    output.push_str(&format!(
-        "{target_display} is required by {} path(s):\n\n",
-        paths.len()
-    ));
+    writeln!(
+        writer,
+        "{target_display} is required by {} path(s):\n",
+        summary.path_count
+    )?;
 
-    for path in &paths {
-        let mut display = String::with_capacity(path.len().saturating_mul(24));
-        for (index, key) in path.iter().enumerate() {
-            if index > 0 {
-                display.push_str(" → ");
+    let mut write_error = None;
+    let rendered_path_count = graph.visit_paths(target_name, |path| {
+        let result = (|| -> io::Result<()> {
+            writer.write_all(b"  ")?;
+            for (index, key) in path.iter().enumerate() {
+                if index > 0 {
+                    writer.write_all(" → ".as_bytes())?;
+                }
+                if let Some(node) = graph.nodes.get(*key) {
+                    write!(
+                        writer,
+                        "{}@{}",
+                        sanitize_terminal_inline(&node.name),
+                        sanitize_terminal_inline(&node.version)
+                    )?;
+                } else {
+                    writer.write_all(sanitize_terminal_inline(key).as_bytes())?;
+                }
             }
-            if let Some(node) = graph.nodes.get(key) {
-                display.push_str(&terminal_package_label(&node.name, &node.version));
-            } else {
-                display.push_str(&sanitize_terminal_inline(key));
+            writeln!(writer)
+        })();
+
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                write_error = Some(error);
+                false
             }
         }
-        output.push_str(&format!("  {display}\n"));
+    });
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+    debug_assert_eq!(rendered_path_count, summary.path_count);
+
+    if summary.version_count > 1 {
+        writeln!(
+            writer,
+            "\n{} versions installed (duplicate)",
+            summary.version_count
+        )?;
     }
 
-    // Check for multiple versions
-    let versions: HashSet<&str> = paths
-        .iter()
-        .filter_map(|p| p.last())
-        .filter_map(|k| graph.nodes.get(k))
-        .filter(|n| n.name == target_name)
-        .map(|n| n.version.as_str())
-        .collect();
-
-    if versions.len() > 1 {
-        output.push_str(&format!(
-            "\n{} versions installed (duplicate)\n",
-            versions.len()
-        ));
-    }
-
-    // surface override hits that touched this
-    // package. We match by canonical name; multiple hits can be
-    // recorded for the same name (e.g., one Path selector + one Name
-    // fallback for a different parent), so iterate the full list.
     if let Some(state) = overrides_state {
-        let matching: Vec<_> = state
-            .applied
-            .iter()
-            .filter(|h| h.package == target_name)
-            .collect();
-        if !matching.is_empty() {
-            output.push('\n');
-            output.push_str("Overrides applied to this package:\n");
-            for hit in matching {
+        let has_matching_override = state.applied.iter().any(|hit| hit.package == target_name);
+        if has_matching_override {
+            writeln!(writer, "\nOverrides applied to this package:")?;
+            for hit in state
+                .applied
+                .iter()
+                .filter(|hit| hit.package == target_name)
+            {
                 let parent_suffix = match &hit.via_parent {
                     Some(parent) => {
                         format!(", reached through {}", sanitize_terminal_inline(parent))
@@ -926,36 +970,20 @@ pub fn render_why(
                 let to_version = sanitize_terminal_inline(&hit.to_version);
                 let source_display = hit.source_display();
                 let source_display = sanitize_terminal_inline(&source_display);
-                output.push_str(&format!(
-                    "  {} → {} (via {}{parent_suffix})\n",
+                writeln!(
+                    writer,
+                    "  {} → {} (via {}{parent_suffix})",
                     from_version, to_version, source_display,
-                ));
+                )?;
             }
         }
     }
 
-    // surface patch hits that touched this
-    // package. Same matching pattern as overrides above.
-    //
-    // The human render now surfaces the actual `original_integrity`
-    // SRI hash (truncated for display)
-    // instead of the literal placeholder "originalIntegrity recorded".
-    // The integrity comes from `AppliedPatchHit.original_integrity`,
-    // which the install pipeline plumbs through from
-    // `lpm.patchedDependencies[<key>].originalIntegrity`. State files
-    // written before this field existed have the field absent (Option::None);
-    // we degrade to the legacy placeholder in that case so old state
-    // files don't break the render.
     if let Some(state) = patch_state {
-        let matching: Vec<_> = state
-            .applied
-            .iter()
-            .filter(|h| h.name == target_name)
-            .collect();
-        if !matching.is_empty() {
-            output.push('\n');
-            output.push_str("Patches applied to this package:\n");
-            for hit in matching {
+        let has_matching_patch = state.applied.iter().any(|hit| hit.name == target_name);
+        if has_matching_patch {
+            writeln!(writer, "\nPatches applied to this package:")?;
+            for hit in state.applied.iter().filter(|hit| hit.name == target_name) {
                 let total = hit.files_modified + hit.files_added + hit.files_deleted;
                 let file_part = if total > 0 {
                     format!("{} file{}, ", total, if total == 1 { "" } else { "s" })
@@ -970,25 +998,31 @@ pub fn render_why(
                     None => "originalIntegrity recorded".to_string(),
                 };
                 let patch_path = sanitize_terminal_inline(&hit.patch_path);
-                output.push_str(&format!(
-                    "  {} ({}{})\n",
-                    patch_path, file_part, integrity_part,
-                ));
+                writeln!(writer, "  {} ({}{})", patch_path, file_part, integrity_part,)?;
             }
         }
     }
 
-    output
+    Ok(())
 }
 
-fn terminal_package_label(name: &str, version: &str) -> String {
-    let name = sanitize_terminal_inline(name);
-    let version = sanitize_terminal_inline(version);
-    let mut label = String::with_capacity(name.len() + 1 + version.len());
-    label.push_str(&name);
-    label.push('@');
-    label.push_str(&version);
-    label
+#[cfg(test)]
+pub(crate) fn render_why(
+    graph: &DepGraph,
+    target_name: &str,
+    overrides_state: Option<&crate::overrides_state::OverridesState>,
+    patch_state: Option<&crate::patch_state::PatchState>,
+) -> String {
+    let mut output = Vec::new();
+    write_why(
+        &mut output,
+        graph,
+        target_name,
+        overrides_state,
+        patch_state,
+    )
+    .expect("write graph why output");
+    String::from_utf8(output).expect("graph why output must be UTF-8")
 }
 
 /// Truncate an SRI integrity hash for compact human-readable display.
@@ -1018,33 +1052,14 @@ fn truncate_integrity(integrity: &str) -> String {
 
 // ── Why JSON ───────────────────────────────────────────────────────
 
-pub fn render_why_json(
+pub fn write_why_json<W: Write>(
+    mut writer: W,
     graph: &DepGraph,
     target_name: &str,
     overrides_state: Option<&crate::overrides_state::OverridesState>,
     patch_state: Option<&crate::patch_state::PatchState>,
-) -> Result<String, serde_json::Error> {
-    let paths = graph.find_paths(target_name);
-
-    let json_paths: Vec<Vec<String>> = paths
-        .iter()
-        .map(|p| {
-            p.iter()
-                .map(|k| {
-                    graph
-                        .nodes
-                        .get(k)
-                        .map_or_else(|| k.clone(), |n| format!("{}@{}", n.name, n.version))
-                })
-                .collect()
-        })
-        .collect();
-
-    // include override hits that touched this
-    // package. Empty array when no state file exists or no hits
-    // matched. The shape mirrors the install JSON output's
-    // `applied_overrides` field so agents can deserialize both with
-    // the same struct.
+) -> Result<(), serde_json::Error> {
+    let summary = graph.path_summary(target_name);
     let override_hits: Vec<serde_json::Value> = overrides_state
         .map(|s| {
             s.applied
@@ -1064,13 +1079,6 @@ pub fn render_why_json(
         })
         .unwrap_or_default();
 
-    // include patch hits that touched this
-    // package. Same shape as the install JSON output's `applied_patches`
-    // field, filtered to entries matching `target_name`. Empty array
-    // when no state file exists or no hits matched.
-    //
-    // Include `original_integrity` so agents can read the patch baseline directly from `lpm graph
-    // --why --json` without re-reading `package.json`.
     let patch_hits: Vec<serde_json::Value> = patch_state
         .map(|s| {
             s.applied
@@ -1093,15 +1101,123 @@ pub fn render_why_json(
         })
         .unwrap_or_default();
 
-    serde_json::to_string_pretty(&serde_json::json!({
-        "success": true,
-        "target": target_name,
-        "found": !paths.is_empty(),
-        "path_count": paths.len(),
-        "paths": json_paths,
-        "applied_overrides": override_hits,
-        "applied_patches": patch_hits,
-    }))
+    let output = WhyJson {
+        graph,
+        target_name,
+        summary,
+        override_hits: &override_hits,
+        patch_hits: &patch_hits,
+    };
+    serde_json::to_writer_pretty(&mut writer, &output)?;
+    writer.write_all(b"\n").map_err(serde_json::Error::io)
+}
+
+struct WhyJson<'graph, 'value> {
+    graph: &'graph DepGraph,
+    target_name: &'value str,
+    summary: PathSummary,
+    override_hits: &'value [serde_json::Value],
+    patch_hits: &'value [serde_json::Value],
+}
+
+// The explicit serializer keeps the JSON field names stable while `paths`
+// writes one visited path at a time instead of materializing the full array.
+impl Serialize for WhyJson<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut output = serializer.serialize_struct("WhyJson", 7)?;
+        output.serialize_field("success", &true)?;
+        output.serialize_field("target", self.target_name)?;
+        output.serialize_field("found", &(self.summary.path_count > 0))?;
+        output.serialize_field("path_count", &self.summary.path_count)?;
+        output.serialize_field(
+            "paths",
+            &WhyJsonPaths {
+                graph: self.graph,
+                target_name: self.target_name,
+                path_count: self.summary.path_count,
+            },
+        )?;
+        output.serialize_field("applied_overrides", self.override_hits)?;
+        output.serialize_field("applied_patches", self.patch_hits)?;
+        output.end()
+    }
+}
+
+struct WhyJsonPaths<'graph, 'value> {
+    graph: &'graph DepGraph,
+    target_name: &'value str,
+    path_count: usize,
+}
+
+impl Serialize for WhyJsonPaths<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut paths = serializer.serialize_seq(Some(self.path_count))?;
+        let mut serialization_error = None;
+        let serialized_path_count = self.graph.visit_paths(self.target_name, |path| {
+            match paths.serialize_element(&WhyJsonPath {
+                graph: self.graph,
+                path,
+            }) {
+                Ok(()) => true,
+                Err(error) => {
+                    serialization_error = Some(error);
+                    false
+                }
+            }
+        });
+
+        if let Some(error) = serialization_error {
+            return Err(error);
+        }
+        debug_assert_eq!(serialized_path_count, self.path_count);
+        paths.end()
+    }
+}
+
+struct WhyJsonPath<'graph, 'path> {
+    graph: &'graph DepGraph,
+    path: &'path [&'graph str],
+}
+
+impl Serialize for WhyJsonPath<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut path = serializer.serialize_seq(Some(self.path.len()))?;
+        for key in self.path {
+            if let Some(node) = self.graph.nodes.get(*key) {
+                path.serialize_element(&format!("{}@{}", node.name, node.version))?;
+            } else {
+                path.serialize_element(key)?;
+            }
+        }
+        path.end()
+    }
+}
+
+#[cfg(test)]
+fn render_why_json(
+    graph: &DepGraph,
+    target_name: &str,
+    overrides_state: Option<&crate::overrides_state::OverridesState>,
+    patch_state: Option<&crate::patch_state::PatchState>,
+) -> Result<String, serde_json::Error> {
+    let mut output = Vec::new();
+    write_why_json(
+        &mut output,
+        graph,
+        target_name,
+        overrides_state,
+        patch_state,
+    )?;
+    Ok(String::from_utf8(output).expect("graph why JSON must be UTF-8"))
 }
 
 // ── HTML Renderer ──────────────────────────────────────────────────
@@ -1278,6 +1394,29 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect()
+    }
+
+    fn package(name: &str, dependencies: &[&str]) -> LockedPackage {
+        LockedPackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            source: None,
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            os: Vec::new(),
+            cpu: Vec::new(),
+            libc: Vec::new(),
+            node_engine: None,
+            optional: false,
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_string())
+                .collect(),
+            alias_dependencies: Vec::new(),
+            peers: Vec::new(),
+            tarball: None,
+        }
     }
 
     #[test]
@@ -1702,12 +1841,11 @@ mod tests {
     // ── Exponential path blowup in dfs_paths ─────────────
 
     #[test]
-    fn find_paths_limits_to_max_paths() {
-        // Build a diamond-chain graph that would create 2^N paths without limit.
+    fn visit_paths_returns_every_path_with_storage_bounded_by_depth() {
         let mut packages = Vec::new();
         let mut root_deps = Vec::new();
 
-        let depth = 16;
+        let depth = 7;
         for i in 0..depth {
             let shared_key = format!("shared-{i}@1.0.0");
             let a_key = format!("branch-{i}-a@1.0.0");
@@ -1803,19 +1941,62 @@ mod tests {
             .collect();
         let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
 
-        let start = std::time::Instant::now();
-        let paths = graph.find_paths("target");
-        let elapsed = start.elapsed();
+        let mut callback_count = 0;
+        let mut max_path_len = 0;
+        let path_count = graph.visit_paths("target", |path| {
+            callback_count += 1;
+            max_path_len = max_path_len.max(path.len());
+            true
+        });
 
-        assert!(
-            paths.len() <= MAX_PATHS,
-            "should cap at MAX_PATHS, got {}",
-            paths.len()
+        assert_eq!(
+            (path_count, callback_count, max_path_len),
+            (1 << depth, 1 << depth, depth * 2 + 2)
         );
-        assert!(
-            elapsed.as_secs() < 2,
-            "should complete quickly, took {:?}",
-            elapsed
+    }
+
+    #[test]
+    fn visit_paths_terminates_cycles_without_losing_acyclic_paths() {
+        let packages = vec![
+            package("a", &["target@1.0.0", "b@1.0.0"]),
+            package("b", &["target@1.0.0", "a@1.0.0"]),
+            package("target", &[]),
+        ];
+        let direct = HashSet::from(["a".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        let path_count = graph.visit_paths("target", |_| true);
+
+        assert_eq!(path_count, 2);
+    }
+
+    #[test]
+    fn visit_paths_orders_target_versions_and_edges_lexically() {
+        let mut target_v2 = package("target", &[]);
+        target_v2.version = "2.0.0".into();
+        let packages = vec![
+            package("zeta", &["target@2.0.0", "target@1.0.0"]),
+            package("alpha", &["target@2.0.0", "target@1.0.0"]),
+            package("target", &[]),
+            target_v2,
+        ];
+        let direct = HashSet::from(["zeta".to_string(), "alpha".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        let mut paths = Vec::new();
+
+        graph.visit_paths("target", |path| {
+            paths.push(path.to_vec());
+            true
+        });
+
+        assert_eq!(
+            paths,
+            vec![
+                vec!["app@1.0.0", "alpha@1.0.0", "target@1.0.0"],
+                vec!["app@1.0.0", "zeta@1.0.0", "target@1.0.0"],
+                vec!["app@1.0.0", "alpha@1.0.0", "target@2.0.0"],
+                vec!["app@1.0.0", "zeta@1.0.0", "target@2.0.0"],
+            ]
         );
     }
 

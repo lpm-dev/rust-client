@@ -329,6 +329,60 @@ pub enum LpmError {
     )]
     SessionExpired,
 
+    #[error("unsupported authentication source for `{command}`: {auth_source}")]
+    #[diagnostic(
+        code(lpm::unsupported_auth_source),
+        help(
+            "Remove the external token before you retry. Run `lpm login` to use local secure storage. In CI, rotate the token in the dashboard and update the secret store."
+        )
+    )]
+    UnsupportedAuthSource {
+        command: &'static str,
+        auth_source: &'static str,
+    },
+
+    #[error("environment credential {expected} is not available for `{command}`")]
+    #[diagnostic(
+        code(lpm::credential_import_unavailable),
+        help(
+            "Set the required environment variable, or omit --save-env-token to use another available authentication source without saving it."
+        )
+    )]
+    CredentialImportUnavailable {
+        command: &'static str,
+        expected: &'static str,
+    },
+
+    #[error("cannot save {auth_source} for `{command}`")]
+    #[diagnostic(
+        code(lpm::credential_import_rejected),
+        help(
+            "CI_JOB_TOKEN is short-lived and job-scoped. Use it without saving, or set GITLAB_TOKEN when you need a persistent credential."
+        )
+    )]
+    CredentialImportRejected {
+        command: &'static str,
+        auth_source: &'static str,
+    },
+
+    #[error("one-time password required for `{command}`")]
+    #[diagnostic(
+        code(lpm::otp_required),
+        help(
+            "Pass a fresh 6-digit authenticator code with `--otp <CODE>`, or run the command in an interactive terminal."
+        )
+    )]
+    OtpRequired { command: &'static str },
+
+    #[error("invalid or expired one-time password for `{command}`")]
+    #[diagnostic(
+        code(lpm::otp_invalid),
+        help(
+            "Get a fresh 6-digit code from your authenticator. Then retry the command or pass the code with `--otp <CODE>`."
+        )
+    )]
+    OtpInvalid { command: &'static str },
+
     #[error("forbidden: {0}")]
     #[diagnostic(
         code(lpm::forbidden),
@@ -650,6 +704,11 @@ impl LpmError {
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
             LpmError::SessionExpired => "session_expired",
+            LpmError::UnsupportedAuthSource { .. } => "unsupported_auth_source",
+            LpmError::CredentialImportUnavailable { .. } => "credential_import_unavailable",
+            LpmError::CredentialImportRejected { .. } => "credential_import_rejected",
+            LpmError::OtpRequired { .. } => "otp_required",
+            LpmError::OtpInvalid { .. } => "otp_invalid",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
             LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
@@ -825,6 +884,24 @@ mod tests {
             },
             LpmError::AuthRequired,
             LpmError::SessionExpired,
+            LpmError::UnsupportedAuthSource {
+                command: "lpm token-rotate",
+                auth_source: "LPM_TOKEN",
+            },
+            LpmError::CredentialImportUnavailable {
+                command: "lpm login --github --save-env-token",
+                expected: "GITHUB_TOKEN",
+            },
+            LpmError::CredentialImportRejected {
+                command: "lpm login --gitlab --save-env-token",
+                auth_source: "CI_JOB_TOKEN",
+            },
+            LpmError::OtpRequired {
+                command: "lpm token-rotate",
+            },
+            LpmError::OtpInvalid {
+                command: "lpm token-rotate",
+            },
             LpmError::Forbidden("x".into()),
             LpmError::NpmFirewallBlocked {
                 package: "is-number@7.0.0".into(),
@@ -968,6 +1045,44 @@ mod tests {
     #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(
+            LpmError::OtpRequired {
+                command: "lpm token-rotate",
+            }
+            .error_code(),
+            "otp_required"
+        );
+        assert_eq!(
+            LpmError::OtpInvalid {
+                command: "lpm token-rotate",
+            }
+            .error_code(),
+            "otp_invalid"
+        );
+        assert_eq!(
+            LpmError::UnsupportedAuthSource {
+                command: "lpm token-rotate",
+                auth_source: "LPM_TOKEN",
+            }
+            .error_code(),
+            "unsupported_auth_source"
+        );
+        assert_eq!(
+            LpmError::CredentialImportUnavailable {
+                command: "lpm login --github --save-env-token",
+                expected: "GITHUB_TOKEN",
+            }
+            .error_code(),
+            "credential_import_unavailable"
+        );
+        assert_eq!(
+            LpmError::CredentialImportRejected {
+                command: "lpm login --gitlab --save-env-token",
+                auth_source: "CI_JOB_TOKEN",
+            }
+            .error_code(),
+            "credential_import_rejected"
+        );
         assert_eq!(LpmError::NotFound("x".into()).error_code(), "not_found");
         assert_eq!(
             LpmError::ArtifactUnavailable(Box::new(ArtifactUnavailableErrorContext {

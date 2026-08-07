@@ -18,6 +18,7 @@ mod support;
 use futures_util::SinkExt;
 use std::fs;
 use std::time::{Duration, Instant};
+use support::auth_state::{SessionSeed, seed_sessions};
 use support::{TempProject, lpm, lpm_spawnable};
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
@@ -78,11 +79,21 @@ fn dev_human_output_suppresses_nested_install_chatter_and_legacy_glyphs() {
     let project =
         TempProject::empty(r#"{"name":"dev-output","version":"1.0.0","dependencies":{}}"#);
     project.write_file(
+        "output-server.js",
+        r#"
+const net = require("net");
+const server = net.createServer();
+server.listen(Number(process.env.PORT), "127.0.0.1", () => {
+  setTimeout(() => server.close(() => process.exit(0)), 1200);
+});
+"#,
+    );
+    project.write_file(
         "lpm.json",
         r#"{
             "services": {
                 "web": {
-                    "command": "node -e \"setTimeout(() => process.exit(0), 300)\""
+                    "command": "node output-server.js"
                 }
             }
         }"#,
@@ -256,6 +267,36 @@ fn tunnel_start_without_auth_under_json_emits_error_envelope_on_stdout() {
     });
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[test]
+fn tunnel_bare_domain_error_suggests_the_supported_positional_domain() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: lpm_common::DEFAULT_REGISTRY_URL,
+            access_token: Some("workflow-access-token"),
+            refresh_token: Some("workflow-refresh-token"),
+            ..Default::default()
+        }],
+    );
+
+    let output = lpm(&project)
+        .args(["tunnel", "3000", "acme"])
+        .output()
+        .expect("failed to run lpm tunnel with a bare domain");
+
+    assert!(!output.status.success(), "a bare domain must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lpm tunnel start acme.lpm.llc"),
+        "the recovery hint must use the supported positional domain, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("--domain"),
+        "the recovery hint must not suggest the rejected --domain flag, got:\n{stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

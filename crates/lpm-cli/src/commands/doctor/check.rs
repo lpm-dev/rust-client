@@ -1,5 +1,27 @@
-use crate::doctor_catalog::{CheckEntry, Severity};
+use crate::doctor_catalog::{CheckEntry, DoctorFix, Severity};
 use crate::install_ui;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum FixTarget {
+    NodeSpec(String),
+    BunSpec(String),
+    TunnelDomain(String),
+    PluginName(String),
+}
+
+impl FixTarget {
+    fn supports(&self, action: DoctorFix) -> bool {
+        matches!(
+            (self, action),
+            (
+                Self::NodeSpec(_),
+                DoctorFix::InstallNodeSpec | DoctorFix::InstallNode22
+            ) | (Self::BunSpec(_), DoctorFix::InstallBunSpec)
+                | (Self::TunnelDomain(_), DoctorFix::ClaimTunnel)
+                | (Self::PluginName(_), DoctorFix::UpdatePlugin)
+        )
+    }
+}
 
 /// Check result emitted by `lpm doctor`.
 ///
@@ -19,6 +41,7 @@ pub(super) struct Check {
     pub(super) passed: bool,
     pub(super) detail: String,
     pub(super) severity: Severity,
+    pub(super) fix_target: Option<FixTarget>,
 }
 
 impl Check {
@@ -29,12 +52,7 @@ impl Check {
             entry.code,
             entry.possible_severities,
         );
-        Self {
-            entry,
-            passed: true,
-            detail: detail.into(),
-            severity: Severity::Pass,
-        }
+        Self::new(entry, true, detail, Severity::Pass, None)
     }
 
     pub(super) fn fail(entry: &'static CheckEntry, detail: &str) -> Self {
@@ -44,12 +62,7 @@ impl Check {
             entry.code,
             entry.possible_severities,
         );
-        Self {
-            entry,
-            passed: false,
-            detail: detail.into(),
-            severity: Severity::Fail,
-        }
+        Self::new(entry, false, detail, Severity::Fail, None)
     }
 
     pub(super) fn warn(entry: &'static CheckEntry, detail: &str) -> Self {
@@ -59,11 +72,50 @@ impl Check {
             entry.code,
             entry.possible_severities,
         );
+        Self::new(entry, true, detail, Severity::Warn, None)
+    }
+
+    pub(super) fn fail_with_fix_target(
+        entry: &'static CheckEntry,
+        detail: &str,
+        target: FixTarget,
+    ) -> Self {
+        debug_assert!(entry.permits(Severity::Fail));
+        Self::new(entry, false, detail, Severity::Fail, Some(target))
+    }
+
+    pub(super) fn warn_with_fix_target(
+        entry: &'static CheckEntry,
+        detail: &str,
+        target: FixTarget,
+    ) -> Self {
+        debug_assert!(entry.permits(Severity::Warn));
+        Self::new(entry, true, detail, Severity::Warn, Some(target))
+    }
+
+    fn new(
+        entry: &'static CheckEntry,
+        passed: bool,
+        detail: &str,
+        severity: Severity,
+        fix_target: Option<FixTarget>,
+    ) -> Self {
+        debug_assert!(
+            match (entry.auto_fix, fix_target.as_ref()) {
+                (Some(action), Some(target)) => target.supports(action),
+                (Some(action), None) => !action.requires_target(),
+                (None, None) => true,
+                (None, Some(_)) => false,
+            },
+            "catalog action and runtime target disagree for `{}`",
+            entry.code,
+        );
         Self {
             entry,
-            passed: true,
+            passed,
             detail: detail.into(),
-            severity: Severity::Warn,
+            severity,
+            fix_target,
         }
     }
 

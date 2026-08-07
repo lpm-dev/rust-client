@@ -58,6 +58,11 @@ impl TokenSource {
         matches!(self, TokenSource::StoredSession)
     }
 
+    /// Whether LPM can replace this credential in its local secure storage.
+    pub fn is_locally_managed(self) -> bool {
+        matches!(self, TokenSource::StoredSession | TokenSource::StoredLegacy)
+    }
+
     /// Short human-readable label for diagnostics.
     pub fn label(self) -> &'static str {
         match self {
@@ -1006,6 +1011,15 @@ mod tests {
         assert!(!TokenSource::EnvVar.is_session_backed());
         assert!(!TokenSource::StoredLegacy.is_session_backed());
         assert!(!TokenSource::CiToken.is_session_backed());
+    }
+
+    #[test]
+    fn locally_managed_table() {
+        assert!(TokenSource::StoredSession.is_locally_managed());
+        assert!(TokenSource::StoredLegacy.is_locally_managed());
+        assert!(!TokenSource::ExplicitFlag.is_locally_managed());
+        assert!(!TokenSource::EnvVar.is_locally_managed());
+        assert!(!TokenSource::CiToken.is_locally_managed());
     }
 
     /// Build a SessionManager directly from a `CachedToken` for tests

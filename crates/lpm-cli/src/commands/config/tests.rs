@@ -41,6 +41,50 @@ fn tmp_config() -> (TempDir, std::path::PathBuf, crate::test_env::ScopedEnv) {
 }
 
 #[test]
+fn generic_set_target_routes_supported_nested_sections() {
+    assert_eq!(
+        [
+            generic_set_target("sandbox"),
+            generic_set_target("sigstore"),
+            generic_set_target("firewall"),
+        ],
+        [
+            GenericSetTarget::Sandbox,
+            GenericSetTarget::Sigstore,
+            GenericSetTarget::Firewall,
+        ]
+    );
+}
+
+#[test]
+fn generic_set_target_rejects_nested_sections_without_scalar_meaning() {
+    assert_eq!(
+        [generic_set_target("policy"), generic_set_target("tunnel")],
+        [
+            GenericSetTarget::UnsupportedNested,
+            GenericSetTarget::UnsupportedNested,
+        ]
+    );
+}
+
+#[test]
+fn generic_set_target_rejects_dotted_paths_for_nested_sections() {
+    for key in [
+        "sandbox.mode",
+        "sigstore.verify",
+        "firewall.mode",
+        "policy.extensions",
+        "tunnel.relay-url",
+    ] {
+        assert_eq!(
+            generic_set_target(key),
+            GenericSetTarget::UnsupportedNested,
+            "{key} must not become a quoted top-level key"
+        );
+    }
+}
+
+#[test]
 fn firewall_wizard_copy_uses_npm_package_language() {
     assert_eq!(
         (

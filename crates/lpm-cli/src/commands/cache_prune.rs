@@ -175,22 +175,7 @@ pub struct PruneSummary {
 /// [`lpm store` — Locking model](https://cli.lpm.dev/docs/infra/store#locking-model).
 pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Result<(), LpmError> {
     let start = Instant::now();
-    let v2_store = V2Store::from_lpm_root_for_version(root, lpm_store::StoreVersion::V2);
-    let v3_store = V2Store::from_lpm_root_for_version(root, lpm_store::StoreVersion::V3);
-    let max_age = match flags.max_age {
-        Some(s) => Some(parse_duration(s)?),
-        None => None,
-    };
-
-    let summary = if flags.apply {
-        with_exclusive_lock(root.store_lock(), || {
-            run_all_virtual_stores_locked(root, &v2_store, &v3_store, &flags, max_age)
-        })?
-    } else {
-        with_shared_lock(root.store_lock(), || {
-            run_all_virtual_stores_locked(root, &v2_store, &v3_store, &flags, max_age)
-        })?
-    };
+    let summary = execute_prune(root, &flags)?;
 
     if json_output {
         emit_json(&summary);
@@ -208,6 +193,41 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
     }
 
     Ok(())
+}
+
+/// Apply the same locked, safety-checked prune used by
+/// `lpm cache prune --apply` without emitting a nested command response.
+pub(crate) fn apply_for_doctor(root: &LpmRoot) -> Result<PruneSummary, LpmError> {
+    let flags = PruneFlags {
+        apply: true,
+        ..PruneFlags::default()
+    };
+    let summary = execute_prune(root, &flags)?;
+    if prune_had_errors(&summary) {
+        return Err(LpmError::Store(
+            "cache prune could not complete every requested cleanup step".into(),
+        ));
+    }
+    Ok(summary)
+}
+
+fn execute_prune(root: &LpmRoot, flags: &PruneFlags<'_>) -> Result<PruneSummary, LpmError> {
+    let v2_store = V2Store::from_lpm_root_for_version(root, lpm_store::StoreVersion::V2);
+    let v3_store = V2Store::from_lpm_root_for_version(root, lpm_store::StoreVersion::V3);
+    let max_age = match flags.max_age {
+        Some(s) => Some(parse_duration(s)?),
+        None => None,
+    };
+
+    if flags.apply {
+        with_exclusive_lock(root.store_lock(), || {
+            run_all_virtual_stores_locked(root, &v2_store, &v3_store, flags, max_age)
+        })
+    } else {
+        with_shared_lock(root.store_lock(), || {
+            run_all_virtual_stores_locked(root, &v2_store, &v3_store, flags, max_age)
+        })
+    }
 }
 
 fn run_all_virtual_stores_locked(

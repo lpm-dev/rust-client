@@ -1,0 +1,10 @@
+---
+source: tests/workflows/tests/setup_ci.rs
+expression: envelope
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error": "script error: `--env` does not apply to `lpm setup ci npmrc`. Use `--env` only with github-actions or gitlab.",
+  "error_code": "script"
+}

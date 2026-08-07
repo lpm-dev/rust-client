@@ -12,7 +12,10 @@ use super::args::{
     lifecycle as lifecycle_args, network as network_args, registry as registry_args,
     release as release_args, security as security_args,
 };
-use super::format::{argv_has_global_registry_flag, exit_with_lpm_error, parse_cli_or_exit};
+use super::format::{
+    argv_has_global_registry_flag, argv_has_setup_ci_registry_flag, exit_with_lpm_error,
+    parse_cli_or_exit,
+};
 use super::helpers::{
     argv_requests_top_level_version, build_install_global_overrides_with_excludes,
     command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
@@ -289,6 +292,14 @@ async fn async_main() -> Result<()> {
         .registry
         .as_deref()
         .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+
+    let setup_ci_target = match preflight_setup_ci(
+        &command,
+        argv_has_setup_ci_registry_flag(std::env::args_os()),
+    ) {
+        Ok(target) => target,
+        Err(error) => exit_with_lpm_error(&error, cli.json, registry_url),
+    };
 
     if let Err(error) = provenance_fetch::EnforceMode::validate_from_env() {
         exit_with_lpm_error(&error, cli.json, registry_url);
@@ -1514,13 +1525,14 @@ async fn async_main() -> Result<()> {
                 gitlab,
                 login_registry,
                 token,
+                save_env_token,
             } = args;
             if npm {
                 commands::third_party_login::run_npm(token, cli.json).await
             } else if github {
-                commands::third_party_login::run_github(token, cli.json)
+                commands::third_party_login::run_github(token, save_env_token, cli.json)
             } else if gitlab {
-                commands::third_party_login::run_gitlab(token, cli.json)
+                commands::third_party_login::run_gitlab(token, save_env_token, cli.json)
             } else if let Some(url) = login_registry.as_deref() {
                 commands::third_party_login::run_custom(url, token, cli.json)
             } else {
@@ -1572,34 +1584,27 @@ async fn async_main() -> Result<()> {
         }
         Commands::Setup(args) => match args.action {
             SetupAction::Ci {
-                target,
+                target: _,
                 env,
                 registry: setup_registry,
                 oidc,
             } => {
+                let target = setup_ci_target.expect("setup CI command must pass preflight");
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                let target = target.as_deref().ok_or_else(|| {
-                    lpm_common::LpmError::Script(
-                        "usage: lpm setup ci <target>. Available: npmrc, github-actions, gitlab"
-                            .into(),
-                    )
-                })?;
                 match target {
-                    "npmrc" => {
+                    commands::setup::CiSetupTarget::Npmrc => {
                         let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
                         commands::setup::run(&client, effective_registry, &cwd, cli.json, oidc).await
                     }
-                    "github-actions" | "github" | "gha" => {
-                        commands::setup::run_ci_platform(target, &cwd, &env)?;
+                    commands::setup::CiSetupTarget::Workflow(platform) => {
+                        commands::setup::run_ci_platform(
+                            platform,
+                            &cwd,
+                            env.as_deref()
+                                .unwrap_or(commands::setup::DEFAULT_CI_ENVIRONMENT),
+                        );
                         Ok(())
                     }
-                    "gitlab" | "gitlab-ci" => {
-                        commands::setup::run_ci_platform(target, &cwd, &env)?;
-                        Ok(())
-                    }
-                    other => Err(lpm_common::LpmError::Script(format!(
-                        "unknown CI setup target: '{other}'. Available: npmrc, github-actions, gitlab"
-                    ))),
                 }
             }
             SetupAction::Local { days } => {
@@ -1607,7 +1612,9 @@ async fn async_main() -> Result<()> {
                 commands::npmrc::run(&client, &cwd, registry_url, days, cli.json).await
             }
         },
-        Commands::TokenRotate => commands::token::run_rotate(&client, registry_url, cli.json).await,
+        Commands::TokenRotate(args) => {
+            commands::token::run_rotate(&client, registry_url, args.otp, cli.json).await
+        }
         Commands::Outdated(args) => {
             let lifecycle_args::OutdatedArgs {
                 registry_only,
@@ -1718,12 +1725,8 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Store(args) => {
-            let lifecycle_args::StoreArgs {
-                action,
-                deep,
-                fix,
-            } = args;
-            commands::store::run(&action, deep, fix, cli.json).await
+            let lifecycle_args::StoreArgs { action } = args;
+            commands::store::run(action, cli.json).await
         }
         Commands::Catalog(args) => {
             let lifecycle_args::CatalogArgs {
@@ -3118,6 +3121,34 @@ async fn async_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn preflight_setup_ci(
+    command: &Commands,
+    registry_flag_requested: bool,
+) -> std::result::Result<Option<commands::setup::CiSetupTarget>, lpm_common::LpmError> {
+    let Commands::Setup(args) = command else {
+        return Ok(None);
+    };
+    let SetupAction::Ci {
+        target,
+        env,
+        registry: _,
+        oidc,
+    } = &args.action
+    else {
+        return Ok(None);
+    };
+
+    let raw_target = target.as_deref().ok_or_else(|| {
+        lpm_common::LpmError::Script(
+            "usage: lpm setup ci <target>. Available: npmrc, github-actions, gitlab".into(),
+        )
+    })?;
+    let target = commands::setup::CiSetupTarget::parse(raw_target)?;
+    commands::setup::validate_ci_flags(target, env.is_some(), registry_flag_requested, *oidc)?;
+
+    Ok(Some(target))
 }
 
 fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSelection {

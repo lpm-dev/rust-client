@@ -900,12 +900,19 @@ pub async fn run(
             // the entire time — no exit/re-enter cycle.
             let project_dir_owned = project_dir.to_path_buf();
             let services_owned = services.clone();
+            let dashboard_failure_tx = dashboard_event_tx.clone();
             let orch_handle = std::thread::spawn(move || {
-                let _ = lpm_runner::orchestrator::run_services(
+                let result = lpm_runner::orchestrator::run_services(
                     &project_dir_owned,
                     &services_owned,
                     options,
                 );
+                if let Err(error) = &result
+                    && let Some(tx) = dashboard_failure_tx
+                {
+                    let _ = tx.send(lpm_dashboard::DashboardEvent::FatalError(error.to_string()));
+                }
+                result
             });
 
             // Dashboard → orchestrator command bridge
@@ -952,39 +959,33 @@ pub async fn run(
                 })
                 .collect();
 
-            // Helper: signal the orchestrator to shut down gracefully and wait for
-            // it to clean up child processes (reverse-topological SIGTERM, then SIGKILL).
-            // Without this, the process would exit immediately and the OS would kill
-            // children ungracefully — skipping the orchestrator's ordered shutdown.
+            // Signal the orchestrator to shut down and preserve its result after
+            // the dashboard exits.
             let graceful_shutdown = move || {
                 let _ = orch_cmd_tx_for_shutdown
                     .send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
-                // Wait for orchestrator to finish cleanup (bounded to avoid hanging)
-                let _ = orch_handle.join();
+                orch_handle.join().unwrap_or_else(|_| {
+                    Err(LpmError::Script(
+                        "service orchestrator panicked".to_string(),
+                    ))
+                })
             };
 
             let inspector_url_for_dashboard = inspector_handle.as_ref().map(|h| h.url.clone());
 
-            let result = if let Some(rx) = dashboard_event_rx {
-                match lpm_dashboard::run_dashboard(
+            let dashboard_result = if let Some(rx) = dashboard_event_rx {
+                lpm_dashboard::run_dashboard(
                     dashboard_services,
                     rx,
                     Some(dash_cmd_tx),
                     inspector_url_for_dashboard,
-                ) {
-                    Ok(_) => {
-                        graceful_shutdown();
-                        Ok(())
-                    }
-                    Err(e) => {
-                        graceful_shutdown();
-                        Err(LpmError::Script(e.to_string()))
-                    }
-                }
+                )
+                .map(|_| ())
+                .map_err(|error| LpmError::Script(error.to_string()))
             } else {
-                graceful_shutdown();
                 Ok(())
             };
+            let result = graceful_shutdown().and(dashboard_result);
 
             let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
             let result = release_proxy_lease_after(result, &proxy_lease).await;
@@ -2488,6 +2489,9 @@ fn convert_service_status(
             lpm_dashboard::ServiceStatus::WaitingForDep(dep.clone())
         }
         lpm_runner::orchestrator::ServiceStatus::Ready => lpm_dashboard::ServiceStatus::Ready,
+        lpm_runner::orchestrator::ServiceStatus::ReadinessFailed(error) => {
+            lpm_dashboard::ServiceStatus::ReadinessFailed(error.clone())
+        }
         lpm_runner::orchestrator::ServiceStatus::Crashed(code) => {
             lpm_dashboard::ServiceStatus::Crashed(format!("exit code {code}"))
         }
@@ -3364,6 +3368,17 @@ mod tests {
     fn convert_ready() {
         let result = convert_service_status(&lpm_runner::orchestrator::ServiceStatus::Ready);
         assert_eq!(result, lpm_dashboard::ServiceStatus::Ready);
+    }
+
+    #[test]
+    fn convert_readiness_failure() {
+        let result = convert_service_status(
+            &lpm_runner::orchestrator::ServiceStatus::ReadinessFailed("timed out".to_string()),
+        );
+        assert_eq!(
+            result,
+            lpm_dashboard::ServiceStatus::ReadinessFailed("timed out".to_string())
+        );
     }
 
     #[test]

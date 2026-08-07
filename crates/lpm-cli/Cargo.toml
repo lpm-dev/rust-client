@@ -89,6 +89,7 @@ base64 = { workspace = true }
 crypto_box = { workspace = true }
 hex = { workspace = true }
 subtle = { workspace = true }
+secrecy = { workspace = true }
 chrono = { workspace = true }
 
 # Config

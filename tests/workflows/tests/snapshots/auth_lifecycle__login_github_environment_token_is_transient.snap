@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/auth_lifecycle.rs
+expression: json
+---
+{
+  "success": true,
+  "registry": "github.com",
+  "source": "env:GITHUB_TOKEN",
+  "stored": false,
+  "storage_backend": null,
+  "storage_degraded": false
+}

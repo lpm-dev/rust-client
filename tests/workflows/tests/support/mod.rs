@@ -47,6 +47,7 @@ pub mod verdaccio;
 pub mod verdaccio_proxy;
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -138,6 +139,40 @@ impl TempProject {
         std::fs::write(&path, content)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     }
+
+    /// Write a credential-bearing file with owner-only permissions on Unix.
+    pub fn write_private_file(&self, rel_path: &str, content: &str) {
+        let path = self.dir.path().join(rel_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        write_private_file(&path, content);
+    }
+}
+
+fn write_private_file(path: &Path, content: impl AsRef<[u8]>) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .unwrap_or_else(|e| panic!("failed to open {}: {e}", path.display()));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| panic!("failed to restrict {}: {e}", path.display()));
+    }
+
+    file.write_all(content.as_ref())
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
 }
 
 /// Build a two-member workspace whose root lockfile stores disjoint importer
