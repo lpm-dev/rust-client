@@ -48,6 +48,17 @@ mod tty {
         }
     }
 
+    fn terminal_echo_is_disabled(file: &File) -> bool {
+        let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `file` owns a valid PTY descriptor and `tcgetattr` initializes
+        // `attributes` when it returns zero.
+        let result = unsafe { libc::tcgetattr(file.as_raw_fd(), attributes.as_mut_ptr()) };
+        assert_eq!(result, 0, "read PTY terminal attributes");
+        // SAFETY: The successful `tcgetattr` call initialized `attributes`.
+        let attributes = unsafe { attributes.assume_init() };
+        attributes.c_lflag & libc::ECHO == 0
+    }
+
     fn run_token_rotate_in_pty(
         project: &std::path::Path,
         lpm_home: &std::path::Path,
@@ -105,6 +116,7 @@ mod tty {
         let mut buffer = [0_u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut response_sent = false;
+        let mut prompt_seen = false;
         let mut prompt_checked_through = 0;
         let status = loop {
             loop {
@@ -117,19 +129,23 @@ mod tty {
                 }
             }
 
-            if !response_sent && prompt_checked_through != transcript.len() {
+            if !prompt_seen && prompt_checked_through != transcript.len() {
                 let scan_start = prompt_checked_through.saturating_sub(prompt.len() - 1);
                 prompt_checked_through = transcript.len();
                 if transcript[scan_start..]
                     .windows(prompt.len())
                     .any(|window| window == prompt)
                 {
-                    master
-                        .write_all(format!("{OTP}\r").as_bytes())
-                        .expect("write OTP response");
-                    master.flush().expect("flush OTP response");
-                    response_sent = true;
+                    prompt_seen = true;
                 }
+            }
+
+            if prompt_seen && !response_sent && terminal_echo_is_disabled(&master) {
+                master
+                    .write_all(format!("{OTP}\r").as_bytes())
+                    .expect("write OTP response");
+                master.flush().expect("flush OTP response");
+                response_sent = true;
             }
 
             if let Some(status) = child.try_wait().expect("poll token rotation") {
