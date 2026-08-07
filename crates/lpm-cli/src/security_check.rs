@@ -255,17 +255,24 @@ fn format_human_security_summary(
             finding_count,
             "finding",
         )));
-        append_issue_tiers(
-            &mut lines,
-            &actionable,
-            &[Severity::Critical, Severity::High, Severity::Medium],
-        );
+        if verbose {
+            append_issue_tiers(
+                &mut lines,
+                &actionable,
+                &[Severity::Critical, Severity::High, Severity::Medium],
+            );
+        } else {
+            append_severity_rollup(&mut lines, &actionable);
+            append_issue_tiers(&mut lines, &actionable, &[Severity::Critical]);
+        }
         lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
             "  {} Run {} for full details.",
             install_ui::dim("hint"),
             install_ui::yellow("lpm audit"),
         )));
-        append_query_hint(&mut lines, &actionable, "findings");
+        if verbose {
+            append_query_hint(&mut lines, &actionable, "findings");
+        }
     }
 
     if !metadata.is_empty() {
@@ -305,6 +312,31 @@ fn summary_heading(
 
 fn issue_count(issues: &[&TagIssue]) -> usize {
     issues.iter().map(|issue| issue.packages.len()).sum()
+}
+
+fn append_severity_rollup(lines: &mut Vec<SecuritySummaryLine>, issues: &[&TagIssue]) {
+    let count = |severity| {
+        issues
+            .iter()
+            .filter(|issue| issue.severity == severity)
+            .map(|issue| issue.packages.len())
+            .sum::<usize>()
+    };
+    let critical = count(Severity::Critical);
+    let high = count(Severity::High);
+    let medium = count(Severity::Medium);
+
+    lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
+        "  {} {} {} {} {} {} {} {}",
+        install_ui::status_ok(&critical.to_string()),
+        format_security_severity(Severity::Critical),
+        install_ui::dim("·"),
+        install_ui::status_ok(&high.to_string()),
+        format_security_severity(Severity::High),
+        install_ui::dim("·"),
+        install_ui::status_ok(&medium.to_string()),
+        format_security_severity(Severity::Medium),
+    )));
 }
 
 fn append_issue_tiers(
@@ -842,25 +874,42 @@ mod tests {
     }
 
     #[test]
-    fn human_security_summary_uses_slim_lines_with_expected_content() {
+    fn human_security_summary_rolls_up_severities_and_details_only_critical_by_default() {
         let issues = vec![
             TagIssue {
-                tag_label: "lifecycle script",
+                tag_label: "obfuscated code",
                 severity: Severity::Critical,
                 install_visibility: InstallVisibility::Default,
-                selector: Some(":scripts"),
-                packages: vec!["evil@1.0.0".to_string(), "risky@2.0.0".to_string()],
+                selector: Some(":obfuscated"),
+                packages: vec!["evil@1.0.0".to_string()],
+            },
+            TagIssue {
+                tag_label: "shell execution",
+                severity: Severity::High,
+                install_visibility: InstallVisibility::Default,
+                selector: Some(":shell"),
+                packages: vec![
+                    "runner-a@1.0.0".to_string(),
+                    "runner-b@1.0.0".to_string(),
+                    "runner-c@1.0.0".to_string(),
+                ],
             },
             TagIssue {
                 tag_label: "network access",
                 severity: Severity::Medium,
                 install_visibility: InstallVisibility::Default,
                 selector: Some(":network"),
-                packages: vec!["net@3.0.0".to_string()],
+                packages: vec![
+                    "net-a@1.0.0".to_string(),
+                    "net-b@1.0.0".to_string(),
+                    "net-c@1.0.0".to_string(),
+                    "net-d@1.0.0".to_string(),
+                    "net-e@1.0.0".to_string(),
+                ],
             },
         ];
 
-        let lines = format_human_security_summary(3, &issues, false);
+        let lines = format_human_security_summary(9, &issues, false);
         let joined = lines
             .iter()
             .map(|line| match line {
@@ -877,21 +926,35 @@ mod tests {
             "security summary headline should render through install_ui::warn"
         );
         assert!(
-            joined.contains("Security summary · 3 packages · 3 findings"),
+            joined.contains("Security summary · 9 packages · 9 findings"),
             "summary headline missing: {joined}"
         );
         assert!(
-            joined.contains("2 lifecycle script") && joined.contains("→ evil@1.0.0, risky@2.0.0"),
+            joined.contains("1 Critical")
+                && joined.contains("3 High")
+                && joined.contains("5 Medium"),
+            "severity roll-up missing: {joined}"
+        );
+        assert!(
+            joined.contains("1 obfuscated code") && joined.contains("→ evil@1.0.0"),
             "critical issue detail missing: {joined}"
+        );
+        assert!(
+            !joined.contains("shell execution") && !joined.contains("network access"),
+            "normal output must hide High and Medium details: {joined}"
         );
         assert!(
             joined.contains("Run lpm audit for full details."),
             "hint detail missing: {joined}"
         );
+        assert!(
+            !joined.contains("lpm query"),
+            "normal output should use one full-details command: {joined}"
+        );
     }
 
     #[test]
-    fn human_security_summary_keeps_actionable_tiers_without_verbose_output() {
+    fn human_security_summary_verbose_output_shows_all_actionable_tiers() {
         let issues = vec![
             TagIssue {
                 tag_label: "network access",
@@ -909,7 +972,7 @@ mod tests {
             },
         ];
 
-        let lines = format_human_security_summary(2, &issues, false);
+        let lines = format_human_security_summary(2, &issues, true);
         let joined = lines
             .iter()
             .map(|line| match line {
@@ -928,6 +991,10 @@ mod tests {
         assert!(
             joined.contains("network access"),
             "medium-severity issue should stay visible: {joined}"
+        );
+        assert!(
+            joined.contains("lpm query \":network,:scripts\""),
+            "verbose output should include exact selectors: {joined}"
         );
     }
 

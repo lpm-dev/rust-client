@@ -5228,8 +5228,12 @@ async fn install_disabled_lpm_insights_skips_enrichment_request_but_keeps_local_
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("eval()"),
-        "local behavioral findings must remain in the install summary; stderr:\n{stderr}"
+        stderr.contains("Security summary") && stderr.contains("1 High"),
+        "local behavioral findings must remain in the compact install summary; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("eval()"),
+        "normal install must hide High finding details; stderr:\n{stderr}"
     );
 
     let batch_requests = mock
@@ -5927,7 +5931,7 @@ async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date()
 }
 
 #[tokio::test]
-async fn npm_only_install_reports_cached_behavioral_security_findings() {
+async fn npm_only_install_compacts_noncritical_security_findings_by_default() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball_with_files(
         "local-security-finding",
@@ -5968,8 +5972,64 @@ async fn npm_only_install_reports_cached_behavioral_security_findings() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        combined.contains("Security summary") && combined.to_lowercase().contains("eval"),
-        "local cached analysis must be summarized without an @lpm.dev dependency:\n{combined}",
+        combined.contains("Security summary")
+            && combined.contains("0 Critical")
+            && combined.contains("1 High")
+            && combined.contains("1 Medium")
+            && combined.contains("Run lpm audit for full details."),
+        "local cached analysis must use a severity roll-up without an @lpm.dev dependency:\n{combined}",
+    );
+    assert!(
+        !combined.contains("eval()")
+            && !combined.contains("no license")
+            && !combined.contains("lpm query"),
+        "normal install must hide noncritical finding details:\n{combined}",
+    );
+}
+
+#[tokio::test]
+async fn verbose_npm_only_install_reports_noncritical_finding_details() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "verbose-local-security-finding",
+        "1.0.0",
+        &[(
+            "danger.js",
+            b"module.exports = eval(process.env.LPM_INPUT);\n",
+        )],
+    );
+    mock.with_package("verbose-local-security-finding", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "verbose-npm-only-security-summary",
+  "version": "1.0.0",
+  "dependencies": {
+    "verbose-local-security-finding": "1.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("run verbose npm-only install with behavioral findings");
+    assert!(
+        output.status.success(),
+        "verbose npm-only install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("eval()")
+            && combined.contains("no license")
+            && combined.contains("lpm query \":eval,:no-license\""),
+        "verbose install must show noncritical finding details and selectors:\n{combined}",
     );
 }
 
