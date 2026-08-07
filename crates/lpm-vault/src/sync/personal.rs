@@ -23,6 +23,7 @@ use crate::crypto;
 #[serde(rename_all = "camelCase")]
 pub struct PushResponse {
     pub version: Option<i32>,
+    pub content_key_version: Option<i32>,
     pub status: Option<String>,
     pub error: Option<String>,
     pub code: Option<String>,
@@ -968,6 +969,7 @@ mod tests {
     fn format_push_error_appends_hint_when_present() {
         let response = PushResponse {
             version: None,
+            content_key_version: None,
             status: None,
             error: Some(
                 "Vault exists on the server. Pull first then push with the synced version, or pass --force to overwrite.".into(),
@@ -989,6 +991,7 @@ mod tests {
     fn format_push_error_falls_back_to_error_only_when_hint_absent() {
         let response = PushResponse {
             version: None,
+            content_key_version: None,
             status: None,
             error: Some("Version conflict".into()),
             code: Some("vault_version_conflict".into()),
@@ -1004,6 +1007,7 @@ mod tests {
     fn format_push_error_falls_back_to_status_when_error_field_missing() {
         let response = PushResponse {
             version: None,
+            content_key_version: None,
             status: None,
             error: None,
             code: None,

@@ -21,7 +21,7 @@ mod step_up;
 
 pub use audit::{AuditEntry, AuditResponse, get_audit_log};
 pub use ci::{CiPullResponse, ci_pull, upload_escrow_key};
-pub use org::{list_org_vaults, pull_org, push_org, push_org_with_keys};
+pub use org::{PulledOrgVault, list_org_vaults, pull_org, push_org_with_keys};
 pub use pairing::{PairingSession, approve_pairing, get_pairing_session, unpair_all};
 pub use personal::{
     ListVaultsResponse, PullResponse, PushMetadata, PushResponse, RemoteVault, list_remote, pull,
@@ -30,7 +30,7 @@ pub use personal::{
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, PendingPublicKey, PublicKeyRegistrationState,
     UploadPublicKeyResponse, classify_public_key_state, create_pending_x25519_keypair,
-    discard_pending_x25519_keypair, ensure_public_key, get_my_public_key, get_org_member_keys,
+    discard_pending_x25519_keypair, get_my_public_key, get_org_member_keys,
     promote_pending_x25519_keypair, read_pending_x25519_keypair, upload_public_key,
 };
 pub use step_up::{

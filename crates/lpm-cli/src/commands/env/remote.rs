@@ -80,9 +80,8 @@ pub(super) async fn env_share(
 
     // Classify the sharing-key state before any wrap work. This
     // refuses the silent-overwrite path on RotationRequired and
-    // prompts for step-up reauth on NeedsInitialSet, instead of
-    // letting `push_org_with_keys`'s internal `ensure_public_key`
-    // silently upload over whatever was on the server.
+    // prompts for step-up reauth on NeedsInitialSet before the
+    // organization payload is encrypted for the current member set.
     super::rotation::ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "share")
         .await?;
 

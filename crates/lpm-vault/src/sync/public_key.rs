@@ -24,6 +24,10 @@ pub struct UploadPublicKeyResponse {
     pub invalidated_wrapped_keys: Option<u32>,
     /// Count of distinct orgs whose wrapped-key rows were invalidated.
     pub affected_orgs: Option<u32>,
+    /// Monotonic revision of the registered sharing key.
+    pub public_key_version: Option<i32>,
+    /// Full SHA-256 fingerprint used by organization wrapped-key bindings.
+    pub public_key_fingerprint: Option<String>,
 }
 
 /// Upload the user's X25519 public key to the server.
@@ -204,10 +208,7 @@ pub async fn classify_public_key_state(
     }
 }
 
-/// Load the local X25519 keypair, creating one if absent. Shared by
-/// `ensure_public_key` and [`classify_public_key_state`] so the two
-/// entry points agree on storage location, generation policy, and
-/// canonical Base64 encoding.
+/// Load the local X25519 keypair, creating one if absent.
 fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
     #[cfg(target_os = "macos")]
     let (private_key, public) = if should_use_file_backed_x25519_keypair(
@@ -390,13 +391,22 @@ pub fn discard_pending_x25519_keypair() -> Result<(), String> {
 }
 
 /// Org member public key info.
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberPublicKey {
     pub user_id: String,
     pub role: String,
     pub public_key: Option<String>,
+    pub public_key_version: Option<i32>,
+    pub public_key_fingerprint: Option<String>,
     pub has_public_key: bool,
+}
+
+/// Returns the lowercase SHA-256 fingerprint for a canonical X25519 public key.
+pub fn public_key_fingerprint(public_key: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(public_key))
 }
 
 /// Fetch all org members' public keys.
@@ -484,25 +494,6 @@ fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), St
     }
 
     Ok((private_key, public_key))
-}
-
-/// Ensure the user's public key is registered on the server.
-///
-/// Legacy entry point retained for callers that still use implicit
-/// registration instead of [`classify_public_key_state`] plus
-/// proof-aware [`upload_public_key`]. Against hardened servers, the
-/// no-proof upload here surfaces as a server-side `step_up_required`
-/// error for the `NeedsInitialSet` and `RotationRequired` cohorts,
-/// which is the correct failure mode; silent overwrite is the security
-/// bug the explicit classification flow prevents.
-pub async fn ensure_public_key(registry_url: &str, auth_token: &str) -> Result<[u8; 32], String> {
-    let local = load_local_public_key_state()?;
-    let server_key = get_my_public_key(registry_url, auth_token).await?;
-    if server_key.as_deref() != Some(&local.public_key_b64) {
-        upload_public_key(registry_url, auth_token, &local.public_key_b64, None).await?;
-    }
-
-    Ok(local.private_key)
 }
 
 #[cfg(test)]
