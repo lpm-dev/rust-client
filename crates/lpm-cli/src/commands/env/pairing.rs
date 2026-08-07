@@ -62,11 +62,16 @@ struct PairConfirmationView {
 }
 
 impl PairConfirmationView {
-    fn new(code: &str, browser_pub_b64: &str, session: &lpm_vault::sync::PairingSession) -> Self {
+    fn new(
+        code: &str,
+        browser_pub_b64: &str,
+        match_number: String,
+        session: &lpm_vault::sync::PairingSession,
+    ) -> Self {
         Self {
             code: code.to_string(),
             fingerprint: lpm_vault::crypto::browser_key_fingerprint(browser_pub_b64),
-            match_number: lpm_vault::crypto::pairing_match_number(code, browser_pub_b64),
+            match_number,
             device_label: session
                 .device_label
                 .as_deref()
@@ -99,7 +104,10 @@ fn print_pair_confirmation(view: &PairConfirmationView) {
     println!();
     println!(
         "{}",
-        install_ui::terminal_line!("  {}", install_ui::bold("Pair this browser to your vault?"))
+        install_ui::terminal_line!(
+            "  {}",
+            install_ui::bold("Pair this browser for env access?")
+        )
     );
     println!();
     println!(
@@ -255,37 +263,69 @@ pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), Lpm
         .clone()
         .ok_or_else(|| LpmError::Script("server did not return browser public key".into()))?;
 
-    let view = PairConfirmationView::new(&parsed.code, &browser_pub_b64, &session);
+    let protocol_version = session.protocol_version.unwrap_or(1);
+    match protocol_version {
+        1 => {
+            let view = PairConfirmationView::new(
+                &parsed.code,
+                &browser_pub_b64,
+                lpm_vault::crypto::legacy_pairing_match_number(&parsed.code, &browser_pub_b64),
+                &session,
+            );
+            print_pair_confirmation(&view);
+            confirm_pairing(&parsed)?;
 
-    // Render the binding info before any decision branch — both the
-    // interactive prompt and the --yes audit trail get the same
-    // attribution lines in the same shape.
-    print_pair_confirmation(&view);
-
-    if parsed.yes {
-        output::warn(
-            "--yes: skipped browser-identity verification. \
-             Only safe when you typed this command yourself from a trusted dashboard.",
-        );
-    } else {
-        prompt_pair_confirmation()?;
-    }
-
-    let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
-
-    let (encrypted_wrapping_key, ephemeral_public_key) =
-        lpm_vault::crypto::p256_pair_wrap_key(&wrapping_key, &browser_pub_b64)
+            let wrapping_key =
+                lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
+            let (encrypted, ephemeral) =
+                lpm_vault::crypto::p256_pair_wrap_key(&wrapping_key, &browser_pub_b64)
+                    .map_err(LpmError::Script)?;
+            lpm_vault::sync::approve_pairing_legacy(
+                &registry_url,
+                &auth_token,
+                &parsed.code,
+                &encrypted,
+                &ephemeral,
+            )
+            .await
             .map_err(LpmError::Script)?;
+        }
+        2 => {
+            let exchange = lpm_vault::crypto::P256PairingKeyExchange::new(&browser_pub_b64)
+                .map_err(LpmError::Script)?;
+            let ephemeral = exchange.ephemeral_public_key_b64().to_string();
+            lpm_vault::sync::stage_pairing(&registry_url, &auth_token, &parsed.code, &ephemeral)
+                .await
+                .map_err(LpmError::Script)?;
 
-    lpm_vault::sync::approve_pairing(
-        &registry_url,
-        &auth_token,
-        &parsed.code,
-        &encrypted_wrapping_key,
-        &ephemeral_public_key,
-    )
-    .await
-    .map_err(LpmError::Script)?;
+            let view = PairConfirmationView::new(
+                &parsed.code,
+                &browser_pub_b64,
+                exchange.short_authentication_string(&parsed.code),
+                &session,
+            );
+            print_pair_confirmation(&view);
+            confirm_pairing(&parsed)?;
+
+            let wrapping_key =
+                lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
+            let encrypted = exchange.wrap_key(&wrapping_key).map_err(LpmError::Script)?;
+            lpm_vault::sync::approve_pairing(
+                &registry_url,
+                &auth_token,
+                &parsed.code,
+                &encrypted,
+                &ephemeral,
+            )
+            .await
+            .map_err(LpmError::Script)?;
+        }
+        version => {
+            return Err(LpmError::Script(format!(
+                "pairing protocol {version} is not supported by this CLI. Upgrade LPM and try again."
+            )));
+        }
+    }
 
     if json_output {
         println!(
@@ -297,11 +337,23 @@ pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), Lpm
         output::success("browser paired successfully");
         println!(
             "  {}",
-            "The dashboard can now decrypt your vault secrets.".dimmed()
+            "The dashboard can now decrypt your env secrets.".dimmed()
         );
         println!();
     }
     Ok(())
+}
+
+fn confirm_pairing(parsed: &PairArgs) -> Result<(), LpmError> {
+    if parsed.yes {
+        output::warn(
+            "--yes: skipped browser-identity verification. \
+             Only safe when you typed this command yourself from a trusted dashboard.",
+        );
+        Ok(())
+    } else {
+        prompt_pair_confirmation()
+    }
 }
 
 pub(super) async fn env_unpair(json_output: bool) -> Result<(), LpmError> {
@@ -450,19 +502,20 @@ mod tests {
     }
 
     #[test]
-    fn pair_confirmation_view_derives_fingerprint_and_match_number_from_pubkey() {
+    fn pair_confirmation_view_uses_derived_sas_and_fingerprints_browser_key() {
         use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
         let pub_b64 = BASE64.encode([0xAAu8; 65]);
         let session = lpm_vault::sync::PairingSession {
             status: "pending".into(),
+            protocol_version: Some(2),
             browser_public_key: Some(pub_b64.clone()),
             device_label: Some("Safari on iOS".into()),
             created_at: Some("2026-05-20T12:34:56Z".into()),
             created_from_ip: Some("203.0.113.0/24".into()),
         };
-        let view = PairConfirmationView::new("ABC123", &pub_b64, &session);
+        let view = PairConfirmationView::new("ABC123", &pub_b64, "1234 5678".into(), &session);
         assert_eq!(view.code, "ABC123");
-        assert_eq!(view.match_number.len(), 2);
+        assert_eq!(view.match_number, "1234 5678");
         assert!(view.fingerprint.is_some());
         assert_eq!(view.device_label.as_deref(), Some("Safari on iOS"));
         assert_eq!(view.created_at.as_deref(), Some("2026-05-20T12:34:56Z"));
@@ -475,12 +528,13 @@ mod tests {
         let pub_b64 = BASE64.encode([0u8; 65]);
         let session = lpm_vault::sync::PairingSession {
             status: "pending".into(),
+            protocol_version: Some(2),
             browser_public_key: Some(pub_b64.clone()),
             device_label: Some("Chrome\x1b[2J\x07".into()),
             created_at: None,
             created_from_ip: None,
         };
-        let view = PairConfirmationView::new("ABC123", &pub_b64, &session);
+        let view = PairConfirmationView::new("ABC123", &pub_b64, "1234 5678".into(), &session);
         let label = view.device_label.as_deref().unwrap_or_default();
         assert!(!label.contains('\x1b'));
         assert!(!label.contains('\x07'));
@@ -499,12 +553,13 @@ mod tests {
         let pub_b64 = BASE64.encode([0u8; 65]);
         let session = lpm_vault::sync::PairingSession {
             status: "pending".into(),
+            protocol_version: Some(2),
             browser_public_key: Some(pub_b64.clone()),
             device_label: None,
             created_at: Some("2026-05-20T12:34:56Z\x1b[2A\x1b[2K".into()),
             created_from_ip: Some("203.0.113.0/24\x07\x1b[1B".into()),
         };
-        let view = PairConfirmationView::new("ABC123", &pub_b64, &session);
+        let view = PairConfirmationView::new("ABC123", &pub_b64, "1234 5678".into(), &session);
         let created_at = view.created_at.as_deref().unwrap_or_default();
         let ip = view.created_from_ip.as_deref().unwrap_or_default();
         for field in [created_at, ip] {

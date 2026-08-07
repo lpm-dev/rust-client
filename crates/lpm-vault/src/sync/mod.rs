@@ -22,7 +22,10 @@ mod step_up;
 pub use audit::{AuditEntry, AuditResponse, get_audit_log};
 pub use ci::{CiPullResponse, ci_pull, upload_escrow_key};
 pub use org::{PulledOrgVault, list_org_vaults, pull_org, push_org_with_keys};
-pub use pairing::{PairingSession, approve_pairing, get_pairing_session, unpair_all};
+pub use pairing::{
+    PairingSession, approve_pairing, approve_pairing_legacy, get_pairing_session, stage_pairing,
+    unpair_all,
+};
 pub use personal::{
     ListVaultsResponse, PullResponse, PushMetadata, PushResponse, RemoteVault, list_remote, pull,
     pull_env, pull_raw, pull_raw_for_rotation, push, push_raw,
