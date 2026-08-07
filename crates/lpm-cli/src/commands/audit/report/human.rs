@@ -243,14 +243,20 @@ pub(in crate::commands::audit) fn print_behavioral_results(
         if !tag_counts.is_empty() {
             let mut sorted: Vec<(&&str, &usize)> = tag_counts.iter().collect();
             sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            let signal_count = tag_counts.values().sum();
             let summary_parts: Vec<String> = sorted
                 .into_iter()
                 .map(|(tag, count)| info_tag_phrase(tag, *count))
                 .collect();
             let separator = format!(" {} ", install_ui::dim("·"));
             eprintln!(
+                "  {} · {}",
+                install_ui::section("Behavioral metadata"),
+                count_phrase(signal_count, "signal", "signals")
+            );
+            eprintln!(
                 "  {} {}",
-                install_ui::dim("also:"),
+                install_ui::dim("signals:"),
                 summary_parts.join(&separator),
             );
         }
@@ -270,18 +276,27 @@ pub(in crate::commands::audit) fn print_summary(
 
     let total_scanned = discovery.packages.len();
     let vuln_count = osv_vulns.len();
-    let lpm_issues: usize = results
+    let lpm_actionable_issues: usize = results
         .iter()
         .filter(|r| r.name.starts_with("@lpm.dev/"))
-        .map(|r| r.issues.len())
-        .sum();
+        .flat_map(|result| &result.issues)
+        .filter(|issue| issue.severity != "info")
+        .count();
+    let metadata_signals = results
+        .iter()
+        .flat_map(|result| &result.issues)
+        .filter(|issue| issue.severity == "info")
+        .count();
 
     if osv_degraded {
         install_ui::warn_untrusted(&format!(
             "Audit incomplete · {total_scanned} {} scanned",
             install_ui::packages_word(total_scanned)
         ));
-    } else if vuln_count == 0 && lpm_issues == 0 && behavioral.packages_with_findings == 0 {
+    } else if vuln_count == 0
+        && lpm_actionable_issues == 0
+        && behavioral.packages_with_actionable_findings == 0
+    {
         let mut parts = vec![format!("{total_scanned} scanned")];
         if checked_lpm > 0 {
             parts.push(format!("{checked_lpm} LPM audited"));
@@ -289,21 +304,31 @@ pub(in crate::commands::audit) fn print_summary(
         if behavioral.packages_scanned > 0 {
             parts.push(format!("{} analyzed", behavioral.packages_scanned));
         }
-        install_ui::done_untrusted(&format!("No issues found · {}", parts.join(" · ")));
+        if metadata_signals > 0 {
+            parts.push(format!(
+                "{metadata_signals} metadata signal{}",
+                if metadata_signals == 1 { "" } else { "s" }
+            ));
+        }
+        install_ui::done_untrusted(&format!("No security issues found · {}", parts.join(" · ")));
     } else {
         let mut parts = Vec::new();
         if vuln_count > 0 {
             parts.push(count_phrase(vuln_count, "vulnerability", "vulnerabilities"));
         }
-        if behavioral.packages_with_findings > 0 {
+        if behavioral.packages_with_actionable_findings > 0 {
             parts.push(count_phrase(
-                behavioral.packages_with_findings,
+                behavioral.packages_with_actionable_findings,
                 "suspicious",
                 "suspicious",
             ));
         }
-        if lpm_issues > 0 {
-            parts.push(count_phrase(lpm_issues, "LPM issue", "LPM issues"));
+        if lpm_actionable_issues > 0 {
+            parts.push(count_phrase(
+                lpm_actionable_issues,
+                "LPM issue",
+                "LPM issues",
+            ));
         }
         parts.push(format!("{total_scanned} scanned"));
 

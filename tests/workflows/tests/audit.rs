@@ -559,7 +559,7 @@ async fn audit_empty_lockfile_json_reports_zero_package_envelope() {
 /// A project with one clean dep and an OSV response carrying zero vulns
 /// must exit 0 — nothing to fail on.
 #[tokio::test]
-async fn audit_clean_dep_with_empty_osv_response_exits_zero() {
+async fn audit_info_only_dep_with_empty_osv_response_exits_zero() {
     let project = TempProject::empty(
         r#"{"name":"clean-audit","version":"1.0.0","dependencies":{"clean-pkg":"^1.0.0"}}"#,
     );
@@ -587,8 +587,10 @@ async fn audit_clean_dep_with_empty_osv_response_exits_zero() {
     assert!(
         stderr.contains("✓ Analyzed 1 package · lpm.lock")
             && stderr.contains("✓ Checked against OSV database")
-            && stderr.contains("✓ No issues found · 1 scanned"),
-        "clean audit must use the slim compact summary, got:\n{stderr}",
+            && stderr.contains("Behavioral metadata")
+            && stderr.contains("✓ No security issues found · 1 scanned")
+            && stderr.contains("1 metadata signal"),
+        "Info-only audit must distinguish metadata from security issues, got:\n{stderr}",
     );
     assert!(
         !stderr.contains("Scanning 1 package")
@@ -1798,6 +1800,88 @@ async fn audit_fail_on_vuln_triggers_when_vulnerability_present() {
     );
 }
 
+#[tokio::test]
+async fn audit_fail_on_vuln_respects_high_threshold_for_direct_command() {
+    let project = TempProject::empty(
+        r#"{"name":"high-vuln-policy","version":"1.0.0","dependencies":{"vuln-pkg":"^1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, "vuln-pkg").await;
+    mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
+        "GHSA-high-direct",
+        "vuln-pkg",
+        "High severity fixture",
+        "8.5",
+    )]])
+    .await;
+
+    let output = run_audit(&project, &mock, &["--level", "high", "--fail-on", "vuln"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("GHSA-high-direct"));
+}
+
+#[tokio::test]
+async fn audit_high_threshold_ignores_moderate_vulnerability() {
+    let project = TempProject::empty(
+        r#"{"name":"moderate-vuln-policy","version":"1.0.0","dependencies":{"vuln-pkg":"^1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, "vuln-pkg").await;
+    mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
+        "GHSA-moderate-direct",
+        "vuln-pkg",
+        "Moderate severity fixture",
+        "5.5",
+    )]])
+    .await;
+
+    let output = run_audit(&project, &mock, &["--level", "high", "--fail-on", "vuln"]);
+
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("GHSA-moderate-direct"));
+}
+
+#[tokio::test]
+async fn run_preserves_audit_fail_on_vuln_exit_status() {
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let script = format!("\"{}\" audit --level high --fail-on vuln", binary.display());
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": "run-vuln-policy",
+            "version": "1.0.0",
+            "dependencies": { "vuln-pkg": "^1.0.0" },
+            "scripts": { "security:audit": script }
+        })
+        .to_string(),
+    );
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, "vuln-pkg").await;
+    mock.with_osv_querybatch(vec![vec![MockRegistry::osv_vuln(
+        "GHSA-high-run",
+        "vuln-pkg",
+        "High severity fixture",
+        "9.1",
+    )]])
+    .await;
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", osv_url)
+        .args(["run", "security:audit"])
+        .output()
+        .expect("run audit package script");
+
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("GHSA-high-run"));
+    assert!(!combined.contains("security:audit · success"));
+}
+
 /// `--fail-on=behavior` only triggers on critical/high BEHAVIORAL flags
 /// (eval, child_process, obfuscation, etc.). An OSV vuln alone — with
 /// no behavioral findings — must not fire this policy.
@@ -1884,6 +1968,44 @@ fn run_audit_no_osv(
     cmd.output().expect("failed to spawn lpm audit")
 }
 
+#[tokio::test]
+async fn audit_reports_info_behavioral_metadata_without_failing() {
+    let project = TempProject::empty(r#"{"name":"info-host","version":"1.0.0"}"#);
+    seed_node_modules_package(
+        &project,
+        "info-pkg",
+        &[(
+            "index.js",
+            "module.exports = process.env.NODE_ENV;\nconst docs = 'https://example.com/docs';\n",
+        )],
+    );
+    project.write_file(
+        "node_modules/info-pkg/package.json",
+        r#"{"name":"info-pkg","version":"1.0.0","license":"MIT"}"#,
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = run_audit_no_osv(&project, &mock, &[]);
+
+    assert!(
+        output.status.success(),
+        "Info metadata must not fail audit\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("environment-variable access"),
+        "{combined}"
+    );
+    assert!(combined.contains("URL literals"), "{combined}");
+}
+
 /// `--fail-on=behavior` must fire on a HIGH-severity behavioral finding
 /// like eval(). Pins the positive case for the `Behavior` arm of
 /// `FailPolicy` (audit/mod.rs::should_fail).
@@ -1907,7 +2029,7 @@ async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
 }
 
 /// `--fail-on=behavior` must also fire on CRITICAL behavioral findings
-/// (obfuscation / protestware / high-entropy strings). Critical and
+/// (obfuscation or protestware). Critical and
 /// high go through different branches of `should_fail`; this case
 /// pins the critical branch.
 #[tokio::test]
@@ -2015,8 +2137,15 @@ async fn audit_private_package_without_license_does_not_emit_no_license_flag() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("audit --json stdout must be valid JSON: {e}\n---\n{stdout}"));
 
-    assert_eq!(envelope["counts"]["info"], serde_json::json!(0));
-    assert_eq!(envelope["packages"], serde_json::json!([]));
+    assert_eq!(envelope["counts"]["moderate"], serde_json::json!(0));
+    assert!(
+        envelope["packages"]
+            .as_array()
+            .expect("packages array")
+            .iter()
+            .flat_map(|package| { package["issues"].as_array().expect("package issues").iter() })
+            .all(|issue| issue["message"] != "no license")
+    );
 }
 
 // ─── JSON contract ──────────────────────────────────────────────────────

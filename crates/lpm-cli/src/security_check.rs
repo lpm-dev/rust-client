@@ -15,23 +15,48 @@
 use crate::install_ui;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
+use lpm_security::query::{InstallVisibility, PseudoClass, Severity, behavioral_tag_policies};
 use lpm_store::V2BaselineIndex;
 use std::collections::{HashMap, HashSet};
-
-/// Severity tier for the post-install summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Severity {
-    Critical,
-    High,
-    Medium,
-    Info,
-}
 
 /// A tagged issue found in a package.
 struct TagIssue {
     tag_label: &'static str,
     severity: Severity,
+    install_visibility: InstallVisibility,
+    selector: Option<&'static str>,
     packages: Vec<String>, // "name@version"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AdditionalSignal {
+    CriticalVulnerability,
+    HighVulnerability,
+    Vulnerability,
+    AiSecurityFinding,
+    LifecycleScripts,
+}
+
+#[derive(Default)]
+struct SummaryCounts {
+    behavioral: HashMap<PseudoClass, HashSet<String>>,
+    additional: HashMap<AdditionalSignal, HashSet<String>>,
+}
+
+impl SummaryCounts {
+    fn insert_behavioral(&mut self, tag: PseudoClass, package: &str) {
+        self.behavioral
+            .entry(tag)
+            .or_default()
+            .insert(package.to_string());
+    }
+
+    fn insert_additional(&mut self, signal: AdditionalSignal, package: &str) {
+        self.additional
+            .entry(signal)
+            .or_default()
+            .insert(package.to_string());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +102,7 @@ pub(crate) async fn post_install_security_summary(
     baseline_index: Option<&V2BaselineIndex>,
     packages: &[SecuritySummaryPackage],
     json_output: bool,
-    quiet: bool,
+    verbose: bool,
     fetch_lpm_security_insights: bool,
 ) {
     if packages.is_empty() {
@@ -96,7 +121,7 @@ pub(crate) async fn post_install_security_summary(
         ));
     }
 
-    let mut tag_counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+    let mut tag_counts = SummaryCounts::default();
 
     for (i, package) in packages.iter().enumerate() {
         if show_progress && i % 50 == 0 && i > 0 {
@@ -164,22 +189,6 @@ pub(crate) async fn post_install_security_summary(
         return;
     }
 
-    let critical_count: usize = issues
-        .iter()
-        .filter(|i| i.severity == Severity::Critical)
-        .map(|i| i.packages.len())
-        .sum();
-    let high_count: usize = issues
-        .iter()
-        .filter(|i| i.severity == Severity::High)
-        .map(|i| i.packages.len())
-        .sum();
-
-    // Skip output if only Info-level tags and in quiet mode
-    if quiet && critical_count == 0 && high_count == 0 {
-        return;
-    }
-
     if json_output {
         let json_issues: Vec<serde_json::Value> = issues
             .iter()
@@ -197,8 +206,7 @@ pub(crate) async fn post_install_security_summary(
         return;
     }
 
-    let total: usize = tag_counts.values().map(|v| v.len()).sum();
-    emit_human_security_summary(packages.len(), total, &issues, quiet);
+    emit_human_security_summary(packages.len(), &issues, verbose);
 }
 
 fn lpm_packages_for_enrichment(
@@ -211,13 +219,8 @@ fn lpm_packages_for_enrichment(
     packages.iter().filter(|package| package.is_lpm).collect()
 }
 
-fn emit_human_security_summary(
-    package_count: usize,
-    finding_count: usize,
-    issues: &[TagIssue],
-    quiet: bool,
-) {
-    for line in format_human_security_summary(package_count, finding_count, issues, quiet) {
+fn emit_human_security_summary(package_count: usize, issues: &[TagIssue], verbose: bool) {
+    for line in format_human_security_summary(package_count, issues, verbose) {
         match line {
             SecuritySummaryLine::Warn(message) => install_ui::warn_line(message),
             SecuritySummaryLine::Detail(message) => install_ui::detail_line(message),
@@ -227,55 +230,101 @@ fn emit_human_security_summary(
 
 fn format_human_security_summary(
     package_count: usize,
-    finding_count: usize,
     issues: &[TagIssue],
-    quiet: bool,
+    verbose: bool,
 ) -> Vec<SecuritySummaryLine> {
     let mut lines = Vec::new();
-    lines.push(SecuritySummaryLine::Warn(install_ui::terminal_line!(
-        "Security summary · {} · {}",
+    let actionable: Vec<&TagIssue> = issues
+        .iter()
+        .filter(|issue| {
+            issue.severity != Severity::Info && issue.install_visibility.is_visible(verbose)
+        })
+        .collect();
+    let metadata: Vec<&TagIssue> = issues
+        .iter()
+        .filter(|issue| {
+            issue.severity == Severity::Info && issue.install_visibility.is_visible(verbose)
+        })
+        .collect();
+
+    if !actionable.is_empty() {
+        let finding_count = issue_count(&actionable);
+        lines.push(SecuritySummaryLine::Warn(summary_heading(
+            "Security summary",
+            package_count,
+            finding_count,
+            "finding",
+        )));
+        append_issue_tiers(
+            &mut lines,
+            &actionable,
+            &[Severity::Critical, Severity::High, Severity::Medium],
+        );
+        lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
+            "  {} Run {} for full details.",
+            install_ui::dim("hint"),
+            install_ui::yellow("lpm audit"),
+        )));
+        append_query_hint(&mut lines, &actionable, "findings");
+    }
+
+    if !metadata.is_empty() {
+        let signal_count = issue_count(&metadata);
+        lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
+            "{} {}",
+            install_ui::cyan("ℹ"),
+            summary_heading("Behavioral metadata", package_count, signal_count, "signal")
+        )));
+        append_issue_tiers(&mut lines, &metadata, &[Severity::Info]);
+        append_query_hint(&mut lines, &metadata, "signals");
+    }
+
+    lines
+}
+
+fn summary_heading(
+    title: &'static str,
+    package_count: usize,
+    item_count: usize,
+    item_name: &'static str,
+) -> install_ui::TerminalLine {
+    install_ui::terminal_line!(
+        "{} · {} · {}",
+        title,
         install_ui::status_ok(&format!(
             "{} {}",
             package_count,
             install_ui::packages_word(package_count)
         )),
         install_ui::status_ok(&format!(
-            "{finding_count} {}",
-            if finding_count == 1 {
-                "finding"
-            } else {
-                "findings"
-            }
+            "{item_count} {item_name}{}",
+            if item_count == 1 { "" } else { "s" }
         )),
-    )));
+    )
+}
 
-    for severity in [
-        Severity::Critical,
-        Severity::High,
-        Severity::Medium,
-        Severity::Info,
-    ] {
-        let tier_issues: Vec<&TagIssue> =
-            issues.iter().filter(|i| i.severity == severity).collect();
+fn issue_count(issues: &[&TagIssue]) -> usize {
+    issues.iter().map(|issue| issue.packages.len()).sum()
+}
 
+fn append_issue_tiers(
+    lines: &mut Vec<SecuritySummaryLine>,
+    issues: &[&TagIssue],
+    severities: &[Severity],
+) {
+    for &severity in severities {
+        let tier_issues: Vec<&TagIssue> = issues
+            .iter()
+            .copied()
+            .filter(|issue| issue.severity == severity)
+            .collect();
         if tier_issues.is_empty() {
             continue;
         }
-
-        // Skip Info tier unless verbose (not quiet)
-        if severity == Severity::Info && quiet {
-            continue;
-        }
-        // Skip Medium tier in quiet mode
-        if severity == Severity::Medium && quiet {
-            continue;
-        }
-
         lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
             "  {}",
             format_security_severity(severity)
         )));
-
         for issue in tier_issues {
             let count = issue.packages.len();
             let preview_str = preview_packages(&issue.packages, 3);
@@ -284,9 +333,8 @@ fn format_human_security_summary(
             } else {
                 install_ui::dim("")
             };
-
             lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
-                "    {} {:<20} {} {}{}",
+                "    {} {:<27} {} {}{}",
                 install_ui::status_ok(&count.to_string()),
                 install_ui::cyan(issue.tag_label),
                 install_ui::dim("→"),
@@ -295,18 +343,38 @@ fn format_human_security_summary(
             )));
         }
     }
+}
 
+fn append_query_hint(
+    lines: &mut Vec<SecuritySummaryLine>,
+    issues: &[&TagIssue],
+    item_name: &'static str,
+) {
+    let selectors: Vec<&str> = issues
+        .iter()
+        .filter_map(|issue| issue.selector)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if selectors.is_empty() {
+        return;
+    }
+    let selector = behavioral_tag_policies()
+        .iter()
+        .filter_map(|policy| selectors.contains(&policy.token).then_some(policy.token))
+        .chain(
+            [":scripts", ":vulnerable"]
+                .into_iter()
+                .filter(|selector| selectors.contains(selector)),
+        )
+        .collect::<Vec<_>>()
+        .join(",");
     lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
-        "  {} Run {} for full details.",
+        "  {} Run {} to inspect these {}.",
         install_ui::dim("hint"),
-        install_ui::yellow("lpm audit"),
+        install_ui::yellow(&format!("lpm query \"{selector}\"")),
+        item_name,
     )));
-    lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
-        "  {} Run {} to inspect specific tags.",
-        install_ui::dim("hint"),
-        install_ui::yellow("lpm query \":critical\""),
-    )));
-    lines
 }
 
 fn format_security_severity(severity: Severity) -> install_ui::TerminalFragment {
@@ -331,145 +399,12 @@ fn preview_packages(packages: &[String], limit: usize) -> String {
 fn collect_tags_from_analysis(
     analysis: &PackageAnalysis,
     pkg_id: &str,
-    counts: &mut HashMap<&'static str, HashSet<String>>,
+    counts: &mut SummaryCounts,
 ) {
-    let s = &analysis.source;
-    let sc = &analysis.supply_chain;
-    let m = &analysis.manifest;
-
-    // Source tags
-    if s.filesystem {
-        counts
-            .entry("filesystem")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.network {
-        counts
-            .entry("network")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.child_process {
-        counts
-            .entry("child_process")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.environment_vars {
-        counts
-            .entry("environment_vars")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.eval {
-        counts.entry("eval").or_default().insert(pkg_id.to_string());
-    }
-    if s.native_bindings {
-        counts
-            .entry("native_bindings")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.crypto {
-        counts
-            .entry("crypto")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.shell {
-        counts
-            .entry("shell")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.web_socket {
-        counts
-            .entry("web_socket")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if s.dynamic_require {
-        counts
-            .entry("dynamic_require")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-
-    // Supply chain tags
-    if sc.obfuscated {
-        counts
-            .entry("obfuscated")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if sc.high_entropy_strings {
-        counts
-            .entry("high_entropy")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if sc.minified {
-        counts
-            .entry("minified")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if sc.telemetry {
-        counts
-            .entry("telemetry")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if sc.url_strings {
-        counts
-            .entry("url_strings")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if sc.trivial {
-        counts
-            .entry("trivial")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if sc.protestware {
-        counts
-            .entry("protestware")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-
-    // Manifest tags
-    if m.git_dependency {
-        counts
-            .entry("git_dependency")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if m.http_dependency {
-        counts
-            .entry("http_dependency")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if m.wildcard_dependency {
-        counts
-            .entry("wildcard_dependency")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if m.copyleft_license {
-        counts
-            .entry("copyleft_license")
-            .or_default()
-            .insert(pkg_id.to_string());
-    }
-    if m.no_license {
-        counts
-            .entry("no_license")
-            .or_default()
-            .insert(pkg_id.to_string());
+    for policy in behavioral_tag_policies() {
+        if policy.tag.matches_analysis(analysis) {
+            counts.insert_behavioral(policy.tag, pkg_id);
+        }
     }
 }
 
@@ -480,262 +415,167 @@ fn collect_tags_from_analysis(
 fn collect_registry_warnings(
     ver_meta: &lpm_registry::VersionMetadata,
     pkg_id: &str,
-    counts: &mut HashMap<&'static str, HashSet<String>>,
+    counts: &mut SummaryCounts,
 ) {
-    // Registry behavioral tags — OR merge with client-side
     if let Some(tags) = &ver_meta.behavioral_tags {
-        // Source tags
-        if tags.eval {
-            counts.entry("eval").or_default().insert(pkg_id.to_string());
-        }
-        if tags.child_process {
-            counts
-                .entry("child_process")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.shell {
-            counts
-                .entry("shell")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.network {
-            counts
-                .entry("network")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.filesystem {
-            counts
-                .entry("filesystem")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.crypto {
-            counts
-                .entry("crypto")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.dynamic_require {
-            counts
-                .entry("dynamic_require")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.native_bindings {
-            counts
-                .entry("native_bindings")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.environment_vars {
-            counts
-                .entry("environment_vars")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.web_socket {
-            counts
-                .entry("web_socket")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        // Supply chain tags
-        if tags.obfuscated {
-            counts
-                .entry("obfuscated")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.high_entropy_strings {
-            counts
-                .entry("high_entropy")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.minified {
-            counts
-                .entry("minified")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.telemetry {
-            counts
-                .entry("telemetry")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.url_strings {
-            counts
-                .entry("url_strings")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.trivial {
-            counts
-                .entry("trivial")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.protestware {
-            counts
-                .entry("protestware")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        // Manifest tags
-        if tags.git_dependency {
-            counts
-                .entry("git_dependency")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.http_dependency {
-            counts
-                .entry("http_dependency")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.wildcard_dependency {
-            counts
-                .entry("wildcard_dependency")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.copyleft_license {
-            counts
-                .entry("copyleft_license")
-                .or_default()
-                .insert(pkg_id.to_string());
-        }
-        if tags.no_license {
-            counts
-                .entry("no_license")
-                .or_default()
-                .insert(pkg_id.to_string());
+        for (tag, present) in [
+            (PseudoClass::Eval, tags.eval),
+            (PseudoClass::Network, tags.network),
+            (PseudoClass::Fs, tags.filesystem),
+            (PseudoClass::Shell, tags.shell),
+            (PseudoClass::ChildProcess, tags.child_process),
+            (PseudoClass::Native, tags.native_bindings),
+            (PseudoClass::Crypto, tags.crypto),
+            (PseudoClass::DynamicRequire, tags.dynamic_require),
+            (PseudoClass::Env, tags.environment_vars),
+            (PseudoClass::Ws, tags.web_socket),
+            (PseudoClass::Obfuscated, tags.obfuscated),
+            (PseudoClass::HighEntropy, tags.high_entropy_strings),
+            (PseudoClass::Minified, tags.minified),
+            (PseudoClass::Telemetry, tags.telemetry),
+            (PseudoClass::UrlStrings, tags.url_strings),
+            (PseudoClass::Trivial, tags.trivial),
+            (PseudoClass::Protestware, tags.protestware),
+            (PseudoClass::GitDep, tags.git_dependency),
+            (PseudoClass::HttpDep, tags.http_dependency),
+            (PseudoClass::WildcardDep, tags.wildcard_dependency),
+            (PseudoClass::Copyleft, tags.copyleft_license),
+            (PseudoClass::NoLicense, tags.no_license),
+        ] {
+            if present {
+                counts.insert_behavioral(tag, pkg_id);
+            }
         }
     }
 
-    // Registry-provided vulnerabilities (from server-side OSV scan)
     if let Some(vulns) = &ver_meta.vulnerabilities {
         for vuln in vulns {
             let severity = vuln.severity.as_deref().unwrap_or("unknown").to_lowercase();
-            let key = match severity.as_str() {
-                "critical" => "vulnerability_critical",
-                "high" => "vulnerability_high",
-                _ => "vulnerability",
+            let signal = match severity.as_str() {
+                "critical" => AdditionalSignal::CriticalVulnerability,
+                "high" => AdditionalSignal::HighVulnerability,
+                _ => AdditionalSignal::Vulnerability,
             };
-            counts.entry(key).or_default().insert(pkg_id.to_string());
+            counts.insert_additional(signal, pkg_id);
         }
     }
 
-    // AI security findings
     if let Some(findings) = &ver_meta.security_findings {
         for finding in findings {
             let severity = finding.severity.as_deref().unwrap_or("info");
             if severity == "critical" || severity == "high" {
-                counts
-                    .entry("ai_security_finding")
-                    .or_default()
-                    .insert(pkg_id.to_string());
+                counts.insert_additional(AdditionalSignal::AiSecurityFinding, pkg_id);
             }
         }
     }
 
-    // Lifecycle scripts (already blocked by default, but show in summary)
     if let Some(scripts) = &ver_meta.lifecycle_scripts
         && !scripts.is_empty()
     {
-        counts
-            .entry("lifecycle_scripts")
-            .or_default()
-            .insert(pkg_id.to_string());
+        counts.insert_additional(AdditionalSignal::LifecycleScripts, pkg_id);
     }
 }
 
-/// Map tag names to severity tiers and build sorted issue list.
-fn build_severity_groups(counts: &HashMap<&'static str, HashSet<String>>) -> Vec<TagIssue> {
-    let tag_severity: &[(&str, &str, Severity)] = &[
-        // Critical
-        ("obfuscated", "obfuscated code", Severity::Critical),
-        ("protestware", "protestware", Severity::Critical),
+fn build_severity_groups(counts: &SummaryCounts) -> Vec<TagIssue> {
+    let mut issues = Vec::new();
+    for severity in [
+        Severity::Critical,
+        Severity::High,
+        Severity::Medium,
+        Severity::Info,
+    ] {
+        for policy in behavioral_tag_policies()
+            .iter()
+            .filter(|policy| policy.severity == severity)
+        {
+            if let Some(packages) = counts.behavioral.get(&policy.tag)
+                && !packages.is_empty()
+            {
+                issues.push(TagIssue {
+                    tag_label: policy.label,
+                    severity: policy.severity,
+                    install_visibility: policy.install_visibility,
+                    selector: Some(policy.token),
+                    packages: sorted_package_labels(packages),
+                });
+            }
+        }
+    }
+    for (signal, label, severity, selector) in [
         (
-            "vulnerability_critical",
+            AdditionalSignal::CriticalVulnerability,
             "critical vulnerability",
             Severity::Critical,
+            Some(":vulnerable"),
         ),
-        // High
-        ("eval", "eval()", Severity::High),
-        ("child_process", "child_process", Severity::High),
-        ("shell", "shell exec", Severity::High),
-        ("dynamic_require", "dynamic require", Severity::High),
-        ("lifecycle_scripts", "install scripts", Severity::High),
-        ("ai_security_finding", "AI security finding", Severity::High),
-        ("vulnerability_high", "high vulnerability", Severity::High),
-        ("vulnerability", "vulnerability", Severity::High),
-        // Medium
-        ("network", "network access", Severity::Medium),
-        ("native_bindings", "native bindings", Severity::Medium),
-        ("git_dependency", "git dependency", Severity::Medium),
-        ("http_dependency", "http dependency", Severity::Medium),
-        ("wildcard_dependency", "wildcard dep", Severity::Medium),
-        ("no_license", "no license", Severity::Medium),
-        // Info
-        ("high_entropy", "high entropy strings", Severity::Info),
-        ("filesystem", "filesystem", Severity::Info),
-        ("crypto", "crypto", Severity::Info),
-        ("environment_vars", "env vars", Severity::Info),
-        ("web_socket", "websocket", Severity::Info),
-        ("telemetry", "telemetry", Severity::Info),
-        ("trivial", "trivial package", Severity::Info),
-        ("copyleft_license", "copyleft", Severity::Info),
-        ("minified", "minified", Severity::Info),
-        ("url_strings", "url strings", Severity::Info),
-    ];
-
-    let mut issues = Vec::new();
-
-    for (key, label, severity) in tag_severity {
-        if let Some(pkgs) = counts.get(key)
-            && !pkgs.is_empty()
+        (
+            AdditionalSignal::LifecycleScripts,
+            "install scripts",
+            Severity::High,
+            Some(":scripts"),
+        ),
+        (
+            AdditionalSignal::AiSecurityFinding,
+            "AI security finding",
+            Severity::High,
+            None,
+        ),
+        (
+            AdditionalSignal::HighVulnerability,
+            "high vulnerability",
+            Severity::High,
+            Some(":vulnerable"),
+        ),
+        (
+            AdditionalSignal::Vulnerability,
+            "vulnerability",
+            Severity::High,
+            Some(":vulnerable"),
+        ),
+    ] {
+        if let Some(packages) = counts.additional.get(&signal)
+            && !packages.is_empty()
         {
-            let mut coordinate_counts: HashMap<&str, usize> = HashMap::new();
-            for package in pkgs {
-                *coordinate_counts
-                    .entry(package.split('\u{1f}').next().unwrap_or(package))
-                    .or_default() += 1;
-            }
-            let mut sorted_pkgs: Vec<String> = pkgs
-                .iter()
-                .map(|package| {
-                    let mut fields = package.split('\u{1f}');
-                    let coordinate = fields.next().unwrap_or(package);
-                    if coordinate_counts.get(coordinate).copied().unwrap_or(0) < 2 {
-                        return coordinate.to_string();
-                    }
-                    let source = fields.next().unwrap_or("");
-                    let integrity = fields.next().unwrap_or("");
-                    let source = install_ui::safe_package_source_identity(source);
-                    let integrity_preview: String = integrity.chars().take(20).collect();
-                    if integrity_preview.is_empty() {
-                        format!("{coordinate} ({source})")
-                    } else {
-                        format!("{coordinate} ({source}, {integrity_preview}…)")
-                    }
-                })
-                .collect();
-            sorted_pkgs.sort();
             issues.push(TagIssue {
                 tag_label: label,
-                severity: *severity,
-                packages: sorted_pkgs,
+                severity,
+                install_visibility: InstallVisibility::Default,
+                selector,
+                packages: sorted_package_labels(packages),
             });
         }
     }
-
     issues
+}
+
+fn sorted_package_labels(packages: &HashSet<String>) -> Vec<String> {
+    let mut coordinate_counts: HashMap<&str, usize> = HashMap::new();
+    for package in packages {
+        *coordinate_counts
+            .entry(package.split('\u{1f}').next().unwrap_or(package))
+            .or_default() += 1;
+    }
+    let mut labels: Vec<String> = packages
+        .iter()
+        .map(|package| {
+            let mut fields = package.split('\u{1f}');
+            let coordinate = fields.next().unwrap_or(package);
+            if coordinate_counts.get(coordinate).copied().unwrap_or(0) < 2 {
+                return coordinate.to_string();
+            }
+            let source = fields.next().unwrap_or("");
+            let integrity = fields.next().unwrap_or("");
+            let source = install_ui::safe_package_source_identity(source);
+            let integrity_preview: String = integrity.chars().take(20).collect();
+            if integrity_preview.is_empty() {
+                format!("{coordinate} ({source})")
+            } else {
+                format!("{coordinate} ({source}, {integrity_preview}…)")
+            }
+        })
+        .collect();
+    labels.sort();
+    labels
 }
 
 #[cfg(test)]
@@ -921,12 +761,24 @@ mod tests {
             SupplyChainTags::default(),
             ManifestTags::default(),
         );
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_tags_from_analysis(&analysis, "test@1.0.0", &mut counts);
 
-        assert!(counts.get("eval").unwrap().contains("test@1.0.0"));
-        assert!(counts.get("shell").unwrap().contains("test@1.0.0"));
-        assert!(!counts.contains_key("network"));
+        assert!(
+            counts
+                .behavioral
+                .get(&PseudoClass::Eval)
+                .unwrap()
+                .contains("test@1.0.0")
+        );
+        assert!(
+            counts
+                .behavioral
+                .get(&PseudoClass::Shell)
+                .unwrap()
+                .contains("test@1.0.0")
+        );
+        assert!(!counts.behavioral.contains_key(&PseudoClass::Network));
     }
 
     #[test]
@@ -940,11 +792,23 @@ mod tests {
             },
             ManifestTags::default(),
         );
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_tags_from_analysis(&analysis, "evil@0.1.0", &mut counts);
 
-        assert!(counts.get("obfuscated").unwrap().contains("evil@0.1.0"));
-        assert!(counts.get("protestware").unwrap().contains("evil@0.1.0"));
+        assert!(
+            counts
+                .behavioral
+                .get(&PseudoClass::Obfuscated)
+                .unwrap()
+                .contains("evil@0.1.0")
+        );
+        assert!(
+            counts
+                .behavioral
+                .get(&PseudoClass::Protestware)
+                .unwrap()
+                .contains("evil@0.1.0")
+        );
     }
 
     #[test]
@@ -958,13 +822,20 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_tags_from_analysis(&analysis, "pkg@2.0.0", &mut counts);
 
-        assert!(counts.get("no_license").unwrap().contains("pkg@2.0.0"));
         assert!(
             counts
-                .get("copyleft_license")
+                .behavioral
+                .get(&PseudoClass::NoLicense)
+                .unwrap()
+                .contains("pkg@2.0.0")
+        );
+        assert!(
+            counts
+                .behavioral
+                .get(&PseudoClass::Copyleft)
                 .unwrap()
                 .contains("pkg@2.0.0")
         );
@@ -976,16 +847,20 @@ mod tests {
             TagIssue {
                 tag_label: "lifecycle script",
                 severity: Severity::Critical,
+                install_visibility: InstallVisibility::Default,
+                selector: Some(":scripts"),
                 packages: vec!["evil@1.0.0".to_string(), "risky@2.0.0".to_string()],
             },
             TagIssue {
                 tag_label: "network access",
                 severity: Severity::Medium,
+                install_visibility: InstallVisibility::Default,
+                selector: Some(":network"),
                 packages: vec!["net@3.0.0".to_string()],
             },
         ];
 
-        let lines = format_human_security_summary(3, 3, &issues, false);
+        let lines = format_human_security_summary(3, &issues, false);
         let joined = lines
             .iter()
             .map(|line| match line {
@@ -1016,21 +891,25 @@ mod tests {
     }
 
     #[test]
-    fn human_security_summary_quiet_mode_keeps_high_signal_tiers_only() {
+    fn human_security_summary_keeps_actionable_tiers_without_verbose_output() {
         let issues = vec![
             TagIssue {
                 tag_label: "network access",
                 severity: Severity::Medium,
+                install_visibility: InstallVisibility::Default,
+                selector: Some(":network"),
                 packages: vec!["net@3.0.0".to_string()],
             },
             TagIssue {
                 tag_label: "lifecycle script",
                 severity: Severity::High,
+                install_visibility: InstallVisibility::Default,
+                selector: Some(":scripts"),
                 packages: vec!["risky@2.0.0".to_string()],
             },
         ];
 
-        let lines = format_human_security_summary(2, 2, &issues, true);
+        let lines = format_human_security_summary(2, &issues, false);
         let joined = lines
             .iter()
             .map(|line| match line {
@@ -1047,9 +926,68 @@ mod tests {
             "high-severity issue should stay visible: {joined}"
         );
         assert!(
-            !joined.contains("network access"),
-            "medium-severity issue should be suppressed in quiet mode: {joined}"
+            joined.contains("network access"),
+            "medium-severity issue should stay visible: {joined}"
         );
+    }
+
+    #[test]
+    fn human_security_summary_hides_info_only_signals_without_verbose_output() {
+        let issues = vec![
+            TagIssue {
+                tag_label: "environment-variable access",
+                severity: Severity::Info,
+                install_visibility: InstallVisibility::VerboseOnly,
+                selector: Some(":env"),
+                packages: vec!["react@19.2.8".to_string()],
+            },
+            TagIssue {
+                tag_label: "URL literals",
+                severity: Severity::Info,
+                install_visibility: InstallVisibility::VerboseOnly,
+                selector: Some(":url-strings"),
+                packages: vec!["react@19.2.8".to_string()],
+            },
+        ];
+
+        assert!(format_human_security_summary(1, &issues, false).is_empty());
+    }
+
+    #[test]
+    fn human_security_summary_verbose_output_names_metadata_and_uses_matching_selectors() {
+        let issues = vec![
+            TagIssue {
+                tag_label: "environment-variable access",
+                severity: Severity::Info,
+                install_visibility: InstallVisibility::VerboseOnly,
+                selector: Some(":env"),
+                packages: vec!["react@19.2.8".to_string()],
+            },
+            TagIssue {
+                tag_label: "URL literals",
+                severity: Severity::Info,
+                install_visibility: InstallVisibility::VerboseOnly,
+                selector: Some(":url-strings"),
+                packages: vec!["react@19.2.8".to_string()],
+            },
+        ];
+
+        let lines = format_human_security_summary(1, &issues, true);
+        let joined = lines
+            .iter()
+            .map(|line| match line {
+                SecuritySummaryLine::Warn(message) | SecuritySummaryLine::Detail(message) => {
+                    message.as_ref()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let joined = console::strip_ansi_codes(&joined).into_owned();
+
+        assert!(joined.contains("Behavioral metadata · 1 package · 2 signals"));
+        assert!(joined.contains("lpm query \":env,:url-strings\""));
+        assert!(!joined.contains(":critical"));
+        assert!(!joined.contains("Security summary"));
     }
 
     #[test]
@@ -1062,12 +1000,11 @@ mod tests {
             SupplyChainTags::default(),
             ManifestTags::default(),
         );
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_tags_from_analysis(&analysis, "pkg@1.0.0", &mut counts);
         collect_tags_from_analysis(&analysis, "pkg@1.0.0", &mut counts);
 
-        // HashSet deduplicates automatically
-        assert_eq!(counts.get("eval").unwrap().len(), 1);
+        assert_eq!(counts.behavioral.get(&PseudoClass::Eval).unwrap().len(), 1);
     }
 
     #[test]
@@ -1086,10 +1023,13 @@ mod tests {
             integrity: Some("sha512-source-b".to_string()),
             is_lpm: false,
         };
-        let counts = HashMap::from([(
-            "eval",
-            HashSet::from([npm.finding_key(), custom.finding_key()]),
-        )]);
+        let counts = SummaryCounts {
+            behavioral: HashMap::from([(
+                PseudoClass::Eval,
+                HashSet::from([npm.finding_key(), custom.finding_key()]),
+            )]),
+            additional: HashMap::new(),
+        };
 
         let issues = build_severity_groups(&counts);
 
@@ -1125,10 +1065,13 @@ mod tests {
             integrity: Some("sha512-source-b".to_string()),
             is_lpm: false,
         };
-        let counts = HashMap::from([(
-            "eval",
-            HashSet::from([package.finding_key(), sibling.finding_key()]),
-        )]);
+        let counts = SummaryCounts {
+            behavioral: HashMap::from([(
+                PseudoClass::Eval,
+                HashSet::from([package.finding_key(), sibling.finding_key()]),
+            )]),
+            additional: HashMap::new(),
+        };
 
         let issues = build_severity_groups(&counts);
 
@@ -1148,10 +1091,11 @@ mod tests {
             SupplyChainTags::default(),
             ManifestTags::default(),
         );
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_tags_from_analysis(&analysis, "clean@1.0.0", &mut counts);
 
-        assert!(counts.is_empty());
+        assert!(counts.behavioral.is_empty());
+        assert!(counts.additional.is_empty());
     }
 
     // ── collect_registry_warnings tests ──────────────────────────────
@@ -1175,18 +1119,20 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(
             counts
-                .get("vulnerability_critical")
+                .additional
+                .get(&AdditionalSignal::CriticalVulnerability)
                 .unwrap()
                 .contains("pkg@1.0.0")
         );
         assert!(
             counts
-                .get("vulnerability_high")
+                .additional
+                .get(&AdditionalSignal::HighVulnerability)
                 .unwrap()
                 .contains("pkg@1.0.0")
         );
@@ -1203,24 +1149,23 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        assert!(counts.get("eval").unwrap().contains("pkg@1.0.0"));
-        assert!(counts.get("obfuscated").unwrap().contains("pkg@1.0.0"));
-        assert!(counts.get("no_license").unwrap().contains("pkg@1.0.0"));
+        for tag in [
+            PseudoClass::Eval,
+            PseudoClass::Obfuscated,
+            PseudoClass::NoLicense,
+        ] {
+            assert!(counts.behavioral.get(&tag).unwrap().contains("pkg@1.0.0"));
+        }
     }
 
     #[test]
     fn registry_warnings_or_merges_with_client_side() {
-        // Simulate client-side already found eval
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        counts
-            .entry("eval")
-            .or_default()
-            .insert("pkg@1.0.0".to_string());
+        let mut counts = SummaryCounts::default();
+        counts.insert_behavioral(PseudoClass::Eval, "pkg@1.0.0");
 
-        // Registry also finds eval + network
         let ver_meta = lpm_registry::VersionMetadata {
             behavioral_tags: Some(lpm_registry::BehavioralTags {
                 eval: true,
@@ -1231,9 +1176,14 @@ mod tests {
         };
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        // eval: still 1 entry (HashSet dedup), network: added
-        assert_eq!(counts.get("eval").unwrap().len(), 1);
-        assert!(counts.get("network").unwrap().contains("pkg@1.0.0"));
+        assert_eq!(counts.behavioral.get(&PseudoClass::Eval).unwrap().len(), 1);
+        assert!(
+            counts
+                .behavioral
+                .get(&PseudoClass::Network)
+                .unwrap()
+                .contains("pkg@1.0.0")
+        );
     }
 
     #[test]
@@ -1246,12 +1196,13 @@ mod tests {
             }]),
             ..Default::default()
         };
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(
             counts
-                .get("ai_security_finding")
+                .additional
+                .get(&AdditionalSignal::AiSecurityFinding)
                 .unwrap()
                 .contains("pkg@1.0.0")
         );
@@ -1266,12 +1217,13 @@ mod tests {
             lifecycle_scripts: Some(scripts),
             ..Default::default()
         };
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(
             counts
-                .get("lifecycle_scripts")
+                .additional
+                .get(&AdditionalSignal::LifecycleScripts)
                 .unwrap()
                 .contains("pkg@1.0.0")
         );
@@ -1280,29 +1232,21 @@ mod tests {
     #[test]
     fn registry_warnings_empty_metadata() {
         let ver_meta = lpm_registry::VersionMetadata::default();
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        assert!(counts.is_empty());
+        assert!(counts.behavioral.is_empty());
+        assert!(counts.additional.is_empty());
     }
 
     // ── build_severity_groups tests ──────────────────────────────────
 
     #[test]
     fn severity_groups_critical_first() {
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        counts
-            .entry("eval")
-            .or_default()
-            .insert("a@1.0.0".to_string());
-        counts
-            .entry("obfuscated")
-            .or_default()
-            .insert("b@1.0.0".to_string());
-        counts
-            .entry("filesystem")
-            .or_default()
-            .insert("c@1.0.0".to_string());
+        let mut counts = SummaryCounts::default();
+        counts.insert_behavioral(PseudoClass::Eval, "a@1.0.0");
+        counts.insert_behavioral(PseudoClass::Obfuscated, "b@1.0.0");
+        counts.insert_behavioral(PseudoClass::Fs, "c@1.0.0");
 
         let issues = build_severity_groups(&counts);
 
@@ -1313,19 +1257,10 @@ mod tests {
 
     #[test]
     fn severity_groups_vulnerability_tiers() {
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        counts
-            .entry("vulnerability_critical")
-            .or_default()
-            .insert("a@1.0.0".to_string());
-        counts
-            .entry("vulnerability_high")
-            .or_default()
-            .insert("b@1.0.0".to_string());
-        counts
-            .entry("vulnerability")
-            .or_default()
-            .insert("c@1.0.0".to_string());
+        let mut counts = SummaryCounts::default();
+        counts.insert_additional(AdditionalSignal::CriticalVulnerability, "a@1.0.0");
+        counts.insert_additional(AdditionalSignal::HighVulnerability, "b@1.0.0");
+        counts.insert_additional(AdditionalSignal::Vulnerability, "c@1.0.0");
 
         let issues = build_severity_groups(&counts);
 
@@ -1340,18 +1275,17 @@ mod tests {
 
     #[test]
     fn severity_groups_empty_counts() {
-        let counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let counts = SummaryCounts::default();
         let issues = build_severity_groups(&counts);
         assert!(issues.is_empty());
     }
 
     #[test]
     fn severity_groups_packages_sorted() {
-        let mut counts: HashMap<&'static str, HashSet<String>> = HashMap::new();
-        let set = counts.entry("eval").or_default();
-        set.insert("z-pkg@1.0.0".to_string());
-        set.insert("a-pkg@1.0.0".to_string());
-        set.insert("m-pkg@1.0.0".to_string());
+        let mut counts = SummaryCounts::default();
+        counts.insert_behavioral(PseudoClass::Eval, "z-pkg@1.0.0");
+        counts.insert_behavioral(PseudoClass::Eval, "a-pkg@1.0.0");
+        counts.insert_behavioral(PseudoClass::Eval, "m-pkg@1.0.0");
 
         let issues = build_severity_groups(&counts);
         assert_eq!(

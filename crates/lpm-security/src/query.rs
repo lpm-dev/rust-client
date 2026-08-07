@@ -15,10 +15,10 @@
 //!
 //! ## Severity aliases
 //!
-//! - `:critical` = `:obfuscated` OR `:protestware` OR `:high-entropy`
+//! - `:critical` = `:obfuscated` OR `:protestware`
 //! - `:high` = `:eval` OR `:child-process` OR `:shell` OR `:dynamic-require` OR `:scripts` OR `:vulnerable`
 //! - `:medium` = `:network` OR `:git-dep` OR `:http-dep` OR `:wildcard-dep` OR `:no-license` OR `:native`
-//! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:minified` OR `:url-strings`
+//! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:high-entropy` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:minified` OR `:url-strings`
 
 use crate::behavioral::PackageAnalysis;
 use std::collections::{HashMap, HashSet};
@@ -76,33 +76,244 @@ impl fmt::Display for TagGroup {
 /// `query.mdx` round-trip against this catalog exactly.
 #[derive(Debug, Clone, Copy)]
 pub struct BehavioralTagInfo {
+    /// Typed selector used by query evaluation and other command surfaces.
+    pub tag: PseudoClass,
     /// CLI token with leading colon (e.g., `:eval`).
     pub token: &'static str,
+    /// Short label for summaries and audit results.
+    pub label: &'static str,
     /// Group the tag belongs to.
     pub group: TagGroup,
-    /// Severity tier reported by `lpm query --count`.
+    /// Severity tier shared by install, audit, and query.
     pub severity: Severity,
+    /// Whether a normal install shows this tag.
+    pub install_visibility: InstallVisibility,
     /// Short user-facing description ("Detects" / "Matches" prose).
     pub description: &'static str,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallVisibility {
+    Default,
+    VerboseOnly,
+}
+
+impl InstallVisibility {
+    pub fn is_visible(self, verbose: bool) -> bool {
+        self == Self::Default || verbose
+    }
+}
+
+const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 22] = [
+    BehavioralTagInfo {
+        tag: PseudoClass::Eval,
+        token: ":eval",
+        label: "eval()",
+        group: TagGroup::Source,
+        severity: Severity::High,
+        install_visibility: InstallVisibility::Default,
+        description: "Use `eval`, `Function()`, or `vm.runInThisContext`",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Network,
+        token: ":network",
+        label: "network access",
+        group: TagGroup::Source,
+        severity: Severity::Medium,
+        install_visibility: InstallVisibility::Default,
+        description: "Make outbound HTTP / WS connections",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Fs,
+        token: ":fs",
+        label: "filesystem access",
+        group: TagGroup::Source,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Touch the filesystem outside their own directory",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Shell,
+        token: ":shell",
+        label: "shell execution",
+        group: TagGroup::Source,
+        severity: Severity::High,
+        install_visibility: InstallVisibility::Default,
+        description: "Spawn shells (`spawn`, `exec`, `execSync`)",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::ChildProcess,
+        token: ":child-process",
+        label: "child processes",
+        group: TagGroup::Source,
+        severity: Severity::High,
+        install_visibility: InstallVisibility::Default,
+        description: "Use `child_process` (any form)",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Native,
+        token: ":native",
+        label: "native bindings",
+        group: TagGroup::Source,
+        severity: Severity::Medium,
+        install_visibility: InstallVisibility::Default,
+        description: "Ship native modules (`.node`, `.wasm`)",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Crypto,
+        token: ":crypto",
+        label: "cryptography",
+        group: TagGroup::Source,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Use cryptographic primitives",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::DynamicRequire,
+        token: ":dynamic-require",
+        label: "dynamic require",
+        group: TagGroup::Source,
+        severity: Severity::High,
+        install_visibility: InstallVisibility::Default,
+        description: "Use dynamic `require()` (variable arg)",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Env,
+        token: ":env",
+        label: "environment-variable access",
+        group: TagGroup::Source,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Read `process.env`",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Ws,
+        token: ":ws",
+        label: "WebSockets",
+        group: TagGroup::Source,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Use WebSockets",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Obfuscated,
+        token: ":obfuscated",
+        label: "obfuscated code",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Critical,
+        install_visibility: InstallVisibility::Default,
+        description: "Show signs of code obfuscation",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::HighEntropy,
+        token: ":high-entropy",
+        label: "high-entropy strings",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Contain high-entropy string blobs",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Minified,
+        token: ":minified",
+        label: "minified code",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Ship minified-only source",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Telemetry,
+        token: ":telemetry",
+        label: "telemetry",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Make telemetry / analytics calls",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::UrlStrings,
+        token: ":url-strings",
+        label: "URL literals",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Contain URL string literals",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Trivial,
+        token: ":trivial",
+        label: "trivial package",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Tiny — measured by AST node count",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Protestware,
+        token: ":protestware",
+        label: "protestware",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Critical,
+        install_visibility: InstallVisibility::Default,
+        description: "Match a curated list of known protest-license / sabotage packages",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::GitDep,
+        token: ":git-dep",
+        label: "git dependency",
+        group: TagGroup::Manifest,
+        severity: Severity::Medium,
+        install_visibility: InstallVisibility::Default,
+        description: "Installed from a git URL",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::HttpDep,
+        token: ":http-dep",
+        label: "HTTP dependency",
+        group: TagGroup::Manifest,
+        severity: Severity::Medium,
+        install_visibility: InstallVisibility::Default,
+        description: "Installed from an HTTP tarball URL",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::WildcardDep,
+        token: ":wildcard-dep",
+        label: "wildcard dependency",
+        group: TagGroup::Manifest,
+        severity: Severity::Medium,
+        install_visibility: InstallVisibility::Default,
+        description: "Declared with `*` or `latest`",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::Copyleft,
+        token: ":copyleft",
+        label: "copyleft license",
+        group: TagGroup::Manifest,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Copyleft license (GPL family)",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::NoLicense,
+        token: ":no-license",
+        label: "no license",
+        group: TagGroup::Manifest,
+        severity: Severity::Medium,
+        install_visibility: InstallVisibility::Default,
+        description: "No `license` field",
+    },
+];
 
 /// The full behavioral-tag catalog, in display order. Length is the
 /// authoritative tag count — every doc page that mentions "N tags"
 /// should derive its number from this rather than hardcoding it.
 pub fn behavioral_tag_catalog() -> Vec<BehavioralTagInfo> {
-    PseudoClass::all_behavioral()
-        .iter()
-        .map(|&pc| BehavioralTagInfo {
-            token: pc.display_name(),
-            group: pc
-                .group()
-                .expect("all_behavioral entries must have a group"),
-            severity: pc.severity(),
-            description: pc
-                .description()
-                .expect("all_behavioral entries must have a description"),
-        })
-        .collect()
+    BEHAVIORAL_TAG_POLICIES.to_vec()
+}
+
+pub fn behavioral_tag_policies() -> &'static [BehavioralTagInfo] {
+    &BEHAVIORAL_TAG_POLICIES
 }
 
 /// All recognized pseudo-class selectors.
@@ -284,33 +495,17 @@ impl PseudoClass {
         ]
     }
 
+    pub fn behavioral_policy(self) -> Option<&'static BehavioralTagInfo> {
+        BEHAVIORAL_TAG_POLICIES
+            .iter()
+            .find(|policy| policy.tag == self)
+    }
+
     /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the 22
     /// behavioral tags; `None` for state / severity / special selectors
     /// that aren't part of the behavioral analysis catalog.
     pub fn group(self) -> Option<TagGroup> {
-        match self {
-            Self::Eval
-            | Self::Network
-            | Self::Fs
-            | Self::Shell
-            | Self::ChildProcess
-            | Self::Native
-            | Self::Crypto
-            | Self::DynamicRequire
-            | Self::Env
-            | Self::Ws => Some(TagGroup::Source),
-            Self::Obfuscated
-            | Self::HighEntropy
-            | Self::Minified
-            | Self::Telemetry
-            | Self::UrlStrings
-            | Self::Trivial
-            | Self::Protestware => Some(TagGroup::SupplyChain),
-            Self::GitDep | Self::HttpDep | Self::WildcardDep | Self::Copyleft | Self::NoLicense => {
-                Some(TagGroup::Manifest)
-            }
-            _ => None,
-        }
+        self.behavioral_policy().map(|policy| policy.group)
     }
 
     /// Short user-facing description ("Detects" prose). Returned for
@@ -319,65 +514,16 @@ impl PseudoClass {
     /// drift test in `lpm-workflows` enforces parity, so editing this
     /// catalog is the single source of truth.
     pub fn description(self) -> Option<&'static str> {
-        Some(match self {
-            // Source behavior
-            Self::Eval => "Use `eval`, `Function()`, or `vm.runInThisContext`",
-            Self::Network => "Make outbound HTTP / WS connections",
-            Self::Fs => "Touch the filesystem outside their own directory",
-            Self::Shell => "Spawn shells (`spawn`, `exec`, `execSync`)",
-            Self::ChildProcess => "Use `child_process` (any form)",
-            Self::Native => "Ship native modules (`.node`, `.wasm`)",
-            Self::Crypto => "Use cryptographic primitives",
-            Self::DynamicRequire => "Use dynamic `require()` (variable arg)",
-            Self::Env => "Read `process.env`",
-            Self::Ws => "Use WebSockets",
-            // Supply chain
-            Self::Obfuscated => "Show signs of code obfuscation",
-            Self::HighEntropy => "Contain high-entropy string blobs",
-            Self::Minified => "Ship minified-only source",
-            Self::Telemetry => "Make telemetry / analytics calls",
-            Self::UrlStrings => "Contain URL string literals",
-            Self::Trivial => "Tiny — measured by AST node count",
-            Self::Protestware => {
-                "Match a curated list of known protest-license / sabotage packages"
-            }
-            // Manifest
-            Self::GitDep => "Installed from a git URL",
-            Self::HttpDep => "Installed from an HTTP tarball URL",
-            Self::WildcardDep => "Declared with `*` or `latest`",
-            Self::Copyleft => "Copyleft license (GPL family)",
-            Self::NoLicense => "No `license` field",
-            // State / severity / special — no catalog entry
-            _ => return None,
-        })
+        self.behavioral_policy().map(|policy| policy.description)
     }
 
     /// Severity tier for this pseudo-class (for --count grouping).
     pub fn severity(self) -> Severity {
+        if let Some(policy) = self.behavioral_policy() {
+            return policy.severity;
+        }
         match self {
-            Self::Obfuscated | Self::Protestware | Self::HighEntropy => Severity::Critical,
-            Self::Eval
-            | Self::ChildProcess
-            | Self::Shell
-            | Self::DynamicRequire
-            | Self::Scripts
-            | Self::Vulnerable => Severity::High,
-            Self::Network
-            | Self::GitDep
-            | Self::HttpDep
-            | Self::WildcardDep
-            | Self::NoLicense
-            | Self::Native => Severity::Medium,
-            Self::Fs
-            | Self::Crypto
-            | Self::Env
-            | Self::Ws
-            | Self::Telemetry
-            | Self::Trivial
-            | Self::Copyleft
-            | Self::Minified
-            | Self::UrlStrings => Severity::Info,
-            // Severity aliases return their own severity
+            Self::Scripts | Self::Vulnerable => Severity::High,
             Self::Critical => Severity::Critical,
             Self::High => Severity::High,
             Self::Medium => Severity::Medium,
@@ -389,6 +535,35 @@ impl PseudoClass {
             | Self::Npm
             | Self::Root
             | Self::WorkspaceRoot => Severity::Info,
+            _ => unreachable!("behavioral tags return from their shared policy"),
+        }
+    }
+
+    pub fn matches_analysis(self, analysis: &PackageAnalysis) -> bool {
+        match self {
+            Self::Eval => analysis.source.eval,
+            Self::Network => analysis.source.network,
+            Self::Fs => analysis.source.filesystem,
+            Self::Shell => analysis.source.shell,
+            Self::ChildProcess => analysis.source.child_process,
+            Self::Native => analysis.source.native_bindings,
+            Self::Crypto => analysis.source.crypto,
+            Self::DynamicRequire => analysis.source.dynamic_require,
+            Self::Env => analysis.source.environment_vars,
+            Self::Ws => analysis.source.web_socket,
+            Self::Obfuscated => analysis.supply_chain.obfuscated,
+            Self::HighEntropy => analysis.supply_chain.high_entropy_strings,
+            Self::Minified => analysis.supply_chain.minified,
+            Self::Telemetry => analysis.supply_chain.telemetry,
+            Self::UrlStrings => analysis.supply_chain.url_strings,
+            Self::Trivial => analysis.supply_chain.trivial,
+            Self::Protestware => analysis.supply_chain.protestware,
+            Self::GitDep => analysis.manifest.git_dependency,
+            Self::HttpDep => analysis.manifest.http_dependency,
+            Self::WildcardDep => analysis.manifest.wildcard_dependency,
+            Self::Copyleft => analysis.manifest.copyleft_license,
+            Self::NoLicense => analysis.manifest.no_license,
+            _ => false,
         }
     }
 }
@@ -1064,36 +1239,11 @@ fn is_root_selector(sel: &Selector) -> bool {
 
 /// Evaluate a pseudo-class against a package's data.
 fn matches_pseudo_class(pc: PseudoClass, pkg: &PackageContext<'_>) -> bool {
+    if pc.behavioral_policy().is_some() {
+        return tag_check(pkg, |analysis| pc.matches_analysis(analysis));
+    }
+
     match pc {
-        // Source tags
-        PseudoClass::Eval => tag_check(pkg, |a| a.source.eval),
-        PseudoClass::Network => tag_check(pkg, |a| a.source.network),
-        PseudoClass::Fs => tag_check(pkg, |a| a.source.filesystem),
-        PseudoClass::Shell => tag_check(pkg, |a| a.source.shell),
-        PseudoClass::ChildProcess => tag_check(pkg, |a| a.source.child_process),
-        PseudoClass::Native => tag_check(pkg, |a| a.source.native_bindings),
-        PseudoClass::Crypto => tag_check(pkg, |a| a.source.crypto),
-        PseudoClass::DynamicRequire => tag_check(pkg, |a| a.source.dynamic_require),
-        PseudoClass::Env => tag_check(pkg, |a| a.source.environment_vars),
-        PseudoClass::Ws => tag_check(pkg, |a| a.source.web_socket),
-
-        // Supply chain tags
-        PseudoClass::Obfuscated => tag_check(pkg, |a| a.supply_chain.obfuscated),
-        PseudoClass::HighEntropy => tag_check(pkg, |a| a.supply_chain.high_entropy_strings),
-        PseudoClass::Minified => tag_check(pkg, |a| a.supply_chain.minified),
-        PseudoClass::Telemetry => tag_check(pkg, |a| a.supply_chain.telemetry),
-        PseudoClass::UrlStrings => tag_check(pkg, |a| a.supply_chain.url_strings),
-        PseudoClass::Trivial => tag_check(pkg, |a| a.supply_chain.trivial),
-        PseudoClass::Protestware => tag_check(pkg, |a| a.supply_chain.protestware),
-
-        // Manifest tags
-        PseudoClass::GitDep => tag_check(pkg, |a| a.manifest.git_dependency),
-        PseudoClass::HttpDep => tag_check(pkg, |a| a.manifest.http_dependency),
-        PseudoClass::WildcardDep => tag_check(pkg, |a| a.manifest.wildcard_dependency),
-        PseudoClass::Copyleft => tag_check(pkg, |a| a.manifest.copyleft_license),
-        PseudoClass::NoLicense => tag_check(pkg, |a| a.manifest.no_license),
-
-        // State selectors
         PseudoClass::Scripts => pkg.has_scripts,
         PseudoClass::Built => pkg.is_built,
         PseudoClass::Vulnerable => pkg.is_vulnerable,
@@ -1103,40 +1253,22 @@ fn matches_pseudo_class(pc: PseudoClass, pkg: &PackageContext<'_>) -> bool {
         PseudoClass::Root => pkg.is_root,
         PseudoClass::WorkspaceRoot => pkg.is_workspace_root_dep,
 
-        // Severity aliases — expand to OR of constituent tags
-        PseudoClass::Critical => {
-            matches_pseudo_class(PseudoClass::Obfuscated, pkg)
-                || matches_pseudo_class(PseudoClass::Protestware, pkg)
-                || matches_pseudo_class(PseudoClass::HighEntropy, pkg)
-        }
+        PseudoClass::Critical => matches_behavioral_severity(pkg, Severity::Critical),
         PseudoClass::High => {
-            matches_pseudo_class(PseudoClass::Eval, pkg)
-                || matches_pseudo_class(PseudoClass::ChildProcess, pkg)
-                || matches_pseudo_class(PseudoClass::Shell, pkg)
-                || matches_pseudo_class(PseudoClass::DynamicRequire, pkg)
+            matches_behavioral_severity(pkg, Severity::High)
                 || matches_pseudo_class(PseudoClass::Scripts, pkg)
                 || matches_pseudo_class(PseudoClass::Vulnerable, pkg)
         }
-        PseudoClass::Medium => {
-            matches_pseudo_class(PseudoClass::Network, pkg)
-                || matches_pseudo_class(PseudoClass::GitDep, pkg)
-                || matches_pseudo_class(PseudoClass::HttpDep, pkg)
-                || matches_pseudo_class(PseudoClass::WildcardDep, pkg)
-                || matches_pseudo_class(PseudoClass::NoLicense, pkg)
-                || matches_pseudo_class(PseudoClass::Native, pkg)
-        }
-        PseudoClass::Info => {
-            matches_pseudo_class(PseudoClass::Fs, pkg)
-                || matches_pseudo_class(PseudoClass::Crypto, pkg)
-                || matches_pseudo_class(PseudoClass::Env, pkg)
-                || matches_pseudo_class(PseudoClass::Ws, pkg)
-                || matches_pseudo_class(PseudoClass::Telemetry, pkg)
-                || matches_pseudo_class(PseudoClass::Trivial, pkg)
-                || matches_pseudo_class(PseudoClass::Copyleft, pkg)
-                || matches_pseudo_class(PseudoClass::Minified, pkg)
-                || matches_pseudo_class(PseudoClass::UrlStrings, pkg)
-        }
+        PseudoClass::Medium => matches_behavioral_severity(pkg, Severity::Medium),
+        PseudoClass::Info => matches_behavioral_severity(pkg, Severity::Info),
+        _ => unreachable!("behavioral tags return before state and severity matching"),
     }
+}
+
+fn matches_behavioral_severity(pkg: &PackageContext<'_>, severity: Severity) -> bool {
+    behavioral_tag_policies()
+        .iter()
+        .any(|policy| policy.severity == severity && matches_pseudo_class(policy.tag, pkg))
 }
 
 /// Helper: check a behavioral tag from analysis data.
@@ -1258,6 +1390,45 @@ mod tests {
             let parsed = PseudoClass::from_name(name)
                 .unwrap_or_else(|| panic!("{token} must round-trip through from_name"));
             assert_eq!(parsed, pc, "{token} round-trip mismatch");
+        }
+    }
+
+    #[test]
+    fn behavioral_tag_policy_fields_are_complete_and_unique() {
+        let mut tags = HashSet::new();
+        let mut tokens = HashSet::new();
+        let mut labels = HashSet::new();
+
+        for policy in behavioral_tag_policies() {
+            assert!(tags.insert(policy.tag), "duplicate tag: {}", policy.token);
+            assert!(
+                tokens.insert(policy.token),
+                "duplicate token: {}",
+                policy.token
+            );
+            assert!(
+                labels.insert(policy.label),
+                "duplicate label: {}",
+                policy.label
+            );
+            assert_eq!(policy.token, policy.tag.display_name());
+            assert!(
+                !policy.label.trim().is_empty(),
+                "empty label: {}",
+                policy.token
+            );
+        }
+    }
+
+    #[test]
+    fn install_visibility_hides_only_info_behavioral_tags_by_default() {
+        for policy in behavioral_tag_policies() {
+            let expected = if policy.severity == Severity::Info {
+                InstallVisibility::VerboseOnly
+            } else {
+                InstallVisibility::Default
+            };
+            assert_eq!(policy.install_visibility, expected, "{}", policy.token);
         }
     }
 
@@ -1646,6 +1817,29 @@ mod tests {
 
         let sel_high = parse_selector(":high").unwrap();
         assert!(!matches(&sel_high, &pkg, &graph, &all));
+    }
+
+    #[test]
+    fn high_entropy_signal_is_info_and_does_not_match_critical() {
+        let mut analysis = default_analysis();
+        analysis.supply_chain.high_entropy_strings = true;
+        let pkg = make_pkg("encoded-assets", Some(&analysis));
+        let graph = empty_graph();
+        let all = HashMap::new();
+
+        assert_eq!(PseudoClass::HighEntropy.severity(), Severity::Info);
+        assert!(matches(
+            &parse_selector(":info").unwrap(),
+            &pkg,
+            &graph,
+            &all
+        ));
+        assert!(!matches(
+            &parse_selector(":critical").unwrap(),
+            &pkg,
+            &graph,
+            &all
+        ));
     }
 
     #[test]

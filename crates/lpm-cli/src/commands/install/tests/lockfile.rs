@@ -657,6 +657,30 @@ fn locked_root_selection_uses_the_persisted_exact_version() {
 }
 
 #[test]
+fn locked_root_selection_rejects_persisted_version_outside_requested_range() {
+    let source = "registry+https://registry.npmjs.org";
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "test-runner".to_string(),
+        version: "1.6.1".to_string(),
+        source: Some(source.to_string()),
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        "test-runner".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            package: "test-runner".to_string(),
+            version: "1.6.1".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+
+    assert!(
+        select_locked_root_package(&lockfile, "test-runner", "test-runner", "^3.2.6").is_none()
+    );
+}
+
+#[test]
 fn locked_root_selection_rejects_ambiguous_inference_when_exact_selection_is_absent() {
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.root_resolutions.clear();
