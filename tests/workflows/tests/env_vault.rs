@@ -2281,6 +2281,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
         "session-access-token",
         "vault-policy-123",
         "acme/repo",
+        "987654321",
         &["main", "release"],
         &["production"],
         &[".github/workflows/deploy.yml"],
@@ -2312,6 +2313,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main,release",
             "--env=production",
             "--workflow=.github/workflows/deploy.yml",
@@ -2349,6 +2351,69 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
     assert!(list_output.contains("repo:acme/repo"));
     assert!(list_output.contains("main, release") || list_output.contains("main,release"));
     assert!(list_output.contains("production"));
+}
+
+#[tokio::test]
+async fn env_oidc_allow_discovers_public_github_repository_id() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-discovery","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-discovery"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/repo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 987654321_u64,
+            "full_name": "acme/repo",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    mock.with_oidc_policy_create(
+        "session-access-token",
+        "vault-policy-discovery",
+        "acme/repo",
+        "987654321",
+        &["main"],
+        &["production"],
+        &[".github/workflows/deploy.yml"],
+        &["push"],
+    )
+    .await;
+    mock.with_escrow_upload_success("session-access-token", "vault-policy-discovery")
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "oidc-repository-discovery")
+        .args([
+            "env",
+            "oidc",
+            "allow",
+            "--provider=github",
+            "--repo=acme/repo",
+            "--branch=main",
+            "--env=production",
+            "--workflow=.github/workflows/deploy.yml",
+        ])
+        .output()
+        .expect("run GitHub OIDC policy creation with ID discovery");
+
+    assert!(
+        output.status.success(),
+        "OIDC repository-ID discovery failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[tokio::test]
@@ -2471,6 +2536,40 @@ async fn env_oidc_allow_github_rejects_empty_repository_segments_before_network(
             mock.server().received_requests().await.unwrap().is_empty(),
             "{repo:?} should fail before authentication or policy creation"
         );
+    }
+}
+
+#[tokio::test]
+async fn env_oidc_allow_github_rejects_malformed_repository_ids_before_network() {
+    for repository_id in ["", "0", "01", "abc", "123456789012345678901"] {
+        let project = TempProject::empty(r#"{"name":"github-oidc","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file("lpm.json", r#"{"vault":"vault-github-invalid-id"}"#);
+
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args([
+                "env",
+                "oidc",
+                "allow",
+                "--provider=github",
+                "--repo=owner/repository",
+                &format!("--repository-id={repository_id}"),
+                "--workflow=.github/workflows/deploy.yml",
+                "--env=production",
+            ])
+            .output()
+            .expect("run rejected GitHub OIDC repository ID");
+
+        assert!(
+            !output.status.success(),
+            "{repository_id:?} should be rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("repository ID must be a positive decimal integer of at most 20 digits")
+        );
+        assert!(mock.server().received_requests().await.unwrap().is_empty());
     }
 }
 
@@ -3026,6 +3125,7 @@ async fn env_oidc_allow_emits_json_response() {
         "session-access-token",
         "vault-policy-json-123",
         "acme/repo",
+        "987654321",
         &["main"],
         &["production"],
         &[".github/workflows/deploy.yml"],
@@ -3044,6 +3144,7 @@ async fn env_oidc_allow_emits_json_response() {
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=production",
             "--workflow=.github/workflows/deploy.yml",
@@ -3251,6 +3352,7 @@ async fn env_oidc_allow_fails_when_escrow_upload_fails() {
         "session-access-token",
         "vault-policy-456",
         "acme/repo",
+        "987654321",
         &["main"],
         &["preview"],
         &[".github/workflows/deploy.yml"],
@@ -3272,6 +3374,7 @@ async fn env_oidc_allow_fails_when_escrow_upload_fails() {
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=preview",
             "--workflow=.github/workflows/deploy.yml",
@@ -3322,6 +3425,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
         "session-access-token",
         "vault-policy-json-failure",
         "acme/repo",
+        "987654321",
         &["main"],
         &["preview"],
         &[".github/workflows/deploy.yml"],
@@ -3344,6 +3448,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=preview",
             "--workflow=.github/workflows/deploy.yml",
@@ -3393,6 +3498,7 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
         "session-access-token",
         "vault-policy-key-failure",
         "acme/repo",
+        "987654321",
         &["main"],
         &["preview"],
         &[".github/workflows/deploy.yml"],
@@ -3412,6 +3518,7 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=preview",
             "--workflow=.github/workflows/deploy.yml",
@@ -3465,6 +3572,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
         "access-from-refresh",
         "vault-policy-refresh-logout-all-123",
         "acme/repo",
+        "987654321",
         &["main"],
         &["preview"],
         &[".github/workflows/deploy.yml"],
@@ -3508,6 +3616,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=preview",
             "--workflow=.github/workflows/deploy.yml",
@@ -3621,6 +3730,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
         "access-from-refresh",
         "vault-policy-refresh-escrow-logout-123",
         "acme/repo",
+        "987654321",
         &["main"],
         &["preview"],
         &[".github/workflows/deploy.yml"],
@@ -3668,6 +3778,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=preview",
             "--workflow=.github/workflows/deploy.yml",
@@ -3784,6 +3895,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
         "access-from-refresh",
         "vault-policy-refresh-escrow-logout-all-123",
         "acme/repo",
+        "987654321",
         &["main"],
         &["preview"],
         &[".github/workflows/deploy.yml"],
@@ -3831,6 +3943,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=preview",
             "--workflow=.github/workflows/deploy.yml",
@@ -3941,6 +4054,7 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
         "session-access-token",
         "vault-policy-canonical-123",
         "acme/repo",
+        "987654321",
         &["main"],
         &["development"],
         &[".github/workflows/deploy.yml"],
@@ -3958,6 +4072,7 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
             "allow",
             "--provider=github",
             "--repo=acme/repo",
+            "--repository-id=987654321",
             "--branch=main",
             "--env=dev",
             "--workflow=.github/workflows/deploy.yml",
