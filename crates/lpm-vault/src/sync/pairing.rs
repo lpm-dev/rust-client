@@ -2,18 +2,13 @@ use super::http::{read_capped_error_text, sync_http_client_builder, url_path_seg
 
 /// Response from GET /api/vault/pair/:code (pending session).
 ///
-/// The CLI derives the browser-key fingerprint and the short authentication
-/// string locally from `browser_public_key` and the user-typed pairing code —
-/// trusting the server for those derived values would let a malicious server
-/// silently approve any pair, defeating the visual confirmation. Only the
-/// genuinely server-side facts (`device_label`, `created_at`,
-/// `created_from_ip`) are wire-supplied, and all three are optional so a
-/// newer CLI built against an older server still parses the response and
-/// simply omits the missing fields from the confirmation prompt.
+/// `protocol_version` is optional so a new CLI can identify and complete a
+/// session created by a protocol-v1 server during a rolling upgrade.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingSession {
     pub status: String,
+    pub protocol_version: Option<u8>,
     pub browser_public_key: Option<String>,
     pub device_label: Option<String>,
     pub created_at: Option<String>,
@@ -50,7 +45,27 @@ pub async fn get_pairing_session(
         .map_err(|e| format!("parse error: {e}"))
 }
 
-/// Approve a pairing session by sending the ECDH-wrapped wrapping key.
+/// Stage the protocol-v2 CLI public key before displaying the ECDH-derived SAS.
+pub async fn stage_pairing(
+    registry_url: &str,
+    auth_token: &str,
+    code: &str,
+    ephemeral_public_key: &str,
+) -> Result<(), String> {
+    post_pairing(
+        registry_url,
+        auth_token,
+        code,
+        serde_json::json!({
+            "action": "stage",
+            "ephemeralPublicKey": ephemeral_public_key,
+        }),
+        "staging",
+    )
+    .await
+}
+
+/// Approve a protocol-v2 pairing session after user SAS confirmation.
 pub async fn approve_pairing(
     registry_url: &str,
     auth_token: &str,
@@ -58,15 +73,52 @@ pub async fn approve_pairing(
     encrypted_wrapping_key: &str,
     ephemeral_public_key: &str,
 ) -> Result<(), String> {
+    post_pairing(
+        registry_url,
+        auth_token,
+        code,
+        serde_json::json!({
+            "action": "approve",
+            "encryptedWrappingKey": encrypted_wrapping_key,
+            "ephemeralPublicKey": ephemeral_public_key,
+        }),
+        "approval",
+    )
+    .await
+}
+
+/// Complete a session created by a protocol-v1 server.
+pub async fn approve_pairing_legacy(
+    registry_url: &str,
+    auth_token: &str,
+    code: &str,
+    encrypted_wrapping_key: &str,
+    ephemeral_public_key: &str,
+) -> Result<(), String> {
+    post_pairing(
+        registry_url,
+        auth_token,
+        code,
+        serde_json::json!({
+            "encryptedWrappingKey": encrypted_wrapping_key,
+            "ephemeralPublicKey": ephemeral_public_key,
+        }),
+        "approval",
+    )
+    .await
+}
+
+async fn post_pairing(
+    registry_url: &str,
+    auth_token: &str,
+    code: &str,
+    body: serde_json::Value,
+    operation: &str,
+) -> Result<(), String> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!("{registry_url}/api/vault/pair/{}", url_path_segment(code));
-
-    let body = serde_json::json!({
-        "encryptedWrappingKey": encrypted_wrapping_key,
-        "ephemeralPublicKey": ephemeral_public_key,
-    });
 
     let response = client
         .post(&url)
@@ -79,7 +131,7 @@ pub async fn approve_pairing(
 
     if !response.status().is_success() {
         let body = read_capped_error_text(response).await;
-        return Err(format!("approval failed: {body}"));
+        return Err(format!("{operation} failed: {body}"));
     }
 
     Ok(())
@@ -125,6 +177,7 @@ mod tests {
             .and(header("authorization", "Bearer auth-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "pending",
+                "protocolVersion": 2,
                 "browserPublicKey": "browser-key"
             })))
             .expect(1)
@@ -136,6 +189,7 @@ mod tests {
             .expect("pairing session should parse");
 
         assert_eq!(result.status, "pending");
+        assert_eq!(result.protocol_version, Some(2));
         assert_eq!(result.browser_public_key.as_deref(), Some("browser-key"));
     }
 
@@ -162,6 +216,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/vault/pair/ABC123"))
             .and(header("authorization", "Bearer auth-token"))
+            .and(body_string_contains("\"action\":\"approve\""))
             .and(body_string_contains(
                 "\"encryptedWrappingKey\":\"wrapped-key\"",
             ))
@@ -184,6 +239,29 @@ mod tests {
         )
         .await
         .expect("approve pairing should succeed");
+    }
+
+    #[tokio::test]
+    async fn stage_pairing_posts_only_the_cli_public_key() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/vault/pair/ABC123"))
+            .and(header("authorization", "Bearer auth-token"))
+            .and(body_string_contains("\"action\":\"stage\""))
+            .and(body_string_contains(
+                "\"ephemeralPublicKey\":\"ephemeral-key\"",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "confirming"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        stage_pairing(&server.uri(), "auth-token", "ABC123", "ephemeral-key")
+            .await
+            .expect("stage pairing should succeed");
     }
 
     #[tokio::test]

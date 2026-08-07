@@ -466,67 +466,119 @@ pub fn unwrap_key_from_sender(wrapped: &str, private_key: &[u8; 32]) -> Result<[
 // but not X25519. So device pairing uses P-256 for the key exchange,
 // while org sync continues to use X25519.
 
-/// Perform P-256 ECDH key exchange for dashboard device pairing.
-///
-/// 1. Generate ephemeral P-256 keypair
-/// 2. Import browser's P-256 public key (uncompressed SEC1 format, base64-encoded)
-/// 3. ECDH → shared secret (raw x-coordinate)
-/// 4. HKDF-SHA256(shared, salt=empty, info="lpm-dashboard-pair") → 32-byte derived key
-/// 5. AES-256-GCM encrypt the wrapping key with the derived key
-///
-/// Returns (encrypted_wrapping_key, ephemeral_public_key_b64).
-/// The encrypted key uses the standard `base64(iv):base64(ciphertext+tag)` format.
-/// The ephemeral public key is base64-encoded uncompressed SEC1 (65 bytes: 04 || x || y).
+const PAIRING_ENCRYPTION_INFO: &[u8] = b"lpm-dashboard-pair";
+const PAIRING_SAS_INFO: &[u8] = b"lpm-pair-sas-v2";
+
+/// Ephemeral P-256 exchange used by the two-phase browser pairing protocol.
+/// The same secret stages the public key, derives the displayed SAS, and
+/// wraps the key after the user confirms the SAS.
+pub struct P256PairingKeyExchange {
+    ephemeral_secret: p256::SecretKey,
+    browser_public: p256::PublicKey,
+    browser_public_bytes: Vec<u8>,
+    ephemeral_public_bytes: Vec<u8>,
+    ephemeral_public_key_b64: String,
+}
+
+impl P256PairingKeyExchange {
+    /// Create a fresh exchange bound to the browser's uncompressed SEC1 key.
+    pub fn new(browser_public_key_b64: &str) -> Result<Self, String> {
+        Self::from_secret(
+            browser_public_key_b64,
+            p256::SecretKey::random(&mut rand::thread_rng()),
+        )
+    }
+
+    fn from_secret(
+        browser_public_key_b64: &str,
+        ephemeral_secret: p256::SecretKey,
+    ) -> Result<Self, String> {
+        use elliptic_curve::sec1::ToEncodedPoint;
+
+        let browser_public_bytes = BASE64
+            .decode(browser_public_key_b64)
+            .map_err(|e| format!("browser public key decode: {e}"))?;
+        let browser_public = p256::PublicKey::from_sec1_bytes(&browser_public_bytes)
+            .map_err(|e| format!("invalid browser P-256 public key: {e}"))?;
+        let ephemeral_public_bytes = ephemeral_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let ephemeral_public_key_b64 = BASE64.encode(&ephemeral_public_bytes);
+
+        Ok(Self {
+            ephemeral_secret,
+            browser_public,
+            browser_public_bytes,
+            ephemeral_public_bytes,
+            ephemeral_public_key_b64,
+        })
+    }
+
+    /// Public key staged with the server before either side displays the SAS.
+    pub fn ephemeral_public_key_b64(&self) -> &str {
+        &self.ephemeral_public_key_b64
+    }
+
+    fn shared_secret(&self) -> p256::ecdh::SharedSecret {
+        p256::ecdh::diffie_hellman(
+            self.ephemeral_secret.to_nonzero_scalar(),
+            self.browser_public.as_affine(),
+        )
+    }
+
+    /// Wrap the user's key with a key domain-separated from the SAS output.
+    pub fn wrap_key(&self, wrapping_key: &[u8; 32]) -> Result<String, String> {
+        let shared_secret = self.shared_secret();
+        let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_slice());
+        let mut derived_key = [0u8; 32];
+        hk.expand(PAIRING_ENCRYPTION_INFO, &mut derived_key)
+            .expect("32-byte HKDF expansion is valid");
+        encrypt(&derived_key, wrapping_key)
+    }
+
+    /// Derive the eight-digit SAS from the ECDH secret, pairing code, and
+    /// ordered browser/CLI public keys.
+    pub fn short_authentication_string(&self, pairing_code: &str) -> String {
+        let mut salt = Vec::with_capacity(
+            PAIRING_SAS_INFO.len()
+                + pairing_code.len()
+                + self.browser_public_bytes.len()
+                + self.ephemeral_public_bytes.len()
+                + 3,
+        );
+        salt.extend_from_slice(PAIRING_SAS_INFO);
+        salt.push(0);
+        salt.extend_from_slice(pairing_code.as_bytes());
+        salt.push(0);
+        salt.extend_from_slice(&self.browser_public_bytes);
+        salt.push(0);
+        salt.extend_from_slice(&self.ephemeral_public_bytes);
+
+        let shared_secret = self.shared_secret();
+        let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret.raw_secret_bytes().as_slice());
+        let mut output = [0u8; 4];
+        hk.expand(PAIRING_SAS_INFO, &mut output)
+            .expect("4-byte HKDF expansion is valid");
+        let value = u32::from_be_bytes(output) % 100_000_000;
+        format!("{:04} {:04}", value / 10_000, value % 10_000)
+    }
+}
+
+/// Compatibility wrapper for protocol-v1 servers.
 pub fn p256_pair_wrap_key(
     wrapping_key: &[u8; 32],
     browser_public_key_b64: &str,
 ) -> Result<(String, String), String> {
-    use p256::ecdh::diffie_hellman;
-    use p256::{PublicKey as P256PublicKey, SecretKey as P256SecretKey};
-
-    // Decode browser's public key (uncompressed SEC1: 65 bytes starting with 0x04)
-    let browser_pub_bytes = BASE64
-        .decode(browser_public_key_b64)
-        .map_err(|e| format!("browser public key decode: {e}"))?;
-
-    let browser_pub = P256PublicKey::from_sec1_bytes(&browser_pub_bytes)
-        .map_err(|e| format!("invalid browser P-256 public key: {e}"))?;
-
-    // Generate ephemeral P-256 keypair
-    let eph_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let eph_public = eph_secret.public_key();
-
-    // ECDH → shared secret (raw scalar bytes)
-    let shared_secret = diffie_hellman(eph_secret.to_nonzero_scalar(), browser_pub.as_affine());
-
-    // HKDF-SHA256 with info="lpm-dashboard-pair" to derive 32-byte key
-    let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_slice());
-    let mut derived_key = [0u8; 32];
-    hk.expand(b"lpm-dashboard-pair", &mut derived_key)
-        .expect("HKDF expand failed");
-
-    // AES-256-GCM encrypt wrapping key with derived key
-    let encrypted = encrypt(&derived_key, wrapping_key)?;
-
-    // Encode ephemeral public key as uncompressed SEC1 → base64
-    use elliptic_curve::sec1::ToEncodedPoint;
-    let eph_pub_bytes = eph_public.to_encoded_point(false); // false = uncompressed
-    let eph_pub_b64 = BASE64.encode(eph_pub_bytes.as_bytes());
-
-    Ok((encrypted, eph_pub_b64))
+    let exchange = P256PairingKeyExchange::new(browser_public_key_b64)?;
+    let encrypted = exchange.wrap_key(wrapping_key)?;
+    Ok((encrypted, exchange.ephemeral_public_key_b64().to_string()))
 }
 
-/// Short authentication string ("match number") for pairing-flow
-/// confirmation. Both the dashboard and the CLI compute this independently
-/// from the same `(pairing_code, browser_public_key_b64)` inputs; the user
-/// glance-compares the two displays to detect a mid-flight key swap. The
-/// server never computes or transmits this value, so a compromised server
-/// cannot pre-compute matching pairs.
-///
-/// Output is always two ASCII digits (`"00"`..`"99"`). Hash domain string
-/// `"lpm-pair-sas"` separates this derivation from any future SHA-256 use
-/// over the same inputs.
-pub fn pairing_match_number(pairing_code: &str, browser_public_key_b64: &str) -> String {
+/// Protocol-v1 compatibility SAS used when an older server omits protocol
+/// metadata.
+pub fn legacy_pairing_match_number(pairing_code: &str, browser_public_key_b64: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-pair-sas:");
     hasher.update(pairing_code.as_bytes());
@@ -967,7 +1019,10 @@ mod tests {
     }
 
     #[test]
-    fn pairing_match_number_is_two_digits_for_random_inputs() {
+    fn protocol_v2_pairing_sas_is_eight_grouped_digits() {
+        use elliptic_curve::sec1::ToEncodedPoint;
+        use p256::SecretKey as P256SecretKey;
+
         for _ in 0..200 {
             let code: String = (0..6)
                 .map(|_| {
@@ -979,71 +1034,101 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            use rand::RngCore;
-            let mut pub_bytes = [0u8; 65];
-            rand::thread_rng().fill_bytes(&mut pub_bytes);
-            let pub_b64 = BASE64.encode(pub_bytes);
-            let out = pairing_match_number(&code, &pub_b64);
-            assert_eq!(out.len(), 2, "match number must be two characters");
+            let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+            let browser_public = BASE64.encode(
+                browser_secret
+                    .public_key()
+                    .to_encoded_point(false)
+                    .as_bytes(),
+            );
+            let exchange = P256PairingKeyExchange::new(&browser_public).unwrap();
+            let out = exchange.short_authentication_string(&code);
+            assert_eq!(
+                out.len(),
+                9,
+                "SAS must render as four digits, a space, and four digits"
+            );
+            assert_eq!(&out[4..5], " ");
             assert!(
-                out.chars().all(|c| c.is_ascii_digit()),
-                "match number must be ASCII digits, got {out:?}"
+                out.chars()
+                    .enumerate()
+                    .all(|(index, c)| index == 4 && c == ' ' || c.is_ascii_digit()),
+                "SAS must contain only ASCII digits and its grouping space, got {out:?}"
             );
         }
     }
 
     #[test]
-    fn pairing_match_number_is_deterministic_for_same_inputs() {
-        // Fixed bytes so the test is reproducible and the SAS value is pinned
-        // in case the derivation ever changes accidentally.
-        let pub_b64 = BASE64.encode([0xABu8; 65]);
-        let a = pairing_match_number("ABC123", &pub_b64);
-        let b = pairing_match_number("ABC123", &pub_b64);
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 2);
-    }
-
-    #[test]
-    fn pairing_match_number_changes_when_pubkey_changes() {
-        // Search a small space of distinct pubkeys to guarantee a discriminating
-        // pair exists. A 1-in-100 collision is acceptable for the SAS itself
-        // (it's a 2-digit short-authentication-string by design), but the
-        // *test* must not depend on a randomly-collision-free fixture pair.
-        let code = "ABC123";
-        let mut found_distinct = false;
-        for tag in 0u8..16 {
-            let mut bytes = [0u8; 65];
-            bytes[64] = tag;
-            let a = pairing_match_number(code, &BASE64.encode([0u8; 65]));
-            let b = pairing_match_number(code, &BASE64.encode(bytes));
-            if a != b {
-                found_distinct = true;
-                break;
-            }
-        }
-        assert!(
-            found_distinct,
-            "in 16 single-byte pubkey variants the SAS never moved — derivation is not key-sensitive"
+    fn protocol_v2_pairing_sas_is_deterministic_for_same_exchange() {
+        use elliptic_curve::sec1::ToEncodedPoint;
+        use p256::SecretKey as P256SecretKey;
+        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_public = BASE64.encode(
+            browser_secret
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes(),
         );
+        let exchange = P256PairingKeyExchange::new(&browser_public).unwrap();
+        let a = exchange.short_authentication_string("ABC123");
+        let b = exchange.short_authentication_string("ABC123");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 9);
     }
 
     #[test]
-    fn pairing_match_number_changes_when_code_changes() {
-        let pub_b64 = BASE64.encode([0xCDu8; 65]);
-        let mut found_distinct = false;
-        for tail in b'0'..=b'9' {
-            let code_a = "AAAAA0";
-            let code_b = format!("AAAAA{}", tail as char);
-            let a = pairing_match_number(code_a, &pub_b64);
-            let b = pairing_match_number(&code_b, &pub_b64);
-            if a != b {
-                found_distinct = true;
-                break;
-            }
-        }
-        assert!(
-            found_distinct,
-            "in 10 single-char code variants the SAS never moved — derivation is not code-sensitive"
+    fn protocol_v2_pairing_sas_matches_browser_web_crypto_vector() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let browser_public = "BHxVGUyrg6Aqn2QCLhpKWxgxAKl8Fzge710Mk4EjOXaWb+2NIrZXsDeew/kaCDoKLvQ74/ux0Jrp4ZdVoFq98Go=";
+        let cli_secret_bytes = URL_SAFE_NO_PAD
+            .decode("5dN15DKUl326VlUkWjxMwcreiXKehsYwgiuPDDbzr0c")
+            .unwrap();
+        let cli_secret = p256::SecretKey::from_slice(&cli_secret_bytes).unwrap();
+        let exchange = P256PairingKeyExchange::from_secret(browser_public, cli_secret).unwrap();
+
+        assert_eq!(
+            exchange.ephemeral_public_key_b64(),
+            "BMWROJBAxLxAGItA6oI/47ay4MyHaC8FRvahmthBlzyLNbhic0DB/NZyzCGIgjXhOBsBsPk0WcP2U32il8d2HZE="
+        );
+        assert_eq!(exchange.short_authentication_string("ABC123"), "9190 5834");
+    }
+
+    #[test]
+    fn protocol_v2_pairing_sas_changes_with_cli_ephemeral_secret() {
+        use elliptic_curve::sec1::ToEncodedPoint;
+        use p256::SecretKey as P256SecretKey;
+        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_public = BASE64.encode(
+            browser_secret
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let a = P256PairingKeyExchange::new(&browser_public)
+            .unwrap()
+            .short_authentication_string("ABC123");
+        let b = P256PairingKeyExchange::new(&browser_public)
+            .unwrap()
+            .short_authentication_string("ABC123");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn protocol_v2_pairing_sas_changes_when_code_changes() {
+        use elliptic_curve::sec1::ToEncodedPoint;
+        use p256::SecretKey as P256SecretKey;
+        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_public = BASE64.encode(
+            browser_secret
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let exchange = P256PairingKeyExchange::new(&browser_public).unwrap();
+        assert_ne!(
+            exchange.short_authentication_string("ABC123"),
+            exchange.short_authentication_string("ABC124")
         );
     }
 
