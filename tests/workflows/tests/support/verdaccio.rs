@@ -123,16 +123,15 @@ impl VerdaccioRegistry {
     }
 
     pub fn write_project_npmrc_with_token(&self, project_dir: &Path, token: &str) {
-        std::fs::write(
-            project_dir.join(".npmrc"),
+        super::write_private_file(
+            &project_dir.join(".npmrc"),
             format!(
                 "registry={}/\n//{}/:_authToken={}\nalways-auth=true\n",
                 self.url(),
                 self.host_port(),
                 token
             ),
-        )
-        .expect("failed to write project .npmrc for verdaccio");
+        );
     }
 
     pub fn publish_package(&self, name: &str, version: &str) {
@@ -280,16 +279,15 @@ impl VerdaccioRegistry {
             std::fs::write(&dest, contents).expect("failed to write verdaccio fixture file");
         }
 
-        std::fs::write(
-            pkg_dir.path().join(".npmrc"),
+        super::write_private_file(
+            &pkg_dir.path().join(".npmrc"),
             format!(
                 "registry={}/\n//{}/:_authToken={}\nalways-auth=true\n",
                 self.url(),
                 self.host_port(),
                 self.token()
             ),
-        )
-        .expect("failed to write verdaccio publish .npmrc");
+        );
 
         let npm_home = TempDir::new().expect("failed to create verdaccio npm home");
         let mut command = Command::new("npm");

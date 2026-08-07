@@ -145,7 +145,7 @@ async fn npmrc_authenticated_install_attaches_bearer_on_every_registry_request()
         .strip_prefix("http://")
         .or_else(|| server_url.strip_prefix("https://"))
         .unwrap_or(&server_url);
-    project.write_file(
+    project.write_private_file(
         ".npmrc",
         &format!("registry={server_url}/\n//{host_no_scheme}/:_authToken={TOKEN}\n"),
     );

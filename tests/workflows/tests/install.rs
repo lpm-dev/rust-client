@@ -9619,7 +9619,7 @@ async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
         "dependencies": { "private-pkg": "1.0.0" }
     }"#,
     );
-    project.write_file(
+    project.write_private_file(
         ".npmrc",
         &format!(
             "registry={registry_url}/\n//{registry_host}/:_authToken=test-token\nalways-auth=true\n"

@@ -79,11 +79,21 @@ fn dev_human_output_suppresses_nested_install_chatter_and_legacy_glyphs() {
     let project =
         TempProject::empty(r#"{"name":"dev-output","version":"1.0.0","dependencies":{}}"#);
     project.write_file(
+        "output-server.js",
+        r#"
+const net = require("net");
+const server = net.createServer();
+server.listen(Number(process.env.PORT), "127.0.0.1", () => {
+  setTimeout(() => server.close(() => process.exit(0)), 1200);
+});
+"#,
+    );
+    project.write_file(
         "lpm.json",
         r#"{
             "services": {
                 "web": {
-                    "command": "node -e \"setTimeout(() => process.exit(0), 300)\""
+                    "command": "node output-server.js"
                 }
             }
         }"#,
