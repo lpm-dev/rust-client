@@ -580,13 +580,13 @@ fn dev_restarts_dependents_after_restarting_dependency_is_ready() {
                     "db": {{
                         "command": "node restarting-db.js {db_port}",
                         "readyUrl": "http://127.0.0.1:{db_port}/health",
-                        "readyTimeout": 3,
+                        "readyTimeout": 15,
                         "restart": true
                     }},
                     "api": {{
-                        "command": "node dependent-api.js {api_port}",
+                        "command": "node dependent-api.js {api_port} {db_port}",
                         "readyUrl": "http://127.0.0.1:{api_port}/health",
-                        "readyTimeout": 3,
+                        "readyTimeout": 15,
                         "dependsOn": ["db"]
                     }}
                 }}
@@ -604,11 +604,17 @@ const count = fs.existsSync(countPath)
   ? Number(fs.readFileSync(countPath, 'utf8')) + 1
   : 1;
 fs.writeFileSync(countPath, String(count));
-const server = http.createServer((_request, response) => response.end('ok'));
+const server = http.createServer((request, response) => {
+  if (count === 1 && request.url === '/restart') {
+    response.end('restarting', () => server.close(() => process.exit(1)));
+    return;
+  }
+  response.end('ok');
+});
 server.listen(port, '127.0.0.1', () => {
-  const exitCode = count === 1 ? 1 : 0;
-  const lifetime = count === 1 ? 500 : 2500;
-  setTimeout(() => server.close(() => process.exit(exitCode)), lifetime);
+  if (count > 1) {
+    setTimeout(() => server.close(() => process.exit(0)), 2500);
+  }
 });
 "#,
     );
@@ -618,6 +624,7 @@ server.listen(port, '127.0.0.1', () => {
 const fs = require('fs');
 const http = require('http');
 const port = Number(process.argv[2]);
+const dbPort = Number(process.argv[3]);
 const countPath = 'api-start-count';
 const count = fs.existsSync(countPath)
   ? Number(fs.readFileSync(countPath, 'utf8')) + 1
@@ -625,8 +632,15 @@ const count = fs.existsSync(countPath)
 fs.writeFileSync(countPath, String(count));
 const server = http.createServer((_request, response) => response.end('ok'));
 server.listen(port, '127.0.0.1', () => {
-  const lifetime = count === 1 ? 3500 : 1000;
-  setTimeout(() => server.close(() => process.exit(0)), lifetime);
+  if (count === 1) {
+    const request = http.get(`http://127.0.0.1:${dbPort}/restart`, response => response.resume());
+    request.on('error', error => {
+      console.error(error);
+      process.exit(1);
+    });
+  } else {
+    setTimeout(() => server.close(() => process.exit(0)), 1000);
+  }
 });
 "#,
     );

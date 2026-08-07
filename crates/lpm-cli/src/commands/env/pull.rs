@@ -50,7 +50,7 @@ pub(super) async fn vars_pull(
             ));
         }
 
-        let (raw_json, version) = lpm_vault::sync::pull_org(
+        let pulled = lpm_vault::sync::pull_org(
             &registry_url,
             &auth_token,
             org_slug,
@@ -67,7 +67,7 @@ pub(super) async fn vars_pull(
                 String,
                 std::collections::HashMap<String, std::collections::HashMap<String, String>>,
             >,
-        >(&raw_json)
+        >(&pulled.raw_json)
         {
             if let Some(remote_envs) = wrapper.get("environments") {
                 let mut total = 0;
@@ -85,7 +85,7 @@ pub(super) async fn vars_pull(
                 total_keys = 0;
             }
         } else if let Ok(remote_secrets) =
-            serde_json::from_str::<std::collections::HashMap<String, String>>(&raw_json)
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&pulled.raw_json)
         {
             let mut merged = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
             merged.extend(remote_secrets);
@@ -99,7 +99,7 @@ pub(super) async fn vars_pull(
             return Err(LpmError::Script("failed to parse pulled vault data".into()));
         }
 
-        lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, version)
+        lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, pulled.version)
             .map_err(LpmError::Script)?;
 
         if json_output {
@@ -107,7 +107,8 @@ pub(super) async fn vars_pull(
                 "success": true,
                 "status": "pulled",
                 "org": org_slug,
-                "version": version,
+                "version": pulled.version,
+                "content_key_version": pulled.content_key_version,
                 "count": total_keys,
             }));
         } else {
@@ -116,7 +117,7 @@ pub(super) async fn vars_pull(
                 install_ui::bold(&total_keys.to_string()),
                 if total_keys == 1 { "" } else { "s" },
                 install_ui::bold(org_slug),
-                install_ui::bold(&version.to_string())
+                install_ui::bold(&pulled.version.to_string())
             ));
         }
         return Ok(());

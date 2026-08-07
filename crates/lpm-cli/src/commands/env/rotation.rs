@@ -5,19 +5,8 @@ pub(super) async fn env_rotate_key(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    if args
-        .iter()
-        .any(|arg| *arg == "--org" || arg.starts_with("--org="))
-    {
-        return Err(LpmError::Script(
-            "`lpm env rotate-key` supports personal vaults only; organization key rotation is not available"
-                .into(),
-        ));
-    }
-    if let Some(argument) = args.first() {
-        return Err(LpmError::Script(format!(
-            "unknown rotate-key argument: {argument}"
-        )));
+    if let Some(org_slug) = parse_rotate_key_org(args)? {
+        return env_rotate_org_key(&org_slug, project_dir, json_output).await;
     }
 
     lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
@@ -79,6 +68,114 @@ pub(super) async fn env_rotate_key(
             output::info(&format!("preserved: {}", environment_names.join(", ")));
         }
     }
+    Ok(())
+}
+
+fn parse_rotate_key_org(args: &[&str]) -> Result<Option<String>, LpmError> {
+    match args {
+        [] => Ok(None),
+        ["--org", slug] if !slug.trim().is_empty() => Ok(Some((*slug).to_string())),
+        ["--org", ..] => Err(LpmError::Script(
+            "`lpm env rotate-key --org` requires exactly one organization slug".into(),
+        )),
+        [argument] => {
+            if let Some(slug) = argument.strip_prefix("--org=")
+                && !slug.trim().is_empty()
+            {
+                return Ok(Some(slug.to_string()));
+            }
+            Err(LpmError::Script(format!(
+                "unknown rotate-key argument: {argument}"
+            )))
+        }
+        [argument, ..] => Err(LpmError::Script(format!(
+            "unknown rotate-key argument: {argument}"
+        ))),
+    }
+}
+
+async fn env_rotate_org_key(
+    org_slug: &str,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+
+    let registry_url = lpm_common::resolve_lpm_registry_url();
+    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
+    let private_key = ensure_sharing_key_ready_for_org_op(
+        &registry_url,
+        &auth_token,
+        "rotate the organization content key",
+    )
+    .await?;
+    let pulled = lpm_vault::sync::pull_org(
+        &registry_url,
+        &auth_token,
+        org_slug,
+        &vault_id,
+        &private_key,
+    )
+    .await
+    .map_err(LpmError::Script)?;
+    let environment_names =
+        validate_rotation_payload(&pulled.raw_json).map_err(LpmError::Script)?;
+    let expected_content_key_version =
+        pulled.content_key_version.checked_add(1).ok_or_else(|| {
+            LpmError::Script("organization content-key version cannot advance further".into())
+        })?;
+
+    if !json_output {
+        output::info("rotating organization env encryption key...");
+    }
+
+    let result = lpm_vault::sync::push_org_with_keys(
+        &registry_url,
+        &auth_token,
+        org_slug,
+        &vault_id,
+        &pulled.raw_json,
+        Some(pulled.version),
+        None,
+    )
+    .await
+    .map_err(LpmError::Script)?;
+    let version = result
+        .version
+        .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
+    let content_key_version = result.content_key_version.ok_or_else(|| {
+        LpmError::Script("rotation response omitted the new content-key version".into())
+    })?;
+    if content_key_version != expected_content_key_version {
+        return Err(LpmError::Script(
+            "rotation response did not advance the organization content-key version".into(),
+        ));
+    }
+
+    lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, version)
+        .map_err(LpmError::Script)?;
+
+    if json_output {
+        super::response::print_json_value(&serde_json::json!({
+            "success": true,
+            "status": "rotated",
+            "org": org_slug,
+            "version": version,
+            "content_key_version": content_key_version,
+            "previous_content_key_version": pulled.content_key_version,
+            "environment_count": environment_names.len(),
+            "environments": environment_names,
+        }));
+    } else {
+        output::success_line(crate::install_ui::terminal_line!(
+            "organization env encryption key rotated for {} (content-key version {})",
+            install_ui::bold(org_slug),
+            install_ui::bold(&content_key_version.to_string()),
+        ));
+    }
+
     Ok(())
 }
 
@@ -353,4 +450,68 @@ pub(super) async fn env_rotate_sharing_key(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rotate_key_org;
+
+    #[test]
+    fn parse_rotate_key_org_returns_none_for_personal_rotation() {
+        let parsed = parse_rotate_key_org(&[]).expect("personal rotation arguments should parse");
+
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn parse_rotate_key_org_accepts_separate_slug_argument() {
+        let parsed = parse_rotate_key_org(&["--org", "acme"])
+            .expect("separate organization slug should parse");
+
+        assert_eq!(parsed.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn parse_rotate_key_org_accepts_equals_slug_argument() {
+        let parsed =
+            parse_rotate_key_org(&["--org=acme"]).expect("equals organization slug should parse");
+
+        assert_eq!(parsed.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn parse_rotate_key_org_rejects_missing_slug() {
+        let error = parse_rotate_key_org(&["--org"])
+            .expect_err("organization flag without a slug must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one organization slug")
+        );
+    }
+
+    #[test]
+    fn parse_rotate_key_org_rejects_duplicate_org_flags() {
+        let error = parse_rotate_key_org(&["--org", "acme", "--org", "other"])
+            .expect_err("duplicate organization flags must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one organization slug")
+        );
+    }
+
+    #[test]
+    fn parse_rotate_key_org_rejects_unknown_argument() {
+        let error = parse_rotate_key_org(&["--force"])
+            .expect_err("unsupported rotation arguments must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown rotate-key argument: --force")
+        );
+    }
 }
