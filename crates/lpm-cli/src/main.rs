@@ -12,6 +12,7 @@ mod commands;
 pub mod constraints;
 pub mod doctor_catalog;
 pub mod editor_skills;
+mod elevation;
 pub mod engine_check;
 pub mod engine_strict_config;
 mod global_blocked_set;

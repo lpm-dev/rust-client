@@ -318,7 +318,7 @@ pub(crate) enum ManagedProtectionAction {
 }
 
 impl ManagedProtectionAction {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::EnableMonitor => "enable-monitor",

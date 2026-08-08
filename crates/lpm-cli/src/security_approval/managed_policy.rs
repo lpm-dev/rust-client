@@ -391,32 +391,23 @@ pub(crate) fn apply_managed_protection_with_privilege(
         return apply_managed_protection_action(action);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
+        #[cfg(unix)]
         if crate::privilege::is_effective_root() {
             return apply_managed_protection_action(action);
         }
 
         let before = load_managed_protection_status()?;
-        let exe = std::env::current_exe().map_err(LpmError::Io)?;
-        let status = std::process::Command::new("/usr/bin/sudo")
-            .arg("-p")
-            .arg("Password for LPM security-policy update: ")
-            .arg("--")
-            .arg(exe)
-            .arg("internal-security-policy")
-            .arg(action.as_str())
-            .status()
-            .map_err(|error| {
-                LpmError::Registry(format!(
-                    "could not run the privileged security-policy helper: {error}"
-                ))
-            })?;
-        if !status.success() {
-            return Err(LpmError::Registry(format!(
-                "privileged security-policy helper exited with {status}"
-            )));
-        }
+        let args = [
+            "internal-security-policy".to_string(),
+            action.as_str().to_string(),
+        ];
+        crate::elevation::run_current_exe_helper(
+            &args,
+            "Password for LPM security-policy update: ",
+            "security-policy",
+        )?;
 
         let after = load_managed_protection_status()?;
         let change = if before == after {
@@ -435,7 +426,7 @@ pub(crate) fn apply_managed_protection_with_privilege(
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     apply_managed_protection_action(action)
 }
 

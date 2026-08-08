@@ -120,6 +120,7 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Security",
     "SelfUpdate",
     "InternalHostsFile",
+    "InternalSecurityPolicy",
     "InternalTsTransform",
     "InternalUpdateCheck",
     "Completions",
