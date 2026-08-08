@@ -45,6 +45,8 @@ brew tap lpm-dev/lpm && brew install lpm
 curl -fsSL https://cli.lpm.dev/install | sh
 ```
 
+Run the installer and all LPM CLI user commands without `sudo`. LPM CLI elevates only the specific operating-system operation that requires administrator access.
+
 The npm package is a dependency-free launcher for the native Rust binary. npm installs the matching platform package through `optionalDependencies`; the approved `postinstall` verifier checks the native binary and wires the global command where the platform allows it.
 
 If your npm version or policy does not require explicit script approval, this also works:

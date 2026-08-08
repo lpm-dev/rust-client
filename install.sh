@@ -12,6 +12,12 @@
 
 set -e
 
+if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  echo "LPM CLI does not support installation through sudo." >&2
+  echo "Run the installer without sudo. It installs into your user home directory." >&2
+  exit 1
+fi
+
 REPO="lpm-dev/rust-client"
 INSTALL_DIR="$HOME/.lpm/bin"
 BINARY_NAME="lpm"

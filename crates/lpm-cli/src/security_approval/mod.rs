@@ -37,8 +37,12 @@ pub use approval::{
 };
 pub use helpers::format_unlock_duration;
 pub(crate) use managed_policy::{
-    install_managed_firewall_protection, load_managed_protection_status,
-    remove_managed_firewall_protection,
+    apply_managed_protection_with_privilege, load_managed_protection_status,
+    run_internal_managed_protection,
+};
+#[cfg(test)]
+pub(crate) use managed_policy::{
+    install_managed_firewall_protection, remove_managed_firewall_protection,
 };
 #[allow(unused_imports)]
 pub use paths::security_dir;
@@ -49,6 +53,7 @@ pub use posture::{
 };
 pub use project_state::authorized_capability_user_bound;
 pub use signed_store::repair_security_state;
+pub(crate) use types::ManagedProtectionAction;
 #[allow(unused_imports)]
 pub use types::{
     ApprovalScope, ApprovalSource, AuthorizedPosture, AuthorizedPostureView,

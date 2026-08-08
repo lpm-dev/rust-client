@@ -18,6 +18,15 @@ const defaultWrapperRoot = path.resolve(scriptDir, "..");
 const defaultValidateTimeoutMs = 30_000;
 const commands = ["lpm", "lpx"];
 
+export class SudoInstallError extends Error {
+  constructor() {
+    super(
+      "LPM CLI does not support npm installation through sudo. Run the npm install command without sudo.",
+    );
+    this.name = "SudoInstallError";
+  }
+}
+
 export function installNativeBinaries(options = {}) {
   const wrapperRoot = options.wrapperRoot ?? defaultWrapperRoot;
   const platform = options.platform ?? process.platform;
@@ -30,6 +39,13 @@ export function installNativeBinaries(options = {}) {
   const logFn = options.logFn ?? console.log;
   const validateTimeoutMs =
     options.validateTimeoutMs ?? defaultValidateTimeoutMs;
+  const geteuid =
+    options.geteuid ??
+    (typeof process.geteuid === "function" ? () => process.geteuid() : undefined);
+
+  if (isSudoTransition({ geteuid, env })) {
+    throw new SudoInstallError();
+  }
 
   const key = platformKey(platform, arch, libc);
   const spec = PLATFORMS[key];
@@ -87,6 +103,19 @@ export function installNativeBinaries(options = {}) {
 
   logFn(`[lpm] Installed native binary from ${spec.pkg}`);
   return { status: "installed", platform: key, package: spec.pkg, optimized };
+}
+
+export function isSudoTransition({ geteuid, env = process.env } = {}) {
+  if (typeof geteuid !== "function" || geteuid() !== 0) {
+    return false;
+  }
+
+  const sudoUser = env.SUDO_USER;
+  return (
+    typeof sudoUser === "string" &&
+    sudoUser.trim() !== "" &&
+    sudoUser.trim() !== "root"
+  );
 }
 
 export function validateNativeBinary(
@@ -220,6 +249,11 @@ function unlinkIfExists(filePath, fsModule) {
 }
 
 function printInstallError(error) {
+  if (error instanceof SudoInstallError) {
+    console.error(`[lpm] ${error.message}`);
+    return;
+  }
+
   if (error instanceof LpmWrapperError) {
     console.error(`[lpm] ${error.message}`);
     for (const hint of error.hints) {

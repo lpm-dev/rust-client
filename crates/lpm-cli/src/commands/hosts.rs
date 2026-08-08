@@ -3,8 +3,6 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use std::io::IsTerminal;
 use std::path::Path;
-#[cfg(unix)]
-use std::process::Command;
 
 pub fn run(action: &str, json_output: bool, yes: bool) -> Result<(), LpmError> {
     match action {
@@ -20,6 +18,7 @@ pub fn run_internal_hosts_file(
     block_id: Option<&str>,
     hosts: &[String],
 ) -> Result<(), LpmError> {
+    crate::privilege::require_effective_root("hosts-file")?;
     let path = lpm_runner::local_domains::system_hosts_file_path();
     match action {
         "upsert" => {
@@ -170,38 +169,12 @@ fn run_privileged_hosts_helper(
     hosts: &[String],
 ) -> Result<(), String> {
     let args = internal_hosts_file_args(action, block_id, hosts);
-    #[cfg(unix)]
-    {
-        let exe = std::env::current_exe()
-            .map_err(|err| format!("resolve current executable for sudo helper: {err}"))?;
-        let mut command = Command::new("sudo");
-        command
-            .arg("-p")
-            .arg("Password for LPM hosts-file update: ")
-            .arg(exe)
-            .args(&args);
-
-        let status = command
-            .status()
-            .map_err(|err| format!("run sudo hosts-file helper: {err}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("sudo hosts-file helper exited with {status}"))
-        }
-    }
-    #[cfg(windows)]
-    {
-        let exe = std::env::current_exe().map_err(|err| {
-            format!("resolve current executable for Windows elevated hosts-file helper: {err}")
-        })?;
-        run_windows_elevated_hosts_helper(&exe, &args)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = args;
-        Err("privileged hosts-file helper is not available on this platform".into())
-    }
+    crate::elevation::run_current_exe_helper(
+        &args,
+        "Password for LPM hosts-file update: ",
+        "hosts-file",
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn internal_hosts_file_args(action: &str, block_id: Option<&str>, hosts: &[String]) -> Vec<String> {
@@ -217,166 +190,6 @@ fn internal_hosts_file_args(action: &str, block_id: Option<&str>, hosts: &[Strin
         args.push(host.clone());
     }
     args
-}
-
-#[cfg(windows)]
-fn run_windows_elevated_hosts_helper(exe: &Path, args: &[String]) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_CANCELLED, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, INFINITE, WaitForSingleObject,
-    };
-    use windows_sys::Win32::UI::Shell::{
-        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    struct ProcessHandle(HANDLE);
-
-    impl ProcessHandle {
-        fn raw(&self) -> HANDLE {
-            self.0
-        }
-    }
-
-    impl Drop for ProcessHandle {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    CloseHandle(self.0);
-                }
-            }
-        }
-    }
-
-    let verb = wide_str("runas");
-    let file: Vec<u16> = exe
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let parameters = wide_str(&quote_windows_args(args));
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
-        lpVerb: verb.as_ptr(),
-        lpFile: file.as_ptr(),
-        lpParameters: parameters.as_ptr(),
-        nShow: SW_SHOWNORMAL,
-        ..Default::default()
-    };
-
-    let launched = unsafe {
-        // SAFETY: `info` points to a fully initialized SHELLEXECUTEINFOW. The UTF-16
-        // buffers are null-terminated and live until ShellExecuteExW returns.
-        ShellExecuteExW(&mut info)
-    };
-    if launched == 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(ERROR_CANCELLED as i32) {
-            return Err("Windows hosts-file elevation was cancelled".into());
-        }
-        return Err(format!(
-            "run Windows elevated hosts-file helper with UAC: {err}"
-        ));
-    }
-    if info.hProcess.is_null() {
-        return Err("Windows elevated hosts-file helper did not return a process handle".into());
-    }
-
-    let process = ProcessHandle(info.hProcess);
-    let wait = unsafe {
-        // SAFETY: `process.raw()` is the process handle returned by ShellExecuteExW
-        // with SEE_MASK_NOCLOSEPROCESS and remains owned by `process` for this wait.
-        WaitForSingleObject(process.raw(), INFINITE)
-    };
-    if wait == WAIT_FAILED {
-        return Err(format!(
-            "wait for Windows elevated hosts-file helper: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if wait != WAIT_OBJECT_0 {
-        return Err(format!(
-            "wait for Windows elevated hosts-file helper returned 0x{wait:08X}"
-        ));
-    }
-
-    let mut exit_code = 1u32;
-    let got_exit = unsafe {
-        // SAFETY: `process.raw()` is still a valid process handle after the wait, and
-        // `exit_code` is a valid out pointer for GetExitCodeProcess.
-        GetExitCodeProcess(process.raw(), &mut exit_code)
-    };
-    if got_exit == 0 {
-        return Err(format!(
-            "read Windows elevated hosts-file helper exit code: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if exit_code == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "Windows elevated hosts-file helper exited with code {exit_code}"
-        ))
-    }
-}
-
-#[cfg(windows)]
-fn wide_str(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(windows)]
-fn quote_windows_args(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| quote_windows_arg(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(any(test, windows))]
-fn quote_windows_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return "\"\"".to_string();
-    }
-    if !arg
-        .bytes()
-        .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\\'))
-    {
-        return arg.to_string();
-    }
-
-    let mut quoted = String::with_capacity(arg.len() + 2);
-    quoted.push('"');
-    let mut backslashes = 0usize;
-    for ch in arg.chars() {
-        if ch == '\\' {
-            backslashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            for _ in 0..(backslashes * 2 + 1) {
-                quoted.push('\\');
-            }
-            quoted.push('"');
-            backslashes = 0;
-            continue;
-        }
-        for _ in 0..backslashes {
-            quoted.push('\\');
-        }
-        backslashes = 0;
-        quoted.push(ch);
-    }
-    for _ in 0..(backslashes * 2) {
-        quoted.push('\\');
-    }
-    quoted.push('"');
-    quoted
 }
 
 fn validated_block_id(block_id: Option<&str>) -> Result<&str, LpmError> {
@@ -545,19 +358,5 @@ mod tests {
                 "api.localhost",
             ]
         );
-    }
-
-    #[test]
-    fn windows_arg_quoting_escapes_spaces_quotes_and_trailing_backslashes() {
-        assert_eq!(quote_windows_arg("plain"), "plain");
-        assert_eq!(
-            quote_windows_arg(r#"C:\Program Files\LPM\lpm-rs.exe"#),
-            r#""C:\Program Files\LPM\lpm-rs.exe""#
-        );
-        assert_eq!(
-            quote_windows_arg(r#"host"alias.test"#),
-            r#""host\"alias.test""#
-        );
-        assert_eq!(quote_windows_arg(r#"C:\Temp\"#), r#""C:\Temp\\""#);
     }
 }

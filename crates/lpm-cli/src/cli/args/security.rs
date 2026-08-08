@@ -2,6 +2,12 @@ use crate::commands;
 use clap::{Args, Subcommand};
 
 #[derive(Args)]
+pub(crate) struct InternalSecurityPolicyArgs {
+    #[arg(value_enum)]
+    pub(crate) action: crate::security_approval::ManagedProtectionAction,
+}
+
+#[derive(Args)]
 pub(crate) struct ConfigArgs {
     /// Action: get, set, delete, list, scripts, triage, sandbox,
     /// sigstore, signatures, trust-policy, typosquat, firewall, integrity,

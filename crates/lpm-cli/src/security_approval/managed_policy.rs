@@ -1,4 +1,5 @@
 use super::prelude::*;
+use super::types::ManagedProtectionAction;
 
 #[cfg(any(debug_assertions, test))]
 fn managed_policy_path_override() -> Option<PathBuf> {
@@ -141,7 +142,7 @@ fn validate_managed_policy_parent_authority(_path: &Path) -> Result<(), LpmError
 
 fn privileged_policy_io_error(path: &Path, action: &str, err: std::io::Error) -> LpmError {
     LpmError::Registry(format!(
-        "could not {action} managed security policy {}: {err}. Re-run with administrator privileges.",
+        "could not {action} managed security policy {}: {err}",
         path.display()
     ))
 }
@@ -358,6 +359,75 @@ pub(crate) fn remove_managed_firewall_protection() -> Result<ManagedProtectionRe
         change: ManagedProtectionChange::Disabled,
         status: load_managed_protection_status()?,
     })
+}
+
+fn apply_managed_protection_action(
+    action: ManagedProtectionAction,
+) -> Result<ManagedProtectionReport, LpmError> {
+    match action {
+        ManagedProtectionAction::EnableMonitor => install_managed_firewall_protection(
+            crate::npm_firewall_config::NpmFirewallMode::Monitor,
+        ),
+        ManagedProtectionAction::EnableEnforce => install_managed_firewall_protection(
+            crate::npm_firewall_config::NpmFirewallMode::Enforce,
+        ),
+        ManagedProtectionAction::Disable => remove_managed_firewall_protection(),
+    }
+}
+
+pub(crate) fn run_internal_managed_protection(
+    action: ManagedProtectionAction,
+) -> Result<(), LpmError> {
+    crate::privilege::require_effective_root("security-policy")?;
+    apply_managed_protection_action(action)?;
+    Ok(())
+}
+
+pub(crate) fn apply_managed_protection_with_privilege(
+    action: ManagedProtectionAction,
+) -> Result<ManagedProtectionReport, LpmError> {
+    #[cfg(debug_assertions)]
+    if managed_policy_path_override().is_some() {
+        return apply_managed_protection_action(action);
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        #[cfg(unix)]
+        if crate::privilege::is_effective_root() {
+            return apply_managed_protection_action(action);
+        }
+
+        let before = load_managed_protection_status()?;
+        let args = [
+            "internal-security-policy".to_string(),
+            action.as_str().to_string(),
+        ];
+        crate::elevation::run_current_exe_helper(
+            &args,
+            "Password for LPM security-policy update: ",
+            "security-policy",
+        )?;
+
+        let after = load_managed_protection_status()?;
+        let change = if before == after {
+            ManagedProtectionChange::Unchanged
+        } else {
+            match action {
+                ManagedProtectionAction::EnableMonitor | ManagedProtectionAction::EnableEnforce => {
+                    ManagedProtectionChange::Enabled
+                }
+                ManagedProtectionAction::Disable => ManagedProtectionChange::Disabled,
+            }
+        };
+        Ok(ManagedProtectionReport {
+            change,
+            status: after,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    apply_managed_protection_action(action)
 }
 
 #[cfg(all(unix, not(any(debug_assertions, test))))]
