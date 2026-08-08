@@ -309,6 +309,25 @@ pub enum ManagedProtectionChange {
     Unchanged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub(crate) enum ManagedProtectionAction {
+    EnableMonitor,
+    EnableEnforce,
+    Disable,
+}
+
+impl ManagedProtectionAction {
+    #[cfg(unix)]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnableMonitor => "enable-monitor",
+            Self::EnableEnforce => "enable-enforce",
+            Self::Disable => "disable",
+        }
+    }
+}
+
 impl ManagedProtectionChange {
     pub const fn as_str(self) -> &'static str {
         match self {

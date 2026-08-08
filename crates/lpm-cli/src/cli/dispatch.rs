@@ -2,7 +2,7 @@ use miette::Result;
 
 use crate::{
     auth, auth_storage_notice, color_policy, commands, engine_check, install_state,
-    lpm_skills_config, output, provenance_fetch, release_age_config, save_spec,
+    lpm_skills_config, output, privilege, provenance_fetch, release_age_config, save_spec,
     script_policy_config, tool_pin_validation, update_check,
 };
 
@@ -52,9 +52,14 @@ pub(crate) fn run() -> Result<()> {
     // check. The install-state check also tries an mtime short-circuit
     // first, which skips both the lpm.lock read and the SHA-256 pass
     // when the manifest/lockfile mtimes are unchanged.
-    if let Some(fast_lane) = install_state::argv_qualifies_for_fast_lane()
-        && let Ok(cwd) = std::env::current_dir()
-    {
+    if let Some(fast_lane) = install_state::argv_qualifies_for_fast_lane() {
+        if let Err(error) = privilege::ensure_user_invocation_allowed() {
+            exit_with_lpm_error(&error, fast_lane.json, lpm_common::DEFAULT_REGISTRY_URL);
+        }
+
+        let Ok(cwd) = std::env::current_dir() else {
+            return run_async_main();
+        };
         // Start timing BEFORE any disk work, matching install.rs which
         // captures `start` at function entry before `check_install_state`.
         let start = std::time::Instant::now();
@@ -128,6 +133,10 @@ pub(crate) fn run() -> Result<()> {
     // are polled by the thread driving `block_on`. Give both thread classes
     // the same explicit budget so debug frames and large workspaces cannot
     // overflow Tokio's 2 MiB default worker stack.
+    run_async_main()
+}
+
+fn run_async_main() -> Result<()> {
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
@@ -230,6 +239,38 @@ async fn async_main() -> Result<()> {
         let _ = cmd.print_help();
         std::process::exit(2);
     };
+
+    if let Err(error) = privilege::ensure_command_allowed(&command) {
+        let registry_url = cli
+            .registry
+            .as_deref()
+            .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+        exit_with_lpm_error(&error, cli.json, registry_url);
+    }
+
+    let privileged_helper_result = match &command {
+        Commands::InternalHostsFile(args) => Some(commands::hosts::run_internal_hosts_file(
+            &args.action,
+            args.block_id.as_deref(),
+            &args.hosts,
+        )),
+        Commands::InternalSecurityPolicy(args) => Some(
+            crate::security_approval::run_internal_managed_protection(args.action),
+        ),
+        _ => None,
+    };
+    if let Some(result) = privileged_helper_result {
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let registry_url = cli
+                    .registry
+                    .as_deref()
+                    .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
+                exit_with_lpm_error(&error, cli.json, registry_url);
+            }
+        }
+    }
 
     if let Commands::InternalTsTransform(args) = &command {
         let result = if args.persistent {
@@ -2935,11 +2976,9 @@ async fn async_main() -> Result<()> {
             })
             .await
         }
-        Commands::InternalHostsFile(args) => commands::hosts::run_internal_hosts_file(
-            &args.action,
-            args.block_id.as_deref(),
-            &args.hosts,
-        ),
+        Commands::InternalHostsFile(_) | Commands::InternalSecurityPolicy(_) => {
+            unreachable!("privileged helpers return before normal command startup")
+        }
         Commands::Tunnel(args) => {
             let network_args::TunnelArgs {
                 action,

@@ -322,6 +322,15 @@ pub enum LpmError {
     )]
     AuthRequired,
 
+    #[error("LPM does not support user commands through sudo")]
+    #[diagnostic(
+        code(lpm::sudo_not_supported),
+        help(
+            "Run LPM without sudo. LPM elevates only the specific OS operation that requires administrator access. To manage root's own LPM state, use a root session with SUDO_USER unset."
+        )
+    )]
+    SudoNotSupported,
+
     #[error("session expired or revoked")]
     #[diagnostic(
         code(lpm::session_expired),
@@ -703,6 +712,7 @@ impl LpmError {
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
+            LpmError::SudoNotSupported => "sudo_not_supported",
             LpmError::SessionExpired => "session_expired",
             LpmError::UnsupportedAuthSource { .. } => "unsupported_auth_source",
             LpmError::CredentialImportUnavailable { .. } => "credential_import_unavailable",
@@ -971,6 +981,7 @@ mod tests {
             LpmError::SelfUpdateRateLimited("x".into()),
             LpmError::SecurityFloor("x".into()),
             LpmError::SecurityApprovalStore("x".into()),
+            LpmError::SudoNotSupported,
         ];
 
         for variant in &variants {
@@ -1045,6 +1056,10 @@ mod tests {
     #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(
+            LpmError::SudoNotSupported.error_code(),
+            "sudo_not_supported"
+        );
         assert_eq!(
             LpmError::OtpRequired {
                 command: "lpm token-rotate",

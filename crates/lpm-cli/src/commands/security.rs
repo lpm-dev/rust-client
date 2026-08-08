@@ -34,15 +34,6 @@ pub(crate) enum ProtectFirewallMode {
     Enforce,
 }
 
-impl ProtectFirewallMode {
-    fn as_npm_firewall_mode(self) -> crate::npm_firewall_config::NpmFirewallMode {
-        match self {
-            Self::Monitor => crate::npm_firewall_config::NpmFirewallMode::Monitor,
-            Self::Enforce => crate::npm_firewall_config::NpmFirewallMode::Enforce,
-        }
-    }
-}
-
 impl SecurityScopeSelector {
     fn as_str(self) -> &'static str {
         match self {
@@ -536,9 +527,15 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 Ok(())
             }
             ProtectCmd::Enable { firewall } => {
-                let report = security_approval::install_managed_firewall_protection(
-                    firewall.as_npm_firewall_mode(),
-                )?;
+                let action = match firewall {
+                    ProtectFirewallMode::Monitor => {
+                        security_approval::ManagedProtectionAction::EnableMonitor
+                    }
+                    ProtectFirewallMode::Enforce => {
+                        security_approval::ManagedProtectionAction::EnableEnforce
+                    }
+                };
+                let report = security_approval::apply_managed_protection_with_privilege(action)?;
                 if json_output {
                     print_protect_report_json(&report);
                 } else {
@@ -548,7 +545,9 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
                 Ok(())
             }
             ProtectCmd::Disable => {
-                let report = security_approval::remove_managed_firewall_protection()?;
+                let report = security_approval::apply_managed_protection_with_privilege(
+                    security_approval::ManagedProtectionAction::Disable,
+                )?;
                 if json_output {
                     print_protect_report_json(&report);
                 } else {

@@ -11,6 +11,24 @@ use support::auth_state::write_credentials_store;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
 
+#[cfg(unix)]
+#[test]
+fn sudo_rejection_has_a_stable_json_error_contract() {
+    let project = TempProject::empty(r#"{"name":"sudo-json-test","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .env("LPM_TEST_ASSUME_EUID_ROOT", "1")
+        .env("SUDO_USER", "alice")
+        .args(["schema", "lpm.json", "--json"])
+        .output()
+        .expect("run sudo-policy JSON command");
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "sudo_not_supported");
+    assert_eq!(envelope["error"]["code"], "SUDO_NOT_SUPPORTED");
+    insta::assert_json_snapshot!("sudo_not_supported_error", envelope);
+}
+
 // ─── lpm info --json ───────────────────────────────────────────────
 
 #[tokio::test]

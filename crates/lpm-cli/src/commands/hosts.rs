@@ -20,6 +20,7 @@ pub fn run_internal_hosts_file(
     block_id: Option<&str>,
     hosts: &[String],
 ) -> Result<(), LpmError> {
+    crate::privilege::require_effective_root("hosts-file")?;
     let path = lpm_runner::local_domains::system_hosts_file_path();
     match action {
         "upsert" => {

@@ -11,7 +11,10 @@ import {
   platformKey,
   resolveNativeBinary,
 } from "../bin/native.js";
-import { installNativeBinaries } from "../scripts/install-binary.js";
+import {
+  installNativeBinaries,
+  isSudoTransition,
+} from "../scripts/install-binary.js";
 
 const repoPackageDir = path.dirname(fileURLToPath(import.meta.url));
 const wrapperRoot = path.resolve(repoPackageDir, "..");
@@ -192,6 +195,51 @@ test("unsupported platforms fail before package resolution", () => {
       }),
     /Unsupported platform: freebsd-x64/,
   );
+});
+
+test("postinstall identifies only root transitions from a non-root sudo user", () => {
+  assert.equal(
+    isSudoTransition({ geteuid: () => 0, env: { SUDO_USER: "alice" } }),
+    true,
+  );
+  assert.equal(
+    isSudoTransition({ geteuid: () => 501, env: { SUDO_USER: "alice" } }),
+    false,
+  );
+  assert.equal(isSudoTransition({ geteuid: () => 0, env: {} }), false);
+  assert.equal(
+    isSudoTransition({ geteuid: () => 0, env: { SUDO_USER: "root" } }),
+    false,
+  );
+});
+
+test("postinstall rejects sudo before platform resolution or native staging", () => {
+  assert.throws(
+    () =>
+      installNativeBinaries({
+        platform: "freebsd",
+        arch: "x64",
+        geteuid: () => 0,
+        env: { SUDO_USER: "alice" },
+      }),
+    /does not support npm installation through sudo/,
+  );
+});
+
+test("postinstall allows an intentional root session without SUDO_USER", () => {
+  const result = installNativeBinaries({
+    platform: "freebsd",
+    arch: "x64",
+    geteuid: () => 0,
+    env: {},
+    logFn() {},
+  });
+
+  assert.deepEqual(result, {
+    status: "unsupported",
+    platform: "freebsd-x64",
+    optimized: [],
+  });
 });
 
 test("lpm wrapper forwards argv to LPM_BINARY_PATH", () => {

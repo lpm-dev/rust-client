@@ -36,6 +36,7 @@ pub mod patch_engine;
 pub mod patch_state;
 pub mod path_onboarding;
 pub mod precedence;
+mod privilege;
 mod prompt;
 mod provenance;
 mod provenance_bundle;

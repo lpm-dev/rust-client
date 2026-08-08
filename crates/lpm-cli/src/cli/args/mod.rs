@@ -584,6 +584,10 @@ pub(crate) enum Commands {
     #[command(name = "internal-hosts-file", hide = true)]
     InternalHostsFile(network::InternalHostsFileArgs),
 
+    /// Hidden sudo helper for the fixed OS-managed security policy.
+    #[command(name = "internal-security-policy", hide = true)]
+    InternalSecurityPolicy(security::InternalSecurityPolicyArgs),
+
     /// Hidden OXC transform helper for the LPM TypeScript runtime.
     #[command(name = "internal-ts-transform", hide = true)]
     InternalTsTransform(build::InternalTsTransformArgs),

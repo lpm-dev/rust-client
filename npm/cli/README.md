@@ -46,5 +46,9 @@ can validate the native binary during installation:
 npm install -g @lpm-registry/cli --allow-scripts=@lpm-registry/cli
 ```
 
+Do not run this install with `sudo`. Configure a user-writable npm global
+prefix, or use the Homebrew or standalone installer. Run all LPM CLI user
+commands without `sudo`.
+
 Other install methods are documented at
 [github.com/lpm-dev/rust-client](https://github.com/lpm-dev/rust-client).

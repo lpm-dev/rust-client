@@ -323,6 +323,17 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "suggested_action": "Run the same lpm install command again.",
             }
         }),
+        lpm_common::LpmError::SudoNotSupported => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": "sudo_not_supported",
+            "error": {
+                "code": "SUDO_NOT_SUPPORTED",
+                "message": error.to_string(),
+                "suggested_action": "Run LPM without sudo. LPM elevates only the specific OS operation that requires administrator access.",
+                "root_session_guidance": "To manage root's own LPM state, use a root session with SUDO_USER unset.",
+            }
+        }),
         _ => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -554,6 +565,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         }
         lpm_common::LpmError::AuthRequired => {
             diagnostic_lines("Authentication required", None, error)
+        }
+        lpm_common::LpmError::SudoNotSupported => {
+            diagnostic_lines("Sudo is not supported", None, error)
         }
         lpm_common::LpmError::SessionExpired => {
             diagnostic_lines("Session expired or revoked", None, error)

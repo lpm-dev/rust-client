@@ -27,6 +27,7 @@
 # Run from anywhere: `sh tests/install-sh/run.sh`.
 
 set -e
+unset SUDO_USER
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
@@ -138,7 +139,7 @@ make_happy_fixture() {
 build_clean_path() {
   CLEAN_PATH_DIR="$(mktemp -d)"
   # Tools install.sh shells out to during the integrity flow.
-  for tool in sh uname mktemp rm basename grep awk curl sed cat tr chmod mv mkdir ln; do
+  for tool in sh id uname mktemp rm basename grep awk curl sed cat tr chmod mv mkdir ln; do
     src="$(command -v "$tool" 2>/dev/null || true)"
     if [ -n "$src" ]; then
       ln -s "$src" "$CLEAN_PATH_DIR/$tool"
@@ -178,7 +179,23 @@ build_clean_path
 sh -n "$INSTALL_SH" || fail "install.sh has shell syntax errors"
 pass "install.sh shell syntax"
 
-# ── Case 2: Linux x64 musl selects the musl artifact ──────────
+# ── Case 2: sudo transition fails before installer activity ───
+sudo_path_dir="$(mktemp -d)"
+sudo_home_dir="$(mktemp -d)"
+ln -s "$(command -v sh)" "$sudo_path_dir/sh"
+printf '#!/bin/sh\n[ "$1" = "-u" ] || exit 2\necho 0\n' > "$sudo_path_dir/id"
+chmod +x "$sudo_path_dir/id"
+actual_exit=0
+out="$(PATH="$sudo_path_dir" HOME="$sudo_home_dir" SUDO_USER="alice" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+[ "$actual_exit" -ne 0 ] || fail "sudo install should fail before installation"
+echo "$out" | grep -q "does not support installation through sudo" \
+  || fail "sudo failure did not explain the policy: $out"
+[ ! -e "$sudo_home_dir/.lpm" ] \
+  || fail "sudo failure created files before rejecting the install"
+rm -rf "$sudo_path_dir" "$sudo_home_dir"
+pass "sudo transition fails before installer activity"
+
+# ── Case 3: Linux x64 musl selects the musl artifact ──────────
 rm -f "$CLEAN_PATH_DIR/uname"
 printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n' > "$CLEAN_PATH_DIR/uname"
 chmod +x "$CLEAN_PATH_DIR/uname"
@@ -220,7 +237,7 @@ pass "Linux ARM64 musl does not select the GNU artifact"
 
 # ── Case 4: fail-closed when sha256sum/shasum missing ──────────
 empty_bin="$(mktemp -d)"
-for tool in sh uname mktemp rm basename grep awk curl sed cat tr; do
+for tool in sh id uname mktemp rm basename grep awk curl sed cat tr; do
   src="$(command -v "$tool" 2>/dev/null || true)"
   if [ -n "$src" ]; then
     ln -s "$src" "$empty_bin/$tool"

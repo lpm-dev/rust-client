@@ -442,6 +442,8 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("CI_JOB_TOKEN");
     cmd.remove_env("LPM_TEST_VAULT_WRAPPING_KEY_ERROR");
     cmd.remove_env("LPM_VAULT_ID");
+    cmd.remove_env("LPM_TEST_ASSUME_EUID_ROOT");
+    cmd.remove_env("SUDO_USER");
 
     // Clear CI-environment vars that GitHub Actions / GitLab inject into
     // every job. Without this, OIDC tests running ON GitHub Actions pick the
