@@ -3620,6 +3620,88 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/release.rs", 2)],
         last_audited_at: "2026-07-03",
     },
+    SurfaceV2 {
+        id: 167,
+        scenarios: 4,
+        failure_modes_tested: &[
+            "package, scope, and exact-version selectors",
+            "duplicate add is a byte-stable no-op",
+            "version range rejected without mutation",
+            "malformed existing list rejected without mutation",
+        ],
+        failure_modes_known: &[
+            "concurrent external package.json editor",
+            "package.json write permission failure",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 4)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 168,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "exact-version removal preserves name and scope selectors",
+            "final-selector removal preserves other lpm fields",
+        ],
+        failure_modes_known: &["selector absent from the project list"],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 2)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 169,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "JSON list returns package, scope, and exact-version selectors",
+            "missing package.json fails with a manifest-specific error",
+        ],
+        failure_modes_known: &["malformed existing list"],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 2)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 170,
+        scenarios: 4,
+        failure_modes_tested: &[
+            "package, scope, and exact-version selectors persist as a TOML array",
+            "duplicate add is a byte-stable no-op",
+            "version range rejected without creating config",
+            "legacy scalar rejected without mutation",
+        ],
+        failure_modes_known: &[
+            "concurrent generic config writer",
+            "config write permission failure",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 4)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 171,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "exact-version removal preserves name and scope selectors",
+            "final-selector removal preserves unrelated config",
+        ],
+        failure_modes_known: &["selector absent from the user list"],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 2)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 172,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "JSON list returns package, scope, and exact-version selectors",
+            "missing config reports an empty list without creating a file",
+        ],
+        failure_modes_known: &["malformed existing list"],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 2)],
+        last_audited_at: "2026-08-09",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

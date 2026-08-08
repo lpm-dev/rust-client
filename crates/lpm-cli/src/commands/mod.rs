@@ -54,6 +54,7 @@ pub mod query;
 pub mod rebuild;
 pub mod registry_reads;
 pub mod release;
+mod release_age_exclude;
 pub mod remote_cache;
 pub mod remove;
 pub mod resolve;

@@ -129,9 +129,9 @@ pub(crate) struct InstallArgs {
     #[arg(long, value_name = "DUR")]
     pub(crate) min_release_age: Option<String>,
 
-    /// Exempt one exact package name from minimumReleaseAge for this install only.
-    /// Repeatable. Aliases must be excluded by their canonical target name.
-    #[arg(long, value_name = "PKG")]
+    /// Exempt a package name, exact version, or @scope/* from minimumReleaseAge.
+    /// Repeatable. Alias selectors must use their canonical target name.
+    #[arg(long, value_name = "SELECTOR")]
     pub(crate) min_release_age_exclude: Vec<String>,
 
     /// Skip the provenance-drift check for this

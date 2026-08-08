@@ -1374,3 +1374,210 @@ fn config_get_missing_key_uses_slim_warning() {
         "config get must not use cliclack gutter output, got:\n{stderr}",
     );
 }
+
+#[test]
+fn config_release_age_exclude_add_accepts_supported_selectors_and_writes_a_toml_array() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(&project, "registry = \"https://registry.example.test\"\n");
+    let selectors = ["react", "@company/*", "react@1.0.0"];
+
+    for selector in selectors {
+        let output = lpm(&project)
+            .args(["--json", "config", "release-age-exclude", "add", selector])
+            .output()
+            .expect("failed to add user release-age exclusion");
+        assert!(
+            output.status.success(),
+            "user exclusion add failed for {selector}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let content = std::fs::read_to_string(config_path(&project)).unwrap();
+    let config: toml::Value = toml::from_str(&content).unwrap();
+    assert_eq!(
+        config["minimum-release-age-exclude"],
+        toml::Value::Array(
+            ["react", "@company/*", "react@1.0.0"]
+                .into_iter()
+                .map(|entry| toml::Value::String(entry.to_string()))
+                .collect()
+        )
+    );
+    assert_eq!(
+        config["registry"].as_str(),
+        Some("https://registry.example.test")
+    );
+
+    let list = lpm(&project)
+        .args(["--json", "config", "release-age-exclude", "list"])
+        .output()
+        .expect("failed to list user release-age exclusions");
+    assert!(list.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "config release-age-exclude",
+      "scope": "user",
+      "action": "list",
+      "changed": false,
+      "exclusions": [
+        "react",
+        "@company/*",
+        "react@1.0.0"
+      ]
+    }
+    "###);
+}
+
+#[test]
+fn config_release_age_exclude_add_reports_a_duplicate_without_rewriting_config() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\nminimum-release-age-exclude = [\"react\"]\n",
+    );
+    let path = config_path(&project);
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "config", "release-age-exclude", "add", "react"])
+        .output()
+        .expect("failed to repeat user release-age exclusion");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "config release-age-exclude",
+      "scope": "user",
+      "action": "add",
+      "selector": "react",
+      "changed": false,
+      "exclusions": [
+        "react"
+      ]
+    }
+    "###);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn config_release_age_exclude_remove_only_removes_the_complete_selector() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "minimum-release-age-exclude = [\"react\", \"react@1.0.0\", \"@company/*\"]\n",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "config",
+            "release-age-exclude",
+            "remove",
+            "react@1.0.0",
+        ])
+        .output()
+        .expect("failed to remove user release-age exclusion");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "config release-age-exclude",
+      "scope": "user",
+      "action": "remove",
+      "selector": "react@1.0.0",
+      "changed": true,
+      "exclusions": [
+        "react",
+        "@company/*"
+      ]
+    }
+    "###);
+}
+
+#[test]
+fn config_release_age_exclude_remove_last_selector_deletes_only_the_config_key() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\nminimum-release-age-exclude = [\"react\"]\n",
+    );
+
+    let output = lpm(&project)
+        .args(["config", "release-age-exclude", "remove", "react"])
+        .output()
+        .expect("failed to remove final user release-age exclusion");
+
+    assert!(output.status.success());
+    let content = std::fs::read_to_string(config_path(&project)).unwrap();
+    let config: toml::Value = toml::from_str(&content).unwrap();
+    assert!(config.get("minimum-release-age-exclude").is_none());
+    assert_eq!(
+        config["registry"].as_str(),
+        Some("https://registry.example.test")
+    );
+}
+
+#[test]
+fn config_release_age_exclude_rejects_ranges_without_creating_config() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["config", "release-age-exclude", "add", "react@^1.0.0"])
+        .output()
+        .expect("failed to run invalid user release-age exclusion");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exact semantic version"),
+        "error must explain exact-version selectors: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!config_path(&project).exists());
+}
+
+#[test]
+fn config_release_age_exclude_rejects_the_legacy_scalar_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(&project, "minimum-release-age-exclude = \"react\"\n");
+    let path = config_path(&project);
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["config", "release-age-exclude", "add", "lodash"])
+        .output()
+        .expect("failed to inspect scalar user release-age exclusion");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must be an array of strings"),
+        "error must identify the required list shape: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn config_release_age_exclude_list_without_config_reports_an_empty_user_list() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "release-age-exclude", "list"])
+        .output()
+        .expect("failed to list user release-age exclusions without config");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["exclusions"], serde_json::json!([]));
+    assert!(!config_path(&project).exists());
+}

@@ -1,7 +1,7 @@
 //! Coverage audit guard for the command-surface matrix.
 //!
 //! This is the lightweight 65.1 enforcement pass:
-//! - the corrected 137-row surface inventory is checked into the repo
+//! - the complete command-surface inventory is checked into the repo
 //! - every top-level `Commands` variant is pinned against `cli/args/mod.rs`
 //! - every surface marked as covered must still point at live evidence files
 //!

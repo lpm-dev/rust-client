@@ -103,6 +103,7 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
+/// - `lpm config release-age-exclude` owns the user-wide package exclusion list.
 /// - `lpm config lpm-skills` owns `auto-install-lpm-skills = true | false`
 ///   for package-published skills from `@lpm.dev/*` packages.
 /// - `lpm config source-analysis` owns
@@ -158,6 +159,28 @@ pub async fn run(
     }
     if action == "release-age-policy" {
         return run_release_age_policy_wizard(&config_path, set, json_output).await;
+    }
+    if action == "release-age-exclude" {
+        let operation =
+            crate::commands::release_age_exclude::parse_config_operation(key, value, set)?;
+        if operation.mutates() {
+            return lpm_common::with_exclusive_lock_async(
+                config_path.with_file_name(".config.lock"),
+                async {
+                    crate::commands::release_age_exclude::run_user(
+                        &config_path,
+                        operation,
+                        json_output,
+                    )
+                },
+            )
+            .await;
+        }
+        return crate::commands::release_age_exclude::run_user(
+            &config_path,
+            operation,
+            json_output,
+        );
     }
     if action == "lpm-skills" {
         return run_lpm_skills_wizard(&config_path, set, json_output).await;
@@ -493,7 +516,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, source-analysis, lpm-dev, lpm-skills, lpm-insights"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, release-age-exclude, source-analysis, lpm-dev, lpm-skills, lpm-insights"
             )));
         }
     }

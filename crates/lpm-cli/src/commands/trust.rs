@@ -1,9 +1,6 @@
 //! — `lpm trust` user-facing subcommands.
 //!
-//! Two subcommands, both operating on
-//! `<project_dir>/package.json > lpm > trustedDependencies` plus (for
-//! `diff`) `<project_dir>/.lpm/trust-snapshot.json` written by the
-//! install pipeline.
+//! Project trust inspection and mutation commands.
 //!
 //! ## `lpm trust diff`
 //!
@@ -76,6 +73,37 @@ pub enum TrustCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Manage project release-age exclusions in package.json.
+    ReleaseAgeExclude {
+        #[command(subcommand)]
+        action: ReleaseAgeExcludeCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReleaseAgeExcludeCmd {
+    /// Add a package, exact version, or @scope/* exclusion.
+    Add {
+        /// Package selector to exclude from the release-age gate.
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a package, exact version, or @scope/* exclusion.
+    Remove {
+        /// Package selector to remove from the exclusion list.
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List project release-age exclusions.
+    List {
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Entry point called from main.rs.
@@ -86,6 +114,40 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Resul
         }
         TrustCmd::Prune { yes, dry_run, json } => {
             run_prune(project_dir, *yes, *dry_run, json_output || *json).await
+        }
+        TrustCmd::ReleaseAgeExclude { action } => {
+            let (operation, local_json) = match action {
+                ReleaseAgeExcludeCmd::Add { selector, json } => (
+                    crate::commands::release_age_exclude::ReleaseAgeExcludeOperation::Add(selector),
+                    *json,
+                ),
+                ReleaseAgeExcludeCmd::Remove { selector, json } => (
+                    crate::commands::release_age_exclude::ReleaseAgeExcludeOperation::Remove(
+                        selector,
+                    ),
+                    *json,
+                ),
+                ReleaseAgeExcludeCmd::List { json } => (
+                    crate::commands::release_age_exclude::ReleaseAgeExcludeOperation::List,
+                    *json,
+                ),
+            };
+            let json = json_output || local_json;
+            if operation.mutates() {
+                lpm_common::with_exclusive_lock_async(
+                    lpm_common::project_install_lock(project_dir),
+                    async {
+                        crate::commands::release_age_exclude::run_project(
+                            project_dir,
+                            operation,
+                            json,
+                        )
+                    },
+                )
+                .await
+            } else {
+                crate::commands::release_age_exclude::run_project(project_dir, operation, json)
+            }
         }
     }
 }

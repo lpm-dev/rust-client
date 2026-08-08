@@ -1,4 +1,4 @@
-//! Workflow tests for `lpm trust diff` and `lpm trust prune`.
+//! Workflow tests for project trust management.
 //!
 //! Pure manifest-and-snapshot operations: no registry, no network. Each
 //! test seeds `package.json > lpm > trustedDependencies` plus (for diff)
@@ -701,5 +701,252 @@ fn trust_prune_without_lockfile_fails_with_helpful_message() {
     assert!(
         stderr.contains("lpm.lock") || stderr.contains("lpm install"),
         "stderr must guide the user to run lpm install first, got:\n{stderr}"
+    );
+}
+
+// ─── lpm trust release-age-exclude ───────────────────────────────────
+
+#[test]
+fn trust_release_age_exclude_add_accepts_package_scope_and_exact_version_selectors() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "release-age-trust",
+  "version": "1.0.0",
+  "scripts": { "test": "vitest" },
+  "lpm": { "minimumReleaseAge": 172800 }
+}"#,
+    );
+    let selectors = ["react", "@company/*", "react@1.0.0"];
+    let mut envelopes = Vec::with_capacity(selectors.len());
+
+    for selector in selectors {
+        let output = lpm(&project)
+            .args(["--json", "trust", "release-age-exclude", "add", selector])
+            .output()
+            .expect("failed to add project release-age exclusion");
+        assert!(
+            output.status.success(),
+            "project exclusion add failed for {selector}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        envelopes.push(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .expect("add output must be valid JSON"),
+        );
+    }
+
+    insta::assert_json_snapshot!(envelopes, @r###"
+    [
+      {
+        "success": true,
+        "schema_version": 1,
+        "command": "trust release-age-exclude",
+        "scope": "project",
+        "action": "add",
+        "selector": "react",
+        "changed": true,
+        "exclusions": [
+          "react"
+        ]
+      },
+      {
+        "success": true,
+        "schema_version": 1,
+        "command": "trust release-age-exclude",
+        "scope": "project",
+        "action": "add",
+        "selector": "@company/*",
+        "changed": true,
+        "exclusions": [
+          "react",
+          "@company/*"
+        ]
+      },
+      {
+        "success": true,
+        "schema_version": 1,
+        "command": "trust release-age-exclude",
+        "scope": "project",
+        "action": "add",
+        "selector": "react@1.0.0",
+        "changed": true,
+        "exclusions": [
+          "react",
+          "@company/*",
+          "react@1.0.0"
+        ]
+      }
+    ]
+    "###);
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["lpm"]["minimumReleaseAgeExclude"],
+        json!(["react", "@company/*", "react@1.0.0"])
+    );
+    assert_eq!(manifest["lpm"]["minimumReleaseAge"], json!(172800));
+    assert_eq!(manifest["scripts"]["test"], json!("vitest"));
+
+    let list = lpm(&project)
+        .args(["--json", "trust", "release-age-exclude", "list"])
+        .output()
+        .expect("failed to list project release-age exclusions");
+    assert!(list.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "trust release-age-exclude",
+      "scope": "project",
+      "action": "list",
+      "changed": false,
+      "exclusions": [
+        "react",
+        "@company/*",
+        "react@1.0.0"
+      ]
+    }
+    "###);
+}
+
+#[test]
+fn trust_release_age_exclude_duplicate_add_is_a_byte_stable_noop() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAgeExclude":["react"]}}"#,
+    );
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "release-age-exclude", "add", "react"])
+        .output()
+        .expect("failed to repeat project release-age exclusion");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_release_age_exclude_remove_matches_the_complete_selector_only() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAgeExclude":["react","react@1.0.0","@company/*"]}}"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "trust",
+            "release-age-exclude",
+            "remove",
+            "react@1.0.0",
+        ])
+        .output()
+        .expect("failed to remove project release-age exclusion");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "trust release-age-exclude",
+      "scope": "project",
+      "action": "remove",
+      "selector": "react@1.0.0",
+      "changed": true,
+      "exclusions": [
+        "react",
+        "@company/*"
+      ]
+    }
+    "###);
+}
+
+#[test]
+fn trust_release_age_exclude_remove_last_selector_deletes_only_the_exclusion_field() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAge":172800,"minimumReleaseAgeExclude":["react"]}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["trust", "release-age-exclude", "remove", "react"])
+        .output()
+        .expect("failed to remove final project release-age exclusion");
+
+    assert!(output.status.success());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["lpm"]["minimumReleaseAge"], json!(172800));
+    assert!(manifest["lpm"].get("minimumReleaseAgeExclude").is_none());
+}
+
+#[test]
+fn trust_release_age_exclude_rejects_ranges_without_mutating_the_manifest() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAgeExclude":["react"]}}"#,
+    );
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["trust", "release-age-exclude", "add", "react@^1.0.0"])
+        .output()
+        .expect("failed to run invalid project release-age exclusion");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exact semantic version"),
+        "error must explain exact-version selectors: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_release_age_exclude_rejects_a_malformed_existing_list_without_mutation() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAgeExclude":"react"}}"#,
+    );
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["trust", "release-age-exclude", "add", "lodash"])
+        .output()
+        .expect("failed to inspect malformed project release-age exclusions");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must be an array of strings"),
+        "error must identify the required list shape: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_release_age_exclude_list_requires_a_project_manifest() {
+    let project = TempProject::empty(r#"{}"#);
+    std::fs::remove_file(project.path().join("package.json")).unwrap();
+
+    let output = lpm(&project)
+        .args(["trust", "release-age-exclude", "list"])
+        .output()
+        .expect("failed to list project release-age exclusions without a manifest");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires a package.json"),
+        "error must identify the required manifest: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

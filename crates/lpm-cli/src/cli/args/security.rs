@@ -11,7 +11,7 @@ pub(crate) struct InternalSecurityPolicyArgs {
 pub(crate) struct ConfigArgs {
     /// Action: get, set, delete, list, scripts, triage, sandbox,
     /// sigstore, signatures, trust-policy, typosquat, firewall, integrity,
-    /// release-age, release-age-policy, source-analysis, lpm-dev,
+    /// release-age, release-age-policy, release-age-exclude, source-analysis, lpm-dev,
     /// lpm-skills, lpm-insights.
     /// Omit to open the guided configuration editor.
     pub(crate) action: Option<String>,

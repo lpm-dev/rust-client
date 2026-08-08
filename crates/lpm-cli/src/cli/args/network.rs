@@ -158,8 +158,8 @@ pub(crate) struct DlxArgs {
     /// Override the minimumReleaseAge cooldown for this dlx run only.
     #[arg(long, value_name = "DUR")]
     pub(crate) min_release_age: Option<String>,
-    /// Exempt one exact package name from minimumReleaseAge for this dlx run only.
-    #[arg(long, value_name = "PKG")]
+    /// Exempt a package name, exact version, or @scope/* from minimumReleaseAge.
+    #[arg(long, value_name = "SELECTOR")]
     pub(crate) min_release_age_exclude: Vec<String>,
     /// Extra arguments passed to the binary.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
