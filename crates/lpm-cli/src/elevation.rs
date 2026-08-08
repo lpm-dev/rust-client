@@ -45,6 +45,14 @@ fn select_elevation_backend(
     }
 }
 
+#[cfg(any(test, unix))]
+fn trusted_sudo_not_found_message(helper: &str) -> String {
+    format!(
+        "LPM CLI did not find a trusted sudo executable for the privileged {helper} helper. Candidate paths: {}",
+        TRUSTED_SUDO_PATHS.join(", ")
+    )
+}
+
 pub(crate) fn run_current_exe_helper(
     args: &[String],
     prompt: &str,
@@ -68,10 +76,7 @@ fn run_platform_helper(
     let Some(ElevationBackend::Sudo(sudo)) =
         select_elevation_backend(ElevationPlatform::Unix, trusted_sudo_candidate)
     else {
-        return Err(LpmError::Registry(format!(
-            "could not find a trusted sudo executable for the privileged {helper} helper; checked {}",
-            TRUSTED_SUDO_PATHS.join(", ")
-        )));
+        return Err(LpmError::Registry(trusted_sudo_not_found_message(helper)));
     };
 
     let status = std::process::Command::new(sudo)
@@ -323,6 +328,17 @@ mod tests {
         });
 
         assert_eq!(backend, None);
+    }
+
+    #[test]
+    fn unix_missing_sudo_error_uses_simple_past_and_separate_sentences() {
+        assert_eq!(
+            trusted_sudo_not_found_message("security policy"),
+            format!(
+                "LPM CLI did not find a trusted sudo executable for the privileged security policy helper. Candidate paths: {}",
+                TRUSTED_SUDO_PATHS.join(", ")
+            )
+        );
     }
 
     #[test]
