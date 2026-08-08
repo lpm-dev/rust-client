@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use lpm_security::query::{PseudoClass, Severity, TagGroup, behavioral_tag_policies};
 use rayon::prelude::*;
 
 use super::cache::ProjectAuditCache;
@@ -11,7 +12,7 @@ use super::types::{AuditIssue, AuditResult};
 /// Behavioral summary stats returned for the final output.
 pub(super) struct BehavioralSummary {
     pub(super) packages_scanned: usize,
-    pub(super) packages_with_findings: usize,
+    pub(super) packages_with_actionable_findings: usize,
 }
 
 /// Run behavioral analysis on all scannable packages.
@@ -57,7 +58,7 @@ pub(super) fn run_behavioral_analysis(
     if scannable.is_empty() {
         return BehavioralSummary {
             packages_scanned: 0,
-            packages_with_findings: 0,
+            packages_with_actionable_findings: 0,
         };
     }
 
@@ -83,7 +84,7 @@ pub(super) fn run_behavioral_analysis(
     });
 
     let mut scanned = 0usize;
-    let mut with_findings = 0usize;
+    let mut with_actionable_findings = 0usize;
 
     let project_cache_ref = project_cache.as_ref();
     let loaded: Vec<LoadedBehavioralAnalysis> = scannable
@@ -184,7 +185,9 @@ pub(super) fn run_behavioral_analysis(
                 continue;
             }
         }
-        with_findings += 1;
+        if issues.iter().any(|issue| issue.severity != "info") {
+            with_actionable_findings += 1;
+        }
 
         // Merge into existing result (for @lpm.dev) or create new entry (npm).
         // Key by "name@version" so different versions of the same package stay separate.
@@ -232,7 +235,7 @@ pub(super) fn run_behavioral_analysis(
 
     BehavioralSummary {
         packages_scanned: scanned,
-        packages_with_findings: with_findings,
+        packages_with_actionable_findings: with_actionable_findings,
     }
 }
 
@@ -241,92 +244,31 @@ pub(super) fn analysis_to_issues(
     analysis: &lpm_security::behavioral::PackageAnalysis,
     source: &str,
 ) -> Vec<AuditIssue> {
-    let mut issues = Vec::new();
+    behavioral_tag_policies()
+        .iter()
+        .filter(|policy| policy.tag.matches_analysis(analysis))
+        .filter_map(|policy| behavioral_issue(policy.tag, source))
+        .collect()
+}
 
-    // Critical: obfuscated, protestware, high entropy
-    if analysis.supply_chain.obfuscated {
-        issues.push(AuditIssue {
-            severity: "critical".into(),
-            message: "obfuscated code detected".into(),
-            category: "supply-chain".into(),
-            source: source.into(),
-        });
-    }
-    if analysis.supply_chain.protestware {
-        issues.push(AuditIssue {
-            severity: "critical".into(),
-            message: "protestware patterns detected".into(),
-            category: "supply-chain".into(),
-            source: source.into(),
-        });
-    }
-    // high_entropy_strings is informational, not critical. It fires on any package
-    // with string literals above Shannon entropy 4.5, which includes legitimate
-    // Base64 data, URL-encoded strings, hash constants, and bundled assets.
-    // Only obfuscated + protestware are true critical supply-chain signals.
-    if analysis.supply_chain.high_entropy_strings {
-        issues.push(AuditIssue {
-            severity: "info".into(),
-            message: "high-entropy strings detected".into(),
-            category: "supply-chain".into(),
-            source: source.into(),
-        });
-    }
-
-    // High: eval, child_process, shell, dynamic_require
-    let s = &analysis.source;
-    let mut dangerous = Vec::new();
-    if s.eval {
-        dangerous.push("eval()");
-    }
-    if s.child_process {
-        dangerous.push("child_process");
-    }
-    if s.shell {
-        dangerous.push("shell exec");
-    }
-    if s.dynamic_require {
-        dangerous.push("dynamic require");
-    }
-    if !dangerous.is_empty() {
-        issues.push(AuditIssue {
-            severity: "high".into(),
-            message: format!("uses {}", dangerous.join(", ")),
-            category: "behavior".into(),
-            source: source.into(),
-        });
-    }
-
-    // Medium: network, native bindings, git/http/wildcard deps, no license
-    let mut medium = Vec::new();
-    if s.network {
-        medium.push("network");
-    }
-    if s.native_bindings {
-        medium.push("native bindings");
-    }
-    if analysis.manifest.git_dependency {
-        medium.push("git dependency");
-    }
-    if analysis.manifest.http_dependency {
-        medium.push("http dependency");
-    }
-    if analysis.manifest.wildcard_dependency {
-        medium.push("wildcard dep");
-    }
-    if analysis.manifest.no_license {
-        medium.push("no license");
-    }
-    if !medium.is_empty() {
-        issues.push(AuditIssue {
-            severity: "info".into(),
-            message: format!("flags: {}", medium.join(", ")),
-            category: "behavior".into(),
-            source: source.into(),
-        });
-    }
-
-    issues
+pub(super) fn behavioral_issue(tag: PseudoClass, source: &str) -> Option<AuditIssue> {
+    let policy = tag.behavioral_policy()?;
+    let category = match policy.group {
+        TagGroup::SupplyChain => "supply-chain",
+        TagGroup::Source | TagGroup::Manifest => "behavior",
+    };
+    let severity = match policy.severity {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "moderate",
+        Severity::Info => "info",
+    };
+    Some(AuditIssue {
+        severity: severity.to_string(),
+        message: policy.label.to_string(),
+        category: category.to_string(),
+        source: source.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -335,7 +277,7 @@ mod tests {
     use crate::commands::audit::discovery::{ManagerKind, ScanMode};
 
     #[test]
-    fn behavioral_summary_counts_only_findings_that_survive_level_filter() {
+    fn behavioral_summary_counts_only_actionable_findings_that_survive_level_filter() {
         let project = tempfile::tempdir().unwrap();
         let package_dir = project.path().join("node_modules/info-only");
         std::fs::create_dir_all(&package_dir).unwrap();
@@ -376,7 +318,7 @@ mod tests {
         );
 
         assert_eq!(summary.packages_scanned, 1);
-        assert_eq!(summary.packages_with_findings, 0);
+        assert_eq!(summary.packages_with_actionable_findings, 0);
         assert!(results.is_empty());
     }
 }

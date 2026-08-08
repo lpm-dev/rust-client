@@ -1,3 +1,6 @@
+use lpm_security::query::PseudoClass;
+
+use super::behavior::behavioral_issue;
 use super::types::AuditIssue;
 
 pub(super) fn collect_registry_issues(
@@ -21,112 +24,34 @@ pub(super) fn collect_registry_issues(
         }
     }
 
-    // Behavioral tags from registry (all 22 tags)
     if let Some(tags) = &ver_meta.behavioral_tags {
-        let mut critical = Vec::new();
-        if tags.obfuscated {
-            critical.push("obfuscated code");
-        }
-        if tags.protestware {
-            critical.push("protestware");
-        }
-        if tags.high_entropy_strings {
-            critical.push("high-entropy strings");
-        }
-        if !critical.is_empty() {
-            issues.push(AuditIssue {
-                severity: "critical".to_string(),
-                message: format!("detected {}", critical.join(", ")),
-                category: "supply-chain".to_string(),
-                source: "registry".to_string(),
-            });
-        }
-
-        let mut dangerous = Vec::new();
-        if tags.eval {
-            dangerous.push("eval()");
-        }
-        if tags.child_process {
-            dangerous.push("child_process");
-        }
-        if tags.shell {
-            dangerous.push("shell exec");
-        }
-        if tags.dynamic_require {
-            dangerous.push("dynamic require");
-        }
-        if !dangerous.is_empty() {
-            issues.push(AuditIssue {
-                severity: "high".to_string(),
-                message: format!("uses {}", dangerous.join(", ")),
-                category: "behavior".to_string(),
-                source: "registry".to_string(),
-            });
-        }
-
-        let mut medium = Vec::new();
-        if tags.network {
-            medium.push("network");
-        }
-        if tags.native_bindings {
-            medium.push("native bindings");
-        }
-        if tags.git_dependency {
-            medium.push("git dependency");
-        }
-        if tags.http_dependency {
-            medium.push("http dependency");
-        }
-        if tags.wildcard_dependency {
-            medium.push("wildcard dep");
-        }
-        if tags.no_license {
-            medium.push("no license");
-        }
-        if !medium.is_empty() {
-            issues.push(AuditIssue {
-                severity: "info".to_string(),
-                message: format!("flags: {}", medium.join(", ")),
-                category: "behavior".to_string(),
-                source: "registry".to_string(),
-            });
-        }
-
-        let mut notable = Vec::new();
-        if tags.filesystem {
-            notable.push("filesystem");
-        }
-        if tags.environment_vars {
-            notable.push("env vars");
-        }
-        if tags.crypto {
-            notable.push("crypto");
-        }
-        if tags.web_socket {
-            notable.push("websocket");
-        }
-        if tags.telemetry {
-            notable.push("telemetry");
-        }
-        if tags.minified {
-            notable.push("minified");
-        }
-        if tags.url_strings {
-            notable.push("url strings");
-        }
-        if tags.trivial {
-            notable.push("trivial");
-        }
-        if tags.copyleft_license {
-            notable.push("copyleft");
-        }
-        if !notable.is_empty() {
-            issues.push(AuditIssue {
-                severity: "info".to_string(),
-                message: format!("accesses {}", notable.join(", ")),
-                category: "behavior".to_string(),
-                source: "registry".to_string(),
-            });
+        for (tag, present) in [
+            (PseudoClass::Eval, tags.eval),
+            (PseudoClass::Network, tags.network),
+            (PseudoClass::Fs, tags.filesystem),
+            (PseudoClass::Shell, tags.shell),
+            (PseudoClass::ChildProcess, tags.child_process),
+            (PseudoClass::Native, tags.native_bindings),
+            (PseudoClass::Crypto, tags.crypto),
+            (PseudoClass::DynamicRequire, tags.dynamic_require),
+            (PseudoClass::Env, tags.environment_vars),
+            (PseudoClass::Ws, tags.web_socket),
+            (PseudoClass::Obfuscated, tags.obfuscated),
+            (PseudoClass::HighEntropy, tags.high_entropy_strings),
+            (PseudoClass::Minified, tags.minified),
+            (PseudoClass::Telemetry, tags.telemetry),
+            (PseudoClass::UrlStrings, tags.url_strings),
+            (PseudoClass::Trivial, tags.trivial),
+            (PseudoClass::Protestware, tags.protestware),
+            (PseudoClass::GitDep, tags.git_dependency),
+            (PseudoClass::HttpDep, tags.http_dependency),
+            (PseudoClass::WildcardDep, tags.wildcard_dependency),
+            (PseudoClass::Copyleft, tags.copyleft_license),
+            (PseudoClass::NoLicense, tags.no_license),
+        ] {
+            if present && let Some(issue) = behavioral_issue(tag, "registry") {
+                issues.push(issue);
+            }
         }
     }
 

@@ -127,7 +127,7 @@ pub async fn run_install_summary(
     Ok(Some(AuditCounts {
         packages_audited: total_packages,
         vulnerabilities: osv_outcome.vulns.len() + registry_vulnerabilities,
-        suspicious: behavioral_results.packages_with_findings,
+        suspicious: behavioral_results.packages_with_actionable_findings,
         elapsed_ms: started.elapsed().as_millis(),
     }))
 }

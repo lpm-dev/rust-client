@@ -23,6 +23,102 @@ fn read_project_lockfile(project: &TempProject, relative: &str) -> lpm_lockfile:
         .lockfile
 }
 
+async fn mount_dependency_range_change_fixture(mock: &MockRegistry) {
+    let runner_1 = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "range-runner",
+            "version": "1.6.1",
+            "dependencies": { "range-bundler": "^5.0.0" }
+        }),
+        &[],
+    );
+    let runner_3 = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "range-runner",
+            "version": "3.2.6",
+            "dependencies": { "range-bundler": "^6.0.0" }
+        }),
+        &[],
+    );
+    let coverage_1 = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "range-coverage",
+            "version": "1.6.1",
+            "dependencies": { "range-runner": "1.6.1" }
+        }),
+        &[],
+    );
+    let coverage_3 = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "range-coverage",
+            "version": "3.2.6",
+            "dependencies": { "range-runner": "3.2.6" }
+        }),
+        &[],
+    );
+    let bundler_5 = make_tarball("range-bundler", "5.4.21");
+    let bundler_6 = make_tarball("range-bundler", "6.4.3");
+
+    let runner = mock
+        .mount_full_package_metadata_routes(
+            "range-runner",
+            "3.2.6",
+            &[
+                (
+                    "1.6.1",
+                    serde_json::json!({ "range-bundler": "^5.0.0" }),
+                    Some(runner_1),
+                ),
+                (
+                    "3.2.6",
+                    serde_json::json!({ "range-bundler": "^6.0.0" }),
+                    Some(runner_3),
+                ),
+            ],
+        )
+        .await;
+    let coverage = mock
+        .mount_full_package_metadata_routes(
+            "range-coverage",
+            "3.2.6",
+            &[
+                (
+                    "1.6.1",
+                    serde_json::json!({ "range-runner": "1.6.1" }),
+                    Some(coverage_1),
+                ),
+                (
+                    "3.2.6",
+                    serde_json::json!({ "range-runner": "3.2.6" }),
+                    Some(coverage_3),
+                ),
+            ],
+        )
+        .await;
+    let bundler = mock
+        .mount_full_package_metadata_routes(
+            "range-bundler",
+            "6.4.3",
+            &[
+                ("5.4.21", serde_json::json!({}), Some(bundler_5)),
+                ("6.4.3", serde_json::json!({}), Some(bundler_6)),
+            ],
+        )
+        .await;
+    mock.with_batch_metadata(vec![runner, coverage, bundler])
+        .await;
+}
+
+fn installed_version(project: &TempProject, package: &str) -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file(&format!("node_modules/{package}/package.json")))
+            .expect("installed package manifest must be valid JSON");
+    manifest["version"]
+        .as_str()
+        .expect("installed package must have a version")
+        .to_string()
+}
+
 fn find_v3_blob_with_contents(project: &TempProject, expected: &[u8]) -> std::path::PathBuf {
     let blobs_root = project.home().join(".lpm/store/v3/blobs/blake3");
     for shard in std::fs::read_dir(&blobs_root)
@@ -84,6 +180,122 @@ fn install_without_package_json_fails() {
         stderr.contains("package.json"),
         "expected error about missing package.json, got:\n{stderr}"
     );
+}
+
+#[tokio::test]
+async fn mutable_install_repairs_stale_root_resolutions_after_dependency_ranges_change() {
+    let mock = MockRegistry::start().await;
+    mount_dependency_range_change_fixture(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "range-change",
+            "version": "1.0.0",
+            "devDependencies": {
+                "range-runner": "^1.6.1",
+                "range-coverage": "^1.6.1"
+            }
+        }"#,
+    );
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run initial install");
+    assert!(
+        initial.status.success(),
+        "initial install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    let mut stale_lockfile = read_project_lockfile(&project, ".");
+    let updated_ranges = std::collections::BTreeMap::from([
+        ("range-bundler".to_string(), "^6.4.3".to_string()),
+        ("range-coverage".to_string(), "^3.2.6".to_string()),
+        ("range-runner".to_string(), "^3.2.6".to_string()),
+    ]);
+    stale_lockfile
+        .importers
+        .get_mut(".")
+        .expect("root importer")
+        .dev_dependencies = updated_ranges.clone();
+    for (name, version) in [
+        ("range-bundler", "5.4.21"),
+        ("range-coverage", "1.6.1"),
+        ("range-runner", "1.6.1"),
+    ] {
+        let source = stale_lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == name && package.version == version)
+            .expect("stale package record")
+            .source
+            .clone();
+        stale_lockfile.root_resolutions.insert(
+            name.to_string(),
+            lpm_lockfile::LockedRootResolution {
+                package: name.to_string(),
+                version: version.to_string(),
+                source,
+            },
+        );
+    }
+    stale_lockfile
+        .write_all(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write stale root-resolution fixture");
+
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "range-change",
+            "version": "1.0.0",
+            "devDependencies": {
+                "range-runner": "^3.2.6",
+                "range-coverage": "^3.2.6",
+                "range-bundler": "^6.4.3"
+            }
+        }"#,
+    );
+
+    let updated = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run mutable install after range changes");
+    assert!(
+        updated.status.success(),
+        "range-changing install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&updated.stdout),
+        String::from_utf8_lossy(&updated.stderr)
+    );
+
+    let lockfile = read_project_lockfile(&project, ".");
+    let importer = lockfile.importers.get(".").expect("root importer");
+    assert_eq!(importer.dev_dependencies, updated_ranges);
+    assert_eq!(
+        lockfile
+            .packages
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.as_str()))
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            ("range-bundler", "6.4.3"),
+            ("range-coverage", "3.2.6"),
+            ("range-runner", "3.2.6"),
+        ])
+    );
+    assert_eq!(installed_version(&project, "range-runner"), "3.2.6");
+    assert_eq!(installed_version(&project, "range-coverage"), "3.2.6");
+    assert_eq!(installed_version(&project, "range-bundler"), "6.4.3");
 }
 
 #[test]
@@ -5016,8 +5228,12 @@ async fn install_disabled_lpm_insights_skips_enrichment_request_but_keeps_local_
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("eval()"),
-        "local behavioral findings must remain in the install summary; stderr:\n{stderr}"
+        stderr.contains("Security summary") && stderr.contains("1 High"),
+        "local behavioral findings must remain in the compact install summary; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("eval()"),
+        "normal install must hide High finding details; stderr:\n{stderr}"
     );
 
     let batch_requests = mock
@@ -5715,7 +5931,7 @@ async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date()
 }
 
 #[tokio::test]
-async fn npm_only_install_reports_cached_behavioral_security_findings() {
+async fn npm_only_install_compacts_noncritical_security_findings_by_default() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball_with_files(
         "local-security-finding",
@@ -5756,9 +5972,131 @@ async fn npm_only_install_reports_cached_behavioral_security_findings() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        combined.contains("Security summary") && combined.to_lowercase().contains("eval"),
-        "local cached analysis must be summarized without an @lpm.dev dependency:\n{combined}",
+        combined.contains("Security summary")
+            && combined.contains("0 Critical")
+            && combined.contains("1 High")
+            && combined.contains("1 Medium")
+            && combined.contains("Run lpm audit for full details."),
+        "local cached analysis must use a severity roll-up without an @lpm.dev dependency:\n{combined}",
     );
+    assert!(
+        !combined.contains("eval()")
+            && !combined.contains("no license")
+            && !combined.contains("lpm query"),
+        "normal install must hide noncritical finding details:\n{combined}",
+    );
+}
+
+#[tokio::test]
+async fn verbose_npm_only_install_reports_noncritical_finding_details() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "verbose-local-security-finding",
+        "1.0.0",
+        &[(
+            "danger.js",
+            b"module.exports = eval(process.env.LPM_INPUT);\n",
+        )],
+    );
+    mock.with_package("verbose-local-security-finding", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "verbose-npm-only-security-summary",
+  "version": "1.0.0",
+  "dependencies": {
+    "verbose-local-security-finding": "1.0.0"
+  }
+}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("run verbose npm-only install with behavioral findings");
+    assert!(
+        output.status.success(),
+        "verbose npm-only install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("eval()")
+            && combined.contains("no license")
+            && combined.contains("lpm query \":eval,:no-license\""),
+        "verbose install must show noncritical finding details and selectors:\n{combined}",
+    );
+}
+
+async fn mount_info_only_behavioral_package(mock: &MockRegistry, name: &str) {
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "main": "index.js",
+            "license": "MIT"
+        }),
+        &[(
+            "index.js",
+            b"module.exports = process.env.NODE_ENV;\nconst docs = 'https://example.com/docs';\n",
+        )],
+    );
+    mock.with_package(name, "1.0.0", &tarball).await;
+}
+
+#[tokio::test]
+async fn install_hides_info_only_behavioral_metadata_by_default() {
+    let mock = MockRegistry::start().await;
+    mount_info_only_behavioral_package(&mock, "info-only-default").await;
+    let project = TempProject::empty(
+        r#"{"name":"info-only-default-app","version":"1.0.0","dependencies":{"info-only-default":"1.0.0"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("run install with Info behavioral metadata");
+
+    assert!(output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("Security summary"));
+    assert!(!combined.contains("Behavioral metadata"));
+}
+
+#[tokio::test]
+async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
+    let mock = MockRegistry::start().await;
+    mount_info_only_behavioral_package(&mock, "info-only-verbose").await;
+    let project = TempProject::empty(
+        r#"{"name":"info-only-verbose-app","version":"1.0.0","dependencies":{"info-only-verbose":"1.0.0"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("run verbose install with Info behavioral metadata");
+
+    assert!(output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Behavioral metadata · 1 package · 2 signals"));
+    assert!(combined.contains("environment-variable access"));
+    assert!(combined.contains("URL literals"));
+    assert!(combined.contains("lpm query \":env,:url-strings\""));
+    assert!(!combined.contains("lpm query \":critical\""));
+    assert!(!combined.contains("Security summary"));
 }
 
 async fn mount_registry_version(

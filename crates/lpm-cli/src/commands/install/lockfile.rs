@@ -1470,11 +1470,17 @@ fn select_locked_root_package_from_rows<'a>(
         if selection.package != target {
             return None;
         }
-        return packages.iter().copied().find(|package| {
-            package.name == selection.package
-                && package.version == selection.version
-                && package.source == selection.source
-        });
+        return packages
+            .iter()
+            .copied()
+            .find(|package| {
+                package.name == selection.package
+                    && package.version == selection.version
+                    && package.source == selection.source
+            })
+            .filter(|package| {
+                locked_version_satisfies_requested_range(&package.version, requested_spec)
+            });
     }
 
     let requested_range = requested_range_for_locked_lookup(requested_spec)
@@ -1499,6 +1505,17 @@ fn select_locked_root_package_from_rows<'a>(
         candidate = Some(package);
     }
     candidate
+}
+
+fn locked_version_satisfies_requested_range(version: &str, requested_spec: &str) -> bool {
+    let Some(requested_range) = requested_range_for_locked_lookup(requested_spec) else {
+        return true;
+    };
+    let Ok(requested_range) = lpm_resolver::NpmRange::parse(&requested_range) else {
+        return false;
+    };
+    lpm_resolver::NpmVersion::parse(version)
+        .is_ok_and(|version| requested_range.satisfies(&version))
 }
 
 fn select_resolved_package_for_requested_spec<'a>(

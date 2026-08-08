@@ -179,6 +179,43 @@ async fn frozen_install_rejects_manifest_specifier_drift_without_rewriting_lockf
 }
 
 #[tokio::test]
+async fn lpm_ci_rejects_manifest_specifier_drift_without_rewriting_lockfile() {
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "ci-drift",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^2.1.3" }
+        }"#,
+    );
+    install_once(&project, &mock).await;
+    let before = project.read_file("lpm.lock");
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "ci-drift",
+            "version": "1.0.0",
+            "dependencies": { "ms": "^3.0.0" }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "ci",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run lpm ci with manifest drift");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("lpm.lock"), before);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Frozen lockfile mismatch"));
+}
+
+#[tokio::test]
 async fn ci_env_enables_frozen_install_when_lockfile_exists() {
     let mock = MockRegistry::start().await;
     mount_ms(&mock).await;

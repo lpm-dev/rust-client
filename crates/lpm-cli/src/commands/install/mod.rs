@@ -1677,7 +1677,7 @@ async fn run_with_options_under_store_lock(
             baseline_index.as_ref(),
             &all_packages,
             false,
-            false, // not quiet — show Medium tier too
+            verbose,
             fetch_lpm_security_insights,
         )
         .await;

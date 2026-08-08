@@ -32,6 +32,8 @@ const SRC_NETWORK: &str = "module.exports = function () { fetch('https://example
 const SRC_EVAL_AND_NETWORK: &str =
     "module.exports = function () { eval('1+1'); fetch('https://example.com') }\n";
 const SRC_CLEAN: &str = "module.exports = function () { return 42 }\n";
+const SRC_INFO: &str =
+    "module.exports = process.env.NODE_ENV;\nconst docs = 'https://example.com/docs';\n";
 
 // ─── basic selector ───────────────────────────────────────────────────
 
@@ -77,6 +79,35 @@ fn query_eval_selects_only_packages_with_eval_tag() {
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('▲'),
         "query status output must not use legacy/cliclack glyphs, got:\n{stderr}"
     );
+}
+
+#[test]
+fn query_info_selects_metadata_that_does_not_match_critical() {
+    let project =
+        TempProject::empty(r#"{"name":"q","version":"1.0.0","dependencies":{"info-pkg":"1.0.0"}}"#);
+    seed_pkg_with_source(&project, "info-pkg", "1.0.0", SRC_INFO);
+
+    let info = lpm(&project)
+        .args(["query", ":info"])
+        .output()
+        .expect("run lpm query :info");
+    assert!(
+        info.status.success(),
+        "query :info failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&info.stdout),
+        String::from_utf8_lossy(&info.stderr)
+    );
+    let info_stdout = String::from_utf8_lossy(&info.stdout);
+    assert!(info_stdout.contains("info-pkg"), "{info_stdout}");
+    assert!(info_stdout.contains("env"), "{info_stdout}");
+    assert!(info_stdout.contains("url-strings"), "{info_stdout}");
+
+    let critical = lpm(&project)
+        .args(["query", ":critical"])
+        .output()
+        .expect("run lpm query :critical");
+    assert!(critical.status.success());
+    assert!(String::from_utf8_lossy(&critical.stderr).contains("No packages match :critical"));
 }
 
 // ─── --json format ────────────────────────────────────────────────────
