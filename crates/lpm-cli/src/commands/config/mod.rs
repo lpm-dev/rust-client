@@ -53,6 +53,7 @@ const NESTED_CONFIG_SECTIONS: [&str; 5] = ["sandbox", "sigstore", "firewall", "p
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenericSetTarget {
     Scalar,
+    ReleaseAgeExcludeList,
     Sandbox,
     Sigstore,
     Firewall,
@@ -61,6 +62,7 @@ enum GenericSetTarget {
 
 fn generic_set_target(key: &str) -> GenericSetTarget {
     match key {
+        crate::commands::release_age_exclude::USER_KEY => GenericSetTarget::ReleaseAgeExcludeList,
         "sandbox" => GenericSetTarget::Sandbox,
         "sigstore" => GenericSetTarget::Sigstore,
         "firewall" => GenericSetTarget::Firewall,
@@ -225,6 +227,11 @@ pub async fn run(
             let mut config = read_config(&config_path)?;
             guard_generic_set_against_force_floor(&config, key, value)?;
             match generic_set_target(key) {
+                GenericSetTarget::ReleaseAgeExcludeList => {
+                    return Err(LpmError::Registry(format!(
+                        "`lpm config set {key} {value}` cannot write an array setting. Use `lpm config release-age-exclude add {value}` instead"
+                    )));
+                }
                 GenericSetTarget::Sandbox => {
                     let global = global_config_view_from_value(&config);
                     apply_sandbox_mode(

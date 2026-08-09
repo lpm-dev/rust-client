@@ -7,7 +7,7 @@ const USER_COMMAND: &str = "config release-age-exclude";
 const PROJECT_SCOPE: &str = "project";
 const USER_SCOPE: &str = "user";
 const PROJECT_KEY: &str = "minimumReleaseAgeExclude";
-const USER_KEY: &str = "minimum-release-age-exclude";
+pub(crate) const USER_KEY: &str = "minimum-release-age-exclude";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ReleaseAgeExcludeOperation<'a> {

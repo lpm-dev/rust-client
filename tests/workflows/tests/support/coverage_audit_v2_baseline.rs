@@ -1074,10 +1074,11 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 44: lpm config set ──
     SurfaceV2 {
         id: 44,
-        scenarios: 1,
+        scenarios: 2,
         failure_modes_tested: &[
             "writes value into isolated home",
             "--json envelope carries success + action + key + value",
+            "array-owned release-age exclusions reject scalar generic set without mutation",
         ],
         failure_modes_known: &[
             "invalid JSON value rejected",
@@ -1086,8 +1087,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "set on a key that violates a typed schema",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 2)],
+        last_audited_at: "2026-08-09",
     },
     // ── id 45: lpm config delete ──
     SurfaceV2 {

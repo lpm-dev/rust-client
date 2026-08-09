@@ -1376,6 +1376,31 @@ fn config_get_missing_key_uses_slim_warning() {
 }
 
 #[test]
+fn generic_config_set_rejects_release_age_exclude_scalar_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "registry = \"https://registry.example.test\"\nminimum-release-age-exclude = [\"react\"]\n",
+    );
+    let path = config_path(&project);
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["config", "set", "minimum-release-age-exclude", "lodash"])
+        .output()
+        .expect("failed to run generic release-age exclusion setter");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("lpm config release-age-exclude add lodash"),
+        "error must point to the typed list command: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn config_release_age_exclude_add_accepts_supported_selectors_and_writes_a_toml_array() {
     let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
     seed_config(&project, "registry = \"https://registry.example.test\"\n");
