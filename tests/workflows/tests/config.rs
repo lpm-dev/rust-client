@@ -1,6 +1,9 @@
 mod support;
 
-use support::{TempProject, assertions, lpm, lpm_spawnable, write_signed_typosquat_guard_posture};
+use support::{
+    LOCK_CONTENTION_MARKER_ENV, TempProject, assertions, lpm, lpm_spawnable,
+    wait_for_lock_contention, write_signed_typosquat_guard_posture,
+};
 
 fn config_path(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("config.toml")
@@ -958,15 +961,16 @@ fn config_mutations_wait_for_one_shared_transaction_lock_and_preserve_prior_upda
     {
         let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path)
             .expect("hold the config transaction lock");
+        let marker_path = project
+            .home()
+            .join(format!("config-lock-contention-{index}"));
         let mut command = lpm_spawnable(&project);
-        command.args(args);
+        command
+            .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
+            .args(args);
         let mut child = command.spawn().expect("spawn config mutation");
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert!(
-            child.try_wait().expect("inspect config mutation").is_none(),
-            "every config mutation must wait for ~/.lpm/.config.lock",
-        );
+        wait_for_lock_contention(&mut child, &marker_path, &lock_path);
         let mut config = std::fs::OpenOptions::new()
             .append(true)
             .open(config_path(&project))

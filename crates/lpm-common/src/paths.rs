@@ -391,6 +391,9 @@ const LOCK_WAIT_HINT_AFTER: std::time::Duration = std::time::Duration::from_secs
 /// Polling interval while waiting for a contended lock. 100 ms gives
 /// near-instant wake-up after release at negligible CPU cost.
 const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const TEST_LOCK_CONTENTION_MARKER_ENV: &str = "LPM_TEST_LOCK_CONTENTION_MARKER";
+
+type LockWaitCallback = Box<dyn FnOnce() + Send>;
 
 /// Derive the writer-intent gate path from the data lock path.
 /// `~/.lpm/store/.gc.lock` → `~/.lpm/store/.gc.lock.writer-intent`.
@@ -508,12 +511,16 @@ fn try_acquire(rw: &mut fd_lock::RwLock<std::fs::File>, mode: LockMode) -> Resul
 fn poll_until_acquired(
     rw: &mut fd_lock::RwLock<std::fs::File>,
     mode: LockMode,
-    mut on_first_wait: Option<Box<dyn FnOnce() + Send>>,
+    mut on_first_wait: Option<LockWaitCallback>,
+    mut on_first_contention: Option<&mut Option<LockWaitCallback>>,
 ) -> Result<(), LpmError> {
     let start = std::time::Instant::now();
     loop {
         if try_acquire(rw, mode)? {
             return Ok(());
+        }
+        if let Some(callback) = on_first_contention.as_deref_mut().and_then(Option::take) {
+            callback();
         }
         if on_first_wait.is_some()
             && start.elapsed() >= LOCK_WAIT_HINT_AFTER
@@ -523,6 +530,31 @@ fn poll_until_acquired(
         }
         std::thread::sleep(LOCK_POLL_INTERVAL);
     }
+}
+
+fn test_lock_contention_callback(data_path: &Path) -> Option<LockWaitCallback> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let marker_path = std::env::var_os(TEST_LOCK_CONTENTION_MARKER_ENV).map(PathBuf::from)?;
+    let lock_path = data_path.to_string_lossy().into_owned();
+    Some(Box::new(move || {
+        if let Some(parent) = marker_path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "failed to create lock contention marker directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+        if let Err(error) = crate::atomic_write::write_file_atomic(&marker_path, lock_path) {
+            eprintln!(
+                "failed to write lock contention marker {}: {error}",
+                marker_path.display()
+            );
+        }
+    }))
 }
 
 /// Probe `rw` non-blocking-exclusive — used by readers to test whether
@@ -590,12 +622,12 @@ fn acquire_shared_with_hint(
     // acquire gate-shared. Uncontended in the steady state.
     let intent_file = open_lock_file(&intent_path)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
-    poll_until_acquired(&mut intent_rw, LockMode::Shared, on_first_wait)?;
+    poll_until_acquired(&mut intent_rw, LockMode::Shared, on_first_wait, None)?;
 
     // acquire data-shared.
     let data_file = open_lock_file(data_path)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
-    poll_until_acquired(&mut data_rw, LockMode::Shared, None)?;
+    poll_until_acquired(&mut data_rw, LockMode::Shared, None, None)?;
 
     // Drop gate so new writers can raise it immediately.
     drop(intent_rw);
@@ -621,6 +653,7 @@ fn acquire_exclusive_with_hint(
 ) -> Result<ExclusiveLockHandle, LpmError> {
     let intent_path = writer_intent_path_for(data_path);
     let queue_path = writer_queue_path_for(data_path);
+    let mut on_first_contention = test_lock_contention_callback(data_path);
 
     // take queue-shared. Multiple writers can each hold this
     // shared simultaneously — that's the point: every queued writer
@@ -631,6 +664,7 @@ fn acquire_exclusive_with_hint(
         &mut queue_rw,
         LockMode::Shared,
         Some(Box::new(on_first_wait)),
+        Some(&mut on_first_contention),
     )?;
 
     // gate exclusive. Blocks new readers from passing the
@@ -638,12 +672,22 @@ fn acquire_exclusive_with_hint(
     // don't compete here.
     let intent_file = open_lock_file(&intent_path)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
-    poll_until_acquired(&mut intent_rw, LockMode::Exclusive, None)?;
+    poll_until_acquired(
+        &mut intent_rw,
+        LockMode::Exclusive,
+        None,
+        Some(&mut on_first_contention),
+    )?;
 
     // data exclusive. Wait for in-body readers to release.
     let data_file = open_lock_file(data_path)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
-    poll_until_acquired(&mut data_rw, LockMode::Exclusive, None)?;
+    poll_until_acquired(
+        &mut data_rw,
+        LockMode::Exclusive,
+        None,
+        Some(&mut on_first_contention),
+    )?;
 
     Ok(ExclusiveLockHandle {
         _data: data_rw,

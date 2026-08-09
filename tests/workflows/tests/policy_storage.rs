@@ -4,7 +4,10 @@ mod support;
 
 use lpm_common::atomic_write::is_atomic_temp_name;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry, write_signed_unlock_for};
+use support::{
+    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
+    wait_for_lock_contention, write_signed_unlock_for,
+};
 
 const VERSION: &str = "1.0.0";
 const PROJECT_EXCLUDED: &str = "project-excluded";
@@ -389,25 +392,27 @@ fn workspace_member_policy_mutations_wait_for_the_workspace_root_install_lock() 
     let sibling_before =
         std::fs::read(project.path().join("packages/sibling/package.json")).unwrap();
 
-    for args in [
+    let lock_path = lpm_common::project_install_lock(project.path());
+    for (index, args) in [
         ["trust", "release-age-exclude", "add", "member-policy@1.0.0"],
         ["trust", "lifecycle-scope", "add", "@company/*"],
-    ] {
-        let transaction_lock =
-            lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
-                .expect("hold the workspace install transaction lock");
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path)
+            .expect("hold the workspace install transaction lock");
+        let marker_path = project
+            .home()
+            .join(format!("policy-lock-contention-{index}"));
         let mut command = lpm_spawnable(&project);
-        command.current_dir(&member_dir).args(args);
+        command
+            .current_dir(&member_dir)
+            .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
+            .args(args);
         let mut child = command.spawn().expect("spawn member policy mutation");
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert!(
-            child
-                .try_wait()
-                .expect("inspect member policy mutation")
-                .is_none(),
-            "workspace member policy mutation must wait for the workspace root install lock",
-        );
+        wait_for_lock_contention(&mut child, &marker_path, &lock_path);
         drop(transaction_lock);
 
         let output = child
@@ -450,27 +455,29 @@ fn workspace_member_policy_mutations_abort_if_the_workspace_root_changes_while_w
     let member_dir = project.path().join("packages/app");
     write_signed_unlock_for(&project, &member_dir, &["trust-scope-widen"]);
 
-    for args in [
+    let lock_path = lpm_common::project_install_lock(project.path());
+    for (index, args) in [
         ["trust", "release-age-exclude", "add", "member-policy@1.0.0"],
         ["trust", "lifecycle-scope", "add", "@company/*"],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         project.write_file("package.json", workspace_manifest);
         project.write_file("packages/app/package.json", member_manifest);
-        let transaction_lock =
-            lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
-                .expect("hold the workspace install transaction lock");
+        let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path)
+            .expect("hold the workspace install transaction lock");
+        let marker_path = project
+            .home()
+            .join(format!("policy-root-change-contention-{index}"));
         let mut command = lpm_spawnable(&project);
-        command.current_dir(&member_dir).args(args);
+        command
+            .current_dir(&member_dir)
+            .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
+            .args(args);
         let mut child = command.spawn().expect("spawn member policy mutation");
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert!(
-            child
-                .try_wait()
-                .expect("inspect member policy mutation")
-                .is_none(),
-            "workspace member policy mutation must wait for the workspace root install lock",
-        );
+        wait_for_lock_contention(&mut child, &marker_path, &lock_path);
         project.write_file(
             "package.json",
             r#"{"name":"no-longer-a-workspace","version":"1.0.0"}"#,
