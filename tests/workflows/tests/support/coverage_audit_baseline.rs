@@ -2084,6 +2084,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2097,6 +2098,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2110,6 +2112,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2123,6 +2126,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/config.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2136,6 +2140,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/config.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2149,6 +2154,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/config.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2162,6 +2168,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/lifecycle_scope.rs",
             "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
     SurfaceBaseline {
@@ -2188,6 +2195,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/lifecycle_scope.rs",
             "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
 ];

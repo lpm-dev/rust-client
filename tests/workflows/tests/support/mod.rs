@@ -257,10 +257,16 @@ pub fn project_bin_path(project: &TempProject, name: &str) -> PathBuf {
 /// Write a short-lived signed project unlock for workflow scenarios that
 /// intentionally need to cross the security-approval boundary.
 pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
+    write_signed_unlock_for(project, project.path(), scopes);
+}
+
+/// Write a short-lived signed unlock for a workspace member or another
+/// project directory that shares the fixture's isolated LPM home.
+pub fn write_signed_unlock_for(project: &TempProject, project_dir: &Path, scopes: &[&str]) {
     use hmac::Mac;
 
     let now = chrono::Utc::now();
-    let project_root = std::fs::canonicalize(project.path())
+    let project_root = std::fs::canonicalize(project_dir)
         .expect("canonicalize temp project")
         .to_string_lossy()
         .to_string();

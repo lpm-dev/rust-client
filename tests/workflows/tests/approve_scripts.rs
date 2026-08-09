@@ -197,6 +197,16 @@ fn approve_scripts_yes_json_reports_rebuild_next_step_when_approved() {
     write_project_no_trusted_deps(&project);
     seed_blocked_build_state_with_real_hash(&project, "some-blocked-pkg", "1.0.0");
     write_signed_unlock(&project, &["trust-bulk-approve"]);
+    project.write_file("lpm.lock", "project-lockfile-sentinel\n");
+    let config_path = project.home().join(".lpm/config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config_path,
+        "minimum-release-age-exclude = [\"user-only\"]\n",
+    )
+    .unwrap();
+    let lockfile_before = std::fs::read(project.path().join("lpm.lock")).unwrap();
+    let config_before = std::fs::read(&config_path).unwrap();
 
     let out = lpm(&project)
         .args(["--json", "approve-scripts", "--yes"])
@@ -220,6 +230,21 @@ fn approve_scripts_yes_json_reports_rebuild_next_step_when_approved() {
     assert_eq!(
         parsed["next_steps"][0]["command"].as_str(),
         Some("lpm rebuild")
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let binding = &manifest["lpm"]["trustedDependencies"]["some-blocked-pkg@1.0.0"];
+    assert!(binding["integrity"].as_str().is_some());
+    assert!(binding["scriptHash"].as_str().is_some());
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).unwrap(),
+        lockfile_before
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+    assert!(
+        !global_trust_path(&project).exists(),
+        "project approval must not create global lifecycle trust"
     );
 }
 
