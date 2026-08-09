@@ -41,17 +41,15 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let existing_cfg = read_config(config_path)?;
-    let global = global_config_view_from_value(&existing_cfg);
     if let Some(raw) = set {
         let assignment = parse_sigstore_assignment(raw)?;
         apply_sigstore_assignment(
             config_path,
-            &global,
             assignment,
             json_output,
             &format!("lpm config sigstore --set {raw}"),
-        )?;
+        )
+        .await?;
         announce_sigstore_set(assignment.setting.key(), assignment.value, json_output);
         return Ok(());
     }
@@ -134,11 +132,11 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
     };
     apply_sigstore_assignment(
         config_path,
-        &global,
         assignment,
         json_output,
         &format!("lpm config sigstore --set {proposed_value}"),
-    )?;
+    )
+    .await?;
     announce_sigstore_set(setting.key(), new_value, json_output);
     Ok(())
 }
@@ -216,23 +214,44 @@ pub(in crate::commands::config) fn parse_sigstore_assignment(
     Ok(SigstoreAssignment { setting, value })
 }
 
-pub(in crate::commands::config) fn apply_sigstore_assignment(
+pub(in crate::commands::config) async fn apply_sigstore_assignment(
     config_path: &std::path::Path,
-    global: &GlobalConfig,
     assignment: SigstoreAssignment<'_>,
     json_output: bool,
     proposed_command: &str,
 ) -> Result<(), LpmError> {
-    if matches!(assignment.setting, SigstoreSetting::Verify) {
-        let requested = parse_sigstore_enforce_mode(assignment.value)?;
-        crate::security_floor::reject_looser_sigstore_write(global, requested)?;
-        crate::security_approval::authorize_persistent_sigstore(
-            requested,
-            json_output,
-            proposed_command,
-        )?;
-    }
-    persist_sigstore_value(config_path, assignment.setting.key(), assignment.value)
+    let requested = matches!(assignment.setting, SigstoreSetting::Verify)
+        .then(|| parse_sigstore_enforce_mode(assignment.value))
+        .transpose()?;
+    update_config(config_path, |config| {
+        if let Some(requested) = requested {
+            let global = global_config_view_from_value(config);
+            crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
+            crate::security_approval::authorize_persistent_sigstore(
+                requested,
+                json_output,
+                proposed_command,
+            )?;
+        }
+        let top = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        let sigstore_section = top
+            .entry("sigstore".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let sigstore_table = sigstore_section.as_table_mut().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{}: `[sigstore]` is not a TOML table — refusing to clobber",
+                config_path.display(),
+            ))
+        })?;
+        sigstore_table.insert(
+            assignment.setting.key().to_string(),
+            toml::Value::String(assignment.value.to_string()),
+        );
+        Ok(((), true))
+    })
+    .await
 }
 
 pub(in crate::commands::config) fn parse_sigstore_enforce_mode(
@@ -277,28 +296,6 @@ pub(in crate::commands::config) fn read_sigstore_availability(
     config_path: &std::path::Path,
 ) -> Result<Option<String>, LpmError> {
     read_sigstore_value(config_path, "availability")
-}
-
-fn persist_sigstore_value(
-    config_path: &std::path::Path,
-    key: &str,
-    value: &str,
-) -> Result<(), LpmError> {
-    let mut cfg = read_config(config_path)?;
-    let top = cfg.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
-    let sigstore_section = top
-        .entry("sigstore".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let sigstore_table = sigstore_section.as_table_mut().ok_or_else(|| {
-        LpmError::Registry(format!(
-            "{}: `[sigstore]` is not a TOML table — refusing to clobber",
-            config_path.display(),
-        ))
-    })?;
-    sigstore_table.insert(key.to_string(), toml::Value::String(value.to_string()));
-    write_config(config_path, &cfg)
 }
 
 pub(in crate::commands::config) fn announce_sigstore_set(

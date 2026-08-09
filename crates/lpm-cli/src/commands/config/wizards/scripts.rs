@@ -12,7 +12,7 @@ pub(in crate::commands::config) async fn run_scripts_wizard(
                 SCRIPT_POLICY_VALUES.join(" | ")
             )));
         }
-        persist_script_policy(config_path, v, json_output)?;
+        persist_script_policy(config_path, v, json_output).await?;
         announce_set(SCRIPT_POLICY_KEY, v, json_output);
         if v == "triage" {
             print_triage_policy_followup(json_output);
@@ -52,7 +52,7 @@ pub(in crate::commands::config) async fn run_scripts_wizard(
         .initial_value(current.as_str())
         .interact()
         .map_err(prompt_err)?;
-    persist_script_policy(config_path, new_value, json_output)?;
+    persist_script_policy(config_path, new_value, json_output).await?;
     announce_set(SCRIPT_POLICY_KEY, new_value, json_output);
 
     if new_value == "triage" {
@@ -61,22 +61,31 @@ pub(in crate::commands::config) async fn run_scripts_wizard(
     Ok(())
 }
 
-pub(in crate::commands::config) fn persist_script_policy(
+pub(in crate::commands::config) async fn persist_script_policy(
     config_path: &std::path::Path,
     value: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let cfg = read_config(config_path)?;
-    let global = global_config_view_from_value(&cfg);
     let requested = crate::script_policy_config::ScriptPolicy::parse(value)
         .map_err(|e| LpmError::Registry(e.to_string()))?;
-    crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
-    crate::security_approval::authorize_persistent_script_policy(
-        requested,
-        json_output,
-        &format!("lpm config scripts --set {value}"),
-    )?;
-    persist_string(config_path, SCRIPT_POLICY_KEY, value)
+    update_config(config_path, |config| {
+        let global = global_config_view_from_value(config);
+        crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
+        crate::security_approval::authorize_persistent_script_policy(
+            requested,
+            json_output,
+            &format!("lpm config scripts --set {value}"),
+        )?;
+        let table = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        table.insert(
+            SCRIPT_POLICY_KEY.to_string(),
+            toml::Value::String(value.to_string()),
+        );
+        Ok(((), true))
+    })
+    .await
 }
 
 pub(in crate::commands::config) fn print_triage_policy_followup(json_output: bool) {

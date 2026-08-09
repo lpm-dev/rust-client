@@ -53,6 +53,8 @@ use tempfile::TempDir;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
+pub const LOCK_CONTENTION_MARKER_ENV: &str = "LPM_TEST_LOCK_CONTENTION_MARKER";
+
 /// A temporary project directory copied from a fixture, with fully isolated
 /// HOME, store, cache, and config directories.
 ///
@@ -257,10 +259,16 @@ pub fn project_bin_path(project: &TempProject, name: &str) -> PathBuf {
 /// Write a short-lived signed project unlock for workflow scenarios that
 /// intentionally need to cross the security-approval boundary.
 pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
+    write_signed_unlock_for(project, project.path(), scopes);
+}
+
+/// Write a short-lived signed unlock for a workspace member or another
+/// project directory that shares the fixture's isolated LPM home.
+pub fn write_signed_unlock_for(project: &TempProject, project_dir: &Path, scopes: &[&str]) {
     use hmac::Mac;
 
     let now = chrono::Utc::now();
-    let project_root = std::fs::canonicalize(project.path())
+    let project_root = std::fs::canonicalize(project_dir)
         .expect("canonicalize temp project")
         .to_string_lossy()
         .to_string();
@@ -443,6 +451,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("LPM_TEST_VAULT_WRAPPING_KEY_ERROR");
     cmd.remove_env("LPM_VAULT_ID");
     cmd.remove_env("LPM_TEST_ASSUME_EUID_ROOT");
+    cmd.remove_env(LOCK_CONTENTION_MARKER_ENV);
     cmd.remove_env("SUDO_USER");
 
     // Clear CI-environment vars that GitHub Actions / GitLab inject into
@@ -572,6 +581,59 @@ pub fn lpm_spawnable(project: &TempProject) -> std::process::Command {
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd
+}
+
+pub fn wait_for_lock_contention(
+    child: &mut std::process::Child,
+    marker_path: &Path,
+    expected_lock_path: &Path,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match std::fs::read_to_string(marker_path) {
+            Ok(actual_lock_path) => {
+                let actual_lock_path = std::fs::canonicalize(&actual_lock_path)
+                    .expect("canonicalize the contended lock path");
+                let expected_lock_path = std::fs::canonicalize(expected_lock_path)
+                    .expect("canonicalize the expected lock path");
+                assert_eq!(
+                    actual_lock_path, expected_lock_path,
+                    "child contended on an unexpected lock"
+                );
+                assert!(
+                    child.try_wait().expect("inspect lock waiter").is_none(),
+                    "child exited after reporting lock contention"
+                );
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!(
+                "failed to read lock contention marker {}: {error}",
+                marker_path.display()
+            ),
+        }
+
+        if let Some(status) = child.try_wait().expect("inspect lock waiter") {
+            panic!("child exited with {status} before reporting lock contention");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut stdout = String::new();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+            }
+            panic!(
+                "child did not report contention on {} within 10 seconds\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                expected_lock_path.display(),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Resolve the absolute path of `lpm-sandbox-helper.exe` if cargo

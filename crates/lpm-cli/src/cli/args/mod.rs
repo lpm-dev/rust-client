@@ -284,7 +284,7 @@ pub(crate) enum Commands {
     /// (= `lpm uninstall -g <pkg>`), `update [<pkg>[@<spec>]]` (with `--dry-run`).
     Global(lifecycle::GlobalArgs),
 
-    /// Inspect and manage `trustedDependencies` in package.json.
+    /// Inspect and manage project package trust and release-age exclusions.
     ///
     ///: `lpm trust diff` shows how the current manifest's
     /// trust list differs from the last install's snapshot; `lpm trust

@@ -161,6 +161,7 @@ fn revoke_unlocks(
     project_root: Option<&Path>,
     scopes: &[ApprovalScope],
     packages: &[String],
+    source: ApprovalSource,
 ) -> Result<Vec<UnlockRevocation>, LpmError> {
     let requested_scopes = normalized_scopes(scopes);
     if requested_scopes.is_empty() {
@@ -211,7 +212,7 @@ fn revoke_unlocks(
 
         let mut audit = AuditRecord::new("unlock-revoked", true, scope_names(&revoked_scopes))
             .packages(entry.grant.packages.clone())
-            .source(ApprovalSource::SecurityCommand)
+            .source(source)
             .unlock_id(entry.grant.id.clone());
         if let Some(root) = entry.grant.project_root.clone() {
             audit = audit.project_root(root);
@@ -252,6 +253,7 @@ pub fn lock_project_scopes_command(
         Some(project_dir),
         scopes,
         packages,
+        ApprovalSource::SecurityCommand,
     )
 }
 
@@ -260,7 +262,30 @@ pub fn lock_global_scopes_command(
     scopes: &[ApprovalScope],
     packages: &[String],
 ) -> Result<Vec<UnlockRevocation>, LpmError> {
-    revoke_unlocks(selector, UnlockTargetKind::Global, None, scopes, packages)
+    revoke_unlocks(
+        selector,
+        UnlockTargetKind::Global,
+        None,
+        scopes,
+        packages,
+        ApprovalSource::SecurityCommand,
+    )
+}
+
+pub(super) fn revoke_project_policy_unlocks(
+    selector: &str,
+    project_dir: &Path,
+    scopes: &[ApprovalScope],
+    source: ApprovalSource,
+) -> Result<Vec<UnlockRevocation>, LpmError> {
+    revoke_unlocks(
+        selector,
+        UnlockTargetKind::Project,
+        Some(project_dir),
+        scopes,
+        &[],
+        source,
+    )
 }
 
 pub(super) fn find_active_project_unlock(

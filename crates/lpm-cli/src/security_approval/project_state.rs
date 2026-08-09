@@ -78,6 +78,21 @@ pub(super) fn candidate_project_policy_state(
     })
 }
 
+pub(super) fn candidate_project_scope_policy_state(
+    project_dir: &Path,
+    trusted_scopes: &[String],
+) -> Result<ApprovedProjectPolicyState, LpmError> {
+    let trusted = read_project_trusted_dependencies(project_dir)?;
+    let mut state = candidate_project_policy_state(project_dir, &trusted)?;
+    state.trusted_scopes = trusted_scopes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(state)
+}
+
 pub(super) fn load_approved_project_policy_state(
     project_dir: &Path,
 ) -> Result<ApprovedProjectPolicyState, LpmError> {

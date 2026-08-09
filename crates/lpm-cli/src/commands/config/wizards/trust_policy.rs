@@ -37,7 +37,7 @@ pub(in crate::commands::config) async fn run_trust_policy_wizard(
             .to_string()
     };
 
-    persist_string(config_path, TRUST_POLICY_KEY, &value)?;
+    persist_string(config_path, TRUST_POLICY_KEY, &value).await?;
     announce_trust_policy_set(&value, json_output);
     Ok(())
 }

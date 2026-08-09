@@ -1,9 +1,6 @@
 //! — `lpm trust` user-facing subcommands.
 //!
-//! Two subcommands, both operating on
-//! `<project_dir>/package.json > lpm > trustedDependencies` plus (for
-//! `diff`) `<project_dir>/.lpm/trust-snapshot.json` written by the
-//! install pipeline.
+//! Project trust inspection and mutation commands.
 //!
 //! ## `lpm trust diff`
 //!
@@ -76,6 +73,70 @@ pub enum TrustCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Manage project lifecycle scope trust in package.json.
+    LifecycleScope {
+        #[command(subcommand)]
+        action: LifecycleScopeCmd,
+    },
+    /// Manage project release-age exclusions in package.json.
+    ReleaseAgeExclude {
+        #[command(subcommand)]
+        action: ReleaseAgeExcludeCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LifecycleScopeCmd {
+    /// Trust all packages in one npm scope to run lifecycle scripts.
+    Add {
+        /// Scope wildcard to trust, such as @company/*.
+        #[arg(value_name = "SCOPE")]
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove lifecycle trust for one npm scope.
+    Remove {
+        /// Scope wildcard to remove, such as @company/*.
+        #[arg(value_name = "SCOPE")]
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List project lifecycle scope trust.
+    List {
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReleaseAgeExcludeCmd {
+    /// Add a package, exact version, or @scope/* exclusion.
+    Add {
+        /// Package selector to exclude from the release-age gate.
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a package, exact version, or @scope/* exclusion.
+    Remove {
+        /// Package selector to remove from the exclusion list.
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List project release-age exclusions.
+    List {
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Entry point called from main.rs.
@@ -87,7 +148,92 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Resul
         TrustCmd::Prune { yes, dry_run, json } => {
             run_prune(project_dir, *yes, *dry_run, json_output || *json).await
         }
+        TrustCmd::LifecycleScope { action } => {
+            let (operation, local_json) = match action {
+                LifecycleScopeCmd::Add { selector, json } => (
+                    crate::commands::lifecycle_scope::LifecycleScopeOperation::Add(selector),
+                    *json,
+                ),
+                LifecycleScopeCmd::Remove { selector, json } => (
+                    crate::commands::lifecycle_scope::LifecycleScopeOperation::Remove(selector),
+                    *json,
+                ),
+                LifecycleScopeCmd::List { json } => (
+                    crate::commands::lifecycle_scope::LifecycleScopeOperation::List,
+                    *json,
+                ),
+            };
+            let json = json_output || local_json;
+            if operation.mutates() {
+                crate::commands::lifecycle_scope::validate_project(project_dir, operation)?;
+                scope_project_policy_mutation(project_dir, async {
+                    crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
+                })
+                .await
+            } else {
+                crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
+            }
+        }
+        TrustCmd::ReleaseAgeExclude { action } => {
+            let (operation, local_json) = match action {
+                ReleaseAgeExcludeCmd::Add { selector, json } => (
+                    crate::commands::release_age_exclude::ReleaseAgeExcludeOperation::Add(selector),
+                    *json,
+                ),
+                ReleaseAgeExcludeCmd::Remove { selector, json } => (
+                    crate::commands::release_age_exclude::ReleaseAgeExcludeOperation::Remove(
+                        selector,
+                    ),
+                    *json,
+                ),
+                ReleaseAgeExcludeCmd::List { json } => (
+                    crate::commands::release_age_exclude::ReleaseAgeExcludeOperation::List,
+                    *json,
+                ),
+            };
+            let json = json_output || local_json;
+            if operation.mutates() {
+                crate::commands::release_age_exclude::validate_project(project_dir, operation)?;
+                scope_project_policy_mutation(project_dir, async {
+                    crate::commands::release_age_exclude::run_project(project_dir, operation, json)
+                })
+                .await
+            } else {
+                crate::commands::release_age_exclude::run_project(project_dir, operation, json)
+            }
+        }
     }
+}
+
+async fn scope_project_policy_mutation<F, T>(project_dir: &Path, mutation: F) -> Result<T, LpmError>
+where
+    F: std::future::Future<Output = Result<T, LpmError>>,
+{
+    let initial_workspace_root = discover_workspace_root(project_dir)?;
+    let lock_root = initial_workspace_root.as_deref().unwrap_or(project_dir);
+    let lock_path = lpm_common::project_install_lock(lock_root);
+    lpm_common::with_exclusive_lock_async(lock_path, async {
+        let current_workspace_root = discover_workspace_root(project_dir)?;
+        if current_workspace_root != initial_workspace_root {
+            let expected = initial_workspace_root
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |root| root.display().to_string());
+            let actual = current_workspace_root
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |root| root.display().to_string());
+            return Err(LpmError::Script(format!(
+                "workspace root changed while waiting for the install transaction ({expected} -> {actual}); retry the command"
+            )));
+        }
+        mutation.await
+    })
+    .await
+}
+
+fn discover_workspace_root(project_dir: &Path) -> Result<Option<std::path::PathBuf>, LpmError> {
+    lpm_workspace::discover_workspace(project_dir)
+        .map(|workspace| workspace.map(|workspace| workspace.root))
+        .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))
 }
 
 // ─── lpm trust diff ────────────────────────────────────────────────

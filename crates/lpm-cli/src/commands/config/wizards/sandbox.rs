@@ -7,16 +7,14 @@ pub(in crate::commands::config) async fn run_sandbox_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let existing_cfg = read_config(config_path)?;
-    let global = global_config_view_from_value(&existing_cfg);
     if let Some(v) = set {
         apply_sandbox_mode(
             config_path,
-            &global,
             v,
             json_output,
             &format!("lpm config sandbox --set {v}"),
-        )?;
+        )
+        .await?;
         announce_sandbox_set(v, json_output);
         return Ok(());
     }
@@ -78,18 +76,17 @@ pub(in crate::commands::config) async fn run_sandbox_wizard(
 
     apply_sandbox_mode(
         config_path,
-        &global,
         new_value,
         json_output,
         &format!("lpm config sandbox --set {new_value}"),
-    )?;
+    )
+    .await?;
     announce_sandbox_set(new_value, json_output);
     Ok(())
 }
 
-pub(in crate::commands::config) fn apply_sandbox_mode(
+pub(in crate::commands::config) async fn apply_sandbox_mode(
     config_path: &std::path::Path,
-    global: &GlobalConfig,
     value: &str,
     json_output: bool,
     proposed_command: &str,
@@ -102,13 +99,30 @@ pub(in crate::commands::config) fn apply_sandbox_mode(
     }
     let requested = ResolvedSandboxMode::parse_for_security_floor(value)
         .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{value}'")))?;
-    crate::security_floor::reject_looser_sandbox_mode_write(global, requested)?;
-    crate::security_approval::authorize_persistent_sandbox_mode(
-        requested,
-        json_output,
-        proposed_command,
-    )?;
-    persist_sandbox_mode(config_path, value)
+    update_config(config_path, |config| {
+        let global = global_config_view_from_value(config);
+        crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
+        crate::security_approval::authorize_persistent_sandbox_mode(
+            requested,
+            json_output,
+            proposed_command,
+        )?;
+        let top = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        let sandbox_section = top
+            .entry("sandbox".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        let sandbox_table = sandbox_section.as_table_mut().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{}: `[sandbox]` is not a TOML table — refusing to clobber",
+                config_path.display(),
+            ))
+        })?;
+        sandbox_table.insert("mode".to_string(), toml::Value::String(value.to_string()));
+        Ok(((), true))
+    })
+    .await
 }
 
 pub(in crate::commands::config) fn read_sandbox_mode(
@@ -121,27 +135,6 @@ pub(in crate::commands::config) fn read_sandbox_mode(
         .and_then(|t| t.get("mode"))
         .and_then(|v| v.as_str())
         .map(String::from))
-}
-
-pub(in crate::commands::config) fn persist_sandbox_mode(
-    config_path: &std::path::Path,
-    value: &str,
-) -> Result<(), LpmError> {
-    let mut cfg = read_config(config_path)?;
-    let top = cfg.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
-    let sandbox_section = top
-        .entry("sandbox".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let sandbox_table = sandbox_section.as_table_mut().ok_or_else(|| {
-        LpmError::Registry(format!(
-            "{}: `[sandbox]` is not a TOML table — refusing to clobber",
-            config_path.display(),
-        ))
-    })?;
-    sandbox_table.insert("mode".to_string(), toml::Value::String(value.to_string()));
-    write_config(config_path, &cfg)
 }
 
 pub(in crate::commands::config) fn announce_sandbox_set(value: &str, json_output: bool) {

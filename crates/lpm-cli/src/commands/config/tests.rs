@@ -246,8 +246,8 @@ async fn scripts_wizard_set_rejects_looser_value_when_force_floor_enabled() {
     assert!(err.to_string().contains("script-policy"));
 }
 
-#[test]
-fn persist_script_policy_rejects_triage_when_force_floor_requires_deny() {
+#[tokio::test]
+async fn persist_script_policy_rejects_triage_when_force_floor_requires_deny() {
     let (_dir, path, _env) = tmp_config();
     std::fs::write(
         &path,
@@ -255,7 +255,9 @@ fn persist_script_policy_rejects_triage_when_force_floor_requires_deny() {
     )
     .unwrap();
 
-    let err = persist_script_policy(&path, "triage", true).unwrap_err();
+    let err = persist_script_policy(&path, "triage", true)
+        .await
+        .unwrap_err();
 
     assert_eq!(err.error_code(), "security_floor");
     assert!(err.to_string().contains("script-policy"));

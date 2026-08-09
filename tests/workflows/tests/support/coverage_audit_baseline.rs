@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 166;
+pub const EXPECTED_SURFACE_COUNT: usize = 175;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -2071,6 +2071,131 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release.rs",
             "tests/workflows/tests/release.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 167,
+        name: "`lpm trust release-age-exclude add <selector>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_age_exclude.rs",
+            "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 168,
+        name: "`lpm trust release-age-exclude remove <selector>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_age_exclude.rs",
+            "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 169,
+        name: "`lpm trust release-age-exclude list`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_age_exclude.rs",
+            "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 170,
+        name: "`lpm config release-age-exclude add <selector>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_age_exclude.rs",
+            "tests/workflows/tests/config.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 171,
+        name: "`lpm config release-age-exclude remove <selector>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_age_exclude.rs",
+            "tests/workflows/tests/config.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 172,
+        name: "`lpm config release-age-exclude list`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_age_exclude.rs",
+            "tests/workflows/tests/config.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 173,
+        name: "`lpm trust lifecycle-scope add <scope>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/lifecycle_scope.rs",
+            "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 174,
+        name: "`lpm trust lifecycle-scope remove <scope>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/lifecycle_scope.rs",
+            "tests/workflows/tests/trust.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 175,
+        name: "`lpm trust lifecycle-scope list`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/lifecycle_scope.rs",
+            "tests/workflows/tests/trust.rs",
+            "tests/workflows/tests/policy_storage.rs",
         ],
     },
 ];

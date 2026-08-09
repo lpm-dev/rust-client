@@ -106,14 +106,27 @@ pub(in crate::commands::config) async fn run_typosquat_wizard(
         }
     }
 
-    let existing_cfg = read_config(config_path)?;
-    reject_looser_typosquat_guard_write(&global_config_view_from_value(&existing_cfg), selection)?;
-    crate::security_approval::authorize_persistent_typosquat_guard(
-        selection,
-        json_output,
-        &format!("lpm config typosquat --set {}", selection.as_str()),
-    )?;
-    persist_typosquat_guard_selection(config_path, selection)?;
+    update_config(config_path, |config| {
+        reject_looser_typosquat_guard_write(&global_config_view_from_value(config), selection)?;
+        crate::security_approval::authorize_persistent_typosquat_guard(
+            selection,
+            json_output,
+            &format!("lpm config typosquat --set {}", selection.as_str()),
+        )?;
+        let top = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        if selection == TyposquatGuardSelection::Default {
+            top.remove(TYPOSQUAT_GUARD_KEY);
+        } else {
+            top.insert(
+                TYPOSQUAT_GUARD_KEY.to_string(),
+                toml::Value::String(selection.as_str().to_string()),
+            );
+        }
+        Ok(((), true))
+    })
+    .await?;
     announce_typosquat_guard_set(selection, json_output);
     Ok(())
 }
@@ -158,22 +171,6 @@ pub(in crate::commands::config) fn reject_looser_typosquat_guard_write(
         requested.as_str(),
         floor.as_str(),
     ))
-}
-
-pub(in crate::commands::config) fn persist_typosquat_guard_selection(
-    config_path: &std::path::Path,
-    selection: TyposquatGuardSelection,
-) -> Result<(), LpmError> {
-    if selection != TyposquatGuardSelection::Default {
-        return persist_string(config_path, TYPOSQUAT_GUARD_KEY, selection.as_str());
-    }
-
-    let mut cfg = read_config(config_path)?;
-    let top = cfg.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
-    top.remove(TYPOSQUAT_GUARD_KEY);
-    write_config(config_path, &cfg)
 }
 
 pub(in crate::commands::config) fn format_current_typosquat_guard(

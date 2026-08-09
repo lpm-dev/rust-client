@@ -23,9 +23,10 @@ pub(crate) use wizards::{
 
 use effective::EffectiveConfig;
 use global_config::global_config_view_from_value;
+pub(crate) use io::update_config;
 use io::{
     config_value_for_display, config_value_to_json, guard_generic_delete_against_force_floor,
-    guard_generic_set_against_force_floor, read_config, write_config,
+    guard_generic_set_against_force_floor, read_config,
 };
 use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY, RELEASE_AGE_KEY,
@@ -53,6 +54,7 @@ const NESTED_CONFIG_SECTIONS: [&str; 5] = ["sandbox", "sigstore", "firewall", "p
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenericSetTarget {
     Scalar,
+    ReleaseAgeExcludeList,
     Sandbox,
     Sigstore,
     Firewall,
@@ -61,6 +63,7 @@ enum GenericSetTarget {
 
 fn generic_set_target(key: &str) -> GenericSetTarget {
     match key {
+        crate::commands::release_age_exclude::USER_KEY => GenericSetTarget::ReleaseAgeExcludeList,
         "sandbox" => GenericSetTarget::Sandbox,
         "sigstore" => GenericSetTarget::Sigstore,
         "firewall" => GenericSetTarget::Firewall,
@@ -103,6 +106,7 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
+/// - `lpm config release-age-exclude` owns the user-wide package exclusion list.
 /// - `lpm config lpm-skills` owns `auto-install-lpm-skills = true | false`
 ///   for package-published skills from `@lpm.dev/*` packages.
 /// - `lpm config source-analysis` owns
@@ -159,6 +163,16 @@ pub async fn run(
     if action == "release-age-policy" {
         return run_release_age_policy_wizard(&config_path, set, json_output).await;
     }
+    if action == "release-age-exclude" {
+        let operation =
+            crate::commands::release_age_exclude::parse_config_operation(key, value, set)?;
+        return crate::commands::release_age_exclude::run_user(
+            &config_path,
+            operation,
+            json_output,
+        )
+        .await;
+    }
     if action == "lpm-skills" {
         return run_lpm_skills_wizard(&config_path, set, json_output).await;
     }
@@ -199,18 +213,20 @@ pub async fn run(
         "set" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let value = value.ok_or_else(|| LpmError::Registry("missing value".into()))?;
-            let mut config = read_config(&config_path)?;
-            guard_generic_set_against_force_floor(&config, key, value)?;
             match generic_set_target(key) {
+                GenericSetTarget::ReleaseAgeExcludeList => {
+                    return Err(LpmError::Registry(format!(
+                        "`lpm config set {key} {value}` cannot write an array setting. Use `lpm config release-age-exclude add {value}` instead"
+                    )));
+                }
                 GenericSetTarget::Sandbox => {
-                    let global = global_config_view_from_value(&config);
                     apply_sandbox_mode(
                         &config_path,
-                        &global,
                         value,
                         json_output,
                         &format!("lpm config set {key} {value}"),
-                    )?;
+                    )
+                    .await?;
                     announce_generic_set(
                         key,
                         value,
@@ -221,14 +237,13 @@ pub async fn run(
                 }
                 GenericSetTarget::Sigstore => {
                     let assignment = parse_sigstore_assignment(value)?;
-                    let global = global_config_view_from_value(&config);
                     apply_sigstore_assignment(
                         &config_path,
-                        &global,
                         assignment,
                         json_output,
                         &format!("lpm config set {key} {value}"),
-                    )?;
+                    )
+                    .await?;
                     announce_generic_set(
                         key,
                         value,
@@ -241,14 +256,13 @@ pub async fn run(
                 }
                 GenericSetTarget::Firewall => {
                     let mode = parse_firewall_mode_selection(value)?;
-                    let global = global_config_view_from_value(&config);
                     apply_firewall_mode(
                         &config_path,
-                        &global,
                         mode,
                         json_output,
                         &format!("lpm config set {key} {value}"),
-                    )?;
+                    )
+                    .await?;
                     announce_generic_set(
                         key,
                         value,
@@ -264,81 +278,88 @@ pub async fn run(
                 }
                 GenericSetTarget::Scalar => {}
             }
-            match key {
-                SCRIPT_POLICY_KEY => {
-                    let requested = crate::script_policy_config::ScriptPolicy::parse(value)
-                        .map_err(|e| LpmError::Registry(e.to_string()))?;
-                    crate::security_approval::authorize_persistent_script_policy(
-                        requested,
-                        json_output,
-                        &format!("lpm config set {key} {value}"),
-                    )?;
-                }
-                RELEASE_AGE_KEY => {
-                    let requested_secs = crate::release_age_config::parse_strict_u64_string(value)
+            let json_value = update_config(&config_path, |config| {
+                guard_generic_set_against_force_floor(config, key, value)?;
+                match key {
+                    SCRIPT_POLICY_KEY => {
+                        let requested = crate::script_policy_config::ScriptPolicy::parse(value)
+                            .map_err(|e| LpmError::Registry(e.to_string()))?;
+                        crate::security_approval::authorize_persistent_script_policy(
+                            requested,
+                            json_output,
+                            &format!("lpm config set {key} {value}"),
+                        )?;
+                    }
+                    RELEASE_AGE_KEY => {
+                        let requested_secs = crate::release_age_config::parse_strict_u64_string(
+                            value,
+                        )
                         .ok_or_else(|| {
                             LpmError::Registry(format!(
                                 "`{RELEASE_AGE_KEY}` must be a non-negative integer second count"
                             ))
                         })?;
-                    crate::security_approval::authorize_persistent_release_age(
-                        requested_secs,
+                        crate::security_approval::authorize_persistent_release_age(
+                            requested_secs,
+                            json_output,
+                            &format!("lpm config set {key} {value}"),
+                        )?;
+                    }
+                    RELEASE_AGE_POLICY_KEY => {
+                        let requested =
+                            crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
+                        let global = global_config_view_from_value(config);
+                        crate::security_floor::reject_looser_release_age_policy_write(
+                            &global, requested,
+                        )?;
+                        crate::security_approval::authorize_persistent_release_age_policy(
+                            requested,
+                            json_output,
+                            &format!("lpm config set {key} {}", requested.as_str()),
+                        )?;
+                    }
+                    SIGNATURES_KEY
+                    | AUTO_INSTALL_LPM_SKILLS_KEY
+                    | FETCH_LPM_SECURITY_INSIGHTS_KEY => {
+                        parse_config_bool(value)
+                            .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
+                    }
+                    INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
+                        let requested = parse_config_bool(value)
+                            .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
+                        crate::security_approval::authorize_persistent_install_time_source_analysis(
+                        requested,
                         json_output,
                         &format!("lpm config set {key} {value}"),
                     )?;
+                    }
+                    TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
+                    INTEGRITY_KEY => {
+                        parse_integrity_policy_selection(value)?;
+                    }
+                    TYPOSQUAT_GUARD_KEY => {
+                        let requested = parse_typosquat_guard_selection(value)?;
+                        let global = global_config_view_from_value(config);
+                        reject_looser_typosquat_guard_write(&global, requested)?;
+                        crate::security_approval::authorize_persistent_typosquat_guard(
+                            requested,
+                            json_output,
+                            &format!("lpm config set {key} {}", requested.as_str()),
+                        )?;
+                    }
+                    _ => {}
                 }
-                RELEASE_AGE_POLICY_KEY => {
-                    let requested = crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
-                    let global = global_config_view_from_value(&config);
-                    crate::security_floor::reject_looser_release_age_policy_write(
-                        &global, requested,
-                    )?;
-                    crate::security_approval::authorize_persistent_release_age_policy(
-                        requested,
-                        json_output,
-                        &format!("lpm config set {key} {}", requested.as_str()),
-                    )?;
-                }
-                SIGNATURES_KEY | AUTO_INSTALL_LPM_SKILLS_KEY | FETCH_LPM_SECURITY_INSIGHTS_KEY => {
-                    parse_config_bool(value)
-                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
-                }
-                INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
-                    let requested = parse_config_bool(value)
-                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?;
-                    crate::security_approval::authorize_persistent_install_time_source_analysis(
-                        requested,
-                        json_output,
-                        &format!("lpm config set {key} {value}"),
-                    )?;
-                }
-                TRUST_POLICY_KEY => validate_trust_policy_value(value)?,
-                INTEGRITY_KEY => {
-                    parse_integrity_policy_selection(value)?;
-                }
-                TYPOSQUAT_GUARD_KEY => {
-                    let requested = parse_typosquat_guard_selection(value)?;
-                    let global = global_config_view_from_value(&config);
-                    reject_looser_typosquat_guard_write(&global, requested)?;
-                    crate::security_approval::authorize_persistent_typosquat_guard(
-                        requested,
-                        json_output,
-                        &format!("lpm config set {key} {}", requested.as_str()),
-                    )?;
-                }
-                _ => {}
-            }
-            if let Some(table) = config.as_table_mut() {
-                if key == AUTO_INSTALL_LPM_SKILLS_KEY {
-                    table.remove(LEGACY_NO_SKILLS_KEY);
-                }
-                if key == TYPOSQUAT_GUARD_KEY
-                    && parse_typosquat_guard_selection(value)? == TyposquatGuardSelection::Default
-                {
-                    table.remove(key);
-                } else {
-                    let value =
-                        if matches!(
+                if let Some(table) = config.as_table_mut() {
+                    if key == AUTO_INSTALL_LPM_SKILLS_KEY {
+                        table.remove(LEGACY_NO_SKILLS_KEY);
+                    }
+                    if key == TYPOSQUAT_GUARD_KEY
+                        && parse_typosquat_guard_selection(value)?
+                            == TyposquatGuardSelection::Default
+                    {
+                        table.remove(key);
+                    } else {
+                        let value = if matches!(
                             key,
                             SIGNATURES_KEY
                                 | AUTO_INSTALL_LPM_SKILLS_KEY
@@ -367,102 +388,108 @@ pub async fn run(
                         } else {
                             toml::Value::String(value.to_string())
                         };
-                    table.insert(key.to_string(), value);
+                        table.insert(key.to_string(), value);
+                    }
                 }
-            }
-            write_config(&config_path, &config)?;
-            let json_value = if matches!(
-                key,
-                SIGNATURES_KEY
-                    | AUTO_INSTALL_LPM_SKILLS_KEY
-                    | FETCH_LPM_SECURITY_INSIGHTS_KEY
-                    | INSTALL_TIME_SOURCE_ANALYSIS_KEY
-            ) {
-                serde_json::Value::Bool(
-                    parse_config_bool(value)
-                        .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?,
-                )
-            } else if key == RELEASE_AGE_POLICY_KEY {
-                serde_json::Value::String(
-                    crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
-                        .as_str()
-                        .to_string(),
-                )
-            } else if key == INTEGRITY_KEY {
-                serde_json::Value::String(
-                    parse_integrity_policy_selection(value)?
-                        .as_str()
-                        .to_string(),
-                )
-            } else if key == TYPOSQUAT_GUARD_KEY {
-                serde_json::Value::String(
-                    parse_typosquat_guard_selection(value)?.as_str().to_string(),
-                )
-            } else {
-                serde_json::Value::String(value.to_string())
-            };
+                let json_value = if matches!(
+                    key,
+                    SIGNATURES_KEY
+                        | AUTO_INSTALL_LPM_SKILLS_KEY
+                        | FETCH_LPM_SECURITY_INSIGHTS_KEY
+                        | INSTALL_TIME_SOURCE_ANALYSIS_KEY
+                ) {
+                    serde_json::Value::Bool(
+                        parse_config_bool(value)
+                            .map_err(|message| LpmError::Registry(format!("`{key}` {message}")))?,
+                    )
+                } else if key == RELEASE_AGE_POLICY_KEY {
+                    serde_json::Value::String(
+                        crate::release_age_config::ReleaseAgePolicy::parse(key, value)?
+                            .as_str()
+                            .to_string(),
+                    )
+                } else if key == INTEGRITY_KEY {
+                    serde_json::Value::String(
+                        parse_integrity_policy_selection(value)?
+                            .as_str()
+                            .to_string(),
+                    )
+                } else if key == TYPOSQUAT_GUARD_KEY {
+                    serde_json::Value::String(
+                        parse_typosquat_guard_selection(value)?.as_str().to_string(),
+                    )
+                } else {
+                    serde_json::Value::String(value.to_string())
+                };
+                Ok((json_value, true))
+            })
+            .await?;
             announce_generic_set(key, value, json_value, json_output);
         }
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
-            let mut config = read_config(&config_path)?;
-            guard_generic_delete_against_force_floor(&config, key)?;
-            match key {
-                SCRIPT_POLICY_KEY => crate::security_approval::authorize_persistent_script_policy(
-                    crate::script_policy_config::ScriptPolicy::Deny,
-                    json_output,
-                    &format!("lpm config delete {key}"),
-                )?,
-                RELEASE_AGE_KEY => crate::security_approval::authorize_persistent_release_age(
-                    crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS,
-                    json_output,
-                    &format!("lpm config delete {key}"),
-                )?,
-                RELEASE_AGE_POLICY_KEY => {
-                    crate::security_floor::reject_looser_release_age_policy_write(
-                        &global_config_view_from_value(&config),
-                        crate::release_age_config::ReleaseAgePolicy::Direct,
-                    )?;
-                    crate::security_approval::authorize_persistent_release_age_policy(
-                        crate::release_age_config::ReleaseAgePolicy::Direct,
+            let existed = update_config(&config_path, |config| {
+                guard_generic_delete_against_force_floor(config, key)?;
+                match key {
+                    SCRIPT_POLICY_KEY => {
+                        crate::security_approval::authorize_persistent_script_policy(
+                            crate::script_policy_config::ScriptPolicy::Deny,
+                            json_output,
+                            &format!("lpm config delete {key}"),
+                        )?
+                    }
+                    RELEASE_AGE_KEY => crate::security_approval::authorize_persistent_release_age(
+                        crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS,
                         json_output,
                         &format!("lpm config delete {key}"),
-                    )?;
-                }
-                "sandbox" => crate::security_approval::authorize_persistent_sandbox_mode(
-                    ResolvedSandboxMode::Default,
-                    json_output,
-                    "lpm config delete sandbox",
-                )?,
-                TYPOSQUAT_GUARD_KEY => {
-                    crate::security_approval::authorize_persistent_typosquat_guard(
-                        TyposquatGuardSelection::Default,
+                    )?,
+                    RELEASE_AGE_POLICY_KEY => {
+                        crate::security_floor::reject_looser_release_age_policy_write(
+                            &global_config_view_from_value(config),
+                            crate::release_age_config::ReleaseAgePolicy::Direct,
+                        )?;
+                        crate::security_approval::authorize_persistent_release_age_policy(
+                            crate::release_age_config::ReleaseAgePolicy::Direct,
+                            json_output,
+                            &format!("lpm config delete {key}"),
+                        )?;
+                    }
+                    "sandbox" => crate::security_approval::authorize_persistent_sandbox_mode(
+                        ResolvedSandboxMode::Default,
                         json_output,
-                        &format!("lpm config delete {key}"),
-                    )?;
-                }
-                FIREWALL_CONFIG_SECTION => {
-                    crate::security_floor::reject_looser_firewall_mode_write(
-                        &global_config_view_from_value(&config),
-                        NpmFirewallMode::Off,
-                    )?;
-                    crate::security_approval::authorize_persistent_npm_firewall_mode(
-                        NpmFirewallMode::Off,
-                        json_output,
-                        &format!("lpm config delete {key}"),
-                    )?;
-                }
-                INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
-                    crate::security_approval::authorize_persistent_install_time_source_analysis(
+                        "lpm config delete sandbox",
+                    )?,
+                    TYPOSQUAT_GUARD_KEY => {
+                        crate::security_approval::authorize_persistent_typosquat_guard(
+                            TyposquatGuardSelection::Default,
+                            json_output,
+                            &format!("lpm config delete {key}"),
+                        )?;
+                    }
+                    FIREWALL_CONFIG_SECTION => {
+                        crate::security_floor::reject_looser_firewall_mode_write(
+                            &global_config_view_from_value(config),
+                            NpmFirewallMode::Off,
+                        )?;
+                        crate::security_approval::authorize_persistent_npm_firewall_mode(
+                            NpmFirewallMode::Off,
+                            json_output,
+                            &format!("lpm config delete {key}"),
+                        )?;
+                    }
+                    INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
+                        crate::security_approval::authorize_persistent_install_time_source_analysis(
                         true,
                         json_output,
                         &format!("lpm config delete {key}"),
                     )?;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-            let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
-            write_config(&config_path, &config)?;
+                let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
+                Ok((existed, true))
+            })
+            .await?;
             if json_output {
                 println!(
                     "{}",
@@ -493,7 +520,7 @@ pub async fn run(
             return Err(LpmError::Registry(format!(
                 "unknown config action: {action}. \
                  Use: get, set, delete (alias: unset), list (alias: ls), \
-                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, source-analysis, lpm-dev, lpm-skills, lpm-insights"
+                 scripts, triage, sandbox, sigstore, signatures, trust-policy, typosquat, firewall, integrity, release-age, release-age-policy, release-age-exclude, source-analysis, lpm-dev, lpm-skills, lpm-insights"
             )));
         }
     }

@@ -261,6 +261,40 @@ fn snapshot_for_binding_missing_pkg_projects_to_none_under_both_modes() {
     }
 }
 
+#[test]
+fn approval_metadata_from_blocked_preserves_every_rich_binding_field() {
+    let mut blocked = make_blocked("acme-widget", "1.0.0");
+    blocked.behavioral_tags_hash = Some("sha256-behavioral-tags".into());
+    blocked.behavioral_tags = Some(vec!["eval".into(), "network".into()]);
+    let provenance = ProvenanceSnapshot {
+        present: true,
+        publisher: Some("github:acme/widget".into()),
+        workflow_path: Some(".github/workflows/publish.yml".into()),
+        workflow_ref: Some("refs/tags/v1.0.0".into()),
+        attestation_cert_sha256: Some("sha256-leaf-cert".into()),
+    };
+
+    let metadata = approval_metadata_from_blocked(
+        &blocked,
+        Some("sha256-capability-set".into()),
+        Some(provenance.clone()),
+    );
+    let mut trusted = TrustedDependencies::default();
+    trusted.approve_with_metadata(&blocked.name, &blocked.version, metadata);
+
+    assert_eq!(
+        trusted.get_binding(&blocked.name, &blocked.version),
+        Some(&TrustedDependencyBinding {
+            integrity: blocked.integrity,
+            script_hash: blocked.script_hash,
+            provenance_at_approval: Some(provenance),
+            behavioral_tags_hash: blocked.behavioral_tags_hash,
+            behavioral_tags: blocked.behavioral_tags,
+            capability_hash: Some("sha256-capability-set".into()),
+        })
+    );
+}
+
 /// Load-bearing warn-mode regression guard: when the snapshot
 /// projection returns `None` (Warn + VerificationRejected, or
 /// any TransportDegraded), an existing exact-version binding's
