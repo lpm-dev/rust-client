@@ -181,7 +181,7 @@ fn is_valid_npm_scope(scope: &str) -> bool {
 
 fn invalid_scope(source: &str, raw: &str) -> LpmError {
     LpmError::Registry(format!(
-        "{source} `{raw}` is invalid; expected one lowercase npm scope wildcard such as `@company/*`"
+        "{source} `{raw}` is invalid; expected one lowercase npm scope wildcard such as `@company/*`. Use `lpm approve-scripts <package>` for one package"
     ))
 }
 

@@ -3704,12 +3704,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     },
     SurfaceV2 {
         id: 173,
-        scenarios: 6,
+        scenarios: 7,
         failure_modes_tested: &[
             "signed trust-scope-widen approval required before manifest mutation",
             "lowercase npm scope wildcard persists under lpm.scripts.trustedScopes",
             "duplicate add is a byte-stable no-op",
             "package, version, uppercase, nested, and control input rejected",
+            "package selectors direct users to approve-scripts without mutation",
             "malformed existing list rejected without mutation",
             "removed signed scope authorization does not authorize a later re-add",
         ],
@@ -3718,7 +3719,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "package.json write failure after security-state authorization",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 6)],
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 7)],
         last_audited_at: "2026-08-09",
     },
     SurfaceV2 {

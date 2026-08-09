@@ -1187,6 +1187,26 @@ fn trust_lifecycle_scope_rejects_non_scope_and_malicious_selectors_without_mutat
 }
 
 #[test]
+fn trust_lifecycle_scope_package_selector_points_to_rich_approval_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#);
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["trust", "lifecycle-scope", "add", "@company/package"])
+        .output()
+        .expect("failed to reject a package lifecycle-scope selector");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lpm approve-scripts <package>"),
+        "package-selector error must preserve the rich approval workflow: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn trust_lifecycle_scope_rejects_a_malformed_existing_list_without_mutation() {
     let project = TempProject::empty(
         r#"{"name":"lifecycle-scope-trust","version":"1.0.0","lpm":{"scripts":{"trustedScopes":["@company/*",42]}}}"#,
