@@ -28,7 +28,7 @@ mod prelude {
     pub(in crate::commands::config) use super::super::global_config::{
         GlobalConfig, global_config_view_from_value,
     };
-    pub(in crate::commands::config) use super::super::io::{read_config, write_config};
+    pub(in crate::commands::config) use super::super::io::{read_config, update_config};
     pub(in crate::commands::config) use super::common::{
         SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES, SIGNATURES_KEY, TRIAGE_ADVISOR_KEY,
         TRIAGE_ADVISOR_VALUES, announce_bool_set, announce_set, format_bool_enabled,

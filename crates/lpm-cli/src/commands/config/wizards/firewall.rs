@@ -110,49 +110,54 @@ pub(in crate::commands::config) async fn run_firewall_wizard(
         }
     }
 
-    let existing_cfg = read_config(config_path)?;
     apply_firewall_selection(
         config_path,
-        &global_config_view_from_value(&existing_cfg),
         selection,
         json_output,
         &format!("lpm config firewall --set {}", mode.as_str()),
-    )?;
+    )
+    .await?;
     announce_firewall_selection_set(selection, json_output);
     Ok(())
 }
 
-pub(in crate::commands::config) fn apply_firewall_mode(
+pub(in crate::commands::config) async fn apply_firewall_mode(
     config_path: &std::path::Path,
-    global: &GlobalConfig,
     mode: NpmFirewallMode,
     json_output: bool,
     proposed_command: &str,
 ) -> Result<(), LpmError> {
     apply_firewall_selection(
         config_path,
-        global,
         FirewallWizardSelection::Mode(mode),
         json_output,
         proposed_command,
     )
+    .await
 }
 
-fn apply_firewall_selection(
+async fn apply_firewall_selection(
     config_path: &std::path::Path,
-    global: &GlobalConfig,
     selection: FirewallWizardSelection,
     json_output: bool,
     proposed_command: &str,
 ) -> Result<(), LpmError> {
     let mode = selection.mode();
-    crate::security_floor::reject_looser_firewall_mode_write(global, mode)?;
-    crate::security_approval::authorize_persistent_npm_firewall_mode(
-        mode,
-        json_output,
-        proposed_command,
-    )?;
-    persist_firewall_selection(config_path, selection)
+    update_config(config_path, |config| {
+        let global = global_config_view_from_value(config);
+        crate::security_floor::reject_looser_firewall_mode_write(&global, mode)?;
+        crate::security_approval::authorize_persistent_npm_firewall_mode(
+            mode,
+            json_output,
+            proposed_command,
+        )?;
+        persist_firewall_mode_in_config_value(config, mode)?;
+        if let Some(profile) = selection.policy_profile() {
+            persist_firewall_policy_profile_in_config_value(config, profile)?;
+        }
+        Ok(((), true))
+    })
+    .await
 }
 
 pub(in crate::commands::config) fn parse_firewall_mode_selection(
@@ -174,18 +179,6 @@ pub(in crate::commands::config) fn read_firewall_mode(
         _ => return Ok(None),
     };
     crate::npm_firewall_config::config_mode(&GlobalConfig { table })
-}
-
-fn persist_firewall_selection(
-    config_path: &std::path::Path,
-    selection: FirewallWizardSelection,
-) -> Result<(), LpmError> {
-    let mut cfg = read_config(config_path)?;
-    persist_firewall_mode_in_config_value(&mut cfg, selection.mode())?;
-    if let Some(profile) = selection.policy_profile() {
-        persist_firewall_policy_profile_in_config_value(&mut cfg, profile)?;
-    }
-    write_config(config_path, &cfg)
 }
 
 pub(in crate::commands::config) fn persist_firewall_mode_in_config_value(

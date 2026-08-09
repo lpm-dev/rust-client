@@ -1074,39 +1074,39 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 44: lpm config set ──
     SurfaceV2 {
         id: 44,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "writes value into isolated home",
             "--json envelope carries success + action + key + value",
             "array-owned release-age exclusions reject scalar generic set without mutation",
+            "generic set waits for the shared config transaction lock and preserves prior updates",
         ],
         failure_modes_known: &[
             "invalid JSON value rejected",
             "config file permission denied on write",
-            "concurrent config writes (last-writer-wins vs lock)",
             "set on a key that violates a typed schema",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 2)],
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 3)],
         last_audited_at: "2026-08-09",
     },
     // ── id 45: lpm config delete ──
     SurfaceV2 {
         id: 45,
-        scenarios: 1,
+        scenarios: 2,
         failure_modes_tested: &[
             "removes existing key + preserves other entries",
             "--json envelope carries success + action + key + existed",
+            "delete waits for the shared config transaction lock and preserves prior updates",
         ],
         failure_modes_known: &[
             "delete last key (file removed vs left empty)",
             "permission denied on file",
-            "concurrent delete + set on same key",
             "delete of a nonexistent key (idempotent vs error)",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/config.rs", 1)],
-        last_audited_at: "2026-05-14",
+        scenarios_by_file: &[("tests/workflows/tests/config.rs", 2)],
+        last_audited_at: "2026-08-09",
     },
     // ── id 46: lpm config list ──
     SurfaceV2 {
@@ -3623,7 +3623,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     },
     SurfaceV2 {
         id: 167,
-        scenarios: 7,
+        scenarios: 9,
         failure_modes_tested: &[
             "package, scope, and exact-version selectors",
             "duplicate add is a byte-stable no-op",
@@ -3631,6 +3631,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "malformed existing list rejected without mutation",
             "runtime merge with user and CLI layers does not cross-persist",
             "workspace member add writes only the member manifest and leaves no atomic temp file",
+            "workspace member add waits for the validated workspace root install lock",
+            "workspace member add aborts if the workspace root changes while waiting",
             "duplicate storage normalization reports no selector change",
         ],
         failure_modes_known: &[
@@ -3640,7 +3642,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
             ("tests/workflows/tests/trust.rs", 5),
-            ("tests/workflows/tests/policy_storage.rs", 2),
+            ("tests/workflows/tests/policy_storage.rs", 4),
         ],
         last_audited_at: "2026-08-09",
     },
@@ -3680,7 +3682,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     },
     SurfaceV2 {
         id: 170,
-        scenarios: 6,
+        scenarios: 7,
         failure_modes_tested: &[
             "package, scope, and exact-version selectors persist as a TOML array",
             "duplicate add is a byte-stable no-op",
@@ -3688,14 +3690,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "legacy scalar rejected without mutation",
             "user add merges at runtime without writing project, global, or lockfile layers",
             "duplicate storage normalization reports no selector change",
+            "typed add shares the config transaction lock with generic and wizard writers",
         ],
-        failure_modes_known: &[
-            "concurrent generic config writer",
-            "config write permission failure",
-        ],
+        failure_modes_known: &["config write permission failure"],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
-            ("tests/workflows/tests/config.rs", 5),
+            ("tests/workflows/tests/config.rs", 6),
             ("tests/workflows/tests/policy_storage.rs", 1),
         ],
         last_audited_at: "2026-08-09",
@@ -3734,7 +3734,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     },
     SurfaceV2 {
         id: 173,
-        scenarios: 9,
+        scenarios: 11,
         failure_modes_tested: &[
             "signed trust-scope-widen approval required before manifest mutation",
             "lowercase npm scope wildcard persists under lpm.scripts.trustedScopes",
@@ -3744,6 +3744,8 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "malformed existing list rejected without mutation",
             "removed signed scope authorization does not authorize a later re-add",
             "workspace member add writes only the member manifest and leaves no atomic temp file",
+            "workspace member add waits for the validated workspace root install lock",
+            "workspace member add aborts if the workspace root changes while waiting",
             "duplicate storage normalization reports no selector change",
         ],
         failure_modes_known: &[
@@ -3753,20 +3755,21 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
             ("tests/workflows/tests/trust.rs", 8),
-            ("tests/workflows/tests/policy_storage.rs", 1),
+            ("tests/workflows/tests/policy_storage.rs", 3),
         ],
         last_audited_at: "2026-08-09",
     },
     SurfaceV2 {
         id: 174,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
             "complete-scope removal preserves sibling scope and unrelated manifest fields",
             "removal narrows signed project authorization and revokes the temporary scope-widen unlock",
+            "absent-selector removal revokes stale authorization without rewriting the manifest",
         ],
-        failure_modes_known: &["selector absent from the project list"],
+        failure_modes_known: &[],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 2)],
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 3)],
         last_audited_at: "2026-08-09",
     },
     SurfaceV2 {
@@ -3877,7 +3880,7 @@ pub const CROSS_COMMAND_FLOWS: &[CrossCommandFlow] = &[
         tested: true,
         test_file: Some("tests/workflows/tests/trust.rs"),
         catches: "removal revokes both persisted authorization and a live temporary scope-widen \
-                  unlock, so a later add requires new authorization.",
+                  unlock after command or manual narrowing, so a later add requires new authorization.",
     },
     CrossCommandFlow {
         name: "env push → env pull on a different machine (round-trip)",

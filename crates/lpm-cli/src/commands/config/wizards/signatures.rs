@@ -37,7 +37,7 @@ pub(in crate::commands::config) async fn run_signatures_wizard(
             .map_err(|message| LpmError::Registry(format!("`{SIGNATURES_KEY}` {message}")))?
     };
 
-    persist_bool(config_path, SIGNATURES_KEY, enabled)?;
+    persist_bool(config_path, SIGNATURES_KEY, enabled).await?;
     announce_bool_set(SIGNATURES_KEY, enabled, json_output);
     Ok(())
 }

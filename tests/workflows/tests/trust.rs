@@ -1264,6 +1264,60 @@ fn trust_lifecycle_scope_remove_revokes_the_signed_scope_authorization() {
 }
 
 #[test]
+fn trust_lifecycle_scope_absent_remove_revokes_stale_authorization_before_re_add() {
+    let project = TempProject::empty(r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#);
+    write_signed_unlock(&project, &["trust-scope-widen", "scripts-allow"]);
+
+    let add = lpm(&project)
+        .args(["trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to add project lifecycle scope");
+    assert!(add.status.success());
+
+    project.write_file(
+        "package.json",
+        r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#,
+    );
+    let manifest_before = std::fs::read(project.path().join("package.json")).unwrap();
+
+    let remove = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "remove", "@company/*"])
+        .output()
+        .expect("failed to remove absent project lifecycle scope");
+    assert!(remove.status.success());
+    let remove_envelope: serde_json::Value = serde_json::from_slice(&remove.stdout).unwrap();
+    assert_eq!(remove_envelope["changed"], json!(false));
+    assert_eq!(remove_envelope["normalized"], json!(false));
+    assert_eq!(remove_envelope["count"], json!(0));
+    assert_eq!(remove_envelope["scopes"], json!([]));
+    assert_eq!(
+        std::fs::read(project.path().join("package.json")).unwrap(),
+        manifest_before
+    );
+
+    let status = lpm(&project)
+        .args(["--json", "security", "status"])
+        .output()
+        .expect("failed to inspect narrowed project unlock");
+    assert!(status.status.success());
+    let status_envelope: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status_envelope["status"]["active_unlocks"][0]["scopes"],
+        json!(["scripts-allow"])
+    );
+
+    let re_add = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to check stale lifecycle-scope authorization");
+    let envelope = assertions::assert_security_approval_required(&re_add);
+    assert_eq!(
+        envelope["error"]["requested_scopes"],
+        json!(["trust-scope-widen"])
+    );
+}
+
+#[test]
 fn trust_lifecycle_scope_rejects_non_scope_and_malicious_selectors_without_mutation() {
     let project = TempProject::empty(r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#);
     let path = project.path().join("package.json");

@@ -79,6 +79,31 @@ pub(crate) fn run_project(
     operation: ReleaseAgeExcludeOperation<'_>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let (manifest_path, mut manifest, result) = prepare_project_edit(project_dir, operation)?;
+    if result.storage_changed() {
+        set_project_exclusions(&mut manifest, &result.exclusions)?;
+        write_project_manifest(&manifest_path, &manifest)?;
+    }
+    print_result(
+        PROJECT_COMMAND,
+        PROJECT_SCOPE,
+        operation,
+        &result,
+        json_output,
+    )
+}
+
+pub(crate) fn validate_project(
+    project_dir: &Path,
+    operation: ReleaseAgeExcludeOperation<'_>,
+) -> Result<(), LpmError> {
+    prepare_project_edit(project_dir, operation).map(|_| ())
+}
+
+fn prepare_project_edit(
+    project_dir: &Path,
+    operation: ReleaseAgeExcludeOperation<'_>,
+) -> Result<(std::path::PathBuf, serde_json::Value, EditResult), LpmError> {
     let manifest_path = project_dir.join("package.json");
     let content = match lpm_common::read_text_file_capped(
         &manifest_path,
@@ -93,7 +118,7 @@ pub(crate) fn run_project(
         }
         Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
-    let mut manifest: serde_json::Value = serde_json::from_str(&content)
+    let manifest: serde_json::Value = serde_json::from_str(&content)
         .map_err(|error| LpmError::Registry(format!("failed to parse package.json: {error}")))?;
     if !manifest.is_object() {
         return Err(LpmError::Registry(
@@ -107,35 +132,38 @@ pub(crate) fn run_project(
         existing,
         operation,
     )?;
-    if result.storage_changed() {
-        set_project_exclusions(&mut manifest, &result.exclusions)?;
-        write_project_manifest(&manifest_path, &manifest)?;
-    }
-    print_result(
-        PROJECT_COMMAND,
-        PROJECT_SCOPE,
-        operation,
-        &result,
-        json_output,
-    )
+    Ok((manifest_path, manifest, result))
 }
 
-pub(crate) fn run_user(
+pub(crate) async fn run_user(
     config_path: &Path,
     operation: ReleaseAgeExcludeOperation<'_>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let mut config = read_user_config(config_path)?;
-    let existing = user_exclusions(config_path, &config)?;
-    let result = edit_exclusions(
-        "~/.lpm/config.toml > minimum-release-age-exclude",
-        existing,
-        operation,
-    )?;
-    if result.storage_changed() {
-        set_user_exclusions(&mut config, &result.exclusions)?;
-        write_user_config(config_path, &config)?;
-    }
+    let result = if operation.mutates() {
+        crate::commands::config::update_config(config_path, |config| {
+            let existing = user_exclusions(config_path, config)?;
+            let result = edit_exclusions(
+                "~/.lpm/config.toml > minimum-release-age-exclude",
+                existing,
+                operation,
+            )?;
+            let storage_changed = result.storage_changed();
+            if storage_changed {
+                set_user_exclusions(config, &result.exclusions)?;
+            }
+            Ok((result, storage_changed))
+        })
+        .await?
+    } else {
+        let config = read_user_config(config_path)?;
+        let existing = user_exclusions(config_path, &config)?;
+        edit_exclusions(
+            "~/.lpm/config.toml > minimum-release-age-exclude",
+            existing,
+            operation,
+        )?
+    };
     print_result(USER_COMMAND, USER_SCOPE, operation, &result, json_output)
 }
 
@@ -327,15 +355,6 @@ fn set_user_exclusions(config: &mut toml::Value, exclusions: &[String]) -> Resul
         );
     }
     Ok(())
-}
-
-fn write_user_config(path: &Path, config: &toml::Value) -> Result<(), LpmError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = toml::to_string_pretty(config)
-        .map_err(|error| LpmError::Registry(format!("config serialize error: {error}")))?;
-    lpm_common::write_file_atomic(path, content).map_err(LpmError::Io)
 }
 
 fn print_result(

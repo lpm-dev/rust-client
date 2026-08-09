@@ -36,7 +36,7 @@ pub(in crate::commands::config) async fn run_lpm_dev_wizard(
     let initial = read_lpm_dev_settings(config_path)?;
     let mut term = Term::stderr();
     let selected = run_lpm_dev_editor(&mut term, initial).map_err(prompt_err)?;
-    persist_lpm_dev_settings(config_path, selected)?;
+    persist_lpm_dev_settings(config_path, selected).await?;
     install_ui::done("Saved LPM.dev settings");
     Ok(())
 }
@@ -81,7 +81,7 @@ pub(in crate::commands::config) async fn run_lpm_insights_wizard(
         })?
     };
 
-    persist_bool(config_path, FETCH_LPM_SECURITY_INSIGHTS_KEY, enabled)?;
+    persist_bool(config_path, FETCH_LPM_SECURITY_INSIGHTS_KEY, enabled).await?;
     announce_bool_set(FETCH_LPM_SECURITY_INSIGHTS_KEY, enabled, json_output);
     Ok(())
 }
@@ -104,24 +104,26 @@ fn read_lpm_dev_settings(config_path: &std::path::Path) -> Result<LpmDevSettings
     })
 }
 
-fn persist_lpm_dev_settings(
+async fn persist_lpm_dev_settings(
     config_path: &std::path::Path,
     settings: LpmDevSettings,
 ) -> Result<(), LpmError> {
-    let mut config = read_config(config_path)?;
-    let table = config.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
-    table.remove(LEGACY_NO_SKILLS_KEY);
-    table.insert(
-        AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),
-        toml::Value::Boolean(settings.package_skills),
-    );
-    table.insert(
-        FETCH_LPM_SECURITY_INSIGHTS_KEY.to_string(),
-        toml::Value::Boolean(settings.security_insights),
-    );
-    write_config(config_path, &config)
+    update_config(config_path, |config| {
+        let table = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        table.remove(LEGACY_NO_SKILLS_KEY);
+        table.insert(
+            AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),
+            toml::Value::Boolean(settings.package_skills),
+        );
+        table.insert(
+            FETCH_LPM_SECURITY_INSIGHTS_KEY.to_string(),
+            toml::Value::Boolean(settings.security_insights),
+        );
+        Ok(((), true))
+    })
+    .await
 }
 
 fn run_lpm_dev_editor(term: &mut Term, initial: LpmDevSettings) -> io::Result<LpmDevSettings> {
@@ -249,8 +251,8 @@ mod tests {
         assert!(plain.contains("● Disabled"));
     }
 
-    #[test]
-    fn grouped_save_writes_both_booleans_and_removes_legacy_skills_key() {
+    #[tokio::test]
+    async fn grouped_save_writes_both_booleans_and_removes_legacy_skills_key() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
@@ -266,6 +268,7 @@ mod tests {
                 security_insights: false,
             },
         )
+        .await
         .unwrap();
 
         let config = read_config(&path).unwrap();

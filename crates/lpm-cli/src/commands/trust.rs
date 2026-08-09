@@ -165,12 +165,10 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Resul
             };
             let json = json_output || local_json;
             if operation.mutates() {
-                lpm_common::with_exclusive_lock_async(
-                    lpm_common::project_install_lock(project_dir),
-                    async {
-                        crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
-                    },
-                )
+                crate::commands::lifecycle_scope::validate_project(project_dir, operation)?;
+                scope_project_policy_mutation(project_dir, async {
+                    crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
+                })
                 .await
             } else {
                 crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
@@ -195,22 +193,47 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Resul
             };
             let json = json_output || local_json;
             if operation.mutates() {
-                lpm_common::with_exclusive_lock_async(
-                    lpm_common::project_install_lock(project_dir),
-                    async {
-                        crate::commands::release_age_exclude::run_project(
-                            project_dir,
-                            operation,
-                            json,
-                        )
-                    },
-                )
+                crate::commands::release_age_exclude::validate_project(project_dir, operation)?;
+                scope_project_policy_mutation(project_dir, async {
+                    crate::commands::release_age_exclude::run_project(project_dir, operation, json)
+                })
                 .await
             } else {
                 crate::commands::release_age_exclude::run_project(project_dir, operation, json)
             }
         }
     }
+}
+
+async fn scope_project_policy_mutation<F, T>(project_dir: &Path, mutation: F) -> Result<T, LpmError>
+where
+    F: std::future::Future<Output = Result<T, LpmError>>,
+{
+    let initial_workspace_root = discover_workspace_root(project_dir)?;
+    let lock_root = initial_workspace_root.as_deref().unwrap_or(project_dir);
+    let lock_path = lpm_common::project_install_lock(lock_root);
+    lpm_common::with_exclusive_lock_async(lock_path, async {
+        let current_workspace_root = discover_workspace_root(project_dir)?;
+        if current_workspace_root != initial_workspace_root {
+            let expected = initial_workspace_root
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |root| root.display().to_string());
+            let actual = current_workspace_root
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |root| root.display().to_string());
+            return Err(LpmError::Script(format!(
+                "workspace root changed while waiting for the install transaction ({expected} -> {actual}); retry the command"
+            )));
+        }
+        mutation.await
+    })
+    .await
+}
+
+fn discover_workspace_root(project_dir: &Path) -> Result<Option<std::path::PathBuf>, LpmError> {
+    lpm_workspace::discover_workspace(project_dir)
+        .map(|workspace| workspace.map(|workspace| workspace.root))
+        .map_err(|error| LpmError::Script(format!("workspace discovery failed: {error}")))
 }
 
 // ─── lpm trust diff ────────────────────────────────────────────────

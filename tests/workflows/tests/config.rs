@@ -1,6 +1,6 @@
 mod support;
 
-use support::{TempProject, assertions, lpm, write_signed_typosquat_guard_posture};
+use support::{TempProject, assertions, lpm, lpm_spawnable, write_signed_typosquat_guard_posture};
 
 fn config_path(project: &TempProject) -> std::path::PathBuf {
     project.home().join(".lpm").join("config.toml")
@@ -939,6 +939,70 @@ fn config_delete_removes_existing_key_and_preserves_other_entries() {
         content.contains("color = \"always\""),
         "config delete must preserve unrelated entries, got:\n{content}"
     );
+}
+
+#[test]
+fn config_mutations_wait_for_one_shared_transaction_lock_and_preserve_prior_updates() {
+    let project = TempProject::empty(r#"{"name":"config-lock","version":"1.0.0"}"#);
+    seed_config(&project, "color = \"always\"\n");
+    let lock_path = project.home().join(".lpm/.config.lock");
+
+    for (index, args) in [
+        vec!["config", "release-age-exclude", "add", "react"],
+        vec!["config", "set", "registry", "https://registry.example.test"],
+        vec!["config", "lpm-skills", "--set", "false"],
+        vec!["config", "delete", "registry"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path)
+            .expect("hold the config transaction lock");
+        let mut command = lpm_spawnable(&project);
+        command.args(args);
+        let mut child = command.spawn().expect("spawn config mutation");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            child.try_wait().expect("inspect config mutation").is_none(),
+            "every config mutation must wait for ~/.lpm/.config.lock",
+        );
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(config_path(&project))
+            .expect("open config as the active transaction owner");
+        std::io::Write::write_all(
+            &mut config,
+            format!("lock-holder-update-{index} = true\n").as_bytes(),
+        )
+        .expect("append a concurrent config transaction update");
+        drop(transaction_lock);
+
+        let output = child.wait_with_output().expect("finish config mutation");
+        assert!(
+            output.status.success(),
+            "config mutation failed after lock release:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(config_path(&project)).unwrap()).unwrap();
+    assert_eq!(config["color"].as_str(), Some("always"));
+    assert_eq!(
+        config["minimum-release-age-exclude"],
+        toml::Value::Array(vec![toml::Value::String("react".to_string())])
+    );
+    assert_eq!(config["auto-install-lpm-skills"].as_bool(), Some(false));
+    assert!(config.get("registry").is_none());
+    for index in 0..4 {
+        assert_eq!(
+            config[format!("lock-holder-update-{index}")].as_bool(),
+            Some(true),
+            "the waiting writer must reload the lock holder's update"
+        );
+    }
 }
 
 #[test]

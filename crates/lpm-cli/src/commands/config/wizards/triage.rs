@@ -15,7 +15,7 @@ pub(in crate::commands::config) async fn run_triage_wizard(
                 TRIAGE_ADVISOR_VALUES.join(" | ")
             )));
         }
-        persist_string(config_path, TRIAGE_ADVISOR_KEY, v)?;
+        persist_string(config_path, TRIAGE_ADVISOR_KEY, v).await?;
         announce_set(TRIAGE_ADVISOR_KEY, v, json_output);
         print_triage_advisor_followup(json_output);
         return Ok(());
@@ -46,7 +46,7 @@ pub(in crate::commands::config) async fn run_triage_wizard(
             .interact()
             .map_err(prompt_err)?;
         if switch {
-            persist_script_policy(config_path, "triage", json_output)?;
+            persist_script_policy(config_path, "triage", json_output).await?;
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Done · {} = {}",
                 SCRIPT_POLICY_KEY,
@@ -129,7 +129,7 @@ pub(in crate::commands::config) async fn run_triage_wizard(
         }
     }
 
-    persist_string(config_path, TRIAGE_ADVISOR_KEY, chosen_slug)?;
+    persist_string(config_path, TRIAGE_ADVISOR_KEY, chosen_slug).await?;
     announce_set(TRIAGE_ADVISOR_KEY, chosen_slug, json_output);
     print_triage_advisor_followup(json_output);
     Ok(())

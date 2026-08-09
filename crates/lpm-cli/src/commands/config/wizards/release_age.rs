@@ -18,8 +18,6 @@ pub(in crate::commands::config) async fn run_release_age_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let existing_cfg = read_config(config_path)?;
-    let global = global_config_view_from_value(&existing_cfg);
     let selection = if let Some(value) = set {
         parse_release_age_selection(value)?
     } else {
@@ -75,7 +73,6 @@ pub(in crate::commands::config) async fn run_release_age_wizard(
     } else {
         None
     };
-    crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
     let command_hint = match selection {
         ReleaseAgeSelection::Default => "lpm config release-age --set default".to_string(),
         ReleaseAgeSelection::Seconds(0) => "lpm config release-age --set 0".to_string(),
@@ -86,24 +83,15 @@ pub(in crate::commands::config) async fn run_release_age_wizard(
             )
         }
     };
-    crate::security_approval::authorize_persistent_release_age(
+    let persisted = persist_release_age_selection(
+        config_path,
+        selection,
         requested_secs,
+        requested_policy,
         json_output,
         &command_hint,
-    )?;
-    if let Some(policy) = requested_policy {
-        crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
-        crate::security_approval::authorize_persistent_release_age_policy(
-            policy,
-            json_output,
-            &format!("lpm config release-age-policy --set {}", policy.as_str()),
-        )?;
-    }
-
-    let persisted = persist_release_age_selection(config_path, selection)?;
-    if let Some(policy) = requested_policy {
-        persist_release_age_policy(config_path, policy)?;
-    }
+    )
+    .await?;
     announce_release_age_set(persisted, json_output);
     Ok(())
 }
@@ -165,38 +153,56 @@ pub(in crate::commands::config) fn prompt_release_age_policy(
     crate::release_age_config::ReleaseAgePolicy::parse(RELEASE_AGE_POLICY_KEY, choice)
 }
 
-fn persist_release_age_selection(
+async fn persist_release_age_selection(
     config_path: &std::path::Path,
     selection: ReleaseAgeSelection,
+    requested_secs: u64,
+    requested_policy: Option<crate::release_age_config::ReleaseAgePolicy>,
+    json_output: bool,
+    command_hint: &str,
 ) -> Result<Option<u64>, LpmError> {
-    let mut cfg = read_config(config_path)?;
-    let top = cfg.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
-
-    let persisted = match selection {
-        ReleaseAgeSelection::Default => {
-            top.remove(RELEASE_AGE_KEY);
-            None
+    update_config(config_path, |config| {
+        let global = global_config_view_from_value(config);
+        crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
+        crate::security_approval::authorize_persistent_release_age(
+            requested_secs,
+            json_output,
+            command_hint,
+        )?;
+        if let Some(policy) = requested_policy {
+            crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
+            crate::security_approval::authorize_persistent_release_age_policy(
+                policy,
+                json_output,
+                &format!("lpm config release-age-policy --set {}", policy.as_str()),
+            )?;
         }
-        ReleaseAgeSelection::Seconds(secs) => {
+
+        let top = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        let persisted = match selection {
+            ReleaseAgeSelection::Default => {
+                top.remove(RELEASE_AGE_KEY);
+                None
+            }
+            ReleaseAgeSelection::Seconds(secs) => {
+                top.insert(
+                    RELEASE_AGE_KEY.to_string(),
+                    toml::Value::String(secs.to_string()),
+                );
+                Some(secs)
+            }
+        };
+        if let Some(policy) = requested_policy {
             top.insert(
-                RELEASE_AGE_KEY.to_string(),
-                toml::Value::String(secs.to_string()),
+                RELEASE_AGE_POLICY_KEY.to_string(),
+                toml::Value::String(policy.as_str().to_string()),
             );
-            Some(secs)
         }
-    };
-
-    write_config(config_path, &cfg)?;
-    Ok(persisted)
-}
-
-pub(in crate::commands::config) fn persist_release_age_policy(
-    config_path: &std::path::Path,
-    policy: crate::release_age_config::ReleaseAgePolicy,
-) -> Result<(), LpmError> {
-    persist_string(config_path, RELEASE_AGE_POLICY_KEY, policy.as_str())
+        Ok((persisted, true))
+    })
+    .await
 }
 
 pub(in crate::commands::config) async fn run_release_age_policy_wizard(
@@ -204,8 +210,6 @@ pub(in crate::commands::config) async fn run_release_age_policy_wizard(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let existing_cfg = read_config(config_path)?;
-    let global = global_config_view_from_value(&existing_cfg);
     let policy = if let Some(value) = set {
         crate::release_age_config::ReleaseAgePolicy::parse(RELEASE_AGE_POLICY_KEY, value)?
     } else {
@@ -218,13 +222,24 @@ pub(in crate::commands::config) async fn run_release_age_policy_wizard(
         prompt_release_age_policy(config_path)?
     };
 
-    crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
-    crate::security_approval::authorize_persistent_release_age_policy(
-        policy,
-        json_output,
-        &format!("lpm config release-age-policy --set {}", policy.as_str()),
-    )?;
-    persist_release_age_policy(config_path, policy)?;
+    update_config(config_path, |config| {
+        let global = global_config_view_from_value(config);
+        crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
+        crate::security_approval::authorize_persistent_release_age_policy(
+            policy,
+            json_output,
+            &format!("lpm config release-age-policy --set {}", policy.as_str()),
+        )?;
+        let table = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        table.insert(
+            RELEASE_AGE_POLICY_KEY.to_string(),
+            toml::Value::String(policy.as_str().to_string()),
+        );
+        Ok(((), true))
+    })
+    .await?;
     announce_release_age_policy_set(policy, json_output);
     Ok(())
 }

@@ -48,7 +48,7 @@ pub(in crate::commands::config) async fn run_integrity_wizard(
         parse_integrity_policy_selection(new_value)?
     };
 
-    persist_integrity_policy(config_path, policy)?;
+    persist_integrity_policy(config_path, policy).await?;
     announce_integrity_policy_set(policy, json_output);
     Ok(())
 }
@@ -77,11 +77,11 @@ pub(crate) fn resolve_object_integrity_policy(
         .unwrap_or(lpm_store::v2::ObjectIntegrityPolicy::Source))
 }
 
-pub(in crate::commands::config) fn persist_integrity_policy(
+pub(in crate::commands::config) async fn persist_integrity_policy(
     config_path: &std::path::Path,
     policy: lpm_store::v2::ObjectIntegrityPolicy,
 ) -> Result<(), LpmError> {
-    persist_string(config_path, INTEGRITY_KEY, policy.as_str())
+    persist_string(config_path, INTEGRITY_KEY, policy.as_str()).await
 }
 
 pub(in crate::commands::config) fn format_current_integrity_policy(

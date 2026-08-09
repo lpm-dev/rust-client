@@ -20,14 +20,29 @@ pub(super) fn read_config(path: &std::path::Path) -> Result<toml::Value, LpmErro
     toml::from_str(&content).map_err(|e| LpmError::Registry(format!("config parse error: {e}")))
 }
 
-pub(super) fn write_config(path: &std::path::Path, config: &toml::Value) -> Result<(), LpmError> {
+pub(crate) async fn update_config<R>(
+    path: &std::path::Path,
+    update: impl FnOnce(&mut toml::Value) -> Result<(R, bool), LpmError>,
+) -> Result<R, LpmError> {
+    let lock_path = path.with_file_name(".config.lock");
+    lpm_common::with_exclusive_lock_async(lock_path, async {
+        let mut config = read_config(path)?;
+        let (result, storage_changed) = update(&mut config)?;
+        if storage_changed {
+            write_config(path, &config)?;
+        }
+        Ok(result)
+    })
+    .await
+}
+
+fn write_config(path: &std::path::Path, config: &toml::Value) -> Result<(), LpmError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let content = toml::to_string_pretty(config)
         .map_err(|e| LpmError::Registry(format!("config serialize error: {e}")))?;
-    std::fs::write(path, content)?;
-    Ok(())
+    lpm_common::write_file_atomic(path, content).map_err(LpmError::Io)
 }
 
 pub(super) fn config_value_to_json(value: &toml::Value) -> serde_json::Value {

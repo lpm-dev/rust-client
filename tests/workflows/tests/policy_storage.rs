@@ -4,7 +4,7 @@ mod support;
 
 use lpm_common::atomic_write::is_atomic_temp_name;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry, write_signed_unlock_for};
+use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry, write_signed_unlock_for};
 
 const VERSION: &str = "1.0.0";
 const PROJECT_EXCLUDED: &str = "project-excluded";
@@ -363,4 +363,136 @@ fn workspace_project_policy_commands_write_only_the_current_member_manifest() {
     );
     assert!(!member_dir.join("lpm.lock").exists());
     assert_no_atomic_temp_files(&member_dir);
+}
+
+#[test]
+fn workspace_member_policy_mutations_wait_for_the_workspace_root_install_lock() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "policy-workspace-lock",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"workspace-app","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "packages/sibling/package.json",
+        r#"{"name":"workspace-sibling","version":"1.0.0"}"#,
+    );
+    let member_dir = project.path().join("packages/app");
+    write_signed_unlock_for(&project, &member_dir, &["trust-scope-widen"]);
+    let root_before = std::fs::read(project.path().join("package.json")).unwrap();
+    let sibling_before =
+        std::fs::read(project.path().join("packages/sibling/package.json")).unwrap();
+
+    for args in [
+        ["trust", "release-age-exclude", "add", "member-policy@1.0.0"],
+        ["trust", "lifecycle-scope", "add", "@company/*"],
+    ] {
+        let transaction_lock =
+            lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+                .expect("hold the workspace install transaction lock");
+        let mut command = lpm_spawnable(&project);
+        command.current_dir(&member_dir).args(args);
+        let mut child = command.spawn().expect("spawn member policy mutation");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect member policy mutation")
+                .is_none(),
+            "workspace member policy mutation must wait for the workspace root install lock",
+        );
+        drop(transaction_lock);
+
+        let output = child
+            .wait_with_output()
+            .expect("finish member policy mutation");
+        assert_success(&output, "member policy mutation after lock release");
+    }
+
+    assert_eq!(
+        std::fs::read(project.path().join("package.json")).unwrap(),
+        root_before
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("packages/sibling/package.json")).unwrap(),
+        sibling_before
+    );
+    let member: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/package.json")).unwrap();
+    assert_eq!(
+        member["lpm"]["minimumReleaseAgeExclude"],
+        serde_json::json!(["member-policy@1.0.0"])
+    );
+    assert_eq!(
+        member["lpm"]["scripts"]["trustedScopes"],
+        serde_json::json!(["@company/*"])
+    );
+}
+
+#[test]
+fn workspace_member_policy_mutations_abort_if_the_workspace_root_changes_while_waiting() {
+    let workspace_manifest = r#"{
+  "name": "policy-workspace-lock",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#;
+    let project = TempProject::empty(workspace_manifest);
+    let member_manifest = r#"{"name":"workspace-app","version":"1.0.0"}"#;
+    project.write_file("packages/app/package.json", member_manifest);
+    let member_dir = project.path().join("packages/app");
+    write_signed_unlock_for(&project, &member_dir, &["trust-scope-widen"]);
+
+    for args in [
+        ["trust", "release-age-exclude", "add", "member-policy@1.0.0"],
+        ["trust", "lifecycle-scope", "add", "@company/*"],
+    ] {
+        project.write_file("package.json", workspace_manifest);
+        project.write_file("packages/app/package.json", member_manifest);
+        let transaction_lock =
+            lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+                .expect("hold the workspace install transaction lock");
+        let mut command = lpm_spawnable(&project);
+        command.current_dir(&member_dir).args(args);
+        let mut child = command.spawn().expect("spawn member policy mutation");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect member policy mutation")
+                .is_none(),
+            "workspace member policy mutation must wait for the workspace root install lock",
+        );
+        project.write_file(
+            "package.json",
+            r#"{"name":"no-longer-a-workspace","version":"1.0.0"}"#,
+        );
+        drop(transaction_lock);
+
+        let output = child
+            .wait_with_output()
+            .expect("finish member policy mutation");
+        assert!(
+            !output.status.success(),
+            "policy mutation must fail when its workspace root changes"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("workspace root changed while waiting for the install transaction"),
+            "failure must identify the changed workspace root: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            project.read_file("packages/app/package.json"),
+            member_manifest
+        );
+    }
 }

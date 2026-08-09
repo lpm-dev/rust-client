@@ -42,7 +42,7 @@ pub(in crate::commands::config) async fn run_lpm_skills_wizard(
         })?
     };
 
-    persist_auto_install_lpm_skills(config_path, enabled)?;
+    persist_auto_install_lpm_skills(config_path, enabled).await?;
     announce_bool_set(AUTO_INSTALL_LPM_SKILLS_KEY, enabled, json_output);
     Ok(())
 }
@@ -62,20 +62,22 @@ pub(in crate::commands::config) fn format_current_lpm_skills(enabled: bool) -> &
     }
 }
 
-fn persist_auto_install_lpm_skills(
+async fn persist_auto_install_lpm_skills(
     config_path: &std::path::Path,
     enabled: bool,
 ) -> Result<(), LpmError> {
-    let mut config = read_config(config_path)?;
-    let table = config.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
-    table.remove(LEGACY_NO_SKILLS_KEY);
-    table.insert(
-        AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),
-        toml::Value::Boolean(enabled),
-    );
-    write_config(config_path, &config)
+    update_config(config_path, |config| {
+        let table = config.as_table_mut().ok_or_else(|| {
+            LpmError::Registry("config.toml must be a TOML table at the top level".into())
+        })?;
+        table.remove(LEGACY_NO_SKILLS_KEY);
+        table.insert(
+            AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),
+            toml::Value::Boolean(enabled),
+        );
+        Ok(((), true))
+    })
+    .await
 }
 
 #[cfg(test)]

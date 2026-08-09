@@ -54,6 +54,50 @@ pub(crate) fn run_project(
     operation: LifecycleScopeOperation<'_>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let (manifest_path, mut manifest, result) = prepare_project_edit(project_dir, operation)?;
+    match operation {
+        LifecycleScopeOperation::Add(_) => {
+            // Authorize the complete candidate before the manifest can contain a wider trust scope.
+            crate::security_approval::ensure_project_scope_candidate_authorized(
+                project_dir,
+                &result.scopes,
+                json_output,
+                crate::security_approval::ApprovalSource::CliFlag,
+            )?;
+        }
+        LifecycleScopeOperation::Remove(_) => {
+            // Revoke authority even when the selector is absent because stale state can outlive a manual manifest edit.
+            crate::security_approval::record_project_scope_candidate_narrowing(
+                project_dir,
+                &result.scopes,
+                result
+                    .selector
+                    .as_deref()
+                    .expect("remove results have a selector"),
+                crate::security_approval::ApprovalSource::CliFlag,
+            )?;
+        }
+        LifecycleScopeOperation::List => {}
+    }
+
+    if result.storage_changed() {
+        set_project_scopes(&mut manifest, &result.scopes)?;
+        write_project_manifest(&manifest_path, &manifest)?;
+    }
+    print_result(operation, &result, json_output)
+}
+
+pub(crate) fn validate_project(
+    project_dir: &Path,
+    operation: LifecycleScopeOperation<'_>,
+) -> Result<(), LpmError> {
+    prepare_project_edit(project_dir, operation).map(|_| ())
+}
+
+fn prepare_project_edit(
+    project_dir: &Path,
+    operation: LifecycleScopeOperation<'_>,
+) -> Result<(std::path::PathBuf, serde_json::Value, EditResult), LpmError> {
     let manifest_path = project_dir.join("package.json");
     let content = match lpm_common::read_text_file_capped(
         &manifest_path,
@@ -68,7 +112,7 @@ pub(crate) fn run_project(
         }
         Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
-    let mut manifest: serde_json::Value = serde_json::from_str(&content)
+    let manifest: serde_json::Value = serde_json::from_str(&content)
         .map_err(|error| LpmError::Registry(format!("failed to parse package.json: {error}")))?;
     if !manifest.is_object() {
         return Err(LpmError::Registry(
@@ -78,37 +122,7 @@ pub(crate) fn run_project(
 
     let existing = project_scopes(&manifest)?;
     let result = edit_scopes(existing, operation)?;
-    match operation {
-        LifecycleScopeOperation::Add(_) => {
-            // Authorize the complete candidate before the manifest can contain a wider trust scope.
-            crate::security_approval::ensure_project_scope_candidate_authorized(
-                project_dir,
-                &result.scopes,
-                json_output,
-                crate::security_approval::ApprovalSource::CliFlag,
-            )?;
-        }
-        LifecycleScopeOperation::Remove(_) if result.changed => {
-            // Revoke signed and temporary authority first so a manifest-write failure leaves runtime trust closed.
-            crate::security_approval::record_project_scope_candidate_narrowing(
-                project_dir,
-                &result.scopes,
-                result
-                    .selector
-                    .as_deref()
-                    .expect("remove results have a selector"),
-                crate::security_approval::ApprovalSource::CliFlag,
-            )?;
-        }
-        LifecycleScopeOperation::Remove(_) => {}
-        LifecycleScopeOperation::List => {}
-    }
-
-    if result.storage_changed() {
-        set_project_scopes(&mut manifest, &result.scopes)?;
-        write_project_manifest(&manifest_path, &manifest)?;
-    }
-    print_result(operation, &result, json_output)
+    Ok((manifest_path, manifest, result))
 }
 
 fn edit_scopes(
