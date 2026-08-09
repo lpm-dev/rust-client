@@ -6,9 +6,9 @@
 //!    the store for every installed package (npm + @lpm.dev). Produces a
 //!    severity-tiered summary of behavioral tags.
 //!
-//! 2. **Registry-side analysis** (@lpm.dev only): Fetches AI security findings,
-//!    behavioral tags, vulnerabilities, and lifecycle scripts from the registry
-//!    metadata. Merges registry behavioral tags with client-side tags via OR.
+//! 2. **Registry-side analysis** (@lpm.dev only): Fetches behavioral tags and
+//!    lifecycle scripts from registry metadata, then merges behavioral tags
+//!    with client-side tags via OR.
 //!
 //! Uses batch metadata endpoint for @lpm.dev packages (1 request for all).
 
@@ -28,19 +28,10 @@ struct TagIssue {
     packages: Vec<String>, // "name@version"
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AdditionalSignal {
-    CriticalVulnerability,
-    HighVulnerability,
-    Vulnerability,
-    AiSecurityFinding,
-    LifecycleScripts,
-}
-
 #[derive(Default)]
 struct SummaryCounts {
     behavioral: HashMap<PseudoClass, HashSet<String>>,
-    additional: HashMap<AdditionalSignal, HashSet<String>>,
+    lifecycle_scripts: HashSet<String>,
 }
 
 impl SummaryCounts {
@@ -51,11 +42,8 @@ impl SummaryCounts {
             .insert(package.to_string());
     }
 
-    fn insert_additional(&mut self, signal: AdditionalSignal, package: &str) {
-        self.additional
-            .entry(signal)
-            .or_default()
-            .insert(package.to_string());
+    fn insert_lifecycle_scripts(&mut self, package: &str) {
+        self.lifecycle_scripts.insert(package.to_string());
     }
 }
 
@@ -95,7 +83,8 @@ enum SecuritySummaryLine {
 ///
 /// Reads `.lpm-security.json` from the store for ALL packages, then
 /// fetches registry metadata for @lpm.dev packages to merge behavioral
-/// tags, vulnerabilities, AI findings, and lifecycle scripts.
+/// tags and lifecycle scripts. Vulnerabilities and registry security findings
+/// are available only through `lpm audit` or audit-after-install.
 pub(crate) async fn post_install_security_summary(
     client: &RegistryClient,
     lpm_root: &lpm_common::LpmRoot,
@@ -395,7 +384,7 @@ fn append_query_hint(
         .iter()
         .filter_map(|policy| selectors.contains(&policy.token).then_some(policy.token))
         .chain(
-            [":scripts", ":vulnerable"]
+            [":scripts"]
                 .into_iter()
                 .filter(|selector| selectors.contains(selector)),
         )
@@ -440,10 +429,9 @@ fn collect_tags_from_analysis(
     }
 }
 
-/// Collect additional warnings from registry metadata (@lpm.dev packages only).
+/// Collect registry metadata used by the normal install summary.
 ///
-/// Merges registry behavioral tags (OR with client-side), vulnerabilities,
-/// AI security findings, and lifecycle scripts into the tag counts.
+/// Merges registry behavioral tags (OR with client-side) and lifecycle scripts.
 fn collect_registry_warnings(
     ver_meta: &lpm_registry::VersionMetadata,
     pkg_id: &str,
@@ -480,31 +468,10 @@ fn collect_registry_warnings(
         }
     }
 
-    if let Some(vulns) = &ver_meta.vulnerabilities {
-        for vuln in vulns {
-            let severity = vuln.severity.as_deref().unwrap_or("unknown").to_lowercase();
-            let signal = match severity.as_str() {
-                "critical" => AdditionalSignal::CriticalVulnerability,
-                "high" => AdditionalSignal::HighVulnerability,
-                _ => AdditionalSignal::Vulnerability,
-            };
-            counts.insert_additional(signal, pkg_id);
-        }
-    }
-
-    if let Some(findings) = &ver_meta.security_findings {
-        for finding in findings {
-            let severity = finding.severity.as_deref().unwrap_or("info");
-            if severity == "critical" || severity == "high" {
-                counts.insert_additional(AdditionalSignal::AiSecurityFinding, pkg_id);
-            }
-        }
-    }
-
     if let Some(scripts) = &ver_meta.lifecycle_scripts
         && !scripts.is_empty()
     {
-        counts.insert_additional(AdditionalSignal::LifecycleScripts, pkg_id);
+        counts.insert_lifecycle_scripts(pkg_id);
     }
 }
 
@@ -533,49 +500,14 @@ fn build_severity_groups(counts: &SummaryCounts) -> Vec<TagIssue> {
             }
         }
     }
-    for (signal, label, severity, selector) in [
-        (
-            AdditionalSignal::CriticalVulnerability,
-            "critical vulnerability",
-            Severity::Critical,
-            Some(":vulnerable"),
-        ),
-        (
-            AdditionalSignal::LifecycleScripts,
-            "install scripts",
-            Severity::High,
-            Some(":scripts"),
-        ),
-        (
-            AdditionalSignal::AiSecurityFinding,
-            "AI security finding",
-            Severity::High,
-            None,
-        ),
-        (
-            AdditionalSignal::HighVulnerability,
-            "high vulnerability",
-            Severity::High,
-            Some(":vulnerable"),
-        ),
-        (
-            AdditionalSignal::Vulnerability,
-            "vulnerability",
-            Severity::High,
-            Some(":vulnerable"),
-        ),
-    ] {
-        if let Some(packages) = counts.additional.get(&signal)
-            && !packages.is_empty()
-        {
-            issues.push(TagIssue {
-                tag_label: label,
-                severity,
-                install_visibility: InstallVisibility::Default,
-                selector,
-                packages: sorted_package_labels(packages),
-            });
-        }
+    if !counts.lifecycle_scripts.is_empty() {
+        issues.push(TagIssue {
+            tag_label: "install scripts",
+            severity: Severity::High,
+            install_visibility: InstallVisibility::Default,
+            selector: Some(":scripts"),
+            packages: sorted_package_labels(&counts.lifecycle_scripts),
+        });
     }
     issues
 }
@@ -1095,7 +1027,7 @@ mod tests {
                 PseudoClass::Eval,
                 HashSet::from([npm.finding_key(), custom.finding_key()]),
             )]),
-            additional: HashMap::new(),
+            lifecycle_scripts: HashSet::new(),
         };
 
         let issues = build_severity_groups(&counts);
@@ -1137,7 +1069,7 @@ mod tests {
                 PseudoClass::Eval,
                 HashSet::from([package.finding_key(), sibling.finding_key()]),
             )]),
-            additional: HashMap::new(),
+            lifecycle_scripts: HashSet::new(),
         };
 
         let issues = build_severity_groups(&counts);
@@ -1162,13 +1094,13 @@ mod tests {
         collect_tags_from_analysis(&analysis, "clean@1.0.0", &mut counts);
 
         assert!(counts.behavioral.is_empty());
-        assert!(counts.additional.is_empty());
+        assert!(counts.lifecycle_scripts.is_empty());
     }
 
     // ── collect_registry_warnings tests ──────────────────────────────
 
     #[test]
-    fn registry_warnings_collects_vulnerabilities() {
+    fn ordinary_install_registry_warnings_ignore_vulnerability_advisories() {
         let ver_meta = lpm_registry::VersionMetadata {
             vulnerabilities: Some(vec![
                 lpm_registry::Vulnerability {
@@ -1190,18 +1122,8 @@ mod tests {
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(
-            counts
-                .additional
-                .get(&AdditionalSignal::CriticalVulnerability)
-                .unwrap()
-                .contains("pkg@1.0.0")
-        );
-        assert!(
-            counts
-                .additional
-                .get(&AdditionalSignal::HighVulnerability)
-                .unwrap()
-                .contains("pkg@1.0.0")
+            counts.lifecycle_scripts.is_empty(),
+            "ordinary install must leave vulnerability advisories to audit-after-install"
         );
     }
 
@@ -1254,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_warnings_ai_findings() {
+    fn ordinary_install_registry_warnings_ignore_ai_security_findings() {
         let ver_meta = lpm_registry::VersionMetadata {
             security_findings: Some(vec![lpm_registry::SecurityFinding {
                 severity: Some("critical".into()),
@@ -1267,11 +1189,8 @@ mod tests {
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(
-            counts
-                .additional
-                .get(&AdditionalSignal::AiSecurityFinding)
-                .unwrap()
-                .contains("pkg@1.0.0")
+            counts.lifecycle_scripts.is_empty(),
+            "ordinary install must leave AI security findings to audit-after-install"
         );
     }
 
@@ -1287,13 +1206,7 @@ mod tests {
         let mut counts = SummaryCounts::default();
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
-        assert!(
-            counts
-                .additional
-                .get(&AdditionalSignal::LifecycleScripts)
-                .unwrap()
-                .contains("pkg@1.0.0")
-        );
+        assert!(counts.lifecycle_scripts.contains("pkg@1.0.0"));
     }
 
     #[test]
@@ -1303,7 +1216,7 @@ mod tests {
         collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
 
         assert!(counts.behavioral.is_empty());
-        assert!(counts.additional.is_empty());
+        assert!(counts.lifecycle_scripts.is_empty());
     }
 
     // ── build_severity_groups tests ──────────────────────────────────
@@ -1320,24 +1233,6 @@ mod tests {
         assert_eq!(issues[0].severity, Severity::Critical); // obfuscated
         assert_eq!(issues[1].severity, Severity::High); // eval
         assert_eq!(issues[2].severity, Severity::Info); // filesystem
-    }
-
-    #[test]
-    fn severity_groups_vulnerability_tiers() {
-        let mut counts = SummaryCounts::default();
-        counts.insert_additional(AdditionalSignal::CriticalVulnerability, "a@1.0.0");
-        counts.insert_additional(AdditionalSignal::HighVulnerability, "b@1.0.0");
-        counts.insert_additional(AdditionalSignal::Vulnerability, "c@1.0.0");
-
-        let issues = build_severity_groups(&counts);
-
-        assert_eq!(issues.len(), 3);
-        assert_eq!(issues[0].severity, Severity::Critical);
-        assert_eq!(issues[0].tag_label, "critical vulnerability");
-        assert_eq!(issues[1].severity, Severity::High);
-        assert_eq!(issues[1].tag_label, "high vulnerability");
-        assert_eq!(issues[2].severity, Severity::High);
-        assert_eq!(issues[2].tag_label, "vulnerability");
     }
 
     #[test]

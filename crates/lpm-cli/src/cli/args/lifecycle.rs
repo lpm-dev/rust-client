@@ -252,8 +252,8 @@ pub(crate) struct InstallArgs {
     pub(crate) no_engine_strict: bool,
 
     /// Run `lpm audit` once after a successful install and surface
-    /// a one-line summary (`! Audited N packages, V vulnerabilities,
-    /// S suspicious in Tms — run \`lpm audit\``).
+    /// a summary (`! Audited N packages, V vulnerabilities, S suspicious,
+    /// C critical in Tms — run \`lpm audit\``) plus Critical details.
     ///
     /// The summary is informational only — vulnerabilities found
     /// here NEVER fail the install. Run `lpm audit --fail-on=...`

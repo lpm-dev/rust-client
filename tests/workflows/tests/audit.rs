@@ -8,7 +8,8 @@
 mod support;
 
 use support::mock_registry::{
-    MockRegistry, RegistrySigningFixture, make_tarball, make_tarball_from_pkg_json,
+    MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
+    make_tarball_from_pkg_json, make_tarball_with_files,
 };
 use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{body_json, method, path};
@@ -1937,16 +1938,14 @@ fn seed_eval_package(project: &TempProject, name: &str) {
     );
 }
 
-/// Seed a node_modules package with deliberately-obfuscated source —
-/// hex-escaped string literals + `_0xAAAA` variable names match the
-/// `lpm-security` obfuscation heuristic (see supply_chain::detect_obfuscation).
-fn seed_obfuscated_package(project: &TempProject, name: &str) {
+/// Seed a node_modules package with high-confidence obfuscated source.
+fn seed_high_confidence_obfuscated_package(project: &TempProject, name: &str) {
     seed_node_modules_package(
         project,
         name,
         &[(
             "index.js",
-            "var _0x1a2b = \"\\x48\\x65\\x6c\\x6c\\x6f\";\nvar _0x3c4d = _0x1a2b;\nmodule.exports = _0x3c4d;\n",
+            "var _0x1a2b=[\"\\x48\",\"\\x65\",\"\\x6c\",\"\\x6c\",\"\\x6f\"];\nfunction _0x3c4d(_0x5e6f) { return _0x1a2b[_0x5e6f]; }\nmodule.exports = _0x3c4d(0x1);\n",
         )],
     );
 }
@@ -2033,9 +2032,9 @@ async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
 /// high go through different branches of `should_fail`; this case
 /// pins the critical branch.
 #[tokio::test]
-async fn audit_fail_on_behavior_triggers_on_local_obfuscation_finding() {
+async fn audit_fail_on_behavior_triggers_on_local_high_confidence_obfuscation() {
     let project = TempProject::empty(r#"{"name":"obfu-host","version":"1.0.0"}"#);
-    seed_obfuscated_package(&project, "obfu-pkg");
+    seed_high_confidence_obfuscated_package(&project, "obfu-pkg");
 
     let mock = MockRegistry::start().await;
     mock.with_osv_querybatch(vec![vec![]]).await;
@@ -2043,9 +2042,72 @@ async fn audit_fail_on_behavior_triggers_on_local_obfuscation_finding() {
     let out = run_audit_no_osv(&project, &mock, &["--fail-on=behavior"]);
     assert!(
         !out.status.success(),
-        "--fail-on=behavior must fire when obfuscation is detected; stdout:\n{}\nstderr:\n{}",
+        "--fail-on=behavior must fire on high-confidence obfuscation; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[tokio::test]
+async fn audit_human_output_shows_local_critical_finding_for_lpm_package() {
+    let mock = MockRegistry::start().await;
+    let package = "@lpm.dev/test.local-critical";
+    let tarball = make_tarball_with_files(
+        package,
+        "1.0.0",
+        &[(
+            "index.js",
+            b"while (true) { value = value.replace('a', 'b'); }\n",
+        )],
+    );
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!(
+                        "{}{}",
+                        mock.url(),
+                        MockRegistry::tarball_path(package, "1.0.0")
+                    ),
+                    "integrity": compute_integrity(&tarball)
+                }
+            }
+        }
+    });
+    mock.with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"local-critical-host","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to install local Critical fixture");
+    assert!(
+        install.status.success(),
+        "fixture install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let output = run_audit(&project, &mock, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "Critical audit must exit non-zero"
+    );
+    assert!(
+        stderr.contains("CRITICAL") && stderr.contains("protestware") && stderr.contains(package),
+        "local LPM Critical finding must be visible in human output: {stderr}"
     );
 }
 

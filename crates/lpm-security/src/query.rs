@@ -18,7 +18,7 @@
 //! - `:critical` = `:obfuscated` OR `:protestware`
 //! - `:high` = `:eval` OR `:child-process` OR `:shell` OR `:dynamic-require` OR `:scripts` OR `:vulnerable`
 //! - `:medium` = `:network` OR `:git-dep` OR `:http-dep` OR `:wildcard-dep` OR `:no-license` OR `:native`
-//! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:high-entropy` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:minified` OR `:url-strings`
+//! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:possible-obfuscation` OR `:high-entropy` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:minified` OR `:url-strings`
 
 use crate::behavioral::PackageAnalysis;
 use std::collections::{HashMap, HashSet};
@@ -44,7 +44,7 @@ pub enum Selector {
     },
 }
 
-/// Group a behavioral tag belongs to. The 22 tags split across three
+/// Group a behavioral tag belongs to. The 23 tags split across three
 /// groups: source-behavior tags (what the code does), supply-chain
 /// tags (what the artifact looks like), and manifest tags (what
 /// `package.json` declares).
@@ -69,7 +69,7 @@ impl fmt::Display for TagGroup {
 }
 
 /// One row of the behavioral-tag catalog — single source of truth for
-/// the 22 tags emitted by `lpm audit` / `lpm query`. Includes the CLI
+/// the 23 tags emitted by `lpm audit` / `lpm query`. Includes the CLI
 /// token (e.g., `:eval`), the group it belongs to, the severity tier,
 /// and a short user-facing description. The drift test in
 /// `lpm-workflows` asserts the doc tables in `security-audit.mdx` and
@@ -104,7 +104,7 @@ impl InstallVisibility {
     }
 }
 
-const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 22] = [
+const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 23] = [
     BehavioralTagInfo {
         tag: PseudoClass::Eval,
         token: ":eval",
@@ -203,6 +203,15 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 22] = [
         severity: Severity::Critical,
         install_visibility: InstallVisibility::Default,
         description: "Show signs of code obfuscation",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::PossibleObfuscation,
+        token: ":possible-obfuscation",
+        label: "possible obfuscation",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Show possible code obfuscation at moderate confidence",
     },
     BehavioralTagInfo {
         tag: PseudoClass::HighEntropy,
@@ -331,8 +340,9 @@ pub enum PseudoClass {
     Env,
     Ws,
 
-    // Supply chain selectors (7)
+    // Supply chain selectors (8)
     Obfuscated,
+    PossibleObfuscation,
     HighEntropy,
     Minified,
     Telemetry,
@@ -388,6 +398,7 @@ impl PseudoClass {
 
             // Supply chain tags
             "obfuscated" => Some(Self::Obfuscated),
+            "possible-obfuscation" => Some(Self::PossibleObfuscation),
             "high-entropy" => Some(Self::HighEntropy),
             "minified" => Some(Self::Minified),
             "telemetry" => Some(Self::Telemetry),
@@ -438,6 +449,7 @@ impl PseudoClass {
             Self::Env => ":env",
             Self::Ws => ":ws",
             Self::Obfuscated => ":obfuscated",
+            Self::PossibleObfuscation => ":possible-obfuscation",
             Self::HighEntropy => ":high-entropy",
             Self::Minified => ":minified",
             Self::Telemetry => ":telemetry",
@@ -481,6 +493,7 @@ impl PseudoClass {
             Self::Env,
             Self::Ws,
             Self::Obfuscated,
+            Self::PossibleObfuscation,
             Self::HighEntropy,
             Self::Minified,
             Self::Telemetry,
@@ -501,7 +514,7 @@ impl PseudoClass {
             .find(|policy| policy.tag == self)
     }
 
-    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the 22
+    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the 23
     /// behavioral tags; `None` for state / severity / special selectors
     /// that aren't part of the behavioral analysis catalog.
     pub fn group(self) -> Option<TagGroup> {
@@ -552,6 +565,7 @@ impl PseudoClass {
             Self::Env => analysis.source.environment_vars,
             Self::Ws => analysis.source.web_socket,
             Self::Obfuscated => analysis.supply_chain.obfuscated,
+            Self::PossibleObfuscation => analysis.supply_chain.possible_obfuscation,
             Self::HighEntropy => analysis.supply_chain.high_entropy_strings,
             Self::Minified => analysis.supply_chain.minified,
             Self::Telemetry => analysis.supply_chain.telemetry,
@@ -1828,6 +1842,35 @@ mod tests {
         let all = HashMap::new();
 
         assert_eq!(PseudoClass::HighEntropy.severity(), Severity::Info);
+        assert!(matches(
+            &parse_selector(":info").unwrap(),
+            &pkg,
+            &graph,
+            &all
+        ));
+        assert!(!matches(
+            &parse_selector(":critical").unwrap(),
+            &pkg,
+            &graph,
+            &all
+        ));
+    }
+
+    #[test]
+    fn possible_obfuscation_is_info_and_does_not_match_critical() {
+        let mut analysis = default_analysis();
+        analysis.supply_chain.possible_obfuscation = true;
+        let pkg = make_pkg("compiled-output", Some(&analysis));
+        let graph = empty_graph();
+        let all = HashMap::new();
+
+        assert_eq!(PseudoClass::PossibleObfuscation.severity(), Severity::Info);
+        assert!(matches(
+            &parse_selector(":possible-obfuscation").unwrap(),
+            &pkg,
+            &graph,
+            &all
+        ));
         assert!(matches(
             &parse_selector(":info").unwrap(),
             &pkg,

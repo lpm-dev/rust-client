@@ -39,6 +39,13 @@ let package = Package(
 }
 
 async fn mount_swift_package(mock: &MockRegistry) -> Vec<u8> {
+    mount_swift_package_with_security_findings(mock, None).await
+}
+
+async fn mount_swift_package_with_security_findings(
+    mock: &MockRegistry,
+    security_findings: Option<serde_json::Value>,
+) -> Vec<u8> {
     let tarball = b"unused swift package tarball";
     let mut metadata = mock.package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball);
     let version = &mut metadata["versions"][SWIFT_VERSION];
@@ -50,6 +57,9 @@ async fn mount_swift_package(mock: &MockRegistry) -> Vec<u8> {
             "targets": ["SwiftLogger"]
         }]
     });
+    if let Some(security_findings) = security_findings {
+        version["_securityFindings"] = security_findings;
+    }
     mock.with_package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball, metadata)
         .await;
     let cert = rcgen::generate_simple_self_signed(vec!["lpm.dev".to_string()])
@@ -325,6 +335,39 @@ async fn swift_install_yes_selects_first_eligible_target_without_prompting() {
     assert!(
         product_is_attached_to_first_target(&project.read_file("Package.swift")),
         "--yes must attach the Swift product to the first eligible target"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_swift_install_does_not_show_registry_ai_findings() {
+    let mock = MockRegistry::start().await;
+    let finding = "registry AI finding must stay behind an audit";
+    let cert = mount_swift_package_with_security_findings(
+        &mock,
+        Some(serde_json::json!([{
+            "severity": "critical",
+            "description": finding
+        }])),
+    )
+    .await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run ordinary Swift install");
+    let combined = combined_output(&output);
+
+    assert!(
+        output.status.success(),
+        "ordinary Swift install should succeed:\n{combined}"
+    );
+    assert!(
+        !combined.contains(finding),
+        "ordinary Swift install must leave registry AI findings to audit:\n{combined}"
     );
 }
 

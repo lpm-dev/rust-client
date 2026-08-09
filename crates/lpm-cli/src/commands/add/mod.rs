@@ -8,7 +8,7 @@ mod source;
 mod swift;
 mod target;
 
-pub use security::print_security_warnings;
+pub use security::{print_install_security_warnings, print_security_warnings};
 
 use crate::commands::install::{
     NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,

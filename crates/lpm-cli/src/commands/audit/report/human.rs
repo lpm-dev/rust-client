@@ -11,7 +11,7 @@ use super::format::{
 use crate::commands::audit::behavior::BehavioralSummary;
 use crate::commands::audit::discovery::DiscoveryResult;
 use crate::commands::audit::osv::OsvVulnerability;
-use crate::commands::audit::types::{AuditIssue, AuditResult};
+use crate::commands::audit::types::AuditResult;
 
 pub(in crate::commands::audit) fn print_discovery_summary(discovery: &DiscoveryResult) {
     let total = discovery.packages.len();
@@ -59,7 +59,7 @@ pub(in crate::commands::audit) fn print_osv_status(osv_degraded_reason: Option<&
     }
 }
 
-/// Print LPM package quality scores and registry-only issues.
+/// Print LPM package quality scores and all registry/local issues.
 pub(in crate::commands::audit) fn print_lpm_results(
     results: &[AuditResult],
     lpm_packages: &[(String, String)],
@@ -80,13 +80,7 @@ pub(in crate::commands::audit) fn print_lpm_results(
             .map(|s| format!(" quality: {s}/100"))
             .unwrap_or_default();
 
-        let registry_issues: Vec<&AuditIssue> = result
-            .issues
-            .iter()
-            .filter(|i| i.source == "registry")
-            .collect();
-
-        if registry_issues.is_empty() {
+        if result.issues.is_empty() {
             let name = lpm_common::sanitize_terminal_inline(&result.name);
             let version = lpm_common::sanitize_terminal_inline(&result.version);
             eprintln!(
@@ -106,10 +100,11 @@ pub(in crate::commands::audit) fn print_lpm_results(
             format!("({version}){score_str}").dimmed(),
         );
 
-        for issue in registry_issues {
-            let icon = match issue.severity.as_str() {
+        for issue in &result.issues {
+            let severity = issue.severity.to_ascii_lowercase();
+            let icon = match severity.as_str() {
                 "high" | "critical" => "✗".red().to_string(),
-                "moderate" => "!".yellow().to_string(),
+                "moderate" | "medium" => "!".yellow().to_string(),
                 _ => "ℹ".blue().to_string(),
             };
             eprintln!(

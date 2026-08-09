@@ -6,9 +6,26 @@ pub fn print_security_warnings(
     version: &str,
     ver_meta: &lpm_registry::VersionMetadata,
 ) {
+    print_security_warnings_with_registry_findings(name, version, ver_meta, true);
+}
+
+pub fn print_install_security_warnings(
+    name: &str,
+    version: &str,
+    ver_meta: &lpm_registry::VersionMetadata,
+) {
+    print_security_warnings_with_registry_findings(name, version, ver_meta, false);
+}
+
+fn print_security_warnings_with_registry_findings(
+    name: &str,
+    version: &str,
+    ver_meta: &lpm_registry::VersionMetadata,
+    include_registry_findings: bool,
+) {
     let mut warnings: Vec<String> = Vec::new();
 
-    if let Some(findings) = &ver_meta.security_findings {
+    if include_registry_findings && let Some(findings) = &ver_meta.security_findings {
         for finding in findings {
             let severity = finding.severity.as_deref().unwrap_or("info");
             let desc = finding

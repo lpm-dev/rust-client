@@ -1,0 +1,18 @@
+---
+source: tests/workflows/tests/install.rs
+expression: summary
+---
+{
+  "packages_audited": 1,
+  "vulnerabilities": 0,
+  "suspicious": 1,
+  "severity_counts": {
+    "critical": 0,
+    "high": 0,
+    "moderate": 1,
+    "low": 0,
+    "info": 1
+  },
+  "critical_findings": [],
+  "elapsed_ms": "[DURATION]"
+}

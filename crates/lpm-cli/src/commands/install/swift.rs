@@ -190,7 +190,7 @@ pub(super) async fn run_swift_install_spm(
 
     // Security check
     if ver_meta.has_security_issues() && !json_output {
-        crate::commands::add::print_security_warnings(&name.scoped(), version, ver_meta);
+        crate::commands::add::print_install_security_warnings(&name.scoped(), version, ver_meta);
     }
 
     if !json_output && !edit.already_exists {
@@ -322,7 +322,7 @@ pub(super) async fn run_swift_install_xcode(
 
     // Security check
     if ver_meta.has_security_issues() && !json_output {
-        crate::commands::add::print_security_warnings(&name.scoped(), version, ver_meta);
+        crate::commands::add::print_install_security_warnings(&name.scoped(), version, ver_meta);
     }
 
     // Xcode warning (first link only)

@@ -10,13 +10,18 @@ pub(super) fn collect_registry_issues(
     // AI security findings
     if let Some(findings) = &ver_meta.security_findings {
         for finding in findings {
-            let severity = finding.severity.as_deref().unwrap_or("moderate");
+            let severity = finding
+                .severity
+                .as_deref()
+                .unwrap_or("moderate")
+                .trim()
+                .to_ascii_lowercase();
             let desc = finding
                 .description
                 .as_deref()
                 .unwrap_or("security concern detected");
             issues.push(AuditIssue {
-                severity: severity.to_string(),
+                severity,
                 message: desc.to_string(),
                 category: "security".to_string(),
                 source: "registry".to_string(),

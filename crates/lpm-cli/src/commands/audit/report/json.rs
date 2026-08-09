@@ -1,6 +1,6 @@
 use crate::commands::audit::discovery::DiscoveryResult;
 use crate::commands::audit::osv::OsvVulnerability;
-use crate::commands::audit::types::AuditResult;
+use crate::commands::audit::types::{AuditResult, summarize_findings};
 
 /// Print JSON output for machine consumption.
 pub(in crate::commands::audit) fn print_json_report(
@@ -10,33 +10,7 @@ pub(in crate::commands::audit) fn print_json_report(
     discovery: &DiscoveryResult,
     checked_lpm: usize,
 ) {
-    let mut critical_count = 0usize;
-    let mut high_count = 0usize;
-    let mut moderate_count = 0usize;
-    let mut low_count = 0usize;
-    let mut info_count = 0usize;
-
-    for r in results {
-        for issue in &r.issues {
-            match issue.severity.to_lowercase().as_str() {
-                "critical" => critical_count += 1,
-                "high" => high_count += 1,
-                "moderate" | "medium" => moderate_count += 1,
-                "low" => low_count += 1,
-                "info" => info_count += 1,
-                _ => {}
-            }
-        }
-    }
-    for v in osv_vulns {
-        match v.severity.to_uppercase().as_str() {
-            "CRITICAL" => critical_count += 1,
-            "HIGH" => high_count += 1,
-            "MODERATE" | "MEDIUM" => moderate_count += 1,
-            "LOW" => low_count += 1,
-            _ => info_count += 1,
-        }
-    }
+    let (counts, _) = summarize_findings(results, osv_vulns);
 
     let json = serde_json::json!({
         "success": osv_degraded_reason.is_none(),
@@ -56,11 +30,11 @@ pub(in crate::commands::audit) fn print_json_report(
         "total_issues": results.iter().map(|r| r.issues.len()).sum::<usize>(),
         "osv_vulnerabilities": osv_vulns.len(),
         "counts": {
-            "critical": critical_count,
-            "high": high_count,
-            "moderate": moderate_count,
-            "low": low_count,
-            "info": info_count,
+            "critical": counts.critical,
+            "high": counts.high,
+            "moderate": counts.moderate,
+            "low": counts.low,
+            "info": counts.info,
         },
         "packages": results.iter().map(|r| {
             serde_json::json!({

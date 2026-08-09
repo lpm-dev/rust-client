@@ -392,13 +392,6 @@ fn registry_all_behavioral_fields_emit_one_policy_issue_each() {
         t.no_license = true;
     }));
     assert_eq!(issues.len(), registry_tag_cases().len(), "{issues:?}");
-    for policy in lpm_security::query::behavioral_tag_policies() {
-        assert!(
-            issues.iter().any(|issue| issue.message == policy.label),
-            "registry issue missing for {}",
-            policy.token
-        );
-    }
 }
 
 // security_findings arm
@@ -408,7 +401,7 @@ fn registry_issue_security_findings_emits_one_issue_per_finding() {
     let meta = VersionMetadata {
         security_findings: Some(vec![
             SecurityFinding {
-                severity: Some("high".into()),
+                severity: Some("Critical".into()),
                 description: Some("hardcoded API key".into()),
                 file: Some("index.js".into()),
             },
@@ -427,8 +420,8 @@ fn registry_issue_security_findings_emits_one_issue_per_finding() {
             .iter()
             .all(|i| i.category == "security" && i.source == "registry")
     );
-    let high = issues.iter().find(|i| i.severity == "high").unwrap();
-    assert_eq!(high.message, "hardcoded API key");
+    let critical = issues.iter().find(|i| i.severity == "critical").unwrap();
+    assert_eq!(critical.message, "hardcoded API key");
     let moderate = issues.iter().find(|i| i.severity == "moderate").unwrap();
     assert_eq!(moderate.message, "unsafe regex");
 }

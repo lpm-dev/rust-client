@@ -9,6 +9,7 @@ mod osv;
 mod policy;
 mod registry;
 mod report;
+mod scan;
 mod secrets;
 mod signatures;
 mod types;
@@ -25,16 +26,11 @@ use lpm_registry::RegistryClient;
 
 use crate::install_ui;
 
-use behavior::run_behavioral_analysis;
-use discovery::ScanMode;
-use osv::run_osv_scan;
 use policy::FailPolicy;
-use registry::collect_registry_issues;
 use report::{
     print_behavioral_results, print_discovery_summary, print_json_report, print_lpm_results,
     print_osv_results, print_osv_status, print_summary,
 };
-use types::{AuditIssue, AuditResult};
 
 pub use fix::run_fix;
 pub use install_summary::run_install_summary;
@@ -190,13 +186,16 @@ pub async fn run(
         Some(s) => FailPolicy::parse(s)?,
         None => FailPolicy::All,
     };
-    // ── Discover packages from any lockfile ──────────────────────
-    //
-    // Discovery only reads the project's lockfile — no LPM-store
-    // touch — so it runs unlocked. The store-touching slice is
-    // [`run_behavioral_analysis`] below, and only when at least one
-    // discovered package has `ScanMode::RegistryAndStore`.
-    let discovery = discovery::discover_packages(project_dir)?;
+
+    let scan::AuditScan {
+        discovery,
+        lpm_packages,
+        results,
+        behavioral: behavioral_results,
+        osv_vulnerabilities: osv_vulns,
+        osv_degraded_reason,
+        checked_lpm,
+    } = scan::run_scan(client, project_dir, store_version, json_output, level).await?;
 
     if discovery.packages.is_empty() {
         if json_output {
@@ -206,105 +205,6 @@ pub async fn run(
         }
         return Ok(());
     }
-
-    // Separate LPM and non-LPM packages
-    let lpm_packages: Vec<(String, String)> = discovery
-        .packages
-        .iter()
-        .filter(|p| p.name.starts_with("@lpm.dev/"))
-        .map(|p| (p.name.clone(), p.version.clone()))
-        .collect();
-
-    let mut results: Vec<AuditResult> = Vec::new();
-    let mut checked_lpm = 0usize;
-
-    // ── LPM registry metadata (@lpm.dev packages only) ──────────
-    if !lpm_packages.is_empty() {
-        let names: Vec<String> = lpm_packages.iter().map(|(n, _)| n.clone()).collect();
-        let metadata_map = client.batch_metadata(&names).await.map_err(|error| {
-            LpmError::Registry(format!(
-                "LPM registry metadata lookup failed during audit: {error}"
-            ))
-        })?;
-
-        for (name, version) in &lpm_packages {
-            let metadata = metadata_map.get(name).ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "LPM registry returned no metadata for installed package {name}@{version}"
-                ))
-            })?;
-            let ver_meta = metadata.version(version).ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "LPM registry metadata omitted installed version {name}@{version}"
-                ))
-            })?;
-            checked_lpm += 1;
-            let mut issues: Vec<AuditIssue> = Vec::new();
-            collect_registry_issues(ver_meta, &mut issues);
-
-            let quality_score = ver_meta.quality_score;
-            if let Some(score) = quality_score
-                && score < 40
-            {
-                issues.push(AuditIssue {
-                    severity: if score < 20 { "high" } else { "moderate" }.to_string(),
-                    message: format!("low quality score: {score}/100"),
-                    category: "quality".to_string(),
-                    source: "registry".to_string(),
-                });
-            }
-
-            results.push(AuditResult {
-                name: name.clone(),
-                version: version.clone(),
-                quality_score,
-                issues,
-            });
-        }
-    }
-
-    // ── Client-side behavioral analysis (ALL packages) ──────────
-    //
-    // Only `RegistryAndStore` packages (i.e., LPM store-backed packages)
-    // touch `~/.lpm/store/`. If none are present — pure npm / pnpm /
-    // yarn / bun project — we skip the store lock entirely. Otherwise
-    // we hold the shared store lock for the duration of the scan so
-    // it can't race a concurrent `lpm cache prune --apply` / `lpm store clean`.
-    let needs_store_lock = discovery
-        .packages
-        .iter()
-        .any(|p| matches!(p.scan_mode, ScanMode::RegistryAndStore));
-
-    let behavioral_results = if needs_store_lock {
-        let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
-        let mut summary = None;
-        lpm_common::with_shared_lock(lock_path, || {
-            summary = Some(run_behavioral_analysis(
-                &discovery,
-                &mut results,
-                &lpm_packages,
-                json_output,
-                level,
-                store_version,
-            ));
-            Ok(())
-        })?;
-        summary.expect("set inside the closure body")
-    } else {
-        run_behavioral_analysis(
-            &discovery,
-            &mut results,
-            &lpm_packages,
-            json_output,
-            level,
-            store_version,
-        )
-    };
-
-    // ── OSV vulnerability scan (non-@lpm.dev packages) ──────────
-    let osv_outcome = run_osv_scan(&discovery.packages, json_output, level).await;
-    let osv_vulns = osv_outcome.vulns;
-    let osv_degraded_reason = osv_outcome.degraded_reason;
 
     // ── Report ──────────────────────────────────────────────────
     if json_output {
