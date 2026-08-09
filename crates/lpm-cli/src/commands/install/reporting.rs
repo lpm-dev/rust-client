@@ -839,32 +839,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // count goes red when non-zero. Computed above before the
         // human/JSON branch split so both surfaces agree.
         if let Some(counts) = audit_summary_for_envelope {
-            install_ui::warn_line(install_ui::format_audit_advisory(
-                counts.packages_audited,
-                counts.vulnerabilities,
-                counts.suspicious,
-                counts.severity_counts.critical,
-                counts.elapsed_ms,
-            ));
-            if !counts.critical_findings.is_empty() {
-                install_ui::detail_line(crate::install_ui::terminal_line!(
-                    "  {}",
-                    install_ui::red("Critical")
-                ));
-                for finding in &counts.critical_findings {
-                    let package = lpm_common::sanitize_terminal_inline(&finding.package);
-                    let version = lpm_common::sanitize_terminal_inline(&finding.version);
-                    let message = lpm_common::sanitize_terminal_inline(&finding.message);
-                    let source = lpm_common::sanitize_terminal_inline(&finding.source);
-                    let category = lpm_common::sanitize_terminal_inline(&finding.category);
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "    {} {} {}",
-                        install_ui::yellow(&format!("{package}@{version}")),
-                        message,
-                        install_ui::dim(&format!("[{source}/{category}]")),
-                    ));
-                }
-            }
+            crate::commands::audit::print_install_summary(counts, true);
         }
 
         if verbose {

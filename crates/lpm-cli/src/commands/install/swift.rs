@@ -1,14 +1,20 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct SwiftInstallOptions<'a> {
+    pub(super) yes: bool,
+    pub(super) json_output: bool,
+    pub(super) audit_after_install: bool,
+    pub(super) registry_url: &'a str,
+}
+
 /// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.
 pub(super) async fn run_swift_install(
     project_dir: &Path,
     name: &lpm_common::PackageName,
     version: &str,
     ver_meta: &lpm_registry::VersionMetadata,
-    yes: bool,
-    json_output: bool,
-    registry_url: &str,
+    options: SwiftInstallOptions<'_>,
 ) -> Result<(), LpmError> {
     use crate::swift_manifest;
     use crate::xcode_project;
@@ -31,9 +37,7 @@ pub(super) async fn run_swift_install(
                 ver_meta,
                 &se0292_id,
                 product_name,
-                yes,
-                json_output,
-                registry_url,
+                options,
             )
             .await
         }
@@ -47,8 +51,7 @@ pub(super) async fn run_swift_install(
                 ver_meta,
                 &se0292_id,
                 product_name,
-                json_output,
-                registry_url,
+                options,
             )
             .await
         }
@@ -69,11 +72,16 @@ pub(super) async fn run_swift_install_spm(
     ver_meta: &lpm_registry::VersionMetadata,
     se0292_id: &str,
     product_name: &str,
-    yes: bool,
-    json_output: bool,
-    registry_url: &str,
+    options: SwiftInstallOptions<'_>,
 ) -> Result<(), LpmError> {
     use crate::swift_manifest;
+
+    let SwiftInstallOptions {
+        yes,
+        json_output,
+        audit_after_install,
+        registry_url,
+    } = options;
 
     let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
 
@@ -160,6 +168,10 @@ pub(super) async fn run_swift_install_spm(
         None
     };
 
+    let audit_summary = audit_after_install.then(|| {
+        crate::commands::audit::summarize_registry_install(&name.scoped(), version, ver_meta)
+    });
+
     // Output
     if json_output {
         let mut json = serde_json::json!({
@@ -173,6 +185,10 @@ pub(super) async fn run_swift_install_spm(
         });
         if let Some(setup) = registry_setup {
             json["registry_setup"] = setup.to_json();
+        }
+        if let Some(summary) = &audit_summary {
+            json["audit_summary"] =
+                serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
         }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
@@ -192,6 +208,9 @@ pub(super) async fn run_swift_install_spm(
     if ver_meta.has_security_issues() && !json_output {
         crate::commands::add::print_install_security_warnings(&name.scoped(), version, ver_meta);
     }
+    if !json_output && let Some(summary) = &audit_summary {
+        crate::commands::audit::print_install_summary(summary, false);
+    }
 
     if !json_output && !edit.already_exists {
         println!();
@@ -210,11 +229,17 @@ pub(super) async fn run_swift_install_xcode(
     ver_meta: &lpm_registry::VersionMetadata,
     se0292_id: &str,
     product_name: &str,
-    json_output: bool,
-    registry_url: &str,
+    options: SwiftInstallOptions<'_>,
 ) -> Result<(), LpmError> {
     use crate::swift_manifest;
     use crate::xcode_project;
+
+    let SwiftInstallOptions {
+        json_output,
+        audit_after_install,
+        registry_url,
+        ..
+    } = options;
 
     // Resolve the project root (xcodeproj's parent)
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
@@ -290,6 +315,10 @@ pub(super) async fn run_swift_install_xcode(
         None
     };
 
+    let audit_summary = audit_after_install.then(|| {
+        crate::commands::audit::summarize_registry_install(&name.scoped(), version, ver_meta)
+    });
+
     // Step 5: Output
     if json_output {
         let mut json = serde_json::json!({
@@ -305,6 +334,10 @@ pub(super) async fn run_swift_install_xcode(
         });
         if let Some(setup) = registry_setup {
             json["registry_setup"] = setup.to_json();
+        }
+        if let Some(summary) = &audit_summary {
+            json["audit_summary"] =
+                serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
         }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if !edit.already_exists {
@@ -323,6 +356,9 @@ pub(super) async fn run_swift_install_xcode(
     // Security check
     if ver_meta.has_security_issues() && !json_output {
         crate::commands::add::print_install_security_warnings(&name.scoped(), version, ver_meta);
+    }
+    if !json_output && let Some(summary) = &audit_summary {
+        crate::commands::audit::print_install_summary(summary, false);
     }
 
     // Xcode warning (first link only)

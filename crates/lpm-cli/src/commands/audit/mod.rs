@@ -33,7 +33,7 @@ use report::{
 };
 
 pub use fix::run_fix;
-pub use install_summary::run_install_summary;
+pub use install_summary::{print_install_summary, run_install_summary, summarize_registry_install};
 pub(crate) use policy::AuditLevel;
 pub use secrets::run_secrets;
 pub use signatures::run_signatures;

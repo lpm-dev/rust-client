@@ -251,9 +251,9 @@ pub(crate) struct InstallArgs {
     #[arg(long)]
     pub(crate) no_engine_strict: bool,
 
-    /// Run `lpm audit` once after a successful install and surface
-    /// a summary (`! Audited N packages, V vulnerabilities, S suspicious,
-    /// C critical in Tms — run \`lpm audit\``) plus Critical details.
+    /// Add an audit summary after a successful install. JavaScript installs
+    /// use the `lpm audit` scan. Explicit Swift installs use fetched Registry
+    /// metadata. Both paths include severity counts and Critical details.
     ///
     /// The summary is informational only — vulnerabilities found
     /// here NEVER fail the install. Run `lpm audit --fail-on=...`

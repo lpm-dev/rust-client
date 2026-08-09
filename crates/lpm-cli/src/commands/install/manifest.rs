@@ -1025,9 +1025,12 @@ pub async fn run_add_packages(
                     &pkg_name,
                     &resolved_ver,
                     ver_meta,
-                    yes,
-                    json_output,
-                    client.base_url(),
+                    SwiftInstallOptions {
+                        yes,
+                        json_output,
+                        audit_after_install,
+                        registry_url: client.base_url(),
+                    },
                 )
                 .await?;
                 continue;
@@ -1399,9 +1402,12 @@ pub async fn run_install_filtered_add(
                     version_metadata,
                     &identifier,
                     product_name,
-                    yes,
-                    json_output,
-                    client.base_url(),
+                    SwiftInstallOptions {
+                        yes,
+                        json_output,
+                        audit_after_install,
+                        registry_url: client.base_url(),
+                    },
                 )
                 .await?;
             }

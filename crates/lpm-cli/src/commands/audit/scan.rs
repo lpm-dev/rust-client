@@ -7,8 +7,8 @@ use super::behavior::{BehavioralSummary, run_behavioral_analysis};
 use super::discovery::{self, DiscoveryResult, ScanMode};
 use super::osv::{OsvVulnerability, run_osv_scan};
 use super::policy::AuditLevel;
-use super::registry::collect_registry_issues;
-use super::types::{AuditIssue, AuditResult};
+use super::registry::registry_audit_result;
+use super::types::AuditResult;
 
 pub(super) struct AuditScan {
     pub(super) discovery: DiscoveryResult,
@@ -59,27 +59,7 @@ pub(super) async fn run_scan(
             })?;
             checked_lpm += 1;
 
-            let mut issues = Vec::new();
-            collect_registry_issues(version_metadata, &mut issues);
-
-            let quality_score = version_metadata.quality_score;
-            if let Some(score) = quality_score
-                && score < 40
-            {
-                issues.push(AuditIssue {
-                    severity: if score < 20 { "high" } else { "moderate" }.to_string(),
-                    message: format!("low quality score: {score}/100"),
-                    category: "quality".to_string(),
-                    source: "registry".to_string(),
-                });
-            }
-
-            results.push(AuditResult {
-                name: name.clone(),
-                version: version.clone(),
-                quality_score,
-                issues,
-            });
+            results.push(registry_audit_result(name, version, version_metadata));
         }
     }
 

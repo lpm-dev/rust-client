@@ -1,0 +1,40 @@
+---
+source: tests/workflows/tests/swift.rs
+expression: "&envelope[\"audit_summary\"]"
+---
+{
+  "packages_audited": 1,
+  "vulnerabilities": 2,
+  "suspicious": 0,
+  "severity_counts": {
+    "critical": 3,
+    "high": 0,
+    "moderate": 0,
+    "low": 0,
+    "info": 0
+  },
+  "critical_findings": [
+    {
+      "package": "@lpm.dev/acme.swift-logger",
+      "version": "1.0.0",
+      "message": "critical Swift registry analysis finding",
+      "category": "security",
+      "source": "registry"
+    },
+    {
+      "package": "@lpm.dev/acme.swift-logger",
+      "version": "1.0.0",
+      "message": "LPM-SWIFT-ADV-A — first Swift advisory",
+      "category": "vulnerability",
+      "source": "registry"
+    },
+    {
+      "package": "@lpm.dev/acme.swift-logger",
+      "version": "1.0.0",
+      "message": "LPM-SWIFT-ADV-B — second Swift advisory",
+      "category": "vulnerability",
+      "source": "registry"
+    }
+  ],
+  "elapsed_ms": "[DURATION]"
+}

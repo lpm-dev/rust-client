@@ -1,7 +1,35 @@
 use lpm_security::query::PseudoClass;
 
 use super::behavior::behavioral_issue;
-use super::types::AuditIssue;
+use super::types::{AuditIssue, AuditResult};
+
+pub(super) fn registry_audit_result(
+    name: &str,
+    version: &str,
+    ver_meta: &lpm_registry::VersionMetadata,
+) -> AuditResult {
+    let mut issues = Vec::new();
+    collect_registry_issues(ver_meta, &mut issues);
+
+    let quality_score = ver_meta.quality_score;
+    if let Some(score) = quality_score
+        && score < 40
+    {
+        issues.push(AuditIssue {
+            severity: if score < 20 { "high" } else { "moderate" }.to_string(),
+            message: format!("low quality score: {score}/100"),
+            category: "quality".to_string(),
+            source: "registry".to_string(),
+        });
+    }
+
+    AuditResult {
+        name: name.to_string(),
+        version: version.to_string(),
+        quality_score,
+        issues,
+    }
+}
 
 pub(super) fn collect_registry_issues(
     ver_meta: &lpm_registry::VersionMetadata,
