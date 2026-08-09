@@ -40,6 +40,13 @@ struct EditResult {
     scopes: Vec<String>,
     selector: Option<String>,
     changed: bool,
+    normalized: bool,
+}
+
+impl EditResult {
+    fn storage_changed(&self) -> bool {
+        self.changed || self.normalized
+    }
 }
 
 pub(crate) fn run_project(
@@ -81,18 +88,23 @@ pub(crate) fn run_project(
                 crate::security_approval::ApprovalSource::CliFlag,
             )?;
         }
-        LifecycleScopeOperation::Remove(_) => {
-            // Revoke signed authority first so a manifest-write failure leaves runtime trust closed.
+        LifecycleScopeOperation::Remove(_) if result.changed => {
+            // Revoke signed and temporary authority first so a manifest-write failure leaves runtime trust closed.
             crate::security_approval::record_project_scope_candidate_narrowing(
                 project_dir,
                 &result.scopes,
+                result
+                    .selector
+                    .as_deref()
+                    .expect("remove results have a selector"),
                 crate::security_approval::ApprovalSource::CliFlag,
             )?;
         }
+        LifecycleScopeOperation::Remove(_) => {}
         LifecycleScopeOperation::List => {}
     }
 
-    if operation.mutates() && result.changed {
+    if result.storage_changed() {
         set_project_scopes(&mut manifest, &result.scopes)?;
         write_project_manifest(&manifest_path, &manifest)?;
     }
@@ -105,7 +117,7 @@ fn edit_scopes(
 ) -> Result<EditResult, LpmError> {
     let mut scopes =
         validate_scope_selectors("package.json > lpm > scripts > trustedScopes", &existing)?;
-    let normalized_existing = scopes != existing;
+    let normalized = operation.mutates() && scopes != existing;
     let selector = operation
         .selector()
         .map(|selector| normalize_scope_selector("lifecycle scope selector", selector))
@@ -114,7 +126,7 @@ fn edit_scopes(
         LifecycleScopeOperation::Add(_) => {
             let selector = selector.as_ref().expect("add has a selector");
             if scopes.iter().any(|entry| entry == selector) {
-                normalized_existing
+                false
             } else {
                 scopes.push(selector.clone());
                 true
@@ -124,7 +136,7 @@ fn edit_scopes(
             let selector = selector.as_ref().expect("remove has a selector");
             let previous_len = scopes.len();
             scopes.retain(|entry| entry != selector);
-            normalized_existing || scopes.len() != previous_len
+            scopes.len() != previous_len
         }
         LifecycleScopeOperation::List => false,
     };
@@ -132,6 +144,7 @@ fn edit_scopes(
         scopes,
         selector,
         changed,
+        normalized,
     })
 }
 
@@ -292,6 +305,8 @@ fn print_result(
                 "action": operation.action(),
                 "selector": selector,
                 "changed": result.changed,
+                "normalized": result.normalized,
+                "count": result.scopes.len(),
                 "scopes": result.scopes,
             })
         } else {
@@ -302,6 +317,8 @@ fn print_result(
                 "scope": PROJECT_SCOPE,
                 "action": operation.action(),
                 "changed": result.changed,
+                "normalized": result.normalized,
+                "count": result.scopes.len(),
                 "scopes": result.scopes,
             })
         };
@@ -322,30 +339,40 @@ fn print_result(
         }
         LifecycleScopeOperation::Add(_) => {
             let selector = display_selector(result);
+            let normalization = normalization_suffix(result);
             if result.changed {
                 crate::install_ui::done_untrusted(&format!(
-                    "Added {selector} to project lifecycle scope trust"
+                    "Added {selector} to project lifecycle scope trust{normalization}"
                 ));
             } else {
                 crate::install_ui::done_untrusted(&format!(
-                    "{selector} is already in project lifecycle scope trust"
+                    "{selector} is already in project lifecycle scope trust{normalization}"
                 ));
             }
         }
         LifecycleScopeOperation::Remove(_) => {
             let selector = display_selector(result);
+            let normalization = normalization_suffix(result);
             if result.changed {
                 crate::install_ui::done_untrusted(&format!(
-                    "Removed {selector} from project lifecycle scope trust"
+                    "Removed {selector} from project lifecycle scope trust{normalization}"
                 ));
             } else {
                 crate::install_ui::done_untrusted(&format!(
-                    "{selector} was not in project lifecycle scope trust"
+                    "{selector} was not in project lifecycle scope trust{normalization}"
                 ));
             }
         }
     }
     Ok(())
+}
+
+fn normalization_suffix(result: &EditResult) -> &'static str {
+    if result.normalized {
+        " (normalized existing entries)"
+    } else {
+        ""
+    }
 }
 
 fn display_selector(result: &EditResult) -> String {
@@ -382,5 +409,31 @@ mod tests {
         for selector in ["@Company/*", "@company-evil/pkg/*", "@company/\n*"] {
             assert!(normalize_scope_selector("test", selector).is_err());
         }
+    }
+
+    #[test]
+    fn duplicate_add_reports_selector_unchanged_after_storage_normalization() {
+        let result = edit_scopes(
+            vec!["@company/*".to_string(), "@company/*".to_string()],
+            LifecycleScopeOperation::Add("@company/*"),
+        )
+        .unwrap();
+
+        assert!(!result.changed);
+        assert!(result.normalized);
+        assert_eq!(result.scopes, ["@company/*"]);
+    }
+
+    #[test]
+    fn absent_remove_reports_selector_unchanged_after_storage_normalization() {
+        let result = edit_scopes(
+            vec!["@company/*".to_string(), "@company/*".to_string()],
+            LifecycleScopeOperation::Remove("@internal/*"),
+        )
+        .unwrap();
+
+        assert!(!result.changed);
+        assert!(result.normalized);
+        assert_eq!(result.scopes, ["@company/*"]);
     }
 }

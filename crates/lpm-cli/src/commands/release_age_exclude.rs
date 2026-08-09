@@ -42,6 +42,13 @@ struct EditResult {
     exclusions: Vec<String>,
     selector: Option<String>,
     changed: bool,
+    normalized: bool,
+}
+
+impl EditResult {
+    fn storage_changed(&self) -> bool {
+        self.changed || self.normalized
+    }
 }
 
 pub(crate) fn parse_config_operation<'a>(
@@ -100,7 +107,7 @@ pub(crate) fn run_project(
         existing,
         operation,
     )?;
-    if operation.mutates() && result.changed {
+    if result.storage_changed() {
         set_project_exclusions(&mut manifest, &result.exclusions)?;
         write_project_manifest(&manifest_path, &manifest)?;
     }
@@ -125,7 +132,7 @@ pub(crate) fn run_user(
         existing,
         operation,
     )?;
-    if operation.mutates() && result.changed {
+    if result.storage_changed() {
         set_user_exclusions(&mut config, &result.exclusions)?;
         write_user_config(config_path, &config)?;
     }
@@ -139,7 +146,7 @@ fn edit_exclusions(
 ) -> Result<EditResult, LpmError> {
     let mut exclusions =
         crate::release_age_config::validate_release_age_excludes(source, &existing)?;
-    let normalized_existing = exclusions != existing;
+    let normalized = operation.mutates() && exclusions != existing;
     let selector = operation
         .selector()
         .map(|selector| {
@@ -158,7 +165,7 @@ fn edit_exclusions(
         ReleaseAgeExcludeOperation::Add(_) => {
             let selector = selector.as_ref().expect("add has a selector");
             if exclusions.iter().any(|entry| entry == selector) {
-                normalized_existing
+                false
             } else {
                 exclusions.push(selector.clone());
                 true
@@ -168,7 +175,7 @@ fn edit_exclusions(
             let selector = selector.as_ref().expect("remove has a selector");
             let previous_len = exclusions.len();
             exclusions.retain(|entry| entry != selector);
-            normalized_existing || exclusions.len() != previous_len
+            exclusions.len() != previous_len
         }
         ReleaseAgeExcludeOperation::List => false,
     };
@@ -176,6 +183,7 @@ fn edit_exclusions(
         exclusions,
         selector,
         changed,
+        normalized,
     })
 }
 
@@ -347,6 +355,8 @@ fn print_result(
                 "action": operation.action(),
                 "selector": selector,
                 "changed": result.changed,
+                "normalized": result.normalized,
+                "count": result.exclusions.len(),
                 "exclusions": result.exclusions,
             })
         } else {
@@ -357,6 +367,8 @@ fn print_result(
                 "scope": scope,
                 "action": operation.action(),
                 "changed": result.changed,
+                "normalized": result.normalized,
+                "count": result.exclusions.len(),
                 "exclusions": result.exclusions,
             })
         };
@@ -377,30 +389,40 @@ fn print_result(
         }
         ReleaseAgeExcludeOperation::Add(_) => {
             let selector = display_selector(result);
+            let normalization = normalization_suffix(result);
             if result.changed {
                 crate::install_ui::done_untrusted(&format!(
-                    "Added {selector} to {scope} release-age exclusions"
+                    "Added {selector} to {scope} release-age exclusions{normalization}"
                 ));
             } else {
                 crate::install_ui::done_untrusted(&format!(
-                    "{selector} is already in {scope} release-age exclusions"
+                    "{selector} is already in {scope} release-age exclusions{normalization}"
                 ));
             }
         }
         ReleaseAgeExcludeOperation::Remove(_) => {
             let selector = display_selector(result);
+            let normalization = normalization_suffix(result);
             if result.changed {
                 crate::install_ui::done_untrusted(&format!(
-                    "Removed {selector} from {scope} release-age exclusions"
+                    "Removed {selector} from {scope} release-age exclusions{normalization}"
                 ));
             } else {
                 crate::install_ui::done_untrusted(&format!(
-                    "{selector} was not in {scope} release-age exclusions"
+                    "{selector} was not in {scope} release-age exclusions{normalization}"
                 ));
             }
         }
     }
     Ok(())
+}
+
+fn normalization_suffix(result: &EditResult) -> &'static str {
+    if result.normalized {
+        " (normalized existing entries)"
+    } else {
+        ""
+    }
 }
 
 fn display_selector(result: &EditResult) -> String {
@@ -418,5 +440,38 @@ fn title_case(value: &str) -> String {
     match characters.next() {
         Some(first) => first.to_uppercase().chain(characters).collect(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_add_reports_selector_unchanged_after_storage_normalization() {
+        let result = edit_exclusions(
+            "test",
+            vec!["react".to_string(), "react".to_string()],
+            ReleaseAgeExcludeOperation::Add("react"),
+        )
+        .unwrap();
+
+        assert!(!result.changed);
+        assert!(result.normalized);
+        assert_eq!(result.exclusions, ["react"]);
+    }
+
+    #[test]
+    fn absent_remove_reports_selector_unchanged_after_storage_normalization() {
+        let result = edit_exclusions(
+            "test",
+            vec!["react".to_string(), "react".to_string()],
+            ReleaseAgeExcludeOperation::Remove("lodash"),
+        )
+        .unwrap();
+
+        assert!(!result.changed);
+        assert!(result.normalized);
+        assert_eq!(result.exclusions, ["react"]);
     }
 }

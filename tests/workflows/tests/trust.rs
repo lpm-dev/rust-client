@@ -746,6 +746,8 @@ fn trust_release_age_exclude_add_accepts_package_scope_and_exact_version_selecto
         "action": "add",
         "selector": "react",
         "changed": true,
+        "normalized": false,
+        "count": 1,
         "exclusions": [
           "react"
         ]
@@ -758,6 +760,8 @@ fn trust_release_age_exclude_add_accepts_package_scope_and_exact_version_selecto
         "action": "add",
         "selector": "@company/*",
         "changed": true,
+        "normalized": false,
+        "count": 2,
         "exclusions": [
           "react",
           "@company/*"
@@ -771,6 +775,8 @@ fn trust_release_age_exclude_add_accepts_package_scope_and_exact_version_selecto
         "action": "add",
         "selector": "react@1.0.0",
         "changed": true,
+        "normalized": false,
+        "count": 3,
         "exclusions": [
           "react",
           "@company/*",
@@ -805,6 +811,8 @@ fn trust_release_age_exclude_add_accepts_package_scope_and_exact_version_selecto
       "scope": "project",
       "action": "list",
       "changed": false,
+      "normalized": false,
+      "count": 3,
       "exclusions": [
         "react",
         "@company/*",
@@ -812,6 +820,8 @@ fn trust_release_age_exclude_add_accepts_package_scope_and_exact_version_selecto
       ]
     }
     "###);
+    assert_eq!(envelopes[2]["count"], json!(3));
+    assert_eq!(envelope["count"], json!(3));
 }
 
 #[test]
@@ -830,7 +840,54 @@ fn trust_release_age_exclude_duplicate_add_is_a_byte_stable_noop() {
     assert!(output.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(envelope["normalized"], json!(false));
+    assert_eq!(envelope["count"], json!(1));
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_release_age_exclude_duplicate_add_normalizes_storage_without_claiming_a_selector_change() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAgeExclude":["react","react"]}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "release-age-exclude", "add", "react"])
+        .output()
+        .expect("failed to normalize duplicate project release-age exclusions");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(envelope["normalized"], json!(true));
+    assert_eq!(envelope["count"], json!(1));
+    assert_eq!(envelope["exclusions"], json!(["react"]));
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest["lpm"]["minimumReleaseAgeExclude"],
+        json!(["react"])
+    );
+}
+
+#[test]
+fn trust_release_age_exclude_absent_remove_normalizes_storage_without_claiming_a_selector_change() {
+    let project = TempProject::empty(
+        r#"{"name":"release-age-trust","version":"1.0.0","lpm":{"minimumReleaseAgeExclude":["react","react"]}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "release-age-exclude", "remove", "lodash"])
+        .output()
+        .expect("failed to normalize duplicate project release-age exclusions");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(envelope["normalized"], json!(true));
+    assert_eq!(envelope["count"], json!(1));
+    assert_eq!(envelope["exclusions"], json!(["react"]));
 }
 
 #[test]
@@ -861,12 +918,15 @@ fn trust_release_age_exclude_remove_matches_the_complete_selector_only() {
       "action": "remove",
       "selector": "react@1.0.0",
       "changed": true,
+      "normalized": false,
+      "count": 2,
       "exclusions": [
         "react",
         "@company/*"
       ]
     }
     "###);
+    assert_eq!(envelope["count"], json!(2));
 }
 
 #[test]
@@ -1015,11 +1075,14 @@ fn trust_lifecycle_scope_add_and_list_write_only_project_scope_trust() {
       "action": "add",
       "selector": "@company/*",
       "changed": true,
+      "normalized": false,
+      "count": 1,
       "scopes": [
         "@company/*"
       ]
     }
     "###);
+    assert_eq!(envelope["count"], json!(1));
 
     let manifest: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
@@ -1046,6 +1109,8 @@ fn trust_lifecycle_scope_add_and_list_write_only_project_scope_trust() {
       "scope": "project",
       "action": "list",
       "changed": false,
+      "normalized": false,
+      "count": 1,
       "scopes": [
         "@company/*"
       ]
@@ -1070,7 +1135,36 @@ fn trust_lifecycle_scope_duplicate_add_is_a_byte_stable_noop() {
     assert!(output.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(envelope["normalized"], json!(false));
+    assert_eq!(envelope["count"], json!(1));
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_lifecycle_scope_duplicate_add_normalizes_storage_without_claiming_a_selector_change() {
+    let project = TempProject::empty(
+        r#"{"name":"lifecycle-scope-trust","version":"1.0.0","lpm":{"scripts":{"trustedScopes":["@company/*","@company/*"]}}}"#,
+    );
+    write_signed_unlock(&project, &["trust-scope-widen"]);
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to normalize duplicate project lifecycle scopes");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(envelope["normalized"], json!(true));
+    assert_eq!(envelope["count"], json!(1));
+    assert_eq!(envelope["scopes"], json!(["@company/*"]));
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest["lpm"]["scripts"]["trustedScopes"],
+        json!(["@company/*"])
+    );
 }
 
 #[test]
@@ -1095,6 +1189,8 @@ fn trust_lifecycle_scope_remove_matches_the_complete_scope_and_preserves_sibling
       "action": "remove",
       "selector": "@company/*",
       "changed": true,
+      "normalized": false,
+      "count": 1,
       "scopes": [
         "@internal/*"
       ]
@@ -1116,7 +1212,7 @@ fn trust_lifecycle_scope_remove_matches_the_complete_scope_and_preserves_sibling
 #[test]
 fn trust_lifecycle_scope_remove_revokes_the_signed_scope_authorization() {
     let project = TempProject::empty(r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#);
-    write_signed_unlock(&project, &["trust-scope-widen"]);
+    write_signed_unlock(&project, &["trust-scope-widen", "scripts-allow"]);
 
     let add = lpm(&project)
         .args(["trust", "lifecycle-scope", "add", "@company/*"])
@@ -1124,7 +1220,6 @@ fn trust_lifecycle_scope_remove_revokes_the_signed_scope_authorization() {
         .expect("failed to add project lifecycle scope");
     assert!(add.status.success());
 
-    std::fs::remove_dir_all(project.home().join(".lpm/security/unlocks")).unwrap();
     let approved_duplicate = lpm(&project)
         .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
         .output()
@@ -1137,12 +1232,25 @@ fn trust_lifecycle_scope_remove_revokes_the_signed_scope_authorization() {
     let duplicate_envelope: serde_json::Value =
         serde_json::from_slice(&approved_duplicate.stdout).unwrap();
     assert_eq!(duplicate_envelope["changed"], json!(false));
+    assert_eq!(duplicate_envelope["normalized"], json!(false));
+    assert_eq!(duplicate_envelope["count"], json!(1));
 
     let remove = lpm(&project)
         .args(["trust", "lifecycle-scope", "remove", "@company/*"])
         .output()
         .expect("failed to remove project lifecycle scope");
     assert!(remove.status.success());
+
+    let status = lpm(&project)
+        .args(["--json", "security", "status"])
+        .output()
+        .expect("failed to inspect narrowed project unlock");
+    assert!(status.status.success());
+    let status_envelope: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status_envelope["status"]["active_unlocks"][0]["scopes"],
+        json!(["scripts-allow"])
+    );
 
     let re_add = lpm(&project)
         .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])

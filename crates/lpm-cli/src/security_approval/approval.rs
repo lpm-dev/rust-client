@@ -300,8 +300,16 @@ pub fn ensure_project_scope_candidate_authorized(
 pub fn record_project_scope_candidate_narrowing(
     project_dir: &Path,
     trusted_scopes: &[String],
+    removed_scope: &str,
     source: ApprovalSource,
 ) -> Result<(), LpmError> {
+    super::unlocks::revoke_project_policy_unlocks(
+        removed_scope,
+        project_dir,
+        &[ApprovalScope::TrustScopeWiden],
+        source,
+    )?;
+
     let retained: BTreeSet<_> = trusted_scopes.iter().map(String::as_str).collect();
     let mut approved = load_approved_project_policy_state(project_dir)?;
     let previous_len = approved.trusted_scopes.len();

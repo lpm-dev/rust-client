@@ -1449,6 +1449,8 @@ fn config_release_age_exclude_add_accepts_supported_selectors_and_writes_a_toml_
       "scope": "user",
       "action": "list",
       "changed": false,
+      "normalized": false,
+      "count": 3,
       "exclusions": [
         "react",
         "@company/*",
@@ -1484,12 +1486,43 @@ fn config_release_age_exclude_add_reports_a_duplicate_without_rewriting_config()
       "action": "add",
       "selector": "react",
       "changed": false,
+      "normalized": false,
+      "count": 1,
       "exclusions": [
         "react"
       ]
     }
     "###);
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn config_release_age_exclude_duplicate_add_normalizes_storage_without_claiming_a_selector_change()
+{
+    let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "minimum-release-age-exclude = [\"react\", \"react\"]\n",
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "config", "release-age-exclude", "add", "react"])
+        .output()
+        .expect("failed to normalize duplicate user release-age exclusions");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["changed"], serde_json::json!(false));
+    assert_eq!(envelope["normalized"], serde_json::json!(true));
+    assert_eq!(envelope["count"], serde_json::json!(1));
+    assert_eq!(envelope["exclusions"], serde_json::json!(["react"]));
+
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(config_path(&project)).unwrap()).unwrap();
+    assert_eq!(
+        config["minimum-release-age-exclude"],
+        toml::Value::Array(vec![toml::Value::String("react".to_string())])
+    );
 }
 
 #[test]
@@ -1522,6 +1555,8 @@ fn config_release_age_exclude_remove_only_removes_the_complete_selector() {
       "action": "remove",
       "selector": "react@1.0.0",
       "changed": true,
+      "normalized": false,
+      "count": 2,
       "exclusions": [
         "react",
         "@company/*"
@@ -1604,5 +1639,7 @@ fn config_release_age_exclude_list_without_config_reports_an_empty_user_list() {
     assert!(output.status.success());
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["exclusions"], serde_json::json!([]));
+    assert_eq!(envelope["count"], serde_json::json!(0));
+    assert_eq!(envelope["normalized"], serde_json::json!(false));
     assert!(!config_path(&project).exists());
 }
