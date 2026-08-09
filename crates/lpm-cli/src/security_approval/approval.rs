@@ -287,6 +287,45 @@ pub fn ensure_project_trust_candidate_authorized(
     ensure_project_policy_candidate_authorized(project_dir, &current, json_output, source)
 }
 
+pub fn ensure_project_scope_candidate_authorized(
+    project_dir: &Path,
+    trusted_scopes: &[String],
+    json_output: bool,
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let current = candidate_project_scope_policy_state(project_dir, trusted_scopes)?;
+    ensure_project_policy_candidate_authorized(project_dir, &current, json_output, source)
+}
+
+pub fn record_project_scope_candidate_narrowing(
+    project_dir: &Path,
+    trusted_scopes: &[String],
+    source: ApprovalSource,
+) -> Result<(), LpmError> {
+    let retained: BTreeSet<_> = trusted_scopes.iter().map(String::as_str).collect();
+    let mut approved = load_approved_project_policy_state(project_dir)?;
+    let previous_len = approved.trusted_scopes.len();
+    approved
+        .trusted_scopes
+        .retain(|scope| retained.contains(scope.as_str()));
+    if approved.trusted_scopes.len() == previous_len {
+        return Ok(());
+    }
+
+    persist_project_policy_state(project_dir, &approved)?;
+    record_audit_event(
+        AuditRecord::new(
+            "project-policy-narrowed",
+            true,
+            vec![ApprovalScope::TrustScopeWiden.as_str().to_string()],
+        )
+        .project_root(canonical_project_root(project_dir))
+        .source(source)
+        .detail("removed project lifecycle scope trust"),
+    );
+    Ok(())
+}
+
 pub(crate) fn record_project_trust_candidate_authorized_from_managed_flow(
     project_dir: &Path,
     trusted: &lpm_workspace::TrustedDependencies,

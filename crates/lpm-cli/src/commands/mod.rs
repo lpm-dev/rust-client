@@ -27,6 +27,7 @@ pub mod install;
 pub mod install_global;
 pub mod install_targets;
 pub mod licenses;
+mod lifecycle_scope;
 pub mod login;
 pub mod logout;
 pub mod manifest_metadata;

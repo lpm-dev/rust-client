@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 172;
+pub const EXPECTED_SURFACE_COUNT: usize = 175;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -2149,6 +2149,45 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/release_age_exclude.rs",
             "tests/workflows/tests/config.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 173,
+        name: "`lpm trust lifecycle-scope add <scope>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/lifecycle_scope.rs",
+            "tests/workflows/tests/trust.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 174,
+        name: "`lpm trust lifecycle-scope remove <scope>`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/lifecycle_scope.rs",
+            "tests/workflows/tests/trust.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 175,
+        name: "`lpm trust lifecycle-scope list`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/lifecycle_scope.rs",
+            "tests/workflows/tests/trust.rs",
         ],
     },
 ];

@@ -73,10 +73,43 @@ pub enum TrustCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Manage project lifecycle scope trust in package.json.
+    LifecycleScope {
+        #[command(subcommand)]
+        action: LifecycleScopeCmd,
+    },
     /// Manage project release-age exclusions in package.json.
     ReleaseAgeExclude {
         #[command(subcommand)]
         action: ReleaseAgeExcludeCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LifecycleScopeCmd {
+    /// Trust all packages in one npm scope to run lifecycle scripts.
+    Add {
+        /// Scope wildcard to trust, such as @company/*.
+        #[arg(value_name = "SCOPE")]
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove lifecycle trust for one npm scope.
+    Remove {
+        /// Scope wildcard to remove, such as @company/*.
+        #[arg(value_name = "SCOPE")]
+        selector: String,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List project lifecycle scope trust.
+    List {
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -114,6 +147,34 @@ pub async fn run(cmd: &TrustCmd, project_dir: &Path, json_output: bool) -> Resul
         }
         TrustCmd::Prune { yes, dry_run, json } => {
             run_prune(project_dir, *yes, *dry_run, json_output || *json).await
+        }
+        TrustCmd::LifecycleScope { action } => {
+            let (operation, local_json) = match action {
+                LifecycleScopeCmd::Add { selector, json } => (
+                    crate::commands::lifecycle_scope::LifecycleScopeOperation::Add(selector),
+                    *json,
+                ),
+                LifecycleScopeCmd::Remove { selector, json } => (
+                    crate::commands::lifecycle_scope::LifecycleScopeOperation::Remove(selector),
+                    *json,
+                ),
+                LifecycleScopeCmd::List { json } => (
+                    crate::commands::lifecycle_scope::LifecycleScopeOperation::List,
+                    *json,
+                ),
+            };
+            let json = json_output || local_json;
+            if operation.mutates() {
+                lpm_common::with_exclusive_lock_async(
+                    lpm_common::project_install_lock(project_dir),
+                    async {
+                        crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
+                    },
+                )
+                .await
+            } else {
+                crate::commands::lifecycle_scope::run_project(project_dir, operation, json)
+            }
         }
         TrustCmd::ReleaseAgeExclude { action } => {
             let (operation, local_json) = match action {

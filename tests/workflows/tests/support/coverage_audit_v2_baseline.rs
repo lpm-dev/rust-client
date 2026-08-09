@@ -3702,6 +3702,49 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         scenarios_by_file: &[("tests/workflows/tests/config.rs", 2)],
         last_audited_at: "2026-08-09",
     },
+    SurfaceV2 {
+        id: 173,
+        scenarios: 6,
+        failure_modes_tested: &[
+            "signed trust-scope-widen approval required before manifest mutation",
+            "lowercase npm scope wildcard persists under lpm.scripts.trustedScopes",
+            "duplicate add is a byte-stable no-op",
+            "package, version, uppercase, nested, and control input rejected",
+            "malformed existing list rejected without mutation",
+            "removed signed scope authorization does not authorize a later re-add",
+        ],
+        failure_modes_known: &[
+            "concurrent external package.json editor",
+            "package.json write failure after security-state authorization",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 6)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 174,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "complete-scope removal preserves sibling scope and unrelated manifest fields",
+            "removal narrows the signed project authorization without an unlock",
+        ],
+        failure_modes_known: &["selector absent from the project list"],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 2)],
+        last_audited_at: "2026-08-09",
+    },
+    SurfaceV2 {
+        id: 175,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "JSON list returns configured project lifecycle scopes",
+            "missing package.json fails with a manifest-specific error",
+        ],
+        failure_modes_known: &["malformed existing list"],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/trust.rs", 2)],
+        last_audited_at: "2026-08-09",
+    },
 ];
 
 // ─── Cross-command flow inventory ─────────────────────────────────────

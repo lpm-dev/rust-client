@@ -8,7 +8,7 @@
 mod support;
 
 use serde_json::json;
-use support::{TempProject, lpm};
+use support::{TempProject, assertions, lpm, write_signed_unlock};
 
 fn write_pkg_with_trust(project: &TempProject, trusted: serde_json::Value) {
     let pkg = json!({
@@ -942,6 +942,281 @@ fn trust_release_age_exclude_list_requires_a_project_manifest() {
         .args(["trust", "release-age-exclude", "list"])
         .output()
         .expect("failed to list project release-age exclusions without a manifest");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires a package.json"),
+        "error must identify the required manifest: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ─── lpm trust lifecycle-scope ───────────────────────────────────────
+
+#[test]
+fn trust_lifecycle_scope_add_requires_security_approval_before_manifest_mutation() {
+    let project = TempProject::empty(
+        r#"{"name":"lifecycle-scope-trust","version":"1.0.0","lpm":{"minimumReleaseAge":86400}}"#,
+    );
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to add lifecycle scope without approval");
+
+    let envelope = assertions::assert_security_approval_required(&output);
+    assert_eq!(
+        envelope["error"]["requested_scopes"],
+        json!(["trust-scope-widen"])
+    );
+    assert!(
+        envelope["error"]["suggested_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("trust-scope-widen")),
+        "error must provide the lifecycle-scope unlock command: {envelope}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_lifecycle_scope_add_and_list_write_only_project_scope_trust() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "lifecycle-scope-trust",
+  "version": "1.0.0",
+  "lpm": {
+    "minimumReleaseAge": 86400,
+    "scripts": { "autoBuild": false }
+  }
+}"#,
+    );
+    write_signed_unlock(&project, &["trust-scope-widen"]);
+
+    let add = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to add project lifecycle scope");
+
+    assert!(
+        add.status.success(),
+        "lifecycle scope add failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "trust lifecycle-scope",
+      "scope": "project",
+      "action": "add",
+      "selector": "@company/*",
+      "changed": true,
+      "scopes": [
+        "@company/*"
+      ]
+    }
+    "###);
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["lpm"]["scripts"]["trustedScopes"],
+        json!(["@company/*"])
+    );
+    assert_eq!(manifest["lpm"]["scripts"]["autoBuild"], json!(false));
+    assert_eq!(manifest["lpm"]["minimumReleaseAge"], json!(86400));
+
+    let list = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "list"])
+        .output()
+        .expect("failed to list project lifecycle scopes");
+    assert!(list.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "trust lifecycle-scope",
+      "scope": "project",
+      "action": "list",
+      "changed": false,
+      "scopes": [
+        "@company/*"
+      ]
+    }
+    "###);
+}
+
+#[test]
+fn trust_lifecycle_scope_duplicate_add_is_a_byte_stable_noop() {
+    let project = TempProject::empty(
+        r#"{"name":"lifecycle-scope-trust","version":"1.0.0","lpm":{"scripts":{"trustedScopes":["@company/*"]}}}"#,
+    );
+    write_signed_unlock(&project, &["trust-scope-widen"]);
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to repeat project lifecycle scope");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["changed"], json!(false));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_lifecycle_scope_remove_matches_the_complete_scope_and_preserves_siblings() {
+    let project = TempProject::empty(
+        r#"{"name":"lifecycle-scope-trust","version":"1.0.0","lpm":{"minimumReleaseAge":86400,"scripts":{"autoBuild":false,"trustedScopes":["@company/*","@internal/*"]}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "remove", "@company/*"])
+        .output()
+        .expect("failed to remove project lifecycle scope");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r###"
+    {
+      "success": true,
+      "schema_version": 1,
+      "command": "trust lifecycle-scope",
+      "scope": "project",
+      "action": "remove",
+      "selector": "@company/*",
+      "changed": true,
+      "scopes": [
+        "@internal/*"
+      ]
+    }
+    "###);
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(project.path().join("package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["lpm"]["scripts"]["trustedScopes"],
+        json!(["@internal/*"])
+    );
+    assert_eq!(manifest["lpm"]["scripts"]["autoBuild"], json!(false));
+    assert_eq!(manifest["lpm"]["minimumReleaseAge"], json!(86400));
+}
+
+#[test]
+fn trust_lifecycle_scope_remove_revokes_the_signed_scope_authorization() {
+    let project = TempProject::empty(r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#);
+    write_signed_unlock(&project, &["trust-scope-widen"]);
+
+    let add = lpm(&project)
+        .args(["trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to add project lifecycle scope");
+    assert!(add.status.success());
+
+    std::fs::remove_dir_all(project.home().join(".lpm/security/unlocks")).unwrap();
+    let approved_duplicate = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to check persisted lifecycle-scope authorization");
+    assert!(
+        approved_duplicate.status.success(),
+        "persisted scope authorization must cover a duplicate add: {}",
+        String::from_utf8_lossy(&approved_duplicate.stderr)
+    );
+    let duplicate_envelope: serde_json::Value =
+        serde_json::from_slice(&approved_duplicate.stdout).unwrap();
+    assert_eq!(duplicate_envelope["changed"], json!(false));
+
+    let remove = lpm(&project)
+        .args(["trust", "lifecycle-scope", "remove", "@company/*"])
+        .output()
+        .expect("failed to remove project lifecycle scope");
+    assert!(remove.status.success());
+
+    let re_add = lpm(&project)
+        .args(["--json", "trust", "lifecycle-scope", "add", "@company/*"])
+        .output()
+        .expect("failed to check removed lifecycle-scope authorization");
+    let envelope = assertions::assert_security_approval_required(&re_add);
+    assert_eq!(
+        envelope["error"]["requested_scopes"],
+        json!(["trust-scope-widen"])
+    );
+}
+
+#[test]
+fn trust_lifecycle_scope_rejects_non_scope_and_malicious_selectors_without_mutation() {
+    let project = TempProject::empty(r#"{"name":"lifecycle-scope-trust","version":"1.0.0"}"#);
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    for selector in [
+        "react",
+        "react@1.0.0",
+        "@company/package",
+        "@Company/*",
+        "@company-evil/pkg/*",
+        "@company/\n*",
+    ] {
+        let output = lpm(&project)
+            .args(["trust", "lifecycle-scope", "add", selector])
+            .output()
+            .expect("failed to run invalid lifecycle scope add");
+        assert!(
+            !output.status.success(),
+            "invalid lifecycle scope must fail: {selector:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("expected one lowercase npm scope"),
+            "error must explain lifecycle scope syntax: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn trust_lifecycle_scope_rejects_a_malformed_existing_list_without_mutation() {
+    let project = TempProject::empty(
+        r#"{"name":"lifecycle-scope-trust","version":"1.0.0","lpm":{"scripts":{"trustedScopes":["@company/*",42]}}}"#,
+    );
+    let path = project.path().join("package.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let output = lpm(&project)
+        .args(["trust", "lifecycle-scope", "add", "@internal/*"])
+        .output()
+        .expect("failed to inspect malformed project lifecycle scopes");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must be an array of strings"),
+        "error must identify the required list shape: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn trust_lifecycle_scope_list_requires_a_project_manifest() {
+    let project = TempProject::empty(r#"{}"#);
+    std::fs::remove_file(project.path().join("package.json")).unwrap();
+
+    let output = lpm(&project)
+        .args(["trust", "lifecycle-scope", "list"])
+        .output()
+        .expect("failed to list lifecycle scopes without a manifest");
 
     assert!(!output.status.success());
     assert!(

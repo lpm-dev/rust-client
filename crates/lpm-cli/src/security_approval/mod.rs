@@ -31,9 +31,10 @@ pub use approval::{
     authorize_persistent_script_policy, authorize_persistent_sigstore,
     authorize_persistent_typosquat_guard, ensure_global_trust_authorized,
     ensure_global_trust_candidate_authorized_from_trust, ensure_project_policy_authorized,
-    ensure_project_trust_candidate_authorized,
+    ensure_project_scope_candidate_authorized, ensure_project_trust_candidate_authorized,
     ensure_runtime_install_time_source_analysis_authorized, ensure_runtime_sigstore_posture,
     ensure_runtime_sigstore_posture_for_global, ensure_runtime_typosquat_guard_config_authorized,
+    record_project_scope_candidate_narrowing,
 };
 pub use helpers::format_unlock_duration;
 pub(crate) use managed_policy::{
@@ -190,8 +191,9 @@ mod prelude {
     };
     pub(super) use super::project_state::{
         authorized_capability_user_bound, candidate_global_trust_state,
-        candidate_project_policy_state, current_global_trust_state, current_project_policy_state,
-        global_trust_widened, load_approved_global_trust_state, load_approved_project_policy_state,
+        candidate_project_policy_state, candidate_project_scope_policy_state,
+        current_global_trust_state, current_project_policy_state, global_trust_widened,
+        load_approved_global_trust_state, load_approved_project_policy_state,
         persist_global_trust_state, persist_project_policy_state, project_policy_required_scopes,
         same_global_trust_shape, same_project_policy_shape, unlock_grant_covers_packages,
     };
