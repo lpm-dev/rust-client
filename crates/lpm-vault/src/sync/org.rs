@@ -1,8 +1,6 @@
-use super::http::{
-    read_capped_error_text, read_verified_response, sync_http_client_builder, url_path_segment,
-};
+use super::http::{read_verified_response, sync_http_client_builder, url_path_segment};
 use super::personal::{
-    ListVaultsResponse, PushMetadata, PushResponse, RemoteVault, format_push_error,
+    PushMetadata, PushResponse, RemoteVault, format_push_error, list_remote_from_url,
 };
 use super::public_key::{MemberPublicKey, get_org_member_keys, public_key_fingerprint};
 use crate::crypto;
@@ -33,33 +31,11 @@ pub async fn list_org_vaults(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<Vec<RemoteVault>, String> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!(
         "{registry_url}/api/orgs/{}/vaults",
         url_path_segment(org_slug)
     );
-
-    let response = client
-        .get(&url)
-        .bearer_auth(auth_token)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
-
-    if !response.status().is_success() {
-        let body = read_capped_error_text(response).await;
-        return Err(format!("server error: {body}"));
-    }
-
-    let data: ListVaultsResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
-
-    Ok(data.vaults)
+    list_remote_from_url(&url, auth_token).await
 }
 
 // ── Org Vault Sync ───────────────────────────────────────────────
