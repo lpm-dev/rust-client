@@ -18,6 +18,27 @@ import { npmInvocation } from "../npm-invocation.mjs";
 import { prepareReleasePackages } from "../prepare-packages.mjs";
 import { smokeInstall, windowsCommandInvocation } from "../smoke-install.mjs";
 
+function releaseTargetTimeout(releaseWorkflow, target) {
+  const targetMarker = `          - target: ${target}`;
+  const targetStart = releaseWorkflow.indexOf(targetMarker);
+
+  assert.notEqual(targetStart, -1, `missing ${target} release target`);
+
+  const nextTarget = releaseWorkflow.indexOf(
+    "\n          - target:",
+    targetStart + targetMarker.length,
+  );
+
+  const targetSource = releaseWorkflow.slice(
+    targetStart,
+    nextTarget === -1 ? releaseWorkflow.length : nextTarget,
+  );
+  const timeout = targetSource.match(/^\s+timeout_minutes:\s*(\d+)\s*$/m);
+
+  assert.ok(timeout, `missing ${target} release timeout`);
+  return Number(timeout[1]);
+}
+
 test("release versions accept stable and prerelease semver values", () => {
   assert.equal(parseReleaseVersion("0.69.0"), "0.69.0");
   assert.equal(parseReleaseVersion("1.0.0-beta.2"), "1.0.0-beta.2");
@@ -49,22 +70,24 @@ test("Windows release builds keep enough timeout headroom for signing", () => {
   const releaseWorkflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
-  const target = "          - target: x86_64-pc-windows-msvc";
-  const targetStart = releaseWorkflow.indexOf(target);
-  const nextTarget = releaseWorkflow.indexOf("\n          - target:", targetStart + target.length);
+  const timeout = releaseTargetTimeout(releaseWorkflow, "x86_64-pc-windows-msvc");
 
-  assert.notEqual(targetStart, -1, "missing Windows release target");
-
-  const windowsTarget = releaseWorkflow.slice(
-    targetStart,
-    nextTarget === -1 ? releaseWorkflow.length : nextTarget,
-  );
-  const timeout = windowsTarget.match(/^\s+timeout_minutes:\s*(\d+)\s*$/m);
-
-  assert.ok(timeout, "missing Windows release timeout");
   assert.ok(
-    Number(timeout[1]) >= 60,
-    `Windows release timeout must be at least 60 minutes, found ${timeout[1]}`,
+    timeout >= 60,
+    `Windows release timeout must be at least 60 minutes, found ${timeout}`,
+  );
+});
+
+test("Apple Silicon release builds keep enough timeout headroom for cold builds", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const timeout = releaseTargetTimeout(releaseWorkflow, "aarch64-apple-darwin");
+
+  assert.ok(
+    timeout >= 60,
+    `Apple Silicon release timeout must be at least 60 minutes, found ${timeout}`,
   );
 });
 
