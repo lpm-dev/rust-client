@@ -3,6 +3,7 @@ use super::prelude::*;
 
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_OIDC_USER_AGENT: &str = "lpm-env-oidc";
+const OIDC_POLICY_ID_ENV: &str = "LPM_OIDC_POLICY_ID";
 
 struct GitHubRepositoryIdentity {
     id: String,
@@ -13,6 +14,70 @@ struct GitHubRepositoryIdentity {
 struct GitHubRepositoryResponse {
     id: u64,
     full_name: String,
+}
+
+fn normalize_oidc_policy_id(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let bytes = normalized.as_bytes();
+    if bytes.len() != 36
+        || bytes[8] != b'-'
+        || bytes[13] != b'-'
+        || bytes[18] != b'-'
+        || bytes[23] != b'-'
+        || bytes[14] != b'4'
+        || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+    {
+        return None;
+    }
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| !matches!(index, 8 | 13 | 18 | 23) && !byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn resolve_oidc_policy_id(explicit: Option<&str>) -> Result<String, LpmError> {
+    let value = if let Some(value) = explicit {
+        value.to_string()
+    } else {
+        match std::env::var(OIDC_POLICY_ID_ENV) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(LpmError::Script(format!(
+                    "OIDC policy selection is required. Set {OIDC_POLICY_ID_ENV} to the policy ID \
+                     returned by `lpm env oidc allow`, or pass --policy-id=<uuid>."
+                )));
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(LpmError::Script(format!(
+                    "{OIDC_POLICY_ID_ENV} must contain a UTF-8 server-issued UUID."
+                )));
+            }
+        }
+    };
+    normalize_oidc_policy_id(&value).ok_or_else(|| {
+        LpmError::Script(format!(
+            "OIDC policy ID must be a server-issued UUID. Check {OIDC_POLICY_ID_ENV}, \
+             --policy-id, or run `lpm env oidc list`."
+        ))
+    })
+}
+
+fn policy_id_from_response(result: &serde_json::Value) -> Result<String, LpmError> {
+    result["policyId"]
+        .as_str()
+        .and_then(normalize_oidc_policy_id)
+        .ok_or_else(|| {
+            LpmError::Script(
+                "the server did not return a valid OIDC policy ID. The policy may have been \
+                 created, but CI cannot select it safely. Run `lpm env oidc list` to recover \
+                 the policy ID before enabling CI pulls."
+                    .into(),
+            )
+        })
 }
 
 /// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production [--events=push,workflow_dispatch] [--allow-forks]`
@@ -277,6 +342,7 @@ pub(super) async fn vars_oidc_allow(
     }
 
     let result: serde_json::Value = super::response::parse_capped_platform_json(response).await?;
+    let policy_id = policy_id_from_response(&result)?;
 
     let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key()
         .map_err(|error| oidc_escrow_setup_error("retrieving the local wrapping key", &error))?;
@@ -310,6 +376,16 @@ pub(super) async fn vars_oidc_allow(
             ));
         }
         output::info("CI escrow enabled — secrets will be decrypted server-side for OIDC pulls");
+        output::info(&format!("policy ID: {policy_id}"));
+        if provider == "gitlab" {
+            output::info(&format!(
+                "Store {OIDC_POLICY_ID_ENV}={policy_id} as a GitLab CI/CD variable. Mark it protected only when every allowed ref is protected."
+            ));
+        } else {
+            output::info(&format!(
+                "Store {OIDC_POLICY_ID_ENV}={policy_id} as a GitHub Actions repository variable before running `lpm env pull --oidc`."
+            ));
+        }
     }
 
     Ok(())
@@ -435,6 +511,13 @@ pub(super) async fn vars_oidc_list(
     }
 
     let result: serde_json::Value = super::response::parse_capped_platform_json(response).await?;
+    let policies = result["policies"]
+        .as_array()
+        .ok_or_else(|| LpmError::Script("invalid OIDC policy list response".into()))?;
+    let policy_ids = policies
+        .iter()
+        .map(policy_id_from_response_for_list)
+        .collect::<Result<Vec<_>, _>>()?;
 
     if json_output {
         println!(
@@ -444,8 +527,7 @@ pub(super) async fn vars_oidc_list(
         return Ok(());
     }
 
-    let policies = result["policies"].as_array();
-    if policies.is_none() || policies.unwrap().is_empty() {
+    if policies.is_empty() {
         output::warn("no OIDC policies configured. Run 'lpm env oidc allow' to add one.");
         return Ok(());
     }
@@ -466,7 +548,7 @@ pub(super) async fn vars_oidc_list(
             })
             .unwrap_or_default()
     }
-    for policy in policies.unwrap() {
+    for (policy, policy_id) in policies.iter().zip(&policy_ids) {
         let provider = policy["provider"].as_str().unwrap_or("?");
         let subject = policy["subject"].as_str().unwrap_or("?");
         let identity = match (provider, policy["repositoryId"].as_str()) {
@@ -491,9 +573,10 @@ pub(super) async fn vars_oidc_list(
         println!(
             "{}",
             install_ui::terminal_line!(
-                "  {} {}\n      branches:  [{}]\n      envs:      [{}]\n      workflows: [{}]\n      events:    [{}]{}",
+                "  {} {}\n      policy ID: {}\n      branches:  [{}]\n      envs:      [{}]\n      workflows: [{}]\n      events:    [{}]{}",
                 install_ui::bold(provider),
                 identity,
+                policy_id,
                 bb,
                 ee,
                 ww,
@@ -511,7 +594,19 @@ pub(super) async fn vars_oidc_list(
     Ok(())
 }
 
-/// `lpm env pull --oidc [--env=<mode>] [--output=<file>]`
+fn policy_id_from_response_for_list(policy: &serde_json::Value) -> Result<String, LpmError> {
+    policy["id"]
+        .as_str()
+        .and_then(normalize_oidc_policy_id)
+        .ok_or_else(|| {
+            LpmError::Script(
+                "the server returned an OIDC policy without a valid policy ID; rerun the command after the Registry is updated"
+                    .into(),
+            )
+        })
+}
+
+/// `lpm env pull --oidc [--policy-id=<uuid>] [--env=<mode>] [--output=<file>]`
 ///
 /// Exchange CI OIDC token for a short-lived LPM token, then pull vault secrets.
 pub(super) async fn vars_oidc_pull(
@@ -525,14 +620,28 @@ pub(super) async fn vars_oidc_pull(
 
     let mut env_mode: Option<&str> = None;
     let mut output_file: Option<&str> = None;
+    let mut explicit_policy_id: Option<&str> = None;
 
     for arg in args {
-        if let Some(v) = arg.strip_prefix("--env=") {
+        if *arg == "--oidc" {
+            continue;
+        } else if let Some(v) = arg.strip_prefix("--env=") {
             env_mode = Some(v);
         } else if let Some(v) = arg.strip_prefix("--output=") {
             output_file = Some(v);
+        } else if let Some(v) = arg.strip_prefix("--policy-id=") {
+            if explicit_policy_id.replace(v).is_some() {
+                return Err(LpmError::Script(
+                    "--policy-id may be supplied only once".into(),
+                ));
+            }
+        } else {
+            return Err(LpmError::Script(format!(
+                "unknown OIDC pull argument: {arg}"
+            )));
         }
     }
+    let policy_id = resolve_oidc_policy_id(explicit_policy_id)?;
 
     // Get OIDC token from CI environment
     let oidc_token = get_ci_oidc_token().await?;
@@ -547,6 +656,7 @@ pub(super) async fn vars_oidc_pull(
             "oidcToken": oidc_token,
             "vaultId": vault_id,
             "env": env_mode,
+            "policyId": policy_id,
         }))
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -701,9 +811,13 @@ async fn get_ci_oidc_token() -> Result<String, LpmError> {
 fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String {
     let code_hint = match code {
         "policy_not_found" => Some(
-            "No OIDC policy exists for this CI identity and vault. Create one with \
-             `lpm env oidc allow`, using the provider-specific identity flags shown by \
-             `lpm setup ci` or `lpm env oidc allow --help`.",
+            "No OIDC policy matches this selector and CI identity. Verify \
+             LPM_OIDC_POLICY_ID with `lpm env oidc list`, or create a policy with \
+             `lpm env oidc allow`.",
+        ),
+        "policy_selector_required" | "policy_selector_invalid" | "policy_ambiguous" => Some(
+            "Set LPM_OIDC_POLICY_ID to the policy ID shown by `lpm env oidc allow` or \
+             `lpm env oidc list`, or pass --policy-id=<uuid>.",
         ),
         "policy_misconfigured" => Some(
             "The OIDC policy exists but is missing required fields (likely a pre-migration \

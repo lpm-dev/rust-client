@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+pub const TEST_OIDC_POLICY_ID: &str = "11111111-1111-4111-8111-111111111111";
+
 /// A mock LPM registry server.
 ///
 /// Wraps `wiremock::MockServer` and provides ergonomic helpers for mounting
@@ -1138,12 +1140,33 @@ impl MockRegistry {
         env_name: Option<&str>,
         lpm_token: &str,
     ) -> &Self {
+        self.with_oidc_exchange_for_policy(
+            oidc_token,
+            vault_id,
+            env_name,
+            TEST_OIDC_POLICY_ID,
+            lpm_token,
+        )
+        .await
+    }
+
+    pub async fn with_oidc_exchange_for_policy(
+        &self,
+        oidc_token: &str,
+        vault_id: &str,
+        env_name: Option<&str>,
+        policy_id: &str,
+        lpm_token: &str,
+    ) -> &Self {
         let mut mock = Mock::given(method("POST"))
             .and(path("/api/vault/oidc"))
             .and(body_string_contains(format!(
                 "\"oidcToken\":\"{oidc_token}\""
             )))
-            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")));
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!(
+                "\"policyId\":\"{policy_id}\""
+            )));
 
         if let Some(env_name) = env_name {
             mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
@@ -1173,7 +1196,11 @@ impl MockRegistry {
             .and(body_string_contains(format!(
                 "\"oidcToken\":\"{oidc_token}\""
             )))
-            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")));
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!(
+                "\"policyId\":\"{}\"",
+                TEST_OIDC_POLICY_ID
+            )));
 
         if let Some(env_name) = env_name {
             mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
@@ -1511,7 +1538,8 @@ impl MockRegistry {
         }
 
         mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true,
+            "status": "ok",
+            "policyId": TEST_OIDC_POLICY_ID,
             "provider": "github",
             "subject": format!("repo:{repo}"),
         })))
@@ -1549,7 +1577,8 @@ impl MockRegistry {
         }
 
         mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true,
+            "status": "ok",
+            "policyId": TEST_OIDC_POLICY_ID,
             "provider": "gitlab",
             "subject": format!("project:{project_id}"),
         })))

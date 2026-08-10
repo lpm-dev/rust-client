@@ -174,6 +174,14 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
         "setup output must use the project vault id when present, got:\n{stdout}"
     );
     assert!(
+        stdout.contains("LPM_OIDC_POLICY_ID: ${{ vars.LPM_OIDC_POLICY_ID }}"),
+        "setup output must read the server-issued policy ID from GitHub configuration, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("LPM_OIDC_POLICY_ID repository variable"),
+        "setup output must recommend a repository variable for a job without an environment, got:\n{stdout}"
+    );
+    assert!(
         stdout.contains(
             "lpm env oidc allow --provider=github --repo=<owner/repo> \
              --workflow=.github/workflows/deploy.yml --branch=main --env=preview"
@@ -250,6 +258,11 @@ fn ci_setup_gitlab_emits_id_tokens_block_and_authorization_command() {
     assert!(
         stdout.contains("LPM_OIDC_TOKEN") && stdout.contains("aud: https://lpm.dev"),
         "setup snippet must declare the `LPM_OIDC_TOKEN` id_tokens block, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("LPM_OIDC_POLICY_ID")
+            && stdout.contains("Mark it protected only when every allowed ref is protected"),
+        "setup output must explain when GitLab variable protection is compatible with allowed refs, got:\n{stdout}"
     );
     assert!(
         stdout.contains("lpm env oidc allow --provider=gitlab")
