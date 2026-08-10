@@ -921,6 +921,9 @@ pub struct WhoamiResponse {
     #[serde(default)]
     pub organizations: Vec<WhoamiOrg>,
 
+    #[serde(default, rename = "organizations_next_cursor")]
+    pub organizations_next_cursor: Option<String>,
+
     #[serde(default, rename = "available_scopes")]
     pub available_scopes: Vec<String>,
 

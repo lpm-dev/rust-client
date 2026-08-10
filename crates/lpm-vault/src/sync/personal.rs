@@ -67,36 +67,73 @@ pub struct RemoteVault {
 
 /// Response from list vaults endpoint.
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListVaultsResponse {
     pub vaults: Vec<RemoteVault>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
-/// List all cloud vaults for the authenticated user.
-pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<RemoteVault>, String> {
-    let url = format!("{registry_url}/api/vaults");
+const MAX_REMOTE_PROJECTS: usize = 10_000;
+const MAX_REMOTE_PROJECT_PAGES: usize = 101;
+
+pub(super) async fn list_remote_from_url(
+    url: &str,
+    auth_token: &str,
+) -> Result<Vec<RemoteVault>, String> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
+    let base_url = reqwest::Url::parse(url).map_err(|e| format!("invalid env list URL: {e}"))?;
+    let mut projects = Vec::new();
+    let mut cursor: Option<String> = None;
 
-    let response = client
-        .get(&url)
-        .bearer_auth(auth_token)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
+    for _ in 0..MAX_REMOTE_PROJECT_PAGES {
+        let mut page_url = base_url.clone();
+        if let Some(current_cursor) = cursor.as_deref() {
+            page_url
+                .query_pairs_mut()
+                .append_pair("cursor", current_cursor);
+        }
+        let response = client
+            .get(page_url)
+            .bearer_auth(auth_token)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(super::http::network_error)?;
 
-    if !response.status().is_success() {
-        let body = read_capped_error_text(response).await;
-        return Err(format!("server error: {body}"));
+        if !response.status().is_success() {
+            let body = read_capped_error_text(response).await;
+            return Err(format!("server error: {body}"));
+        }
+
+        let data: ListVaultsResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("parse error: {e}"))?;
+        if projects.len() + data.vaults.len() > MAX_REMOTE_PROJECTS {
+            return Err(format!(
+                "env project list exceeds the supported {MAX_REMOTE_PROJECTS}-project limit"
+            ));
+        }
+        projects.extend(data.vaults);
+
+        let Some(next_cursor) = data.next_cursor else {
+            return Ok(projects);
+        };
+        if next_cursor.is_empty() || cursor.as_deref() == Some(next_cursor.as_str()) {
+            return Err("env project pagination returned an invalid cursor".to_string());
+        }
+        cursor = Some(next_cursor);
     }
 
-    let data: ListVaultsResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
+    Err("env project pagination exceeded the supported page limit".to_string())
+}
 
-    Ok(data.vaults)
+/// List all cloud env projects for the authenticated user.
+pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<RemoteVault>, String> {
+    list_remote_from_url(&format!("{registry_url}/api/vaults"), auth_token).await
 }
 
 /// Push a vault to the cloud (personal sync).
@@ -461,10 +498,48 @@ mod tests {
     use crate::sync::test_support::{env_lock_guard, signed_ok_response};
     #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex as StdMutex};
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     #[cfg(debug_assertions)]
     use wiremock::{Request, Respond};
+
+    #[tokio::test]
+    async fn list_remote_collects_all_cursor_pages() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "vaults": [{ "vaultId": "project-1", "version": 1 }],
+                "nextCursor": "cursor-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/vaults"))
+            .and(query_param("cursor", "cursor-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "vaults": [{ "vaultId": "project-2", "version": 2 }],
+                "nextCursor": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let projects = list_remote(&server.uri(), "auth-token")
+            .await
+            .expect("all env project pages should load");
+
+        assert_eq!(
+            projects
+                .iter()
+                .map(|project| project.vault_id.as_str())
+                .collect::<Vec<_>>(),
+            ["project-1", "project-2"]
+        );
+    }
 
     #[cfg(debug_assertions)]
     #[tokio::test]

@@ -161,9 +161,59 @@ impl RegistryClient {
     ///
     /// Calls: GET /api/registry/-/whoami
     pub async fn whoami(&self) -> Result<WhoamiResponse, LpmError> {
+        const MAX_ORGANIZATION_PAGES: usize = 100;
+
+        #[derive(serde::Deserialize)]
+        struct WhoamiOrganizationsPage {
+            #[serde(default)]
+            organizations: Vec<WhoamiOrg>,
+            #[serde(default, rename = "organizations_next_cursor")]
+            organizations_next_cursor: Option<String>,
+        }
+
         let url = format!("{}/api/registry/-/whoami", self.base_url);
-        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
-            .await
+        let mut response: WhoamiResponse = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await?;
+        let mut next_cursor = response.organizations_next_cursor.take();
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut seen_scopes: std::collections::HashSet<String> =
+            response.available_scopes.iter().cloned().collect();
+
+        for _ in 0..MAX_ORGANIZATION_PAGES {
+            let Some(cursor) = next_cursor.take() else {
+                return Ok(response);
+            };
+            if !seen_cursors.insert(cursor.clone()) {
+                return Err(LpmError::Registry(
+                    "registry returned a repeated whoami organization cursor".to_string(),
+                ));
+            }
+
+            let continuation_url = format!(
+                "{}/api/registry/-/whoami/organizations?cursor={}",
+                self.base_url,
+                urlencoding::encode(&cursor)
+            );
+            let page: WhoamiOrganizationsPage = self
+                .execute_with_recovery(AuthPosture::AuthRequired, || {
+                    self.get_json(&continuation_url)
+                })
+                .await?;
+
+            for organization in page.organizations {
+                let scope = format!("@{}", organization.slug);
+                if seen_scopes.insert(scope.clone()) {
+                    response.available_scopes.push(scope);
+                }
+                response.organizations.push(organization);
+            }
+            next_cursor = page.organizations_next_cursor;
+        }
+
+        Err(LpmError::Registry(
+            "registry returned too many whoami organization pages".to_string(),
+        ))
     }
 
     /// Validate the current token.

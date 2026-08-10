@@ -28,6 +28,52 @@ async fn whoami_maps_401_to_auth_required() {
 }
 
 #[tokio::test]
+async fn whoami_follows_organization_continuation_pages() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let cursor = "00000000-0000-4000-8000-000000000001";
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "owner@lpm.dev",
+            "organizations": [{ "slug": "first" }],
+            "available_scopes": ["@first"],
+            "organizations_next_cursor": cursor
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami/organizations"))
+        .and(query_param("cursor", cursor))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": [{ "slug": "second" }],
+            "organizations_next_cursor": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let response = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("test-token")
+        .whoami()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response
+            .organizations
+            .iter()
+            .map(|org| org.slug.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+}
+
+#[tokio::test]
 async fn publish_preflight_sends_resolved_identity_and_bearer_without_mutation() {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
