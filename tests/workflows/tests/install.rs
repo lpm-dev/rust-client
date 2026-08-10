@@ -1393,6 +1393,174 @@ async fn install_audit_after_install_counts_lpm_registry_advisories() {
 }
 
 #[tokio::test]
+async fn install_without_audit_after_install_ignores_lpm_registry_advisories() {
+    let mock = MockRegistry::start().await;
+    let package = "@lpm.dev/test.ordinary-install-advisory";
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": package,
+            "version": "1.0.0",
+            "license": "MIT"
+        }),
+        &[],
+    );
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!(
+                        "{}{}",
+                        mock.url(),
+                        MockRegistry::tarball_path(package, "1.0.0")
+                    ),
+                    "integrity": compute_integrity(&tarball)
+                },
+                "_vulnerabilities": [{
+                    "id": "LPM-ADV-ORDINARY-INSTALL",
+                    "summary": "must stay behind audit-after-install",
+                    "severity": "critical"
+                }],
+                "_securityFindings": [{
+                    "severity": "critical",
+                    "description": "ordinary install must not show this registry finding"
+                }]
+            }
+        }
+    });
+    mock.with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"ordinary-install-advisory","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("failed to run ordinary install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install must succeed: {stderr}");
+    assert!(
+        !stderr.contains("critical vulnerability")
+            && !stderr.contains("ordinary install must not show this registry finding")
+            && !stderr.contains("Security summary"),
+        "ordinary install must not surface registry advisories: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn install_audit_after_install_preserves_individual_critical_findings() {
+    let mock = MockRegistry::start().await;
+    let package = "@lpm.dev/test.audit-critical-parity";
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": package,
+            "version": "1.0.0",
+            "license": "MIT"
+        }),
+        &[],
+    );
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": format!(
+                        "{}{}",
+                        mock.url(),
+                        MockRegistry::tarball_path(package, "1.0.0")
+                    ),
+                    "integrity": compute_integrity(&tarball)
+                },
+                "_vulnerabilities": [
+                    {
+                        "id": "LPM-ADV-CRITICAL-A",
+                        "summary": "first critical advisory",
+                        "severity": "critical"
+                    },
+                    {
+                        "id": "LPM-ADV-CRITICAL-B",
+                        "summary": "second critical advisory",
+                        "severity": "critical"
+                    }
+                ],
+                "_securityFindings": [{
+                    "severity": "critical",
+                    "description": "critical registry analysis finding"
+                }]
+            }
+        }
+    });
+    mock.with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"audit-critical-parity","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to run install with audit-after-install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "install must succeed: {stderr}");
+    for expected in [
+        "2 vulnerabilities",
+        "3 critical",
+        "LPM-ADV-CRITICAL-A",
+        "LPM-ADV-CRITICAL-B",
+        "critical registry analysis finding",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "audit-after-install must preserve {expected:?}: {stderr}"
+        );
+    }
+
+    let json_project = TempProject::empty(&format!(
+        r#"{{"name":"audit-critical-parity-json","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let json_output = lpm_with_registry(&json_project, &mock.url())
+        .args([
+            "--json",
+            "install",
+            "--audit-after-install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to rerun audit-enabled install in JSON mode");
+    assert!(
+        json_output.status.success(),
+        "JSON install must succeed: {}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&json_output.stdout)
+        .expect("audit-enabled install must emit valid JSON");
+    insta::assert_json_snapshot!(
+        "install_audit_after_install_critical_findings_json",
+        &envelope["audit_summary"],
+        {
+            ".elapsed_ms" => "[DURATION]",
+        }
+    );
+}
+
+#[tokio::test]
 async fn install_no_audit_after_install_overrides_env() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("ms", "2.1.3");
@@ -1496,6 +1664,27 @@ async fn install_audit_after_install_attaches_summary_to_json_envelope() {
             "audit_summary.{key} must be a number; got envelope:\n{stdout}"
         );
     }
+    let severity_counts = summary
+        .get("severity_counts")
+        .and_then(serde_json::Value::as_object)
+        .expect("audit_summary.severity_counts must be an object");
+    for severity in ["critical", "high", "moderate", "low", "info"] {
+        assert!(
+            severity_counts
+                .get(severity)
+                .is_some_and(serde_json::Value::is_number),
+            "audit_summary.severity_counts.{severity} must be numeric: {stdout}"
+        );
+    }
+    assert!(
+        summary
+            .get("critical_findings")
+            .is_some_and(serde_json::Value::is_array),
+        "audit_summary.critical_findings must be an array: {stdout}"
+    );
+    insta::assert_json_snapshot!("install_audit_after_install_json_summary", summary, {
+        ".elapsed_ms" => "[DURATION]",
+    });
     // Human stderr must NOT carry the `! Audited …` line in JSON mode.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

@@ -1,4 +1,4 @@
-//! Supply chain & code quality tag detection (7 tags).
+//! Supply chain & code quality tag detection (8 tags).
 //!
 //! Detects patterns beyond API usage: obfuscation, high-entropy strings,
 //! minified code, telemetry SDKs, URL literals, trivial packages, and
@@ -15,6 +15,8 @@ use std::sync::OnceLock;
 #[serde(rename_all = "camelCase")]
 pub struct SupplyChainTags {
     pub obfuscated: bool,
+    #[serde(default)]
+    pub possible_obfuscation: bool,
     pub high_entropy_strings: bool,
     pub minified: bool,
     pub telemetry: bool,
@@ -22,8 +24,8 @@ pub struct SupplyChainTags {
     pub trivial: bool,
     pub protestware: bool,
     /// Obfuscation confidence score (0.0–1.0).
-    /// - < 0.3: not obfuscated
-    /// - 0.3–0.7: possible obfuscation (likely compiled/minified output)
+    /// - ≤ 0.3: not obfuscated
+    /// - > 0.3 and ≤ 0.7: possible obfuscation (likely compiled/minified output)
     /// - > 0.7: high-confidence deliberate obfuscation
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub obfuscation_confidence: f64,
@@ -31,6 +33,14 @@ pub struct SupplyChainTags {
 
 fn is_zero_f64(v: &f64) -> bool {
     *v == 0.0
+}
+
+fn is_critical_obfuscation(confidence: f64) -> bool {
+    confidence > 0.7
+}
+
+fn is_possible_obfuscation(confidence: f64) -> bool {
+    confidence > 0.3 && confidence <= 0.7
 }
 
 /// Metadata collected during supply chain analysis.
@@ -110,8 +120,8 @@ fn supply_pattern_summary(stripped: &str) -> SupplyPatternSummary {
 /// Replaces the old boolean `detect_obfuscation` with a graduated score
 /// that accounts for signal density:
 ///
-/// - **< 0.3** — not flagged (legitimate minified/compiled code)
-/// - **0.3–0.7** — flagged as info (possible obfuscation, likely compiled output)
+/// - **≤ 0.3** — not flagged (legitimate minified/compiled code)
+/// - **> 0.3 and ≤ 0.7** — flagged as info (possible obfuscation, likely compiled output)
 /// - **> 0.7** — flagged as critical (high-confidence deliberate obfuscation)
 ///
 /// Factors:
@@ -239,9 +249,10 @@ fn detect_dispatcher_pattern_with_var_names(stripped: &str, has_0x_var_names: bo
     indexed.is_match(stripped)
 }
 
-/// Legacy boolean detection — returns true when confidence > 0.3.
+/// Boolean detection for possible or high-confidence obfuscation.
 ///
-/// Wraps `obfuscation_confidence` for backward compatibility.
+/// This broad detector crosses the informational threshold. Use the
+/// `SupplyChainTags` confidence bands to distinguish Info from Critical.
 pub fn detect_obfuscation(stripped: &str) -> bool {
     obfuscation_confidence(stripped, false) > 0.3
 }
@@ -513,7 +524,7 @@ pub fn analyze_trivial(stripped: &str) -> TrivialAnalysis {
 
 // ── Aggregated analysis ───────────────────────────────────────
 
-/// Analyze source text for all 7 supply chain tags.
+/// Analyze source text for all 8 supply chain tags.
 ///
 /// Takes already-stripped source content. `raw_content` is the original
 /// file content before comment stripping (needed for minification detection).
@@ -531,7 +542,8 @@ pub(crate) fn analyze_supply_chain_with_url_presence(
     let confidence = obfuscation_confidence_with_summary(stripped, is_minified, patterns);
 
     SupplyChainTags {
-        obfuscated: confidence > 0.3,
+        obfuscated: is_critical_obfuscation(confidence),
+        possible_obfuscation: is_possible_obfuscation(confidence),
         high_entropy_strings: detect_high_entropy(stripped),
         minified: is_minified,
         telemetry: patterns.telemetry,
@@ -545,8 +557,13 @@ pub(crate) fn analyze_supply_chain_with_url_presence(
 /// Merge two SupplyChainTags with OR logic.
 pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> SupplyChainTags {
     let confidence = a.obfuscation_confidence.max(b.obfuscation_confidence);
+    let obfuscated = a.obfuscated || b.obfuscated || is_critical_obfuscation(confidence);
     SupplyChainTags {
-        obfuscated: confidence > 0.3,
+        obfuscated,
+        possible_obfuscation: !obfuscated
+            && (a.possible_obfuscation
+                || b.possible_obfuscation
+                || is_possible_obfuscation(confidence)),
         high_entropy_strings: a.high_entropy_strings || b.high_entropy_strings,
         minified: a.minified || b.minified,
         telemetry: a.telemetry || b.telemetry,
@@ -560,6 +577,20 @@ pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> Supp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obfuscation_confidence_boundaries_map_to_documented_bands() {
+        for confidence in [0.0, 0.3] {
+            assert!(!is_possible_obfuscation(confidence));
+            assert!(!is_critical_obfuscation(confidence));
+        }
+        for confidence in [0.300_000_000_1, 0.7] {
+            assert!(is_possible_obfuscation(confidence));
+            assert!(!is_critical_obfuscation(confidence));
+        }
+        assert!(!is_possible_obfuscation(0.700_000_000_1));
+        assert!(is_critical_obfuscation(0.700_000_000_1));
+    }
 
     #[test]
     fn source_line_count_matches_str_lines_semantics() {
@@ -974,6 +1005,33 @@ mod tests {
         "#;
         let tags = analyze_supply_chain(code, code.as_bytes());
         assert!(tags.obfuscation_confidence > 0.0);
-        assert_eq!(tags.obfuscated, tags.obfuscation_confidence > 0.3);
+        assert_eq!(tags.obfuscated, tags.obfuscation_confidence > 0.7);
+        assert_eq!(
+            tags.possible_obfuscation,
+            tags.obfuscation_confidence > 0.3 && tags.obfuscation_confidence <= 0.7
+        );
+    }
+
+    #[test]
+    fn moderate_confidence_obfuscation_is_not_critical() {
+        let code = r#"
+            var _0x1a2b = "\x48\x65\x6c\x6c\x6f\x20\x57\x6f\x72\x6c\x64";
+            var _0x3c4d = _0x1a2b;
+        "#;
+        let tags = analyze_supply_chain(code, code.as_bytes());
+
+        assert!(
+            tags.obfuscation_confidence > 0.3 && tags.obfuscation_confidence <= 0.7,
+            "fixture must remain in the possible-obfuscation band: {}",
+            tags.obfuscation_confidence
+        );
+        assert!(
+            !tags.obfuscated,
+            "possible obfuscation must not be promoted to the Critical tag"
+        );
+        assert!(
+            tags.possible_obfuscation,
+            "possible obfuscation must remain available as an informational tag"
+        );
     }
 }

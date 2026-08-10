@@ -179,8 +179,8 @@ fn format_lpm_dev_editor_frame(settings: LpmDevSettings, cursor: usize) -> Strin
             settings.package_skills,
         ),
         (
-            "Fetch LPM AI Insights Results",
-            "At install time, fetch server-side AI findings, vulnerabilities, lifecycle-script data, and registry behavioral tags.",
+            "Fetch LPM Registry Insights",
+            "At install time, use registry behavioral tags and lifecycle-script data. Audits add AI findings and vulnerabilities.",
             settings.security_insights,
         ),
     ];
@@ -245,8 +245,8 @@ mod tests {
         );
         let plain = console::strip_ansi_codes(&frame);
         assert!(plain.contains("LPM.dev package skills"));
-        assert!(plain.contains("Fetch LPM AI Insights Results"));
-        assert!(plain.contains("server-side AI findings"));
+        assert!(plain.contains("Fetch LPM Registry Insights"));
+        assert!(plain.contains("Audits add AI findings and vulnerabilities"));
         assert!(plain.contains("● Enabled"));
         assert!(plain.contains("● Disabled"));
     }

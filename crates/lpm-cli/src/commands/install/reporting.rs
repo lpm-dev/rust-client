@@ -839,12 +839,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // count goes red when non-zero. Computed above before the
         // human/JSON branch split so both surfaces agree.
         if let Some(counts) = audit_summary_for_envelope {
-            install_ui::warn_line(install_ui::format_audit_advisory(
-                counts.packages_audited,
-                counts.vulnerabilities,
-                counts.suspicious,
-                counts.elapsed_ms,
-            ));
+            crate::commands::audit::print_install_summary(counts, true);
         }
 
         if verbose {

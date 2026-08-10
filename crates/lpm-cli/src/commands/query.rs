@@ -527,6 +527,9 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
     if analysis.supply_chain.obfuscated {
         tags.push("obfuscated".into());
     }
+    if analysis.supply_chain.possible_obfuscation {
+        tags.push("possible-obfuscation".into());
+    }
     if analysis.supply_chain.high_entropy_strings {
         tags.push("high-entropy".into());
     }

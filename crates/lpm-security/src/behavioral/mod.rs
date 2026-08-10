@@ -1,8 +1,8 @@
 //! Client-side behavioral analysis for all packages (npm + @lpm.dev).
 //!
-//! Detects 22 security-relevant tags across three groups:
+//! Detects 23 security-relevant tags across three groups:
 //! - **Source tags** (10): API usage patterns (filesystem, network, eval, etc.)
-//! - **Supply chain tags** (7): Obfuscation, entropy, minified, telemetry, etc.
+//! - **Supply chain tags** (8): Obfuscation confidence, entropy, minified, telemetry, etc.
 //! - **Manifest tags** (5): License + dependency configuration issues
 //!
 //! Runs on every extracted package in the store. Results are cached in
@@ -41,7 +41,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Maximum file size to scan (2MB). Files larger than this are skipped.
 /// No legitimate single source file is this large — it's bundled/generated.
@@ -73,7 +73,7 @@ pub struct PackageAnalysis {
     pub analyzed_at: String,
     /// Source code behavioral tags (10).
     pub source: SourceTags,
-    /// Supply chain & code quality tags (7).
+    /// Supply chain & code quality tags (8).
     pub supply_chain: SupplyChainTags,
     /// Package manifest tags (5).
     pub manifest: ManifestTags,
@@ -403,6 +403,11 @@ fn oversized_source_signals(source: &SourceTags, supply_chain: &SupplyChainTags)
     push_signal(&mut signals, source.web_socket, "webSocket");
     push_signal(&mut signals, source.dynamic_require, "dynamicRequire");
     push_signal(&mut signals, supply_chain.obfuscated, "obfuscated");
+    push_signal(
+        &mut signals,
+        supply_chain.possible_obfuscation,
+        "possibleObfuscation",
+    );
     push_signal(
         &mut signals,
         supply_chain.high_entropy_strings,

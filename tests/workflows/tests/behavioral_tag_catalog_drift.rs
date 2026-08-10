@@ -208,7 +208,7 @@ fn assert_doc_covers_catalog(
 }
 
 /// security-audit.mdx splits the catalog into three tables — Source
-/// (10), Supply chain (7), Manifest (5). Every catalog entry MUST
+/// (10), Supply chain (8), Manifest (5). Every catalog entry MUST
 /// appear in exactly one of those tables, and every row MUST be in
 /// the catalog.
 #[test]

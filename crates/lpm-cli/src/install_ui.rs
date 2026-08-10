@@ -922,15 +922,18 @@ pub fn packages_word(count: usize) -> &'static str {
 /// Coloring (per the slim-UI spec):
 ///   * `{N} vulnerabilit{y|ies}` is **red** when N > 0, otherwise plain
 ///   * `{N} suspicious` is plain
+///   * `{N} critical` is red when N > 0, otherwise plain
 ///   * the elapsed time is plain
-///   * the trailing `— run \`lpm audit\`` hint is dimmed
+///   * the optional trailing `— run \`lpm audit\`` hint is dimmed
 ///
 /// Returns just the message body (no `!` prefix, no trailing newline).
 pub fn format_audit_advisory(
     packages_audited: usize,
     vulnerabilities: usize,
     suspicious: usize,
+    critical: usize,
     elapsed_ms: u128,
+    show_audit_follow_up: bool,
 ) -> TerminalLine {
     let pkg_word = packages_word(packages_audited);
     let vuln_word = if vulnerabilities == 1 {
@@ -943,14 +946,25 @@ pub fn format_audit_advisory(
     } else {
         field(&format!("{vulnerabilities} {vuln_word}"))
     };
+    let critical_segment = if critical > 0 {
+        red(&format!("{critical} critical"))
+    } else {
+        field("0 critical")
+    };
+    let follow_up = if show_audit_follow_up {
+        dim(" — run `lpm audit`")
+    } else {
+        field("")
+    };
     terminal_line!(
-        "Audited {} {}, {}, {} suspicious in {}ms {}",
+        "Audited {} {}, {}, {} suspicious, {} in {}ms{}",
         packages_audited,
         pkg_word,
         vuln_segment,
         suspicious,
+        critical_segment,
         elapsed_ms,
-        dim("— run `lpm audit`"),
+        follow_up,
     )
 }
 

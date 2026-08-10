@@ -308,7 +308,8 @@ pub(crate) enum Commands {
     ///
     /// Selectors target behavioral tags, state, and dependency relationships:
     ///   :eval, :network, :fs, :shell, :child-process, :native, :crypto,
-    ///   :dynamic-require, :env, :ws, :obfuscated, :high-entropy, :minified,
+    ///   :dynamic-require, :env, :ws, :obfuscated, :possible-obfuscation,
+    ///   :high-entropy, :minified,
     ///   :telemetry, :url-strings, :trivial, :protestware, :git-dep, :http-dep,
     ///   :wildcard-dep, :copyleft, :no-license, :scripts, :built, :vulnerable,
     ///   :deprecated, :lpm, :npm, :critical, :high, :medium, :info

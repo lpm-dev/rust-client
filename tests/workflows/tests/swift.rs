@@ -17,6 +17,7 @@ use wiremock::{Mock, ResponseTemplate};
 const SWIFT_PACKAGE: &str = "@lpm.dev/acme.swift-logger";
 const SWIFT_VERSION: &str = "1.0.0";
 const SWIFT_PRODUCT: &str = "SwiftLogger";
+const SWIFT_CRITICAL_FINDING: &str = "critical Swift registry analysis finding";
 
 fn swift_project() -> TempProject {
     let project = TempProject::empty(r#"{"name":"swift-app","version":"1.0.0"}"#);
@@ -39,6 +40,37 @@ let package = Package(
 }
 
 async fn mount_swift_package(mock: &MockRegistry) -> Vec<u8> {
+    mount_swift_package_with_security_metadata(mock, None, None).await
+}
+
+async fn mount_swift_package_with_audit_findings(mock: &MockRegistry) -> Vec<u8> {
+    mount_swift_package_with_security_metadata(
+        mock,
+        Some(serde_json::json!([{
+            "severity": "critical",
+            "description": SWIFT_CRITICAL_FINDING
+        }])),
+        Some(serde_json::json!([
+            {
+                "id": "LPM-SWIFT-ADV-A",
+                "summary": "first Swift advisory",
+                "severity": "critical"
+            },
+            {
+                "id": "LPM-SWIFT-ADV-B",
+                "summary": "second Swift advisory",
+                "severity": "critical"
+            }
+        ])),
+    )
+    .await
+}
+
+async fn mount_swift_package_with_security_metadata(
+    mock: &MockRegistry,
+    security_findings: Option<serde_json::Value>,
+    vulnerabilities: Option<serde_json::Value>,
+) -> Vec<u8> {
     let tarball = b"unused swift package tarball";
     let mut metadata = mock.package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball);
     let version = &mut metadata["versions"][SWIFT_VERSION];
@@ -50,6 +82,12 @@ async fn mount_swift_package(mock: &MockRegistry) -> Vec<u8> {
             "targets": ["SwiftLogger"]
         }]
     });
+    if let Some(security_findings) = security_findings {
+        version["_securityFindings"] = security_findings;
+    }
+    if let Some(vulnerabilities) = vulnerabilities {
+        version["_vulnerabilities"] = vulnerabilities;
+    }
     mock.with_package_metadata(SWIFT_PACKAGE, SWIFT_VERSION, tarball, metadata)
         .await;
     let cert = rcgen::generate_simple_self_signed(vec!["lpm.dev".to_string()])
@@ -325,6 +363,140 @@ async fn swift_install_yes_selects_first_eligible_target_without_prompting() {
     assert!(
         product_is_attached_to_first_target(&project.read_file("Package.swift")),
         "--yes must attach the Swift product to the first eligible target"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_swift_install_does_not_show_registry_audit_findings() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package_with_audit_findings(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run ordinary Swift install");
+    let combined = combined_output(&output);
+
+    assert!(
+        output.status.success(),
+        "ordinary Swift install should succeed:\n{combined}"
+    );
+    for hidden in [SWIFT_CRITICAL_FINDING, "LPM-SWIFT-ADV-A", "LPM-SWIFT-ADV-B"] {
+        assert!(
+            !combined.contains(hidden),
+            "ordinary Swift install must leave {hidden:?} to audit:\n{combined}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn swift_install_with_audit_after_install_preserves_critical_registry_findings() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package_with_audit_findings(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .args(["install", "--yes", "--audit-after-install", SWIFT_PACKAGE])
+        .output()
+        .expect("run audit-enabled Swift install");
+    let combined = combined_output(&output);
+
+    assert!(
+        output.status.success(),
+        "audit-enabled Swift install should succeed:\n{combined}"
+    );
+    for expected in [
+        SWIFT_CRITICAL_FINDING,
+        "2 vulnerabilities",
+        "3 critical",
+        "LPM-SWIFT-ADV-A",
+        "LPM-SWIFT-ADV-B",
+        "[registry/security]",
+        "[registry/vulnerability]",
+    ] {
+        assert!(
+            combined.contains(expected),
+            "audit-enabled Swift install must show {expected:?}:\n{combined}"
+        );
+    }
+    assert!(
+        !combined.contains("run `lpm audit`"),
+        "Swift audit summary must not recommend an audit command that lacks Swift discovery:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn swift_install_config_enables_registry_audit_findings() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package_with_audit_findings(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let config_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&config_dir).expect("create LPM config directory");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "audit-after-install = true\n",
+    )
+    .expect("write LPM config");
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run Swift install with audit enabled by config");
+    let combined = combined_output(&output);
+
+    assert!(
+        output.status.success(),
+        "config-enabled Swift audit should succeed:\n{combined}"
+    );
+    assert!(
+        combined.contains(SWIFT_CRITICAL_FINDING) && combined.contains("3 critical"),
+        "audit-after-install config must expose Critical Swift registry findings:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn swift_install_audit_summary_json_preserves_critical_registry_findings() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package_with_audit_findings(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let output = command
+        .args([
+            "--json",
+            "install",
+            "--yes",
+            "--audit-after-install",
+            SWIFT_PACKAGE,
+        ])
+        .output()
+        .expect("run JSON Swift install with audit enabled");
+    assert!(
+        output.status.success(),
+        "JSON Swift audit should succeed:\n{}",
+        combined_output(&output)
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("audit-enabled Swift install must emit valid JSON");
+    insta::assert_json_snapshot!(
+        "swift_install_audit_summary_critical_registry_findings",
+        &envelope["audit_summary"],
+        {
+            ".elapsed_ms" => "[DURATION]",
+        }
     );
 }
 

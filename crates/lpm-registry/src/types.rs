@@ -185,8 +185,8 @@ pub struct Vulnerability {
 
 /// Static behavioral analysis tags — what the package code does.
 ///
-/// 22 tags in three groups matching the client-side `lpm-security` analyzer
-/// and the server-side `behavioral-tags.js`:
+/// 22 server-provided tags in three groups. The client analyzer also derives
+/// confidence-only signals that are not part of this registry payload:
 ///
 /// - Source (10): eval, childProcess, shell, network, filesystem, crypto,
 ///   dynamicRequire, nativeBindings, environmentVars, webSocket
