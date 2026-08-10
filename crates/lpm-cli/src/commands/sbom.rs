@@ -1,6 +1,6 @@
 use crate::commands::manifest_metadata::{
-    ManifestMetadata, extract_manifest_metadata, package_metadata_key, read_json_file,
-    read_local_metadata,
+    ManifestMetadata, extract_manifest_metadata, package_metadata_key,
+    read_installed_manifest_metadata, read_json_file,
 };
 use crate::commands::registry_reads::{
     RoutedPackageRef, RoutedReadContext, fetch_routed_package_metadata, prepare_routed_read_context,
@@ -172,7 +172,7 @@ async fn build_document(
     client: &RegistryClient,
     project_dir: &Path,
     root_json: Value,
-    lockfile: Lockfile,
+    mut lockfile: Lockfile,
     registry: bool,
 ) -> Result<SbomDocument, LpmError> {
     let root_name = root_json
@@ -198,7 +198,10 @@ async fn build_document(
     let direct_scopes = root_dependency_scopes(&root_json);
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let local_metadata = read_local_metadata(project_dir, &lockfile.packages)?;
+    let local_metadata = read_installed_manifest_metadata(project_dir, &lockfile.packages)?;
+    lockfile
+        .packages
+        .retain(|package| !local_metadata.is_platform_skipped(package));
     let registry_metadata = if registry {
         fetch_registry_metadata(client, project_dir, &lockfile.packages).await?
     } else {
@@ -231,7 +234,7 @@ async fn build_document(
         let bom_ref = bom_ref_for_package(&package);
         component_refs.insert(bom_ref.clone());
         let mut metadata = ManifestMetadata::default();
-        if let Some(local) = local_metadata.get(&key) {
+        if let Some(local) = local_metadata.get(&package) {
             metadata.merge_missing(local.clone());
         }
         if let Some(registry) = registry_metadata.get(&key) {
