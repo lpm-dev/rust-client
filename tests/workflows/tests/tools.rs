@@ -790,7 +790,7 @@ fn lint_single_package_reports_slim_completion_with_elapsed_time() {
 fn lint_malformed_lpm_json_tools_config_warns_with_slim_line() {
     let project = TempProject::empty(r#"{"name":"slim-lint-config","version":"1.0.0"}"#);
     project.write_file("lpm.json", "{");
-    seed_fake_plugin(&project, "oxlint", "1.77.0", ".lint-ok");
+    seed_fake_plugin(&project, "oxlint", "1.78.0", ".lint-ok");
 
     let output = lpm(&project)
         .args(["lint"])

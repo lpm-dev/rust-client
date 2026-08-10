@@ -484,15 +484,37 @@ mod tests {
     #[test]
     fn unverified_advertised_url_does_not_hide_the_unique_owned_listener() {
         let project = tempfile::TempDir::new().unwrap();
-        let owned_port = ports::find_available_port(49000).unwrap();
-        let incidental_port = ports::find_available_port(owned_port.saturating_add(1)).unwrap();
         let baseline = ListenerSnapshot::capture();
-        let script = "require('http').createServer((_, response) => response.end('ok')).listen(Number(process.argv[1]), '127.0.0.1')";
+        let port_path = project.path().join("owned-port");
+        let script = "const fs=require('fs');const path=process.argv[1];const server=require('http').createServer((_,response)=>response.end('ok'));server.listen(0,'127.0.0.1',()=>{const tmp=`${path}.tmp`;fs.writeFileSync(tmp,String(server.address().port));fs.renameSync(tmp,path)})";
         let mut child = std::process::Command::new("node")
-            .args(["-e", script, &owned_port.to_string()])
+            .args(["-e", script])
+            .arg(&port_path)
             .current_dir(project.path())
             .spawn()
             .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let owned_port = loop {
+            match std::fs::read_to_string(&port_path) {
+                Ok(port) => break port.parse::<u16>().unwrap(),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not publish its listener port: {error}");
+                }
+            }
+        };
+        let incidental_port = if owned_port == u16::MAX {
+            owned_port - 1
+        } else {
+            owned_port + 1
+        };
         let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
         candidate_tx
             .send(LocalTarget::loopback(LocalScheme::Http, incidental_port))

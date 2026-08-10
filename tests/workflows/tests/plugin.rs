@@ -132,7 +132,7 @@ async fn mount_github_latest(server: &MockServer) {
         .and(path("/repos/oxc-project/oxc/releases"))
         .and(query_param("per_page", "20"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            { "tag_name": "apps_v1.77.1" }
+            { "tag_name": "apps_v1.78.1" }
         ])))
         .mount(server)
         .await;
@@ -296,7 +296,7 @@ fn plugin_list_json_reports_installed_versions_and_known_latest_versions() {
     let oxlint = plugin_entry(plugins, "oxlint");
     assert_eq!(oxlint["installed"], serde_json::json!(["1.57.0"]));
     assert_eq!(oxlint["current"], serde_json::json!("1.57.0"));
-    assert_eq!(oxlint["latest"], serde_json::json!("1.77.0"));
+    assert_eq!(oxlint["latest"], serde_json::json!("1.78.0"));
 
     let biome = plugin_entry(plugins, "biome");
     assert_eq!(biome["installed"], serde_json::json!([]));
@@ -354,7 +354,7 @@ fn plugin_list_human_renders_table_and_slim_completion() {
     assert!(
         stdout_raw.contains("\u{1b}[2mPlugin")
             && stdout_raw.contains("\u{1b}[2m1.57.0")
-            && stdout_raw.contains("\u{1b}[33m1.77.0")
+            && stdout_raw.contains("\u{1b}[33m1.78.0")
             && stdout_raw.contains("\u{1b}[33mupdate available")
             && stdout_raw.contains("\u{1b}[32mcurrent"),
         "plugin list must apply slim color roles, got:\n{stdout_raw:?}"
@@ -403,7 +403,7 @@ async fn plugin_outdated_json_reports_managed_tools_and_project_owned_tsdown() {
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["outdated_count"], serde_json::json!(3));
-    assert_eq!(plugin_entry(plugins, "oxlint")["latest"], "1.77.1");
+    assert_eq!(plugin_entry(plugins, "oxlint")["latest"], "1.78.1");
     assert_eq!(plugin_entry(plugins, "biome")["latest"], "2.5.8");
     assert_eq!(
         plugin_entry(plugins, "rolldown")["latest"],
