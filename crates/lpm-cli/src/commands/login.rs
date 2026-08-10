@@ -1,15 +1,71 @@
 use crate::{auth, install_ui};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
-use std::sync::Arc;
-use tokio::sync::oneshot;
+
+const MAX_CLI_EXCHANGE_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_CONCURRENT_CALLBACKS: usize = 16;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliExchangeSession {
+    token: String,
+    refresh_token: String,
+    expires_in: u64,
+    expires_at: String,
+}
+
+fn parse_cli_exchange_session(body: &[u8]) -> Result<CliExchangeSession, LpmError> {
+    let session: CliExchangeSession = serde_json::from_slice(body)
+        .map_err(|error| LpmError::Registry(format!("exchange response parse error: {error}")))?;
+    if session.token.trim().is_empty()
+        || session.refresh_token.trim().is_empty()
+        || session.expires_in == 0
+        || chrono::DateTime::parse_from_rfc3339(&session.expires_at).is_err()
+    {
+        return Err(LpmError::Registry(
+            "exchange response did not contain a complete refresh session".to_string(),
+        ));
+    }
+    Ok(session)
+}
+
+async fn read_capped_exchange_body(mut response: reqwest::Response) -> Result<Vec<u8>, LpmError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CLI_EXCHANGE_RESPONSE_BYTES as u64)
+    {
+        return Err(LpmError::Registry(
+            "exchange response exceeded the 64 KiB limit".to_string(),
+        ));
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(1024)
+            .min(MAX_CLI_EXCHANGE_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| LpmError::Registry(format!("exchange response read error: {error}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_CLI_EXCHANGE_RESPONSE_BYTES {
+            return Err(LpmError::Registry(
+                "exchange response exceeded the 64 KiB limit".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
 /// Login flow:
 /// 1. Start a local HTTP server on a random port
 /// 2. Open browser to `{registry}/cli/login?port={port}`
 /// 3. User authenticates in browser
-/// 4. Browser redirects to `localhost:{port}/callback?token={token}`
-/// 5. We capture the token, verify it with whoami, store it
+/// 4. Browser posts a short-lived exchange code to the loopback callback
+/// 5. Redeem the PKCE-bound code, verify the token, and store the session
 pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> {
     // Check if already logged in
     if let Some(existing) = auth::get_token(registry_url) {
@@ -38,10 +94,6 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         install_ui::phase("Opening browser for authentication");
     }
 
-    // Create a oneshot channel to receive the token from the callback
-    let (tx, rx) = oneshot::channel::<String>();
-    let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
-
     // Start local HTTP server on random port
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -69,9 +121,13 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         .unwrap_or_else(|_| "CLI".to_string());
 
     // Open browser
-    let login_url = format!(
-        "{registry_url}/cli/login?port={port}&state={state}&fp={device_fingerprint}&code_challenge={code_challenge}&dn={}",
-        urlencoding::encode(&device_name)
+    let login_url = build_login_url(
+        registry_url,
+        port,
+        &state,
+        &device_fingerprint,
+        &code_challenge,
+        &device_name,
     );
     if open::that(&login_url).is_err() && !json_output {
         install_ui::warn("Could not open browser automatically");
@@ -82,79 +138,62 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         install_ui::detail_line(login_detail_row("browser:", &install_ui::url(&login_url)));
     }
 
-    // Handle the callback
-    let tx_clone = tx.clone();
-    let expected_state = state.clone();
-    let server_handle = tokio::spawn(async move {
-        // Accept one connection
-        if let Ok((stream, _)) = listener.accept().await {
-            handle_callback(stream, tx_clone, &expected_state).await;
-        }
-    });
+    let mut server_handle = tokio::spawn(wait_for_valid_callback(listener, state));
+    let code =
+        match tokio::time::timeout(std::time::Duration::from_secs(120), &mut server_handle).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(error)) => {
+                return Err(LpmError::Registry(format!(
+                    "login callback task failed: {error}"
+                )));
+            }
+            Err(_) => {
+                server_handle.abort();
+                return Err(LpmError::Registry(
+                    "login timed out after 2 minutes".to_string(),
+                ));
+            }
+        };
 
-    // Wait for credential with timeout (2 minutes)
-    let credential = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+    if !json_output {
+        install_ui::phase("Exchanging authorization code");
+    }
+    let exchange_url = format!("{registry_url}/api/cli/exchange");
+    let http_client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Registry(format!("exchange client build failed: {error}")))?;
+    let resp = http_client
+        .post(&exchange_url)
+        .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
+        .send()
         .await
-        .map_err(|_| LpmError::Registry("login timed out after 2 minutes".to_string()))?
-        .map_err(|_| LpmError::Registry("login callback channel closed".to_string()))?;
-
-    server_handle.abort();
-
-    // Exchange code for token if needed.
-    let (token, expires_at, refresh_token) = if let Some(code) = credential.strip_prefix("code:") {
-        if !json_output {
-            install_ui::phase("Exchanging authorization code");
-        }
-        let exchange_url = format!("{registry_url}/api/cli/exchange");
-        let http_client = lpm_http::client_builder().build().map_err(|error| {
-            LpmError::Registry(format!("exchange client build failed: {error}"))
+        .map_err(|error| {
+            LpmError::Registry(format!(
+                "exchange request failed: {}",
+                lpm_http::display_error(&error)
+            ))
         })?;
-        let resp = http_client
-            .post(&exchange_url)
-            .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
-            .send()
-            .await
-            .map_err(|error| {
-                LpmError::Registry(format!(
-                    "exchange request failed: {}",
-                    lpm_http::display_error(&error)
-                ))
-            })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let detail = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                json["error"]
-                    .as_str()
-                    .unwrap_or("unknown error")
-                    .to_string()
-            } else {
-                format!("HTTP {status}")
-            };
-            return Err(LpmError::Registry(format!(
-                "Failed to exchange authorization code: {detail}. It may have expired — please try again."
-            )));
-        }
+    let status = resp.status();
+    let body = read_capped_exchange_body(resp).await?;
+    if !status.is_success() {
+        let detail = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+            json["error"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string()
+        } else {
+            format!("HTTP {status}")
+        };
+        return Err(LpmError::Registry(format!(
+            "Failed to exchange authorization code: {detail}. It may have expired — please try again."
+        )));
+    }
 
-        let data: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("exchange response parse error: {e}")))?;
-
-        let token = data["token"]
-            .as_str()
-            .ok_or_else(|| LpmError::Registry("no token in exchange response".to_string()))?
-            .to_string();
-        let expires_at = data["expiresAt"].as_str().map(|s| s.to_string());
-        let refresh_token = data["refreshToken"].as_str().map(|s| s.to_string());
-        (token, expires_at, refresh_token)
-    } else if let Some(token) = credential.strip_prefix("token:") {
-        // Legacy direct token flow
-        (token.to_string(), None, None)
-    } else {
-        return Err(LpmError::Registry("unexpected callback format".to_string()));
-    };
+    let session = parse_cli_exchange_session(&body)?;
+    let token = session.token;
+    let expires_at = session.expires_at;
+    let refresh_token = session.refresh_token;
 
     // Verify the token via whoami
     let client = RegistryClient::new()
@@ -178,26 +217,15 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
     let mut storage_status = auth::AuthStorageStatus::from_backend(access_backend);
 
-    // Store refresh token for session-based auth.
-    if let Some(ref rt) = refresh_token {
-        if let Some(ref ea) = expires_at {
-            auth::set_session_access_token_expiry(registry_url, ea);
+    auth::set_session_access_token_expiry(registry_url, &expires_at);
+    match auth::set_refresh_token_with_backend(registry_url, &refresh_token) {
+        Ok(refresh_backend) => {
+            storage_status =
+                auth::AuthStorageStatus::from_backends(Some(access_backend), Some(refresh_backend));
         }
-        match auth::set_refresh_token_with_backend(registry_url, rt) {
-            Ok(refresh_backend) => {
-                storage_status = auth::AuthStorageStatus::from_backends(
-                    Some(access_backend),
-                    Some(refresh_backend),
-                );
-            }
-            Err(error) => {
-                tracing::warn!("failed to store refresh token securely: {error}");
-            }
+        Err(error) => {
+            tracing::warn!("failed to store refresh token securely: {error}");
         }
-    } else if let Some(ref ea) = expires_at {
-        // Legacy direct-token flow still uses date-based reminder metadata.
-        let date_part = ea.split('T').next().unwrap_or(ea);
-        auth::set_token_expiry(registry_url, date_part);
     }
 
     if json_output {
@@ -259,26 +287,68 @@ fn login_detail_row<T: install_ui::TerminalValue + ?Sized>(
     install_ui::terminal_line!("    {:<9} {}", install_ui::dim(label), value)
 }
 
+fn build_login_url(
+    registry_url: &str,
+    port: u16,
+    state: &str,
+    device_fingerprint: &str,
+    code_challenge: &str,
+    device_name: &str,
+) -> String {
+    let registry_url = registry_url.trim_end_matches('/');
+    format!(
+        "{registry_url}/cli/login?port={port}&state={state}&fp={device_fingerprint}&code_challenge={code_challenge}&code_challenge_method=S256&dn={}",
+        urlencoding::encode(device_name)
+    )
+}
+
+fn is_valid_exchange_code(code: &str) -> bool {
+    code.len() == 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+async fn wait_for_valid_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: String,
+) -> Result<String, LpmError> {
+    let mut handlers = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept(), if handlers.len() < MAX_CONCURRENT_CALLBACKS => {
+                let (stream, _) = accepted.map_err(LpmError::Io)?;
+                let expected_state = expected_state.clone();
+                handlers.spawn(async move { handle_callback(stream, &expected_state).await });
+            }
+            completed = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Ok(Some(code))) = completed {
+                    return Ok(code);
+                }
+            }
+        }
+    }
+}
+
 /// Handle the OAuth callback HTTP request.
 ///
 /// Expects: POST /callback with form body code=xxx&state=yyy
-///   or:    GET  /callback?code=xxx&state=yyy (exchange code flow, legacy)
-///   or:    GET  /callback?token=lpm_xxx (direct token flow, legacy)
+///   or:    GET  /callback?code=xxx&state=yyy
 /// Responds with a simple HTML page that auto-closes.
-async fn handle_callback(
-    stream: tokio::net::TcpStream,
-    tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<String>>>>,
-    expected_state: &str,
-) {
+async fn handle_callback(stream: tokio::net::TcpStream, expected_state: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = stream;
     let mut buf = vec![0u8; 8192];
 
-    // Read headers (and possibly body) in first read
-    let mut total = match stream.read(&mut buf).await {
-        Ok(n) => n,
-        Err(_) => return,
+    let mut total = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return None,
     };
 
     // For POST requests the body may arrive in a separate TCP segment.
@@ -321,9 +391,8 @@ async fn handle_callback(
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
     // Parse key-value pairs from a query/form string
-    fn parse_params(data: &str) -> (Option<String>, Option<String>, Option<String>) {
+    fn parse_params(data: &str) -> (Option<String>, Option<String>) {
         let mut code = None;
-        let mut token = None;
         let mut state = None;
         for param in data.split('&') {
             let mut parts = param.splitn(2, '=');
@@ -333,27 +402,24 @@ async fn handle_callback(
             let decoded = urlencoding::decode(value).unwrap_or(std::borrow::Cow::Borrowed(value));
             match key {
                 "code" => code = Some(decoded.into_owned()),
-                "token" => token = Some(decoded.into_owned()),
                 "state" => state = Some(decoded.into_owned()),
                 _ => {}
             }
         }
-        (code, token, state)
+        (code, state)
     }
 
-    // Extract code, token, and state from POST body or GET query string
-    let (code, token, received_state) = if path.starts_with("/callback") {
-        if method == "POST" {
-            // POST form body: split on \r\n\r\n to get body after headers
+    let callback_path = path.split('?').next().unwrap_or("");
+    let (code, received_state) = match (method, callback_path) {
+        ("POST", "/callback") => {
             let body = request.split("\r\n\r\n").nth(1).unwrap_or("").trim();
             parse_params(body)
-        } else {
-            // GET query string
-            let query = path.split('?').nth(1).unwrap_or("");
+        }
+        ("GET", "/callback") => {
+            let query = path.split_once('?').map_or("", |(_, query)| query);
             parse_params(query)
         }
-    } else {
-        (None, None, None)
+        _ => (None, None),
     };
 
     // Verify CSRF state parameter
@@ -362,23 +428,12 @@ async fn handle_callback(
         tracing::warn!("login callback state mismatch — possible CSRF attack");
     }
 
-    // Prefer exchange code over direct token; send whichever is present with "code:" or "token:" prefix
-    let credential = if state_ok {
-        if let Some(c) = code {
-            Some(format!("code:{c}"))
-        } else {
-            token.map(|t| format!("token:{t}"))
-        }
-    } else {
-        None
-    };
+    let credential = state_ok
+        .then_some(code)
+        .flatten()
+        .filter(|code| is_valid_exchange_code(code));
 
-    let (status, body) = if let Some(ref cred) = credential {
-        // Send credential to main thread
-        if let Some(sender) = tx.lock().await.take() {
-            let _ = sender.send(cred.clone());
-        }
-
+    let (status, body) = if credential.is_some() {
         ("200 OK", render_login_page(true, None))
     } else {
         ("400 Bad Request", render_login_page(false, None))
@@ -388,6 +443,8 @@ async fn handle_callback(
 
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
+
+    credential
 }
 
 /// Render the HTTP response served back to the OAuth callback. The
@@ -395,9 +452,8 @@ async fn handle_callback(
 /// cross-origin `fetch` from another tab, so it sends no
 /// `Access-Control-Allow-Origin` header — that wildcard previously
 /// let any web page the user had open probe the ephemeral callback
-/// port and read the success/failure HTML body (M11). The state-
-/// token check still defeats forged callbacks; this removes the
-/// probe surface entirely.
+/// port and read the success/failure HTML body. The state check
+/// still defeats forged callbacks; this removes the probe surface.
 fn format_callback_response(status: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -419,7 +475,7 @@ fn render_login_page(success: bool, _username: Option<&str>) -> String {
     } else {
         (
             "Login Failed",
-            "No token received. Please try again.",
+            "No authorization code received. Please try again.",
             "#ef4444",
             r#"<path class="checkmark-path" d="M6 6l12 12M6 18L18 6"/>"#,
             r#"Return to your terminal and run <code>lpm login</code> again"#,
@@ -623,13 +679,71 @@ fn generate_pkce_pair() -> (String, String) {
 mod tests {
     use super::*;
 
-    /// M11: the callback response must NOT carry
-    /// `Access-Control-Allow-Origin: *`. Foreign tabs cannot reach
-    /// `127.0.0.1:<ephemeral>` via direct navigation but they CAN
-    /// issue cross-origin `fetch` requests if the response opts in
-    /// via CORS — the wildcard previously here did exactly that.
-    /// Pinning the absence of the header in a behavioural test
-    /// catches a future regression that re-adds it.
+    fn valid_exchange_session() -> serde_json::Value {
+        serde_json::json!({
+            "token": "lpm_access_token",
+            "refreshToken": "lpmrt_refresh_token",
+            "expiresIn": 3600,
+            "expiresAt": "2030-01-01T00:00:00Z",
+        })
+    }
+
+    async fn send_callback_request(request: &str) -> (String, Option<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback test listener");
+        let address = listener.local_addr().expect("read callback test address");
+        let expected_state = "expected-state".to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test callback");
+            handle_callback(stream, &expected_state).await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect callback test client");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write callback test request");
+        client
+            .shutdown()
+            .await
+            .expect("finish callback test request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .await
+            .expect("read callback test response");
+        let credential = server.await.expect("join callback test server");
+        (response, credential)
+    }
+
+    async fn send_request(address: std::net::SocketAddr, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect callback test client");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write callback test request");
+        client
+            .shutdown()
+            .await
+            .expect("finish callback test request");
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .await
+            .expect("read callback test response");
+        response
+    }
+
     #[test]
     fn callback_response_has_no_cors_wildcard_header() {
         let resp = format_callback_response("200 OK", "<html>ok</html>");
@@ -649,10 +763,168 @@ mod tests {
     }
 
     #[test]
+    fn exchange_response_requires_a_complete_refresh_session() {
+        for field in ["token", "refreshToken", "expiresIn", "expiresAt"] {
+            let mut response = valid_exchange_session();
+            response
+                .as_object_mut()
+                .expect("session object")
+                .remove(field);
+            let body = serde_json::to_vec(&response).expect("serialize session response");
+
+            assert!(
+                parse_cli_exchange_session(&body).is_err(),
+                "missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_response_rejects_invalid_refresh_session_values() {
+        for (field, value) in [
+            ("token", serde_json::json!("")),
+            ("refreshToken", serde_json::json!("")),
+            ("expiresIn", serde_json::json!(0)),
+            ("expiresAt", serde_json::json!("not-a-timestamp")),
+        ] {
+            let mut response = valid_exchange_session();
+            response[field] = value;
+            let body = serde_json::to_vec(&response).expect("serialize session response");
+
+            assert!(
+                parse_cli_exchange_session(&body).is_err(),
+                "invalid {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_response_accepts_a_complete_refresh_session() {
+        let body =
+            serde_json::to_vec(&valid_exchange_session()).expect("serialize session response");
+        let session = parse_cli_exchange_session(&body).expect("parse complete session");
+
+        assert_eq!(session.token, "lpm_access_token");
+        assert_eq!(session.refresh_token, "lpmrt_refresh_token");
+        assert_eq!(session.expires_in, 3600);
+        assert_eq!(session.expires_at, "2030-01-01T00:00:00Z");
+    }
+
+    #[test]
     fn callback_response_carries_failure_status_for_400() {
         let resp = format_callback_response("400 Bad Request", "");
         assert!(resp.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(resp.contains("Content-Length: 0\r\n"));
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_legacy_raw_tokens() {
+        let (response, credential) = send_callback_request(
+            "GET /callback?token=lpm_attacker_token&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(credential.is_none());
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_a_malformed_exchange_code() {
+        let (response, credential) = send_callback_request(
+            "GET /callback?code=not-hex&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(credential.is_none());
+    }
+
+    #[tokio::test]
+    async fn callback_listener_continues_after_wrong_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback listener");
+        let address = listener.local_addr().expect("read callback address");
+        let server = tokio::spawn(wait_for_valid_callback(
+            listener,
+            "expected-state".to_string(),
+        ));
+
+        let rejected = send_request(
+            address,
+            "GET /callback?code=attacker-code&state=wrong-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(rejected.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let accepted = send_request(
+            address,
+            &format!(
+                "GET /callback?code={}&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "a".repeat(64)
+            ),
+        )
+        .await;
+        assert!(accepted.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            server
+                .await
+                .expect("join callback listener")
+                .expect("receive valid callback"),
+            "a".repeat(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_listener_continues_after_an_idle_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback listener");
+        let address = listener.local_addr().expect("read callback address");
+        let server = tokio::spawn(wait_for_valid_callback(
+            listener,
+            "expected-state".to_string(),
+        ));
+
+        let _idle = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("open idle callback connection");
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_request(
+                address,
+                &format!(
+                    "GET /callback?code={}&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    "a".repeat(64)
+                ),
+            ),
+		)
+		.await
+		.expect("idle callback connection must not block a valid callback");
+
+        assert!(accepted.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            server
+                .await
+                .expect("join callback listener")
+                .expect("receive valid callback"),
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn login_url_declares_s256_pkce() {
+        let url = build_login_url(
+            "https://lpm.dev",
+            49152,
+            "state",
+            "fingerprint",
+            "challenge",
+            "Developer Mac",
+        );
+
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("dn=Developer%20Mac"));
     }
 
     #[test]

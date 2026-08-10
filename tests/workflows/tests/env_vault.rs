@@ -14,10 +14,12 @@ use support::auth_state::{
     SessionSeed, credentials_path, read_credentials, read_expiry_metadata, seed_sessions,
     token_expiry_path,
 };
-use support::mock_registry::MockRegistry;
+use support::mock_registry::{MockRegistry, TEST_OIDC_POLICY_ID};
 use support::{TempProject, lpm};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
+
+const TEST_OIDC_POLICY_ID_2: &str = "22222222-2222-4222-8222-222222222222";
 
 fn doctor_check<'a>(json: &'a serde_json::Value, code: &str) -> &'a serde_json::Value {
     json["checks"]
@@ -1415,6 +1417,7 @@ async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_VAULT_ID", "vault-ci-123")
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args([
             "env",
             "pull",
@@ -1474,6 +1477,7 @@ async fn env_pull_oidc_uses_lpm_vault_id_without_local_vault() {
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_VAULT_ID", "vault-from-environment")
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args(["--json", "env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run env-only OIDC pull");
@@ -1514,6 +1518,7 @@ async fn env_pull_oidc_environment_vault_id_overrides_local_vault() {
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_VAULT_ID", "vault-from-environment")
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args(["--json", "env", "pull", "--oidc"])
         .output()
         .expect("failed to run OIDC pull with vault override");
@@ -1549,6 +1554,7 @@ async fn env_pull_oidc_whitespace_vault_id_falls_back_to_local_vault() {
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_VAULT_ID", " \t ")
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args(["--json", "env", "pull", "--oidc"])
         .output()
         .expect("failed to run OIDC pull with whitespace vault override");
@@ -1613,6 +1619,157 @@ fn env_pull_oidc_rejects_unsafe_environment_vault_id() {
     );
 }
 
+#[test]
+fn env_pull_oidc_requires_policy_selector_before_resolving_ci_token() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-policy-required","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-required"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", "http://127.0.0.1:9")
+        .args(["env", "pull", "--oidc"])
+        .output()
+        .expect("run OIDC pull without policy selector");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LPM_OIDC_POLICY_ID") && stderr.contains("--policy-id"),
+        "missing selector error must explain both supported inputs: {stderr}",
+    );
+    assert!(
+        !stderr.contains("no OIDC signal"),
+        "selector validation must happen before CI token resolution: {stderr}",
+    );
+}
+
+#[test]
+fn env_pull_oidc_rejects_malformed_policy_selector_before_network() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-policy-invalid","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-invalid"}"#);
+
+    for (label, args, env_value) in [
+        (
+            "environment",
+            vec!["env", "pull", "--oidc"],
+            Some("not-a-uuid"),
+        ),
+        ("whitespace", vec!["env", "pull", "--oidc"], Some(" \t ")),
+        (
+            "flag",
+            vec!["env", "pull", "--oidc", "--policy-id=not-a-uuid"],
+            None,
+        ),
+    ] {
+        let mut command = lpm(&project);
+        command
+            .env("LPM_REGISTRY_URL", "http://127.0.0.1:9")
+            .env("LPM_OIDC_TOKEN", "must-not-be-sent")
+            .args(&args);
+        if let Some(value) = env_value {
+            command.env("LPM_OIDC_POLICY_ID", value);
+        }
+        let output = command.output().expect("run malformed selector case");
+        assert!(
+            !output.status.success(),
+            "{label} selector unexpectedly passed"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("policy ID") && stderr.contains("UUID"),
+            "{label} selector should fail local UUID validation: {stderr}",
+        );
+        assert!(!stderr.contains("OIDC exchange failed"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_pull_oidc_rejects_non_utf8_policy_selector_before_network() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let project = TempProject::empty(r#"{"name":"vault-oidc-policy-utf8","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-utf8"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", "http://127.0.0.1:9")
+        .env("LPM_OIDC_TOKEN", "must-not-be-sent")
+        .env(
+            "LPM_OIDC_POLICY_ID",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )
+        .args(["env", "pull", "--oidc"])
+        .output()
+        .expect("run OIDC pull with non-UTF-8 selector");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("UTF-8") && stderr.contains("LPM_OIDC_POLICY_ID"));
+    assert!(!stderr.contains("OIDC exchange failed"));
+}
+
+#[tokio::test]
+async fn env_pull_oidc_policy_flag_overrides_environment_selector() {
+    const FLAG_POLICY_ID: &str = "22222222-2222-4222-8222-222222222222";
+    let project =
+        TempProject::empty(r#"{"name":"vault-oidc-policy-precedence","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-precedence"}"#);
+
+    mock.with_oidc_exchange_for_policy(
+        "ci-oidc-token",
+        "vault-policy-precedence",
+        Some("preview"),
+        FLAG_POLICY_ID,
+        "lpm-ci-token",
+    )
+    .await;
+    mock.with_ci_pull(
+        "vault-policy-precedence",
+        "lpm-ci-token",
+        Some("preview"),
+        serde_json::json!({"SOURCE": "flag"}),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
+        .args([
+            "--json",
+            "env",
+            "pull",
+            "--oidc",
+            "--env=preview",
+            &format!("--policy-id={FLAG_POLICY_ID}"),
+        ])
+        .output()
+        .expect("run OIDC pull with selector precedence");
+
+    assert!(
+        output.status.success(),
+        "flag selector should override environment:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(parse_json_output(&output.stdout)["vars"]["SOURCE"], "flag");
+}
+
+#[test]
+fn env_pull_oidc_rejects_unknown_selector_flag() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-policy-typo","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-typo"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
+        .args(["env", "pull", "--oidc", "--policyid=typo"])
+        .output()
+        .expect("run OIDC pull with misspelled selector flag");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown OIDC pull argument"));
+}
+
 #[tokio::test]
 async fn env_pull_oidc_uses_lpm_oidc_token_canonical_and_ignores_ci_job_jwt_v2() {
     // Locks the contract that LPM_OIDC_TOKEN is the canonical registry-exchange
@@ -1651,6 +1808,7 @@ async fn env_pull_oidc_uses_lpm_oidc_token_canonical_and_ignores_ci_job_jwt_v2()
         // input token and the test fails.
         .env("CI_JOB_JWT_V2", "should-be-ignored")
         .env("LPM_OIDC_TOKEN", "lpm-oidc-token-with-aud-lpm-dev")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args(["--json", "env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run GitLab OIDC pull --json");
@@ -1873,6 +2031,7 @@ async fn env_pull_oidc_uses_github_actions_runtime_token() {
         .env("LPM_REGISTRY_URL", mock.url())
         .env("GITHUB_ACTIONS", "true")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "github-request-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .env(
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             format!("{}/github/oidc?existing=1", mock.url()),
@@ -1914,6 +2073,7 @@ async fn env_pull_oidc_partial_github_signal_token_only_falls_through() {
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "true")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "partial-gh-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
         .env_remove("LPM_OIDC_TOKEN")
         .env_remove("LPM_GITLAB_OIDC_TOKEN")
@@ -1948,6 +2108,7 @@ async fn env_pull_oidc_partial_github_signal_url_only_falls_through() {
 
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "true")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .env(
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             "https://example.invalid/oidc",
@@ -1993,6 +2154,7 @@ async fn env_pull_oidc_surfaces_github_runtime_request_failures() {
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "true")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "github-request-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .env(
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             format!("{}/github/oidc?existing=1", mock.url()),
@@ -2040,6 +2202,7 @@ async fn env_pull_oidc_rejects_github_runtime_responses_without_value() {
     let output = lpm(&project)
         .env("GITHUB_ACTIONS", "true")
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "github-request-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .env(
             "ACTIONS_ID_TOKEN_REQUEST_URL",
             format!("{}/github/oidc?existing=1", mock.url()),
@@ -2081,6 +2244,7 @@ async fn env_pull_oidc_surfaces_exchange_error_hint() {
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args(["env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run oidc pull exchange error test");
@@ -2119,6 +2283,7 @@ async fn env_pull_oidc_exchange_error_emits_json_error() {
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env("LPM_OIDC_TOKEN", "ci-oidc-token")
+        .env("LPM_OIDC_POLICY_ID", TEST_OIDC_POLICY_ID)
         .args(["--json", "env", "pull", "--oidc", "--env=preview"])
         .output()
         .expect("failed to run oidc pull JSON error test");
@@ -2295,6 +2460,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
         "vault-policy-123",
         serde_json::json!([
             {
+                "id": TEST_OIDC_POLICY_ID,
                 "provider": "github",
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main", "release"],
@@ -2334,6 +2500,10 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
     );
     assert!(allow_output.contains("OIDC policy set: github"));
     assert!(allow_output.contains("CI escrow enabled"));
+    assert!(allow_output.contains(TEST_OIDC_POLICY_ID));
+    assert!(allow_output.contains("LPM_OIDC_POLICY_ID"));
+    assert!(allow_output.contains("GitHub Actions repository variable"));
+    assert!(!allow_output.contains("protected CI variable"));
 
     let list = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -2351,6 +2521,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
     assert!(list_output.contains("repo:acme/repo"));
     assert!(list_output.contains("main, release") || list_output.contains("main,release"));
     assert!(list_output.contains("production"));
+    assert!(list_output.contains(TEST_OIDC_POLICY_ID));
 }
 
 #[tokio::test]
@@ -2467,6 +2638,15 @@ async fn env_oidc_allow_gitlab_uses_numeric_project_subject_without_github_field
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(combined.contains("project ID 12345"));
+    assert!(
+        combined.contains("GitLab CI/CD variable")
+            && combined.contains("only when every allowed ref is protected"),
+        "GitLab output must explain conditional variable protection: {combined}"
+    );
+    assert!(
+        !combined.contains("protected CI variable"),
+        "GitLab output must not require protection for policies that allow unprotected refs: {combined}"
+    );
     assert!(
         !combined.contains("workflows") && !combined.contains("events"),
         "GitLab output must not describe GitHub-only policy fields: {combined}"
@@ -3160,9 +3340,87 @@ async fn env_oidc_allow_emits_json_response() {
     );
 
     let json = parse_json_output(&output.stdout);
-    assert_eq!(json["success"], true);
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["policyId"], TEST_OIDC_POLICY_ID);
     assert_eq!(json["provider"], "github");
     assert_eq!(json["subject"], "repo:acme/repo");
+}
+
+#[tokio::test]
+async fn env_oidc_allow_rejects_missing_or_malformed_policy_id_before_escrow() {
+    for (label, response) in [
+        (
+            "missing",
+            serde_json::json!({
+                "status": "ok",
+                "provider": "github",
+                "subject": "repo:acme/repo",
+            }),
+        ),
+        (
+            "malformed",
+            serde_json::json!({
+                "status": "ok",
+                "policyId": "not-a-uuid",
+                "provider": "github",
+                "subject": "repo:acme/repo",
+            }),
+        ),
+    ] {
+        let project =
+            TempProject::empty(r#"{"name":"vault-oidc-invalid-policy-id","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file("lpm.json", r#"{"vault":"vault-policy-invalid-id"}"#);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("session-access-token"),
+                refresh_token: Some("refresh-token"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/policies"))
+            .and(header("authorization", "Bearer session-access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(mock.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/escrow"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(mock.server())
+            .await;
+
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args([
+                "env",
+                "oidc",
+                "allow",
+                "--provider=github",
+                "--repo=acme/repo",
+                "--repository-id=987654321",
+                "--branch=main",
+                "--env=production",
+                "--workflow=.github/workflows/deploy.yml",
+            ])
+            .output()
+            .expect("run OIDC allow with invalid policy selector response");
+
+        assert!(
+            !output.status.success(),
+            "{label} policy ID unexpectedly passed"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("valid OIDC policy ID"),
+            "{label} policy ID error was not actionable: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
 
 #[tokio::test]
@@ -3187,6 +3445,7 @@ async fn env_oidc_list_emits_json_response() {
         "vault-policy-list-json-123",
         serde_json::json!([
             {
+                "id": TEST_OIDC_POLICY_ID,
                 "provider": "github",
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main"],
@@ -3196,6 +3455,7 @@ async fn env_oidc_list_emits_json_response() {
                 "allowForks": false,
             },
             {
+                "id": TEST_OIDC_POLICY_ID_2,
                 "provider": "github",
                 "subject": "repo:acme/preview",
                 "allowedBranches": ["develop"],
@@ -3229,8 +3489,7 @@ async fn env_oidc_list_emits_json_response() {
         .as_array()
         .expect("policies should be an array");
     assert_eq!(policies.len(), 2);
-    // Pin every field end-to-end so a future schema/CLI drift trips
-    // here, not in production.
+    assert_eq!(policies[0]["id"], TEST_OIDC_POLICY_ID);
     assert_eq!(policies[0]["provider"], "github");
     assert_eq!(policies[0]["subject"], "repo:acme/repo");
     assert_eq!(policies[0]["allowedBranches"], serde_json::json!(["main"]));
@@ -3245,6 +3504,7 @@ async fn env_oidc_list_emits_json_response() {
     assert_eq!(policies[0]["allowedEvents"], serde_json::json!(["push"]));
     assert_eq!(policies[0]["allowForks"], false);
 
+    assert_eq!(policies[1]["id"], TEST_OIDC_POLICY_ID_2);
     assert_eq!(policies[1]["subject"], "repo:acme/preview");
     assert_eq!(
         policies[1]["allowedWorkflows"],
@@ -3255,6 +3515,41 @@ async fn env_oidc_list_emits_json_response() {
         serde_json::json!(["push", "pull_request_target"]),
     );
     assert_eq!(policies[1]["allowForks"], true);
+}
+
+#[tokio::test]
+async fn env_oidc_list_rejects_policy_without_valid_id() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-list-invalid-id","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-policy-list-invalid-id"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_oidc_policy_list(
+        "session-access-token",
+        "vault-policy-list-invalid-id",
+        serde_json::json!([{
+            "id": "not-a-uuid",
+            "provider": "github",
+            "subject": "repo:acme/repo",
+        }]),
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "oidc", "list"])
+        .output()
+        .expect("run OIDC policy list with invalid selector");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("valid policy ID"));
 }
 
 #[tokio::test]
@@ -3284,6 +3579,7 @@ async fn env_oidc_list_human_output_renders_new_fields() {
         "vault-policy-list-human-1",
         serde_json::json!([
             {
+                "id": TEST_OIDC_POLICY_ID,
                 "provider": "github",
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main"],
@@ -3586,6 +3882,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
         "vault-policy-refresh-logout-all-123",
         serde_json::json!([
             {
+                "id": TEST_OIDC_POLICY_ID,
                 "provider": "github",
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main"],
@@ -3748,6 +4045,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
         "vault-policy-refresh-escrow-logout-123",
         serde_json::json!([
             {
+                "id": TEST_OIDC_POLICY_ID,
                 "provider": "github",
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main"],
@@ -3913,6 +4211,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
         "vault-policy-refresh-escrow-logout-all-123",
         serde_json::json!([
             {
+                "id": TEST_OIDC_POLICY_ID,
                 "provider": "github",
                 "subject": "repo:acme/repo",
                 "allowedBranches": ["main"],

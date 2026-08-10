@@ -587,6 +587,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("CI_JOB_TOKEN");
     cmd.remove_env("LPM_TEST_VAULT_WRAPPING_KEY_ERROR");
     cmd.remove_env("LPM_VAULT_ID");
+    cmd.remove_env("LPM_OIDC_POLICY_ID");
     cmd.remove_env("LPM_TEST_ASSUME_EUID_ROOT");
     cmd.remove_env(LOCK_CONTENTION_MARKER_ENV);
     cmd.remove_env("SUDO_USER");
@@ -609,6 +610,7 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_URL");
     cmd.remove_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
     cmd.remove_env("GITLAB_CI");
+    cmd.remove_env("LPM_OIDC_TOKEN");
     cmd.remove_env("LPM_GITLAB_OIDC_TOKEN");
     cmd.remove_env("NPM_ID_TOKEN");
     cmd.remove_env("SIGSTORE_ID_TOKEN");

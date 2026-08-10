@@ -359,6 +359,7 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
           run: lpm env pull --oidc --env={ENV} --output=.env
           env:
             LPM_VAULT_ID: {VAULT_ID}
+            LPM_OIDC_POLICY_ID: ${{ vars.LPM_OIDC_POLICY_ID }}
         - name: Deploy
           run: lpm run deploy"
             .replace("{ENV}", env_mode.as_ref())
@@ -375,6 +376,12 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
              --workflow=.github/workflows/deploy.yml --branch=main --env={env_mode}"
         )
         .bold()
+    );
+    println!();
+    println!(
+        "  {} Store the policy ID returned by `lpm env oidc allow` as the {} repository variable.",
+        "3.".bold(),
+        "LPM_OIDC_POLICY_ID".bold(),
     );
     println!();
 }
@@ -409,6 +416,12 @@ fn setup_gitlab_ci(env_mode: &str) {
             "lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=main --env={env_mode}"
         )
         .bold()
+    );
+    println!();
+    println!(
+        "  {} Store the policy ID returned by `lpm env oidc allow` as an {} CI/CD variable. Mark it protected only when every allowed ref is protected.",
+        "3.".bold(),
+        "LPM_OIDC_POLICY_ID".bold(),
     );
     println!();
 }
