@@ -2,7 +2,77 @@
 
 mod support;
 
-use support::{TempProject, lpm, workspace_projection_project};
+use support::{
+    TempProject, installed_manifest_dependency_graph, lpm, lpm_v1, workspace_projection_project,
+};
+
+#[tokio::test]
+async fn licenses_resolves_hoisted_and_isolated_transitives_before_applying_policy() {
+    for linker in ["hoisted", "isolated"] {
+        let project = installed_manifest_dependency_graph(linker).await;
+        let output = lpm(&project)
+            .args(["licenses", "--fail-on", "copyleft,missing", "--json"])
+            .output()
+            .expect("run licenses policy against installed linker graph");
+        assert!(
+            !output.status.success(),
+            "{linker} licenses policy must fail after inventorying transitive manifests:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("licenses policy stdout must be valid JSON");
+        assert_eq!(
+            envelope["summary"]["copyleft"],
+            serde_json::json!(1),
+            "{linker} licenses output must contain a policy summary: {envelope:#}"
+        );
+        assert_eq!(
+            envelope["summary"]["missing"],
+            serde_json::json!(1),
+            "{linker} licenses output must contain a policy summary: {envelope:#}"
+        );
+        assert_eq!(
+            package_for_version(&envelope, "multi-license", "1.0.0")
+                .and_then(|package| package["license_expression"].as_str()),
+            Some("Apache-2.0")
+        );
+        assert_eq!(
+            package_for_version(&envelope, "multi-license", "2.0.0")
+                .and_then(|package| package["license_expression"].as_str()),
+            Some("BSD-3-Clause")
+        );
+        assert!(
+            package_for_version(&envelope, "platform-only-leaf", "1.0.0").is_none(),
+            "platform-skipped optional package must not be reported as installed"
+        );
+        assert!(
+            package_for_version(&envelope, "optional-platform-runtime", "1.0.0").is_none(),
+            "a descendant of a platform-skipped optional package must not be reported as installed"
+        );
+
+        for policy in ["copyleft", "missing"] {
+            let policy_output = lpm(&project)
+                .args(["licenses", "--fail-on", policy, "--json"])
+                .output()
+                .unwrap_or_else(|error| panic!("run {policy} policy: {error}"));
+            assert!(
+                !policy_output.status.success(),
+                "{linker} {policy} policy must fail independently:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&policy_output.stdout),
+                String::from_utf8_lossy(&policy_output.stderr)
+            );
+            let policy_envelope: serde_json::Value = serde_json::from_slice(&policy_output.stdout)
+                .unwrap_or_else(|error| panic!("parse {policy} policy JSON: {error}"));
+            assert_eq!(
+                policy_envelope["policy"]["fail_on"],
+                serde_json::json!([policy])
+            );
+            assert_eq!(policy_envelope["policy"]["failed"], serde_json::json!(true));
+        }
+    }
+}
 
 fn seed_project() -> TempProject {
     let project = TempProject::empty(
@@ -52,6 +122,18 @@ fn seed_project() -> TempProject {
         }"#,
     );
     project
+}
+
+fn write_v1_package_manifest(project: &TempProject, name: &str, version: &str, manifest: &str) {
+    let package_dir = project
+        .store_dir()
+        .join("v1")
+        .join(format!("{name}@{version}"));
+    std::fs::create_dir_all(&package_dir).expect("create v1 package fixture");
+    std::fs::write(package_dir.join("package.json"), manifest)
+        .expect("write v1 package manifest fixture");
+    std::fs::write(package_dir.join(".integrity"), "sha512-fixture")
+        .expect("write v1 package integrity fixture");
 }
 
 #[test]
@@ -221,8 +303,18 @@ fn licenses_scope_keeps_dev_only_duplicate_versions_excluded() {
             "license": "MIT"
         }"#,
     );
+    write_v1_package_manifest(
+        &project,
+        "foo",
+        "2.0.0",
+        r#"{
+            "name": "foo",
+            "version": "2.0.0",
+            "license": "MIT"
+        }"#,
+    );
 
-    let output = lpm(&project)
+    let output = lpm_v1(&project)
         .args(["licenses", "--json"])
         .output()
         .expect("failed to run lpm licenses --json");
@@ -246,7 +338,7 @@ fn licenses_scope_keeps_dev_only_duplicate_versions_excluded() {
 }
 
 #[test]
-fn licenses_missing_policy_does_not_reuse_root_manifest_for_duplicate_version() {
+fn licenses_ignores_stale_v1_copy_when_virtual_install_is_missing_version() {
     let project = TempProject::empty(
         r#"{
             "name": "licenses-duplicate-manifest",
@@ -299,27 +391,59 @@ fn licenses_missing_policy_does_not_reuse_root_manifest_for_duplicate_version() 
             "license": "MIT"
         }"#,
     );
+    write_v1_package_manifest(
+        &project,
+        "foo",
+        "2.0.0",
+        r#"{
+            "name": "foo",
+            "version": "2.0.0",
+            "license": "MIT"
+        }"#,
+    );
 
     let output = lpm(&project)
-        .args(["licenses", "--json", "--fail-on", "missing"])
+        .args(["licenses", "--json"])
         .output()
-        .expect("failed to run lpm licenses --fail-on missing --json");
+        .expect("run licenses with a missing installed version");
     assert!(
         !output.status.success(),
-        "licenses --fail-on missing must fail for foo@2 without matching metadata; stdout:\n{}\nstderr:\n{}",
+        "licenses must fail for foo@2 without an installed manifest; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("licenses stdout must be valid JSON");
-    assert_eq!(envelope["summary"]["missing"], serde_json::json!(1));
-    let foo_two =
-        package_for_version(&envelope, "foo", "2.0.0").expect("foo@2.0.0 must be reported");
-    assert_eq!(foo_two["missing"], serde_json::json!(true));
-    assert_eq!(
-        foo_two["license_expression"],
-        serde_json::json!("NOASSERTION")
+    assert_eq!(envelope["error_code"], serde_json::json!("not_found"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("foo@2.0.0")
+                && error.contains("Run `lpm install`")),
+        "missing installed version must return a repairable error: {envelope:#}"
+    );
+}
+
+#[test]
+fn licenses_reports_the_path_of_a_corrupt_installed_manifest() {
+    let project = seed_project();
+    project.write_file("node_modules/left-pad/package.json", "{not valid JSON");
+
+    let output = lpm(&project)
+        .args(["licenses", "--json"])
+        .output()
+        .expect("run licenses against corrupt installed manifest");
+    assert!(!output.status.success());
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("licenses error stdout must be valid JSON");
+    assert_eq!(envelope["error_code"], serde_json::json!("store"));
+    assert!(
+        envelope["error"].as_str().is_some_and(|error| error
+            .contains("failed to parse installed package manifest")
+            && error.contains("node_modules/left-pad/package.json")),
+        "corrupt manifest error must identify the installed path: {envelope:#}"
     );
 }
 

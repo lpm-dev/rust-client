@@ -1,7 +1,6 @@
 use crate::commands::install::select_locked_package_for_requested_spec;
 use crate::commands::manifest_metadata::{
-    ManifestMetadata, extract_manifest_metadata, package_metadata_key, read_json_file,
-    read_local_metadata,
+    ManifestMetadata, extract_manifest_metadata, read_installed_manifest_metadata, read_json_file,
 };
 use crate::install_ui;
 use clap::ValueEnum;
@@ -120,7 +119,7 @@ fn build_inventory(
         copyleft: licenses_are_copyleft(&root_metadata.licenses),
     };
 
-    let local_metadata = read_local_metadata(project_dir, &lockfile.packages)?;
+    let local_metadata = read_installed_manifest_metadata(project_dir, &lockfile.packages)?;
     let scopes = package_scopes_by_lockfile_index(&root_json, lockfile);
     let denied_policy = normalize_policy_values(deny);
     let denied_lookup: BTreeSet<String> = denied_policy
@@ -131,9 +130,12 @@ fn build_inventory(
 
     let mut packages = Vec::with_capacity(lockfile.packages.len());
     for (index, package) in lockfile.packages.iter().enumerate() {
+        if local_metadata.is_platform_skipped(package) {
+            continue;
+        }
         packages.push(package_license(
             package,
-            local_metadata.get(&package_metadata_key(package)),
+            local_metadata.get(package),
             scopes
                 .get(index)
                 .copied()

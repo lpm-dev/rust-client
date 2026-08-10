@@ -2,7 +2,62 @@
 
 mod support;
 
-use support::{TempProject, lpm, workspace_projection_project};
+use support::{
+    TempProject, installed_manifest_dependency_graph, lpm, workspace_projection_project,
+};
+
+#[tokio::test]
+async fn sbom_resolves_hoisted_and_isolated_transitives_with_distinct_versions() {
+    for linker in ["hoisted", "isolated"] {
+        let project = installed_manifest_dependency_graph(linker).await;
+        let output = lpm(&project)
+            .args(["sbom", "--json"])
+            .output()
+            .expect("run SBOM against installed linker graph");
+        assert!(
+            output.status.success(),
+            "{linker} SBOM must resolve transitive manifests:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("SBOM stdout must be valid JSON");
+        let components = document["components"]
+            .as_array()
+            .expect("CycloneDX components must be an array");
+        assert_eq!(
+            component_license(components, "multi-license", "1.0.0"),
+            Some("Apache-2.0")
+        );
+        assert_eq!(
+            component_license(components, "multi-license", "2.0.0"),
+            Some("BSD-3-Clause")
+        );
+        assert!(
+            components.iter().all(|component| {
+                component["name"] != "platform-only-leaf"
+                    && component["name"] != "optional-platform-runtime"
+            }),
+            "platform-skipped optional packages must not be emitted in the installed SBOM"
+        );
+    }
+}
+
+fn component_license<'a>(
+    components: &'a [serde_json::Value],
+    name: &str,
+    version: &str,
+) -> Option<&'a str> {
+    let license = components
+        .iter()
+        .find(|component| component["name"] == name && component["version"] == version)?
+        .get("licenses")?
+        .as_array()?
+        .first()?
+        .get("license")?;
+    license.get("id").or_else(|| license.get("name"))?.as_str()
+}
 
 fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
     use sha2::{Digest, Sha256};

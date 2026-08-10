@@ -244,6 +244,143 @@ pub fn workspace_projection_project() -> TempProject {
     project
 }
 
+pub async fn installed_manifest_dependency_graph(linker: &str) -> TempProject {
+    use mock_registry::{MockRegistry, make_tarball_from_pkg_json};
+
+    let registry = MockRegistry::start().await;
+    for manifest in [
+        serde_json::json!({
+            "name": "manifest-parent",
+            "version": "1.0.0",
+            "license": "MIT",
+            "dependencies": {
+                "copyleft-leaf": "1.0.0",
+                "multi-license": "1.0.0"
+            },
+            "optionalDependencies": {
+                "platform-only-leaf": "1.0.0"
+            }
+        }),
+        serde_json::json!({
+            "name": "version-parent",
+            "version": "1.0.0",
+            "license": "MIT",
+            "dependencies": {
+                "missing-license-leaf": "1.0.0",
+                "multi-license": "2.0.0"
+            }
+        }),
+        serde_json::json!({
+            "name": "copyleft-leaf",
+            "version": "1.0.0",
+            "license": "GPL-3.0-only"
+        }),
+        serde_json::json!({
+            "name": "missing-license-leaf",
+            "version": "1.0.0"
+        }),
+        serde_json::json!({
+            "name": "platform-only-leaf",
+            "version": "1.0.0",
+            "license": "GPL-3.0-only",
+            "cpu": ["wasm32"],
+            "dependencies": {
+                "optional-platform-runtime": "1.0.0"
+            }
+        }),
+        serde_json::json!({
+            "name": "optional-platform-runtime",
+            "version": "1.0.0",
+            "license": "GPL-3.0-only"
+        }),
+    ] {
+        registry.with_manifest_package(manifest, &[]).await;
+    }
+    let multi_one = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "multi-license",
+            "version": "1.0.0",
+            "license": "Apache-2.0"
+        }),
+        &[],
+    );
+    let multi_two = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "multi-license",
+            "version": "2.0.0",
+            "license": "BSD-3-Clause"
+        }),
+        &[],
+    );
+    registry
+        .with_full_package_metadata(
+            "multi-license",
+            "2.0.0",
+            &[
+                ("1.0.0", serde_json::json!({}), Some(multi_one)),
+                ("2.0.0", serde_json::json!({}), Some(multi_two)),
+            ],
+        )
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "installed-manifest-graph",
+            "version": "1.0.0",
+            "license": "MIT",
+            "dependencies": {
+                "manifest-parent": "1.0.0",
+                "version-parent": "1.0.0"
+            }
+        }"#,
+    );
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "install",
+            "--strict-peer-dependencies",
+            "--linker",
+            linker,
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run manifest dependency graph install");
+    assert!(
+        output.status.success(),
+        "{linker} manifest dependency graph install must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists("node_modules/manifest-parent/package.json"),
+        "direct dependency must be linked at project node_modules"
+    );
+    assert!(
+        !project.file_exists("node_modules/copyleft-leaf/package.json"),
+        "transitive dependency must remain inside the linker graph"
+    );
+    assert!(
+        !project.file_exists("node_modules/platform-only-leaf/package.json"),
+        "platform-incompatible optional dependency must not be materialized"
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project.path())
+        .expect("read installed manifest graph lockfile")
+        .lockfile;
+    for name in ["platform-only-leaf", "optional-platform-runtime"] {
+        let package = lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == name)
+            .unwrap_or_else(|| panic!("{name} must remain represented in the lockfile"));
+        assert!(
+            package.optional,
+            "{name} must retain optional-only reachability in the lockfile"
+        );
+    }
+    project
+}
+
 pub fn project_bin_path(project: &TempProject, name: &str) -> PathBuf {
     let bin_dir = project.path().join("node_modules").join(".bin");
     #[cfg(windows)]
