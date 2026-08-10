@@ -57,7 +57,7 @@ static PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "oxlint",
         binary_name: "oxlint",
-        latest_version: "1.77.0",
+        latest_version: "1.78.0",
         url_template: "https://github.com/oxc-project/oxc/releases/download/apps_v{version}/{platform}",
         platform_map: &[
             ("darwin-arm64", "oxlint-aarch64-apple-darwin.tar.gz"),
@@ -73,23 +73,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "ef6e6bd5fcf3c20eb9f8120e559408a252c4ffa0baa4af9bff1780c45b8e2bf6",
+                "6045c729ac1d31f2a7f02ec784c5c56199d0ae1065ddf6515b0f0271e320ad73",
             ),
             (
                 "darwin-x64",
-                "c0fe77e58f54d76afd23800ffb798506c369a48d05bb0068ccbd7f9fe3bd392f",
+                "6c7d8a72840d1a2ea5648b6d59ca79d9502a279abddfc2dddca92c5ed2595022",
             ),
             (
                 "linux-x64",
-                "09994ebf16e9cb3537d36847cb07ffc6f096557d3137a95db08fe2d67186c58c",
+                "41aeb2a54673882c3ab383c44405482e54530dadd216d32cddd8645496fb5409",
             ),
             (
                 "linux-arm64",
-                "182acc8df9ae90b5b34188ca2334b81e76352a1bba87b7c728087bd7f7cc395e",
+                "1932e7dfd971e23fabc46c568a13c55b11bce9204a0a9fafcac7e3b0be7c8246",
             ),
             (
                 "win-x64",
-                "75b927530a3689fb6c319e37666eb1755312869d38e7e254865116021e9f25c8",
+                "71630f9bd91923a12ddbd3dbb1877fc8268153acd2aeb9065604f70284fd9971",
             ),
         ],
     },
@@ -179,11 +179,11 @@ mod tests {
         let p = get_plugin("oxlint").unwrap();
         let url = p
             .url_template
-            .replace("{version}", "1.77.0")
+            .replace("{version}", "1.78.0")
             .replace("{platform}", "oxlint-aarch64-apple-darwin.tar.gz");
         assert_eq!(
             url,
-            "https://github.com/oxc-project/oxc/releases/download/apps_v1.77.0/oxlint-aarch64-apple-darwin.tar.gz"
+            "https://github.com/oxc-project/oxc/releases/download/apps_v1.78.0/oxlint-aarch64-apple-darwin.tar.gz"
         );
     }
 

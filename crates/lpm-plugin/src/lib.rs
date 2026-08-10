@@ -6,7 +6,7 @@
 //! ```text
 //! ~/.lpm/plugins/
 //!   oxlint/
-//!     1.77.0/
+//!     1.78.0/
 //!       darwin-arm64/
 //!         oxlint               ← downloaded binary
 //!         .lpm-plugin.json     ← sidecar (verification metadata)

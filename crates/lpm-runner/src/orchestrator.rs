@@ -2105,13 +2105,11 @@ mod tests {
 
     #[test]
     fn restarted_managed_service_republishes_its_verified_endpoint() {
-        let port = crate::ports::find_available_port(49000).unwrap();
         let mut services = HashMap::new();
         services.insert(
             "web".to_string(),
             ServiceConfig {
                 command: "node -e \"require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1')\"".to_string(),
-                port: Some(port),
                 ready_timeout: 3,
                 ..Default::default()
             },
@@ -2266,8 +2264,8 @@ setInterval(() => {{}}, 1000);
 
     #[test]
     fn reassigned_service_fails_readiness_instead_of_using_stale_occupied_port() {
-        let occupied_port = crate::ports::find_available_port(49000).unwrap();
-        let occupied_listener = std::net::TcpListener::bind(("127.0.0.1", occupied_port)).unwrap();
+        let occupied_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let occupied_port = occupied_listener.local_addr().unwrap().port();
 
         let mut services = HashMap::new();
         services.insert(
