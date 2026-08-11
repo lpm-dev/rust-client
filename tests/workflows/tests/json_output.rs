@@ -40,7 +40,13 @@ async fn info_json_accepts_subcommand_version_flag_without_panic() {
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["info", "owner.react", "--version", "1.0.0", "--json"])
+        .args([
+            "info",
+            "@lpm.dev/owner.react",
+            "--version",
+            "1.0.0",
+            "--json",
+        ])
         .output()
         .expect("failed to run lpm info --json");
 

@@ -27,7 +27,7 @@ async fn info_human_output_uses_slim_completion_and_stdout_report() {
     .await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["info", "owner.react", "--version", "1.0.0"])
+        .args(["info", "@lpm.dev/owner.react", "--version", "1.0.0"])
         .output()
         .expect("failed to run lpm info");
 
@@ -65,6 +65,7 @@ async fn info_human_output_uses_slim_completion_and_stdout_report() {
 async fn info_human_output_sanitizes_registry_control_sequences() {
     let project = TempProject::empty(r#"{"name":"info-controls","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     let tarball = make_tarball("ansi-info-pkg", "1.0.0");
     let mut metadata = mock.package_metadata("ansi-info-pkg", "1.0.0", &tarball);
     metadata["name"] = serde_json::json!("ansi-info-pkg\u{1b}[2J");
