@@ -1,6 +1,8 @@
 use crate::install_ui;
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::{PackageMetadata, RegistryClient, RouteTable, UpstreamRoute};
+use lpm_registry::{
+    PackageMetadata, RegistryClient, RouteTable, TimedPackageMetadata, UpstreamRoute,
+};
 use std::path::Path;
 
 pub struct RoutedReadContext {
@@ -125,15 +127,49 @@ pub async fn fetch_routed_package_metadata(
     }
 
     let route = context.route_table.route_for_package(package);
-    match context.client.get_npm_metadata_routed(package, route).await {
-        Ok(metadata) => Ok((RoutedPackageRef::Registry(package.to_string()), metadata)),
-        Err(LpmError::NotFound(_)) if !package.contains('/') => {
-            let lpm_package = PackageName::parse(package)?;
-            let metadata = context.client.get_package_metadata(&lpm_package).await?;
-            Ok((RoutedPackageRef::Lpm(lpm_package), metadata))
-        }
-        Err(error) => Err(error),
+    let metadata = context
+        .client
+        .get_npm_metadata_routed(package, route)
+        .await?;
+    Ok((RoutedPackageRef::Registry(package.to_string()), metadata))
+}
+
+pub async fn revalidate_routed_package_metadata(
+    context: &RoutedReadContext,
+    package: &str,
+) -> Result<(RoutedPackageRef, TimedPackageMetadata), LpmError> {
+    if package.starts_with("@lpm.dev/") {
+        let lpm_package = PackageName::parse(package)?;
+        let metadata = context
+            .client
+            .revalidate_package_metadata_with_timings(&lpm_package)
+            .await?;
+        return Ok((RoutedPackageRef::Lpm(lpm_package), metadata));
     }
+
+    let route = context.route_table.route_for_package(package);
+    let result = match route {
+        UpstreamRoute::NpmDirect => {
+            context
+                .client
+                .revalidate_npm_metadata_direct_with_timings(package)
+                .await
+        }
+        UpstreamRoute::Custom { target, auth } => {
+            context
+                .client
+                .revalidate_npm_metadata_from_with_timings(&target.base_url, package, auth.as_ref())
+                .await
+        }
+        UpstreamRoute::LpmWorker => {
+            context
+                .client
+                .revalidate_npm_metadata_direct_with_timings(package)
+                .await
+        }
+    };
+    let metadata = result?;
+    Ok((RoutedPackageRef::Registry(package.to_string()), metadata))
 }
 
 pub fn search_route_for_query(route_table: &RouteTable, query: &str) -> UpstreamRoute {

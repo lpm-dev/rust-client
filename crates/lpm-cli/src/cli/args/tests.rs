@@ -4,6 +4,24 @@ use clap::Parser;
 use std::num::NonZeroUsize;
 
 use crate::commands;
+
+fn subcommand_long_help(name: &str) -> String {
+    use clap::CommandFactory;
+
+    let mut command = Cli::command();
+    let mut buffer = Vec::new();
+    command
+        .find_subcommand_mut(name)
+        .expect("subcommand registered")
+        .write_long_help(&mut buffer)
+        .expect("write subcommand help");
+    String::from_utf8(buffer)
+        .expect("subcommand help must be UTF-8")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // Version flag parser contract.
 //
 // Pins the user-visible contract:
@@ -326,6 +344,16 @@ fn info_subcommand_long_version_parses_as_package_version() {
 }
 
 #[test]
+fn info_help_requires_the_full_lpm_package_name() {
+    let help = subcommand_long_help("info");
+
+    assert!(
+        help.contains("Use the full @lpm.dev/owner.package name for LPM packages. Bare and other scoped names use npm or .npmrc routing"),
+        "info help must distinguish LPM names from npm and .npmrc routing: {help}",
+    );
+}
+
+#[test]
 fn download_subcommand_long_version_parses_as_package_version() {
     let cli = Cli::try_parse_from(["lpm", "download", "react", "--version", "1.0.0"]).unwrap();
     match cli.command {
@@ -345,6 +373,16 @@ fn download_subcommand_long_version_parses_as_package_version() {
         }
         _ => panic!("expected download command"),
     }
+}
+
+#[test]
+fn download_help_requires_the_full_lpm_package_name() {
+    let help = subcommand_long_help("download");
+
+    assert!(
+        help.contains("Use the full @lpm.dev/owner.package name for LPM packages. Bare and other scoped names use npm or .npmrc routing"),
+        "download help must distinguish LPM names from npm and .npmrc routing: {help}",
+    );
 }
 
 /// `--allow-unverified` is opt-in and must be plumbed through the
@@ -415,6 +453,38 @@ fn publish_provenance_modes_are_mutually_exclusive() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn publish_wait_flag_parses_with_bounded_timeout() {
+    let cli = Cli::try_parse_from(["lpm", "publish", "--wait", "--wait-timeout", "900"]).unwrap();
+
+    match cli.command {
+        Some(Commands::Publish(registry::PublishArgs {
+            wait, wait_timeout, ..
+        })) => {
+            assert!(wait);
+            assert_eq!(wait_timeout, Some(900));
+        }
+        _ => panic!("expected publish command"),
+    }
+}
+
+#[test]
+fn publish_wait_timeout_requires_wait_flag() {
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait-timeout", "60"]).is_err());
+}
+
+#[test]
+fn publish_wait_rejects_non_upload_modes() {
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--check"]).is_err());
+}
+
+#[test]
+fn publish_wait_timeout_enforces_supported_range() {
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--wait-timeout", "9"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--wait-timeout", "3601"]).is_err());
 }
 
 #[test]

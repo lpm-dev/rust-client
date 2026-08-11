@@ -59,7 +59,7 @@ async fn download_json_accepts_version_flag_and_canonicalizes_output_dir() {
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "download",
-            "owner.react",
+            "@lpm.dev/owner.react",
             "--version",
             "1.0.0",
             "--json",
@@ -484,7 +484,7 @@ async fn download_human_output_uses_slim_progress_and_completion() {
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "download",
-            "owner.react",
+            "@lpm.dev/owner.react",
             "--version",
             "1.0.0",
             "--output",
@@ -507,7 +507,7 @@ async fn download_human_output_uses_slim_progress_and_completion() {
         "human download must keep the extracted file list on stderr, got stdout:\n{stdout}"
     );
     assert!(
-        stderr.contains("› Resolving owner.react"),
+        stderr.contains("› Resolving @lpm.dev/owner.react"),
         "download must use a slim resolve phase, got:\n{stderr}"
     );
     assert!(

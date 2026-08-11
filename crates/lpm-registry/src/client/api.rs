@@ -257,6 +257,30 @@ impl RegistryClient {
         Ok(response)
     }
 
+    /// Read the current publication lifecycle state for an uploaded LPM version.
+    pub async fn get_publication_status(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<PublicationStatusResponse, LpmError> {
+        let url = format!(
+            "{}/api/registry/-/package/publication-status?name={}&version={}",
+            self.base_url,
+            urlencoding::encode(name),
+            urlencoding::encode(version)
+        );
+        let response: PublicationStatusResponse = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+            .await?;
+        if response.name != name || response.version != version {
+            return Err(LpmError::Registry(format!(
+                "publication status returned a mismatched package identity (expected {name}@{version}, received {}@{})",
+                response.name, response.version
+            )));
+        }
+        Ok(response)
+    }
+
     /// Revoke every browser pairing authorized by the current stored session.
     ///
     /// Posture: `SessionRequired`. The bearer is re-resolved inside the

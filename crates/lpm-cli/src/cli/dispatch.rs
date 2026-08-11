@@ -515,8 +515,15 @@ async fn async_main() -> Result<()> {
                 package_version,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::info::run(&client, &cwd, &package, package_version.as_deref(), cli.json)
-                .await
+            commands::info::run(
+                &client,
+                &cwd,
+                &package,
+                package_version.as_deref(),
+                cli.json,
+                cli.verbose,
+            )
+            .await
         }
         Commands::Search(args) => {
             let registry_args::SearchArgs {
@@ -1330,6 +1337,8 @@ async fn async_main() -> Result<()> {
             let registry_args::PublishArgs {
                 dry_run,
                 check,
+                wait,
+                wait_timeout,
                 yes,
                 provenance,
                 min_score,
@@ -1357,6 +1366,8 @@ async fn async_main() -> Result<()> {
                 &cwd,
                 dry_run,
                 check,
+                wait,
+                wait_timeout,
                 yes,
                 cli.json,
                 min_score,

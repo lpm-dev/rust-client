@@ -200,6 +200,52 @@ async fn info_json_routes_bare_package_through_project_npmrc_registry() {
 }
 
 #[tokio::test]
+async fn info_does_not_fallback_from_missing_npm_package_to_lpm() {
+    let project = TempProject::empty(r#"{"name":"read-only-routing","version":"1.0.0"}"#);
+    let lpm_registry = MockRegistry::start().await;
+    let npm_registry = MockRegistry::start().await;
+    write_project_npmrc(&project, &npm_registry.url());
+
+    let output = lpm_with_registry(&project, &lpm_registry.url())
+        .env_remove("LPM_NPM_ROUTE")
+        .env_remove("LPM_TOKEN")
+        .args(["info", "never.found", "--json"])
+        .output()
+        .expect("run lpm info for a missing npm package");
+
+    assert!(
+        !output.status.success(),
+        "a missing npm package must fail; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        npm_registry
+            .server()
+            .received_requests()
+            .await
+            .expect("npm registry request log")
+            .len(),
+        1,
+        "the configured npm registry must receive the metadata request",
+    );
+    let lpm_request_paths = lpm_registry
+        .server()
+        .received_requests()
+        .await
+        .expect("LPM registry request log")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        !lpm_request_paths
+            .iter()
+            .any(|path| path == "/api/registry/@lpm.dev/never.found"),
+        "an npm 404 must not trigger an LPM metadata fallback; requests: {lpm_request_paths:?}",
+    );
+}
+
+#[tokio::test]
 async fn download_json_routes_bare_package_through_project_npmrc_registry() {
     let project = TempProject::empty(r#"{"name":"read-only-routing","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

@@ -1,5 +1,6 @@
 use crate::commands::publish_common::{NpmProvenanceAttachment, TarballFile};
 use crate::oidc;
+use lpm_common::LpmError;
 use lpm_runner::lpm_json;
 use std::path::Path;
 
@@ -52,6 +53,11 @@ impl PublishTarget {
 pub enum LpmPublicationStatus {
     Active,
     PendingReview,
+    Processing,
+    ManualReview,
+    Rejected,
+    Quarantined,
+    Unpublished,
     Other(String),
 }
 
@@ -67,6 +73,11 @@ impl LpmPublicationStatus {
         match value {
             "active" => Self::Active,
             "pending_review" => Self::PendingReview,
+            "processing" => Self::Processing,
+            "manual_review" => Self::ManualReview,
+            "rejected" => Self::Rejected,
+            "quarantined" => Self::Quarantined,
+            "unpublished" => Self::Unpublished,
             other => Self::Other(other.to_string()),
         }
     }
@@ -75,8 +86,86 @@ impl LpmPublicationStatus {
         match self {
             Self::Active => "active",
             Self::PendingReview => "pending_review",
+            Self::Processing => "processing",
+            Self::ManualReview => "manual_review",
+            Self::Rejected => "rejected",
+            Self::Quarantined => "quarantined",
+            Self::Unpublished => "unpublished",
             Self::Other(value) => value,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationWaitResult {
+    pub success: bool,
+    pub status: Option<LpmPublicationStatus>,
+    pub current_latest_version: Option<String>,
+    pub error: Option<String>,
+}
+
+impl PublicationWaitResult {
+    pub(super) fn active() -> Self {
+        Self {
+            success: true,
+            status: Some(LpmPublicationStatus::Active),
+            current_latest_version: None,
+            error: None,
+        }
+    }
+
+    pub(super) fn terminal(status: LpmPublicationStatus) -> Self {
+        let message = match status {
+            LpmPublicationStatus::ManualReview => "publication requires manual review",
+            LpmPublicationStatus::Rejected => "publication review rejected the version",
+            LpmPublicationStatus::Quarantined => "the uploaded version was quarantined",
+            LpmPublicationStatus::Unpublished => "the uploaded version was unpublished",
+            LpmPublicationStatus::Other(_) => {
+                "the Registry returned an unrecognized publication state"
+            }
+            LpmPublicationStatus::Active
+            | LpmPublicationStatus::PendingReview
+            | LpmPublicationStatus::Processing => "publication did not become active",
+        };
+        Self {
+            success: false,
+            status: Some(status),
+            current_latest_version: None,
+            error: Some(format!(
+                "Upload succeeded, but {message}. Do not publish this version again."
+            )),
+        }
+    }
+
+    pub(super) fn timed_out(status: Option<LpmPublicationStatus>) -> Self {
+        Self {
+            success: false,
+            status,
+            current_latest_version: None,
+            error: Some(
+                "Upload succeeded, but waiting for LPM.dev Registry publication timed out. Do not publish this version again."
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub(super) fn request_failed(error: &LpmError) -> Self {
+        Self {
+            success: false,
+            status: None,
+            current_latest_version: None,
+            error: Some(format!(
+                "Upload succeeded, but LPM.dev Registry publication could not be checked: {error}. Do not publish this version again."
+            )),
+        }
+    }
+
+    pub(super) fn with_current_latest_version(
+        mut self,
+        current_latest_version: Option<String>,
+    ) -> Self {
+        self.current_latest_version = current_latest_version;
+        self
     }
 }
 
@@ -88,6 +177,8 @@ pub struct PublishResult {
     pub error: Option<String>,
     pub auth: Option<&'static str>,
     pub publication_status: Option<LpmPublicationStatus>,
+    pub current_latest_version: Option<String>,
+    pub publication_wait: Option<PublicationWaitResult>,
     pub duration: std::time::Duration,
 }
 

@@ -11,6 +11,7 @@ mod target;
 mod types;
 mod upload_lpm;
 mod version_data;
+mod wait;
 
 pub(crate) use npm_artifact::prepare_npm_target_artifact;
 pub use orchestrator::run;

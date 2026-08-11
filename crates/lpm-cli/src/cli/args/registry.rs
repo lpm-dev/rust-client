@@ -3,7 +3,8 @@ use clap::{Args, Subcommand};
 
 #[derive(Args)]
 pub(crate) struct InfoArgs {
-    /// Package name (e.g., @lpm.dev/owner.package or owner.package)
+    /// Package name. Use the full @lpm.dev/owner.package name for LPM packages.
+    /// Bare and other scoped names use npm or .npmrc routing, for example react.
     pub(crate) package: String,
 
     /// Show a specific version instead of latest.
@@ -29,7 +30,8 @@ pub(crate) struct QualityArgs {
 
 #[derive(Args)]
 pub(crate) struct DownloadArgs {
-    /// Package name (e.g., @lpm.dev/owner.package or owner.package)
+    /// Package name. Use the full @lpm.dev/owner.package name for LPM packages.
+    /// Bare and other scoped names use npm or .npmrc routing, for example react.
     pub(crate) package: String,
 
     /// Version to download (default: latest).
@@ -61,6 +63,19 @@ pub(crate) struct PublishArgs {
     /// Prepare and validate locally without publishing: pack files, validate skills and provenance files, run quality checks, and scan for secrets.
     #[arg(long)]
     pub(crate) check: bool,
+
+    /// Wait for an LPM upload to become publicly available.
+    #[arg(long, conflicts_with_all = ["dry_run", "check"])]
+    pub(crate) wait: bool,
+
+    /// Maximum time to wait for LPM publication review, in seconds.
+    #[arg(
+        long = "wait-timeout",
+        value_name = "SECONDS",
+        requires = "wait",
+        value_parser = clap::value_parser!(u64).range(10..=3600)
+    )]
+    pub(crate) wait_timeout: Option<u64>,
 
     /// Skip confirmation prompt.
     #[arg(long, short = 'y')]

@@ -32,6 +32,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const PACKAGE_NAME: &str = "@lpm.dev/owner.publish-oidc-contract";
 const SUPPLIED_JWT: &str = "publish-jwt-with-aud-lpm-dev";
 const EXCHANGED_TOKEN: &str = "EXCHANGED-PUBLISH-SESSION-TOKEN";
+const PUBLICATION_STATUS_TOKEN: &str = "EXCHANGED-PUBLICATION-STATUS-TOKEN";
 
 fn write_minimal_project(cwd: &std::path::Path) {
     fs::create_dir_all(cwd.join(".home")).unwrap();
@@ -165,6 +166,10 @@ async fn publish_dry_run_lpm_target_exchange_includes_package_field() {
     assert_eq!(
         body["package"], PACKAGE_NAME,
         "publish auto-exchange must include `package` — origin requires it for scope=publish"
+    );
+    assert!(
+        body.get("publicationWaitTimeoutSeconds").is_none(),
+        "a publish without --wait must not request a status-only credential"
     );
 }
 
@@ -500,6 +505,78 @@ async fn first_publish_with_authored_skills_continues_after_missing_published_sk
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["success"], true);
     assert_eq!(json["results"][0]["success"], true);
+}
+
+#[tokio::test]
+async fn publish_wait_uses_the_status_only_oidc_credential() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .and(query_param("scope", "publish"))
+        .and(body_partial_json(serde_json::json!({
+            "publicationWaitTimeoutSeconds": 10
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": EXCHANGED_TOKEN,
+            "publicationStatusToken": PUBLICATION_STATUS_TOKEN,
+            "publicationStatusExpiresAt": "2099-08-11T12:00:00.000Z"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "owner",
+            "mfa_enabled": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "pending_review",
+            "currentLatestVersion": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .and(header(
+            "authorization",
+            format!("Bearer {PUBLICATION_STATUS_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE_NAME,
+            "version": "0.1.0",
+            "status": "active",
+            "reviewStatus": "approved",
+            "currentLatestVersion": "0.1.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+
+    let output = spawn_publish(
+        tmp.path(),
+        &server.uri(),
+        &["--yes", "--wait", "--wait-timeout", "10"],
+    );
+
+    assert!(
+        output.status.success(),
+        "OIDC publication wait must use the status credential\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[tokio::test]

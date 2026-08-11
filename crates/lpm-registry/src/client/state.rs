@@ -20,6 +20,7 @@ pub struct DownloadedTarball {
 pub struct PackageMetadataFetchTimings {
     pub cache_hit: bool,
     pub not_modified: bool,
+    pub cache_age_seconds: Option<u64>,
     pub cache_read_ms: u128,
     pub validator_read_ms: u128,
     pub http_ms: u128,
@@ -52,6 +53,7 @@ pub(super) struct CacheContent {
 /// Magic-verified cache validator used for conditional metadata requests.
 pub(super) struct CacheValidator {
     pub(super) etag: Option<String>,
+    pub(super) age_seconds: Option<u64>,
 }
 
 /// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].
