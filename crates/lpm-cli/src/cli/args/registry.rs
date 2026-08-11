@@ -3,7 +3,8 @@ use clap::{Args, Subcommand};
 
 #[derive(Args)]
 pub(crate) struct InfoArgs {
-    /// Package name (e.g., @lpm.dev/owner.package or owner.package)
+    /// Package name. Use the full @lpm.dev/owner.package name for LPM packages.
+    /// Bare and other scoped names use npm or .npmrc routing, for example react.
     pub(crate) package: String,
 
     /// Show a specific version instead of latest.
@@ -29,7 +30,8 @@ pub(crate) struct QualityArgs {
 
 #[derive(Args)]
 pub(crate) struct DownloadArgs {
-    /// Package name (e.g., @lpm.dev/owner.package or owner.package)
+    /// Package name. Use the full @lpm.dev/owner.package name for LPM packages.
+    /// Bare and other scoped names use npm or .npmrc routing, for example react.
     pub(crate) package: String,
 
     /// Version to download (default: latest).
