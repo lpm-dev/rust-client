@@ -123,6 +123,8 @@ pub(crate) async fn publish(
             &member.path,
             false,
             false,
+            false,
+            None,
             options.yes || json_output,
             json_output,
             options.min_score,

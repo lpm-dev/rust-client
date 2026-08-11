@@ -418,6 +418,38 @@ fn publish_provenance_modes_are_mutually_exclusive() {
 }
 
 #[test]
+fn publish_wait_flag_parses_with_bounded_timeout() {
+    let cli = Cli::try_parse_from(["lpm", "publish", "--wait", "--wait-timeout", "900"]).unwrap();
+
+    match cli.command {
+        Some(Commands::Publish(registry::PublishArgs {
+            wait, wait_timeout, ..
+        })) => {
+            assert!(wait);
+            assert_eq!(wait_timeout, Some(900));
+        }
+        _ => panic!("expected publish command"),
+    }
+}
+
+#[test]
+fn publish_wait_timeout_requires_wait_flag() {
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait-timeout", "60"]).is_err());
+}
+
+#[test]
+fn publish_wait_rejects_non_upload_modes() {
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--check"]).is_err());
+}
+
+#[test]
+fn publish_wait_timeout_enforces_supported_range() {
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--wait-timeout", "9"]).is_err());
+    assert!(Cli::try_parse_from(["lpm", "publish", "--wait", "--wait-timeout", "3601"]).is_err());
+}
+
+#[test]
 fn stage_publish_provenance_file_flag_parses() {
     let cli = Cli::try_parse_from([
         "lpm",

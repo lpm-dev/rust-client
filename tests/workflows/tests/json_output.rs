@@ -61,6 +61,14 @@ async fn info_json_accepts_subcommand_version_flag_without_panic() {
         json["versions"].get("1.0.0").is_some(),
         "info --json must include the requested version metadata"
     );
+    insta::assert_json_snapshot!(json["_cache"], @r###"
+    {
+      "status": "fetched",
+      "age_seconds": null,
+      "network_request": true,
+      "not_modified": false
+    }
+    "###);
 }
 
 // ─── lpm health --json ───────────────────────────────────────────

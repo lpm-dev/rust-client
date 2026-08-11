@@ -950,6 +950,18 @@ pub struct PublishPreflightResponse {
     pub package_exists: bool,
 }
 
+/// GET /api/registry/-/package/publication-status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationStatusResponse {
+    pub name: String,
+    pub version: String,
+    pub status: String,
+    #[serde(default, rename = "reviewStatus")]
+    pub review_status: Option<String>,
+    #[serde(default, rename = "currentLatestVersion")]
+    pub current_latest_version: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoamiUsage {
     #[serde(default, rename = "storage_bytes")]

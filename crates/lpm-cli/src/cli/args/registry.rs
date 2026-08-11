@@ -62,6 +62,19 @@ pub(crate) struct PublishArgs {
     #[arg(long)]
     pub(crate) check: bool,
 
+    /// Wait for an LPM upload to become publicly available.
+    #[arg(long, conflicts_with_all = ["dry_run", "check"])]
+    pub(crate) wait: bool,
+
+    /// Maximum time to wait for LPM publication review, in seconds.
+    #[arg(
+        long = "wait-timeout",
+        value_name = "SECONDS",
+        requires = "wait",
+        value_parser = clap::value_parser!(u64).range(10..=3600)
+    )]
+    pub(crate) wait_timeout: Option<u64>,
+
     /// Skip confirmation prompt.
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,

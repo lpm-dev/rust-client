@@ -417,7 +417,8 @@ impl RegistryClient {
             return None;
         }
 
-        let file_size = path.metadata().ok()?.len();
+        let file_metadata = path.metadata().ok()?;
+        let file_size = file_metadata.len();
         if file_size > METADATA_CACHE_FILE_CAP {
             tracing::warn!(
                 path = %path.display(),
@@ -457,7 +458,13 @@ impl RegistryClient {
             .filter(|s| !s.is_empty())
             .map(str::to_string);
 
-        Some(CacheValidator { etag })
+        let age_seconds = file_metadata
+            .modified()
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .map(|age| age.as_secs());
+
+        Some(CacheValidator { etag, age_seconds })
     }
 
     /// Write metadata to cache with a magic-header marker and optional ETag.

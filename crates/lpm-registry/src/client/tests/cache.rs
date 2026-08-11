@@ -313,6 +313,45 @@ async fn explicit_lpm_refetch_bypasses_a_fresh_packument_cache() {
 }
 
 #[tokio::test]
+async fn explicit_lpm_revalidation_uses_a_fresh_packument_validator() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let pkg_name = "@lpm.dev/test.explicit-revalidation";
+    let name = PackageName::parse(pkg_name).unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.explicit-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(pkg_name))
+                .append_header("ETag", "\"fresh-validator\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    client.get_package_metadata(&name).await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.explicit-revalidation"))
+        .and(header("If-None-Match", "\"fresh-validator\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .revalidate_package_metadata_with_timings(&name)
+        .await
+        .unwrap();
+
+    assert!(result.timings.not_modified);
+}
+
+#[tokio::test]
 async fn etag_updated_on_new_response() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -533,6 +572,48 @@ async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
             .is_some(),
         "304 should refresh cache freshness for the next TTL read"
     );
+}
+
+#[tokio::test]
+async fn explicit_direct_npm_revalidation_uses_a_fresh_packument_validator() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let npm_name = "explicit-revalidation";
+
+    Mock::given(method("GET"))
+        .and(path("/explicit-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("ETag", "\"fresh-direct-validator\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/explicit-revalidation"))
+        .and(header("If-None-Match", "\"fresh-direct-validator\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .revalidate_npm_metadata_direct_with_timings(npm_name)
+        .await
+        .unwrap();
+
+    assert!(result.timings.not_modified);
 }
 
 #[tokio::test]
@@ -1139,6 +1220,47 @@ async fn custom_metadata_etag_304_revalidation_keeps_auth_partition() {
         .await
         .unwrap();
     assert_eq!(cached.name, "private-pkg");
+}
+
+#[tokio::test]
+async fn explicit_custom_revalidation_uses_a_fresh_packument_validator() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let npm_name = "custom-explicit-revalidation";
+
+    Mock::given(method("GET"))
+        .and(path("/custom-explicit-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("ETag", "\"fresh-custom-validator\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    client
+        .get_npm_metadata_from(&server.uri(), npm_name, None)
+        .await
+        .unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/custom-explicit-revalidation"))
+        .and(header("If-None-Match", "\"fresh-custom-validator\""))
+        .respond_with(ResponseTemplate::new(304))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .revalidate_npm_metadata_from_with_timings(&server.uri(), npm_name, None)
+        .await
+        .unwrap();
+
+    assert!(result.timings.not_modified);
 }
 
 #[tokio::test]

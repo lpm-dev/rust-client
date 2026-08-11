@@ -12,8 +12,9 @@ use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_j
 use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets};
-use super::types::{LpmPublicationStatus, PublishResult, PublishTarget};
+use super::types::{LpmPublicationStatus, PublicationWaitResult, PublishResult, PublishTarget};
 use super::version_data::integrity_to_sha512_hex;
+use super::wait::poll_publication_status;
 use crate::commands::publish_common;
 use crate::commands::skills::author;
 use lpm_runner::lpm_json;
@@ -535,12 +536,15 @@ fn pending_review_is_exposed_in_lpm_publish_result_json() {
         error: None,
         auth: None,
         publication_status,
+        current_latest_version: Some("1.1.0".to_string()),
+        publication_wait: None,
         duration: std::time::Duration::ZERO,
     };
 
     let json = publish_result_json(&result);
 
     assert_eq!(json["publication_status"], "pending_review");
+    assert_eq!(json["current_latest_version"], "1.1.0");
     assert_eq!(json["success"], true);
 }
 
@@ -554,6 +558,8 @@ fn missing_publication_status_remains_absent_from_lpm_publish_result_json() {
         error: None,
         auth: None,
         publication_status,
+        current_latest_version: None,
+        publication_wait: None,
         duration: std::time::Duration::ZERO,
     };
 
@@ -570,6 +576,8 @@ fn unrelated_publish_result_does_not_gain_lpm_publication_status() {
         error: None,
         auth: Some("token"),
         publication_status: None,
+        current_latest_version: None,
+        publication_wait: None,
         duration: std::time::Duration::ZERO,
     };
 
@@ -646,6 +654,8 @@ fn unknown_publication_status_stays_successful_without_rendering_registry_text()
         error: None,
         auth: None,
         publication_status: Some(status),
+        current_latest_version: None,
+        publication_wait: None,
         duration: std::time::Duration::ZERO,
     };
 
@@ -663,6 +673,103 @@ fn unknown_publication_status_stays_successful_without_rendering_registry_text()
     assert_eq!(json["publication_status"], "future\u{1b}[31mstatus");
     assert!(!notice.contains("future"));
     assert!(!notice.contains('\u{1b}'));
+}
+
+#[tokio::test]
+async fn publication_wait_completes_after_pending_processing_and_active_states() {
+    let statuses = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+        Ok(LpmPublicationStatus::PendingReview),
+        Ok(LpmPublicationStatus::Processing),
+        Ok(LpmPublicationStatus::Active),
+    ])));
+    let fetch_status = || {
+        let statuses = std::sync::Arc::clone(&statuses);
+        async move {
+            statuses
+                .lock()
+                .expect("status queue lock")
+                .pop_front()
+                .expect("one status per poll")
+        }
+    };
+
+    let result = poll_publication_status(fetch_status, 3, std::time::Duration::ZERO).await;
+
+    assert_eq!(result, PublicationWaitResult::active());
+}
+
+#[tokio::test]
+async fn publication_wait_stops_immediately_for_manual_review() {
+    let result = poll_publication_status(
+        || async { Ok(LpmPublicationStatus::ManualReview) },
+        3,
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    assert_eq!(result.status, Some(LpmPublicationStatus::ManualReview),);
+    assert!(!result.success);
+}
+
+#[tokio::test]
+async fn publication_wait_stops_immediately_for_rejected_or_quarantined_versions() {
+    for status in [
+        LpmPublicationStatus::Rejected,
+        LpmPublicationStatus::Quarantined,
+    ] {
+        let result = poll_publication_status(
+            || {
+                let status = status.clone();
+                async move { Ok(status) }
+            },
+            3,
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+        assert!(!result.success, "{status:?} must be terminal");
+        assert_eq!(result.status, Some(status));
+    }
+}
+
+#[tokio::test]
+async fn publication_wait_times_out_with_the_last_observed_state() {
+    let result = poll_publication_status(
+        || async { Ok(LpmPublicationStatus::PendingReview) },
+        2,
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    assert_eq!(result.status, Some(LpmPublicationStatus::PendingReview),);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("timed out")),
+    );
+}
+
+#[test]
+fn publication_wait_failure_preserves_successful_upload_in_json() {
+    let result = PublishResult {
+        target: "lpm".into(),
+        success: true,
+        error: None,
+        auth: None,
+        publication_status: Some(LpmPublicationStatus::PendingReview),
+        current_latest_version: Some("1.1.0".to_string()),
+        publication_wait: Some(PublicationWaitResult::timed_out(Some(
+            LpmPublicationStatus::PendingReview,
+        ))),
+        duration: std::time::Duration::ZERO,
+    };
+
+    let json = publish_result_json(&result);
+
+    assert_eq!(json["success"], true);
+    assert_eq!(json["publication_wait"]["success"], false);
+    assert_eq!(json["publication_wait"]["status"], "pending_review");
 }
 
 #[test]

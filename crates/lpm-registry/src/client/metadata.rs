@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MetadataCachePolicy {
+    UseFresh,
+    Revalidate,
+    Reload,
+}
+
 /// Coalesce concurrent packument fetches for one cache key.
 ///
 /// Concurrent installs in one process (recursive workspace targets)
@@ -859,7 +866,9 @@ impl RegistryClient {
         &self,
         name: &PackageName,
     ) -> Result<PackageMetadata, LpmError> {
-        self.get_package_metadata_inner(name, true).await
+        self.get_package_metadata_inner(name, MetadataCachePolicy::UseFresh)
+            .await
+            .map(|result| result.metadata)
     }
 
     /// Fetch full metadata for an LPM package without reading or validating
@@ -868,31 +877,56 @@ impl RegistryClient {
         &self,
         name: &PackageName,
     ) -> Result<PackageMetadata, LpmError> {
-        self.get_package_metadata_inner(name, false).await
+        self.get_package_metadata_inner(name, MetadataCachePolicy::Reload)
+            .await
+            .map(|result| result.metadata)
+    }
+
+    /// Revalidate LPM package metadata even when the cached packument is
+    /// within its normal install TTL. Reuses the cached body on HTTP 304.
+    pub async fn revalidate_package_metadata_with_timings(
+        &self,
+        name: &PackageName,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_package_metadata_inner(name, MetadataCachePolicy::Revalidate)
+            .await
     }
 
     async fn get_package_metadata_inner(
         &self,
         name: &PackageName,
-        use_cache: bool,
-    ) -> Result<PackageMetadata, LpmError> {
+        cache_policy: MetadataCachePolicy,
+    ) -> Result<TimedPackageMetadata, LpmError> {
         let scoped = name.scoped();
         crate::timing::record_metadata_request(&scoped);
         let cache_key = format!("lpm:{scoped}");
+        let mut timings = PackageMetadataFetchTimings::default();
 
-        if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        let cache_read_start = std::time::Instant::now();
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
         {
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: {scoped}");
-            return Ok(cached);
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
         }
+        timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
 
-        let _flight = if use_cache {
+        let _flight = if cache_policy == MetadataCachePolicy::UseFresh {
             let flight = metadata_fetch_flight_guard(&cache_key).await;
             if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+                timings.cache_hit = true;
                 tracing::debug!("metadata cache hit (coalesced): {scoped}");
-                return Ok(cached);
+                return Ok(TimedPackageMetadata {
+                    metadata: cached,
+                    timings,
+                });
             }
             Some(flight)
         } else {
@@ -911,39 +945,77 @@ impl RegistryClient {
         // gated; on 401 the recovery wrapper performs one silent
         // refresh + retry. The closure re-reads ETag + bearer each
         // attempt so the rotated token is used on retry.
+        let cache_key_ref = cache_key.as_str();
+        let url_ref = url.as_str();
+        let initial_timings = timings;
         let result = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || async {
-                let cache_validator = use_cache
-                    .then(|| self.read_cache_validator(&cache_key))
-                    .flatten();
-                let mut req = self.build_worker_metadata_get(&url).await?;
-                if let Some(etag) = cache_validator.as_ref().and_then(|c| c.etag.as_deref()) {
-                    req = req.header("If-None-Match", etag);
-                }
-
-                let mut response = self.send_package_metadata_request(req).await?;
-
-                if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                    if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
-                        tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
-                        return Ok(meta);
+            .execute_with_recovery(AuthPosture::AuthRequired, || {
+                let mut timings = initial_timings;
+                async move {
+                    let validator_start = std::time::Instant::now();
+                    let cache_validator = (cache_policy != MetadataCachePolicy::Reload)
+                        .then(|| self.read_cache_validator(cache_key_ref))
+                        .flatten();
+                    timings.validator_read_ms = validator_start.elapsed().as_millis();
+                    timings.cache_age_seconds = cache_validator
+                        .as_ref()
+                        .and_then(|validator| validator.age_seconds);
+                    let mut req = self.build_worker_metadata_get(url_ref).await?;
+                    if let Some(etag) = cache_validator.as_ref().and_then(|c| c.etag.as_deref()) {
+                        req = req.header("If-None-Match", etag);
                     }
-                    response = self
-                        .send_package_metadata_request(self.build_worker_metadata_get(&url).await?)
+
+                    let http_start = std::time::Instant::now();
+                    let mut response = self.send_package_metadata_request(req).await?;
+                    timings.http_ms = http_start.elapsed().as_millis();
+
+                    if cache_policy != MetadataCachePolicy::Reload
+                        && response.status() == reqwest::StatusCode::NOT_MODIFIED
+                    {
+                        timings.not_modified = true;
+                        let cache_304_start = std::time::Instant::now();
+                        if let Some(meta) = self.cached_metadata_after_304(cache_key_ref).await {
+                            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                            tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
+                            return Ok(TimedPackageMetadata {
+                                metadata: meta,
+                                timings,
+                            });
+                        }
+                        timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                        timings.not_modified = false;
+                        let retry_http_start = std::time::Instant::now();
+                        response = self
+                            .send_package_metadata_request(
+                                self.build_worker_metadata_get(url_ref).await?,
+                            )
+                            .await?;
+                        timings.http_ms = timings
+                            .http_ms
+                            .saturating_add(retry_http_start.elapsed().as_millis());
+                    }
+
+                    let etag = response
+                        .headers()
+                        .get("etag")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+
+                    let (metadata, body_timings) =
+                        parse_capped_metadata_with_timing::<PackageMetadata>(
+                            response,
+                            &format!("get_package_metadata {url_ref}"),
+                        )
                         .await?;
+                    timings.body_read_ms = body_timings.body_read_ms;
+                    timings.json_decode_ms = body_timings.json_parse_ms;
+                    timings.body_bytes = body_timings.body_bytes;
+
+                    let cache_write_start = std::time::Instant::now();
+                    self.write_metadata_cache(cache_key_ref, &metadata, etag.as_deref());
+                    timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+                    Ok(TimedPackageMetadata { metadata, timings })
                 }
-
-                let etag = response
-                    .headers()
-                    .get("etag")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
-
-                let metadata: PackageMetadata =
-                    parse_capped_metadata(response, &format!("get_package_metadata {url}")).await?;
-
-                self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-                Ok(metadata)
             })
             .await;
 
@@ -1108,100 +1180,32 @@ impl RegistryClient {
     /// to it on a miss. The TTL cache is preserved so warm installs and
     /// previously-seen packages stay cache-fast.
     pub async fn get_npm_metadata_direct(&self, name: &str) -> Result<PackageMetadata, LpmError> {
-        crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
-        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
-
-        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
-            crate::timing::record_metadata_cache_hit();
-            return Ok(cached);
-        }
-
-        // Tier 1: TTL+HMAC cache hit (same as `get_npm_package_metadata`).
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
-            crate::timing::record_metadata_cache_hit();
-            tracing::debug!("metadata cache hit (direct): npm:{name}");
-            self.remember_metadata_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
-        }
-        crate::timing::record_metadata_cache_miss();
-
-        let _flight = metadata_fetch_flight_guard(&cache_key).await;
-        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
-            tracing::debug!("metadata memory cache hit (direct, coalesced): npm:{name}");
-            return Ok(cached);
-        }
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
-            tracing::debug!("metadata cache hit (direct, coalesced): npm:{name}");
-            self.remember_metadata_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
-        }
-
-        let rpc_start = std::time::Instant::now();
-        macro_rules! finish {
-            ($expr:expr) => {{
-                let r = $expr;
-                crate::timing::record_rpc(rpc_start.elapsed());
-                r
-            }};
-        }
-
-        let cache_validator = self.read_cache_validator(&cache_key);
-
-        // Go straight to the public npm registry. Abbreviated packument
-        // format reduces payload by 50-90%, matching what the proxy-fallback
-        // tier in `get_npm_package_metadata` uses.
-        let npm_url = format!("{}/{}", self.npm_registry_url, name);
-        tracing::debug!("fetching {name} direct from npm registry");
-        let req = self
-            .http
-            .for_url(&npm_url)
-            .await?
-            .get(&npm_url)
-            .header("Accept", "application/vnd.npm.install-v1+json");
-        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_package_metadata_request(req).await {
-            Ok(r) => r,
-            Err(e) => return finish!(Err(e)),
-        };
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
-                tracing::debug!("metadata cache revalidated (direct 304): npm:{name}");
-                self.remember_metadata_for_command(&memory_cache_key, &metadata);
-                return finish!(Ok(metadata));
-            }
-            response = match self
-                .send_package_metadata_request(
-                    self.http
-                        .for_url(&npm_url)
-                        .await?
-                        .get(&npm_url)
-                        .header("Accept", "application/vnd.npm.install-v1+json"),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return finish!(Err(e)),
-            };
-        }
-        let etag = Self::response_etag(&response);
-        let metadata = match parse_capped_metadata::<PackageMetadata>(
-            response,
-            &format!("get_npm_metadata_direct {name}"),
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => return finish!(Err(e)),
-        };
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-        self.remember_metadata_for_command(&memory_cache_key, &metadata);
-        finish!(Ok(metadata))
+        self.get_npm_metadata_direct_with_timings(name)
+            .await
+            .map(|result| result.metadata)
     }
 
     pub async fn get_npm_metadata_direct_with_timings(
         &self,
         name: &str,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_npm_metadata_direct_inner(name, MetadataCachePolicy::UseFresh)
+            .await
+    }
+
+    /// Revalidate direct npm metadata regardless of the normal install TTL.
+    pub async fn revalidate_npm_metadata_direct_with_timings(
+        &self,
+        name: &str,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_npm_metadata_direct_inner(name, MetadataCachePolicy::Revalidate)
+            .await
+    }
+
+    async fn get_npm_metadata_direct_inner(
+        &self,
+        name: &str,
+        cache_policy: MetadataCachePolicy,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
         let cache_key = format!("npm:{name}");
@@ -1209,7 +1213,9 @@ impl RegistryClient {
         let mut timings = PackageMetadataFetchTimings::default();
 
         let memory_read_start = std::time::Instant::now();
-        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+        {
             timings.cache_read_ms = memory_read_start.elapsed().as_millis();
             timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
@@ -1220,7 +1226,9 @@ impl RegistryClient {
         }
 
         let cache_read_start = std::time::Instant::now();
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
@@ -1235,7 +1243,9 @@ impl RegistryClient {
         crate::timing::record_metadata_cache_miss();
 
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
-        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+        {
             timings.cache_hit = true;
             tracing::debug!("metadata memory cache hit (direct, coalesced): npm:{name}");
             return Ok(TimedPackageMetadata {
@@ -1244,7 +1254,9 @@ impl RegistryClient {
             });
         }
         let coalesced_read_start = std::time::Instant::now();
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        {
             timings.cache_read_ms = timings
                 .cache_read_ms
                 .saturating_add(coalesced_read_start.elapsed().as_millis());
@@ -1272,6 +1284,9 @@ impl RegistryClient {
         let validator_start = std::time::Instant::now();
         let cache_validator = self.read_cache_validator(&cache_key);
         timings.validator_read_ms = validator_start.elapsed().as_millis();
+        timings.cache_age_seconds = cache_validator
+            .as_ref()
+            .and_then(|validator| validator.age_seconds);
 
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         tracing::debug!("fetching {name} direct from npm registry");
@@ -1304,6 +1319,7 @@ impl RegistryClient {
                 return finish!(Ok(TimedPackageMetadata { metadata, timings }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+            timings.not_modified = false;
             let req = self
                 .http
                 .for_url(&npm_url)
@@ -2472,8 +2488,33 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<PackageMetadata, LpmError> {
+        self.get_npm_metadata_from_inner(base_url, name, auth, MetadataCachePolicy::UseFresh)
+            .await
+            .map(|result| result.metadata)
+    }
+
+    /// Revalidate custom-registry metadata without bypassing the
+    /// principal-partitioned cache validator.
+    pub async fn revalidate_npm_metadata_from_with_timings(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_npm_metadata_from_inner(base_url, name, auth, MetadataCachePolicy::Revalidate)
+            .await
+    }
+
+    async fn get_npm_metadata_from_inner(
+        &self,
+        base_url: &str,
+        name: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+        cache_policy: MetadataCachePolicy,
+    ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
         let url = format!("{base_url}/{name}");
+        let mut timings = PackageMetadataFetchTimings::default();
 
         // Parse destination origin once; used for both the cache key
         // and the auth-origin defensive check.
@@ -2515,32 +2556,73 @@ impl RegistryClient {
         );
         let memory_cache_key = format!("custom:{cache_key}");
 
-        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
+        let memory_read_start = std::time::Instant::now();
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+        {
+            timings.cache_read_ms = memory_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
-            return Ok(cached);
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
         }
 
         // Tier 1: TTL+magic cache hit.
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        let cache_read_start = std::time::Instant::now();
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        {
+            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+            timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (custom)");
             self.remember_metadata_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
         }
+        timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
 
         let _flight = metadata_fetch_flight_guard(&memory_cache_key).await;
-        if let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key) {
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+        {
+            timings.cache_hit = true;
             tracing::debug!("metadata memory cache hit (custom, coalesced)");
-            return Ok(cached);
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
         }
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        let coalesced_read_start = std::time::Instant::now();
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        {
+            timings.cache_read_ms = timings
+                .cache_read_ms
+                .saturating_add(coalesced_read_start.elapsed().as_millis());
+            timings.cache_hit = true;
             tracing::debug!("metadata cache hit (custom, coalesced)");
             self.remember_metadata_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
+            return Ok(TimedPackageMetadata {
+                metadata: cached,
+                timings,
+            });
         }
+        timings.cache_read_ms = timings
+            .cache_read_ms
+            .saturating_add(coalesced_read_start.elapsed().as_millis());
 
+        let validator_start = std::time::Instant::now();
         let cache_validator = self.read_cache_validator(&cache_key);
+        timings.validator_read_ms = validator_start.elapsed().as_millis();
+        timings.cache_age_seconds = cache_validator
+            .as_ref()
+            .and_then(|validator| validator.age_seconds);
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
@@ -2562,16 +2644,25 @@ impl RegistryClient {
         let req = apply_npmrc_auth(req, &url, auth)?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
 
+        let http_start = std::time::Instant::now();
         let mut response = match self.send_package_metadata_request(req).await {
-            Ok(r) => r,
+            Ok(r) => {
+                timings.http_ms = http_start.elapsed().as_millis();
+                r
+            }
             Err(e) => return finish!(Err(e)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            timings.not_modified = true;
+            let cache_304_start = std::time::Instant::now();
             if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                 tracing::debug!("metadata cache revalidated (custom 304)");
                 self.remember_metadata_for_command(&memory_cache_key, &metadata);
-                return finish!(Ok(metadata));
+                return finish!(Ok(TimedPackageMetadata { metadata, timings }));
             }
+            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+            timings.not_modified = false;
             let req = self
                 .http
                 .for_url(&url)
@@ -2579,13 +2670,19 @@ impl RegistryClient {
                 .get(&url)
                 .header("Accept", "application/vnd.npm.install-v1+json");
             let req = apply_npmrc_auth(req, &url, auth)?;
+            let retry_http_start = std::time::Instant::now();
             response = match self.send_package_metadata_request(req).await {
-                Ok(r) => r,
+                Ok(r) => {
+                    timings.http_ms = timings
+                        .http_ms
+                        .saturating_add(retry_http_start.elapsed().as_millis());
+                    r
+                }
                 Err(e) => return finish!(Err(e)),
             };
         }
         let etag = Self::response_etag(&response);
-        let metadata = match parse_capped_metadata::<PackageMetadata>(
+        let (metadata, body_timings) = match parse_capped_metadata_with_timing::<PackageMetadata>(
             response,
             &format!("get_npm_metadata_from {name} @ {base_url}"),
         )
@@ -2594,9 +2691,14 @@ impl RegistryClient {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
         };
+        timings.body_read_ms = body_timings.body_read_ms;
+        timings.json_decode_ms = body_timings.json_parse_ms;
+        timings.body_bytes = body_timings.body_bytes;
+        let cache_write_start = std::time::Instant::now();
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
         self.remember_metadata_for_command(&memory_cache_key, &metadata);
-        finish!(Ok(metadata))
+        finish!(Ok(TimedPackageMetadata { metadata, timings }))
     }
 
     /// Fetch a full packument from a configured custom registry.

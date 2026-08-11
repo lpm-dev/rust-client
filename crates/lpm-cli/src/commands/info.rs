@@ -1,9 +1,10 @@
 use crate::commands::registry_reads::{
-    fetch_routed_package_metadata, normalize_package_version_input, prepare_routed_read_context,
+    normalize_package_version_input, prepare_routed_read_context,
+    revalidate_routed_package_metadata,
 };
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_registry::RegistryClient;
+use lpm_registry::{PackageMetadataFetchTimings, RegistryClient};
 use std::path::Path;
 
 pub async fn run(
@@ -12,16 +13,20 @@ pub async fn run(
     package: &str,
     version: Option<&str>,
     json_output: bool,
+    verbose: bool,
 ) -> Result<(), LpmError> {
     let (package, version) = normalize_package_version_input("info", package, version)?;
     let context =
         prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
-    let (_package_ref, metadata) = fetch_routed_package_metadata(&context, package).await?;
+    let (_package_ref, result) = revalidate_routed_package_metadata(&context, package).await?;
+    let metadata = result.metadata;
+    let cache = result.timings;
 
     if json_output {
         let mut json = serde_json::to_value(&metadata)?;
         if let Some(obj) = json.as_object_mut() {
             obj.insert("success".to_string(), serde_json::Value::Bool(true));
+            obj.insert("_cache".to_string(), cache_diagnostics_json(cache));
         }
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
@@ -31,6 +36,10 @@ pub async fn run(
         "{}",
         crate::install_ui::terminal_line!("{}", install_ui::bold(&metadata.name))
     );
+
+    if verbose {
+        print_field("metadata", &cache_diagnostics_text(cache));
+    }
 
     // Determine which version to show
     let version_key = version
@@ -118,6 +127,37 @@ pub async fn run(
     Ok(())
 }
 
+fn cache_status(timings: PackageMetadataFetchTimings) -> &'static str {
+    if timings.not_modified {
+        "revalidated"
+    } else if timings.cache_hit {
+        "cache_hit"
+    } else {
+        "fetched"
+    }
+}
+
+fn cache_diagnostics_json(timings: PackageMetadataFetchTimings) -> serde_json::Value {
+    serde_json::json!({
+        "status": cache_status(timings),
+        "age_seconds": timings.cache_age_seconds,
+        "network_request": !timings.cache_hit,
+        "not_modified": timings.not_modified,
+    })
+}
+
+fn cache_diagnostics_text(timings: PackageMetadataFetchTimings) -> String {
+    match (cache_status(timings), timings.cache_age_seconds) {
+        ("revalidated", Some(age)) => {
+            format!("revalidated cached metadata (HTTP 304, prior age {age}s)")
+        }
+        ("revalidated", None) => "revalidated cached metadata (HTTP 304)".to_string(),
+        ("cache_hit", Some(age)) => format!("local cache hit ({age}s old)"),
+        ("cache_hit", None) => "local cache hit".to_string(),
+        (_, _) => "fetched current metadata from the registry".to_string(),
+    }
+}
+
 fn print_field(label: &'static str, value: &str) {
     println!(
         "{}",
@@ -157,4 +197,28 @@ fn short_integrity(integrity: &str) -> String {
     let tail_start = integrity.chars().count().saturating_sub(TAIL_CHARS);
     short.extend(integrity.chars().skip(tail_start));
     short
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_diagnostics_expose_conditional_revalidation() {
+        let diagnostics = cache_diagnostics_json(PackageMetadataFetchTimings {
+            not_modified: true,
+            cache_age_seconds: Some(143),
+            ..PackageMetadataFetchTimings::default()
+        });
+
+        assert_eq!(
+            diagnostics,
+            serde_json::json!({
+                "status": "revalidated",
+                "age_seconds": 143,
+                "network_request": true,
+                "not_modified": true,
+            })
+        );
+    }
 }

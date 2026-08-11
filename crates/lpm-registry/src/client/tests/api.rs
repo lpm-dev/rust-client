@@ -106,6 +106,67 @@ async fn publish_preflight_sends_resolved_identity_and_bearer_without_mutation()
 }
 
 #[tokio::test]
+async fn publication_status_sends_package_identity_and_publish_bearer() {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .and(query_param("name", "@lpm.dev/owner.resolved"))
+        .and(query_param("version", "1.2.3"))
+        .and(header("authorization", "Bearer publish-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3",
+            "status": "pending_review",
+            "reviewStatus": "pending",
+            "currentLatestVersion": "1.1.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let response = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .get_publication_status("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .expect("publication status request should succeed");
+
+    assert_eq!(response.status, "pending_review");
+    assert_eq!(response.current_latest_version.as_deref(), Some("1.1.0"));
+}
+
+#[tokio::test]
+async fn publication_status_rejects_a_mismatched_response_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "@lpm.dev/other.package",
+            "version": "9.9.9",
+            "status": "active",
+            "reviewStatus": "approved"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .get_publication_status("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .expect_err("mismatched status response must fail closed");
+
+    assert!(error.to_string().contains("mismatched package identity"));
+}
+
+#[tokio::test]
 async fn publish_preflight_rejects_an_unsuccessful_success_envelope() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

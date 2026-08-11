@@ -22,6 +22,7 @@ use super::types::{
 };
 use super::upload_lpm::publish_to_lpm;
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
+use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication};
 use crate::commands::skills::author;
 use crate::commands::{npm_auth, publish_common, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, sigstore};
@@ -48,6 +49,8 @@ pub async fn run(
     project_dir: &Path,
     dry_run: bool,
     check_only: bool,
+    wait_for_publication: bool,
+    wait_timeout_seconds: Option<u64>,
     yes: bool,
     json_output: bool,
     min_score: Option<u32>,
@@ -85,6 +88,11 @@ pub async fn run(
     }
 
     let targets_lpm = targets.contains(&PublishTarget::Lpm);
+    if wait_for_publication && !targets_lpm {
+        return Err(LpmError::Registry(
+            "--wait requires publishing to the LPM registry".into(),
+        ));
+    }
     if targets_lpm {
         let lpm_name = publish_manifest
             .publish_config
@@ -613,6 +621,10 @@ pub async fn run(
                     Ok(resp) => {
                         let publication_status =
                             LpmPublicationStatus::from_registry_response(&resp);
+                        let current_latest_version = resp
+                            .get("currentLatestVersion")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
                         if !json_output {
                             if let Some(url) = lpm_package_url(lpm_name) {
                                 publish_detail("url", install_ui::url(&url));
@@ -622,6 +634,17 @@ pub async fn run(
                                 .and_then(format_lpm_publication_notice)
                             {
                                 install_ui::warn_line(notice);
+                            }
+                            if !matches!(
+                                publication_status.as_ref(),
+                                Some(LpmPublicationStatus::Active)
+                            ) {
+                                publish_detail(
+                                    "current latest",
+                                    install_ui::yellow(
+                                        current_latest_version.as_deref().unwrap_or("none"),
+                                    ),
+                                );
                             }
                             if let Some(warnings) = resp.get("warnings").and_then(|w| w.as_array())
                             {
@@ -640,6 +663,8 @@ pub async fn run(
                             error: None,
                             auth: None,
                             publication_status,
+                            current_latest_version,
+                            publication_wait: None,
                             duration,
                         });
                     }
@@ -657,6 +682,8 @@ pub async fn run(
                             error: Some(e.to_string()),
                             auth: None,
                             publication_status: None,
+                            current_latest_version: None,
+                            publication_wait: None,
                             duration,
                         });
                     }
@@ -888,6 +915,8 @@ pub async fn run(
                         error: npm_result.error,
                         auth: auth_source,
                         publication_status: None,
+                        current_latest_version: None,
+                        publication_wait: None,
                         duration: npm_result.duration,
                     })
                 }
@@ -913,6 +942,8 @@ pub async fn run(
                             error: Some(e.to_string()),
                             auth: None,
                             publication_status: None,
+                            current_latest_version: None,
+                            publication_wait: None,
                             duration,
                         });
                     }
@@ -921,8 +952,48 @@ pub async fn run(
         }
     }
 
+    if wait_for_publication {
+        let lpm_name = target_names
+            .get("lpm")
+            .map_or(name.as_str(), String::as_str);
+        if let Some(result) = results
+            .iter_mut()
+            .find(|result| result.target == "lpm" && result.success)
+        {
+            if !json_output {
+                install_ui::phase("Waiting for LPM.dev Registry publication");
+            }
+            let timeout = wait_timeout_seconds.map_or(
+                DEFAULT_PUBLICATION_WAIT_TIMEOUT,
+                std::time::Duration::from_secs,
+            );
+            let wait_result = wait_for_lpm_publication(client, lpm_name, &version, timeout).await;
+            if let Some(status) = wait_result.status.clone() {
+                result.publication_status = Some(status);
+            }
+            if let Some(current_latest_version) = wait_result.current_latest_version.clone() {
+                result.current_latest_version = Some(current_latest_version);
+            }
+            if !json_output {
+                if wait_result.success {
+                    install_ui::done("LPM.dev Registry publication is active");
+                } else if let Some(error) = wait_result.error.as_deref() {
+                    install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(error));
+                }
+            }
+            result.publication_wait = Some(wait_result);
+        }
+    }
+
     // Final summary after every target has had a chance to publish.
     let any_failed = results.iter().any(|r| !r.success);
+    let any_wait_failed = results.iter().any(|result| {
+        result
+            .publication_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.success)
+    });
+    let command_failed = any_failed || any_wait_failed;
     let succeeded = results.iter().filter(|r| r.success).count();
     let lpm_publication_status = results
         .iter()
@@ -931,10 +1002,13 @@ pub async fn run(
 
     if json_output {
         let json = serde_json::json!({
-            "success": !any_failed,
+            "success": !command_failed,
             "results": results.iter().map(publish_result_json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else if any_wait_failed {
+        // The specific wait failure is printed above. Do not offer a publish retry:
+        // the immutable version upload already succeeded.
     } else if targets.len() > 1 {
         if any_failed {
             install_ui::warn_line(format_multi_publish_partial_summary(
@@ -968,12 +1042,17 @@ pub async fn run(
         ));
     }
 
-    if any_failed {
+    if command_failed {
         if json_output {
             Err(LpmError::ExitCode(1))
-        } else {
+        } else if any_failed {
             Err(LpmError::Registry(
                 "one or more publish targets failed".into(),
+            ))
+        } else {
+            Err(LpmError::Registry(
+                "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again"
+                    .into(),
             ))
         }
     } else {
