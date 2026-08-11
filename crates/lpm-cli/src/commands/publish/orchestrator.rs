@@ -17,12 +17,12 @@ use super::secret_scan::run_publish_secret_scan;
 use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
 use super::target::resolve_targets;
 use super::types::{
-    LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublishProject,
-    PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
+    LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
+    PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
 };
 use super::upload_lpm::publish_to_lpm;
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
-use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication};
+use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
 use crate::commands::{npm_auth, publish_common, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, sigstore};
@@ -93,6 +93,12 @@ pub async fn run(
             "--wait requires publishing to the LPM registry".into(),
         ));
     }
+    let publication_wait_timeout = wait_for_publication.then(|| {
+        wait_timeout_seconds.map_or(
+            DEFAULT_PUBLICATION_WAIT_TIMEOUT,
+            std::time::Duration::from_secs,
+        )
+    });
     if targets_lpm {
         let lpm_name = publish_manifest
             .publish_config
@@ -364,20 +370,28 @@ pub async fn run(
     // only becomes known after `package.json` is parsed — that's why this
     // can't live in main.rs.
     //
+    let mut oidc_token_for_wait = None;
     let oidc_swapped_client;
     let client: &RegistryClient =
         if targets_lpm && !check_only && oidc::registry_exchange_jwt_available() {
             let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
                 LpmError::Registry("no resolved LPM.dev package name for OIDC exchange".into())
             })?;
-            let oidc_token =
-                oidc::exchange_oidc_token(client.base_url(), Some(resolved_lpm_name), "publish")
-                    .await
-                    .map_err(|error| {
-                        LpmError::Registry(format!(
-                            "Trusted Publisher exchange failed for {resolved_lpm_name}: {error}"
-                        ))
-                    })?;
+            let oidc_token = oidc::exchange_publish_oidc_token(
+                client.base_url(),
+                resolved_lpm_name,
+                publication_wait_timeout,
+            )
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "Trusted Publisher exchange failed for {resolved_lpm_name}: {error}"
+                ))
+            })?;
+            if let Some(timeout) = publication_wait_timeout {
+                oidc_token.publication_status_token_for_wait(timeout)?;
+                oidc_token_for_wait = Some(oidc_token.clone());
+            }
             oidc_swapped_client = client
                 .clone_with_config()
                 .with_token_override(oidc_token.token);
@@ -963,11 +977,20 @@ pub async fn run(
             if !json_output {
                 install_ui::phase("Waiting for LPM.dev Registry publication");
             }
-            let timeout = wait_timeout_seconds.map_or(
-                DEFAULT_PUBLICATION_WAIT_TIMEOUT,
-                std::time::Duration::from_secs,
-            );
-            let wait_result = wait_for_lpm_publication(client, lpm_name, &version, timeout).await;
+            let timeout = publication_wait_timeout.unwrap_or(DEFAULT_PUBLICATION_WAIT_TIMEOUT);
+            let wait_result = if result.publication_status == Some(LpmPublicationStatus::Active) {
+                PublicationWaitResult::active()
+                    .with_current_latest_version(result.current_latest_version.clone())
+            } else {
+                wait_for_lpm_publication_with_oidc(
+                    client,
+                    lpm_name,
+                    &version,
+                    timeout,
+                    oidc_token_for_wait.as_ref(),
+                )
+                .await
+            };
             if let Some(status) = wait_result.status.clone() {
                 result.publication_status = Some(status);
             }
@@ -1006,30 +1029,25 @@ pub async fn run(
             "results": results.iter().map(publish_result_json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else if any_wait_failed {
-        // The specific wait failure is printed above. Do not offer a publish retry:
-        // the immutable version upload already succeeded.
-    } else if targets.len() > 1 {
-        if any_failed {
-            install_ui::warn_line(format_multi_publish_partial_summary(
-                succeeded,
-                targets.len(),
-                lpm_publication_status,
-            ));
-            for (target, result) in targets.iter().zip(results.iter()) {
-                if !result.success {
-                    install_ui::detail_line(format_publish_retry_detail(target));
-                }
+    } else if targets.len() > 1 && any_failed {
+        install_ui::warn_line(format_multi_publish_partial_summary(
+            succeeded,
+            targets.len(),
+            lpm_publication_status,
+        ));
+        for (target, result) in targets.iter().zip(results.iter()) {
+            if !result.success {
+                install_ui::detail_line(format_publish_retry_detail(target));
             }
-        } else {
-            let elapsed = install_ui::format_duration(publish_started.elapsed());
-            install_ui::done_line(format_multi_publish_success_summary(
-                targets.len(),
-                &elapsed,
-                lpm_publication_status,
-            ));
         }
-    } else if !any_failed {
+    } else if !any_wait_failed && targets.len() > 1 {
+        let elapsed = install_ui::format_duration(publish_started.elapsed());
+        install_ui::done_line(format_multi_publish_success_summary(
+            targets.len(),
+            &elapsed,
+            lpm_publication_status,
+        ));
+    } else if !any_wait_failed && !any_failed {
         let target = &targets[0];
         let key = target.key();
         let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());

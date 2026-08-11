@@ -846,6 +846,137 @@ async fn publish_wait_json_reports_upload_and_active_publication_states() {
 }
 
 #[tokio::test]
+async fn publish_wait_accepts_an_authoritative_active_upload_without_polling() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.wait-already-active";
+    const VERSION: &str = "1.0.0";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "active",
+            "currentLatestVersion": VERSION,
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{PACKAGE_NAME}",
+  "version": "{VERSION}",
+  "description": "Already-active publication wait fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--wait",
+        ])
+        .output()
+        .expect("run lpm publish --wait for an already-active version");
+
+    assert!(
+        output.status.success(),
+        "an authoritative active upload must satisfy --wait\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let status_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/registry/-/package/publication-status")
+        .count();
+    assert_eq!(status_requests, 0);
+}
+
+#[tokio::test]
+async fn publish_wait_failure_keeps_retry_guidance_for_other_failed_targets() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.wait-with-github-failure";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "pending_review",
+            "currentLatestVersion": null,
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE_NAME,
+            "version": "1.0.0",
+            "status": "rejected",
+            "reviewStatus": "rejected",
+            "currentLatestVersion": null,
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{PACKAGE_NAME}",
+  "version": "1.0.0",
+  "description": "Combined publication and target failure fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"github":{"name":"@testuser/wait-with-github-failure"}}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--github",
+            "--wait",
+        ])
+        .output()
+        .expect("run publish with a failed wait and failed GitHub target");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(
+        !output.status.success(),
+        "combined failures must fail the command"
+    );
+    assert!(
+        combined.contains("Retry: lpm publish --github"),
+        "the independently failed GitHub upload needs scoped retry guidance:\n{combined}",
+    );
+    assert!(
+        !combined.contains("Retry: lpm publish --lpm"),
+        "the successfully uploaded immutable LPM version must not be republished:\n{combined}",
+    );
+}
+
+#[tokio::test]
 async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
     const RESOLVED_NAME: &str = "@lpm.dev/testuser.resolved-upload";
     let mock = MockRegistry::start().await;

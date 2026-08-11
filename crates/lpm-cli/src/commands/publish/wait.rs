@@ -1,4 +1,5 @@
 use super::types::{LpmPublicationStatus, PublicationWaitResult};
+use crate::oidc::OidcToken;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use std::future::Future;
@@ -42,6 +43,33 @@ pub(super) async fn wait_for_lpm_publication(
         Ok(result) => result,
         Err(_) => PublicationWaitResult::timed_out(None),
     }
+}
+
+pub(super) async fn wait_for_lpm_publication_with_oidc(
+    client: &RegistryClient,
+    name: &str,
+    version: &str,
+    timeout: Duration,
+    oidc_token: Option<&OidcToken>,
+) -> PublicationWaitResult {
+    let status_token = match oidc_token
+        .map(|token| token.publication_status_token_for_wait(timeout))
+        .transpose()
+    {
+        Ok(token) => token.flatten(),
+        Err(error) => return PublicationWaitResult::request_failed(&error),
+    };
+    let status_client;
+    let wait_client = if let Some(token) = status_token {
+        status_client = client
+            .clone_with_config()
+            .with_token_override(token.to_string());
+        &status_client
+    } else {
+        client
+    };
+
+    wait_for_lpm_publication(wait_client, name, version, timeout).await
 }
 
 #[cfg(test)]
@@ -110,10 +138,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oidc::OidcPublicationStatusToken;
 
     #[test]
     fn poll_limit_leaves_the_outer_timeout_in_control() {
         assert_eq!(publication_poll_limit(Duration::from_secs(10)), 5);
         assert_eq!(publication_poll_limit(Duration::from_secs(600)), 201);
+    }
+
+    #[tokio::test]
+    async fn expired_oidc_wait_credential_preserves_successful_upload_state() {
+        let oidc_token = OidcToken {
+            token: "publish-token".into(),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(15)),
+            publication_status: Some(OidcPublicationStatusToken {
+                token: "status-token".into(),
+                expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            }),
+        };
+        let client = RegistryClient::new().with_base_url("http://127.0.0.1:1");
+
+        let result = wait_for_lpm_publication_with_oidc(
+            &client,
+            "@lpm.dev/owner.package",
+            "1.0.0",
+            Duration::from_secs(60),
+            Some(&oidc_token),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Do not publish this version again"))
+        );
     }
 }
