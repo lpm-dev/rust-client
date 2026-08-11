@@ -5,7 +5,7 @@ use lpm_registry::RegistryClient;
 use std::future::Future;
 use std::time::Duration;
 
-pub(super) const DEFAULT_PUBLICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const DEFAULT_PUBLICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(1_200);
 const PUBLICATION_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 fn publication_poll_limit(timeout: Duration) -> usize {
@@ -144,6 +144,11 @@ mod tests {
     fn poll_limit_leaves_the_outer_timeout_in_control() {
         assert_eq!(publication_poll_limit(Duration::from_secs(10)), 5);
         assert_eq!(publication_poll_limit(Duration::from_secs(600)), 201);
+    }
+
+    #[test]
+    fn default_wait_exceeds_the_registry_source_change_cooldown() {
+        assert!(DEFAULT_PUBLICATION_WAIT_TIMEOUT > Duration::from_secs(15 * 60));
     }
 
     #[tokio::test]
