@@ -62,6 +62,8 @@ const STORE_V3_VERSION: &str = "v3";
 /// Subdirectory holding the content-addressable object dirs.
 const OBJECTS_DIR: &str = "objects";
 
+const INTEGRITY_MARKER_SIZE_CAP_BYTES: u64 = 1024;
+
 /// Subdirectory holding per-graph-key link entries.
 const LINKS_DIR: &str = "links";
 
@@ -86,6 +88,11 @@ struct FileCasFinishContext<'a> {
     prepared: Option<&'a PreparedSourceRecord>,
     reuse_timings: Option<&'a mut ReusableObjectCheckTimings>,
     validation_batch: Option<&'a ReusableObjectValidationBatch>,
+}
+
+enum TarballInput<'a> {
+    Bytes(&'a [u8]),
+    File(std::io::BufReader<std::fs::File>),
 }
 
 /// Subdirectory holding per-build-key advisory lock files.
@@ -1044,10 +1051,37 @@ impl Store {
         self.extract_object_with_timings_and_policy(sri, tarball_data, self.object_integrity_policy)
     }
 
+    /// Extract a verified tarball file without materializing its compressed
+    /// bytes in memory.
+    pub fn extract_object_from_file(
+        &self,
+        tarball_path: &Path,
+        expected_integrity: &str,
+    ) -> Result<(PathBuf, StageTimings), LpmError> {
+        let expected = Integrity::parse(expected_integrity)?;
+        expected.verify_file(tarball_path)?;
+        let file = std::fs::File::open(tarball_path).map_err(LpmError::Io)?;
+        self.extract_object_from_input_with_policy(
+            expected_integrity,
+            TarballInput::File(std::io::BufReader::new(file)),
+            self.object_integrity_policy,
+        )
+        .map(|(object, timings)| (object.path, timings))
+    }
+
     fn extract_object_with_timings_and_policy(
         &self,
         sri: &str,
         tarball_data: &[u8],
+        policy: ObjectIntegrityPolicy,
+    ) -> Result<(ExtractedObject, StageTimings), LpmError> {
+        self.extract_object_from_input_with_policy(sri, TarballInput::Bytes(tarball_data), policy)
+    }
+
+    fn extract_object_from_input_with_policy(
+        &self,
+        sri: &str,
+        tarball_input: TarballInput<'_>,
         policy: ObjectIntegrityPolicy,
     ) -> Result<(ExtractedObject, StageTimings), LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
@@ -1179,20 +1213,37 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let extract_result = if registry_cas_ingest.is_some() {
-            lpm_extractor::extract_tarball_with_entry_digests(
-                tarball_data,
+        let extract_result = match (tarball_input, registry_cas_ingest.is_some()) {
+            (TarballInput::Bytes(bytes), true) => {
+                lpm_extractor::extract_tarball_with_entry_digests(
+                    bytes,
+                    &tmp_dir,
+                    buffer_predicate,
+                    inspect_entry,
+                )
+            }
+            (TarballInput::Bytes(bytes), false) => lpm_extractor::extract_tarball_with_inspector(
+                bytes,
                 &tmp_dir,
                 buffer_predicate,
                 inspect_entry,
-            )
-        } else {
-            lpm_extractor::extract_tarball_with_inspector(
-                tarball_data,
-                &tmp_dir,
-                buffer_predicate,
-                inspect_entry,
-            )
+            ),
+            (TarballInput::File(reader), true) => {
+                lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                    reader,
+                    &tmp_dir,
+                    buffer_predicate,
+                    inspect_entry,
+                )
+            }
+            (TarballInput::File(reader), false) => {
+                lpm_extractor::extract_tarball_from_reader_streaming_with_inspector(
+                    reader,
+                    &tmp_dir,
+                    buffer_predicate,
+                    inspect_entry,
+                )
+            }
         };
         if let Err(error) = extract_result {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1953,29 +2004,42 @@ impl Store {
     /// **What gets copied.**
     /// - All package files at the root of `v1_pkg_dir` (e.g.,
     ///   `package.json`, `index.js`, `dist/`).
-    /// - The `.integrity` sidecar (rewritten to `sri` for byte-
-    ///   accuracy, since v1 may have a slightly different normalized
-    ///   form).
+    /// - The `.integrity` sidecar after it is verified to represent the
+    ///   same content identity as `sri`.
     /// - The `.lpm-security.json` cache, if present in `v1_pkg_dir`.
     ///   Security analysis is content-determined; copying the cache
     ///   skips the multi-millisecond re-analysis on warm-cache
     ///   migrations. If absent, the helper re-runs analysis to
     ///   match `extract_object`'s post-write contract.
     ///
-    /// **Limitation.** This helper trusts the caller to provide a
-    /// `(v1_pkg_dir, sri)` pair where the SRI matches the extracted
-    /// bytes. The install pipeline derives `sri` from the lockfile
-    /// or from the prior install's recorded integrity; both come
-    /// from the same SHA-512 the v1 extract recorded, so the trust
-    /// is sound under normal flows. A pathological `(v1_pkg_dir,
-    /// wrong_sri)` pair would land bytes at the wrong v2 key, but
-    /// that's an upstream programmer error, not a security boundary
-    /// the helper enforces.
     pub fn populate_object_from_v1(
         &self,
         v1_pkg_dir: &Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
+        let requested_integrity = Integrity::parse(sri)?;
+        let marker_path = v1_pkg_dir.join(".integrity");
+        let recorded_sri =
+            lpm_common::read_text_file_capped(&marker_path, INTEGRITY_MARKER_SIZE_CAP_BYTES)
+                .map_err(|error| {
+                    LpmError::Store(format!(
+                        "v1 to virtual-store translation: failed to read {}: {error}",
+                        marker_path.display()
+                    ))
+                })?;
+        let recorded_sri = recorded_sri.trim();
+        let recorded_integrity = Integrity::parse(recorded_sri).map_err(|error| {
+            LpmError::Store(format!(
+                "v1 to virtual-store translation: invalid integrity marker at {}: {error}",
+                marker_path.display()
+            ))
+        })?;
+        if recorded_integrity != requested_integrity {
+            return Err(LpmError::IntegrityMismatch {
+                expected: sri.to_string(),
+                actual: recorded_sri.to_string(),
+            });
+        }
         self.populate_object_from_existing_tree(v1_pkg_dir, sri, "v1 to virtual-store translation")
     }
 

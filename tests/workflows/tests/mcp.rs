@@ -521,11 +521,22 @@ async fn mcp_serve_ignores_workspace_lockfile_and_security_overrides() {
     );
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "@lpm-registry/mcp-server".to_string(),
         version: "0.1.0".to_string(),
-        integrity: Some("sha512-workspace-pin".to_string()),
+        integrity: Some(support::VALID_TEST_INTEGRITY.to_string()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[(
+            "@lpm-registry/mcp-server",
+            "@lpm-registry/mcp-server",
+            "0.1.0",
+        )],
+    );
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("seed workspace lockfile");

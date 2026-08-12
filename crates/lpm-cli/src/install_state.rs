@@ -2095,7 +2095,7 @@ mod tests {
         assert_eq!(lines.next(), Some("a:enabled"));
         assert_eq!(lines.next(), Some("e:none"));
         assert_eq!(lines.next(), Some("n:none"));
-        assert_eq!(lines.next(), Some("b:required"));
+        assert_eq!(lines.next(), Some("b:not-required"));
         assert_eq!(lines.next(), None);
     }
 

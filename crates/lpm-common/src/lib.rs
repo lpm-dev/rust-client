@@ -12,8 +12,10 @@ pub mod error;
 pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
+pub mod package_instance;
 pub mod package_name;
 pub mod paths;
+pub mod peer;
 pub mod platform;
 pub mod provenance;
 pub mod symlink;
@@ -38,6 +40,7 @@ pub use error::{
 };
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
+pub use package_instance::{PackageInstanceId, ResolutionNodeId};
 pub use package_name::PackageName;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
@@ -45,6 +48,7 @@ pub use paths::{
     is_local_fs, project_install_lock, try_acquire_exclusive_lock, try_with_exclusive_lock,
     with_exclusive_lock, with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
 };
+pub use peer::PeerEdge;
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use symlink::{
     create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,

@@ -134,7 +134,7 @@ pub(crate) fn trust_downgrade_violation_unprofiled(
     ))
 }
 
-pub(super) fn version_allowed_by_policy(
+pub(crate) fn version_allowed_by_policy(
     package: &CanonicalKey,
     info: &CachedPackageInfo,
     version: &NpmVersion,

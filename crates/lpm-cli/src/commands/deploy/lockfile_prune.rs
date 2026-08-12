@@ -33,12 +33,110 @@ pub(in crate::commands::deploy) fn write_pruned_deploy_lockfile_if_possible(
         })?
         .lockfile;
 
-    let mut queue = VecDeque::new();
-    for (name, spec) in &root_specs {
-        let Some(package) = select_locked_package_for_spec(&source_lockfile, name, spec) else {
+    let exact_schema = source_lockfile.metadata.lockfile_version
+        >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES;
+    let selected_instances = if exact_schema {
+        let Some(selected) = select_exact_instances(&source_lockfile, &root_specs) else {
             return Ok(None);
         };
-        queue.push_back(package.clone());
+        Some(selected)
+    } else {
+        None
+    };
+    let selected_artifacts = if exact_schema {
+        None
+    } else {
+        let Some(selected) = select_legacy_artifacts(&source_lockfile, &root_specs) else {
+            return Ok(None);
+        };
+        Some(selected)
+    };
+
+    let mut pruned = lpm_lockfile::Lockfile::new();
+    pruned.metadata = source_lockfile.metadata.clone();
+    pruned.catalogs = source_lockfile.catalogs.clone();
+    pruned.packages = source_lockfile
+        .packages
+        .into_iter()
+        .filter(|package| {
+            if let Some(selected) = selected_instances.as_ref() {
+                package.instance_id.is_some_and(|id| selected.contains(&id))
+            } else {
+                selected_artifacts
+                    .as_ref()
+                    .is_some_and(|selected| selected.contains(&locked_package_key(package)))
+            }
+        })
+        .collect();
+    pruned.root_aliases = source_lockfile
+        .root_aliases
+        .into_iter()
+        .filter(|(local, _)| root_specs.contains_key(local))
+        .collect();
+    pruned.root_resolutions = source_lockfile
+        .root_resolutions
+        .into_iter()
+        .filter(|(local, root)| {
+            root_specs.contains_key(local)
+                && root.instance_id.is_none_or(|id| {
+                    selected_instances
+                        .as_ref()
+                        .is_none_or(|selected| selected.contains(&id))
+                })
+        })
+        .collect();
+    pruned.ambient_peer_installs = source_lockfile
+        .ambient_peer_installs
+        .into_iter()
+        .filter(|name| pruned.packages.iter().any(|package| &package.name == name))
+        .collect();
+    let package_count = pruned.packages.len();
+    pruned
+        .write_all(&output_dir.join(lpm_lockfile::LOCKFILE_NAME))
+        .map_err(|e| LpmError::Script(format!("deploy: failed to write pruned lockfile: {e}")))?;
+
+    Ok(Some(package_count))
+}
+
+fn select_exact_instances(
+    lockfile: &lpm_lockfile::Lockfile,
+    root_specs: &HashMap<String, String>,
+) -> Option<HashSet<lpm_common::PackageInstanceId>> {
+    let by_instance = lockfile
+        .packages
+        .iter()
+        .filter_map(|package| package.instance_id.map(|id| (id, package)))
+        .collect::<HashMap<_, _>>();
+    let mut queue = VecDeque::with_capacity(lockfile.packages.len());
+    for (local_name, spec) in root_specs {
+        let root = lockfile.root_resolutions.get(local_name)?;
+        let instance_id = root.instance_id?;
+        let package = by_instance.get(&instance_id)?;
+        if !locked_package_matches_spec(package, local_name, spec) {
+            return None;
+        }
+        queue.push_back(instance_id);
+    }
+
+    let mut selected = HashSet::with_capacity(lockfile.packages.len());
+    while let Some(instance_id) = queue.pop_front() {
+        if !selected.insert(instance_id) {
+            continue;
+        }
+        let package = by_instance.get(&instance_id)?;
+        queue.extend(package.dependency_targets.values().copied());
+        queue.extend(package.peer_targets.values().copied());
+    }
+    Some(selected)
+}
+
+fn select_legacy_artifacts(
+    lockfile: &lpm_lockfile::Lockfile,
+    root_specs: &HashMap<String, String>,
+) -> Option<HashSet<(String, String, Option<String>)>> {
+    let mut queue = VecDeque::new();
+    for (name, spec) in root_specs {
+        queue.push_back(select_locked_package_for_spec(lockfile, name, spec)?.clone());
     }
 
     let mut selected = HashSet::new();
@@ -57,36 +155,30 @@ pub(in crate::commands::deploy) fn write_pruned_deploy_lockfile_if_possible(
                 continue;
             };
             let target = alias_targets.get(local_name).copied().unwrap_or(local_name);
-            if let Some(child) = find_locked_package_exact(&source_lockfile, target, version) {
+            if let Some(child) = find_locked_package_exact(lockfile, target, version) {
                 queue.push_back(child.clone());
             }
         }
     }
+    Some(selected)
+}
 
-    let mut pruned = lpm_lockfile::Lockfile::new();
-    pruned.metadata = source_lockfile.metadata.clone();
-    pruned.catalogs = source_lockfile.catalogs.clone();
-    pruned.packages = source_lockfile
-        .packages
-        .into_iter()
-        .filter(|package| selected.contains(&locked_package_key(package)))
-        .collect();
-    pruned.root_aliases = source_lockfile
-        .root_aliases
-        .into_iter()
-        .filter(|(local, _)| root_specs.contains_key(local))
-        .collect();
-    pruned.ambient_peer_installs = source_lockfile
-        .ambient_peer_installs
-        .into_iter()
-        .filter(|name| pruned.packages.iter().any(|package| &package.name == name))
-        .collect();
-    let package_count = pruned.packages.len();
-    pruned
-        .write_all(&output_dir.join(lpm_lockfile::LOCKFILE_NAME))
-        .map_err(|e| LpmError::Script(format!("deploy: failed to write pruned lockfile: {e}")))?;
-
-    Ok(Some(package_count))
+fn locked_package_matches_spec(
+    package: &lpm_lockfile::LockedPackage,
+    local_name: &str,
+    spec: &str,
+) -> bool {
+    let (target, range_spec) = match lpm_resolver::ranges::parse_npm_alias(spec) {
+        Some(alias) => (alias.target, alias.range),
+        None => (local_name.to_string(), spec.to_string()),
+    };
+    if package.name != target {
+        return false;
+    }
+    let Ok(range) = lpm_resolver::NpmRange::parse(&range_spec) else {
+        return false;
+    };
+    lpm_resolver::NpmVersion::parse(&package.version).is_ok_and(|version| range.satisfies(&version))
 }
 
 fn collect_registry_specs_from_deploy_manifests(

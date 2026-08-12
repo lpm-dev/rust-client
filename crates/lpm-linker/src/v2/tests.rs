@@ -94,6 +94,7 @@ fn write_local_source_object(store: &V2Store, sri: &str, source_dir: &Path) -> P
 
 fn target(name: &str, version: &str, sri: &str, is_direct: bool) -> V2Target {
     V2Target {
+        instance_id: lpm_common::PackageInstanceId::derive(name, version, "registry+npm", sri),
         target: Arc::new(LinkTarget {
             name: name.into(),
             version: version.into(),
@@ -107,6 +108,8 @@ fn target(name: &str, version: &str, sri: &str, is_direct: bool) -> V2Target {
             peers: Vec::new(),
             patch_fingerprint: None,
         }),
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         source_sri: sri.into(),
         verified_object_integrity: None,
         fresh_object: None,
@@ -455,10 +458,66 @@ fn link_packages_v2_rejects_conflicting_dependency_slots() {
         matches!(
             error,
             LpmError::Store(message)
-                if message.contains("dependency slot shared-slot")
-                    && message.contains("conflicting graph keys")
+                if message.contains("dependency \"shared-slot\"")
+                    && message.contains("metadata disagrees")
         ),
         "conflicting dependency slots must return a typed store error"
+    );
+}
+
+#[test]
+fn link_packages_v2_rejects_conflicting_peer_slots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let first_sri = synthetic_sri(b"conflicting-peer-slots/first");
+    write_object(
+        &store,
+        &first_sri,
+        &[("package.json", br#"{"name":"first","version":"1.0.0"}"#)],
+    );
+    let second_sri = synthetic_sri(b"conflicting-peer-slots/second");
+    write_object(
+        &store,
+        &second_sri,
+        &[("package.json", br#"{"name":"second","version":"1.0.0"}"#)],
+    );
+    let consumer_sri = synthetic_sri(b"conflicting-peer-slots/consumer");
+    write_object(
+        &store,
+        &consumer_sri,
+        &[("package.json", br#"{"name":"consumer","version":"1.0.0"}"#)],
+    );
+
+    let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+    Arc::make_mut(&mut consumer.target).peers = vec![
+        lpm_common::PeerEdge::registry("shared-slot", "first", "1.0.0"),
+        lpm_common::PeerEdge::registry("shared-slot", "second", "1.0.0"),
+    ];
+
+    let error = link_packages_v2(
+        &project,
+        vec![
+            consumer,
+            target("first", "1.0.0", &first_sri, false),
+            target("second", "1.0.0", &second_sri, false),
+        ],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .expect_err("one peer slot cannot resolve to two graph keys");
+
+    assert!(
+        matches!(
+            error,
+            LpmError::Store(message)
+                if message.contains("peer \"shared-slot\"")
+                    && message.contains("metadata disagrees")
+        ),
+        "conflicting peer slots must return a typed store error"
     );
 }
 
@@ -569,8 +628,8 @@ fn link_packages_v2_materializes_next_compatibility_island_under_node_modules() 
     Arc::make_mut(&mut next.target).dependencies =
         vec![LinkDependency::registry("@swc/helpers", "0.5.0")];
     Arc::make_mut(&mut next.target).peers = vec![
-        ("react".to_string(), "19.2.5".to_string()),
-        ("react-dom".to_string(), "19.2.5".to_string()),
+        lpm_common::PeerEdge::registry("react", "react", "19.2.5"),
+        lpm_common::PeerEdge::registry("react-dom", "react-dom", "19.2.5"),
     ];
     let react = target("react", "19.2.5", &react_sri, true);
     let react_dom = target("react-dom", "19.2.5", &react_dom_sri, true);
@@ -1580,6 +1639,41 @@ fn link_packages_v2_missing_dep_key_surfaces_error() {
     );
 }
 
+#[test]
+fn authoritative_peer_context_rejects_missing_provider() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let sri = synthetic_sri(b"link_packages_v2/missing_peer");
+    write_object(
+        &store,
+        &sri,
+        &[(
+            "package.json",
+            b"{\"name\":\"consumer\",\"version\":\"1.0.0\"}",
+        )],
+    );
+    let mut consumer = target("consumer", "1.0.0", &sri, true);
+    Arc::make_mut(&mut consumer.target).peers = vec![lpm_common::PeerEdge::registry(
+        "runtime", "runtime", "1.0.0",
+    )];
+
+    let error = match link_v2_prepare_with_authoritative_peer_context(
+        &project,
+        vec![consumer],
+        &store,
+        LinkerMode::Isolated,
+    ) {
+        Ok(_) => panic!("authoritative peer edge without a provider must fail plan validation"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+
+    assert!(message.contains("peer"));
+    assert!(message.contains("runtime@1.0.0"));
+    assert!(message.contains("references missing target"));
+}
+
 /// **Cross-project peer-divergence invariant.**
 ///
 /// The same consumer package + edge graph but a different
@@ -1799,7 +1893,8 @@ fn link_packages_v2_hoisted_mode_accepts_targets_with_peer_context() {
     );
 
     let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
-    Arc::make_mut(&mut consumer.target).peers = vec![("react".into(), "18.3.1".into())];
+    Arc::make_mut(&mut consumer.target).peers =
+        vec![lpm_common::PeerEdge::registry("react", "react", "18.3.1")];
     let react = target("react", "18.3.1", &react_sri, false);
 
     let result = link_packages_v2(
@@ -1853,7 +1948,8 @@ fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
     let project_18 = tmp.path().join("project-18");
     std::fs::create_dir_all(&project_18).unwrap();
     let mut consumer_18 = target("consumer", "1.0.0", &consumer_sri, true);
-    Arc::make_mut(&mut consumer_18.target).peers = vec![("react".into(), "18.3.1".into())];
+    Arc::make_mut(&mut consumer_18.target).peers =
+        vec![lpm_common::PeerEdge::registry("react", "react", "18.3.1")];
     let result_18 = link_packages_v2(
         &project_18,
         vec![consumer_18, target("react", "18.3.1", &react_18_sri, false)],
@@ -1866,7 +1962,8 @@ fn link_packages_v2_hoisted_mode_splits_peer_divergent_projects() {
     let project_19 = tmp.path().join("project-19");
     std::fs::create_dir_all(&project_19).unwrap();
     let mut consumer_19 = target("consumer", "1.0.0", &consumer_sri, true);
-    Arc::make_mut(&mut consumer_19.target).peers = vec![("react".into(), "19.0.0".into())];
+    Arc::make_mut(&mut consumer_19.target).peers =
+        vec![lpm_common::PeerEdge::registry("react", "react", "19.0.0")];
     let result_19 = link_packages_v2(
         &project_19,
         vec![consumer_19, target("react", "19.0.0", &react_19_sri, false)],
@@ -1968,6 +2065,85 @@ fn link_packages_v2_resolves_multi_source_same_coords_with_source_edges() {
     let source_sibling = consumer_link_dir.join("node_modules").join("x");
     assert_eq!(
         std::fs::read_to_string(source_sibling.join("index.js")).unwrap(),
+        "module.exports = 'source';\n",
+    );
+}
+
+#[test]
+fn link_packages_v2_binds_aliased_peer_to_exact_source_wrapper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let registry_sri = synthetic_sri(b"aliased_peer/registry");
+    let source_sri = synthetic_sri(b"aliased_peer/source");
+    let consumer_sri = synthetic_sri(b"aliased_peer/consumer");
+    write_object(
+        &store,
+        &registry_sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'registry';\n"),
+        ],
+    );
+    write_object(
+        &store,
+        &source_sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"react\",\"version\":\"1.0.0\"}",
+            ),
+            ("index.js", b"module.exports = 'source';\n"),
+        ],
+    );
+    write_object(
+        &store,
+        &consumer_sri,
+        &[(
+            "package.json",
+            b"{\"name\":\"consumer\",\"version\":\"1.0.0\"}",
+        )],
+    );
+
+    let registry_react = target("react", "1.0.0", &registry_sri, true);
+    let mut source_react = target("react", "1.0.0", &source_sri, false);
+    Arc::make_mut(&mut source_react.target).wrapper_id = Some("t-source-react".into());
+    let mut consumer = target("consumer", "1.0.0", &consumer_sri, true);
+    Arc::make_mut(&mut consumer.target).peers = vec![lpm_common::PeerEdge {
+        local_name: "react-compat".to_string(),
+        target_name: "react".to_string(),
+        target_version: "1.0.0".to_string(),
+        target_wrapper_id: Some("t-source-react".to_string()),
+    }];
+
+    let result = link_packages_v2(
+        &project,
+        vec![registry_react, source_react, consumer],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+
+    let consumer_link_pkg = result
+        .materialized
+        .iter()
+        .find(|materialized| materialized.name == "consumer")
+        .map(|materialized| materialized.destination.clone())
+        .unwrap();
+    let peer_sibling = consumer_link_pkg
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("node_modules/react-compat");
+    assert_eq!(
+        std::fs::read_to_string(peer_sibling.join("index.js")).unwrap(),
         "module.exports = 'source';\n",
     );
 }
@@ -2758,10 +2934,7 @@ fn link_v2_finalize_replaces_symlinked_scope_parent_before_root_symlink_write() 
             .is_symlink(),
         "scoped root link must be recreated under the real scope directory",
     );
-    let key = plan
-        .key_map
-        .get_for(&plan.augmented_targets[0].target)
-        .unwrap();
+    let key = plan.key_map.get_for(&plan.augmented_targets[0]).unwrap();
     assert!(
         symlink_points_to(&root_link, &store.paths().link_package_dir(key)),
         "scoped root link should point at the virtual-store link package dir",

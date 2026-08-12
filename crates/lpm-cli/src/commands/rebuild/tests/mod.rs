@@ -759,10 +759,14 @@ fn toposort_respects_dependency_order() {
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.packages = vec![
         lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "a".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -773,13 +777,18 @@ fn toposort_respects_dependency_order() {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         },
         lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "b".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -790,6 +799,7 @@ fn toposort_respects_dependency_order() {
             dependencies: vec!["a@1.0.0".into()],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         },
     ];

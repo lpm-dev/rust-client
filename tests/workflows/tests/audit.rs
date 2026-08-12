@@ -1480,7 +1480,22 @@ async fn audit_fix_does_not_apply_transitive_version_advisory_to_safe_direct_ins
     let mut lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
     let mut transitive = lockfile.packages[0].clone();
     transitive.version = "1.0.0".to_string();
-    lockfile.packages.push(transitive);
+    transitive.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &transitive.name,
+        &transitive.version,
+        transitive.source.as_deref().unwrap_or("registry+unknown"),
+        "fixture/transitive-vulnerable-instance",
+    ));
+    lockfile.add_package(transitive);
+    for package in &mut lockfile.packages {
+        package.instance_id = None;
+        package.dependency_targets.clear();
+        package.peer_targets.clear();
+    }
+    for root in lockfile.root_resolutions.values_mut() {
+        root.instance_id = None;
+    }
+    lockfile.metadata.lockfile_version = 12;
     lockfile.write_all(&lockfile_path).unwrap();
     mock.with_osv_querybatch(vec![
         vec![],
@@ -1550,8 +1565,25 @@ async fn audit_fix_skips_source_ambiguous_installed_lockfile_instances() {
     let mut lockfile = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
     let mut local_fork = lockfile.find_package("vuln-pkg").unwrap().clone();
     local_fork.source = Some("directory+../local-vuln-pkg".to_string());
+    local_fork.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &local_fork.name,
+        &local_fork.version,
+        local_fork.source.as_deref().expect("local source"),
+        "fixture/local-vulnerable-fork",
+    ));
+    local_fork.integrity = None;
     local_fork.tarball = None;
     lockfile.add_package(local_fork);
+    for package in &mut lockfile.packages {
+        package.instance_id = None;
+        package.dependency_targets.clear();
+        package.peer_targets.clear();
+        package.manifest_fingerprint = None;
+    }
+    for root in lockfile.root_resolutions.values_mut() {
+        root.instance_id = None;
+    }
+    lockfile.metadata.lockfile_version = 10;
     lockfile.write_all(&lockfile_path).unwrap();
     let _ = std::fs::remove_dir_all(project.cache_dir().join("metadata"));
     mock.with_osv_querybatch(vec![vec![osv_fixed_vuln(

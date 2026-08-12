@@ -3513,6 +3513,7 @@ dependencies = [
  "hex",
  "lpm-common",
  "memmap2",
+ "node-semver",
  "serde",
  "sha2",
  "tempfile",

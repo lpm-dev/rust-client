@@ -2,8 +2,158 @@ use super::super::super::*;
 use super::super::ExperimentalResolverParityMode;
 use super::super::experimental::{
     DEFAULT_EXPERIMENTAL_RESOLVER_METADATA_CONCURRENCY, ExperimentalResolverAdmission,
-    ExperimentalResolverGraphSource, unsupported_admission_reasons,
+    ExperimentalResolverGraphSource, apply_computed_sri_to_artifact, index_v2_targets_by_artifact,
+    unsupported_admission_reasons,
 };
+use super::super::peer::{attach_peer_edges_to_drafts, collect_peer_requirements};
+use super::common::{empty_info_value, fake_draft};
+
+fn contextual_v2_target(
+    package: &InstallPackage,
+    instance_id: lpm_common::PackageInstanceId,
+) -> Arc<lpm_linker::v2::V2Target> {
+    Arc::new(lpm_linker::v2::V2Target {
+        instance_id,
+        target: Arc::new(lpm_linker::LinkTarget {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            store_path: PathBuf::from("/unused"),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            is_direct: false,
+            root_link_names: None,
+            wrapper_id: None,
+            materialization: lpm_linker::Materialization::CasBacked,
+            peers: Vec::new(),
+            patch_fingerprint: None,
+        }),
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
+        source_sri: package.integrity.clone().unwrap(),
+        verified_object_integrity: None,
+        fresh_object: None,
+    })
+}
+
+#[test]
+fn event_dispatch_indexes_every_contextual_instance_of_one_artifact() {
+    let mut first = super::common::fake_package("plugin", "1.0.0", &[]);
+    let mut second = first.clone();
+    let first_id = lpm_common::PackageInstanceId::derive(
+        &first.name,
+        &first.version,
+        &first.source,
+        "root/first/plugin",
+    );
+    let second_id = lpm_common::PackageInstanceId::derive(
+        &second.name,
+        &second.version,
+        &second.source,
+        "root/second/plugin",
+    );
+    first.instance_id = Some(first_id);
+    second.instance_id = Some(second_id);
+    let targets = vec![
+        contextual_v2_target(&first, first_id),
+        contextual_v2_target(&second, second_id),
+    ];
+
+    let index = index_v2_targets_by_artifact(&[first, second], &targets).unwrap();
+
+    assert_eq!(
+        index
+            .values()
+            .flat_map(|targets| targets.iter())
+            .map(|target| target.instance_id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([first_id, second_id])
+    );
+}
+
+#[test]
+fn computed_sri_updates_only_matching_source_instances() {
+    let registry = super::common::fake_package("plugin", "1.0.0", &[]);
+    let mut tarball = registry.clone();
+    tarball.source = "tarball+https://example.test/plugin.tgz".to_string();
+    tarball.integrity = None;
+    let tarball_key = install_pkg_key(&tarball);
+    let computed_sri = "sha512-computed".to_string();
+    let mut packages = vec![registry.clone(), tarball];
+
+    apply_computed_sri_to_artifact(&mut packages, &tarball_key, computed_sri.clone());
+
+    assert_eq!(
+        packages
+            .iter()
+            .map(|package| package.integrity.clone())
+            .collect::<Vec<_>>(),
+        vec![registry.integrity, Some(computed_sri)]
+    );
+}
+
+#[test]
+fn computed_sri_updates_every_contextual_instance_of_matching_artifact() {
+    let mut first = super::common::fake_package("plugin", "1.0.0", &[]);
+    first.integrity = None;
+    let mut second = first.clone();
+    first.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &first.name,
+        &first.version,
+        &first.source,
+        "root/first/plugin",
+    ));
+    second.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &second.name,
+        &second.version,
+        &second.source,
+        "root/second/plugin",
+    ));
+    let artifact_key = install_pkg_key(&first);
+    let computed_sri = "sha512-computed".to_string();
+    let mut packages = vec![first, second];
+
+    apply_computed_sri_to_artifact(&mut packages, &artifact_key, computed_sri.clone());
+
+    assert_eq!(
+        packages
+            .iter()
+            .map(|package| package.integrity.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some(computed_sri.as_str()), Some(computed_sri.as_str())]
+    );
+}
+
+#[test]
+fn experimental_resolver_rejects_malformed_required_peer_range() {
+    let mut info = empty_info_value();
+    info.peer_deps.insert(
+        "1.0.0".to_string(),
+        HashMap::from([("runtime".to_string(), "~X0^.00".to_string())]),
+    );
+    let mut consumer = fake_draft("consumer", "1.0.0", &[]);
+    consumer.info = Arc::new(info);
+    let mut packages = HashMap::from([
+        (("consumer".to_string(), "1.0.0".to_string()), consumer),
+        (
+            ("runtime".to_string(), "1.0.0".to_string()),
+            fake_draft("runtime", "1.0.0", &[]),
+        ),
+    ]);
+
+    let requirement_error = collect_peer_requirements(&packages)
+        .expect_err("ambient peer collection must reject a malformed required range");
+    let requirement_message = requirement_error.to_string();
+    assert!(requirement_message.contains("consumer"));
+    assert!(requirement_message.contains("runtime"));
+    assert!(requirement_message.contains("~X0^.00"));
+
+    let edge_error = attach_peer_edges_to_drafts(&mut packages)
+        .expect_err("peer-edge attachment must reject a malformed required range");
+    let edge_message = edge_error.to_string();
+    assert!(edge_message.contains("consumer"));
+    assert!(edge_message.contains("runtime"));
+    assert!(edge_message.contains("~X0^.00"));
+}
 
 fn benchmark_admission() -> ExperimentalResolverAdmission {
     ExperimentalResolverAdmission {

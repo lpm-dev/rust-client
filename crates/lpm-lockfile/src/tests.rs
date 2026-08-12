@@ -1,13 +1,27 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+const VALID_SHA512_SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+const VALID_SHA512_SRI_ALT: &str = "sha512-AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==";
+const VALID_SHA256_SRI: &str = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+fn legacy_lockfile() -> Lockfile {
+    let mut lockfile = Lockfile::new();
+    lockfile.metadata.lockfile_version = LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+    lockfile
+}
+
 fn sample_lockfile() -> Lockfile {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "@lpm.dev/neo.highlight".to_string(),
         version: "1.1.1".to_string(),
         source: Some("registry+https://lpm.dev".to_string()),
-        integrity: Some("sha512-abc123...".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -19,13 +33,18 @@ fn sample_lockfile() -> Lockfile {
         dependencies: vec!["react@999.999.999".to_string()],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "999.999.999".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -37,6 +56,7 @@ fn sample_lockfile() -> Lockfile {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf
@@ -50,9 +70,670 @@ fn serialize_roundtrip() {
     assert_eq!(lf, parsed);
 }
 
-fn lockfile_with_verified_provenance() -> (Lockfile, PackageKey, LockedProvenance) {
+#[test]
+fn add_package_preserves_same_artifact_rows_with_distinct_instance_ids() {
     let mut lockfile = Lockfile::new();
+    let without_peer = LockedPackage {
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "plugin".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            "plugin",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/without-peer",
+        )),
+        ..LockedPackage::default()
+    };
+    let with_peer = LockedPackage {
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            "plugin",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/with-peer",
+        )),
+        peer_edges: vec![lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "1.0.0",
+        )],
+        ..without_peer.clone()
+    };
+
+    lockfile.add_package(without_peer);
+    lockfile.add_package(with_peer);
+
+    assert_eq!(lockfile.packages.len(), 2);
+}
+
+fn instance_id(path: &str) -> lpm_common::PackageInstanceId {
+    lpm_common::PackageInstanceId::derive(
+        "fixture",
+        "1.0.0",
+        "registry+https://registry.npmjs.org",
+        path,
+    )
+}
+
+fn exact_lockfile_with_orphan() -> Lockfile {
+    let root_id = instance_id("root/reachable");
+    let orphan_id = instance_id("root/orphan");
+    let source = "registry+https://registry.npmjs.org";
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(orphan_id),
+        name: "orphan".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(source.to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(root_id),
+        name: "reachable".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(source.to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        "reachable".to_string(),
+        LockedRootResolution {
+            instance_id: Some(root_id),
+            package: "reachable".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+    lockfile
+}
+
+#[test]
+fn current_schema_round_trips_exact_instance_graph() {
+    let parent_id = instance_id("root/parent");
+    let child_id = instance_id("root/parent/child");
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["child@1.0.0".to_string()],
+        dependency_targets: BTreeMap::from([("child".to_string(), child_id)]),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(child_id),
+        name: "child".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        "parent".to_string(),
+        LockedRootResolution {
+            instance_id: Some(parent_id),
+            package: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+
+    let toml = lockfile.to_toml().expect("serialize exact instance graph");
+    let parsed = Lockfile::from_toml(&toml).expect("parse exact instance graph");
+
+    assert_eq!(parsed, lockfile);
+    assert!(!binary::binary_format_supports(&lockfile));
+}
+
+#[test]
+fn current_schema_rejects_package_unreachable_from_every_exact_root() {
+    let lockfile = exact_lockfile_with_orphan();
+    let malformed = toml::to_string_pretty(&lockfile).expect("serialize malformed fixture");
+
+    let write_error = lockfile
+        .to_toml()
+        .expect_err("writer must reject an unreachable package instance");
+    let read_error = Lockfile::from_toml(&malformed)
+        .expect_err("reader must reject an unreachable package instance");
+
+    assert!(
+        write_error
+            .to_string()
+            .contains("unreachable from every exact root")
+    );
+    assert!(
+        read_error
+            .to_string()
+            .contains("unreachable from every exact root")
+    );
+}
+
+fn exact_lockfile_with_ambient_peer(peer_is_reachable: bool) -> Lockfile {
+    let consumer_id = instance_id("root/consumer");
+    let peer_id = instance_id("root/consumer/peer-host");
+    let source = "registry+https://registry.npmjs.org";
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(consumer_id),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(source.to_string()),
+        peer_edges: if peer_is_reachable {
+            vec![lpm_common::PeerEdge::registry(
+                "peer-host",
+                "peer-host",
+                "1.0.0",
+            )]
+        } else {
+            Vec::new()
+        },
+        peer_targets: if peer_is_reachable {
+            BTreeMap::from([("peer-host".to_string(), peer_id)])
+        } else {
+            BTreeMap::new()
+        },
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(peer_id),
+        name: "peer-host".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(source.to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        "consumer".to_string(),
+        LockedRootResolution {
+            instance_id: Some(consumer_id),
+            package: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+    lockfile.root_resolutions.insert(
+        "peer-host".to_string(),
+        LockedRootResolution {
+            instance_id: Some(peer_id),
+            package: "peer-host".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+    lockfile.ambient_peer_installs = vec!["peer-host".to_string()];
+    lockfile.importers.insert(
+        ".".to_string(),
+        ImporterSnapshot {
+            dependencies: BTreeMap::from([("consumer".to_string(), "1.0.0".to_string())]),
+            auto_install_peers: Some(true),
+            ..ImporterSnapshot::default()
+        },
+    );
+    lockfile
+}
+
+#[test]
+fn current_schema_rejects_ambient_root_unreachable_from_declared_dependencies() {
+    let lockfile = exact_lockfile_with_ambient_peer(false);
+    let malformed = toml::to_string_pretty(&lockfile).expect("serialize malformed fixture");
+
+    let write_error = lockfile
+        .to_toml()
+        .expect_err("writer must reject a forged ambient root");
+    let read_error =
+        Lockfile::from_toml(&malformed).expect_err("reader must reject a forged ambient root");
+
+    assert!(write_error.to_string().contains("ambient peer root"));
+    assert!(read_error.to_string().contains("ambient peer root"));
+}
+
+#[test]
+fn current_workspace_schema_rejects_ambient_root_unreachable_from_declared_dependencies() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", exact_lockfile_with_ambient_peer(false))
+        .expect("build malformed workspace union fixture");
+
+    let error = union
+        .to_toml()
+        .expect_err("writer must reject a forged workspace ambient root");
+
+    assert!(error.to_string().contains("ambient peer root"));
+}
+
+#[test]
+fn current_schema_accepts_ambient_root_reachable_through_a_peer_edge() {
+    let lockfile = exact_lockfile_with_ambient_peer(true);
+
+    let encoded = lockfile.to_toml().expect("serialize exact peer graph");
+    let decoded = Lockfile::from_toml(&encoded).expect("parse exact peer graph");
+
+    assert_eq!(decoded, lockfile);
+}
+
+#[test]
+fn current_workspace_schema_rejects_importer_package_unreachable_from_every_exact_root() {
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", exact_lockfile_with_orphan())
+        .expect("build malformed workspace union fixture");
+
+    let error = union
+        .to_toml()
+        .expect_err("writer must reject an unreachable importer package instance");
+
+    assert!(
+        error
+            .to_string()
+            .contains("package \"orphan\" in workspace importer \"packages/app\" is unreachable from every exact root")
+    );
+}
+
+#[test]
+fn current_schema_rejects_dangling_dependency_instance_target() {
+    let parent_id = instance_id("root/parent");
+    let missing_id = instance_id("missing");
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["child@1.0.0".to_string()],
+        dependency_targets: BTreeMap::from([("child".to_string(), missing_id)]),
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("dangling instance target must fail");
+
+    assert!(error.to_string().contains("references missing instance"));
+}
+
+#[test]
+fn current_schema_rejects_dependency_metadata_that_disagrees_with_target() {
+    let parent_id = instance_id("root/parent");
+    let child_id = instance_id("root/parent/child");
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["child@2.0.0".to_string()],
+        dependency_targets: BTreeMap::from([("child".to_string(), child_id)]),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(child_id),
+        name: "child".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("denormalized target metadata must fail");
+
+    assert!(error.to_string().contains("metadata disagrees"));
+}
+
+#[test]
+fn current_schema_accepts_exact_source_dependency_identity() {
+    let parent_id = instance_id("root/parent");
+    let child_id = instance_id("root/parent/child");
+    let child_source = Source::Directory {
+        path: "packages/child".to_string(),
+    };
+    let child_source_id = child_source.source_id();
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec![format!("child@{child_source_id}")],
+        dependency_targets: BTreeMap::from([("child".to_string(), child_id)]),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(child_id),
+        name: "child".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(child_source.to_string()),
+        manifest_fingerprint: Some(format!("sha256-{}", "a".repeat(64))),
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        "parent".to_string(),
+        LockedRootResolution {
+            instance_id: Some(parent_id),
+            package: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+
+    let encoded = lockfile
+        .to_toml()
+        .expect("source-backed dependency identity must serialize");
+    let decoded =
+        Lockfile::from_toml(&encoded).expect("source-backed dependency identity must deserialize");
+
+    assert_eq!(decoded, lockfile);
+}
+
+#[test]
+fn current_schema_rejects_package_without_instance_id() {
+    let mut lockfile = Lockfile::new();
+    lockfile.packages.push(LockedPackage {
+        name: "package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("current package rows must carry exact instance IDs");
+
+    assert!(error.to_string().contains("missing instance-id"));
+}
+
+#[test]
+fn legacy_schema_rejects_root_instance_id() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.root_resolutions.insert(
+        "package".to_string(),
+        LockedRootResolution {
+            instance_id: Some(instance_id("root/package")),
+            package: "package".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("legacy lockfiles must reject v13-only root metadata");
+
+    assert!(error.to_string().contains("root resolution"));
+    assert!(error.to_string().contains("instance-id"));
+}
+
+#[test]
+fn current_schema_rejects_malformed_package_source() {
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(instance_id("root/package")),
+        name: "package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("unsupported+attacker-controlled".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("malformed package sources must fail at the lockfile boundary");
+
+    assert!(error.to_string().contains("invalid source"));
+}
+
+#[test]
+fn current_schema_rejects_duplicate_instance_id() {
+    let duplicate_id = instance_id("duplicate");
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(duplicate_id),
+        name: "alpha".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(duplicate_id),
+        name: "beta".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("instance IDs must identify exactly one graph row");
+
+    assert!(error.to_string().contains("duplicate package instance-id"));
+}
+
+#[test]
+fn current_schema_rejects_dangling_peer_instance_target() {
+    let consumer_id = instance_id("root/consumer");
+    let runtime_id = instance_id("root/consumer/runtime");
+    let missing_id = instance_id("missing");
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(consumer_id),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        peer_edges: vec![lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "1.0.0",
+        )],
+        peer_targets: BTreeMap::from([("runtime".to_string(), missing_id)]),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(runtime_id),
+        name: "runtime".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("dangling peer instance target must fail");
+
+    assert!(error.to_string().contains("references missing instance"));
+}
+
+#[test]
+fn current_schema_rejects_root_metadata_that_disagrees_with_target() {
+    let package_id = instance_id("root/package");
+    let mut lockfile = Lockfile::new();
+    lockfile.add_package(LockedPackage {
+        instance_id: Some(package_id),
+        name: "package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.root_resolutions.insert(
+        "package".to_string(),
+        LockedRootResolution {
+            instance_id: Some(package_id),
+            package: "package".to_string(),
+            version: "2.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+        },
+    );
+
+    let error = lockfile
+        .to_toml()
+        .expect_err("root metadata must agree with its exact target");
+
+    assert!(error.to_string().contains("metadata disagrees"));
+}
+
+#[test]
+fn toml_preserves_same_artifact_rows_with_distinct_instance_ids() {
+    let first_id = instance_id("root/first/plugin");
+    let second_id = instance_id("root/second/plugin");
+    let mut lockfile = Lockfile::new();
+    for instance_id in [first_id, second_id] {
+        lockfile.add_package(LockedPackage {
+            instance_id: Some(instance_id),
+            name: "plugin".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..LockedPackage::default()
+        });
+    }
+    for (local_name, instance_id) in [("first", first_id), ("second", second_id)] {
+        lockfile.root_resolutions.insert(
+            local_name.to_string(),
+            LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: "plugin".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+            },
+        );
+    }
+
+    let encoded = lockfile
+        .to_toml()
+        .expect("serialize duplicate artifact rows");
+    let decoded = Lockfile::from_toml(&encoded).expect("parse duplicate artifact rows");
+    let decoded_ids = decoded
+        .packages
+        .iter()
+        .map(|package| package.instance_id.expect("validated instance ID"))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(decoded_ids, BTreeSet::from([first_id, second_id]));
+}
+
+#[test]
+fn workspace_projection_rejects_dependency_target_slot_without_edge() {
+    let parent_id = instance_id("root/parent");
+    let child_id = instance_id("root/parent/child");
+    let mut standalone = Lockfile::new();
+    standalone.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependency_targets: BTreeMap::from([("child".to_string(), child_id)]),
+        ..LockedPackage::default()
+    });
+    standalone.add_package(LockedPackage {
+        instance_id: Some(child_id),
+        name: "child".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", standalone)
+        .expect("absorb malformed in-memory importer");
+
+    let error = union
+        .project_importer("packages/app")
+        .expect_err("dependency target without an edge must fail without panicking");
+
+    assert!(error.to_string().contains("dependency-target slots"));
+}
+
+#[test]
+fn workspace_projection_rejects_peer_edge_without_target_slot() {
+    let parent_id = instance_id("root/parent");
+    let peer_id = instance_id("root/parent/runtime");
+    let mut standalone = Lockfile::new();
+    standalone.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        peer_edges: vec![lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "1.0.0",
+        )],
+        ..LockedPackage::default()
+    });
+    standalone.add_package(LockedPackage {
+        instance_id: Some(peer_id),
+        name: "runtime".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", standalone)
+        .expect("absorb malformed in-memory importer");
+
+    let error = union
+        .project_importer("packages/app")
+        .expect_err("peer edge without a target must fail without panicking");
+
+    assert!(error.to_string().contains("peer-target slots"));
+}
+
+#[test]
+fn workspace_union_rejects_dependency_target_outside_importer_projection() {
+    let parent_id = instance_id("packages/app/parent");
+    let child_id = instance_id("packages/app/parent/child");
+    let mut app = Lockfile::new();
+    app.add_package(LockedPackage {
+        instance_id: Some(parent_id),
+        name: "parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["child@1.0.0".to_string()],
+        dependency_targets: BTreeMap::from([("child".to_string(), child_id)]),
+        ..LockedPackage::default()
+    });
+    app.add_package(LockedPackage {
+        instance_id: Some(child_id),
+        name: "child".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let other_id = instance_id("packages/other/package");
+    let mut other = Lockfile::new();
+    other.add_package(LockedPackage {
+        instance_id: Some(other_id),
+        name: "other".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/app", app)
+        .expect("absorb app importer");
+    union
+        .absorb_importer("packages/other", other)
+        .expect("absorb other importer");
+    let child_address = union.importers["packages/app"]
+        .locked_packages
+        .iter()
+        .find(|id| union.workspace_packages[*id].instance_id == Some(child_id))
+        .cloned()
+        .expect("child package address");
+    union
+        .importers
+        .get_mut("packages/app")
+        .expect("app importer")
+        .locked_packages
+        .retain(|id| id != &child_address);
+
+    let error = union
+        .to_toml()
+        .expect_err("dependency target outside the importer projection must fail");
+
+    assert!(error.to_string().contains("references missing instance"));
+    assert!(error.to_string().contains("packages/app"));
+}
+
+fn lockfile_with_verified_provenance() -> (Lockfile, PackageKey, LockedProvenance) {
+    let mut lockfile = legacy_lockfile();
     let package = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "axios".to_string(),
         version: "1.14.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
@@ -199,9 +880,10 @@ fn toml_output_is_readable() {
     let toml_str = lf.to_toml().unwrap();
 
     assert!(toml_str.contains("[metadata]"));
-    // Assert against the constant so a future version bump only
-    // requires one change.
-    assert!(toml_str.contains(&format!("lockfile-version = {}", LOCKFILE_VERSION)));
+    assert!(toml_str.contains(&format!(
+        "lockfile-version = {}",
+        LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+    )));
     assert!(toml_str.contains("[[packages]]"));
     assert!(toml_str.contains("@lpm.dev/neo.highlight"));
     assert!(toml_str.contains("react"));
@@ -209,7 +891,7 @@ fn toml_output_is_readable() {
 
 #[test]
 fn importer_snapshots_round_trip_dependency_sections() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     let importer = ImporterSnapshot {
         dependencies: BTreeMap::from([("react".to_string(), "^19.0.0".to_string())]),
         dev_dependencies: BTreeMap::from([("vitest".to_string(), "^4.0.0".to_string())]),
@@ -240,12 +922,16 @@ fn patch_records_round_trip_and_skip_binary() {
     let toml_path = dir.path().join("lpm.lock");
     let binary_path = toml_path.with_extension("lockb");
 
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "lodash".to_string(),
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-original".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -256,6 +942,7 @@ fn patch_records_round_trip_and_skip_binary() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.write_all(&toml_path).unwrap();
@@ -296,12 +983,16 @@ fn write_all_skips_binary_when_importer_snapshots_present() {
     let toml_path = dir.path().join("lpm.lock");
     let binary_path = toml_path.with_extension("lockb");
 
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -312,6 +1003,7 @@ fn write_all_skips_binary_when_importer_snapshots_present() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.write_all(&toml_path).unwrap();
@@ -361,7 +1053,7 @@ fn new_with_resolver_records_resolver_name() {
 
 #[test]
 fn auto_isolated_peer_conflicts_metadata_round_trips_when_true() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.metadata.auto_isolated_peer_conflicts = true;
 
     let toml = lf.to_toml().unwrap();
@@ -376,7 +1068,7 @@ fn auto_isolated_peer_conflicts_metadata_round_trips_when_true() {
 
 #[test]
 fn auto_isolated_peer_conflicts_metadata_defaults_false_and_is_skipped() {
-    let lf = Lockfile::new();
+    let lf = legacy_lockfile();
 
     let toml = lf.to_toml().unwrap();
     assert!(
@@ -397,7 +1089,7 @@ resolved-with = "greedy-fusion"
 
 #[test]
 fn catalog_snapshots_roundtrip_when_present() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.catalogs.insert(
         "default".to_string(),
         BTreeMap::from([(
@@ -422,7 +1114,7 @@ fn catalog_snapshots_roundtrip_when_present() {
 
 #[test]
 fn catalog_snapshots_are_additive_and_skipped_when_empty() {
-    let lf = Lockfile::new();
+    let lf = legacy_lockfile();
 
     let toml = lf.to_toml().unwrap();
     assert!(
@@ -443,7 +1135,7 @@ resolved-with = "greedy-fusion"
 
 #[test]
 fn binary_format_does_not_claim_support_for_catalog_snapshots() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.catalogs.insert(
         "default".to_string(),
         BTreeMap::from([(
@@ -464,12 +1156,16 @@ fn binary_format_does_not_claim_support_for_catalog_snapshots() {
 
 #[test]
 fn packages_sorted_by_name() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "zlib".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -481,13 +1177,18 @@ fn packages_sorted_by_name() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "alpha".to_string(),
         version: "2.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -499,6 +1200,7 @@ fn packages_sorted_by_name() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -516,12 +1218,16 @@ fn find_package_by_name() {
 
 #[test]
 fn tarball_roundtrips_when_present() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "lodash".to_string(),
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-xyz".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -533,6 +1239,7 @@ fn tarball_roundtrips_when_present() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
     });
 
@@ -576,12 +1283,16 @@ fn tarball_mixed_population_roundtrips() {
     // Real-world rollout window: some entries have a tarball URL,
     // others don't. Per-package `None` must be preserved; `Some`
     // must round-trip with its value.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "express".to_string(),
         version: "4.22.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -593,13 +1304,18 @@ fn tarball_mixed_population_roundtrips() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None, // old entry, not yet re-resolved
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "lodash".to_string(),
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -611,6 +1327,7 @@ fn tarball_mixed_population_roundtrips() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
     });
 
@@ -638,7 +1355,7 @@ resolved-with = "greedy-fusion"
 name = "signed-pkg"
 version = "1.0.0"
 source = "registry+https://registry.npmjs.org"
-integrity = "sha512-signed"
+integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 registry-published-at = "2025-01-01T00:00:00.000Z"
 dependencies = []
 
@@ -707,7 +1424,7 @@ version = "1.0.0"
         ));
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("empty '{field}'")) && msg.contains("bad-pkg"),
+            msg.contains(field) && msg.contains("empty") && msg.contains("bad-pkg"),
             "error for {field} should name field and package, got: {msg}"
         );
     }
@@ -726,7 +1443,7 @@ resolved-with = "pubgrub"
 name = "react"
 version = "18.2.0"
 source = "registry+https://registry.npmjs.org"
-integrity = "sha512-old"
+integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 dependencies = []
 "#;
     let parsed = Lockfile::from_toml(toml_str).unwrap();
@@ -760,6 +1477,58 @@ fn write_and_read_file() {
 
     let read_back = Lockfile::read_from_file(&path).unwrap();
     assert_eq!(lf, read_back);
+}
+
+#[test]
+fn authoritative_toml_reader_accepts_exact_limit_and_rejects_one_byte_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(LOCKFILE_NAME);
+    let mut exact = sample_lockfile().to_toml().unwrap();
+    exact.push('\n');
+    exact.push('#');
+    exact.extend(std::iter::repeat_n(
+        ' ',
+        TOML_LOCKFILE_SIZE_CAP_BYTES as usize - exact.len(),
+    ));
+    assert_eq!(exact.len() as u64, TOML_LOCKFILE_SIZE_CAP_BYTES);
+    std::fs::write(&path, exact).unwrap();
+
+    Lockfile::read_from_file(&path).expect("exactly-at-limit lockfile must load");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(TOML_LOCKFILE_SIZE_CAP_BYTES + 1)
+        .unwrap();
+    let error = Lockfile::read_from_file(&path).expect_err("over-limit lockfile must fail");
+    assert!(error.to_string().contains("exceeds"));
+}
+
+#[test]
+fn write_to_file_refuses_content_over_limit_without_replacing_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(LOCKFILE_NAME);
+    std::fs::write(&path, b"original").unwrap();
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "oversized".to_string(),
+        version: "1.0.0".to_string(),
+        tarball: Some(format!(
+            "https://registry.npmjs.org/oversized/-/oversized-{}.tgz",
+            "a".repeat(TOML_LOCKFILE_SIZE_CAP_BYTES as usize)
+        )),
+        ..Default::default()
+    });
+
+    let error = lockfile
+        .write_to_file(&path)
+        .expect_err("writer must not create a lockfile its reader rejects");
+
+    assert!(error.to_string().contains("exceeds"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"original");
 }
 
 #[test]
@@ -908,6 +1677,23 @@ fn safe_source_loopback() {
 }
 
 #[test]
+fn safe_source_rejects_http_hosts_with_localhost_prefixes() {
+    for source in [
+        "registry+http://localhost.evil.com:3000",
+        "registry+http://127.0.0.1.evil.com:3000",
+    ] {
+        assert!(!is_safe_source(source), "accepted unsafe source {source:?}");
+    }
+}
+
+#[test]
+fn safe_source_rejects_registry_urls_with_credentials() {
+    assert!(!is_safe_source(
+        "registry+https://user:secret@registry.example.com"
+    ));
+}
+
+#[test]
 fn unsafe_source_ftp() {
     assert!(!is_safe_source("ftp://evil.com/packages"));
 }
@@ -940,8 +1726,11 @@ fn safe_source_rejects_github_repository_with_credentials() {
 
 #[test]
 fn to_toml_rejects_git_source_without_archive_integrity() {
-    let mut lockfile = Lockfile::new();
+    let mut lockfile = legacy_lockfile();
     lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "wa-sqlite".to_string(),
         version: "1.0.9".to_string(),
         source: Some(
@@ -954,7 +1743,142 @@ fn to_toml_rejects_git_source_without_archive_integrity() {
     let error = lockfile
         .to_toml()
         .expect_err("Git source without integrity must not serialize");
-    assert!(error.to_string().contains("missing archive integrity"));
+    assert!(error.to_string().contains("missing integrity"));
+}
+
+#[test]
+fn tarball_source_requires_integrity_at_every_lockfile_boundary() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "archive-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("tarball+https://example.com/archive-package.tgz".to_string()),
+        ..Default::default()
+    });
+    let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+    let read_error = Lockfile::from_toml(&raw).expect_err("TOML reader must reject missing SRI");
+    assert!(read_error.to_string().contains("missing integrity"));
+    let write_error = lockfile
+        .to_toml()
+        .expect_err("TOML writer must reject missing SRI");
+    assert!(write_error.to_string().contains("missing integrity"));
+    let binary_error =
+        binary::to_binary(&lockfile).expect_err("binary writer must reject missing SRI");
+    assert!(binary_error.to_string().contains("missing integrity"));
+}
+
+#[test]
+fn directory_and_link_sources_reject_integrity_at_every_lockfile_boundary() {
+    for source in ["directory+./package", "link+./package"] {
+        let mut lockfile = legacy_lockfile();
+        lockfile.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
+            name: "local-package".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            ..Default::default()
+        });
+        let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+        let read_error =
+            Lockfile::from_toml(&raw).expect_err("TOML reader must reject unexpected SRI");
+        assert!(read_error.to_string().contains("must not have integrity"));
+        let write_error = lockfile
+            .to_toml()
+            .expect_err("TOML writer must reject unexpected SRI");
+        assert!(write_error.to_string().contains("must not have integrity"));
+        let binary_error =
+            binary::to_binary(&lockfile).expect_err("binary writer must reject unexpected SRI");
+        assert!(binary_error.to_string().contains("must not have integrity"));
+    }
+}
+
+#[test]
+fn current_schema_local_sources_require_valid_manifest_fingerprints() {
+    for source in ["directory+./package", "link+./package"] {
+        let mut missing = legacy_lockfile();
+        missing.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
+            name: "local-package".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            ..Default::default()
+        });
+        let missing_raw = toml::to_string_pretty(&missing).expect("serialize crafted lockfile");
+        assert!(Lockfile::from_toml(&missing_raw).is_err());
+        assert!(missing.to_toml().is_err());
+
+        let mut malformed = missing.clone();
+        malformed.packages[0].manifest_fingerprint = Some("sha256-not-hex".to_string());
+        let malformed_raw = toml::to_string_pretty(&malformed).expect("serialize crafted lockfile");
+        assert!(Lockfile::from_toml(&malformed_raw).is_err());
+        assert!(malformed.to_toml().is_err());
+
+        let mut valid = missing;
+        valid.packages[0].manifest_fingerprint = Some(format!("sha256-{}", "ab".repeat(32)));
+        let encoded = valid
+            .to_toml()
+            .expect("serialize fingerprinted local source");
+        assert_eq!(Lockfile::from_toml(&encoded).unwrap(), valid);
+    }
+}
+
+#[test]
+fn version_ten_local_sources_remain_readable_without_fingerprints() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.metadata.lockfile_version = LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS;
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "local-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("directory+./package".to_string()),
+        ..Default::default()
+    });
+
+    let encoded = lockfile.to_toml().expect("serialize v10 local source");
+    assert_eq!(Lockfile::from_toml(&encoded).unwrap(), lockfile);
+}
+
+#[test]
+fn fingerprints_are_rejected_before_version_eleven_and_on_non_local_sources() {
+    let fingerprint = Some(format!("sha256-{}", "ab".repeat(32)));
+    let mut legacy = legacy_lockfile();
+    legacy.metadata.lockfile_version = LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS;
+    legacy.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "local-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("directory+./package".to_string()),
+        manifest_fingerprint: fingerprint.clone(),
+        ..Default::default()
+    });
+    assert!(legacy.to_toml().is_err());
+
+    let mut registry = legacy_lockfile();
+    registry.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "registry-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        manifest_fingerprint: fingerprint,
+        ..Default::default()
+    });
+    assert!(registry.to_toml().is_err());
 }
 
 #[test]
@@ -967,7 +1891,7 @@ lockfile-version = 9
 name = "wa-sqlite"
 version = "1.0.9"
 source = "git+https://github.com/rhashimoto/wa-sqlite.git#main"
-integrity = "sha512-YQ=="
+integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 "#;
 
     let error =
@@ -985,7 +1909,7 @@ lockfile-version = 8
 name = "wa-sqlite"
 version = "1.0.9"
 source = "git+https://github.com/rhashimoto/wa-sqlite.git#779219540f66cecaa159da32b3b8936697ba10a7"
-integrity = "sha512-YQ=="
+integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 "#;
 
     let error = Lockfile::from_toml(toml)
@@ -996,10 +1920,13 @@ integrity = "sha512-YQ=="
 #[test]
 fn package_key_distinguishes_two_commits_of_same_github_package() {
     let package_at = |commit: &str| LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "example".to_string(),
         version: "1.0.0".to_string(),
         source: Some(format!("git+https://github.com/owner/example.git#{commit}")),
-        integrity: Some("sha512-YQ==".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
         ..Default::default()
     };
 
@@ -1015,14 +1942,18 @@ fn package_key_distinguishes_two_commits_of_same_github_package() {
 /// `node_modules/<local>/` layout.
 #[test]
 fn toml_roundtrips_npm_alias_metadata() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.root_aliases
         .insert("strip-ansi-cjs".to_string(), "strip-ansi".to_string());
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "strip-ansi".to_string(),
         version: "6.0.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-abc".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1034,13 +1965,18 @@ fn toml_roundtrips_npm_alias_metadata() {
         dependencies: vec!["ansi-regex@5.0.1".to_string()],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "parent-with-alias-dep".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1052,6 +1988,7 @@ fn toml_roundtrips_npm_alias_metadata() {
         dependencies: vec!["strip-ansi-cjs@6.0.1".to_string()],
         alias_dependencies: vec![["strip-ansi-cjs".to_string(), "strip-ansi".to_string()]],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -1074,10 +2011,11 @@ fn toml_roundtrips_npm_alias_metadata() {
 
 #[test]
 fn toml_roundtrips_exact_root_resolutions() {
-    let mut lockfile = Lockfile::new();
+    let mut lockfile = legacy_lockfile();
     lockfile.root_resolutions.insert(
         "peer-host".to_string(),
         LockedRootResolution {
+            instance_id: None,
             package: "peer-host".to_string(),
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
@@ -1101,12 +2039,16 @@ fn write_all_skips_binary_when_root_aliases_present() {
     let binary_path = toml_path.with_extension("lockb");
 
     // First write — non-aliased lockfile produces BOTH files.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1118,6 +2060,7 @@ fn write_all_skips_binary_when_root_aliases_present() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.write_all(&toml_path).unwrap();
@@ -1143,12 +2086,16 @@ fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
     let toml_path = dir.path().join("lpm.lock");
     let binary_path = toml_path.with_extension("lockb");
 
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1160,6 +2107,7 @@ fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.write_all(&toml_path).unwrap();
@@ -1175,12 +2123,16 @@ fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
 
 #[test]
 fn empty_deps_not_serialized() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1192,6 +2144,7 @@ fn empty_deps_not_serialized() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     let toml_str = lf.to_toml().unwrap();
@@ -1221,12 +2174,16 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
     let toml_path = dir.path().join("lpm.lock");
     let binary_path = dir.path().join("lpm.lockb");
 
-    let mut toml_lockfile = Lockfile::new();
+    let mut toml_lockfile = legacy_lockfile();
     toml_lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "reviewed".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-reviewed".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1238,18 +2195,23 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/reviewed/-/reviewed-1.0.0.tgz".to_string()),
     });
     toml_lockfile.write_to_file(&toml_path).unwrap();
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let mut poisoned_binary = Lockfile::new();
+    let mut poisoned_binary = legacy_lockfile();
     poisoned_binary.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "reviewed".to_string(),
         version: "9.9.9".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-poisoned".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1261,6 +2223,7 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         dependencies: vec!["payload@1.0.0".to_string()],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/reviewed/-/reviewed-9.9.9.tgz".to_string()),
     });
     binary::write_binary(&poisoned_binary, &binary_path).unwrap();
@@ -1281,12 +2244,16 @@ fn read_fast_ignores_stale_binary() {
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let mut lf2 = Lockfile::new();
+    let mut lf2 = legacy_lockfile();
     lf2.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "only-in-toml".to_string(),
         version: "9.9.9".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1298,6 +2265,7 @@ fn read_fast_ignores_stale_binary() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf2.write_to_file(&toml_path).unwrap();
@@ -1364,10 +2332,14 @@ fn read_fast_works_with_only_toml() {
 
 fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
     LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: name.to_string(),
         version: "1.0.0".to_string(),
         source: source.map(|s| s.to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1379,6 +2351,7 @@ fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     }
 }
@@ -1452,18 +2425,28 @@ fn source_kind_returns_err_for_unknown_kind() {
     let pkg = pkg_with_source("foo", Some("nonsense+whatever"));
     assert!(matches!(
         pkg.source_kind(),
-        Some(Err(SourceParseError::UnknownKind(_)))
+        Some(Err(SourceParseError::UnknownKind))
     ));
 }
 
 // ── tarball field-hint disjointness ──────────────────────────────────────
 
 fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> LockedPackage {
+    let integrity = source
+        .is_some_and(|source| source.starts_with("tarball+") || source.starts_with("git+"))
+        .then(|| VALID_SHA512_SRI.to_string());
+    let manifest_fingerprint = source
+        .is_some_and(|source| source.starts_with("directory+") || source.starts_with("link+"))
+        .then(|| format!("sha256-{}", "ab".repeat(32)));
     LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: source.map(|s| s.to_string()),
-        integrity: None,
+        integrity,
+        manifest_fingerprint,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1475,6 +2458,7 @@ fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> L
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: tarball.map(|s| s.to_string()),
     }
 }
@@ -1555,7 +2539,7 @@ fn tarball_hint_consistent_when_source_unparseable() {
 fn tarball_field_hint_round_trips_through_toml_with_registry() {
     // The full-shape TOML round-trip with both source AND tarball
     // hint set must survive serialization unchanged.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("registry+https://registry.npmjs.org"),
         Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
@@ -1571,7 +2555,7 @@ fn tarball_source_round_trips_through_toml_without_hint() {
     // A `Source::Tarball` package must NOT carry a tarball hint
     // through the round-trip — the parser preserves the shape we
     // wrote (no hint), and the consistency check stays green.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("tarball+https://e.com/foo-1.0.0.tgz"),
         None,
@@ -1594,7 +2578,7 @@ fn directory_source_round_trips_through_toml() {
     // `Source::Directory { path }` — file: directory dep.
     // Wire-format `directory+<rel-path>` survives serialize +
     // parse; disjointness invariant holds (no tarball hint).
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("directory+./packages/foo"),
         None,
@@ -1616,7 +2600,7 @@ fn directory_source_round_trips_through_toml() {
 fn link_source_round_trips_through_toml() {
     // `Source::Link { path }` — link: dep. Same shape as
     // Directory but with `link+` wire prefix.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("link+../shared/util"),
         None,
@@ -1640,12 +2624,16 @@ fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
     // the URL prefix is what disambiguates downstream. Integrity is sha256 (computed
     // from the bytes at install time), distinct from the sha512
     // SRI typically used for remote registry tarballs.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "local-bundle".to_string(),
         version: "1.0.0".to_string(),
         source: Some("tarball+file:./vendor/local-bundle-1.0.0.tgz".to_string()),
-        integrity: Some("sha256-abc123def456".to_string()),
+        integrity: Some(VALID_SHA256_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1657,6 +2645,7 @@ fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     let toml = lf.to_toml().expect("serialize");
@@ -1668,7 +2657,7 @@ fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
     // Integrity preserved exactly.
     assert_eq!(
         parsed.packages[0].integrity.as_deref(),
-        Some("sha256-abc123def456"),
+        Some(VALID_SHA256_SRI),
     );
     // The URL retains the file: prefix — this is what install.rs's
     // `store_path_source_aware` route discrimination depends on.
@@ -1689,12 +2678,16 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
     // (local) + directory + link, all in one graph. Round-trip
     // preserves every package's source identity. Exercises the
     // identity model end-to-end at the lockfile layer.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "lodash".to_string(),
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-lodash".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1706,13 +2699,18 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "remote-fork".to_string(),
         version: "1.0.0".to_string(),
         source: Some("tarball+https://e.com/remote-fork.tgz".to_string()),
-        integrity: Some("sha512-remoteFork".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1724,13 +2722,18 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "local-tarball".to_string(),
         version: "1.0.0".to_string(),
         source: Some("tarball+file:./vendor/local-tarball.tgz".to_string()),
-        integrity: Some("sha256-localTarball".to_string()),
+        integrity: Some(VALID_SHA256_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1742,13 +2745,18 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "local-dir".to_string(),
         version: "0.1.0".to_string(),
         source: Some("directory+./packages/local-dir".to_string()),
         integrity: None,
+        manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1760,13 +2768,18 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "linked".to_string(),
         version: "0.1.0".to_string(),
         source: Some("link+../shared/linked".to_string()),
         integrity: None,
+        manifest_fingerprint: Some(format!("sha256-{}", "cd".repeat(32))),
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -1778,6 +2791,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -1910,7 +2924,7 @@ fn from_toml_rejects_link_source_with_hint_conflation() {
 fn from_toml_accepts_registry_source_with_hint() {
     // The intended shape — registry source plus dist-URL hint —
     // must still parse cleanly through the gate.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("registry+https://registry.npmjs.org"),
         Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
@@ -1929,11 +2943,94 @@ fn from_toml_rejects_lpm_scope_pointed_at_non_lpm_origin() {
              version = \"1.0.0\"\n\
              source = \"registry+https://registry.npmjs.org\"\n";
     match Lockfile::from_toml(toml) {
-        Err(LockfileError::InvalidScopeOrigin { package, url }) => {
+        Err(LockfileError::InvalidScopeOrigin {
+            package,
+            source_identity,
+        }) => {
             assert_eq!(package, "@lpm.dev/alice.utils");
-            assert_eq!(url, "https://registry.npmjs.org");
+            assert_eq!(source_identity, "registry+https://registry.npmjs.org");
         }
         other => panic!("expected InvalidScopeOrigin, got {other:?}"),
+    }
+}
+
+#[test]
+fn scope_origin_error_redacts_credentials_and_url_components() {
+    let toml = "[metadata]\n\
+             lockfile-version = 1\n\
+             \n\
+             [[packages]]\n\
+             name = \"@lpm.dev/alice.utils\"\n\
+             version = \"1.0.0\"\n\
+             source = \"registry+https://source-user:source-password@example.invalid/private-path?token=query-secret#fragment-secret\"\n";
+    let error = Lockfile::from_toml(toml).expect_err("off-origin source must be rejected");
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("registry+https://example.invalid"));
+    for secret in [
+        "source-user",
+        "source-password",
+        "private-path",
+        "query-secret",
+        "fragment-secret",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "scope-origin error exposed {secret:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn malformed_source_error_does_not_echo_the_raw_source() {
+    let raw_source = "https://source-user:source-password@example.invalid/private-path?token=query-secret#fragment-secret";
+    let toml = format!(
+        "[metadata]\nlockfile-version = 1\n\n[[packages]]\nname = \"ordinary-package\"\nversion = \"1.0.0\"\nsource = {raw_source:?}\n"
+    );
+    let error = Lockfile::from_toml(&toml).expect_err("malformed source must be rejected");
+    let rendered = error.to_string();
+
+    assert!(rendered.contains("unknown source kind"));
+    for secret in [
+        "source-user",
+        "source-password",
+        "example.invalid",
+        "private-path",
+        "query-secret",
+        "fragment-secret",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "malformed-source error exposed {secret:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn malformed_toml_error_does_not_echo_source_credentials() {
+    let toml = "[metadata]\n\
+                lockfile-version = 13\n\
+                \n\
+                [[packages]]\n\
+                name = \"ordinary-package\"\n\
+                version = \"1.0.0\"\n\
+                source = \"registry+https://source-user:source-password@example.invalid/private-path?token=query-secret#fragment-secret\n";
+    let rendered = Lockfile::from_toml(toml)
+        .expect_err("malformed TOML must be rejected")
+        .to_string();
+
+    for secret in [
+        "source-user",
+        "source-password",
+        "example.invalid",
+        "private-path",
+        "query-secret",
+        "fragment-secret",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "TOML parser error exposed {secret:?}: {rendered}"
+        );
     }
 }
 
@@ -1991,10 +3088,14 @@ fn from_toml_accepts_non_lpm_scope_at_any_origin() {
 #[test]
 fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
     let bad = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "@lpm.dev/alice.utils".into(),
         version: "1.0.0".into(),
         source: Some("registry+https://registry.npmjs.org".into()),
-        integrity: Some("sha512-deadbeef".into()),
+        integrity: Some(VALID_SHA512_SRI.into()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2006,15 +3107,217 @@ fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     };
     match Lockfile::validate_loaded_packages(&[bad]) {
-        Err(LockfileError::InvalidScopeOrigin { package, url }) => {
+        Err(LockfileError::InvalidScopeOrigin {
+            package,
+            source_identity,
+        }) => {
             assert_eq!(package, "@lpm.dev/alice.utils");
-            assert_eq!(url, "https://registry.npmjs.org");
+            assert_eq!(source_identity, "registry+https://registry.npmjs.org");
         }
         other => panic!("expected InvalidScopeOrigin, got {other:?}"),
     }
+}
+
+#[test]
+fn from_toml_rejects_package_name_that_escapes_install_roots() {
+    let mut lockfile = sample_lockfile();
+    lockfile.packages[0].name = "../escape".to_string();
+    let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+    assert!(matches!(
+        Lockfile::from_toml(&raw),
+        Err(LockfileError::InvalidPackageField { field: "name", .. })
+    ));
+}
+
+#[test]
+fn from_toml_rejects_package_version_that_is_not_a_single_version() {
+    let mut lockfile = sample_lockfile();
+    lockfile.packages[0].version = "../1.0.0".to_string();
+    let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+    assert!(matches!(
+        Lockfile::from_toml(&raw),
+        Err(LockfileError::InvalidPackageField {
+            field: "version",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn lockfile_boundaries_reject_malformed_dependency_edges() {
+    let cases = [
+        ("missing separator", vec!["child".to_string()]),
+        ("empty local name", vec!["@1.0.0".to_string()]),
+        ("empty version", vec!["child@".to_string()]),
+        ("unsafe local name", vec!["../child@1.0.0".to_string()]),
+        ("non-exact version", vec!["child@^1.0.0".to_string()]),
+        (
+            "duplicate local slot",
+            vec!["child@1.0.0".to_string(), "child@2.0.0".to_string()],
+        ),
+    ];
+
+    for (case, dependencies) in cases {
+        let mut lockfile = sample_lockfile();
+        lockfile.packages[0].dependencies = dependencies;
+        let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+        let read_error = Lockfile::from_toml(&raw)
+            .expect_err("malformed dependency edge must fail at the read boundary");
+        assert!(
+            read_error.to_string().contains("dependency"),
+            "case {case:?} returned {read_error}"
+        );
+
+        let write_error = lockfile
+            .to_toml()
+            .expect_err("malformed dependency edge must fail at the write boundary");
+        assert!(
+            write_error.to_string().contains("dependency"),
+            "case {case:?} returned {write_error}"
+        );
+    }
+}
+
+#[test]
+fn lockfile_boundaries_reject_malformed_alias_edges() {
+    let cases = [
+        (
+            "missing dependency slot",
+            vec![["alias".to_string(), "react".to_string()]],
+        ),
+        (
+            "duplicate alias slot",
+            vec![
+                ["react".to_string(), "target-one".to_string()],
+                ["react".to_string(), "target-two".to_string()],
+            ],
+        ),
+        (
+            "unsafe alias local name",
+            vec![["../react".to_string(), "react".to_string()]],
+        ),
+        (
+            "unsafe alias target name",
+            vec![["react".to_string(), "../target".to_string()]],
+        ),
+    ];
+
+    for (case, aliases) in cases {
+        let mut lockfile = sample_lockfile();
+        lockfile.packages[0].alias_dependencies = aliases;
+        let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+        let read_error = Lockfile::from_toml(&raw)
+            .expect_err("malformed alias edge must fail at the read boundary");
+        assert!(
+            read_error.to_string().contains("alias"),
+            "case {case:?} returned {read_error}"
+        );
+
+        let write_error = lockfile
+            .to_toml()
+            .expect_err("malformed alias edge must fail at the write boundary");
+        assert!(
+            write_error.to_string().contains("alias"),
+            "case {case:?} returned {write_error}"
+        );
+    }
+}
+
+#[test]
+fn from_toml_rejects_standalone_packages_out_of_identity_order() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.packages = vec![
+        LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
+            name: "zlib".to_string(),
+            version: "1.0.0".to_string(),
+            ..LockedPackage::default()
+        },
+        LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
+            name: "alpha".to_string(),
+            version: "1.0.0".to_string(),
+            ..LockedPackage::default()
+        },
+    ];
+    let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+    let error = Lockfile::from_toml(&raw)
+        .expect_err("out-of-order standalone package rows must fail validation");
+
+    assert!(error.to_string().contains("package identity order"));
+}
+
+#[test]
+fn from_toml_rejects_duplicate_standalone_package_identity() {
+    let first = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "duplicate".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    };
+    let mut second = first.clone();
+    second.dependencies = vec!["child@1.0.0".to_string()];
+    let mut lockfile = legacy_lockfile();
+    lockfile.packages = vec![first, second];
+    let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+    let error = Lockfile::from_toml(&raw)
+        .expect_err("duplicate standalone package identities must fail validation");
+
+    assert!(error.to_string().contains("duplicate package identity"));
+}
+
+#[test]
+fn writers_reject_unsafe_package_identity() {
+    let mut lockfile = sample_lockfile();
+    lockfile.packages[0].name = "C:\\escape".to_string();
+
+    assert!(matches!(
+        lockfile.to_toml(),
+        Err(LockfileError::InvalidPackageField { field: "name", .. })
+    ));
+    assert!(matches!(
+        binary::to_binary(&lockfile),
+        Err(LockfileError::InvalidPackageField { field: "name", .. })
+    ));
+}
+
+#[test]
+fn lockfile_boundaries_reject_malformed_integrity() {
+    let mut lockfile = sample_lockfile();
+    lockfile.packages[0].integrity = Some("sha512-not-base64!".to_string());
+    let raw = toml::to_string_pretty(&lockfile).expect("serialize crafted lockfile");
+
+    assert!(matches!(
+        Lockfile::from_toml(&raw),
+        Err(LockfileError::InvalidPackageField {
+            field: "integrity",
+            ..
+        })
+    ));
+    assert!(matches!(
+        lockfile.to_toml(),
+        Err(LockfileError::InvalidPackageField {
+            field: "integrity",
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -2062,7 +3365,7 @@ fn from_toml_gate_runs_per_package_and_names_first_offender() {
 
 #[test]
 fn to_toml_rejects_tarball_source_with_hint_conflation() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("tarball+https://e.com/foo.tgz"),
         Some("https://e.com/foo.tgz"),
@@ -2077,7 +3380,7 @@ fn to_toml_rejects_tarball_source_with_hint_conflation() {
 
 #[test]
 fn to_toml_rejects_git_source_with_hint_conflation() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("git+https://github.com/foo/bar.git"),
         Some("https://e.com/foo.tgz"),
@@ -2090,7 +3393,7 @@ fn to_toml_rejects_git_source_with_hint_conflation() {
 
 #[test]
 fn to_toml_rejects_directory_source_with_hint_conflation() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("directory+../packages/foo"),
         Some("https://e.com/foo.tgz"),
@@ -2103,7 +3406,7 @@ fn to_toml_rejects_directory_source_with_hint_conflation() {
 
 #[test]
 fn to_toml_rejects_link_source_with_hint_conflation() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("link+../packages/foo"),
         Some("https://e.com/foo.tgz"),
@@ -2118,7 +3421,7 @@ fn to_toml_rejects_link_source_with_hint_conflation() {
 fn to_toml_accepts_registry_source_with_hint() {
     // Registry + dist-URL hint must continue to serialize cleanly
     // through the guard.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("registry+https://registry.npmjs.org"),
         Some("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"),
@@ -2128,7 +3431,7 @@ fn to_toml_accepts_registry_source_with_hint() {
 
 #[test]
 fn to_toml_accepts_tarball_source_without_hint() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("tarball+https://e.com/foo.tgz"),
         None,
@@ -2141,12 +3444,16 @@ fn to_toml_accepts_tarball_source_without_hint() {
 fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
     // Two-package case mirroring the reader-side test: first OK,
     // second conflated. Writer guard must surface the second.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "good-pkg".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2158,13 +3465,18 @@ fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/good-pkg/-/good-pkg-1.0.0.tgz".to_string()),
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "bad-pkg".to_string(),
         version: "1.0.0".to_string(),
         source: Some("git+https://github.com/foo/bar.git".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2176,6 +3488,7 @@ fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: Some("https://e.com/bad.tgz".to_string()),
     });
     match lf.to_toml() {
@@ -2193,7 +3506,7 @@ fn writer_guard_prevents_serialization_of_conflated_shape() {
     // reader-side gate is genuinely the last line of defense
     // against external corruption (hand-edits, CI tampering),
     // not a fallback for our own writer.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(pkg_with_source_and_tarball(
         Some("tarball+https://e.com/foo.tgz"),
         Some("https://e.com/foo.tgz"),
@@ -2223,10 +3536,14 @@ fn package_key_distinguishes_cross_source_same_name_version() {
     // produce distinct PackageKeys — that
     // collision case being structurally prevented.
     let reg = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2238,13 +3555,18 @@ fn package_key_distinguishes_cross_source_same_name_version() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     };
     let tar = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2256,6 +3578,7 @@ fn package_key_distinguishes_cross_source_same_name_version() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     };
 
@@ -2272,10 +3595,14 @@ fn package_key_distinguishes_cross_source_same_name_version() {
 #[test]
 fn package_key_uses_unknown_sentinel_when_source_missing() {
     let pkg = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2287,6 +3614,7 @@ fn package_key_uses_unknown_sentinel_when_source_missing() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     };
     assert_eq!(pkg.package_key().source_id, PackageKey::UNKNOWN_SOURCE_ID);
@@ -2298,12 +3626,16 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
     // must coexist in the Vec, sorted deterministically by the
     // (name, version, source_id) triple. A name-only sort would have either dropped one or
     // returned ambiguous ordering on insert.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2315,13 +3647,18 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2333,6 +3670,7 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -2359,12 +3697,16 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
 
 #[test]
 fn find_package_by_key_disambiguates_cross_source_collisions() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     let registry_pkg = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-AAAAAAAAAA==".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2376,13 +3718,18 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     };
     let tarball_pkg = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
-        integrity: Some("sha512-BBBBBBBBBB==".to_string()),
+        integrity: Some(VALID_SHA512_SRI_ALT.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2394,6 +3741,7 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     };
     let reg_key = registry_pkg.package_key();
@@ -2410,13 +3758,13 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         by_reg.source.as_deref().unwrap().starts_with("registry+"),
         "find_package_by_key(registry-key) must return the registry pkg, not the tarball one"
     );
-    assert_eq!(by_reg.integrity.as_deref(), Some("sha512-AAAAAAAAAA=="));
+    assert_eq!(by_reg.integrity.as_deref(), Some(VALID_SHA512_SRI));
 
     let by_tar = lf
         .find_package_by_key(&tar_key)
         .expect("tarball must be findable");
     assert!(by_tar.source.as_deref().unwrap().starts_with("tarball+"));
-    assert_eq!(by_tar.integrity.as_deref(), Some("sha512-BBBBBBBBBB=="));
+    assert_eq!(by_tar.integrity.as_deref(), Some(VALID_SHA512_SRI_ALT));
 }
 
 // ── Peers + ambient_peer_installs round-trip ──────────────────
@@ -2443,7 +3791,7 @@ fn ambient_peer_installs_round_trip_through_toml() {
     // Cold-resolve writes a lockfile with two ambient peer
     // installs. Round-trip through TOML must preserve them in
     // alphabetical order.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.ambient_peer_installs = vec!["react".to_string(), "@types/react".to_string()];
     // Sort here mirrors the resolver's drain-tail dedup+sort; the
     // ordering invariant is part of the contract so tests pin both
@@ -2469,7 +3817,7 @@ fn ambient_peer_installs_empty_skipped_in_serialization() {
     // Backward-compat: a lockfile with NO ambient peers must
     // serialize WITHOUT the `ambient-peer-installs` field, keeping
     // older lockfiles byte-identical.
-    let lf = Lockfile::new();
+    let lf = legacy_lockfile();
     assert!(lf.ambient_peer_installs.is_empty());
 
     let toml = lf.to_toml().expect("serialize must succeed");
@@ -2482,12 +3830,34 @@ fn ambient_peer_installs_empty_skipped_in_serialization() {
 #[test]
 fn locked_package_peers_round_trip_through_toml() {
     // A package with two peer pins survives TOML round-trip.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "react".to_string(),
+        version: "18.2.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "redux".to_string(),
+        version: "5.0.1".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react-redux".to_string(),
         version: "9.2.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2498,21 +3868,28 @@ fn locked_package_peers_round_trip_through_toml() {
 
         dependencies: vec!["use-sync-external-store@1.6.0".to_string()],
         alias_dependencies: vec![],
-        peers: vec!["react@18.2.0".to_string(), "redux@5.0.1".to_string()],
+        peers: Vec::new(),
+        peer_edges: vec![
+            lpm_common::PeerEdge::registry("react-compat", "react", "18.2.0"),
+            lpm_common::PeerEdge::registry("redux", "redux", "5.0.1"),
+        ],
         tarball: None,
     });
 
     let toml = lf.to_toml().expect("serialize must succeed");
     assert!(
-        toml.contains("peers ="),
+        toml.contains("[[packages.peer-edges]]"),
         "non-empty peers must serialize: {toml}"
     );
 
     let restored = Lockfile::from_toml(&toml).expect("parse must succeed");
     let pkg = restored.find_package("react-redux").unwrap();
     assert_eq!(
-        pkg.peers,
-        vec!["react@18.2.0".to_string(), "redux@5.0.1".to_string()],
+        pkg.peer_edges,
+        vec![
+            lpm_common::PeerEdge::registry("react-compat", "react", "18.2.0"),
+            lpm_common::PeerEdge::registry("redux", "redux", "5.0.1"),
+        ],
         "per-package peers must round-trip exactly — load-bearing for v2 \
              graph-key reproducibility on warm installs"
     );
@@ -2523,12 +3900,16 @@ fn locked_package_peers_empty_skipped_in_serialization() {
     // Backward-compat: a package WITHOUT peers must serialize
     // WITHOUT the `peers = [...]` line, keeping older lockfiles
     // byte-identical.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "lodash".to_string(),
         version: "4.17.21".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2540,6 +3921,7 @@ fn locked_package_peers_empty_skipped_in_serialization() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -2564,13 +3946,187 @@ resolved-with = "greedy-fusion"
 name = "react"
 version = "18.2.0"
 source = "registry+https://registry.npmjs.org"
-integrity = "sha512-pre-r25"
+integrity = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 dependencies = []
 "#;
     let lf = Lockfile::from_toml(legacy_peerless_toml).expect("legacy lockfile must parse");
     assert!(lf.ambient_peer_installs.is_empty());
     assert_eq!(lf.packages.len(), 1);
     assert!(lf.packages[0].peers.is_empty());
+}
+
+#[test]
+fn legacy_lockfile_peer_strings_remain_readable() {
+    let legacy = r#"
+[metadata]
+lockfile-version = 11
+resolved-with = "greedy-fusion"
+
+[[packages]]
+name = "consumer"
+version = "1.0.0"
+source = "registry+https://registry.npmjs.org"
+dependencies = []
+peers = ["react@18.2.0"]
+
+[[packages]]
+name = "react"
+version = "18.2.0"
+source = "registry+https://registry.npmjs.org"
+dependencies = []
+"#;
+    let lockfile = Lockfile::from_toml(legacy).expect("v11 peers must remain readable");
+    let consumer = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "consumer")
+        .unwrap();
+    assert_eq!(consumer.peers, vec!["react@18.2.0"]);
+}
+
+#[test]
+fn structured_peer_rejects_source_mismatched_target() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "react".to_string(),
+        version: "18.2.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        peer_edges: vec![lpm_common::PeerEdge {
+            local_name: "react".to_string(),
+            target_name: "react".to_string(),
+            target_version: "18.2.0".to_string(),
+            target_wrapper_id: Some("f-attacker".to_string()),
+        }],
+        ..LockedPackage::default()
+    });
+    assert!(lockfile.to_toml().is_err());
+}
+
+#[test]
+fn structured_peer_rejects_duplicate_local_slots() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "react".to_string(),
+        version: "18.2.0".to_string(),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        peer_edges: vec![
+            lpm_common::PeerEdge::registry("react-compat", "react", "18.2.0"),
+            lpm_common::PeerEdge::registry("react-compat", "react", "18.2.0"),
+        ],
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile.to_toml().unwrap_err().to_string();
+    assert!(error.contains("duplicate peer slot"), "{error}");
+}
+
+#[test]
+fn structured_peer_rejects_dependency_slot_collision() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "react".to_string(),
+        version: "18.2.0".to_string(),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        dependencies: vec!["react-compat@18.2.0".to_string()],
+        peer_edges: vec![lpm_common::PeerEdge::registry(
+            "react-compat",
+            "react",
+            "18.2.0",
+        )],
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile.to_toml().unwrap_err().to_string();
+    assert!(error.contains("both dependency and peer"), "{error}");
+}
+
+#[test]
+fn structured_peer_rejects_malformed_identity() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        peer_edges: vec![lpm_common::PeerEdge {
+            local_name: "../react".to_string(),
+            target_name: "react".to_string(),
+            target_version: "18.2.0".to_string(),
+            target_wrapper_id: None,
+        }],
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile.to_toml().unwrap_err().to_string();
+    assert!(error.contains("invalid peer local name"), "{error}");
+}
+
+#[test]
+fn current_schema_rejects_legacy_peer_strings() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        peers: vec!["react@18.2.0".to_string()],
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile.to_toml().unwrap_err().to_string();
+    assert!(error.contains("legacy peer metadata"), "{error}");
+}
+
+#[test]
+fn legacy_schema_rejects_structured_peer_edges() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.metadata.lockfile_version = LOCKFILE_VERSION_WITH_STRUCTURED_PEERS - 1;
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        peer_edges: vec![lpm_common::PeerEdge::registry("react", "react", "18.2.0")],
+        ..LockedPackage::default()
+    });
+
+    let error = lockfile.to_toml().unwrap_err().to_string();
+    assert!(error.contains("structured peer metadata before"), "{error}");
 }
 
 #[test]
@@ -2581,12 +4137,16 @@ fn binary_format_falls_back_when_ambient_peers_present() {
     // writer skips the binary path and the warm-install reader
     // falls back to TOML — preserving the auto-install state
     // that the binary roundtrip would silently drop.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "18.2.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2598,6 +4158,7 @@ fn binary_format_falls_back_when_ambient_peers_present() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     // Without peer metadata → binary format OK.
@@ -2615,12 +4176,16 @@ fn binary_format_falls_back_when_ambient_peers_present() {
 fn binary_format_falls_back_when_per_package_peers_present() {
     // Same gate, on the LockedPackage side. Even ONE package with
     // a non-empty `peers` field is enough to fall back to TOML.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react-redux".to_string(),
         version: "9.2.0".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2632,6 +4197,7 @@ fn binary_format_falls_back_when_per_package_peers_present() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec!["react@18.2.0".to_string()],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     assert!(
@@ -2641,8 +4207,28 @@ fn binary_format_falls_back_when_per_package_peers_present() {
 }
 
 #[test]
+fn binary_format_falls_back_when_structured_peer_edges_are_present() {
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "consumer".to_string(),
+        version: "1.0.0".to_string(),
+        peer_edges: vec![lpm_common::PeerEdge::registry(
+            "react-compat",
+            "react",
+            "18.2.0",
+        )],
+        ..LockedPackage::default()
+    });
+
+    assert!(!crate::binary::binary_format_supports(&lockfile));
+}
+
+#[test]
 fn auto_isolated_peer_conflicts_metadata_triggers_binary_fallback() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     assert!(crate::binary::binary_format_supports(&lf));
 
     lf.metadata.auto_isolated_peer_conflicts = true;
@@ -2654,12 +4240,16 @@ fn auto_isolated_peer_conflicts_metadata_triggers_binary_fallback() {
 
 #[test]
 fn registry_signature_metadata_triggers_binary_fallback() {
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "signed-pkg".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-signed".to_string()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        manifest_fingerprint: None,
         registry_signatures: vec![LockedRegistrySignature {
             keyid: Some("SHA256:abc123".to_string()),
             sig: Some("MEUCIQDregistrySignature".to_string()),
@@ -2674,6 +4264,7 @@ fn registry_signature_metadata_triggers_binary_fallback() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -2688,12 +4279,16 @@ fn legacy_find_package_returns_some_match_under_collision() {
     // Documents the pre-existing name-only behavior: returns
     // *some* match but doesn't disambiguate. Callers that need
     // disambiguation must use find_package_by_key.
-    let mut lf = Lockfile::new();
+    let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2705,13 +4300,18 @@ fn legacy_find_package_returns_some_match_under_collision() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     lf.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "react".to_string(),
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -2723,6 +4323,7 @@ fn legacy_find_package_returns_some_match_under_collision() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
     // Returns *some* react entry. Don't depend on which one.
@@ -2731,17 +4332,35 @@ fn legacy_find_package_returns_some_match_under_collision() {
 }
 
 fn importer_lockfile(package_name: &str, peer_version: &str) -> Lockfile {
-    let mut lockfile = Lockfile::new();
+    let mut lockfile = legacy_lockfile();
     lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "runtime".to_string(),
+        version: peer_version.to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    lockfile.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: package_name.to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        peers: vec![format!("runtime@{peer_version}")],
+        peers: Vec::new(),
+        peer_edges: vec![lpm_common::PeerEdge::registry(
+            "runtime",
+            "runtime",
+            peer_version,
+        )],
         ..LockedPackage::default()
     });
     lockfile.root_resolutions.insert(
         package_name.to_string(),
         LockedRootResolution {
+            instance_id: None,
             package: package_name.to_string(),
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
@@ -2755,7 +4374,7 @@ fn importer_lockfile(package_name: &str, peer_version: &str) -> Lockfile {
 
 #[test]
 fn workspace_union_round_trips_distinct_importer_peer_contexts() {
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/one", importer_lockfile("plugin", "1.0.0"))
         .unwrap();
@@ -2763,23 +4382,143 @@ fn workspace_union_round_trips_distinct_importer_peer_contexts() {
         .absorb_importer("packages/two", importer_lockfile("plugin", "2.0.0"))
         .unwrap();
 
-    assert_eq!(union.workspace_packages.len(), 2);
+    assert_eq!(union.workspace_packages.len(), 4);
     let encoded = union.to_toml().expect("serialize workspace union");
     let decoded = Lockfile::from_toml(&encoded).expect("parse workspace union");
     assert_eq!(decoded, union);
     assert_eq!(
-        decoded.project_importer("packages/one").unwrap().packages[0].peers,
-        ["runtime@1.0.0"]
+        decoded
+            .project_importer("packages/one")
+            .unwrap()
+            .packages
+            .iter()
+            .find(|package| package.name == "plugin")
+            .unwrap()
+            .peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "1.0.0"
+        )]
     );
     assert_eq!(
-        decoded.project_importer("packages/two").unwrap().packages[0].peers,
-        ["runtime@2.0.0"]
+        decoded
+            .project_importer("packages/two")
+            .unwrap()
+            .packages
+            .iter()
+            .find(|package| package.name == "plugin")
+            .unwrap()
+            .peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "2.0.0"
+        )]
     );
 }
 
 #[test]
+fn workspace_union_rejects_peer_target_outside_importer_projection() {
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/a", importer_lockfile("consumer", "1.0.0"))
+        .unwrap();
+    union
+        .absorb_importer("packages/b", importer_lockfile("other", "1.0.0"))
+        .unwrap();
+    let runtime_id = union.importers["packages/a"]
+        .locked_packages
+        .iter()
+        .find(|id| union.workspace_packages[*id].name == "runtime")
+        .cloned()
+        .expect("runtime package id");
+    union
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .locked_packages
+        .retain(|id| id != &runtime_id);
+    let raw = toml::to_string_pretty(&union).expect("serialize crafted workspace union");
+
+    let load_error = crate::ValidatedLockfile::from_toml(&raw)
+        .expect_err("peer provider outside importer projection must fail validation");
+    assert!(load_error.to_string().contains("peer"));
+    assert!(load_error.to_string().contains("packages/a"));
+    assert!(load_error.to_string().contains("runtime@1.0.0"));
+
+    let projection_error = union
+        .project_importer("packages/a")
+        .expect_err("direct projection must defensively reject an open peer graph");
+    assert!(projection_error.to_string().contains("peer"));
+}
+
+#[test]
+fn absorbing_v11_peer_importer_into_v12_union_requires_fresh_resolution() {
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/current", importer_lockfile("current", "2.0.0"))
+        .unwrap();
+    let before = union.clone();
+    let mut legacy = importer_lockfile("legacy-plugin", "1.0.0");
+    legacy.metadata.lockfile_version = LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS;
+    let plugin = legacy
+        .packages
+        .iter_mut()
+        .find(|package| package.name == "legacy-plugin")
+        .unwrap();
+    plugin.peer_edges.clear();
+    plugin.peers = vec!["runtime@1.0.0".to_string()];
+
+    let error = union
+        .absorb_importer("packages/legacy", legacy)
+        .expect_err("legacy peer identities cannot be promoted to structured peers");
+
+    assert!(error.to_string().contains("fresh resolution"));
+    assert_eq!(union, before, "failed absorption must be transactional");
+}
+
+#[test]
+fn failed_absorption_after_legacy_downgrade_leaves_union_unchanged() {
+    let mut current = legacy_lockfile();
+    current.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "local-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("directory+../local-package".to_string()),
+        manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
+        ..LockedPackage::default()
+    });
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/current", current)
+        .expect("absorb current importer");
+    let before = union.clone();
+
+    let package = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "duplicate".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    };
+    let mut conflicting = package.clone();
+    conflicting.optional = true;
+    let mut legacy = legacy_lockfile();
+    legacy.metadata.lockfile_version = LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS;
+    legacy.packages = vec![package, conflicting];
+
+    let error = union
+        .absorb_importer("packages/legacy", legacy)
+        .expect_err("ambiguous legacy importer must fail");
+
+    assert!(error.to_string().contains("ambiguous package identity"));
+    assert_eq!(union, before, "failed absorption must be transactional");
+}
+
+#[test]
 fn validated_workspace_projection_does_not_recompute_loaded_package_addresses() {
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
@@ -2798,13 +4537,13 @@ fn validated_workspace_projection_does_not_recompute_loaded_package_addresses() 
 
     assert_eq!(
         (load_calls, crate::model::workspace_package_id_call_count()),
-        (1, 1)
+        (2, 2)
     );
 }
 
 #[test]
 fn validated_workspace_projection_reuses_loaded_package_order() {
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
@@ -2822,7 +4561,7 @@ fn validated_workspace_projection_reuses_loaded_package_order() {
 
 #[test]
 fn validated_workspace_metadata_projection_borrows_union_package_rows() {
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
@@ -2843,20 +4582,26 @@ fn validated_workspace_metadata_projection_borrows_union_package_rows() {
 
 #[test]
 fn workspace_union_stores_importer_packages_in_package_identity_order() {
-    let mut standalone = Lockfile::new();
+    let mut standalone = legacy_lockfile();
     standalone.packages = vec![
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "zlib".to_string(),
             version: "1.0.0".to_string(),
             ..LockedPackage::default()
         },
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "alpha".to_string(),
             version: "2.0.0".to_string(),
             ..LockedPackage::default()
         },
     ];
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
 
     union
         .absorb_importer("packages/app", standalone)
@@ -2872,18 +4617,24 @@ fn workspace_union_stores_importer_packages_in_package_identity_order() {
 
 #[test]
 fn validated_workspace_lockfile_rejects_importer_package_ids_out_of_identity_order() {
-    let mut standalone = Lockfile::new();
+    let mut standalone = legacy_lockfile();
     standalone.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "alpha".to_string(),
         version: "1.0.0".to_string(),
         ..LockedPackage::default()
     });
     standalone.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "zlib".to_string(),
         version: "1.0.0".to_string(),
         ..LockedPackage::default()
     });
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", standalone)
         .expect("build workspace union");
@@ -2903,7 +4654,7 @@ fn validated_workspace_lockfile_rejects_importer_package_ids_out_of_identity_ord
 
 #[test]
 fn validated_workspace_lockfile_rejects_tampered_package_address_at_load() {
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
@@ -2921,11 +4672,14 @@ fn validated_workspace_lockfile_rejects_tampered_package_address_at_load() {
 #[test]
 fn workspace_package_address_includes_every_serialized_package_field() {
     let base = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "package".to_string(),
         version: "1.0.0".to_string(),
         ..LockedPackage::default()
     };
-    let mut variants = Vec::with_capacity(16);
+    let mut variants = Vec::with_capacity(17);
     variants.push(base.clone());
     let mut package = base.clone();
     package.name = "renamed".to_string();
@@ -2938,6 +4692,9 @@ fn workspace_package_address_includes_every_serialized_package_field() {
     variants.push(package);
     let mut package = base.clone();
     package.integrity = Some("sha512-value".to_string());
+    variants.push(package);
+    let mut package = base.clone();
+    package.manifest_fingerprint = Some(format!("sha256-{}", "ab".repeat(32)));
     variants.push(package);
     let mut package = base.clone();
     package.registry_signatures = vec![LockedRegistrySignature {
@@ -2978,18 +4735,22 @@ fn workspace_package_address_includes_every_serialized_package_field() {
 
     let addresses = variants
         .iter()
-        .map(crate::model::workspace_package_id_for_test)
+        .map(|package| crate::model::workspace_package_id_for_test(package, LOCKFILE_VERSION))
         .collect::<BTreeSet<_>>();
     assert_eq!(addresses.len(), variants.len());
 }
 
 #[test]
-fn workspace_package_address_v1_has_stable_encoding() {
+fn workspace_package_address_v10_has_stable_encoding() {
     let package = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "@scope/package".to_string(),
         version: "1.2.3".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some("sha512-integrity".to_string()),
+        manifest_fingerprint: None,
         registry_signatures: vec![LockedRegistrySignature {
             keyid: Some("SHA256:key".to_string()),
             sig: Some("signature".to_string()),
@@ -3006,18 +4767,45 @@ fn workspace_package_address_v1_has_stable_encoding() {
         ],
         alias_dependencies: vec![["alias".to_string(), "target@4.0.0".to_string()]],
         peers: vec!["react@19.0.0".to_string()],
+        peer_edges: Vec::new(),
         tarball: Some("https://registry.npmjs.org/@scope/package/-/package-1.2.3.tgz".to_string()),
     };
 
     assert_eq!(
-        crate::model::workspace_package_id_for_test(&package),
+        crate::model::workspace_package_id_for_test(
+            &package,
+            LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
+        ),
         "sha256:8a75a99e5a0df0b37450d5ffbbb5c332e96874ee1d56f2a2dcdeeef759706bd8"
     );
 }
 
 #[test]
+fn workspace_package_address_v11_has_stable_encoding() {
+    let package = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "local-package".to_string(),
+        version: "1.2.3".to_string(),
+        source: Some("directory+packages/local-package".to_string()),
+        manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
+        dependencies: vec!["dependency@2.0.0".to_string()],
+        ..LockedPackage::default()
+    };
+
+    assert_eq!(
+        crate::model::workspace_package_id_for_test(
+            &package,
+            LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS,
+        ),
+        "sha256:efb494e2cabbe144970480499253c4d281e074fdc98c574e07f4df92e3907d5c"
+    );
+}
+
+#[test]
 fn workspace_union_serialization_is_independent_of_importer_insertion_order() {
-    let mut forward = Lockfile::new();
+    let mut forward = legacy_lockfile();
     forward
         .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
         .unwrap();
@@ -3025,7 +4813,7 @@ fn workspace_union_serialization_is_independent_of_importer_insertion_order() {
         .absorb_importer("packages/b", importer_lockfile("b", "2.0.0"))
         .unwrap();
 
-    let mut reverse = Lockfile::new();
+    let mut reverse = legacy_lockfile();
     reverse
         .absorb_importer("packages/b", importer_lockfile("b", "2.0.0"))
         .unwrap();
@@ -3037,8 +4825,207 @@ fn workspace_union_serialization_is_independent_of_importer_insertion_order() {
 }
 
 #[test]
+fn replacing_one_v10_importer_preserves_union_until_untouched_local_rows_are_fingerprinted() {
+    let local = LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "local-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("directory+../local-package".to_string()),
+        ..LockedPackage::default()
+    };
+    let local_id = crate::model::workspace_package_id_for_test(
+        &local,
+        LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
+    );
+    let mut union = legacy_lockfile();
+    union.metadata.lockfile_version = LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS;
+    union.workspace_packages.insert(local_id.clone(), local);
+    union.importers.insert(
+        "packages/b".to_string(),
+        ImporterSnapshot {
+            locked_packages: vec![local_id],
+            ..ImporterSnapshot::default()
+        },
+    );
+    let mut replacement = legacy_lockfile();
+    replacement.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "registry-package".to_string(),
+        version: "2.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    union
+        .replace_importer("packages/a", replacement)
+        .expect("replace one importer");
+
+    assert_eq!(
+        union.metadata.lockfile_version,
+        LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
+    );
+    let encoded = union
+        .to_toml()
+        .expect("untouched v10 local rows must not make a partial update fail");
+    assert_eq!(Lockfile::from_toml(&encoded).unwrap(), union);
+    assert!(union.project_importer("packages/b").is_ok());
+}
+
+#[test]
+fn replacing_importer_with_structured_peers_leaves_legacy_peer_union_unchanged() {
+    let mut legacy = importer_lockfile("legacy-plugin", "1.0.0");
+    legacy.metadata.lockfile_version = LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS;
+    let plugin = legacy
+        .packages
+        .iter_mut()
+        .find(|package| package.name == "legacy-plugin")
+        .unwrap();
+    plugin.peer_edges.clear();
+    plugin.peers = vec!["runtime@1.0.0".to_string()];
+
+    let mut replaceable = legacy_lockfile();
+    replaceable.metadata.lockfile_version = LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS;
+    replaceable.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "old-package".to_string(),
+        version: "1.0.0".to_string(),
+        ..LockedPackage::default()
+    });
+
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/legacy", legacy)
+        .expect("absorb legacy peer importer");
+    union
+        .absorb_importer("packages/replaceable", replaceable)
+        .expect("absorb replaceable importer");
+    let before = union.clone();
+
+    let error = union
+        .replace_importer(
+            "packages/replaceable",
+            importer_lockfile("current-plugin", "2.0.0"),
+        )
+        .expect_err("structured peers cannot be mixed with legacy peer rows");
+
+    assert!(error.to_string().contains("fresh resolution"));
+    assert_eq!(union, before, "failed replacement must be transactional");
+}
+
+#[test]
+fn absorbing_v11_importer_remaps_v12_package_addresses_without_peer_edges() {
+    let mut current = legacy_lockfile();
+    current.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "current-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let mut legacy = legacy_lockfile();
+    legacy.metadata.lockfile_version = LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS;
+    legacy.add_package(LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "legacy-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/current", current)
+        .expect("absorb current importer");
+
+    union
+        .absorb_importer("packages/legacy", legacy)
+        .expect("absorb peer-free legacy importer");
+
+    let encoded = union
+        .to_toml()
+        .expect("version downgrade must preserve valid package addresses");
+    assert_eq!(Lockfile::from_toml(&encoded).unwrap(), union);
+}
+
+#[test]
+fn absorbing_v12_importer_downgrades_v13_instance_metadata() {
+    let mut current = Lockfile::new();
+    current.add_package(LockedPackage {
+        instance_id: Some(instance_id("current-package")),
+        name: "current-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let mut legacy = legacy_lockfile();
+    legacy.add_package(LockedPackage {
+        name: "legacy-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+
+    let mut union = Lockfile::new();
+    union
+        .absorb_importer("packages/current", current)
+        .expect("absorb current importer");
+    union
+        .absorb_importer("packages/legacy", legacy)
+        .expect("absorb peer-free v12 importer");
+
+    let encoded = union
+        .to_toml()
+        .expect("schema downgrade must remove v13-only instance metadata");
+    assert_eq!(Lockfile::from_toml(&encoded).unwrap(), union);
+}
+
+#[test]
+fn absorbing_contextual_v13_importer_into_v12_union_fails_without_mutation() {
+    let mut legacy = legacy_lockfile();
+    legacy.add_package(LockedPackage {
+        name: "legacy-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..LockedPackage::default()
+    });
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/legacy", legacy)
+        .expect("absorb v12 importer");
+    let before = union.clone();
+
+    let mut contextual = Lockfile::new();
+    for path in ["root/left", "root/right"] {
+        contextual.add_package(LockedPackage {
+            instance_id: Some(instance_id(path)),
+            name: "plugin".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..LockedPackage::default()
+        });
+    }
+
+    let error = union
+        .absorb_importer("packages/contextual", contextual)
+        .expect_err("v12 cannot represent distinct contextual package instances");
+
+    assert!(error.to_string().contains("ambiguous package identity"));
+    assert_eq!(union, before, "failed absorption must be transactional");
+}
+
+#[test]
 fn workspace_union_rejects_missing_duplicate_and_unreachable_package_ids() {
-    let mut missing = Lockfile::new();
+    let mut missing = legacy_lockfile();
     missing
         .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
         .unwrap();
@@ -3049,7 +5036,7 @@ fn workspace_union_rejects_missing_duplicate_and_unreachable_package_ids() {
         .locked_packages[0] = format!("sha256:{}", "00".repeat(32));
     assert!(missing.to_toml().is_err(), "missing package id must fail");
 
-    let mut duplicate = Lockfile::new();
+    let mut duplicate = legacy_lockfile();
     duplicate
         .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
         .unwrap();
@@ -3065,7 +5052,7 @@ fn workspace_union_rejects_missing_duplicate_and_unreachable_package_ids() {
         "duplicate package id must fail"
     );
 
-    let mut unreachable = Lockfile::new();
+    let mut unreachable = legacy_lockfile();
     unreachable
         .absorb_importer("packages/a", importer_lockfile("a", "1.0.0"))
         .unwrap();
@@ -3083,7 +5070,7 @@ fn workspace_union_rejects_missing_duplicate_and_unreachable_package_ids() {
 
 #[test]
 fn workspace_union_rejects_parent_traversal_importer_paths() {
-    let error = Lockfile::new()
+    let error = legacy_lockfile()
         .absorb_importer("../outside", importer_lockfile("a", "1.0.0"))
         .expect_err("parent traversal importer must fail");
     assert!(
@@ -3098,7 +5085,7 @@ fn read_for_project_returns_the_nearest_workspace_importer_projection() {
     let directory = tempfile::tempdir().unwrap();
     let member = directory.path().join("packages/app");
     std::fs::create_dir_all(&member).unwrap();
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
@@ -3123,7 +5110,7 @@ fn read_for_project_anchors_nested_directories_at_the_nearest_manifest() {
         r#"{"name":"app","version":"1.0.0"}"#,
     )
     .unwrap();
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
@@ -3150,7 +5137,7 @@ fn read_for_project_prefers_the_authoritative_workspace_projection_over_a_legacy
         .write_to_file(&member.join(LOCKFILE_NAME))
         .unwrap();
 
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/app", importer_lockfile("root-dep", "2.0.0"))
         .unwrap();
@@ -3171,7 +5158,7 @@ fn write_for_project_replaces_only_the_member_projection_and_prunes_old_rows() {
     let second = directory.path().join("packages/second");
     std::fs::create_dir_all(&first).unwrap();
     std::fs::create_dir_all(&second).unwrap();
-    let mut union = Lockfile::new();
+    let mut union = legacy_lockfile();
     union
         .absorb_importer("packages/first", importer_lockfile("old", "1.0.0"))
         .unwrap();

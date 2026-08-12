@@ -5,10 +5,14 @@ fn make_lockfile(n: usize) -> Lockfile {
     let mut lf = Lockfile::new();
     for i in 0..n {
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: format!("pkg-{i:05}"),
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-abcdef1234567890".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -24,6 +28,7 @@ fn make_lockfile(n: usize) -> Lockfile {
             },
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
     }

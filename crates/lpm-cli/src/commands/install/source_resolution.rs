@@ -42,6 +42,12 @@ pub(super) enum DepKind {
     Git,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceDepRole {
+    Dependency,
+    Peer,
+}
+
 /// a single dep entry from a
 /// local source's `package.json`. Captured during pre-resolve so the
 /// post-resolve fix-up can populate the parent
@@ -58,6 +64,8 @@ pub(super) struct SourceDep {
     /// Classification used to drive both the recursive pre-resolve
     /// and the post-resolve fix-up.
     pub(super) kind: DepKind,
+    /// Whether the manifest declared this edge as a dependency or peer.
+    pub(super) role: SourceDepRole,
     /// Whether this edge was declared in `optionalDependencies`.
     pub(super) optional: bool,
     /// Whether a missing registry target should be promoted into the
@@ -75,6 +83,151 @@ pub(super) struct SourceDep {
 pub(super) enum WorkspaceTransitiveMode {
     RootSymlinkOnly,
     SourceGraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocalManifestSemantics {
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) node_engine: Option<String>,
+    pub(super) platform: Option<lpm_resolver::PlatformMeta>,
+    pub(super) fingerprint: String,
+}
+
+fn hash_local_manifest_field(hasher: &mut sha2::Sha256, value: &[u8]) {
+    use sha2::Digest;
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_local_manifest_optional_field(hasher: &mut sha2::Sha256, value: Option<&str>) {
+    use sha2::Digest;
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hash_local_manifest_field(hasher, value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn normalize_local_platform_values(mut values: Vec<String>) -> Vec<String> {
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+pub(super) fn read_local_manifest_semantics(
+    source_dir: &Path,
+) -> Result<LocalManifestSemantics, LpmError> {
+    use sha2::Digest;
+
+    let source_label = format!("local source at {}", source_dir.display());
+    let pkg_json_path = source_dir.join("package.json");
+    let pkg_json_str =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to read package.json from {source_label}: {error}"
+            ))
+        })?;
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&pkg_json_str)).map_err(|error| {
+            LpmError::Registry(format!("invalid package.json in {source_label}: {error}"))
+        })?;
+    let manifest: lpm_workspace::PackageJson =
+        serde_json::from_value(pkg_json.clone()).map_err(|error| {
+            LpmError::Registry(format!(
+                "invalid package.json fields in {source_label}: {error}"
+            ))
+        })?;
+    let name = manifest.name.clone().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "{source_label} has no `name` field in package.json"
+        ))
+    })?;
+    let version = manifest
+        .version
+        .clone()
+        .unwrap_or_else(|| "0.0.0".to_string());
+    lpm_lockfile::Lockfile::validate_package_name_and_version(&name, &version).map_err(
+        |error| {
+            LpmError::Registry(format!(
+                "{source_label} has invalid package identity: {error}"
+            ))
+        },
+    )?;
+
+    let mut dependency_specs = source_dep_specs_from_value(source_dir, &pkg_json)?;
+    dependency_specs.sort_unstable_by(|left, right| {
+        left.local_name
+            .cmp(&right.local_name)
+            .then_with(|| left.raw_spec.cmp(&right.raw_spec))
+            .then_with(|| (left.kind as u8).cmp(&(right.kind as u8)))
+            .then_with(|| (left.role as u8).cmp(&(right.role as u8)))
+            .then_with(|| left.optional.cmp(&right.optional))
+            .then_with(|| left.auto_install.cmp(&right.auto_install))
+    });
+    let node_engine = manifest.engines.get("node").cloned();
+    let os = normalize_local_platform_values(manifest.os);
+    let cpu = normalize_local_platform_values(manifest.cpu);
+    let libc = normalize_local_platform_values(manifest.libc);
+    let platform = (!os.is_empty() || !cpu.is_empty() || !libc.is_empty()).then(|| {
+        lpm_resolver::PlatformMeta {
+            os: os.clone(),
+            cpu: cpu.clone(),
+            libc: libc.clone(),
+        }
+    });
+    let mut bins = manifest
+        .bin
+        .as_ref()
+        .map_or_else(Vec::new, |bin| bin.entries(&name));
+    bins.sort_unstable();
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"lpm-local-manifest-fingerprint-v1\0");
+    hash_local_manifest_field(&mut hasher, name.as_bytes());
+    hash_local_manifest_field(&mut hasher, version.as_bytes());
+    hash_local_manifest_optional_field(&mut hasher, node_engine.as_deref());
+    for values in [&os, &cpu, &libc] {
+        hasher.update((values.len() as u64).to_le_bytes());
+        for value in values {
+            hash_local_manifest_field(&mut hasher, value.as_bytes());
+        }
+    }
+    hasher.update((bins.len() as u64).to_le_bytes());
+    for (command, path) in bins {
+        hash_local_manifest_field(&mut hasher, command.as_bytes());
+        hash_local_manifest_field(&mut hasher, path.as_bytes());
+    }
+    hasher.update((dependency_specs.len() as u64).to_le_bytes());
+    for dependency in dependency_specs {
+        hash_local_manifest_field(&mut hasher, dependency.local_name.as_bytes());
+        hash_local_manifest_field(&mut hasher, dependency.raw_spec.as_bytes());
+        hasher.update([match dependency.kind {
+            DepKind::Registry => 0,
+            DepKind::Workspace => 1,
+            DepKind::FileDir => 2,
+            DepKind::Link => 3,
+            DepKind::Git => 4,
+        }]);
+        hasher.update([match dependency.role {
+            SourceDepRole::Dependency => 0,
+            SourceDepRole::Peer => 1,
+        }]);
+        hasher.update([u8::from(dependency.optional)]);
+        hasher.update([u8::from(dependency.auto_install)]);
+    }
+    let fingerprint = format!("sha256-{}", hex::encode(hasher.finalize()));
+
+    Ok(LocalManifestSemantics {
+        name,
+        version,
+        node_engine,
+        platform,
+        fingerprint,
+    })
 }
 
 /// return shape for
@@ -286,6 +439,7 @@ pub(super) fn expand_local_source_install_packages(
     workspace_members: &[WorkspaceMemberLink],
     json_output: bool,
     workspace_transitives: WorkspaceTransitiveMode,
+    auto_install_peers: bool,
 ) -> Result<LocalSourceExpansionResult, LpmError> {
     let mut source_deps_out: HashMap<String, Vec<SourceDep>> = HashMap::new();
     let mut visited_realpaths: HashMap<PathBuf, String> =
@@ -307,14 +461,14 @@ pub(super) fn expand_local_source_install_packages(
         }
     }
 
-    let immediate_dir_link: Vec<(String, PathBuf)> = install_pkgs
+    let immediate_dir_link: Vec<(String, PathBuf, bool)> = install_pkgs
         .iter()
         .filter_map(|p| match p.source_kind() {
             Ok(lpm_lockfile::Source::Directory { path }) => {
-                Some((p.source.clone(), project_dir.join(path)))
+                Some((p.source.clone(), project_dir.join(path), p.optional))
             }
             Ok(lpm_lockfile::Source::Link { path }) => {
-                Some((p.source.clone(), project_dir.join(path)))
+                Some((p.source.clone(), project_dir.join(path), p.optional))
             }
             _ => None,
         })
@@ -324,7 +478,7 @@ pub(super) fn expand_local_source_install_packages(
         std::collections::HashSet::new();
     let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
     let mut promoted_git_root_names = HashSet::new();
-    for (parent_source_string, parent_abs) in immediate_dir_link {
+    for (parent_source_string, parent_abs, inherited_optional) in immediate_dir_link {
         let Ok(realpath) = parent_abs.canonicalize() else {
             continue;
         };
@@ -344,7 +498,8 @@ pub(super) fn expand_local_source_install_packages(
             &mut additional_workspace_links,
             workspace_transitives,
             &mut promoted_git_root_names,
-            false,
+            inherited_optional,
+            auto_install_peers,
         )?;
     }
 
@@ -360,10 +515,15 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
     deps: &mut HashMap<String, String>,
     direct_workspace_member_deps: &[WorkspaceMemberLink],
     all_workspace_members: &[WorkspaceMemberLink],
+    root_optional_dependency_names: &HashSet<String>,
     json_output: bool,
+    auto_install_peers: bool,
 ) -> Result<V2WorkspaceRootPreResolveResult, LpmError> {
     if direct_workspace_member_deps.is_empty() {
-        return Ok(V2WorkspaceRootPreResolveResult::default());
+        return Ok(V2WorkspaceRootPreResolveResult {
+            optional_registry_roots: root_optional_dependency_names.clone(),
+            ..V2WorkspaceRootPreResolveResult::default()
+        });
     }
 
     let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
@@ -380,12 +540,12 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
             }
             continue;
         }
-        let node_engine = read_pkg_json_node_engine(
-            member.resolution_dir(),
-            &format!("workspace member at {}", member.resolution_dir().display()),
-        )?;
+        let semantics = read_local_manifest_semantics(member.resolution_dir())?;
         package_by_source.insert(source.clone(), install_pkgs.len());
         install_pkgs.push(InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: member.name.clone(),
             version: member.version.clone(),
             source,
@@ -398,13 +558,15 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
             integrity: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
-            platform: None,
-            node_engine,
-            optional: false,
+            platform: semantics.platform,
+            node_engine: semantics.node_engine,
+            optional: root_optional_dependency_names.contains(&member.link_name),
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: Some(semantics.fingerprint),
         });
     }
+    mark_direct_root_optionality(&mut install_pkgs, root_optional_dependency_names);
 
     let LocalSourceExpansionResult {
         source_deps,
@@ -417,10 +579,11 @@ pub(super) fn pre_resolve_v2_direct_workspace_member_deps(
         all_workspace_members,
         json_output,
         WorkspaceTransitiveMode::SourceGraph,
+        auto_install_peers,
     )?;
     let optional_registry_roots = merge_optional_registry_roots(
         &dependency_names_before_expansion,
-        &HashSet::new(),
+        root_optional_dependency_names,
         registry_root_optionality(&install_pkgs, &source_deps),
     );
 
@@ -601,6 +764,7 @@ pub(super) async fn pre_resolve_non_registry_deps(
         workspace_members,
         &HashSet::new(),
         &HashSet::new(),
+        true,
     )
     .await
 }
@@ -617,6 +781,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     workspace_members: &[WorkspaceMemberLink],
     inherited_optional_registry_roots: &HashSet<String>,
     promoted_git_root_names: &HashSet<String>,
+    auto_install_peers: bool,
 ) -> Result<NonRegistryPreResolveResult, LpmError> {
     // Gate the manifest boundary for non-registry specifiers.
     //
@@ -634,6 +799,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // typed error). The classification is cached in `file_kinds` so
     // the partition `retain` below dispatches without re-statting.
     let mut file_kinds: HashMap<String, FileKindClassification> = HashMap::new();
+    let mut unavailable_optional_sources = Vec::new();
     for (local_name, raw) in deps.iter() {
         match lpm_resolver::Specifier::parse(raw) {
             // Surface manifest-boundary parser errors before the
@@ -684,6 +850,16 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                         )));
                     }
                     Err(e) => {
+                        if inherited_optional_registry_roots.contains(local_name) {
+                            tracing::warn!(
+                                dependency = %local_name,
+                                path = %abs_path.display(),
+                                error = %e,
+                                "skipping unavailable optional file dependency"
+                            );
+                            unavailable_optional_sources.push(local_name.clone());
+                            continue;
+                        }
                         return Err(LpmError::Registry(format!(
                             "dep '{local_name}' uses file: specifier '{path}' but the \
                              resolved path ({}) is unreadable: {e}",
@@ -727,6 +903,16 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                         )));
                     }
                     Err(e) => {
+                        if inherited_optional_registry_roots.contains(local_name) {
+                            tracing::warn!(
+                                dependency = %local_name,
+                                path = %abs_path.display(),
+                                error = %e,
+                                "skipping unavailable optional link dependency"
+                            );
+                            unavailable_optional_sources.push(local_name.clone());
+                            continue;
+                        }
                         return Err(LpmError::Registry(format!(
                             "dep '{local_name}' uses link: specifier '{path}' but the \
                              resolved path ({}) is unreadable: {e}",
@@ -736,6 +922,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 }
             }
         }
+    }
+    for local_name in unavailable_optional_sources {
+        deps.remove(&local_name);
     }
 
     // Partition the manifest deps into the five non-registry arms.
@@ -786,7 +975,19 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     for (local_name, raw_spec, url, reference) in git_specs {
         let resolved = resolve_github_source(&url, reference.as_deref()).await?;
         let (archive, downloaded_sri) =
-            download_github_archive(&resolved.archive_url, None).await?;
+            match download_github_archive(&resolved.archive_url, None).await {
+                Ok(downloaded) => downloaded,
+                Err(error) if inherited_optional_registry_roots.contains(&local_name) => {
+                    tracing::warn!(
+                        dependency = %local_name,
+                        source = %resolved.locked_source,
+                        error = %error,
+                        "skipping unavailable optional GitHub dependency"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         let (package_dir, integrity) = if let Some(store_v2) = store_v2 {
             let (object_dir, integrity, _) =
                 store_v2.extract_object_from_bytes(&archive, Some(&downloaded_sri))?;
@@ -800,7 +1001,6 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &package_dir,
             &format!("GitHub dependency {}", resolved.locked_source),
-            MissingVersionPolicy::Require,
         )?;
         if local_name != real_name && !json_output {
             output::warn(&format!(
@@ -814,10 +1014,14 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             &resolved.locked_source,
             deps,
             &mut git_source_deps,
+            auto_install_peers,
         )?;
         resolved_git_sources.insert(raw_spec, resolved.locked_source.clone());
         let promoted = promoted_git_root_names.contains(&local_name);
         install_pkgs.push(InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: real_name,
             version: real_version,
             source: resolved.locked_source,
@@ -839,11 +1043,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             optional: false,
             tarball_url: Some(resolved.archive_url),
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         });
     }
 
     // ── Arm 1: — remote tarball URLs ──────────────────────
     for (local_name, url, declared_integrity) in tarball_url_specs {
+        let display_url = install_ui::safe_url_origin(&url);
         // () — strict-integrity gate. When set,
         // a tarball-URL dep without a manifest-declared SRI is a
         // hard error rather than trust-on-first-use. Recommended
@@ -853,7 +1059,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // strict-integrity has nothing more to enforce.
         if strict_integrity && declared_integrity.is_none() {
             return Err(LpmError::Registry(format!(
-                "--strict-integrity: dep '{local_name}' uses tarball URL {url} without a \
+                "--strict-integrity: dep '{local_name}' uses tarball URL {display_url} without a \
                  declared SRI. Add `#sha512-...` (or `#sha256-...`) to the URL in your \
                  manifest, or remove --strict-integrity to allow trust-on-first-use."
             )));
@@ -872,12 +1078,12 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             tracing::warn!(
                 target: "lpm_cli::install",
                 local_name = %local_name,
-                tarball_url = %url,
+                tarball_url = %display_url,
                 "tarball+URL dep without declared SRI — trusting whatever the server returns AND pinning the computed hash into lpm.lock (trust-on-first-use). Pin via `#sha512-...` on the URL, or pass `--strict-integrity` to refuse."
             );
             if !json_output {
                 let local_name = lpm_common::sanitize_terminal_inline(&local_name);
-                let url = lpm_common::sanitize_terminal_inline(&url);
+                let url = lpm_common::sanitize_terminal_inline(&display_url);
                 output::warn(&format!(
                     "tarball+URL dep '{local_name}' has no declared SRI — pinning trust-on-first-use to {url}"
                 ));
@@ -893,11 +1099,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             .await?;
         let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
 
-        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
-            &cas_path,
-            &format!("tarball at {url}"),
-            MissingVersionPolicy::Require,
-        )?;
+        let (real_name, real_version, node_engine) =
+            read_pkg_json_name_version(&cas_path, &format!("tarball at {display_url}"))?;
 
         // Dep-key vs fetched-name policy: warn rather than reject. The manifest dep key
         // controls node_modules layout (via `root_link_names`); the
@@ -906,7 +1109,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         if local_name != real_name && !json_output {
             let local_name = lpm_common::sanitize_terminal_inline(&local_name);
             let real_name = lpm_common::sanitize_terminal_inline(&real_name);
-            let url = lpm_common::sanitize_terminal_inline(&url);
+            let url = lpm_common::sanitize_terminal_inline(&display_url);
             output::warn(&format!(
                 "dep '{local_name}' resolves to package '{real_name}' from {url}; \
                  using local key as the link name in node_modules"
@@ -914,6 +1117,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         }
 
         install_pkgs.push(InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: real_name,
             version: real_version,
             source: format!("tarball+{url}"),
@@ -931,6 +1137,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             optional: false,
             tarball_url: Some(url),
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         });
     }
 
@@ -987,7 +1194,6 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &cas_path,
             &format!("local tarball at {}", abs_path.display()),
-            MissingVersionPolicy::Require,
         )?;
 
         if local_name != real_name && !json_output {
@@ -1020,6 +1226,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         .to_string();
 
         install_pkgs.push(InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: real_name,
             version: real_version,
             source,
@@ -1042,6 +1251,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             // entries.
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         });
     }
 
@@ -1083,11 +1293,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             ))
         })?;
 
-        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
-            &realpath,
-            &format!("file: directory at {}", realpath.display()),
-            MissingVersionPolicy::DefaultToZero,
-        )?;
+        let semantics = read_local_manifest_semantics(&realpath)?;
+        let real_name = semantics.name;
+        let real_version = semantics.version;
 
         // : workspace overlap detection. Realpath of source
         // matched against every workspace member; on match dedupe
@@ -1128,6 +1336,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                     version: member.version.clone(),
                     package_dir: member.package_dir.clone(),
                     source_dir: member.source_dir.clone(),
+                    optional: inherited_optional_registry_roots.contains(&local_name),
                 });
                 continue;
             }
@@ -1161,6 +1370,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // Canonicalization happens at install time, not at lockfile
         // load time.
         install_pkgs.push(InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: real_name,
             version: real_version,
             source: format!("directory+{raw_path}"),
@@ -1180,11 +1392,12 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             integrity: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
-            platform: None,
-            node_engine,
+            platform: semantics.platform,
+            node_engine: semantics.node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: Some(semantics.fingerprint),
         });
     }
 
@@ -1208,11 +1421,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             ))
         })?;
 
-        let (real_name, real_version, node_engine) = read_pkg_json_name_version(
-            &realpath,
-            &format!("link: dep at {}", realpath.display()),
-            MissingVersionPolicy::DefaultToZero,
-        )?;
+        let semantics = read_local_manifest_semantics(&realpath)?;
+        let real_name = semantics.name;
+        let real_version = semantics.version;
 
         // : workspace overlap detection — same logic as the
         // directory arm.
@@ -1244,6 +1455,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                     version: member.version.clone(),
                     package_dir: member.package_dir.clone(),
                     source_dir: member.source_dir.clone(),
+                    optional: inherited_optional_registry_roots.contains(&local_name),
                 });
                 continue;
             }
@@ -1275,6 +1487,9 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // is preserved verbatim; canonicalization happens at install
         // time.
         install_pkgs.push(InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: real_name,
             version: real_version,
             source: format!("link+{raw_path}"),
@@ -1293,11 +1508,12 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             integrity: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
-            platform: None,
-            node_engine,
+            platform: semantics.platform,
+            node_engine: semantics.node_engine,
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: Some(semantics.fingerprint),
         });
     }
 
@@ -1313,6 +1529,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // - Stash per-source-string dep specs in `source_deps_out` for
     // the post-resolve fix-up at install.rs:2663+.
     //
+    mark_direct_root_optionality(&mut install_pkgs, inherited_optional_registry_roots);
     let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let LocalSourceExpansionResult {
         source_deps: mut source_deps_out,
@@ -1325,6 +1542,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         workspace_members,
         json_output,
         WorkspaceTransitiveMode::RootSymlinkOnly,
+        auto_install_peers,
     )?;
     source_deps_out.extend(git_source_deps);
     let optional_registry_roots = merge_optional_registry_roots(
@@ -1493,16 +1711,9 @@ pub(super) async fn read_local_tarball_bounded(
 /// inline this logic with identical error shapes. `source_label` is
 /// embedded in error messages so the user knows which arm produced
 /// them (`"tarball at https://..."` vs `"local tarball at ..."`).
-#[derive(Clone, Copy)]
-pub(super) enum MissingVersionPolicy {
-    Require,
-    DefaultToZero,
-}
-
 pub(super) fn read_pkg_json_name_version(
     cas_path: &Path,
     source_label: &str,
-    missing_version: MissingVersionPolicy,
 ) -> Result<(String, String, Option<String>), LpmError> {
     let pkg_json = read_pkg_json(cas_path, source_label)?;
     let name = pkg_json
@@ -1514,17 +1725,36 @@ pub(super) fn read_pkg_json_name_version(
             ))
         })?
         .to_string();
-    let version = match pkg_json.get("version").and_then(|value| value.as_str()) {
-        Some(version) => version.to_string(),
-        None if matches!(missing_version, MissingVersionPolicy::DefaultToZero) => {
-            "0.0.0".to_string()
-        }
-        None => {
-            return Err(LpmError::Registry(format!(
+    let version = pkg_json
+        .get("version")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
                 "{source_label} has no `version` field in package.json"
-            )));
-        }
-    };
+            ))
+        })?
+        .to_string();
+    lpm_lockfile::Lockfile::validate_package_name_and_version(&name, &version).map_err(
+        |error| match error {
+            lpm_lockfile::LockfileError::InvalidPackageField {
+                field: "name",
+                reason,
+                ..
+            } => LpmError::Registry(format!(
+                "{source_label} has invalid package name {name:?}: {reason}"
+            )),
+            lpm_lockfile::LockfileError::InvalidPackageField {
+                field: "version",
+                reason,
+                ..
+            } => LpmError::Registry(format!(
+                "{source_label} has invalid package version {version:?}: {reason}"
+            )),
+            error => LpmError::Registry(format!(
+                "{source_label} has invalid package identity: {error}"
+            )),
+        },
+    )?;
     let node_engine = package_json_node_engine(&pkg_json);
     Ok((name, version, node_engine))
 }
@@ -1618,6 +1848,13 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
             ))
         })?;
 
+    source_dep_specs_from_value(source_dir, &pkg_json)
+}
+
+fn source_dep_specs_from_value(
+    source_dir: &Path,
+    pkg_json: &serde_json::Value,
+) -> Result<Vec<SourceDep>, LpmError> {
     let dependency_fields = ["dependencies", "peerDependencies", "optionalDependencies"];
     let has_catalog_references = dependency_fields.iter().any(|field| {
         pkg_json
@@ -1727,6 +1964,11 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
                 local_name: local_name.clone(),
                 raw_spec: normalized_spec.unwrap_or_else(|| raw_str.to_string()),
                 kind,
+                role: if field == "peerDependencies" {
+                    SourceDepRole::Peer
+                } else {
+                    SourceDepRole::Dependency
+                },
                 optional: field == "optionalDependencies" || optional_peer,
                 auto_install: !optional_peer,
                 target_source: None,
@@ -1736,13 +1978,21 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
     Ok(out)
 }
 
-fn collect_git_source_dependencies(
+pub(super) fn collect_git_source_dependencies(
     package_dir: &Path,
     parent_source: &str,
     resolver_dependencies: &mut HashMap<String, String>,
     source_dependencies: &mut HashMap<String, Vec<SourceDep>>,
+    auto_install_peers: bool,
 ) -> Result<(), LpmError> {
-    let specs = read_source_dep_specs(package_dir)?;
+    let mut specs = read_source_dep_specs(package_dir)?;
+    if !auto_install_peers {
+        for spec in &mut specs {
+            if matches!(spec.role, SourceDepRole::Peer) {
+                spec.auto_install = false;
+            }
+        }
+    }
     for spec in &specs {
         match spec.kind {
             DepKind::Registry if spec.auto_install => {
@@ -2020,6 +2270,7 @@ fn promote_workspace_member_source_graph(
     workspace_transitives: WorkspaceTransitiveMode,
     promoted_git_root_names: &mut HashSet<String>,
     inherited_optional: bool,
+    auto_install_peers: bool,
 ) -> Result<(), LpmError> {
     let realpath = match matched_member.resolution_dir().canonicalize() {
         Ok(path) => path,
@@ -2042,14 +2293,11 @@ fn promote_workspace_member_source_graph(
     }
     visited.insert(realpath.clone(), source_string.clone());
     spec.target_source = Some(source_string.clone());
-    let node_engine = read_pkg_json_node_engine(
-        matched_member.resolution_dir(),
-        &format!(
-            "workspace member at {}",
-            matched_member.resolution_dir().display()
-        ),
-    )?;
+    let semantics = read_local_manifest_semantics(matched_member.resolution_dir())?;
     install_pkgs_out.push(InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: matched_member.name.clone(),
         version: matched_member.version.clone(),
         source: source_string.clone(),
@@ -2062,11 +2310,12 @@ fn promote_workspace_member_source_graph(
         integrity: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
-        platform: None,
-        node_engine,
+        platform: semantics.platform,
+        node_engine: semantics.node_engine,
         optional: inherited_optional || spec.optional,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: Some(semantics.fingerprint),
     });
     recurse_local_source_deps(
         project_dir,
@@ -2085,6 +2334,7 @@ fn promote_workspace_member_source_graph(
         workspace_transitives,
         promoted_git_root_names,
         inherited_optional || spec.optional,
+        auto_install_peers,
     )
 }
 
@@ -2139,11 +2389,19 @@ pub(super) fn recurse_local_source_deps(
     workspace_transitives: WorkspaceTransitiveMode,
     promoted_git_root_names: &mut HashSet<String>,
     inherited_optional: bool,
+    auto_install_peers: bool,
 ) -> Result<(), LpmError> {
     if current_depth > max_depth {
         return Ok(());
     }
     let mut specs = read_source_dep_specs(source_dir)?;
+    if !auto_install_peers {
+        for spec in &mut specs {
+            if matches!(spec.role, SourceDepRole::Peer) {
+                spec.auto_install = false;
+            }
+        }
+    }
 
     for spec in specs.iter_mut() {
         match spec.kind {
@@ -2204,6 +2462,12 @@ pub(super) fn recurse_local_source_deps(
                         available_str,
                     )));
                 };
+                lpm_workspace::validate_workspace_protocol_version(
+                    &spec.local_name,
+                    &spec.raw_spec,
+                    &matched_member.version,
+                )
+                .map_err(LpmError::Workspace)?;
                 let optional_path = inherited_optional || spec.optional;
                 let graph_backed_root_link = matches!(
                     workspace_transitives,
@@ -2216,6 +2480,7 @@ pub(super) fn recurse_local_source_deps(
                         version: matched_member.version.clone(),
                         package_dir: matched_member.package_dir.clone(),
                         source_dir: matched_member.source_dir.clone(),
+                        optional: optional_path,
                     });
                 }
                 if matches!(
@@ -2245,6 +2510,7 @@ pub(super) fn recurse_local_source_deps(
                     workspace_transitives,
                     promoted_git_root_names,
                     optional_path,
+                    auto_install_peers,
                 )?;
             }
             DepKind::FileDir | DepKind::Link => {
@@ -2265,11 +2531,9 @@ pub(super) fn recurse_local_source_deps(
                     spec.target_source = Some(existing_source.clone());
                     continue;
                 }
-                let (real_name, real_version, node_engine) = read_pkg_json_name_version(
-                    &realpath,
-                    &format!("transitive local source at {}", realpath.display()),
-                    MissingVersionPolicy::DefaultToZero,
-                )?;
+                let semantics = read_local_manifest_semantics(&realpath)?;
+                let real_name = semantics.name;
+                let real_version = semantics.version;
                 // (): workspace overlap on
                 // transitive deps too. Same dedupe-or-error logic
                 // as the immediate arms.
@@ -2305,6 +2569,7 @@ pub(super) fn recurse_local_source_deps(
                                 version: member.version.clone(),
                                 package_dir: member.package_dir.clone(),
                                 source_dir: member.source_dir.clone(),
+                                optional: optional_path,
                             });
                         }
                         if matches!(workspace_transitives, WorkspaceTransitiveMode::SourceGraph)
@@ -2330,6 +2595,7 @@ pub(super) fn recurse_local_source_deps(
                                 workspace_transitives,
                                 promoted_git_root_names,
                                 optional_path,
+                                auto_install_peers,
                             )?;
                         }
                         continue;
@@ -2354,6 +2620,9 @@ pub(super) fn recurse_local_source_deps(
                 spec.target_source = Some(source_string.clone());
                 visited.insert(realpath.clone(), source_string.clone());
                 install_pkgs_out.push(InstallPackage {
+                    instance_id: None,
+                    dependency_targets: HashMap::new(),
+                    peer_targets: HashMap::new(),
                     name: real_name,
                     version: real_version,
                     source: source_string.clone(),
@@ -2373,11 +2642,12 @@ pub(super) fn recurse_local_source_deps(
                     integrity: None,
                     registry_signatures: Vec::new(),
                     registry_published_at: None,
-                    platform: None,
-                    node_engine,
+                    platform: semantics.platform,
+                    node_engine: semantics.node_engine,
                     optional: inherited_optional || spec.optional,
                     tarball_url: None,
                     metadata_checked_for_tarball: false,
+                    manifest_fingerprint: Some(semantics.fingerprint),
                 });
                 // Recurse into THIS dep's source at depth + 1.
                 recurse_local_source_deps(
@@ -2397,6 +2667,7 @@ pub(super) fn recurse_local_source_deps(
                     workspace_transitives,
                     promoted_git_root_names,
                     inherited_optional || spec.optional,
+                    auto_install_peers,
                 )?;
             }
         }
@@ -2418,6 +2689,116 @@ pub(super) fn bind_resolved_git_source_dependencies(
             }
         }
     }
+}
+
+fn local_source_peer_range(spec: &SourceDep) -> Result<Option<lpm_resolver::NpmRange>, String> {
+    let raw_range = match spec.kind {
+        DepKind::Registry => lpm_resolver::ranges::parse_npm_alias(&spec.raw_spec)
+            .map_or_else(|| spec.raw_spec.clone(), |alias| alias.range),
+        DepKind::Workspace => {
+            let workspace_range = spec
+                .raw_spec
+                .strip_prefix("workspace:")
+                .unwrap_or(spec.raw_spec.as_str());
+            if matches!(workspace_range, "" | "*" | "^" | "~") {
+                "*".to_string()
+            } else {
+                workspace_range.to_string()
+            }
+        }
+        DepKind::FileDir | DepKind::Link | DepKind::Git => return Ok(None),
+    };
+    lpm_resolver::NpmRange::parse(&raw_range).map(Some)
+}
+
+fn local_source_peer_range_error(
+    consumer: &InstallPackage,
+    spec: &SourceDep,
+    error: &str,
+) -> LpmError {
+    LpmError::Registry(format!(
+        "local source {}@{} declares invalid peer range {:?} for {:?}: {error}",
+        consumer.name, consumer.version, spec.raw_spec, spec.local_name
+    ))
+}
+
+fn peer_version_satisfies_range(
+    consumer: &InstallPackage,
+    spec: &SourceDep,
+    version: &str,
+    range: &lpm_resolver::NpmRange,
+) -> Result<bool, LpmError> {
+    let version = lpm_resolver::NpmVersion::parse(version).map_err(|error| {
+        LpmError::Registry(format!(
+            "local source {}@{} peer {:?} resolved to invalid provider version {:?}: {error}",
+            consumer.name, consumer.version, spec.local_name, version
+        ))
+    })?;
+    Ok(range.satisfies(&version))
+}
+
+fn select_registry_peer_version(
+    consumer: &InstallPackage,
+    spec: &SourceDep,
+    target_name: &str,
+    candidates: &[String],
+) -> Result<Option<String>, LpmError> {
+    let range = match local_source_peer_range(spec) {
+        Ok(Some(range)) => range,
+        Ok(None) => return Ok(None),
+        Err(_) if spec.optional => return Ok(None),
+        Err(error) => return Err(local_source_peer_range_error(consumer, spec, &error)),
+    };
+    let mut matching = Vec::with_capacity(candidates.len());
+    for version in candidates {
+        if peer_version_satisfies_range(consumer, spec, version, &range)? {
+            matching.push(version.as_str());
+        }
+    }
+    match matching.as_slice() {
+        [version] => Ok(Some((*version).to_string())),
+        [] if spec.optional || candidates.is_empty() && !spec.auto_install => Ok(None),
+        [] => Err(LpmError::Registry(format!(
+            "local source {}@{} requires peer {:?} targeting {target_name:?} at {:?}, but resolved provider versions {:?} are incompatible",
+            consumer.name, consumer.version, spec.local_name, spec.raw_spec, candidates
+        ))),
+        _ => Err(LpmError::Registry(format!(
+            "local source {}@{} peer {:?} targeting {target_name:?} at {:?} matches multiple resolved provider versions {:?}; exact provider selection is ambiguous",
+            consumer.name, consumer.version, spec.local_name, spec.raw_spec, matching
+        ))),
+    }
+}
+
+fn source_peer_version_is_compatible(
+    consumer: &InstallPackage,
+    spec: &SourceDep,
+    target_name: &str,
+    target_version: &str,
+) -> Result<bool, LpmError> {
+    let range = match local_source_peer_range(spec) {
+        Ok(Some(range)) => range,
+        Ok(None) => return Ok(true),
+        Err(_) if spec.optional => return Ok(false),
+        Err(error) => return Err(local_source_peer_range_error(consumer, spec, &error)),
+    };
+    if peer_version_satisfies_range(consumer, spec, target_version, &range)? {
+        return Ok(true);
+    }
+    if spec.optional {
+        return Ok(false);
+    }
+    Err(LpmError::Registry(format!(
+        "local source {}@{} requires peer {:?} targeting {target_name:?} at {:?}, but resolved provider version {target_version:?} is incompatible",
+        consumer.name, consumer.version, spec.local_name, spec.raw_spec
+    )))
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SourcePeerProvider {
+    name: String,
+    version: String,
+    instance_id: lpm_common::PackageInstanceId,
+    wrapper_id: Option<String>,
 }
 
 /// post-resolve fix-up that
@@ -2448,32 +2829,116 @@ pub(super) fn bind_resolved_git_source_dependencies(
 pub(super) fn apply_post_resolve_directory_link_fixup(
     packages: &mut [InstallPackage],
     source_deps: &HashMap<String, Vec<SourceDep>>,
-) {
+) -> Result<(), LpmError> {
+    ensure_install_package_instance_ids(packages);
+
     // Build indexes over the merged list. Registry/tarball entries
     // are still resolved by package name here; directory/link edges
     // resolve by exact source string so same-name local forks do not
     // collapse onto the first package encountered.
     let mut name_to_version: HashMap<String, String> = HashMap::new();
-    let mut source_to_package: HashMap<String, (String, String)> = HashMap::new();
+    let mut peer_candidates: HashMap<String, Vec<String>> = HashMap::new();
+    let mut peer_providers: HashMap<String, HashMap<String, Vec<SourcePeerProvider>>> =
+        HashMap::new();
+    let mut peer_root_providers: HashMap<String, Vec<SourcePeerProvider>> = HashMap::new();
+    let mut registry_roots: HashMap<String, Vec<(String, String, lpm_common::PackageInstanceId)>> =
+        HashMap::new();
+    let mut registry_instances: HashMap<
+        String,
+        HashMap<String, Vec<lpm_common::PackageInstanceId>>,
+    > = HashMap::new();
+    let mut source_to_package: HashMap<
+        String,
+        (String, String, String, lpm_common::PackageInstanceId),
+    > = HashMap::new();
+    let mut source_instance_by_wrapper = HashMap::new();
     for p in packages.iter() {
         if let Ok(s) = p.source_kind() {
+            let instance_id = p
+                .instance_id
+                .expect("source fix-up assigns package instance IDs before indexing");
+            let peer_provider = SourcePeerProvider {
+                name: p.name.clone(),
+                version: p.version.clone(),
+                instance_id,
+                wrapper_id: p.wrapper_id_for_source(),
+            };
+            peer_candidates
+                .entry(p.name.clone())
+                .or_default()
+                .push(p.version.clone());
+            peer_providers
+                .entry(p.name.clone())
+                .or_default()
+                .entry(p.version.clone())
+                .or_default()
+                .push(peer_provider.clone());
+            if let Some(root_link_names) = &p.root_link_names {
+                for local_name in root_link_names {
+                    peer_root_providers
+                        .entry(local_name.clone())
+                        .or_default()
+                        .push(peer_provider.clone());
+                }
+            }
             match s {
                 lpm_lockfile::Source::Directory { .. }
                 | lpm_lockfile::Source::Link { .. }
                 | lpm_lockfile::Source::Git { .. } => {
                     if let Some(sid) = p.wrapper_id_for_source() {
+                        source_instance_by_wrapper
+                            .entry(sid.clone())
+                            .or_insert(instance_id);
                         source_to_package
                             .entry(p.source.clone())
-                            .or_insert_with(|| (sid, p.name.clone()));
+                            .or_insert_with(|| {
+                                (sid, p.name.clone(), p.version.clone(), instance_id)
+                            });
                     }
                 }
-                _ => {
+                lpm_lockfile::Source::Registry { .. } => {
                     name_to_version
                         .entry(p.name.clone())
                         .or_insert(p.version.clone());
+                    registry_instances
+                        .entry(p.name.clone())
+                        .or_default()
+                        .entry(p.version.clone())
+                        .or_default()
+                        .push(instance_id);
+                    if let Some(root_link_names) = &p.root_link_names {
+                        for local_name in root_link_names {
+                            registry_roots.entry(local_name.clone()).or_default().push((
+                                p.name.clone(),
+                                p.version.clone(),
+                                instance_id,
+                            ));
+                        }
+                    }
                 }
+                lpm_lockfile::Source::Tarball { .. } => {}
             }
         }
+    }
+    for versions in peer_candidates.values_mut() {
+        versions.sort_unstable();
+        versions.dedup();
+    }
+    for versions in registry_instances.values_mut() {
+        for instances in versions.values_mut() {
+            instances.sort_unstable();
+            instances.dedup();
+        }
+    }
+    for versions in peer_providers.values_mut() {
+        for providers in versions.values_mut() {
+            providers.sort_unstable();
+            providers.dedup();
+        }
+    }
+    for providers in peer_root_providers.values_mut() {
+        providers.sort_unstable();
+        providers.dedup();
     }
 
     // Walk and patch.
@@ -2496,6 +2961,9 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
             continue;
         };
         let mut deps_out: Vec<(String, String)> = Vec::with_capacity(specs.len());
+        let mut dependency_targets_out = HashMap::with_capacity(specs.len());
+        let mut peers_out: Vec<lpm_common::PeerEdge> = Vec::with_capacity(specs.len());
+        let mut peer_targets_out = HashMap::with_capacity(specs.len());
         let mut aliases_out: HashMap<String, String> = HashMap::new();
         for spec in specs {
             match spec.kind {
@@ -2504,10 +2972,80 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                     let lookup_name = alias
                         .as_ref()
                         .map_or(spec.local_name.as_str(), |a| a.target.as_str());
-                    if let Some(version) = name_to_version.get(lookup_name) {
-                        deps_out.push((spec.local_name.clone(), version.clone()));
-                        if let Some(alias) = alias {
-                            aliases_out.insert(spec.local_name.clone(), alias.target);
+                    match spec.role {
+                        SourceDepRole::Dependency => {
+                            let root_selection = select_local_source_registry_root(
+                                &registry_roots,
+                                &spec.local_name,
+                                lookup_name,
+                                &p.name,
+                                &p.version,
+                            )?;
+                            let version = root_selection
+                                .as_ref()
+                                .map(|(version, _)| version)
+                                .or_else(|| name_to_version.get(lookup_name));
+                            if let Some(version) = version {
+                                deps_out.push((spec.local_name.clone(), version.clone()));
+                                let instance_id = root_selection
+                                    .as_ref()
+                                    .map(|(_, instance_id)| *instance_id)
+                                    .map_or_else(
+                                        || {
+                                            unique_registry_instance(
+                                                &registry_instances,
+                                                lookup_name,
+                                                version,
+                                                &p.name,
+                                                &p.version,
+                                                &spec.local_name,
+                                            )
+                                        },
+                                        Ok,
+                                    )?;
+                                dependency_targets_out.insert(spec.local_name.clone(), instance_id);
+                                if let Some(alias) = alias {
+                                    aliases_out.insert(spec.local_name.clone(), alias.target);
+                                }
+                            }
+                        }
+                        SourceDepRole::Peer => {
+                            let candidates = peer_candidates
+                                .get(lookup_name)
+                                .map_or(&[][..], Vec::as_slice);
+                            if let Some(version) =
+                                select_registry_peer_version(p, spec, lookup_name, candidates)?
+                            {
+                                let root_selection = select_local_source_peer_root(
+                                    &peer_root_providers,
+                                    &spec.local_name,
+                                    lookup_name,
+                                    &version,
+                                    &p.name,
+                                    &p.version,
+                                )?;
+                                let provider = root_selection.map_or_else(
+                                    || {
+                                        unique_source_peer_provider(
+                                            &peer_providers,
+                                            lookup_name,
+                                            &version,
+                                            &p.name,
+                                            &p.version,
+                                            &spec.local_name,
+                                        )
+                                    },
+                                    Ok,
+                                )?;
+                                peers_out.push(lpm_common::PeerEdge {
+                                    local_name: spec.local_name.clone(),
+                                    target_name: lookup_name.to_string(),
+                                    target_version: version,
+                                    target_wrapper_id: provider.wrapper_id,
+                                });
+                                peer_targets_out
+                                    .insert(spec.local_name.clone(), provider.instance_id);
+                            }
                         }
                     }
                     // Missing → resolver didn't fulfill this spec
@@ -2518,28 +3056,167 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                 }
                 DepKind::FileDir | DepKind::Link | DepKind::Workspace | DepKind::Git => {
                     if let Some(target_source) = &spec.target_source
-                        && let Some((sid, canonical_name)) = source_to_package.get(target_source)
+                        && let Some((sid, canonical_name, target_version, instance_id)) =
+                            source_to_package.get(target_source)
                     {
-                        deps_out.push((spec.local_name.clone(), sid.clone()));
-                        if spec.local_name != *canonical_name {
-                            aliases_out.insert(spec.local_name.clone(), canonical_name.clone());
+                        match spec.role {
+                            SourceDepRole::Dependency => {
+                                deps_out.push((spec.local_name.clone(), sid.clone()));
+                                dependency_targets_out
+                                    .insert(spec.local_name.clone(), *instance_id);
+                                if spec.local_name != *canonical_name {
+                                    aliases_out
+                                        .insert(spec.local_name.clone(), canonical_name.clone());
+                                }
+                            }
+                            SourceDepRole::Peer => {
+                                if source_peer_version_is_compatible(
+                                    p,
+                                    spec,
+                                    canonical_name,
+                                    target_version,
+                                )? {
+                                    peers_out.push(lpm_common::PeerEdge {
+                                        local_name: spec.local_name.clone(),
+                                        target_name: canonical_name.clone(),
+                                        target_version: target_version.clone(),
+                                        target_wrapper_id: Some(sid.clone()),
+                                    });
+                                    peer_targets_out.insert(spec.local_name.clone(), *instance_id);
+                                }
+                            }
                         }
                     } else if matches!(spec.kind, DepKind::Git)
+                        && matches!(spec.role, SourceDepRole::Dependency)
                         && let Some((_, locked_target)) = p
                             .dependencies
                             .iter()
                             .find(|(local_name, _)| local_name == &spec.local_name)
                     {
                         deps_out.push((spec.local_name.clone(), locked_target.clone()));
+                        let instance_id = source_instance_by_wrapper.get(locked_target).ok_or_else(
+                            || {
+                                LpmError::Registry(format!(
+                                    "local source {}@{} dependency slot {:?} references missing source wrapper {:?}",
+                                    p.name, p.version, spec.local_name, locked_target
+                                ))
+                            },
+                        )?;
+                        dependency_targets_out.insert(spec.local_name.clone(), *instance_id);
                     }
                 }
             }
         }
         p.dependencies = deps_out;
-        p.aliases.extend(aliases_out);
+        p.dependency_targets = dependency_targets_out;
+        p.peers = peers_out;
+        p.peer_targets = peer_targets_out;
+        p.aliases = aliases_out;
     }
 
     apply_local_source_optionality(packages, source_deps);
+    Ok(())
+}
+
+fn select_local_source_registry_root(
+    registry_roots: &HashMap<String, Vec<(String, String, lpm_common::PackageInstanceId)>>,
+    local_name: &str,
+    target_name: &str,
+    consumer_name: &str,
+    consumer_version: &str,
+) -> Result<Option<(String, lpm_common::PackageInstanceId)>, LpmError> {
+    let Some(candidates) = registry_roots.get(local_name) else {
+        return Ok(None);
+    };
+    let mut matching = candidates
+        .iter()
+        .filter(|(name, _, _)| name == target_name)
+        .map(|(_, version, instance_id)| (version.clone(), *instance_id))
+        .collect::<Vec<_>>();
+    matching.sort_unstable();
+    matching.dedup();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [selection] => Ok(Some(selection.clone())),
+        _ => Err(LpmError::Registry(format!(
+            "local source {consumer_name}@{consumer_version} dependency slot {local_name:?} has multiple exact root selections for {target_name:?}"
+        ))),
+    }
+}
+
+fn unique_registry_instance(
+    registry_instances: &HashMap<String, HashMap<String, Vec<lpm_common::PackageInstanceId>>>,
+    name: &str,
+    version: &str,
+    consumer_name: &str,
+    consumer_version: &str,
+    local_name: &str,
+) -> Result<lpm_common::PackageInstanceId, LpmError> {
+    let instances = registry_instances
+        .get(name)
+        .and_then(|versions| versions.get(version))
+        .map_or(&[][..], Vec::as_slice);
+    match instances {
+        [instance_id] => Ok(*instance_id),
+        [] => Err(LpmError::Registry(format!(
+            "local source {consumer_name}@{consumer_version} dependency slot {local_name:?} references missing registry target {name}@{version}"
+        ))),
+        _ => Err(LpmError::Registry(format!(
+            "local source {consumer_name}@{consumer_version} dependency slot {local_name:?} matches {} instances of {name}@{version}; exact target identity is required",
+            instances.len()
+        ))),
+    }
+}
+
+fn select_local_source_peer_root(
+    peer_roots: &HashMap<String, Vec<SourcePeerProvider>>,
+    local_name: &str,
+    target_name: &str,
+    target_version: &str,
+    consumer_name: &str,
+    consumer_version: &str,
+) -> Result<Option<SourcePeerProvider>, LpmError> {
+    let Some(candidates) = peer_roots.get(local_name) else {
+        return Ok(None);
+    };
+    let mut matching = candidates
+        .iter()
+        .filter(|provider| provider.name == target_name && provider.version == target_version)
+        .cloned()
+        .collect::<Vec<_>>();
+    matching.sort_unstable();
+    matching.dedup();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [selection] => Ok(Some(selection.clone())),
+        _ => Err(LpmError::Registry(format!(
+            "local source {consumer_name}@{consumer_version} peer slot {local_name:?} has multiple exact root selections for {target_name}@{target_version}"
+        ))),
+    }
+}
+
+fn unique_source_peer_provider(
+    peer_providers: &HashMap<String, HashMap<String, Vec<SourcePeerProvider>>>,
+    name: &str,
+    version: &str,
+    consumer_name: &str,
+    consumer_version: &str,
+    local_name: &str,
+) -> Result<SourcePeerProvider, LpmError> {
+    let providers = peer_providers
+        .get(name)
+        .and_then(|versions| versions.get(version))
+        .map_or(&[][..], Vec::as_slice);
+    match providers {
+        [provider] => Ok(provider.clone()),
+        [] => Err(LpmError::Registry(format!(
+            "local source {consumer_name}@{consumer_version} peer slot {local_name:?} references missing target {name}@{version}"
+        ))),
+        _ => Err(LpmError::Registry(format!(
+            "local source {consumer_name}@{consumer_version} peer slot {local_name:?} matches {} instances of {name}@{version}; exact target identity is required",
+            providers.len()
+        ))),
+    }
 }
 
 fn apply_local_source_optionality(
@@ -2552,6 +3229,21 @@ fn apply_local_source_optionality(
         if local_sources.contains(package.source.as_str()) {
             package.optional = !required_sources.contains(package.source.as_str());
         }
+    }
+}
+
+fn mark_direct_root_optionality(
+    packages: &mut [InstallPackage],
+    optional_root_names: &HashSet<String>,
+) {
+    for package in packages.iter_mut().filter(|package| package.is_direct) {
+        let Some(root_link_names) = package.root_link_names.as_ref() else {
+            continue;
+        };
+        package.optional = !root_link_names.is_empty()
+            && root_link_names
+                .iter()
+                .all(|name| optional_root_names.contains(name));
     }
 }
 
@@ -2576,7 +3268,7 @@ fn required_local_sources<'a>(
     let mut required_sources: HashSet<&str> = HashSet::with_capacity(local_sources.len());
     let mut queue = VecDeque::with_capacity(local_sources.len());
     for package in packages.iter() {
-        if !package.is_direct {
+        if !package.is_direct || package.optional {
             continue;
         }
         let Some(&source) = local_sources.get(package.source.as_str()) else {
@@ -2592,7 +3284,7 @@ fn required_local_sources<'a>(
             continue;
         };
         for spec in specs {
-            if spec.optional {
+            if spec.optional || matches!(spec.role, SourceDepRole::Peer) {
                 continue;
             }
             let Some(target_source) = spec.target_source.as_deref() else {
@@ -2618,7 +3310,7 @@ fn registry_root_optionality(
     for (source, specs) in source_deps {
         let parent_required = required_sources.contains(source.as_str());
         for spec in specs {
-            if !matches!(spec.kind, DepKind::Registry) {
+            if !matches!(spec.kind, DepKind::Registry) || matches!(spec.role, SourceDepRole::Peer) {
                 continue;
             }
             if parent_required && !spec.optional {

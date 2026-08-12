@@ -77,6 +77,8 @@ fn merge_cached_package_info(
     deps.extend(incoming.deps.clone());
     let mut peer_deps = existing.peer_deps.clone();
     peer_deps.extend(incoming.peer_deps.clone());
+    let mut peer_aliases = existing.peer_aliases.clone();
+    peer_aliases.extend(incoming.peer_aliases.clone());
     let mut optional_dep_names = existing.optional_dep_names.clone();
     optional_dep_names.extend(incoming.optional_dep_names.clone());
     let mut optional_peer_names = existing.optional_peer_names.clone();
@@ -98,6 +100,7 @@ fn merge_cached_package_info(
         let version = workspace_version.to_string();
         preserve_workspace_entry(&mut deps, &existing.deps, &version);
         preserve_workspace_entry(&mut peer_deps, &existing.peer_deps, &version);
+        preserve_workspace_entry(&mut peer_aliases, &existing.peer_aliases, &version);
         preserve_workspace_entry(
             &mut optional_dep_names,
             &existing.optional_dep_names,
@@ -154,6 +157,7 @@ fn merge_cached_package_info(
         versions,
         deps,
         peer_deps,
+        peer_aliases,
         optional_dep_names,
         optional_peer_names,
         node_engines,

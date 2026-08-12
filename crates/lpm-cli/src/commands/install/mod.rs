@@ -77,6 +77,7 @@ pub(crate) use firewall::{
     registry_materialization_route_is_public_npm,
     run_prepared_npm_firewall_materialization_preflight,
 };
+pub(crate) use github_source::download_github_archive_to_file;
 use github_source::resolve_github_source;
 pub(crate) use github_source::{download_github_archive, github_archive_url};
 pub use gitignore::ensure_skills_gitignore;
@@ -110,7 +111,10 @@ use skills::*;
 use source_resolution::*;
 use state::*;
 use swift::*;
-use test_support::{maybe_test_audit_after_install_should_fail, maybe_test_panic};
+use test_support::{
+    maybe_test_audit_after_install_should_fail, maybe_test_panic,
+    maybe_test_pause_before_local_materialization,
+};
 use timing::*;
 pub(crate) use validation::{FrozenLockfileMode, install_running_in_ci};
 use validation::{
@@ -560,6 +564,7 @@ async fn run_with_options_under_store_lock(
         linker_mode,
         store_version,
         manifest_deps,
+        root_optional_dependency_names,
         production_dependency_names,
     } = prepare_install_setup_context(InstallSetupInput {
         project_dir,
@@ -600,6 +605,7 @@ async fn run_with_options_under_store_lock(
         pkg_json_path: &pkg_json_path,
         lockfile_path: &lockfile_path,
         manifest_deps: &manifest_deps,
+        root_optional_dependency_names: &root_optional_dependency_names,
         production_dependency_names: &production_dependency_names,
         policy_extension_configs: &policy_extension_configs,
         force,
@@ -776,7 +782,10 @@ async fn run_with_options_under_store_lock(
     })?;
 
     if deps.is_empty() && workspace_member_deps.is_empty() {
-        workspace_resolution::publish_root_peer_providers_for_empty_install(project_dir);
+        workspace_resolution::publish_root_peer_providers_for_empty_install(
+            project_dir,
+            omit_policy,
+        );
         workspace_resolution::enter_commit();
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
@@ -832,10 +841,15 @@ async fn run_with_options_under_store_lock(
             &mut deps,
             &direct_workspace_member_deps,
             &all_workspace_members,
+            &root_optional_dependency_names,
             json_output,
+            auto_install_peers,
         )?
     } else {
-        V2WorkspaceRootPreResolveResult::default()
+        V2WorkspaceRootPreResolveResult {
+            optional_registry_roots: root_optional_dependency_names.clone(),
+            ..V2WorkspaceRootPreResolveResult::default()
+        }
     };
     if requested_v2_mode {
         workspace_member_deps.retain(WorkspaceMemberLink::needs_publish_projection_link);
@@ -897,6 +911,7 @@ async fn run_with_options_under_store_lock(
             patches_changed,
             auto_install_peers,
             omit_policy,
+            root_optional_dependency_names: &root_optional_dependency_names,
             production_dependency_names: &production_dependency_names,
             store_version,
             object_integrity_policy,
@@ -935,8 +950,10 @@ async fn run_with_options_under_store_lock(
     let lockfile_result = select_lockfile_install_plan(LockfileSelectionInput {
         lockfile_path: &lockfile_path,
         deps: &direct_dependency_snapshot,
+        optional_root_names: &root_optional_dependency_names,
         catalog_resolutions: &catalog_resolutions,
         workspace: workspace.as_deref(),
+        route_table: &route_table,
         client,
         gate_stats: &gate_stats,
         frozen_lockfile_active,
@@ -1104,6 +1121,7 @@ async fn run_with_options_under_store_lock(
             &all_workspace_members,
             &v2_workspace_root_pre_resolve.optional_registry_roots,
             &v2_workspace_root_pre_resolve.promoted_git_root_names,
+            auto_install_peers,
         )
         .await?;
 
@@ -1120,9 +1138,12 @@ async fn run_with_options_under_store_lock(
             &mut workspace_member_deps,
             &all_workspace_members,
         )?;
+        if omit_policy.optional {
+            filter_optional_workspace_member_links(&mut workspace_member_deps);
+        }
         if !requested_v2_mode {
             enforce_required_workspace_member_engines(
-                &workspace_member_deps,
+                &mut workspace_member_deps,
                 dependency_engine_policy.as_ref(),
             )?;
         }
@@ -1212,6 +1233,7 @@ async fn run_with_options_under_store_lock(
         force,
         offline,
         omit_policy,
+        root_optional_dependency_names: &root_optional_dependency_names,
         production_dependency_names: &production_dependency_names,
         pubgrub_opt_out,
         auto_install_peers,
@@ -1449,6 +1471,7 @@ async fn run_with_options_under_store_lock(
         linker_mode,
         force,
         compatibility_bin_names,
+        store_version,
     })
     .await?;
     let mut link_result = link_phase.link_result;

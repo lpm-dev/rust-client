@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn workspace_member_identity_is_validated_before_local_linking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let member_dir = dir.path().join("packages/app");
+    std::fs::create_dir_all(&member_dir).unwrap();
+    std::fs::write(
+        member_dir.join("package.json"),
+        r#"{"name":"../escape","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let workspace = lpm_workspace::discover_workspace(dir.path())
+        .unwrap()
+        .unwrap();
+
+    let error = all_workspace_members(Some(&workspace))
+        .expect_err("unsafe member identity must be rejected before local linking");
+
+    assert!(error.to_string().contains("invalid package name"));
+}
+
+#[test]
 fn matching_semver_workspace_dependency_is_extracted_for_local_linking() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -37,6 +62,7 @@ fn incompatible_semver_workspace_dependency_remains_a_registry_dependency() {
         version: "1.0.0".to_string(),
         package_dir: PathBuf::from("packages/app"),
         source_dir: PathBuf::from("packages/app"),
+        optional: false,
     };
     let mut deps = HashMap::from([("app".to_string(), "^2.0.0".to_string())]);
 
@@ -76,6 +102,7 @@ fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
         version: "1.0.0".to_string(),
         package_dir: runtime_dir.clone(),
         source_dir: runtime_dir,
+        optional: false,
     };
     let build_tool = WorkspaceMemberLink {
         name: "@test/build-tool".to_string(),
@@ -83,6 +110,7 @@ fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
         version: "1.0.0".to_string(),
         package_dir: build_tool_dir.clone(),
         source_dir: build_tool_dir,
+        optional: false,
     };
     let mut expanded = vec![runtime.clone()];
 
@@ -96,6 +124,29 @@ fn transitive_workspace_expansion_excludes_consumed_member_dev_dependencies() {
         vec!["@test/runtime"],
         "consumed workspace member devDependencies must not become transitives",
     );
+}
+
+#[test]
+fn required_workspace_path_dominates_optional_duplicate() {
+    let package_dir = PathBuf::from("packages/shared");
+    let optional = WorkspaceMemberLink {
+        name: "shared".into(),
+        link_name: "shared".into(),
+        version: "1.0.0".into(),
+        package_dir: package_dir.clone(),
+        source_dir: package_dir,
+        optional: true,
+    };
+    let required = WorkspaceMemberLink {
+        optional: false,
+        ..optional.clone()
+    };
+    let mut links = vec![optional];
+
+    merge_workspace_member_links(&mut links, [required]);
+
+    assert_eq!(links.len(), 1);
+    assert!(!links[0].optional);
 }
 
 // ── invariant: install_root must be the member dir, not workspace ──
@@ -449,6 +500,42 @@ fn extract_workspace_protocol_deps_handles_all_workspace_protocol_forms() {
     }
 }
 
+#[test]
+fn extract_workspace_protocol_deps_rejects_a_nonmatching_explicit_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_workspace_for_install_tests(
+        root,
+        &[
+            ("@test/core", "packages/core"),
+            ("@test/app", "packages/app"),
+        ],
+    );
+    std::fs::write(
+        root.join("packages/core/package.json"),
+        r#"{"name":"@test/core","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("packages/app/package.json"),
+        r#"{"name":"@test/app","version":"1.0.0","dependencies":{"@test/core":"workspace:^1.0.0"}}"#,
+    )
+    .unwrap();
+    let app_dir = root.join("packages/app");
+    let package = lpm_workspace::read_package_json(&app_dir.join("package.json")).unwrap();
+    let mut deps = package.dependencies;
+    let workspace = lpm_workspace::discover_workspace(&app_dir)
+        .unwrap()
+        .unwrap();
+
+    let error = extract_workspace_protocol_deps(&mut deps, &workspace)
+        .expect_err("a nonmatching explicit workspace range must fail");
+
+    assert!(error.to_string().contains("workspace:^1.0.0"));
+    assert!(error.to_string().contains("2.0.0"));
+    assert!(deps.contains_key("@test/core"));
+}
+
 /// A `workspace:` reference to an unknown member must hard
 /// error so users don't silently install nothing. Mirrors the validation
 /// `resolve_workspace_protocol` already enforces.
@@ -521,6 +608,7 @@ fn link_workspace_members_creates_node_modules_symlink_to_member_source_dir() {
         version: "2.0.0".to_string(),
         package_dir: core_dir.clone(),
         source_dir: core_dir.clone(),
+        optional: false,
     }];
 
     let linked = link_workspace_members(&app_dir, &members).unwrap();
@@ -566,6 +654,7 @@ fn link_workspace_members_is_idempotent_across_repeated_calls() {
         version: "0.0.0".to_string(),
         package_dir: core_dir.clone(),
         source_dir: core_dir.clone(),
+        optional: false,
     }];
 
     link_workspace_members(&app_dir, &members).unwrap();
@@ -601,6 +690,7 @@ fn link_workspace_members_from_member_also_populates_workspace_root() {
             version: "0.0.0".to_string(),
             package_dir: core_dir.clone(),
             source_dir: core_dir.clone(),
+            optional: false,
         },
         WorkspaceMemberLink {
             name: "@test/tokens".to_string(),
@@ -608,6 +698,7 @@ fn link_workspace_members_from_member_also_populates_workspace_root() {
             version: "0.0.0".to_string(),
             package_dir: tokens_dir.clone(),
             source_dir: tokens_dir.clone(),
+            optional: false,
         },
     ];
 

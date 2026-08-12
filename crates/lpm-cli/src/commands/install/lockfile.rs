@@ -44,8 +44,15 @@ pub(super) fn lockfile_needs_peer_state_repair(
     lockfile: &lpm_lockfile::Lockfile,
     auto_install_peers: bool,
 ) -> bool {
-    auto_install_peers
-        && lockfile.metadata.lockfile_version < MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE
+    (auto_install_peers
+        && lockfile.metadata.lockfile_version < MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE)
+        || (lockfile.metadata.lockfile_version
+            < lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+            && lockfile
+                .packages
+                .iter()
+                .chain(lockfile.workspace_packages.values())
+                .any(|package| !package.peers.is_empty()))
 }
 
 pub(super) fn importer_snapshot_is_authoritative(
@@ -57,9 +64,11 @@ pub(super) fn importer_snapshot_is_authoritative(
 pub(super) struct LockfileSelectionInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) deps: &'a HashMap<String, String>,
+    pub(super) optional_root_names: &'a HashSet<String>,
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
     pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
     pub(super) client: &'a RegistryClient,
+    pub(super) route_table: &'a RouteTable,
     pub(super) gate_stats: &'a GateStats,
     pub(super) frozen_lockfile_active: bool,
     pub(super) force: bool,
@@ -76,14 +85,28 @@ pub(super) fn select_lockfile_install_plan(
     input: LockfileSelectionInput<'_>,
 ) -> Result<Option<LockfileFastPath>, LpmError> {
     if input.frozen_lockfile_active {
-        let candidate = try_lockfile_fast_path(
-            input.lockfile_path,
-            input.deps,
-            input.catalog_resolutions,
-            input.workspace,
-            input.client,
-            input.gate_stats,
-            false,
+        if let Ok(lockfile) = workspace_lockfile::read_full_shared(input.lockfile_path)
+            && lockfile.metadata.lockfile_version
+                < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+        {
+            return Err(LpmError::Registry(format!(
+                "Frozen lockfile mismatch\n  lockfile    v{}\n  required    v{}\n  hint        this lockfile has no exact package-instance graph; run `lpm install` locally and commit the upgraded lpm.lock",
+                lockfile.metadata.lockfile_version,
+                lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES,
+            )));
+        }
+        let candidate = try_lockfile_fast_path_with_optional_roots(
+            TryLockfileFastPathInput {
+                lockfile_path: input.lockfile_path,
+                deps: input.deps,
+                optional_root_names: input.optional_root_names,
+                catalog_resolutions: input.catalog_resolutions,
+                workspace: input.workspace,
+                route_table: input.route_table,
+                client: input.client,
+                gate_stats: input.gate_stats,
+                accept_unsafe_sources: false,
+            },
         )
         .ok_or_else(|| {
             LpmError::Registry(
@@ -118,15 +141,17 @@ pub(super) fn select_lockfile_install_plan(
         return Ok(None);
     }
 
-    let candidate = try_lockfile_fast_path(
-        input.lockfile_path,
-        input.deps,
-        input.catalog_resolutions,
-        input.workspace,
-        input.client,
-        input.gate_stats,
-        false,
-    );
+    let candidate = try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
+        lockfile_path: input.lockfile_path,
+        deps: input.deps,
+        optional_root_names: input.optional_root_names,
+        catalog_resolutions: input.catalog_resolutions,
+        workspace: input.workspace,
+        route_table: input.route_table,
+        client: input.client,
+        gate_stats: input.gate_stats,
+        accept_unsafe_sources: false,
+    });
     match candidate {
         Some(fast)
             if lockfile_needs_peer_state_repair(&fast.lockfile, input.auto_install_peers) =>
@@ -231,14 +256,15 @@ fn fresh_resolved_lockfile(
     let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver(input.resolved_with);
     lockfile.metadata.auto_isolated_peer_conflicts = input.auto_isolated_peer_conflicts;
 
-    let persisted_packages = input.packages_for_lockfile.to_vec();
+    let persisted_packages = input.packages_for_lockfile;
 
-    for package in &persisted_packages {
+    for package in persisted_packages {
+        verify_local_manifest_fingerprint(input.project_dir, package)?;
         lockfile.add_package(locked_package_from_install_package(package));
     }
 
-    lockfile.root_aliases = root_aliases_for_lockfile(&persisted_packages, input.deps);
-    lockfile.root_resolutions = root_resolutions_for_lockfile(&persisted_packages);
+    lockfile.root_aliases = root_aliases_for_lockfile(persisted_packages, input.deps);
+    lockfile.root_resolutions = root_resolutions_for_lockfile(persisted_packages);
     lockfile.ambient_peer_installs = input.ambient_peer_installs_for_lockfile.to_vec();
     let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
         &input.catalog_resolutions[..input.dependency_catalog_resolution_count],
@@ -246,7 +272,7 @@ fn fresh_resolved_lockfile(
         input.applied_overrides,
     );
     lockfile.catalogs =
-        catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, &persisted_packages)?;
+        catalog_snapshot_from_install_packages(&lockfile_catalog_resolutions, persisted_packages)?;
     lockfile.patches = input.current_lockfile_patches.clone();
     lockfile.provenance = input.verified_provenance.clone();
     lockfile
@@ -254,6 +280,35 @@ fn fresh_resolved_lockfile(
         .insert(".".to_string(), input.current_importer_snapshot.clone());
 
     Ok(lockfile)
+}
+
+fn verify_local_manifest_fingerprint(
+    source_base_dir: &Path,
+    package: &InstallPackage,
+) -> Result<(), LpmError> {
+    let source_path = match package.source_kind() {
+        Ok(lpm_lockfile::Source::Directory { path }) | Ok(lpm_lockfile::Source::Link { path }) => {
+            path
+        }
+        Ok(_) | Err(_) => return Ok(()),
+    };
+    let expected = package.manifest_fingerprint.as_deref().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "local package {}@{} has no resolution-time manifest fingerprint",
+            package.name, package.version
+        ))
+    })?;
+    let current = read_local_manifest_semantics(&source_base_dir.join(source_path))?;
+    if current.name != package.name
+        || current.version != package.version
+        || current.fingerprint != expected
+    {
+        return Err(LpmError::Registry(format!(
+            "local source for {}@{} changed during install; rerun `lpm install`",
+            package.name, package.version
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn locked_package_from_install_package(
@@ -272,11 +327,7 @@ pub(super) fn locked_package_from_install_package(
     alias_dependencies.sort_unstable_by(|left, right| {
         left[0].cmp(&right[0]).then_with(|| left[1].cmp(&right[1]))
     });
-    let peers = package
-        .peers
-        .iter()
-        .map(|(name, version)| format!("{name}@{version}"))
-        .collect();
+    let peer_edges = package.peers.clone();
     let tarball = if matches!(
         package.source_kind(),
         Ok(lpm_lockfile::Source::Registry { .. })
@@ -287,10 +338,22 @@ pub(super) fn locked_package_from_install_package(
     };
 
     lpm_lockfile::LockedPackage {
+        instance_id: package.instance_id,
+        dependency_targets: package
+            .dependency_targets
+            .iter()
+            .map(|(local_name, target)| (local_name.clone(), *target))
+            .collect(),
+        peer_targets: package
+            .peer_targets
+            .iter()
+            .map(|(local_name, target)| (local_name.clone(), *target))
+            .collect(),
         name: package.name.clone(),
         version: package.version.clone(),
         source: Some(package.source.clone()),
         integrity: package.integrity.clone(),
+        manifest_fingerprint: package.manifest_fingerprint.clone(),
         registry_signatures: lockfile_registry_signatures(&package.registry_signatures),
         registry_published_at: package.registry_published_at.clone(),
         os: package
@@ -309,7 +372,8 @@ pub(super) fn locked_package_from_install_package(
         optional: package.optional,
         dependencies,
         alias_dependencies,
-        peers,
+        peers: Vec::new(),
+        peer_edges,
         tarball,
     }
 }
@@ -680,6 +744,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) patches_changed: bool,
     pub(super) auto_install_peers: bool,
     pub(super) omit_policy: InstallOmitPolicy,
+    pub(super) root_optional_dependency_names: &'a HashSet<String>,
     pub(super) production_dependency_names: &'a HashSet<String>,
     pub(super) store_version: lpm_store::StoreVersion,
     pub(super) object_integrity_policy: lpm_store::v2::ObjectIntegrityPolicy,
@@ -735,6 +800,7 @@ pub(super) async fn run_offline_install_phase(
         patches_changed,
         auto_install_peers,
         omit_policy,
+        root_optional_dependency_names,
         production_dependency_names,
         store_version,
         object_integrity_policy,
@@ -808,16 +874,33 @@ pub(super) async fn run_offline_install_phase(
         )));
     }
 
+    let offline_lockfile = workspace_lockfile::read_full_shared(lockfile_path).map_err(|error| {
+        LpmError::Registry(format!(
+            "--offline could not load the lockfile: {error}. Run `lpm install` online to repair it, then retry --offline."
+        ))
+    })?;
+    if offline_lockfile.metadata.lockfile_version
+        < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+    {
+        return Err(LpmError::Registry(format!(
+            "--offline cannot safely replay lockfile v{} because it has no exact package-instance graph. Run `lpm install` online once to upgrade to v{}, then retry --offline.",
+            offline_lockfile.metadata.lockfile_version,
+            lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES,
+        )));
+    }
+
     // Offline replay cannot fresh-resolve, so it trusts lockfile-local source entries.
-    let fast = try_lockfile_fast_path(
+    let fast = try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
         lockfile_path,
-        lockfile_deps,
+        deps: lockfile_deps,
+        optional_root_names: root_optional_dependency_names,
         catalog_resolutions,
-        None,
+        workspace: None,
+        route_table,
         client,
         gate_stats,
-        true,
-    )
+        accept_unsafe_sources: true,
+    })
     .ok_or_else(|| {
         LpmError::Registry(
             "--offline could not load the lockfile. Possible causes: (1) lpm.lock is \
@@ -874,9 +957,17 @@ pub(super) async fn run_offline_install_phase(
         }
     }
 
+    let ambient_peer_installs = fast.lockfile.ambient_peer_installs.clone();
     let mut locked = fast.packages;
     if omit_policy.dev {
         filter_dev_packages(&mut locked, production_dependency_names);
+    }
+    if omit_policy.optional {
+        filter_optional_packages_for_install(
+            &mut locked,
+            root_optional_dependency_names,
+            &ambient_peer_installs,
+        );
     }
     filter_dependency_engine_packages(&mut locked, dependency_engine_policy)?;
     let _platform_skipped = filter_platform_packages(&mut locked)?;
@@ -921,6 +1012,9 @@ pub(super) async fn run_offline_install_phase(
             .cloned(),
     );
     expand_workspace_member_deps_with_transitives(workspace_member_deps, all_workspace_members)?;
+    if omit_policy.optional {
+        filter_optional_workspace_member_links(workspace_member_deps);
+    }
     if !requested_v2_mode {
         enforce_required_workspace_member_engines(workspace_member_deps, dependency_engine_policy)?;
     }
@@ -949,6 +1043,13 @@ pub(super) async fn run_offline_install_phase(
     .await?;
     let policy_extension_stats =
         run_policy_extensions(policy_extension_configs, project_dir, &locked, json_output).await?;
+    let mut ephemeral_packages = v2_workspace_root_pre_resolve.install_pkgs.clone();
+    if omit_policy.dev {
+        filter_dev_packages(&mut ephemeral_packages, production_dependency_names);
+    }
+    if omit_policy.optional {
+        filter_optional_packages(&mut ephemeral_packages, root_optional_dependency_names);
+    }
 
     run_link_and_finish(
         client,
@@ -956,7 +1057,7 @@ pub(super) async fn run_offline_install_phase(
         deps,
         pkg,
         locked,
-        &v2_workspace_root_pre_resolve.install_pkgs,
+        &ephemeral_packages,
         &v2_workspace_root_pre_resolve.source_deps,
         0,
         0,
@@ -1470,6 +1571,25 @@ fn select_locked_root_package_from_rows<'a>(
         if selection.package != target {
             return None;
         }
+        if lockfile.metadata.lockfile_version
+            >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+        {
+            let instance_id = selection.instance_id?;
+            return packages
+                .iter()
+                .copied()
+                .find(|package| package.instance_id == Some(instance_id))
+                .filter(|package| {
+                    package.name == selection.package
+                        && package.version == selection.version
+                        && package.source == selection.source
+                        && locked_source_kind_matches_requested_spec(package, requested_spec)
+                        && locked_version_satisfies_requested_range(
+                            &package.version,
+                            requested_spec,
+                        )
+                });
+        }
         return packages
             .iter()
             .copied()
@@ -1479,8 +1599,12 @@ fn select_locked_root_package_from_rows<'a>(
                     && package.source == selection.source
             })
             .filter(|package| {
-                locked_version_satisfies_requested_range(&package.version, requested_spec)
+                locked_source_kind_matches_requested_spec(package, requested_spec)
+                    && locked_version_satisfies_requested_range(&package.version, requested_spec)
             });
+    }
+    if lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        return None;
     }
 
     let requested_range = requested_range_for_locked_lookup(requested_spec)
@@ -1504,7 +1628,130 @@ fn select_locked_root_package_from_rows<'a>(
         }
         candidate = Some(package);
     }
-    candidate
+    candidate.filter(|package| locked_source_kind_matches_requested_spec(package, requested_spec))
+}
+
+pub(super) fn select_locked_ambient_root_package_from_rows<'a>(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&'a lpm_lockfile::LockedPackage],
+    local_name: &str,
+) -> Option<&'a lpm_lockfile::LockedPackage> {
+    let selection = lockfile.root_resolutions.get(local_name)?;
+    let instance_id = selection.instance_id?;
+    packages.iter().copied().find(|package| {
+        package.instance_id == Some(instance_id)
+            && package.name == selection.package
+            && package.version == selection.version
+            && package.source == selection.source
+    })
+}
+
+fn locked_source_kind_matches_requested_spec(
+    package: &lpm_lockfile::LockedPackage,
+    requested_spec: &str,
+) -> bool {
+    let Ok(requested) = lpm_resolver::Specifier::parse(requested_spec) else {
+        return false;
+    };
+    match requested {
+        lpm_resolver::Specifier::SemverRange(_) | lpm_resolver::Specifier::NpmAlias { .. } => {
+            matches!(
+                package.source_kind(),
+                Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+            )
+        }
+        lpm_resolver::Specifier::Workspace(_) => matches!(
+            package.source_kind(),
+            Some(Ok(lpm_lockfile::Source::Directory { .. }))
+        ),
+        lpm_resolver::Specifier::Tarball { url, .. } => matches!(
+            package.source_kind(),
+            Some(Ok(lpm_lockfile::Source::Tarball { url: locked_url })) if locked_url == url
+        ),
+        lpm_resolver::Specifier::File { .. } => matches!(
+            package.source_kind(),
+            Some(Ok(
+                lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Tarball { .. }
+            ))
+        ),
+        lpm_resolver::Specifier::Link { .. } => matches!(
+            package.source_kind(),
+            Some(Ok(lpm_lockfile::Source::Link { .. }))
+        ),
+        lpm_resolver::Specifier::Git { url, refspec } => matches!(
+            package.source_kind(),
+            Some(Ok(lpm_lockfile::Source::Git { url: locked_url }))
+                if locked_github_source_matches_request(&locked_url, &url, refspec.as_deref())
+        ),
+    }
+}
+
+fn locked_github_source_matches_request(
+    locked_source: &str,
+    requested_url: &str,
+    requested_ref: Option<&str>,
+) -> bool {
+    let Some((locked_url, locked_commit)) = locked_source.rsplit_once('#') else {
+        return false;
+    };
+    if locked_commit.len() != 40
+        || !locked_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || locked_commit.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let Ok(locked_repository) = super::github_source::canonicalize_github_repository(locked_url)
+    else {
+        return false;
+    };
+    let Ok(requested_repository) =
+        super::github_source::canonicalize_github_repository(requested_url)
+    else {
+        return false;
+    };
+    locked_repository == requested_repository
+        && requested_ref.is_none_or(|reference| {
+            reference.len() != 40
+                || !reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || locked_commit.eq_ignore_ascii_case(reference)
+        })
+}
+
+fn locked_source_identity_matches_requested_spec(
+    package: &lpm_lockfile::LockedPackage,
+    requested_spec: &str,
+    lockfile_dir: &Path,
+) -> bool {
+    let Ok(requested) = lpm_resolver::Specifier::parse(requested_spec) else {
+        return false;
+    };
+    match (requested, package.source_kind()) {
+        (
+            lpm_resolver::Specifier::File { path },
+            Some(Ok(lpm_lockfile::Source::Directory { path: locked_path })),
+        )
+        | (
+            lpm_resolver::Specifier::Link { path },
+            Some(Ok(lpm_lockfile::Source::Link { path: locked_path })),
+        ) => canonical_source_paths_match(lockfile_dir, &path, &locked_path),
+        (
+            lpm_resolver::Specifier::File { path },
+            Some(Ok(lpm_lockfile::Source::Tarball { url })),
+        ) => url.strip_prefix("file:").is_some_and(|locked_path| {
+            canonical_source_paths_match(lockfile_dir, &path, locked_path)
+        }),
+        _ => locked_source_kind_matches_requested_spec(package, requested_spec),
+    }
+}
+
+fn canonical_source_paths_match(lockfile_dir: &Path, requested: &str, locked: &str) -> bool {
+    let (Ok(requested), Ok(locked)) = (
+        lockfile_dir.join(requested).canonicalize(),
+        lockfile_dir.join(locked).canonicalize(),
+    ) else {
+        return false;
+    };
+    requested == locked
 }
 
 fn locked_version_satisfies_requested_range(version: &str, requested_spec: &str) -> bool {
@@ -1637,31 +1884,137 @@ pub(super) fn package_platform_compatible(package: &InstallPackage) -> bool {
         .is_none_or(lpm_resolver::is_platform_compatible)
 }
 
-pub(super) fn package_reference_keys(package: &InstallPackage) -> Vec<String> {
-    let mut keys = Vec::with_capacity(2);
-    keys.push(link_target_lookup_key(&package.name, &package.version));
-    if let Some(source_id) = package.wrapper_id_for_source() {
-        keys.push(link_target_lookup_key(&package.name, &source_id));
+struct PackageTraversalIndex {
+    by_instance: HashMap<lpm_common::PackageInstanceId, usize>,
+    registry_by_coordinate: HashMap<String, usize>,
+    source_by_wrapper: HashMap<String, usize>,
+}
+
+impl PackageTraversalIndex {
+    fn new(packages: &[InstallPackage]) -> Self {
+        let mut by_instance = HashMap::with_capacity(packages.len());
+        let mut registry_by_coordinate = HashMap::with_capacity(packages.len());
+        let mut source_by_wrapper = HashMap::with_capacity(packages.len());
+        for (index, package) in packages.iter().enumerate() {
+            if let Some(instance_id) = package.instance_id {
+                by_instance.insert(instance_id, index);
+            }
+            if matches!(
+                package.source_kind(),
+                Ok(lpm_lockfile::Source::Registry { .. })
+            ) {
+                registry_by_coordinate
+                    .entry(link_target_lookup_key(&package.name, &package.version))
+                    .or_insert(index);
+            }
+            if let Some(wrapper_id) = package.wrapper_id_for_source() {
+                source_by_wrapper.entry(wrapper_id).or_insert(index);
+            }
+        }
+        Self {
+            by_instance,
+            registry_by_coordinate,
+            source_by_wrapper,
+        }
     }
-    keys
+
+    fn dependency(
+        &self,
+        package: &InstallPackage,
+        local_name: &str,
+        version: &str,
+    ) -> Option<usize> {
+        if let Some(instance_id) = package.dependency_targets.get(local_name) {
+            return self.by_instance.get(instance_id).copied();
+        }
+        let target = package
+            .aliases
+            .get(local_name)
+            .map_or(local_name, String::as_str);
+        self.source_by_wrapper
+            .get(version)
+            .or_else(|| {
+                self.registry_by_coordinate
+                    .get(&link_target_lookup_key(target, version))
+            })
+            .copied()
+    }
+
+    fn peer(&self, package: &InstallPackage, peer: &lpm_common::PeerEdge) -> Option<usize> {
+        if let Some(instance_id) = package.peer_targets.get(&peer.local_name) {
+            return self.by_instance.get(instance_id).copied();
+        }
+        peer.target_wrapper_id
+            .as_ref()
+            .and_then(|wrapper_id| self.source_by_wrapper.get(wrapper_id))
+            .or_else(|| {
+                self.registry_by_coordinate.get(&link_target_lookup_key(
+                    &peer.target_name,
+                    &peer.target_version,
+                ))
+            })
+            .copied()
+    }
+}
+
+fn retain_reachable_edges(
+    package: &mut InstallPackage,
+    retained_instances: &HashSet<lpm_common::PackageInstanceId>,
+    retained_registry_coordinates: &HashSet<String>,
+    retained_source_wrappers: &HashSet<String>,
+) {
+    let dependency_targets = &package.dependency_targets;
+    let aliases = &package.aliases;
+    let mut removed_dependency_slots = Vec::new();
+    package.dependencies.retain(|(local_name, version)| {
+        let retained = dependency_targets.get(local_name).map_or_else(
+            || {
+                let target = aliases
+                    .get(local_name)
+                    .map_or(local_name.as_str(), String::as_str);
+                retained_source_wrappers.contains(version)
+                    || retained_registry_coordinates
+                        .contains(&link_target_lookup_key(target, version))
+            },
+            |instance_id| retained_instances.contains(instance_id),
+        );
+        if !retained {
+            removed_dependency_slots.push(local_name.clone());
+        }
+        retained
+    });
+    for local_name in removed_dependency_slots {
+        package.dependency_targets.remove(&local_name);
+        package.aliases.remove(&local_name);
+    }
+
+    let peer_targets = &package.peer_targets;
+    let mut removed_peer_slots = Vec::new();
+    package.peers.retain(|peer| {
+        let retained = peer_targets.get(&peer.local_name).map_or_else(
+            || {
+                peer.target_wrapper_id
+                    .as_ref()
+                    .is_some_and(|wrapper_id| retained_source_wrappers.contains(wrapper_id))
+                    || retained_registry_coordinates.contains(&link_target_lookup_key(
+                        &peer.target_name,
+                        &peer.target_version,
+                    ))
+            },
+            |instance_id| retained_instances.contains(instance_id),
+        );
+        if !retained {
+            removed_peer_slots.push(peer.local_name.clone());
+        }
+        retained
+    });
+    for local_name in removed_peer_slots {
+        package.peer_targets.remove(&local_name);
+    }
 }
 
 fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
-    let mut registry_key_to_index = HashMap::with_capacity(packages.len());
-    let mut source_id_to_index = HashMap::with_capacity(packages.len());
-    for (idx, package) in packages.iter().enumerate() {
-        if matches!(
-            package.source_kind(),
-            Ok(lpm_lockfile::Source::Registry { .. })
-        ) {
-            registry_key_to_index
-                .entry(link_target_lookup_key(&package.name, &package.version))
-                .or_insert(idx);
-        }
-        if let Some(source_id) = package.wrapper_id_for_source() {
-            source_id_to_index.entry(source_id).or_insert(idx);
-        }
-    }
+    let traversal = PackageTraversalIndex::new(packages);
 
     let mut retained = HashSet::with_capacity(packages.len());
     let mut queue = VecDeque::new();
@@ -1678,29 +2031,27 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
     while let Some(idx) = queue.pop_front() {
         let package = &packages[idx];
         for (local_name, version) in &package.dependencies {
-            let target = package
-                .aliases
-                .get(local_name)
-                .map_or(local_name.as_str(), String::as_str);
-            let next_idx = source_id_to_index
-                .get(version)
-                .or_else(|| registry_key_to_index.get(&link_target_lookup_key(target, version)));
+            let next_idx = traversal.dependency(package, local_name, version);
             if let Some(next_idx) = next_idx
-                && retained.insert(*next_idx)
+                && retained.insert(next_idx)
             {
-                queue.push_back(*next_idx);
+                queue.push_back(next_idx);
             }
         }
-        for (peer_name, version) in &package.peers {
-            if let Some(next_idx) =
-                registry_key_to_index.get(&link_target_lookup_key(peer_name, version))
-                && retained.insert(*next_idx)
+        for peer in &package.peers {
+            let next_idx = traversal.peer(package, peer);
+            if let Some(next_idx) = next_idx
+                && retained.insert(next_idx)
             {
-                queue.push_back(*next_idx);
+                queue.push_back(next_idx);
             }
         }
     }
 
+    let retained_instances = retained
+        .iter()
+        .filter_map(|index| packages[*index].instance_id)
+        .collect::<HashSet<_>>();
     let mut retained_registry_keys = HashSet::with_capacity(retained.len());
     let mut retained_source_ids = HashSet::with_capacity(retained.len());
     for idx in &retained {
@@ -1721,17 +2072,12 @@ fn prune_unreachable_packages(packages: &mut Vec<InstallPackage>) {
         if !retained.contains(&idx) {
             continue;
         }
-        package.dependencies.retain(|(local_name, version)| {
-            let target = package
-                .aliases
-                .get(local_name)
-                .map_or(local_name.as_str(), String::as_str);
-            retained_source_ids.contains(version)
-                || retained_registry_keys.contains(&link_target_lookup_key(target, version))
-        });
-        package.peers.retain(|(name, version)| {
-            retained_registry_keys.contains(&link_target_lookup_key(name, version))
-        });
+        retain_reachable_edges(
+            &mut package,
+            &retained_instances,
+            &retained_registry_keys,
+            &retained_source_ids,
+        );
         kept.push(package);
     }
     *packages = kept;
@@ -1745,12 +2091,7 @@ pub(super) fn filter_dev_packages(
         return 0;
     }
 
-    let mut key_to_index = HashMap::with_capacity(packages.len() * 2);
-    for (idx, package) in packages.iter().enumerate() {
-        for key in package_reference_keys(package) {
-            key_to_index.entry(key).or_insert(idx);
-        }
-    }
+    let traversal = PackageTraversalIndex::new(packages);
 
     let mut retained = HashSet::with_capacity(packages.len());
     let mut queue = VecDeque::new();
@@ -1767,34 +2108,43 @@ pub(super) fn filter_dev_packages(
     while let Some(idx) = queue.pop_front() {
         let package = &packages[idx];
         for (local_name, version) in &package.dependencies {
-            let target = package
-                .aliases
-                .get(local_name)
-                .map_or(local_name.as_str(), String::as_str);
-            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(target, version))
-                && retained.insert(*next_idx)
+            let next_idx = traversal.dependency(package, local_name, version);
+            if let Some(next_idx) = next_idx
+                && retained.insert(next_idx)
             {
-                queue.push_back(*next_idx);
+                queue.push_back(next_idx);
             }
         }
-        for (peer_name, version) in &package.peers {
-            if let Some(next_idx) = key_to_index.get(&link_target_lookup_key(peer_name, version))
-                && retained.insert(*next_idx)
+        for peer in &package.peers {
+            let next_idx = traversal.peer(package, peer);
+            if let Some(next_idx) = next_idx
+                && retained.insert(next_idx)
             {
-                queue.push_back(*next_idx);
+                queue.push_back(next_idx);
             }
         }
     }
 
-    let mut retained_keys = HashSet::with_capacity(retained.len() * 2);
+    let retained_instances = retained
+        .iter()
+        .filter_map(|index| packages[*index].instance_id)
+        .collect::<HashSet<_>>();
+    let mut retained_registry_keys = HashSet::with_capacity(retained.len());
+    let mut retained_source_ids = HashSet::with_capacity(retained.len());
     let mut peer_root_names = HashSet::new();
     for idx in &retained {
         let package = &packages[*idx];
-        for key in package_reference_keys(package) {
-            retained_keys.insert(key);
+        if matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Registry { .. })
+        ) {
+            retained_registry_keys.insert(link_target_lookup_key(&package.name, &package.version));
         }
-        for (peer_name, _) in &package.peers {
-            peer_root_names.insert(peer_name.clone());
+        if let Some(source_id) = package.wrapper_id_for_source() {
+            retained_source_ids.insert(source_id);
+        }
+        for peer in &package.peers {
+            peer_root_names.insert(peer.local_name.clone());
         }
     }
 
@@ -1814,16 +2164,12 @@ pub(super) fn filter_dev_packages(
             }
         }
 
-        package.dependencies.retain(|(local_name, version)| {
-            let target = package
-                .aliases
-                .get(local_name)
-                .map_or(local_name.as_str(), String::as_str);
-            retained_keys.contains(&link_target_lookup_key(target, version))
-        });
-        package.peers.retain(|(name, version)| {
-            retained_keys.contains(&link_target_lookup_key(name, version))
-        });
+        retain_reachable_edges(
+            &mut package,
+            &retained_instances,
+            &retained_registry_keys,
+            &retained_source_ids,
+        );
         kept.push(package);
     }
 
@@ -1831,10 +2177,92 @@ pub(super) fn filter_dev_packages(
     skipped
 }
 
+pub(super) fn filter_optional_packages(
+    packages: &mut Vec<InstallPackage>,
+    optional_roots: &HashSet<String>,
+) -> usize {
+    if packages.is_empty() {
+        return 0;
+    }
+
+    let original_len = packages.len();
+    for package in packages.iter_mut() {
+        if let Some(root_link_names) = &mut package.root_link_names {
+            root_link_names.retain(|name| !optional_roots.contains(name));
+            if root_link_names.is_empty() {
+                package.root_link_names = None;
+                package.is_direct = false;
+            }
+        }
+    }
+    packages.retain(|package| !package.optional);
+    prune_unreachable_packages(packages);
+    original_len - packages.len()
+}
+
+pub(super) fn filter_optional_packages_for_install(
+    packages: &mut Vec<InstallPackage>,
+    optional_roots: &HashSet<String>,
+    ambient_peer_installs: &[String],
+) -> usize {
+    if ambient_peer_installs.is_empty() {
+        return filter_optional_packages(packages, optional_roots);
+    }
+
+    let ambient_names = ambient_peer_installs
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut detached_root_links = Vec::new();
+    for package in packages.iter_mut().filter(|package| !package.is_direct) {
+        let Some(root_link_names) = &mut package.root_link_names else {
+            continue;
+        };
+        let mut detached = Vec::new();
+        root_link_names.retain(|name| {
+            if ambient_names.contains(name.as_str()) {
+                detached.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !detached.is_empty() {
+            detached_root_links.push((
+                package.instance_id,
+                package.name.clone(),
+                package.version.clone(),
+                package.source.clone(),
+                detached,
+            ));
+        }
+        if root_link_names.is_empty() {
+            package.root_link_names = None;
+        }
+    }
+
+    let skipped = filter_optional_packages(packages, optional_roots);
+    for (instance_id, name, version, source, detached) in detached_root_links {
+        let Some(package) = packages.iter_mut().find(|package| {
+            instance_id.map_or_else(
+                || package.name == name && package.version == version && package.source == source,
+                |instance_id| package.instance_id == Some(instance_id),
+            )
+        }) else {
+            continue;
+        };
+        let root_link_names = package.root_link_names.get_or_insert_with(Vec::new);
+        root_link_names.extend(detached);
+        root_link_names.sort_unstable();
+        root_link_names.dedup();
+    }
+    skipped
+}
+
 pub(super) fn filter_platform_packages(
     packages: &mut Vec<InstallPackage>,
 ) -> Result<usize, LpmError> {
-    let mut skipped: HashSet<(String, String)> = HashSet::new();
+    let mut skipped = 0usize;
     let mut kept = Vec::with_capacity(packages.len());
 
     for package in packages.drain(..) {
@@ -1843,7 +2271,7 @@ pub(super) fn filter_platform_packages(
             continue;
         }
         if package.optional {
-            skipped.insert((package.name.clone(), package.version.clone()));
+            skipped += 1;
             continue;
         }
         return Err(LpmError::Registry(format!(
@@ -1852,23 +2280,12 @@ pub(super) fn filter_platform_packages(
         )));
     }
 
-    if !skipped.is_empty() {
-        for package in &mut kept {
-            package.dependencies.retain(|(local, version)| {
-                let target = package
-                    .aliases
-                    .get(local)
-                    .map_or(local.as_str(), String::as_str);
-                !skipped.contains(&(target.to_string(), version.clone()))
-            });
-            package
-                .peers
-                .retain(|(name, version)| !skipped.contains(&(name.clone(), version.clone())));
-        }
+    if skipped > 0 {
+        prune_unreachable_packages(&mut kept);
     }
 
     *packages = kept;
-    Ok(skipped.len())
+    Ok(skipped)
 }
 
 pub(super) fn filter_dependency_engine_packages(
@@ -1901,12 +2318,38 @@ pub(super) fn filter_dependency_engine_packages(
 pub(super) fn lockfile_satisfies_fast_path_with_packages(
     lockfile: &lpm_lockfile::Lockfile,
     packages: &[&lpm_lockfile::LockedPackage],
-    lockfile_dir: &Path,
-    deps: &HashMap<String, String>,
-    catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
-    workspace: Option<&lpm_workspace::Workspace>,
-    policy: LockfileReplayPolicy,
+    input: LockfileReplayInput<'_>,
 ) -> bool {
+    lockfile_satisfies_fast_path_with_packages_and_optional_roots(
+        lockfile,
+        packages,
+        &HashSet::new(),
+        input,
+    )
+}
+
+pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
+    lockfile: &lpm_lockfile::Lockfile,
+    packages: &[&lpm_lockfile::LockedPackage],
+    optional_root_names: &HashSet<String>,
+    input: LockfileReplayInput<'_>,
+) -> bool {
+    let LockfileReplayInput {
+        lockfile_dir,
+        deps,
+        catalog_resolutions,
+        workspace,
+        registry_source,
+        policy,
+    } = input;
+    if lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        if policy.emit_warnings {
+            tracing::debug!(
+                "legacy lockfile has no exact package-instance graph; fresh resolution required"
+            );
+        }
+        return false;
+    }
     if policy.emit_warnings {
         let insecure_count = packages
             .iter()
@@ -1931,25 +2374,41 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages(
         if let Some(source) = package.source.as_deref()
             && !lpm_lockfile::is_safe_source(source)
         {
-            if policy.accept_unsafe_sources
-                || online_local_source_is_allowed(package, lockfile_dir, deps, workspace)
+            let local_source_valid =
+                online_local_source_is_allowed(package, lockfile_dir, deps, workspace);
+            if local_source_valid
+                || policy.accept_unsafe_sources && !is_mutable_local_source(package)
             {
                 if policy.emit_warnings {
+                    let safe_source = lpm_lockfile::safe_source_identity(source);
                     tracing::debug!(
                         "package {}@{} validated non-registry source {} for lockfile replay",
                         package.name,
                         package.version,
-                        source
+                        safe_source
                     );
                 }
                 continue;
             }
             if policy.emit_warnings {
+                let safe_source = lpm_lockfile::safe_source_identity(source);
                 tracing::warn!(
                     "package {}@{} has unsafe source URL: {} — skipping lockfile fast path",
                     package.name,
                     package.version,
-                    source
+                    safe_source
+                );
+            }
+            return false;
+        }
+        if !policy.accept_unsafe_sources
+            && !locked_registry_source_matches_active_route(package, registry_source)
+        {
+            if policy.emit_warnings {
+                tracing::debug!(
+                    "package {}@{} registry source does not match the active route",
+                    package.name,
+                    package.version
                 );
             }
             return false;
@@ -1973,8 +2432,11 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages(
             .root_aliases
             .get(local)
             .map_or(local.as_str(), String::as_str);
-        if select_locked_root_package_from_rows(lockfile, packages, local, target, requested_spec)
-            .is_none()
+        let selected =
+            select_locked_root_package_from_rows(lockfile, packages, local, target, requested_spec);
+        if selected.is_none_or(|package| {
+            !locked_source_identity_matches_requested_spec(package, requested_spec, lockfile_dir)
+        }) && !optional_root_names.contains(local)
         {
             if policy.emit_warnings {
                 tracing::debug!(
@@ -1988,10 +2450,50 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages(
     true
 }
 
+fn locked_registry_source_matches_active_route(
+    package: &lpm_lockfile::LockedPackage,
+    registry_source: RegistrySourceContext<'_>,
+) -> bool {
+    let expected = registry_source_url_for(
+        &package.name,
+        registry_source.route_table,
+        registry_source.registry_client,
+    );
+    match package.source_kind() {
+        Some(Ok(lpm_lockfile::Source::Registry { url })) => {
+            registry_base_urls_match(&url, &expected)
+        }
+        None => registry_base_urls_match(&expected, "https://registry.npmjs.org"),
+        Some(Ok(_)) | Some(Err(_)) => true,
+    }
+}
+
+fn registry_base_urls_match(left: &str, right: &str) -> bool {
+    let (Ok(left), Ok(right)) = (reqwest::Url::parse(left), reqwest::Url::parse(right)) else {
+        return false;
+    };
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.path().trim_end_matches('/') == right.path().trim_end_matches('/')
+        && left.query() == right.query()
+        && left.fragment() == right.fragment()
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct LockfileReplayPolicy {
     pub(super) accept_unsafe_sources: bool,
     pub(super) emit_warnings: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LockfileReplayInput<'a> {
+    pub(super) lockfile_dir: &'a Path,
+    pub(super) deps: &'a HashMap<String, String>,
+    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
+    pub(super) registry_source: RegistrySourceContext<'a>,
+    pub(super) policy: LockfileReplayPolicy,
 }
 
 pub(super) fn online_local_source_is_allowed(
@@ -2016,13 +2518,15 @@ pub(super) fn online_local_source_is_allowed(
         return false;
     }
 
-    if workspace.is_some_and(|workspace| {
-        workspace_package_at_source(workspace, &canonical_source)
-            .is_some_and(|manifest| manifest_matches_locked_package(manifest, package))
-    }) {
-        return true;
-    }
-
+    let declared_workspace_source = workspace
+        .and_then(|workspace| workspace_package_at_source(workspace, &canonical_source))
+        .is_some()
+        || is_declared_workspace_package_source(
+            lockfile_dir,
+            &canonical_source,
+            &package.name,
+            &package.version,
+        );
     let declared_directly = deps.values().any(|specifier| {
         let Some(path) = specifier
             .strip_prefix("file:")
@@ -2035,12 +2539,67 @@ pub(super) fn online_local_source_is_allowed(
             .canonicalize()
             .is_ok_and(|declared| declared == canonical_source)
     });
-    if !declared_directly {
+    let reachable_from_declared_local_source =
+        declared_local_source_reaches(lockfile_dir, deps, &canonical_source);
+    if !declared_workspace_source && !declared_directly && !reachable_from_declared_local_source {
         return false;
     }
 
-    lpm_workspace::read_package_json(&canonical_source.join("package.json"))
-        .is_ok_and(|manifest| manifest_matches_locked_package(&manifest, package))
+    local_manifest_matches_locked_package(&canonical_source, package)
+}
+
+fn declared_local_source_reaches(
+    lockfile_dir: &Path,
+    deps: &HashMap<String, String>,
+    target: &Path,
+) -> bool {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    for specifier in deps.values() {
+        let Some(path) = specifier
+            .strip_prefix("file:")
+            .or_else(|| specifier.strip_prefix("link:"))
+        else {
+            continue;
+        };
+        if let Ok(source) = lockfile_dir.join(path).canonicalize() {
+            queue.push_back(source);
+        }
+    }
+
+    while let Some(source) = queue.pop_front() {
+        if !visited.insert(source.clone()) {
+            continue;
+        }
+        if source == target {
+            return true;
+        }
+        let Ok(specs) = read_source_dep_specs(&source) else {
+            continue;
+        };
+        for spec in specs {
+            let path = match spec.kind {
+                DepKind::FileDir => spec.raw_spec.strip_prefix("file:"),
+                DepKind::Link => spec.raw_spec.strip_prefix("link:"),
+                DepKind::Registry | DepKind::Workspace | DepKind::Git => None,
+            };
+            if let Some(path) = path
+                && let Ok(child) = source.join(path).canonicalize()
+            {
+                queue.push_back(child);
+            }
+        }
+    }
+    false
+}
+
+fn is_mutable_local_source(package: &lpm_lockfile::LockedPackage) -> bool {
+    matches!(
+        package.source_kind(),
+        Some(Ok(
+            lpm_lockfile::Source::Directory { .. } | lpm_lockfile::Source::Link { .. }
+        ))
+    )
 }
 
 fn workspace_package_at_source<'a>(
@@ -2057,14 +2616,22 @@ fn workspace_package_at_source<'a>(
     })
 }
 
-fn manifest_matches_locked_package(
-    manifest: &lpm_workspace::PackageJson,
+fn local_manifest_matches_locked_package(
+    source_dir: &Path,
     package: &lpm_lockfile::LockedPackage,
 ) -> bool {
-    manifest.name.as_deref() == Some(package.name.as_str())
-        && manifest.version.as_deref().unwrap_or("0.0.0") == package.version
+    let Ok(manifest) = read_local_manifest_semantics(source_dir) else {
+        return false;
+    };
+    manifest.name == package.name
+        && manifest.version == package.version
+        && package
+            .manifest_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| fingerprint == manifest.fingerprint)
 }
 
+#[cfg(test)]
 pub(super) fn try_lockfile_fast_path(
     lockfile_path: &Path,
     deps: &HashMap<String, String>,
@@ -2090,57 +2657,69 @@ pub(super) fn try_lockfile_fast_path(
     // unconditionally rejected the lockfile entry.
     accept_unsafe_sources: bool,
 ) -> Option<LockfileFastPath> {
-    if !workspace_lockfile::exists(lockfile_path) {
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
+        lockfile_path,
+        deps,
+        optional_root_names: &HashSet::new(),
+        catalog_resolutions,
+        workspace,
+        route_table: &route_table,
+        client,
+        gate_stats,
+        accept_unsafe_sources,
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TryLockfileFastPathInput<'a> {
+    pub(super) lockfile_path: &'a Path,
+    pub(super) deps: &'a HashMap<String, String>,
+    pub(super) optional_root_names: &'a HashSet<String>,
+    pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
+    pub(super) workspace: Option<&'a lpm_workspace::Workspace>,
+    pub(super) route_table: &'a RouteTable,
+    pub(super) client: &'a RegistryClient,
+    pub(super) gate_stats: &'a GateStats,
+    pub(super) accept_unsafe_sources: bool,
+}
+
+pub(super) fn try_lockfile_fast_path_with_optional_roots(
+    input: TryLockfileFastPathInput<'_>,
+) -> Option<LockfileFastPath> {
+    if !workspace_lockfile::exists(input.lockfile_path) {
         return None;
     }
 
-    workspace_lockfile::with_package_rows(lockfile_path, |mut lockfile, package_rows| {
-        try_lockfile_fast_path_from_rows(
-            &mut lockfile,
-            package_rows,
-            TryLockfileFastPathRowsInput {
-                lockfile_path,
-                deps,
-                catalog_resolutions,
-                workspace,
-                client,
-                gate_stats,
-                accept_unsafe_sources,
-            },
-        )
+    workspace_lockfile::with_package_rows(input.lockfile_path, |mut lockfile, package_rows| {
+        try_lockfile_fast_path_from_rows(&mut lockfile, package_rows, input)
     })
     .ok()
     .flatten()
 }
 
-struct TryLockfileFastPathRowsInput<'a> {
-    lockfile_path: &'a Path,
-    deps: &'a HashMap<String, String>,
-    catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
-    workspace: Option<&'a lpm_workspace::Workspace>,
-    client: &'a RegistryClient,
-    gate_stats: &'a GateStats,
-    accept_unsafe_sources: bool,
-}
-
 fn try_lockfile_fast_path_from_rows(
     lockfile: &mut Arc<lpm_lockfile::Lockfile>,
     package_rows: &[&lpm_lockfile::LockedPackage],
-    input: TryLockfileFastPathRowsInput<'_>,
+    input: TryLockfileFastPathInput<'_>,
 ) -> Option<LockfileFastPath> {
     let needs_binary_upgrade = !workspace_lockfile::active()
         && binary_lockfile_needs_writeback(input.lockfile_path, lockfile);
 
-    if !lockfile_satisfies_fast_path_with_packages(
+    if !lockfile_satisfies_fast_path_with_packages_and_optional_roots(
         lockfile,
         package_rows,
-        input.lockfile_path.parent()?,
-        input.deps,
-        input.catalog_resolutions,
-        input.workspace,
-        LockfileReplayPolicy {
-            accept_unsafe_sources: input.accept_unsafe_sources,
-            emit_warnings: true,
+        input.optional_root_names,
+        LockfileReplayInput {
+            lockfile_dir: input.lockfile_path.parent()?,
+            deps: input.deps,
+            catalog_resolutions: input.catalog_resolutions,
+            workspace: input.workspace,
+            registry_source: RegistrySourceContext::new(input.route_table, input.client),
+            policy: LockfileReplayPolicy {
+                accept_unsafe_sources: input.accept_unsafe_sources,
+                emit_warnings: true,
+            },
         },
     ) {
         return None;
@@ -2165,40 +2744,33 @@ fn try_lockfile_fast_path_from_rows(
     // Keep the raw source in this short-lived key to distinguish
     // same-version packages from different registries, tarballs, or
     // Git commits without allocating a hashed PackageKey per lookup.
-    let root_link_key = |package: &lpm_lockfile::LockedPackage| -> String {
-        let source_len = package.source.as_deref().map_or(0, str::len);
-        let mut k =
-            String::with_capacity(package.name.len() + 1 + package.version.len() + 1 + source_len);
-        k.push_str(&package.name);
-        k.push('\x00');
-        k.push_str(&package.version);
-        k.push('\x00');
-        if let Some(source) = &package.source {
-            k.push_str(source);
-        }
-        k
-    };
-    let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut root_link_map: HashMap<lpm_common::PackageInstanceId, Vec<String>> = HashMap::new();
     for (local, requested_spec) in input.deps {
         let target = lockfile
             .root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        let lp = select_locked_root_package_from_rows(
+        let Some(lp) = select_locked_root_package_from_rows(
             lockfile,
             package_rows,
             local,
             &target,
             requested_spec,
-        )?;
+        ) else {
+            if input.optional_root_names.contains(local) {
+                continue;
+            }
+            return None;
+        };
         let selected = lpm_lockfile::LockedRootResolution {
+            instance_id: lp.instance_id,
             package: lp.name.clone(),
             version: lp.version.clone(),
             source: lp.source.clone(),
         };
         root_link_map
-            .entry(root_link_key(lp))
+            .entry(lp.instance_id?)
             .or_default()
             .push(local.clone());
         if !lockfile.root_resolutions.contains_key(local) {
@@ -2225,14 +2797,14 @@ fn try_lockfile_fast_path_from_rows(
         if input.deps.contains_key(ambient) {
             continue;
         }
-        let lp =
-            select_locked_root_package_from_rows(lockfile, package_rows, ambient, ambient, "*")?;
+        let lp = select_locked_ambient_root_package_from_rows(lockfile, package_rows, ambient)?;
         let selected = lpm_lockfile::LockedRootResolution {
+            instance_id: lp.instance_id,
             package: lp.name.clone(),
             version: lp.version.clone(),
             source: lp.source.clone(),
         };
-        let entry = root_link_map.entry(root_link_key(lp)).or_default();
+        let entry = root_link_map.entry(lp.instance_id?).or_default();
         if !entry.iter().any(|l| l == ambient) {
             entry.push(ambient.clone());
         }
@@ -2293,19 +2865,40 @@ fn try_lockfile_fast_path_from_rows(
             // wrong-but-self-consistent shape as before.
             // Re-running a fresh resolve writes the peers field and
             // upgrades the project to the correct shape.
-            let peers: Vec<(String, String)> = lp
-                .peers
-                .iter()
-                .filter_map(|s| {
-                    s.rfind('@')
-                        .map(|at| (s[..at].to_string(), s[at + 1..].to_string()))
-                })
-                .collect();
+            let peers = if lp.peer_edges.is_empty() {
+                lp.peers
+                    .iter()
+                    .filter_map(|value| {
+                        value.rfind('@').map(|at| {
+                            lpm_common::PeerEdge::registry(
+                                &value[..at],
+                                &value[..at],
+                                &value[at + 1..],
+                            )
+                        })
+                    })
+                    .collect()
+            } else {
+                lp.peer_edges.clone()
+            };
 
-            let root_link_names = root_link_map.get(&root_link_key(lp)).cloned();
+            let root_link_names = lp
+                .instance_id
+                .and_then(|instance_id| root_link_map.get(&instance_id).cloned());
             let is_direct = install_package_is_direct(root_link_names.as_deref(), input.deps);
 
             InstallPackage {
+                instance_id: lp.instance_id,
+                dependency_targets: lp
+                    .dependency_targets
+                    .iter()
+                    .map(|(local_name, target)| (local_name.clone(), *target))
+                    .collect(),
+                peer_targets: lp
+                    .peer_targets
+                    .iter()
+                    .map(|(local_name, target)| (local_name.clone(), *target))
+                    .collect(),
                 name: lp.name.clone(),
                 version: lp.version.clone(),
                 source: lp
@@ -2386,6 +2979,7 @@ fn try_lockfile_fast_path_from_rows(
                     }),
                 },
                 metadata_checked_for_tarball: false,
+                manifest_fingerprint: lp.manifest_fingerprint.clone(),
             }
         })
         .collect();
@@ -2432,6 +3026,7 @@ pub(super) fn root_resolutions_for_lockfile(
             resolutions.insert(
                 local_name.clone(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: package.instance_id,
                     package: package.name.clone(),
                     version: package.version.clone(),
                     source: Some(package.source.clone()),
@@ -2494,6 +3089,7 @@ pub(super) fn build_latest_stable_versions(
     out
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct RegistrySourceContext<'a> {
     route_table: &'a RouteTable,
     registry_client: &'a RegistryClient,
@@ -2523,6 +3119,33 @@ pub(super) fn resolved_to_install_packages(
     // exactly this reason; without route-awareness here, the type
     // system's granularity wasn't reaching the install pipeline.
     registry_source: RegistrySourceContext<'_>,
+) -> Result<Vec<InstallPackage>, LpmError> {
+    let mut packages = resolved_to_unfinalized_install_packages(
+        resolved,
+        deps,
+        root_aliases,
+        root_resolutions,
+        ambient_peer_installs,
+        resolver_cache,
+        registry_source,
+    );
+    assign_resolved_instance_ids(resolved, root_resolutions, &mut packages).map_err(|detail| {
+        LpmError::Registry(format!(
+            "failed to assign exact package-instance identities: {detail}"
+        ))
+    })?;
+    Ok(packages)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolved_to_unfinalized_install_packages(
+    resolved: &[ResolvedPackage],
+    deps: &HashMap<String, String>,
+    root_aliases: &HashMap<String, String>,
+    root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
+    ambient_peer_installs: &[String],
+    resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    registry_source: RegistrySourceContext<'_>,
 ) -> Vec<InstallPackage> {
     let RegistrySourceContext {
         route_table,
@@ -2544,30 +3167,24 @@ pub(super) fn resolved_to_install_packages(
     // (SHA-256 source_id + 2 String clones) per entry and per lookup.
     // Safe because same-name-same-version cross-source packages collapse
     // to one row via the dedup filter below.
-    let rlk = |name: &str, version: &str| -> String {
-        let mut k = String::with_capacity(name.len() + 1 + version.len());
-        k.push_str(name);
-        k.push('\x00');
-        k.push_str(version);
-        k
-    };
-    let mut root_link_map: HashMap<String, Vec<String>> = HashMap::new();
+    let resolved_by_id = resolved
+        .iter()
+        .map(|package| (package.resolution_id, package))
+        .collect::<HashMap<_, _>>();
+    let mut root_link_map: HashMap<lpm_common::ResolutionNodeId, Vec<String>> = HashMap::new();
     for (local, requested_spec) in deps {
         let target = root_aliases
             .get(local)
             .cloned()
             .unwrap_or_else(|| local.clone());
-        let exact = root_resolutions.get(local).and_then(|selection| {
-            resolved.iter().find(|package| {
-                package.package.canonical_name() == selection.package
-                    && package.version.to_string() == selection.version
-            })
-        });
+        let exact = root_resolutions
+            .get(local)
+            .and_then(|selection| resolved_by_id.get(&selection.target).copied());
         if let Some(package) = exact.or_else(|| {
             select_resolved_package_for_requested_spec(resolved, &target, requested_spec)
         }) {
             root_link_map
-                .entry(rlk(&target, &package.version.to_string()))
+                .entry(package.resolution_id)
                 .or_default()
                 .push(local.clone());
         }
@@ -2580,17 +3197,14 @@ pub(super) fn resolved_to_install_packages(
         if deps.contains_key(ambient) {
             continue;
         }
-        if let Some(package) = resolved
-            .iter()
-            .filter(|package| package.package.canonical_name() == *ambient)
-            .max_by(|a, b| a.version.cmp(&b.version))
+        if let Some(package) = root_resolutions
+            .get(ambient)
+            .and_then(|root| resolved_by_id.get(&root.target).copied())
         {
             // Avoid duplicate locals if the user ALSO listed the peer
             // in their `dependencies` (in which case `deps.keys()`
             // already covered it; we shouldn't double-link).
-            let entry = root_link_map
-                .entry(rlk(ambient, &package.version.to_string()))
-                .or_default();
+            let entry = root_link_map.entry(package.resolution_id).or_default();
             if !entry.iter().any(|l| l == ambient) {
                 entry.push(ambient.clone());
             }
@@ -2602,35 +3216,11 @@ pub(super) fn resolved_to_install_packages(
         locals.sort();
     }
 
-    // The resolver can emit multiple `ResolvedPackage`
-    // rows for the same `(canonical_name, version)` tuple when // splits a subtree for multi-version peer-dep resolution: each
-    // split scope produces its own row differing only in
-    // `ResolverPackage::context`. `canonical_name()` strips that context,
-    // so every split collapses to the same `InstallPackage`. Without
-    // this dedup, downstream stages receive N identical rows for one
-    // physical package, which in turn produced N concurrent // root-symlink creations in `link_finalize` and raced on
-    // `std::os::unix::fs::symlink` — leaving whichever thread lost to
-    // abort the install with `EEXIST`.
-    //
-    // First-seen wins. The resolver guarantees that all rows with the
-    // same `(canonical_name, version)` agree on everything observable
-    // to the install pipeline — same tarball URL, same integrity, same
-    // dependency set, same aliases — because they represent the same
-    // physical package. Split contexts are a resolver-internal scoping
-    // device that doesn't change the store's view of the package.
-    //
-    // Preserving the resolver's input order keeps lockfile and JSON
-    // output deterministic across runs.
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(resolved.len());
     resolved
         .iter()
-        .filter_map(|r| {
+        .map(|r| {
             let name = r.package.canonical_name();
             let version = r.version.to_string();
-            if !seen.insert(rlk(&name, &version)) {
-                return None;
-            }
             let canonical = CanonicalKey::from(&r.package);
             let (registry_signatures, registry_published_at) = resolver_cache
                 .get(&canonical)
@@ -2643,14 +3233,16 @@ pub(super) fn resolved_to_install_packages(
             // private mirror gets filed under its real URL.
             let registry_url = registry_source_url_for(&name, route_table, registry_client);
             let source = format!("registry+{registry_url}");
-            let root_link_names = root_link_map.get(&rlk(&name, &version)).cloned();
+            let root_link_names = root_link_map.get(&r.resolution_id).cloned();
             let is_direct = install_package_is_direct(root_link_names.as_deref(), deps);
 
-            Some(InstallPackage {
+            InstallPackage {
+                instance_id: None,
                 name,
                 version,
                 source,
                 dependencies: r.dependencies.clone(),
+                dependency_targets: HashMap::with_capacity(r.dependency_targets.len()),
                 aliases: r.aliases.clone(),
                 root_link_names,
                 is_direct,
@@ -2660,6 +3252,7 @@ pub(super) fn resolved_to_install_packages(
                 // the install set; carry the resulting
                 // `(peer_name, version)` list straight through.
                 peers: r.peers.clone(),
+                peer_targets: HashMap::with_capacity(r.peer_targets.len()),
                 integrity: r.integrity.clone(),
                 registry_signatures,
                 registry_published_at,
@@ -2668,9 +3261,151 @@ pub(super) fn resolved_to_install_packages(
                 optional: r.optional,
                 tarball_url: r.tarball_url.clone(),
                 metadata_checked_for_tarball: true,
-            })
+                manifest_fingerprint: None,
+            }
         })
         .collect()
+}
+
+fn assign_resolved_instance_ids(
+    resolved: &[ResolvedPackage],
+    root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
+    packages: &mut [InstallPackage],
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    if resolved.len() != packages.len() {
+        return Err("resolved and install package cardinalities differ".to_string());
+    }
+    let by_resolution = resolved
+        .iter()
+        .enumerate()
+        .map(|(index, package)| (package.resolution_id, index))
+        .collect::<HashMap<_, _>>();
+    if by_resolution.len() != resolved.len() {
+        return Err("resolver returned duplicate resolution node IDs".to_string());
+    }
+
+    let mut roots = root_resolutions.iter().collect::<Vec<_>>();
+    roots.sort_by(|left, right| left.0.cmp(right.0));
+    let mut paths = vec![None::<[u8; 32]>; packages.len()];
+    let mut queue = VecDeque::with_capacity(packages.len());
+    for (local, root) in roots {
+        let Some(&index) = by_resolution.get(&root.target) else {
+            return Err(format!("root {local:?} references a missing resolver node"));
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"lpm-instance-root-v1\0");
+        hasher.update(local.as_bytes());
+        let digest = hasher.finalize().into();
+        if paths[index].is_none() {
+            paths[index] = Some(digest);
+            queue.push_back(index);
+        }
+    }
+
+    while let Some(index) = queue.pop_front() {
+        let Some(parent_path) = paths[index] else {
+            return Err("internal instance traversal queued a node without a path".to_string());
+        };
+        let mut edges = resolved[index]
+            .dependency_targets
+            .iter()
+            .collect::<Vec<_>>();
+        edges.sort_by(|left, right| left.0.cmp(right.0));
+        for (local, target) in edges {
+            let Some(&target_index) = by_resolution.get(target) else {
+                return Err(format!(
+                    "package {}@{} dependency {local:?} references a missing resolver node",
+                    packages[index].name, packages[index].version,
+                ));
+            };
+            if paths[target_index].is_some() {
+                continue;
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"lpm-instance-edge-v1\0");
+            hasher.update(parent_path);
+            hasher.update(local.as_bytes());
+            paths[target_index] = Some(hasher.finalize().into());
+            queue.push_back(target_index);
+        }
+
+        let mut peer_edges = resolved[index].peer_targets.iter().collect::<Vec<_>>();
+        peer_edges.sort_by(|left, right| left.0.cmp(right.0));
+        for (local, target) in peer_edges {
+            let Some(&target_index) = by_resolution.get(target) else {
+                return Err(format!(
+                    "package {}@{} peer {local:?} references a missing resolver node",
+                    packages[index].name, packages[index].version,
+                ));
+            };
+            if paths[target_index].is_some() {
+                continue;
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(b"lpm-instance-peer-v1\0");
+            hasher.update(parent_path);
+            hasher.update(local.as_bytes());
+            paths[target_index] = Some(hasher.finalize().into());
+            queue.push_back(target_index);
+        }
+    }
+
+    for (index, path) in paths.into_iter().enumerate() {
+        let Some(path) = path else {
+            return Err(format!(
+                "package {}@{} is unreachable from every exact root",
+                packages[index].name, packages[index].version,
+            ));
+        };
+        packages[index].instance_id = Some(lpm_common::PackageInstanceId::derive_from_path_digest(
+            &packages[index].name,
+            &packages[index].version,
+            &packages[index].source,
+            path,
+        ));
+    }
+
+    for (index, resolved_package) in resolved.iter().enumerate() {
+        packages[index].dependency_targets.clear();
+        packages[index].peer_targets.clear();
+        for (local, target) in &resolved_package.dependency_targets {
+            let Some(&target_index) = by_resolution.get(target) else {
+                return Err(format!(
+                    "package {}@{} dependency {local:?} references a missing resolver node",
+                    packages[index].name, packages[index].version,
+                ));
+            };
+            let Some(target_instance_id) = packages[target_index].instance_id else {
+                return Err(format!(
+                    "package {}@{} dependency {local:?} targets an unassigned resolver node",
+                    packages[index].name, packages[index].version,
+                ));
+            };
+            packages[index]
+                .dependency_targets
+                .insert(local.clone(), target_instance_id);
+        }
+        for (local, target) in &resolved_package.peer_targets {
+            let Some(&target_index) = by_resolution.get(target) else {
+                return Err(format!(
+                    "package {}@{} peer {local:?} references a missing resolver node",
+                    packages[index].name, packages[index].version,
+                ));
+            };
+            let Some(target_instance_id) = packages[target_index].instance_id else {
+                return Err(format!(
+                    "package {}@{} peer {local:?} targets an unassigned resolver node",
+                    packages[index].name, packages[index].version,
+                ));
+            };
+            packages[index]
+                .peer_targets
+                .insert(local.clone(), target_instance_id);
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2684,8 +3419,8 @@ pub(super) fn resolved_to_install_packages_with_workspace_members(
     registry_source: RegistrySourceContext<'_>,
     workspace_members: &[WorkspaceMemberLink],
     project_dir: &Path,
-) -> Vec<InstallPackage> {
-    let mut packages = resolved_to_install_packages(
+) -> Result<Vec<InstallPackage>, LpmError> {
+    let mut packages = resolved_to_unfinalized_install_packages(
         resolved,
         deps,
         root_aliases,
@@ -2699,8 +3434,13 @@ pub(super) fn resolved_to_install_packages_with_workspace_members(
         resolver_cache,
         workspace_members,
         project_dir,
-    );
-    packages
+    )?;
+    assign_resolved_instance_ids(resolved, root_resolutions, &mut packages).map_err(|detail| {
+        LpmError::Registry(format!(
+            "failed to assign exact package-instance identities after workspace source resolution: {detail}"
+        ))
+    })?;
+    Ok(packages)
 }
 
 #[cfg(test)]

@@ -108,6 +108,7 @@ fn peer_deps_stored_per_version() {
         ],
         deps: HashMap::new(),
         peer_deps,
+        peer_aliases: HashMap::new(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
         node_engines: HashMap::new(),
@@ -151,25 +152,21 @@ fn platform_filter_exclusion_only() {
     assert!(!check_platform_filter(&entries, "win32", "os"));
 }
 
-/// Mixed include/exclude entries enter exclusion mode (npm behavior).
-/// The positive "darwin" entry is IGNORED — only "!win32" matters.
-/// On macOS this is compatible because the current OS is not excluded by "!win32".
 #[test]
-fn platform_filter_mixed_uses_exclusion_mode() {
+fn platform_filter_mixed_requires_a_positive_match_and_no_negative_match() {
     let entries = vec!["darwin".to_string(), "!win32".to_string()];
-    // Exclusion mode: "darwin" positive entry is ignored, only "!win32" matters
-    assert!(
-        check_platform_filter(&entries, "darwin", "os"),
-        "darwin not excluded by !win32"
-    );
-    assert!(
-        check_platform_filter(&entries, "linux", "os"),
-        "linux not excluded by !win32"
-    );
-    assert!(
-        !check_platform_filter(&entries, "win32", "os"),
-        "win32 excluded by !win32"
-    );
+    assert!(check_platform_filter(&entries, "darwin", "os"));
+    assert!(!check_platform_filter(&entries, "linux", "os"));
+    assert!(!check_platform_filter(&entries, "win32", "os"));
+}
+
+#[test]
+fn platform_filter_single_any_entry_allows_every_value() {
+    let entries = vec!["any".to_string()];
+
+    assert!(check_platform_filter(&entries, "darwin", "os"));
+    assert!(check_platform_filter(&entries, "linux", "os"));
+    assert!(check_platform_filter(&entries, "win32", "os"));
 }
 
 #[test]
@@ -264,17 +261,12 @@ fn libc_filter_exclusion_only() {
     assert!(!check_platform_filter(&entries, "glibc", "libc"));
 }
 
-/// Mixed inclusion + exclusion enters exclusion mode (same as os/cpu).
-/// `["musl", "!glibc"]` → only `!glibc` is honored.
 #[test]
-fn libc_filter_mixed_uses_exclusion_mode() {
+fn libc_filter_mixed_requires_a_positive_match_and_no_negative_match() {
     let entries = vec!["musl".to_string(), "!glibc".to_string()];
     assert!(check_platform_filter(&entries, "musl", "libc"));
     assert!(!check_platform_filter(&entries, "glibc", "libc"));
-    assert!(
-        check_platform_filter(&entries, "bionic", "libc"),
-        "exclusion mode: any libc other than glibc passes — positive `musl` entry ignored"
-    );
+    assert!(!check_platform_filter(&entries, "bionic", "libc"));
 }
 
 /// Empty `meta.libc` always passes regardless of host libc value —
@@ -533,6 +525,7 @@ fn make_info(
             })
             .collect(),
         peer_deps: HashMap::new(),
+        peer_aliases: HashMap::new(),
         optional_peer_names: HashMap::new(),
         node_engines: HashMap::new(),
         bundled_dep_names: HashMap::new(),
@@ -646,6 +639,48 @@ fn parse_metadata_keeps_peer_dependencies_when_regular_dependency_cache_is_spars
             .and_then(|deps| deps.get("react"))
             .map(String::as_str),
         Some("^18.0.0")
+    );
+}
+
+#[test]
+fn parse_metadata_normalizes_npm_aliased_peer_to_canonical_target() {
+    let value = serde_json::json!({
+        "name": "aliased-peer-host",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "aliased-peer-host",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/aliased-peer-host-1.0.0.tgz",
+                    "integrity": "sha512-test"
+                },
+                "peerDependencies": {
+                    "react-compat": "npm:react@^18.0.0"
+                }
+            }
+        }
+    });
+    let metadata: lpm_registry::PackageMetadata =
+        serde_json::from_value(value).expect("valid PackageMetadata");
+
+    let info = parse_metadata_to_cache_info(&metadata);
+
+    assert_eq!(
+        info.peer_deps
+            .get("1.0.0")
+            .and_then(|deps| deps.get("react-compat"))
+            .map(String::as_str),
+        Some("^18.0.0"),
+        "peer ranges must be normalized before semver parsing"
+    );
+    assert_eq!(
+        info.peer_aliases
+            .get("1.0.0")
+            .and_then(|aliases| aliases.get("react-compat"))
+            .map(String::as_str),
+        Some("react"),
+        "the local peer slot must retain its canonical provider name"
     );
 }
 

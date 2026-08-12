@@ -83,6 +83,15 @@ pub struct PackageJson {
     /// Engine version constraints (e.g., `{"node": ">=22.0.0"}`).
     pub engines: HashMap<String, String>,
 
+    /// Operating-system allow/deny selectors from package.json.
+    pub os: Vec<String>,
+
+    /// CPU-architecture allow/deny selectors from package.json.
+    pub cpu: Vec<String>,
+
+    /// libc allow/deny selectors from package.json.
+    pub libc: Vec<String>,
+
     /// Scripts defined in package.json (e.g., "build": "tsup", "dev": "vite dev").
     pub scripts: HashMap<String, String>,
 
@@ -151,6 +160,9 @@ fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, Str
         publish_config: publish_config_from_value(obj.get("publishConfig")),
         lpm: optional_typed_field(obj, "lpm")?,
         engines: lossy_string_map_from_value(obj.get("engines")),
+        os: lossy_string_vec_from_value(obj.get("os")),
+        cpu: lossy_string_vec_from_value(obj.get("cpu")),
+        libc: lossy_string_vec_from_value(obj.get("libc")),
         scripts: lossy_string_map_from_value(obj.get("scripts")),
         bin: obj.get("bin").and_then(bin_config_from_value),
         catalogs: lossy_nested_string_map_from_value(obj.get("catalogs")),
@@ -162,6 +174,19 @@ fn string_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> 
     obj.get(key)
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn lossy_string_vec_from_value(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn optional_typed_field<T>(

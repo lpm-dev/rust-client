@@ -290,10 +290,14 @@ mod tests {
 
         let lockfile = make_lockfile(vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "express".to_string(),
                 version: "4.22.1".to_string(),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-abc".to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -305,13 +309,18 @@ mod tests {
                 dependencies: vec!["accepts@1.3.8".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "accepts".to_string(),
                 version: "1.3.8".to_string(),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
                 integrity: Some("sha512-def".to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -323,6 +332,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]);
@@ -340,10 +350,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let lockfile = make_lockfile(vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "express".to_string(),
             version: "4.22.1".to_string(),
             source: None,
             integrity: Some("sha512-abc".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -355,6 +369,7 @@ mod tests {
             dependencies: vec!["missing-dep@1.0.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }]);
 
@@ -373,10 +388,14 @@ mod tests {
         .unwrap();
 
         let lockfile = make_lockfile(vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "express".to_string(),
             version: "4.22.1".to_string(),
             source: None,
             integrity: Some("sha512-abc".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -388,6 +407,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }]);
 
@@ -401,10 +421,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let lockfile = make_lockfile(vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "bad-pkg".to_string(),
             version: "1.0.0".to_string(),
             source: None,
             integrity: Some("md5-notvalid".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -416,6 +440,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }]);
 
@@ -429,10 +454,14 @@ mod tests {
         // Don't create package.json
 
         let lockfile = make_lockfile(vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "express".to_string(),
             version: "4.22.1".to_string(),
             source: None,
             integrity: Some("sha512-abc".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -444,6 +473,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }]);
 
@@ -470,10 +500,14 @@ mod tests {
         // Build a lockfile that exceeds the threshold
         let packages: Vec<LockedPackage> = (0..HUGE_LOCKFILE_THRESHOLD + 1)
             .map(|i| LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("pkg-{i}"),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -485,6 +519,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             })
             .collect();
@@ -502,10 +537,14 @@ mod tests {
 
         let lockfile = make_lockfile(vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: Some("sha256-abc".to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -517,13 +556,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: Some("sha384-def".to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -535,13 +579,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "c".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: Some("sha512-ghi".to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -553,6 +602,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]);
@@ -575,10 +625,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let lockfile = make_lockfile(vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "legacy-pkg".to_string(),
             version: "1.0.0".to_string(),
             source: None,
             integrity: Some("sha1-abcdef".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -590,6 +644,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }]);
 
@@ -623,10 +678,14 @@ mod tests {
 
         let lockfile = make_lockfile(vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -638,13 +697,18 @@ mod tests {
                 dependencies: vec!["b@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -656,6 +720,7 @@ mod tests {
                 dependencies: vec!["a@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]);
@@ -674,10 +739,14 @@ mod tests {
 
         let lockfile = make_lockfile(vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -689,13 +758,18 @@ mod tests {
                 dependencies: vec!["b@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -707,13 +781,18 @@ mod tests {
                 dependencies: vec!["c@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "c".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -725,6 +804,7 @@ mod tests {
                 dependencies: vec!["a@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]);
@@ -743,10 +823,14 @@ mod tests {
 
         let lockfile = make_lockfile(vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -758,13 +842,18 @@ mod tests {
                 dependencies: vec!["b@1.0.0".to_string(), "c@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -776,13 +865,18 @@ mod tests {
                 dependencies: vec!["c@1.0.0".to_string()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "c".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -794,6 +888,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]);

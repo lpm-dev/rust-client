@@ -28,75 +28,102 @@ pub(super) fn compute_resolved_peers(
     consumer: &ResolverPackage,
     consumer_version: &str,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
-    resolved_versions: &HashMap<String, Vec<(Option<String>, String)>>,
-) -> Vec<(String, String)> {
+    resolved_versions: &HashMap<String, Vec<(ResolverPackage, String)>>,
+) -> Result<Vec<(lpm_common::PeerEdge, ResolverPackage)>, ResolveError> {
     let key = CanonicalKey::from(consumer);
     let Some(peer_deps) = cache
         .get(&key)
         .and_then(|info| info.peer_deps.get(consumer_version))
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let mut peers: Vec<(String, String)> = peer_deps
-        .iter()
-        .filter_map(|peer_name| {
-            let (peer_name, peer_range) = peer_name;
-            let parsed_range = NpmRange::parse(peer_range).ok();
-            resolve_peer_binding_version(
-                consumer,
-                peer_name,
-                parsed_range.as_ref(),
-                resolved_versions,
-            )
-            .map(|(version, _)| (peer_name.clone(), version.clone()))
-        })
-        .collect();
-    peers.sort_by(|a, b| a.0.cmp(&b.0));
-    peers
+    let peer_aliases = cache
+        .get(&key)
+        .and_then(|info| info.peer_aliases.get(consumer_version));
+    let optional_peers = cache
+        .get(&key)
+        .and_then(|info| info.optional_peer_names.get(consumer_version));
+    let mut peers = Vec::with_capacity(peer_deps.len());
+    for (peer_name, peer_range) in peer_deps {
+        let target_name = peer_aliases
+            .and_then(|aliases| aliases.get(peer_name))
+            .unwrap_or(peer_name);
+        let parsed_range = match NpmRange::parse(peer_range) {
+            Ok(range) => range,
+            Err(_) if optional_peers.is_some_and(|peers| peers.contains(peer_name)) => continue,
+            Err(detail) => {
+                return Err(ResolveError::InvalidPeerRange {
+                    package: consumer.canonical_name(),
+                    version: consumer_version.to_string(),
+                    peer: peer_name.clone(),
+                    range: peer_range.clone(),
+                    detail,
+                });
+            }
+        };
+        if let Some((provider, version, _)) = resolve_peer_binding_version(
+            consumer,
+            target_name,
+            Some(&parsed_range),
+            resolved_versions,
+            cache
+                .get(&CanonicalKey::from_dep_name(target_name))
+                .and_then(|info| info.latest_version.as_ref()),
+        ) {
+            peers.push((
+                lpm_common::PeerEdge::registry(peer_name, target_name, version),
+                provider.clone(),
+            ));
+        }
+    }
+    peers.sort_by(|(left, _), (right, _)| left.local_name.cmp(&right.local_name));
+    Ok(peers)
 }
 
 pub(crate) fn resolve_peer_binding_version<'a>(
     consumer: &ResolverPackage,
     peer_name: &str,
     peer_range: Option<&NpmRange>,
-    resolved_versions: &'a HashMap<String, Vec<(Option<String>, String)>>,
-) -> Option<(&'a String, bool)> {
+    resolved_versions: &'a HashMap<String, Vec<(ResolverPackage, String)>>,
+    latest_version: Option<&NpmVersion>,
+) -> Option<(&'a ResolverPackage, &'a String, bool)> {
     let candidates = resolved_versions.get(peer_name)?;
 
     if let Some(context) = consumer.context() {
-        let same_context: Vec<&(Option<String>, String)> = candidates
+        let same_context: Vec<&(ResolverPackage, String)> = candidates
             .iter()
-            .filter(|(candidate_context, _)| candidate_context.as_deref() == Some(context))
+            .filter(|(candidate, _)| candidate.context() == Some(context))
             .collect();
-        if let Some(selected) = select_peer_candidate(&same_context, peer_range) {
+        if let Some(selected) = select_peer_candidate(&same_context, peer_range, latest_version) {
             return Some(selected);
         }
     }
 
-    let unsplit: Vec<&(Option<String>, String)> = candidates
+    let unsplit: Vec<&(ResolverPackage, String)> = candidates
         .iter()
-        .filter(|(candidate_context, _)| candidate_context.is_none())
+        .filter(|(candidate, _)| candidate.context().is_none())
         .collect();
-    if let Some(selected) = select_peer_candidate(&unsplit, peer_range) {
+    if let Some(selected) = select_peer_candidate(&unsplit, peer_range, latest_version) {
         return Some(selected);
     }
 
-    let all_candidates: Vec<&(Option<String>, String)> = candidates.iter().collect();
-    select_peer_candidate(&all_candidates, peer_range)
+    let all_candidates: Vec<&(ResolverPackage, String)> = candidates.iter().collect();
+    select_peer_candidate(&all_candidates, peer_range, latest_version)
 }
 
 pub(super) fn select_peer_candidate<'a>(
-    candidates: &[&'a (Option<String>, String)],
+    candidates: &[&'a (ResolverPackage, String)],
     peer_range: Option<&NpmRange>,
-) -> Option<(&'a String, bool)> {
-    let mut first_candidate: Option<&'a String> = None;
-    let mut first_satisfying: Option<&'a String> = None;
-    let mut newest_candidate: Option<(&'a String, NpmVersion)> = None;
-    let mut newest_satisfying: Option<(&'a String, NpmVersion)> = None;
+    latest_version: Option<&NpmVersion>,
+) -> Option<(&'a ResolverPackage, &'a String, bool)> {
+    let mut first_candidate: Option<&'a (ResolverPackage, String)> = None;
+    let mut first_satisfying: Option<&'a (ResolverPackage, String)> = None;
+    let mut newest_candidate: Option<(&'a (ResolverPackage, String), NpmVersion)> = None;
+    let mut newest_satisfying: Option<(&'a (ResolverPackage, String), NpmVersion)> = None;
 
     for candidate in candidates.iter().copied() {
         let version = &candidate.1;
-        first_candidate.get_or_insert(version);
+        first_candidate.get_or_insert(candidate);
 
         let parsed = NpmVersion::parse(version).ok();
         if let Some(parsed) = parsed.as_ref()
@@ -104,38 +131,42 @@ pub(super) fn select_peer_candidate<'a>(
                 .as_ref()
                 .is_none_or(|(_, newest)| parsed > newest)
         {
-            newest_candidate = Some((version, parsed.clone()));
+            newest_candidate = Some((candidate, parsed.clone()));
         }
 
-        if peer_version_satisfies(version, peer_range) {
-            first_satisfying.get_or_insert(version);
+        if peer_version_satisfies(version, peer_range, latest_version) {
+            first_satisfying.get_or_insert(candidate);
             if let Some(parsed) = parsed
                 && newest_satisfying
                     .as_ref()
                     .is_none_or(|(_, newest)| &parsed > newest)
             {
-                newest_satisfying = Some((version, parsed));
+                newest_satisfying = Some((candidate, parsed));
             }
         }
     }
 
-    if let Some((version, _)) = newest_satisfying {
-        return Some((version, true));
+    if let Some((candidate, _)) = newest_satisfying {
+        return Some((&candidate.0, &candidate.1, true));
     }
-    if let Some(version) = first_satisfying {
-        return Some((version, true));
+    if let Some(candidate) = first_satisfying {
+        return Some((&candidate.0, &candidate.1, true));
     }
-    if let Some((version, _)) = newest_candidate {
-        return Some((version, false));
+    if let Some((candidate, _)) = newest_candidate {
+        return Some((&candidate.0, &candidate.1, false));
     }
-    first_candidate.map(|version| (version, false))
+    first_candidate.map(|candidate| (&candidate.0, &candidate.1, false))
 }
 
-pub(super) fn peer_version_satisfies(version: &str, peer_range: Option<&NpmRange>) -> bool {
+pub(super) fn peer_version_satisfies(
+    version: &str,
+    peer_range: Option<&NpmRange>,
+    latest_version: Option<&NpmVersion>,
+) -> bool {
     peer_range.is_none_or(|range| {
         NpmVersion::parse(version)
             .ok()
-            .is_some_and(|parsed| range.satisfies(&parsed))
+            .is_some_and(|parsed| range.satisfies_with_latest_bound(&parsed, latest_version))
     })
 }
 
@@ -152,6 +183,8 @@ pub struct PeerWarning {
     pub version: String,
     /// The peer dependency name.
     pub peer: String,
+    /// Canonical package name used to locate the provider.
+    pub target: String,
     /// The required peer version range.
     pub required_range: String,
     /// The version actually resolved in the tree (None if peer is completely missing).
@@ -750,14 +783,11 @@ pub fn check_unmet_peers(
 
     // Build lookup: canonical_name → all resolved instances for that package.
     // Split packages may legitimately appear multiple times with different contexts.
-    let resolved_versions: HashMap<String, Vec<(Option<String>, String)>> =
+    let resolved_versions: HashMap<String, Vec<(ResolverPackage, String)>> =
         resolved.iter().fold(HashMap::new(), |mut acc, package| {
             acc.entry(package.package.canonical_name())
                 .or_default()
-                .push((
-                    package.package.context().map(str::to_string),
-                    package.version.to_string(),
-                ));
+                .push((package.package.clone(), package.version.to_string()));
             acc
         });
 
@@ -785,18 +815,25 @@ pub fn check_unmet_peers(
         // warrants a warning (the user opted into having a peer, just
         // at an incompatible version).
         let optional_peers = info.and_then(|i| i.optional_peer_names.get(&ver_str));
+        let peer_aliases = info.and_then(|i| i.peer_aliases.get(&ver_str));
 
         for (peer_name, peer_range_str) in peer_deps {
+            let target_name = peer_aliases
+                .and_then(|aliases| aliases.get(peer_name))
+                .unwrap_or(peer_name);
             let parsed_range = NpmRange::parse(peer_range_str).ok();
             let resolved_peer_ver = resolve_peer_binding_version(
                 &resolved_pkg.package,
-                peer_name,
+                target_name,
                 parsed_range.as_ref(),
                 &resolved_versions,
+                cache
+                    .get(&CanonicalKey::from_dep_name(target_name))
+                    .and_then(|info| info.latest_version.as_ref()),
             );
 
             match resolved_peer_ver {
-                Some((resolved_ver, satisfies)) => {
+                Some((_, resolved_ver, satisfies)) => {
                     // Peer is in the tree — check if the resolved version satisfies the range
                     let parsed_resolved = NpmVersion::parse(resolved_ver).ok();
 
@@ -825,6 +862,7 @@ pub fn check_unmet_peers(
                             package: canonical.clone(),
                             version: ver_str.clone(),
                             peer: peer_name.clone(),
+                            target: target_name.clone(),
                             required_range: peer_range_str.clone(),
                             resolved_version: Some(resolved_ver.clone()),
                         });
@@ -850,6 +888,7 @@ pub fn check_unmet_peers(
                         package: canonical.clone(),
                         version: ver_str.clone(),
                         peer: peer_name.clone(),
+                        target: target_name.clone(),
                         required_range: peer_range_str.clone(),
                         resolved_version: None,
                     });

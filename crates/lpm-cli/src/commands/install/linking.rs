@@ -104,20 +104,30 @@ pub(super) fn build_v2_targets(
     packages: &[InstallPackage],
     link_targets: &[LinkTarget],
 ) -> Result<Vec<lpm_linker::v2::V2Target>, LpmError> {
-    let sri_by_pkg: HashMap<String, String> = packages
-        .iter()
-        .filter_map(|p| {
-            p.integrity
-                .clone()
-                .map(|sri| (link_target_lookup_key(&p.name, &p.version), sri))
-        })
-        .collect();
+    if packages.len() != link_targets.len() {
+        return Err(LpmError::Registry(format!(
+            "virtual-store install: package/link-target cardinality mismatch ({} != {})",
+            packages.len(),
+            link_targets.len(),
+        )));
+    }
 
     let mut v2_targets: Vec<lpm_linker::v2::V2Target> = Vec::with_capacity(link_targets.len());
-    for target in link_targets {
-        let lookup_key = link_target_lookup_key(&target.name, &target.version);
+    for (package, target) in packages.iter().zip(link_targets) {
+        if package.name != target.name || package.version != target.version {
+            return Err(LpmError::Registry(format!(
+                "virtual-store install: package/link-target order mismatch for {}@{} and {}@{}",
+                package.name, package.version, target.name, target.version,
+            )));
+        }
+        let instance_id = package.instance_id.ok_or_else(|| {
+            LpmError::Registry(format!(
+                "virtual-store install: missing exact instance ID for {}@{}",
+                package.name, package.version
+            ))
+        })?;
         let sri = match target.materialization {
-            lpm_linker::Materialization::CasBacked => sri_by_pkg.get(&lookup_key).cloned(),
+            lpm_linker::Materialization::CasBacked => package.integrity.clone(),
             lpm_linker::Materialization::DirectorySource => {
                 Some(local_source_sri_for_target(target))
             }
@@ -129,7 +139,10 @@ pub(super) fn build_v2_targets(
             ))
         })?;
         v2_targets.push(lpm_linker::v2::V2Target {
+            instance_id,
             target: Arc::new(target.clone()),
+            dependency_targets: package.dependency_targets.clone(),
+            peer_targets: package.peer_targets.clone(),
             source_sri: sri,
             verified_object_integrity: None,
             fresh_object: None,
@@ -137,6 +150,40 @@ pub(super) fn build_v2_targets(
     }
 
     Ok(v2_targets)
+}
+
+pub(super) fn validate_store_graph_compatibility(
+    packages: &[InstallPackage],
+    store_version: lpm_store::StoreVersion,
+) -> Result<(), LpmError> {
+    if store_version.uses_virtual_store() {
+        return Ok(());
+    }
+
+    let mut instance_by_artifact: HashMap<lpm_lockfile::PackageKey, lpm_common::PackageInstanceId> =
+        HashMap::with_capacity(packages.len());
+    for package in packages {
+        let Some(instance_id) = package.instance_id else {
+            continue;
+        };
+        let source = package.source_kind().map_err(|error| {
+            LpmError::Registry(format!(
+                "legacy store graph validation: invalid source for {}@{}: {error}",
+                package.name, package.version
+            ))
+        })?;
+        let artifact =
+            lpm_lockfile::PackageKey::new(&package.name, &package.version, source.source_id());
+        if let Some(existing) = instance_by_artifact.insert(artifact, instance_id)
+            && existing != instance_id
+        {
+            return Err(LpmError::Registry(format!(
+                "legacy store v1 cannot safely link multiple dependency contexts for {}@{}; unset LPM_STORE_VERSION or set LPM_STORE_VERSION=v2",
+                package.name, package.version
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -202,6 +249,7 @@ pub(super) struct OnlineLinkPhaseInput<'a> {
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) force: bool,
     pub(super) compatibility_bin_names: &'a [String],
+    pub(super) store_version: lpm_store::StoreVersion,
 }
 
 pub(super) struct OnlineLinkPhaseResult {
@@ -276,7 +324,10 @@ pub(super) async fn run_online_link_phase(
         linker_mode,
         force,
         compatibility_bin_names,
+        store_version,
     } = input;
+
+    validate_store_graph_compatibility(packages, store_version)?;
 
     let waterfall_start_ms = start.elapsed().as_millis();
     let link_start = Instant::now();
@@ -431,9 +482,10 @@ pub(super) async fn run_link_and_finish(
     let mut packages = packages;
     if !ephemeral_packages.is_empty() {
         packages.extend(ephemeral_packages.iter().cloned());
-        apply_post_resolve_directory_link_fixup(&mut packages, ephemeral_source_deps);
+        apply_post_resolve_directory_link_fixup(&mut packages, ephemeral_source_deps)?;
     }
-    dedupe_install_packages_by_identity(&mut packages);
+    dedupe_install_packages_by_identity(&mut packages)?;
+    validate_store_graph_compatibility(&packages, store_version)?;
     let store = PackageStore::from_root(lpm_root);
 
     // Mirror of the online-arm

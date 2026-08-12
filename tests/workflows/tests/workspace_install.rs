@@ -306,6 +306,41 @@ fn frozen_offline_replay_preserves_workspace_publish_directory_projection() {
 }
 
 #[test]
+fn frozen_online_replay_preserves_workspace_publish_directory_projection() {
+    let project = publish_directory_workspace(true);
+    let app_dir = project.path().join("packages/app");
+    let initial = lpm(&project)
+        .current_dir(&app_dir)
+        .arg("install")
+        .arg("--no-recursive")
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("install workspace package with publish directory");
+    assert_install_succeeded(&initial, "initial workspace install should succeed");
+
+    std::fs::remove_dir_all(app_dir.join("node_modules"))
+        .expect("remove installed workspace layout before replay");
+    std::fs::remove_dir_all(app_dir.join(".lpm"))
+        .expect("remove materialization state before replay");
+
+    let replay = lpm(&project)
+        .current_dir(&app_dir)
+        .args(["install", "--no-recursive", "--frozen-lockfile"])
+        .args(INSTALL_FLAGS)
+        .output()
+        .expect("replay workspace publish directory from the lockfile");
+
+    assert_install_succeeded(
+        &replay,
+        "frozen online replay should preserve the workspace projection",
+    );
+    assert_eq!(
+        project.read_file("packages/app/node_modules/@fixture/library/index.js"),
+        "module.exports = 'published';\n",
+    );
+}
+
+#[test]
 fn workspace_protocol_allows_a_publish_directory_before_build_output_exists() {
     let project = publish_directory_workspace(false);
     let app_dir = project.path().join("packages/app");

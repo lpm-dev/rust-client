@@ -988,6 +988,9 @@ mod tests {
             patches: Default::default(),
             provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
                 ..Default::default()
@@ -1125,6 +1128,9 @@ mod tests {
             patches: Default::default(),
             provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
                 ..Default::default()
@@ -1170,6 +1176,9 @@ mod tests {
             patches: Default::default(),
             provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "esbuild".into(),
                 version: "1.0.0".into(),
                 ..Default::default()

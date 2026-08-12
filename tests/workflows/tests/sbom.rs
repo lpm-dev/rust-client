@@ -68,18 +68,24 @@ fn patch_sha256(project: &TempProject, rel_path: &str) -> String {
 fn seed_lockfile(project: &TempProject) {
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "ansi-regex".to_string(),
         version: "5.0.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-ansi".to_string()),
+        integrity: Some(support::VALID_TEST_INTEGRITY.to_string()),
         tarball: Some("https://registry.npmjs.org/ansi-regex/-/ansi-regex-5.0.1.tgz".to_string()),
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "left-pad".to_string(),
         version: "1.3.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some("sha512-leftpad".to_string()),
+        integrity: Some(support::VALID_TEST_INTEGRITY.to_string()),
         dependencies: vec!["ansi-regex@5.0.1".to_string()],
         tarball: Some("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".to_string()),
         ..Default::default()
@@ -92,6 +98,7 @@ fn seed_lockfile(project: &TempProject) {
             original_integrity: "sha512-leftpad-original".to_string(),
         },
     );
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[("left-pad", "left-pad", "1.3.0")]);
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write lpm.lock");
@@ -288,6 +295,9 @@ fn sbom_uses_verified_lockfile_provenance_when_cache_is_empty() {
         }}"#
     ));
     let package = lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: PACKAGE.to_string(),
         version: VERSION.to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
@@ -297,6 +307,7 @@ fn sbom_uses_verified_lockfile_provenance_when_cache_is_empty() {
     let integrity = lpm_common::Integrity::parse(INTEGRITY).expect("valid fixture integrity");
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(package.clone());
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(PACKAGE, PACKAGE, VERSION)]);
     lockfile.set_verified_provenance(
         &package.package_key(),
         lpm_lockfile::LockedProvenance {

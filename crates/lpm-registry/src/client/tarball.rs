@@ -534,6 +534,25 @@ impl RegistryClient {
         // consistent.
         Ok((data, actual_int.to_string()))
     }
+
+    /// Download a tarball to disk and verify it against the declared SRI
+    /// without buffering the compressed archive in memory.
+    pub async fn download_tarball_to_file_with_integrity(
+        &self,
+        url: &str,
+        expected_integrity: &str,
+    ) -> Result<DownloadedTarball, LpmError> {
+        use lpm_common::integrity::Integrity;
+
+        let downloaded = self.download_tarball_to_file(url).await?;
+        let expected = Integrity::parse(expected_integrity)?;
+        expected.verify_file(downloaded.file.path())?;
+        Ok(DownloadedTarball {
+            file: downloaded.file,
+            sri: expected.to_string(),
+            compressed_size: downloaded.compressed_size,
+        })
+    }
 }
 
 pub(super) fn write_tarball_chunk(

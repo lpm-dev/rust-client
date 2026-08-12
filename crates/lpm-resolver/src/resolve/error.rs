@@ -153,6 +153,17 @@ pub enum ResolveError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    #[error(
+        "invalid required peer range {range:?} for {peer:?} declared by {package}@{version}: {detail}"
+    )]
+    InvalidPeerRange {
+        package: String,
+        version: String,
+        peer: String,
+        range: String,
+        detail: String,
+    },
+
     /// Two or more consumers in the install set declare
     /// `peerDependencies` for `canonical` whose ranges have no version
     /// in common, AND at least one of those consumers is non-optional.

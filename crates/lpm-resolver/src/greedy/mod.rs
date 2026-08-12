@@ -317,11 +317,11 @@ mod prelude {
         parse_metadata_to_cache_info, parse_partial_metadata_to_cache_info,
         release_age_status_for_version, release_age_status_for_version_unprofiled,
         select_override_target, trust_downgrade_violation, trust_downgrade_violation_unprofiled,
+        version_allowed_by_policy,
     };
     pub(super) use crate::ranges::NpmRange;
     pub(super) use crate::resolve::{
         ResolveError, ResolveResult, ResolvedPackage, RootResolution, StageTiming,
-        resolve_peer_binding_version,
     };
     pub(super) use crate::speculation::SpeculativePackageMetadata;
     pub(super) use ahash::{AHashMap, AHashSet};

@@ -57,3 +57,25 @@ pub(super) fn maybe_test_audit_after_install_should_fail() -> bool {
     }
     std::env::var("LPM_TEST_AUDIT_AFTER_INSTALL_FAIL").as_deref() == Ok("1")
 }
+
+pub(super) fn maybe_test_pause_before_local_materialization() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Ok(marker) = std::env::var("LPM_TEST_PAUSE_BEFORE_LOCAL_MATERIALIZATION") else {
+        return;
+    };
+    let marker = std::path::PathBuf::from(marker);
+    std::fs::write(&marker, b"ready").expect("write local materialization test marker");
+    let resume = marker.with_extension("resume");
+    for _ in 0..1_000 {
+        if resume.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(
+        "timed out waiting for local materialization test resume marker {}",
+        resume.display()
+    );
+}

@@ -1,6 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use crate::{LOCKFILE_VERSION, Lockfile, LockfileError, ValidatedLockfile, binary};
+use crate::{
+    LOCKFILE_VERSION, Lockfile, LockfileError, TOML_LOCKFILE_SIZE_CAP_BYTES, ValidatedLockfile,
+    binary,
+};
+
+fn read_authoritative_toml(path: &Path) -> Result<String, LockfileError> {
+    lpm_common::read_text_file_capped(path, TOML_LOCKFILE_SIZE_CAP_BYTES)
+        .map_err(|error| LockfileError::Io(error.to_string()))
+}
 
 impl ValidatedLockfile {
     /// Deserialize and validate the authoritative TOML lockfile.
@@ -10,9 +18,7 @@ impl ValidatedLockfile {
 
     /// Read and validate the authoritative TOML lockfile from disk.
     pub fn read_fast(toml_path: &Path) -> Result<Self, LockfileError> {
-        let content = std::fs::read_to_string(toml_path).map_err(|error| {
-            LockfileError::Io(format!("failed to read {}: {error}", toml_path.display()))
-        })?;
+        let content = read_authoritative_toml(toml_path)?;
         Self::from_toml(&content)
     }
 }
@@ -102,7 +108,35 @@ impl Lockfile {
     /// [`Lockfile::from_toml`]'s reader gate; together they make a
     /// bidirectional invariant rather than parser-only.
     pub fn to_toml(&self) -> Result<String, LockfileError> {
+        for package in self.packages.iter().chain(self.workspace_packages.values()) {
+            if !package.tarball_field_hint_is_consistent() {
+                return Err(LockfileError::InvalidTarballHint {
+                    package: package.name.clone(),
+                });
+            }
+            Self::validate_loaded_package(package)?;
+            Self::validate_package_schema(package, self.metadata.lockfile_version)
+                .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        }
+        Self::validate_standalone_package_order(&self.packages)
+            .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        Self::validate_root_resolution_schema(
+            &self.root_resolutions,
+            self.metadata.lockfile_version,
+        )
+        .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        for snapshot in self.importers.values() {
+            Self::validate_root_resolution_schema(
+                &snapshot.root_resolutions,
+                self.metadata.lockfile_version,
+            )
+            .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        }
         self.validate_workspace_projections()
+            .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        self.validate_peer_edge_targets()
+            .map_err(|error| LockfileError::Serialize(error.to_string()))?;
+        self.validate_instance_graph()
             .map_err(|error| LockfileError::Serialize(error.to_string()))?;
         self.validate_provenance()
             .map_err(LockfileError::Serialize)?;
@@ -127,8 +161,8 @@ impl Lockfile {
 
     /// Deserialize from TOML string.
     pub fn from_toml(input: &str) -> Result<Self, LockfileError> {
-        let lockfile: Lockfile =
-            toml::from_str(input).map_err(|e| LockfileError::Deserialize(e.to_string()))?;
+        let lockfile: Lockfile = toml::from_str(input)
+            .map_err(|error| LockfileError::Deserialize(error.message().to_string()))?;
 
         if lockfile.metadata.lockfile_version > LOCKFILE_VERSION {
             return Err(LockfileError::UnsupportedVersion {
@@ -136,10 +170,36 @@ impl Lockfile {
                 max_supported: LOCKFILE_VERSION,
             });
         }
+        for package in lockfile
+            .packages
+            .iter()
+            .chain(lockfile.workspace_packages.values())
+        {
+            if !package.tarball_field_hint_is_consistent() {
+                return Err(LockfileError::InvalidTarballHint {
+                    package: package.name.clone(),
+                });
+            }
+            Self::validate_loaded_package(package)?;
+            Self::validate_package_schema(package, lockfile.metadata.lockfile_version)?;
+        }
+        Self::validate_standalone_package_order(&lockfile.packages)?;
+        Self::validate_root_resolution_schema(
+            &lockfile.root_resolutions,
+            lockfile.metadata.lockfile_version,
+        )?;
+        for snapshot in lockfile.importers.values() {
+            Self::validate_root_resolution_schema(
+                &snapshot.root_resolutions,
+                lockfile.metadata.lockfile_version,
+            )?;
+        }
         if let Some(reason) = lockfile.git_schema_error() {
             return Err(LockfileError::Deserialize(reason));
         }
         lockfile.validate_workspace_projections()?;
+        lockfile.validate_peer_edge_targets()?;
+        lockfile.validate_instance_graph()?;
 
         // Reject empty-string optional fields at the TOML layer,
         // matching the binary writer's rejection. Without this, a
@@ -202,10 +262,10 @@ impl Lockfile {
 
             // Scope-pin `@lpm.dev/*` to the lpm.dev origin. The binary
             // reader runs the same check via `validate_loaded_packages`.
-            if let Some(url) = pkg.lpm_scope_origin_mismatch() {
+            if let Some(source) = pkg.lpm_scope_origin_mismatch() {
                 return Err(LockfileError::InvalidScopeOrigin {
                     package: pkg.name.clone(),
-                    url,
+                    source_identity: source,
                 });
             }
         }
@@ -219,14 +279,21 @@ impl Lockfile {
     /// Write the lockfile with an atomic same-directory replacement.
     pub fn write_to_file(&self, path: &Path) -> Result<(), LockfileError> {
         let content = self.to_toml()?;
+        if content.len() as u64 > TOML_LOCKFILE_SIZE_CAP_BYTES {
+            return Err(LockfileError::Io(format!(
+                "lockfile {} is {} bytes and exceeds {}-byte limit",
+                path.display(),
+                content.len(),
+                TOML_LOCKFILE_SIZE_CAP_BYTES
+            )));
+        }
         lpm_common::write_file_atomic(path, content)
             .map_err(|e| LockfileError::Io(format!("failed to write {}: {e}", path.display())))
     }
 
     /// Read lockfile from disk.
     pub fn read_from_file(path: &Path) -> Result<Self, LockfileError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| LockfileError::Io(format!("failed to read {}: {e}", path.display())))?;
+        let content = read_authoritative_toml(path)?;
         Self::from_toml(&content)
     }
 

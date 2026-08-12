@@ -360,6 +360,78 @@ where
     )
 }
 
+/// Bounded-memory variant that always uses streaming gzip decompression.
+pub fn extract_tarball_from_reader_streaming_with_inspector<P, I>(
+    reader: impl std::io::Read,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    let limits = ExtractionLimits {
+        max_buffered_compressed_size: 0,
+        ..DEFAULT_EXTRACTION_LIMITS
+    };
+    extract_tarball_from_reader_with_inspector_with_limits(
+        reader,
+        target_dir,
+        limits,
+        false,
+        buffer_predicate,
+        inspector,
+    )
+}
+
+/// Extract a tarball from a reader while computing a BLAKE3 digest for every
+/// regular file in the same write pass.
+pub fn extract_tarball_from_reader_with_entry_digests<P, I>(
+    reader: impl std::io::Read,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    extract_tarball_from_reader_with_inspector_with_limits(
+        reader,
+        target_dir,
+        DEFAULT_EXTRACTION_LIMITS,
+        true,
+        buffer_predicate,
+        inspector,
+    )
+}
+
+/// Digest-enabled bounded-memory variant that always streams gzip input.
+pub fn extract_tarball_from_reader_streaming_with_entry_digests<P, I>(
+    reader: impl std::io::Read,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    let limits = ExtractionLimits {
+        max_buffered_compressed_size: 0,
+        ..DEFAULT_EXTRACTION_LIMITS
+    };
+    extract_tarball_from_reader_with_inspector_with_limits(
+        reader,
+        target_dir,
+        limits,
+        true,
+        buffer_predicate,
+        inspector,
+    )
+}
+
 /// Extract an in-memory tarball while inspecting regular file entries.
 ///
 /// Unlike [`extract_tarball_from_reader_with_inspector`], this path uses the
@@ -1237,7 +1309,7 @@ pub fn extract_tarball_from_file(path: &Path, target_dir: &Path) -> Result<Vec<P
         ))
     })?;
     let reader = std::io::BufReader::new(file);
-    extract_tarball_from_reader(reader, target_dir)
+    extract_tarball_from_reader_streaming_with_inspector(reader, target_dir, |_, _| false, |_| {})
 }
 
 /// Extract + verify in one step. The typical pipeline.

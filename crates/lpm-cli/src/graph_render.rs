@@ -20,6 +20,7 @@ pub struct DepNode {
     pub is_direct: bool,
     pub is_duplicate: bool,
     pub is_root: bool,
+    is_project_root: bool,
     pub dependencies: Vec<String>, // "name@version" keys
 }
 
@@ -56,6 +57,33 @@ fn level_from_node_depths<'a>(depths: impl Iterator<Item = &'a usize>) -> usize 
     depths.max().map_or(0, |d| d + 1)
 }
 
+fn recompute_duplicate_state(nodes: &mut HashMap<String, DepNode>) -> Vec<(String, Vec<String>)> {
+    let mut name_versions: HashMap<&str, HashSet<&str>> = HashMap::with_capacity(nodes.len());
+    for node in nodes.values().filter(|node| !node.is_project_root) {
+        name_versions
+            .entry(node.name.as_str())
+            .or_default()
+            .insert(node.version.as_str());
+    }
+
+    let mut duplicates = Vec::new();
+    for (name, versions) in name_versions {
+        if versions.len() > 1 {
+            let mut sorted: Vec<String> = versions.into_iter().map(str::to_owned).collect();
+            sorted.sort_unstable();
+            duplicates.push((name.to_owned(), sorted));
+        }
+    }
+    duplicates.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let duplicate_names: HashSet<&str> = duplicates.iter().map(|(name, _)| name.as_str()).collect();
+    for node in nodes.values_mut() {
+        node.is_duplicate = !node.is_project_root && duplicate_names.contains(node.name.as_str());
+    }
+
+    duplicates
+}
+
 /// The full dependency graph.
 pub struct DepGraph {
     /// Map of "name@version" → node.
@@ -69,6 +97,20 @@ pub struct DepGraph {
 // ── Graph Construction ─────────────────────────────────────────────
 
 impl DepGraph {
+    pub fn from_lockfile_with_root_resolutions(
+        packages: &[lpm_lockfile::LockedPackage],
+        direct_dep_names: &HashSet<String>,
+        root_resolutions: &lpm_lockfile::RootResolutions,
+        root_name: &str,
+    ) -> Self {
+        Self::from_lockfile_inner(
+            packages,
+            direct_dep_names,
+            Some(root_resolutions),
+            root_name,
+        )
+    }
+
     /// Build a dependency graph from lockfile packages and direct dependency names.
     /// `root_name` is the project name from package.json (e.g., "my-app@1.0.0").
     pub fn from_lockfile(
@@ -76,37 +118,107 @@ impl DepGraph {
         direct_dep_names: &HashSet<String>,
         root_name: &str,
     ) -> Self {
+        Self::from_lockfile_inner(packages, direct_dep_names, None, root_name)
+    }
+
+    fn from_lockfile_inner(
+        packages: &[lpm_lockfile::LockedPackage],
+        direct_dep_names: &HashSet<String>,
+        root_resolutions: Option<&lpm_lockfile::RootResolutions>,
+        root_name: &str,
+    ) -> Self {
         let mut nodes = HashMap::new();
 
-        // Index all packages by "name@version"
-        for pkg in packages {
-            let key = format!("{}@{}", pkg.name, pkg.version);
+        let exact_root_ids = root_resolutions.map(|resolutions| {
+            resolutions
+                .iter()
+                .filter(|(local_name, _)| direct_dep_names.contains(*local_name))
+                .filter_map(|(_, resolution)| resolution.instance_id)
+                .collect::<HashSet<_>>()
+        });
+
+        let mut coordinate_counts = HashMap::with_capacity(packages.len());
+        for package in packages {
+            *coordinate_counts
+                .entry((package.name.as_str(), package.version.as_str()))
+                .or_insert(0_usize) += 1;
+        }
+        let mut instance_indices = HashMap::with_capacity(packages.len());
+        let mut package_keys = Vec::with_capacity(packages.len());
+        for (index, package) in packages.iter().enumerate() {
+            let base = format!("{}@{}", package.name, package.version);
+            let key = if coordinate_counts[&(package.name.as_str(), package.version.as_str())] > 1 {
+                match package.instance_id {
+                    Some(instance_id) => format!("{base}#{instance_id}"),
+                    None => format!("{base}#{}", index + 1),
+                }
+            } else {
+                base
+            };
+            if let Some(instance_id) = package.instance_id {
+                instance_indices.insert(instance_id, index);
+            }
+            package_keys.push(key);
+        }
+
+        for (index, pkg) in packages.iter().enumerate() {
             let registry = match pkg.source.as_deref() {
                 Some(s) if s.contains("lpm.dev") => Registry::Lpm,
                 Some(s) if s.contains("npmjs.org") => Registry::Npm,
                 _ => Registry::Unknown,
             };
 
-            let mut dependencies = pkg.dependencies.clone();
+            let mut dependencies = if pkg.instance_id.is_some() {
+                pkg.dependency_targets
+                    .values()
+                    .chain(pkg.peer_targets.values())
+                    .filter_map(|instance_id| {
+                        instance_indices
+                            .get(instance_id)
+                            .map(|target_index| package_keys[*target_index].clone())
+                    })
+                    .collect()
+            } else {
+                pkg.dependencies.clone()
+            };
             dependencies.sort_unstable();
+            dependencies.dedup();
 
             nodes.insert(
-                key.clone(),
+                std::mem::take(&mut package_keys[index]),
                 DepNode {
                     name: pkg.name.clone(),
                     version: pkg.version.clone(),
                     registry,
                     depth: 0,
-                    is_direct: direct_dep_names.contains(&pkg.name),
+                    is_direct: exact_root_ids.as_ref().map_or_else(
+                        || direct_dep_names.contains(&pkg.name),
+                        |instance_ids| {
+                            pkg.instance_id
+                                .is_some_and(|instance_id| instance_ids.contains(&instance_id))
+                        },
+                    ),
                     is_duplicate: false,
                     is_root: false,
+                    is_project_root: false,
                     dependencies,
                 },
             );
         }
 
         // Create synthetic root node pointing to all direct deps
-        let root_key = root_name.to_string();
+        let mut root_key = root_name.to_string();
+        if nodes.contains_key(&root_key) {
+            let mut suffix = 1_usize;
+            loop {
+                let candidate = format!("{root_name}#project-{suffix}");
+                if !nodes.contains_key(&candidate) {
+                    root_key = candidate;
+                    break;
+                }
+                suffix += 1;
+            }
+        }
         let mut direct_dep_keys: Vec<String> = nodes
             .iter()
             .filter(|(_, n)| n.is_direct)
@@ -114,20 +226,21 @@ impl DepGraph {
             .collect();
         direct_dep_keys.sort_unstable();
 
+        let (root_package_name, root_version) = root_name
+            .rsplit_once('@')
+            .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+            .unwrap_or((root_name, "0.0.0"));
         nodes.insert(
             root_key.clone(),
             DepNode {
-                name: root_name.split('@').next().unwrap_or(root_name).to_string(),
-                version: root_name
-                    .split('@')
-                    .next_back()
-                    .unwrap_or("0.0.0")
-                    .to_string(),
+                name: root_package_name.to_string(),
+                version: root_version.to_string(),
                 registry: Registry::Unknown,
                 depth: 0,
                 is_direct: false,
                 is_duplicate: false,
                 is_root: true,
+                is_project_root: true,
                 dependencies: direct_dep_keys,
             },
         );
@@ -150,7 +263,9 @@ impl DepGraph {
 
             if let Some(node) = nodes.get_mut(&key) {
                 node.depth = depth;
-                for dep_key in &node.dependencies.clone() {
+            }
+            if let Some(node) = nodes.get(&key) {
+                for dep_key in &node.dependencies {
                     if !visited.contains(dep_key) {
                         queue.push_back((dep_key.clone(), depth + 1));
                     }
@@ -158,44 +273,17 @@ impl DepGraph {
             }
         }
 
-        // Find duplicates (same name, different versions)
-        let mut name_versions: HashMap<String, Vec<String>> = HashMap::new();
-        for node in nodes.values() {
-            name_versions
-                .entry(node.name.clone())
-                .or_default()
-                .push(node.version.clone());
-        }
-
-        let mut duplicates = Vec::new();
-        for (name, versions) in &name_versions {
-            if versions.len() > 1 {
-                let mut sorted = versions.clone();
-                sorted.sort();
-                sorted.dedup();
-                if sorted.len() > 1 {
-                    duplicates.push((name.clone(), sorted.clone()));
-                    // Mark nodes as duplicate
-                    for v in &sorted {
-                        let key = format!("{name}@{v}");
-                        if let Some(node) = nodes.get_mut(&key) {
-                            node.is_duplicate = true;
-                        }
-                    }
-                }
-            }
-        }
-        duplicates.sort_by(|a, b| a.0.cmp(&b.0));
+        let duplicates = recompute_duplicate_state(&mut nodes);
 
         // 1-based to match the `--depth N` flag contract (root = 1).
         let max_depth = level_from_node_depths(nodes.values().map(|n| &n.depth));
         let lpm_count = nodes
             .values()
-            .filter(|n| n.registry == Registry::Lpm)
+            .filter(|n| !n.is_project_root && n.registry == Registry::Lpm)
             .count();
         let npm_count = nodes
             .values()
-            .filter(|n| n.registry == Registry::Npm)
+            .filter(|n| !n.is_project_root && n.registry == Registry::Npm)
             .count();
 
         let stats = GraphStats {
@@ -472,14 +560,16 @@ pub fn filter_graph(graph: &mut DepGraph, filter: &str) {
     // a match (i.e., their subtree contains a match).
     let mut keep = HashSet::new();
 
+    let mut memo = HashMap::with_capacity(graph.nodes.len());
+    let mut visiting = HashSet::new();
     for root_key in &graph.roots {
         // Root always stays
         keep.insert(root_key.clone());
-        mark_matching_subtrees(graph, root_key, filter, &mut keep, &mut HashSet::new());
+        mark_matching_subtrees(graph, root_key, filter, &mut keep, &mut memo, &mut visiting);
     }
 
     // Remove non-kept nodes
-    graph.nodes.retain(|k, _| keep.contains(k));
+    graph.nodes.retain(|key, _| keep.contains(key));
 
     // Remove dangling edges from remaining nodes
     for node in graph.nodes.values_mut() {
@@ -490,60 +580,53 @@ pub fn filter_graph(graph: &mut DepGraph, filter: &str) {
 /// DFS walk: if this node or any descendant contains `filter`, add this node
 /// (and the chain leading to it) to `keep`. Returns true when the subtree
 /// contains a match.
-fn mark_matching_subtrees(
-    graph: &DepGraph,
+fn mark_matching_subtrees<'graph>(
+    graph: &'graph DepGraph,
     key: &str,
     filter: &str,
     keep: &mut HashSet<String>,
-    visited: &mut HashSet<String>,
+    memo: &mut HashMap<&'graph str, bool>,
+    visiting: &mut HashSet<&'graph str>,
 ) -> bool {
-    if !visited.insert(key.to_string()) {
-        // Already visited — return whether we already decided to keep it
-        return keep.contains(key);
-    }
-
-    let node = match graph.nodes.get(key) {
-        Some(n) => n,
-        None => {
-            visited.remove(key);
-            return false;
-        }
+    let Some((graph_key, node)) = graph.nodes.get_key_value(key) else {
+        return false;
     };
+    let graph_key = graph_key.as_str();
+    if let Some(matches) = memo.get(graph_key) {
+        return *matches;
+    }
+    if !visiting.insert(graph_key) {
+        return false;
+    }
 
     let self_matches = node.name.contains(filter);
 
-    // Check children (need to clone deps to avoid borrow conflict)
-    // Walk every child; do NOT use `.any()` here. `.any()` short-circuits
-    // on the first true, which silently drops sibling branches in a
-    // diamond pattern (root → {a, b} → shared-target). When `a` matches,
-    // `b` would never be visited and gets pruned even though its subtree
-    // also contains the target. Each child must be evaluated for its own
-    // sake so its mark / keep_subtree side effects fire.
-    let deps = node.dependencies.clone();
     let mut child_matches = false;
-    for dep_key in &deps {
-        if mark_matching_subtrees(graph, dep_key, filter, keep, visited) {
+    for dep_key in &node.dependencies {
+        if mark_matching_subtrees(graph, dep_key, filter, keep, memo, visiting) {
             child_matches = true;
         }
     }
 
-    visited.remove(key);
+    visiting.remove(graph_key);
 
     if self_matches || child_matches {
-        keep.insert(key.to_string());
+        keep.insert(graph_key.to_string());
         // Also ensure the matched node's full subtree is kept (so the user
         // can see the dependencies of the matched package)
         if self_matches {
-            keep_subtree(graph, key, keep);
+            keep_subtree(graph, graph_key, keep);
         }
+        memo.insert(graph_key, true);
         true
     } else {
+        memo.insert(graph_key, false);
         false
     }
 }
 
 /// Recursively add all descendants of `key` to `keep`.
-fn keep_subtree(graph: &DepGraph, key: &str, keep: &mut HashSet<String>) {
+fn keep_subtree<'graph>(graph: &'graph DepGraph, key: &'graph str, keep: &mut HashSet<String>) {
     if let Some(node) = graph.nodes.get(key) {
         for dep_key in &node.dependencies {
             if keep.insert(dep_key.clone()) {
@@ -606,35 +689,19 @@ pub fn recompute_stats(graph: &mut DepGraph) {
     let lpm_count = graph
         .nodes
         .values()
-        .filter(|n| n.registry == Registry::Lpm)
+        .filter(|n| !n.is_project_root && n.registry == Registry::Lpm)
         .count();
     let npm_count = graph
         .nodes
         .values()
-        .filter(|n| n.registry == Registry::Npm)
+        .filter(|n| !n.is_project_root && n.registry == Registry::Npm)
         .count();
     // 1-based to match the `--depth N` flag contract (root = 1).
     let max_depth = level_from_node_depths(graph.nodes.values().map(|n| &n.depth));
 
-    let mut name_versions: HashMap<String, Vec<String>> = HashMap::new();
-    for node in graph.nodes.values() {
-        name_versions
-            .entry(node.name.clone())
-            .or_default()
-            .push(node.version.clone());
-    }
-    let mut duplicates = Vec::new();
-    for (name, versions) in &name_versions {
-        let mut sorted = versions.clone();
-        sorted.sort();
-        sorted.dedup();
-        if sorted.len() > 1 {
-            duplicates.push((name.clone(), sorted));
-        }
-    }
-    duplicates.sort_by(|a, b| a.0.cmp(&b.0));
+    let duplicates = recompute_duplicate_state(&mut graph.nodes);
 
-    let root_count = graph.nodes.values().filter(|n| n.is_root).count();
+    let root_count = graph.nodes.values().filter(|n| n.is_project_root).count();
 
     graph.stats = GraphStats {
         total_packages: graph.nodes.len().saturating_sub(root_count),
@@ -783,65 +850,153 @@ pub fn render_mermaid(graph: &DepGraph) -> String {
 
 // ── JSON Renderer ──────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn render_json(graph: &DepGraph) -> Result<String, serde_json::Error> {
-    let nodes: Vec<serde_json::Value> = graph
-        .nodes
-        .iter()
-        .map(|(key, node)| {
-            serde_json::json!({
-                "key": key,
-                "name": node.name,
-                "version": node.version,
-                "registry": match node.registry {
-                    Registry::Lpm => "lpm",
-                    Registry::Npm => "npm",
-                    Registry::Unknown => "unknown",
-                },
-                "depth": node.depth,
-                "is_direct": node.is_direct,
-                "is_duplicate": node.is_duplicate,
-                "is_root": node.is_root,
-                "dependency_count": node.dependencies.len(),
-                "deps": node.dependencies,
-            })
-        })
-        .collect();
+    let mut output = Vec::new();
+    write_json(&mut output, graph)?;
+    Ok(String::from_utf8(output).expect("graph JSON must be UTF-8"))
+}
 
-    let edges: Vec<serde_json::Value> = graph
-        .nodes
-        .iter()
-        .flat_map(|(key, node)| {
-            node.dependencies
-                .iter()
-                .map(move |dep| serde_json::json!({ "from": key, "to": dep }))
-        })
-        .collect();
+pub fn write_json<W: Write>(mut writer: W, graph: &DepGraph) -> Result<(), serde_json::Error> {
+    serde_json::to_writer_pretty(&mut writer, &GraphJson { graph })?;
+    writer.write_all(b"\n").map_err(serde_json::Error::io)
+}
 
-    let duplicates: Vec<serde_json::Value> = graph
-        .stats
-        .duplicates
-        .iter()
-        .map(|(name, versions)| serde_json::json!({ "name": name, "versions": versions }))
-        .collect();
+struct GraphJson<'graph> {
+    graph: &'graph DepGraph,
+}
 
-    let root_name = graph
-        .roots
-        .first()
-        .and_then(|k| graph.nodes.get(k))
-        .map(|n| format!("{}@{}", n.name, n.version))
-        .unwrap_or_default();
+impl Serialize for GraphJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let graph = self.graph;
+        let root_name = graph
+            .roots
+            .first()
+            .and_then(|key| graph.nodes.get(key))
+            .map(|node| format!("{}@{}", node.name, node.version))
+            .unwrap_or_default();
+        let mut output = serializer.serialize_struct("GraphJson", 9)?;
+        output.serialize_field("success", &true)?;
+        output.serialize_field("root", &root_name)?;
+        output.serialize_field("packages", &graph.stats.total_packages)?;
+        output.serialize_field("lpm_packages", &graph.stats.lpm_packages)?;
+        output.serialize_field("npm_packages", &graph.stats.npm_packages)?;
+        output.serialize_field("max_depth", &graph.stats.max_depth)?;
+        output.serialize_field("duplicates", &GraphJsonDuplicates { graph })?;
+        output.serialize_field("nodes", &GraphJsonNodes { graph })?;
+        output.serialize_field("edges", &GraphJsonEdges { graph })?;
+        output.end()
+    }
+}
 
-    serde_json::to_string_pretty(&serde_json::json!({
-        "success": true,
-        "root": root_name,
-        "packages": graph.stats.total_packages,
-        "lpm_packages": graph.stats.lpm_packages,
-        "npm_packages": graph.stats.npm_packages,
-        "max_depth": graph.stats.max_depth,
-        "duplicates": duplicates,
-        "nodes": nodes,
-        "edges": edges,
-    }))
+struct GraphJsonDuplicates<'graph> {
+    graph: &'graph DepGraph,
+}
+
+impl Serialize for GraphJsonDuplicates<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut duplicates = serializer.serialize_seq(Some(self.graph.stats.duplicates.len()))?;
+        for (name, versions) in &self.graph.stats.duplicates {
+            duplicates.serialize_element(&GraphJsonDuplicate { name, versions })?;
+        }
+        duplicates.end()
+    }
+}
+
+#[derive(Serialize)]
+struct GraphJsonDuplicate<'value> {
+    name: &'value str,
+    versions: &'value [String],
+}
+
+struct GraphJsonNodes<'graph> {
+    graph: &'graph DepGraph,
+}
+
+impl Serialize for GraphJsonNodes<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sorted_keys: Vec<&String> = self.graph.nodes.keys().collect();
+        sorted_keys.sort_unstable();
+        let mut nodes = serializer.serialize_seq(Some(sorted_keys.len()))?;
+        for key in sorted_keys {
+            let node = &self.graph.nodes[key];
+            nodes.serialize_element(&GraphJsonNode { key, node })?;
+        }
+        nodes.end()
+    }
+}
+
+struct GraphJsonNode<'value> {
+    key: &'value str,
+    node: &'value DepNode,
+}
+
+impl Serialize for GraphJsonNode<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut node = serializer.serialize_struct("GraphJsonNode", 10)?;
+        node.serialize_field("key", self.key)?;
+        node.serialize_field("name", &self.node.name)?;
+        node.serialize_field("version", &self.node.version)?;
+        let registry = match self.node.registry {
+            Registry::Lpm => "lpm",
+            Registry::Npm => "npm",
+            Registry::Unknown => "unknown",
+        };
+        node.serialize_field("registry", registry)?;
+        node.serialize_field("depth", &self.node.depth)?;
+        node.serialize_field("is_direct", &self.node.is_direct)?;
+        node.serialize_field("is_duplicate", &self.node.is_duplicate)?;
+        node.serialize_field("is_root", &self.node.is_root)?;
+        node.serialize_field("dependency_count", &self.node.dependencies.len())?;
+        node.serialize_field("deps", &self.node.dependencies)?;
+        node.end()
+    }
+}
+
+struct GraphJsonEdges<'graph> {
+    graph: &'graph DepGraph,
+}
+
+impl Serialize for GraphJsonEdges<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let edge_count = self
+            .graph
+            .nodes
+            .values()
+            .map(|node| node.dependencies.len())
+            .sum();
+        let mut sorted_keys: Vec<&String> = self.graph.nodes.keys().collect();
+        sorted_keys.sort_unstable();
+        let mut edges = serializer.serialize_seq(Some(edge_count))?;
+        for from in sorted_keys {
+            let node = &self.graph.nodes[from];
+            for to in &node.dependencies {
+                edges.serialize_element(&GraphJsonEdge { from, to })?;
+            }
+        }
+        edges.end()
+    }
+}
+
+#[derive(Serialize)]
+struct GraphJsonEdge<'value> {
+    from: &'value str,
+    to: &'value str,
 }
 
 // ── Stats Renderer ─────────────────────────────────────────────────
@@ -1060,53 +1215,12 @@ pub fn write_why_json<W: Write>(
     patch_state: Option<&crate::patch_state::PatchState>,
 ) -> Result<(), serde_json::Error> {
     let summary = graph.path_summary(target_name);
-    let override_hits: Vec<serde_json::Value> = overrides_state
-        .map(|s| {
-            s.applied
-                .iter()
-                .filter(|h| h.package == target_name)
-                .map(|h| {
-                    serde_json::json!({
-                        "raw_key": h.raw_key,
-                        "source": h.source,
-                        "package": h.package,
-                        "from_version": h.from_version,
-                        "to_version": h.to_version,
-                        "via_parent": h.via_parent,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let patch_hits: Vec<serde_json::Value> = patch_state
-        .map(|s| {
-            s.applied
-                .iter()
-                .filter(|h| h.name == target_name)
-                .map(|h| {
-                    serde_json::json!({
-                        "raw_key": h.raw_key,
-                        "name": h.name,
-                        "version": h.version,
-                        "patch_path": h.patch_path,
-                        "original_integrity": h.original_integrity,
-                        "locations": h.locations,
-                        "files_modified": h.files_modified,
-                        "files_added": h.files_added,
-                        "files_deleted": h.files_deleted,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     let output = WhyJson {
         graph,
         target_name,
         summary,
-        override_hits: &override_hits,
-        patch_hits: &patch_hits,
+        overrides_state,
+        patch_state,
     };
     serde_json::to_writer_pretty(&mut writer, &output)?;
     writer.write_all(b"\n").map_err(serde_json::Error::io)
@@ -1116,8 +1230,8 @@ struct WhyJson<'graph, 'value> {
     graph: &'graph DepGraph,
     target_name: &'value str,
     summary: PathSummary,
-    override_hits: &'value [serde_json::Value],
-    patch_hits: &'value [serde_json::Value],
+    overrides_state: Option<&'value crate::overrides_state::OverridesState>,
+    patch_state: Option<&'value crate::patch_state::PatchState>,
 }
 
 // The explicit serializer keeps the JSON field names stable while `paths`
@@ -1140,9 +1254,83 @@ impl Serialize for WhyJson<'_, '_> {
                 path_count: self.summary.path_count,
             },
         )?;
-        output.serialize_field("applied_overrides", self.override_hits)?;
-        output.serialize_field("applied_patches", self.patch_hits)?;
+        output.serialize_field(
+            "applied_overrides",
+            &WhyJsonOverrideHits {
+                target_name: self.target_name,
+                state: self.overrides_state,
+            },
+        )?;
+        output.serialize_field(
+            "applied_patches",
+            &WhyJsonPatchHits {
+                target_name: self.target_name,
+                state: self.patch_state,
+            },
+        )?;
         output.end()
+    }
+}
+
+struct WhyJsonOverrideHits<'value> {
+    target_name: &'value str,
+    state: Option<&'value crate::overrides_state::OverridesState>,
+}
+
+impl Serialize for WhyJsonOverrideHits<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let matching_count = self.state.map_or(0, |state| {
+            state
+                .applied
+                .iter()
+                .filter(|hit| hit.package == self.target_name)
+                .count()
+        });
+        let mut hits = serializer.serialize_seq(Some(matching_count))?;
+        if let Some(state) = self.state {
+            for hit in state
+                .applied
+                .iter()
+                .filter(|hit| hit.package == self.target_name)
+            {
+                hits.serialize_element(hit)?;
+            }
+        }
+        hits.end()
+    }
+}
+
+struct WhyJsonPatchHits<'value> {
+    target_name: &'value str,
+    state: Option<&'value crate::patch_state::PatchState>,
+}
+
+impl Serialize for WhyJsonPatchHits<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let matching_count = self.state.map_or(0, |state| {
+            state
+                .applied
+                .iter()
+                .filter(|hit| hit.name == self.target_name)
+                .count()
+        });
+        let mut hits = serializer.serialize_seq(Some(matching_count))?;
+        if let Some(state) = self.state {
+            for hit in state
+                .applied
+                .iter()
+                .filter(|hit| hit.name == self.target_name)
+            {
+                hits.serialize_element(hit)?;
+            }
+        }
+        hits.end()
     }
 }
 
@@ -1222,21 +1410,71 @@ fn render_why_json(
 
 // ── HTML Renderer ──────────────────────────────────────────────────
 
+#[cfg(test)]
 pub fn render_html(graph: &DepGraph) -> Result<String, serde_json::Error> {
-    let json_data = render_json(graph)?;
+    let mut output = Vec::new();
+    write_html(&mut output, graph)?;
+    Ok(String::from_utf8(output).expect("graph HTML must be UTF-8"))
+}
+
+pub fn write_html<W: Write>(mut writer: W, graph: &DepGraph) -> Result<(), serde_json::Error> {
+    let template = include_str!("templates/graph.html");
+    let (before_stats, after_stats) = template
+        .split_once("__STATS__")
+        .expect("graph template must contain the stats placeholder");
+    let (before_graph, after_graph) = after_stats
+        .split_once("__GRAPH_DATA__")
+        .expect("graph template must contain the graph placeholder");
     let stats = render_stats(graph).replace('\n', " | ");
     let stats = stats.trim_end_matches(" | ");
-
-    // Sanitize JSON for safe embedding in <script> tag.
-    // Replace all `</` sequences (case-insensitive attack vector for </script>, </SCRIPT>, etc.)
-    let safe_json = json_data.replace("</", "<\\/");
-
-    // HTML-escape the stats string to prevent XSS via package names
     let safe_stats = html_escape(stats);
 
-    Ok(include_str!("templates/graph.html")
-        .replace("__GRAPH_DATA__", &safe_json)
-        .replace("__STATS__", &safe_stats))
+    writer
+        .write_all(before_stats.as_bytes())
+        .map_err(serde_json::Error::io)?;
+    writer
+        .write_all(safe_stats.as_bytes())
+        .map_err(serde_json::Error::io)?;
+    writer
+        .write_all(before_graph.as_bytes())
+        .map_err(serde_json::Error::io)?;
+    {
+        let mut script_safe_writer = ScriptSafeJsonWriter::new(&mut writer);
+        write_json(&mut script_safe_writer, graph)?;
+    }
+    writer
+        .write_all(after_graph.as_bytes())
+        .map_err(serde_json::Error::io)
+}
+
+struct ScriptSafeJsonWriter<'writer, W> {
+    writer: &'writer mut W,
+}
+
+impl<'writer, W: Write> ScriptSafeJsonWriter<'writer, W> {
+    fn new(writer: &'writer mut W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: Write> Write for ScriptSafeJsonWriter<'_, W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut start = 0;
+        for (index, byte) in buffer.iter().enumerate() {
+            if *byte != b'<' {
+                continue;
+            }
+            self.writer.write_all(&buffer[start..index])?;
+            self.writer.write_all(br"\u003c")?;
+            start = index + 1;
+        }
+        self.writer.write_all(&buffer[start..])?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1268,10 +1506,14 @@ mod tests {
     fn mock_packages() -> Vec<LockedPackage> {
         vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "express".into(),
                 version: "4.22.1".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1282,13 +1524,18 @@ mod tests {
                 dependencies: vec!["accepts@1.3.8".into(), "debug@2.6.9".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "accepts".into(),
                 version: "1.3.8".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1299,13 +1546,18 @@ mod tests {
                 dependencies: vec!["mime-types@2.1.35".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "debug".into(),
                 version: "2.6.9".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1316,13 +1568,18 @@ mod tests {
                 dependencies: vec!["ms@2.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "ms".into(),
                 version: "2.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1333,13 +1590,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "ms".into(),
                 version: "2.1.3".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1350,13 +1612,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "mime-types".into(),
                 version: "2.1.35".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1367,13 +1634,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "@lpm.dev/neo.highlight".into(),
                 version: "1.1.1".into(),
                 source: Some("registry+https://lpm.dev".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1384,6 +1656,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]
@@ -1398,10 +1671,14 @@ mod tests {
 
     fn package(name: &str, dependencies: &[&str]) -> LockedPackage {
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: name.into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1415,8 +1692,355 @@ mod tests {
                 .collect(),
             alias_dependencies: Vec::new(),
             peers: Vec::new(),
+            peer_edges: Vec::new(),
             tarball: None,
         }
+    }
+
+    #[test]
+    fn exact_graph_keeps_contextual_instances_and_their_distinct_targets() {
+        let source = "registry+https://registry.npmjs.org";
+        let left_parent_id = lpm_common::PackageInstanceId::derive(
+            "left-parent",
+            "1.0.0",
+            source,
+            "root/left-parent",
+        );
+        let right_parent_id = lpm_common::PackageInstanceId::derive(
+            "right-parent",
+            "1.0.0",
+            source,
+            "root/right-parent",
+        );
+        let left_plugin_id = lpm_common::PackageInstanceId::derive(
+            "plugin",
+            "1.0.0",
+            source,
+            "root/left-parent/plugin",
+        );
+        let right_plugin_id = lpm_common::PackageInstanceId::derive(
+            "plugin",
+            "1.0.0",
+            source,
+            "root/right-parent/plugin",
+        );
+        let left_leaf_id = lpm_common::PackageInstanceId::derive(
+            "left-leaf",
+            "1.0.0",
+            source,
+            "root/left-parent/plugin/left-leaf",
+        );
+        let right_leaf_id = lpm_common::PackageInstanceId::derive(
+            "right-leaf",
+            "1.0.0",
+            source,
+            "root/right-parent/plugin/right-leaf",
+        );
+        let packages = vec![
+            LockedPackage {
+                instance_id: Some(left_parent_id),
+                name: "left-parent".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                dependencies: vec!["plugin@1.0.0".into()],
+                dependency_targets: std::collections::BTreeMap::from([(
+                    "plugin".into(),
+                    left_plugin_id,
+                )]),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(right_parent_id),
+                name: "right-parent".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                dependencies: vec!["plugin@1.0.0".into()],
+                dependency_targets: std::collections::BTreeMap::from([(
+                    "plugin".into(),
+                    right_plugin_id,
+                )]),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(left_plugin_id),
+                name: "plugin".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                dependencies: vec!["left-leaf@1.0.0".into()],
+                dependency_targets: std::collections::BTreeMap::from([(
+                    "left-leaf".into(),
+                    left_leaf_id,
+                )]),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(right_plugin_id),
+                name: "plugin".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                dependencies: vec!["right-leaf@1.0.0".into()],
+                dependency_targets: std::collections::BTreeMap::from([(
+                    "right-leaf".into(),
+                    right_leaf_id,
+                )]),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(left_leaf_id),
+                name: "left-leaf".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(right_leaf_id),
+                name: "right-leaf".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+        ];
+        let direct = HashSet::from(["left-parent".to_string(), "right-parent".to_string()]);
+
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        assert_eq!(graph.stats.total_packages, 6);
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.name == "plugin")
+                .count(),
+            2
+        );
+        assert!(graph.nodes.values().any(|node| {
+            node.name == "plugin"
+                && node.dependencies.iter().any(|dependency| {
+                    graph
+                        .nodes
+                        .get(dependency)
+                        .is_some_and(|target| target.name == "left-leaf")
+                })
+        }));
+        assert!(graph.nodes.values().any(|node| {
+            node.name == "plugin"
+                && node.dependencies.iter().any(|dependency| {
+                    graph
+                        .nodes
+                        .get(dependency)
+                        .is_some_and(|target| target.name == "right-leaf")
+                })
+        }));
+    }
+
+    #[test]
+    fn exact_graph_includes_peer_target_reachable_only_through_peer_edge() {
+        let source = "registry+https://registry.npmjs.org";
+        let consumer_id =
+            lpm_common::PackageInstanceId::derive("consumer", "1.0.0", source, "root/consumer");
+        let provider_id = lpm_common::PackageInstanceId::derive(
+            "provider",
+            "2.0.0",
+            source,
+            "root/consumer/provider",
+        );
+        let packages = vec![
+            LockedPackage {
+                instance_id: Some(consumer_id),
+                name: "consumer".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                peers: vec!["provider@2.0.0".into()],
+                peer_targets: std::collections::BTreeMap::from([("provider".into(), provider_id)]),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(provider_id),
+                name: "provider".into(),
+                version: "2.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+        ];
+        let graph = DepGraph::from_lockfile(
+            &packages,
+            &HashSet::from(["consumer".to_string()]),
+            "app@1.0.0",
+        );
+
+        assert_eq!(
+            graph.nodes["consumer@1.0.0"].dependencies,
+            vec!["provider@2.0.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn project_root_key_does_not_overwrite_matching_dependency_coordinate() {
+        let packages = vec![LockedPackage {
+            name: "app".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        }];
+
+        let graph =
+            DepGraph::from_lockfile(&packages, &HashSet::from(["app".to_string()]), "app@1.0.0");
+
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(!graph.nodes["app@1.0.0"].is_root);
+        assert_eq!(graph.nodes[&graph.roots[0]].dependencies, ["app@1.0.0"]);
+    }
+
+    #[test]
+    fn scoped_project_root_preserves_name_and_version() {
+        let graph = DepGraph::from_lockfile(&[], &HashSet::new(), "@scope/app@1.2.3");
+        let root = &graph.nodes[&graph.roots[0]];
+
+        assert_eq!((&*root.name, &*root.version), ("@scope/app", "1.2.3"));
+    }
+
+    #[test]
+    fn project_root_is_excluded_from_duplicate_state() {
+        let packages = vec![
+            LockedPackage {
+                name: "app".into(),
+                version: "2.0.0".into(),
+                ..Default::default()
+            },
+            LockedPackage {
+                name: "app".into(),
+                version: "3.0.0".into(),
+                ..Default::default()
+            },
+        ];
+        let graph = DepGraph::from_lockfile(&packages, &HashSet::new(), "app@1.0.0");
+
+        assert_eq!(
+            graph.stats.duplicates,
+            [(
+                "app".to_string(),
+                vec!["2.0.0".to_string(), "3.0.0".to_string()]
+            )]
+        );
+        assert!(!graph.nodes[&graph.roots[0]].is_duplicate);
+    }
+
+    #[test]
+    fn exact_graph_root_uses_only_the_selected_contextual_instance() {
+        let source = "registry+https://registry.npmjs.org";
+        let root_plugin_id =
+            lpm_common::PackageInstanceId::derive("plugin", "1.0.0", source, "root/plugin");
+        let parent_id =
+            lpm_common::PackageInstanceId::derive("parent", "1.0.0", source, "root/parent");
+        let nested_plugin_id =
+            lpm_common::PackageInstanceId::derive("plugin", "1.0.0", source, "root/parent/plugin");
+        let packages = vec![
+            LockedPackage {
+                instance_id: Some(root_plugin_id),
+                name: "plugin".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(parent_id),
+                name: "parent".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                dependencies: vec!["plugin@1.0.0".into()],
+                dependency_targets: std::collections::BTreeMap::from([(
+                    "plugin".into(),
+                    nested_plugin_id,
+                )]),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(nested_plugin_id),
+                name: "plugin".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+        ];
+        let direct = HashSet::from(["parent".to_string(), "plugin".to_string()]);
+        let root_resolutions = lpm_lockfile::RootResolutions::from([
+            (
+                "parent".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(parent_id),
+                    package: "parent".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                },
+            ),
+            (
+                "plugin".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(root_plugin_id),
+                    package: "plugin".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                },
+            ),
+        ]);
+
+        let graph = DepGraph::from_lockfile_with_root_resolutions(
+            &packages,
+            &direct,
+            &root_resolutions,
+            "app@1.0.0",
+        );
+
+        assert_eq!(
+            graph.nodes["app@1.0.0"].dependencies,
+            vec![
+                "parent@1.0.0".to_string(),
+                format!("plugin@1.0.0#{root_plugin_id}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_graph_marks_every_contextual_version_as_duplicate() {
+        let source = "registry+https://registry.npmjs.org";
+        let first_id = lpm_common::PackageInstanceId::derive("dep", "1.0.0", source, "root/first");
+        let first_sibling_id =
+            lpm_common::PackageInstanceId::derive("dep", "1.0.0", source, "root/first-sibling");
+        let second_id =
+            lpm_common::PackageInstanceId::derive("dep", "2.0.0", source, "root/second");
+        let packages = vec![
+            LockedPackage {
+                instance_id: Some(first_id),
+                name: "dep".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(first_sibling_id),
+                name: "dep".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(second_id),
+                name: "dep".into(),
+                version: "2.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+        ];
+        let direct = HashSet::from(["dep".to_string()]);
+
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+
+        assert!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.name == "dep")
+                .all(|node| node.is_duplicate)
+        );
     }
 
     #[test]
@@ -1438,6 +2062,34 @@ mod tests {
         assert_eq!(graph.stats.duplicates.len(), 1);
         assert_eq!(graph.stats.duplicates[0].0, "ms");
         assert_eq!(graph.stats.duplicates[0].1.len(), 2);
+    }
+
+    #[test]
+    fn recompute_stats_clears_duplicate_flags_when_one_version_is_filtered_out() {
+        let packages = vec![
+            package("parent-a", &["dup@1.0.0"]),
+            package("parent-b", &["dup@2.0.0"]),
+            LockedPackage {
+                name: "dup".into(),
+                version: "1.0.0".into(),
+                ..Default::default()
+            },
+            LockedPackage {
+                name: "dup".into(),
+                version: "2.0.0".into(),
+                ..Default::default()
+            },
+        ];
+        let mut graph = DepGraph::from_lockfile(
+            &packages,
+            &HashSet::from(["parent-a".to_string(), "parent-b".to_string()]),
+            "app@1.0.0",
+        );
+
+        filter_graph(&mut graph, "parent-a");
+        recompute_stats(&mut graph);
+
+        assert!(!graph.nodes["dup@1.0.0"].is_duplicate);
     }
 
     #[test]
@@ -1484,6 +2136,38 @@ mod tests {
             .iter()
             .find(|n| n["is_root"].as_bool() == Some(true));
         assert!(root.is_some(), "root node should be in JSON");
+    }
+
+    #[test]
+    fn json_output_orders_nodes_and_edges_by_key() {
+        let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_json(&graph).expect("render graph JSON"))
+                .expect("parse graph JSON");
+        let node_keys: Vec<&str> = parsed["nodes"]
+            .as_array()
+            .expect("nodes array")
+            .iter()
+            .map(|node| node["key"].as_str().expect("node key"))
+            .collect();
+        let mut sorted_node_keys = node_keys.clone();
+        sorted_node_keys.sort_unstable();
+        assert_eq!(node_keys, sorted_node_keys);
+
+        let edges: Vec<(&str, &str)> = parsed["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .map(|edge| {
+                (
+                    edge["from"].as_str().expect("edge source"),
+                    edge["to"].as_str().expect("edge target"),
+                )
+            })
+            .collect();
+        let mut sorted_edges = edges.clone();
+        sorted_edges.sort_unstable();
+        assert_eq!(edges, sorted_edges);
     }
 
     #[test]
@@ -1768,10 +2452,14 @@ mod tests {
         // Create a duplicate-triggering package with XSS name so the name appears in stats
         let packages = vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "<img src=x onerror=alert(1)>".into(),
                 version: "1.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1782,13 +2470,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "<img src=x onerror=alert(1)>".into(),
                 version: "2.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1799,6 +2492,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ];
@@ -1861,10 +2555,14 @@ mod tests {
             };
 
             packages.push(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("branch-{i}-a"),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1875,13 +2573,18 @@ mod tests {
                 dependencies: vec![shared_key.clone()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
             packages.push(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("branch-{i}-b"),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1892,13 +2595,18 @@ mod tests {
                 dependencies: vec![shared_key.clone()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
             packages.push(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("shared-{i}"),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1909,6 +2617,7 @@ mod tests {
                 dependencies: next_deps,
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
 
@@ -1918,10 +2627,14 @@ mod tests {
             }
         }
         packages.push(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "target".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1932,6 +2645,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
 
@@ -2005,10 +2719,14 @@ mod tests {
     #[test]
     fn dot_escapes_quotes_in_names() {
         let packages = vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "foo\"bar\\baz".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2019,6 +2737,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }];
         let direct: HashSet<String> = ["foo\"bar\\baz"].iter().map(|s| s.to_string()).collect();
@@ -2035,10 +2754,14 @@ mod tests {
     #[test]
     fn mermaid_escapes_quotes_and_brackets() {
         let packages = vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "foo\"bar]baz".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2049,6 +2772,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }];
         let direct: HashSet<String> = ["foo\"bar]baz"].iter().map(|s| s.to_string()).collect();
@@ -2070,10 +2794,14 @@ mod tests {
     #[test]
     fn html_escapes_all_script_closing_tags() {
         let packages = vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "pkg</SCRIPT>test".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2084,6 +2812,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }];
         let direct: HashSet<String> = ["pkg</SCRIPT>test"].iter().map(|s| s.to_string()).collect();
@@ -2099,16 +2828,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn streamed_html_matches_buffered_html_and_escapes_less_than() {
+        let packages = vec![LockedPackage {
+            name: "pkg</script>test".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        }];
+        let direct = HashSet::from(["pkg</script>test".to_string()]);
+        let graph = DepGraph::from_lockfile(&packages, &direct, "app@1.0.0");
+        let buffered = render_html(&graph).expect("render buffered HTML");
+        let mut streamed = Vec::new();
+        write_html(&mut streamed, &graph).expect("stream HTML");
+        let streamed = String::from_utf8(streamed).expect("HTML is UTF-8");
+
+        assert_eq!(streamed, buffered);
+        assert!(streamed.contains(r"pkg\u003c/script>test"));
+        assert!(!streamed.contains("pkg</script>test"));
+    }
+
     // ── --filter misses diamond-pattern matches ───────────
 
     #[test]
     fn filter_finds_match_through_both_diamond_branches() {
         let packages = vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "branch-a".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2119,13 +2871,18 @@ mod tests {
                 dependencies: vec!["shared-target@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "branch-b".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2136,13 +2893,18 @@ mod tests {
                 dependencies: vec!["shared-target@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "shared-target".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2153,6 +2915,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ];
@@ -2183,10 +2946,14 @@ mod tests {
     fn stats_exclude_synthetic_root() {
         let packages = vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2197,13 +2964,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2214,13 +2986,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "c".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2231,6 +3008,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ];
@@ -2441,10 +3219,14 @@ mod tests {
     #[test]
     fn mermaid_sanitize_handles_parentheses_in_name() {
         let packages = vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "foo(bar)".into(),
             version: "1.0.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2455,6 +3237,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }];
         let direct: HashSet<String> = ["foo(bar)"].iter().map(|s| s.to_string()).collect();
@@ -2536,10 +3319,14 @@ mod tests {
     #[test]
     fn unknown_registry_handled() {
         let packages = vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "private-pkg".into(),
             version: "1.0.0".into(),
             source: Some("registry+https://custom.registry.com".into()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2550,6 +3337,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }];
         let direct: HashSet<String> = ["private-pkg"].iter().map(|s| s.to_string()).collect();
@@ -2581,10 +3369,14 @@ mod tests {
         // Create a graph where two versions of "ms" are both reachable
         let packages = vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2595,13 +3387,18 @@ mod tests {
                 dependencies: vec!["ms@2.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2612,13 +3409,18 @@ mod tests {
                 dependencies: vec!["ms@2.1.3".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "ms".into(),
                 version: "2.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2629,13 +3431,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "ms".into(),
                 version: "2.1.3".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2646,6 +3453,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ];
@@ -2974,10 +3782,14 @@ mod tests {
     fn tree_handles_circular_deps() {
         let packages = vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "a".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2988,13 +3800,18 @@ mod tests {
                 dependencies: vec!["b@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "b".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -3005,6 +3822,7 @@ mod tests {
                 dependencies: vec!["a@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ];
@@ -3022,10 +3840,14 @@ mod tests {
     #[test]
     fn no_source_field_defaults_to_unknown() {
         let packages = vec![LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "local-pkg".into(),
             version: "0.1.0".into(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -3036,6 +3858,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         }];
         let direct: HashSet<String> = ["local-pkg"].iter().map(|s| s.to_string()).collect();
@@ -3085,10 +3908,14 @@ mod tests {
         // Create a graph where the matched node has its own deps
         let packages = vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "parent".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -3099,13 +3926,18 @@ mod tests {
                 dependencies: vec!["target@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "target".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -3116,13 +3948,18 @@ mod tests {
                 dependencies: vec!["child-of-target@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "child-of-target".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -3133,13 +3970,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "unrelated".into(),
                 version: "1.0.0".into(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -3150,6 +3992,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ];

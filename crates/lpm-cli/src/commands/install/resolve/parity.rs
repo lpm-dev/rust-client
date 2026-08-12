@@ -50,7 +50,7 @@ impl ExperimentalResolverParityMode {
 pub(in crate::commands::install) struct PackageFingerprint {
     pub(in crate::commands::install) dependencies: Vec<(String, String)>,
     pub(in crate::commands::install) aliases: Vec<(String, String)>,
-    pub(in crate::commands::install) peers: Vec<(String, String)>,
+    pub(in crate::commands::install) peers: Vec<lpm_common::PeerEdge>,
     pub(in crate::commands::install) root_link_names: Vec<String>,
     pub(in crate::commands::install) is_direct: bool,
     pub(in crate::commands::install) optional: bool,

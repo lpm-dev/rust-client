@@ -184,6 +184,9 @@ fn read_manifest(path: &Path) -> serde_json::Value {
 /// stubbed because they don't affect the result.
 fn fake_pkg(name: &str, version: &str, is_direct: bool) -> InstallPackage {
     InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: name.to_string(),
         version: version.to_string(),
         source: "registry+https://registry.npmjs.org".to_string(),
@@ -201,7 +204,33 @@ fn fake_pkg(name: &str, version: &str, is_direct: bool) -> InstallPackage {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     }
+}
+
+#[test]
+fn v1_linker_rejects_contextual_instances_of_one_artifact() {
+    let first_id = lpm_common::PackageInstanceId::derive(
+        "plugin",
+        "1.0.0",
+        "registry+https://registry.npmjs.org",
+        "root/left/plugin",
+    );
+    let second_id = lpm_common::PackageInstanceId::derive(
+        "plugin",
+        "1.0.0",
+        "registry+https://registry.npmjs.org",
+        "root/right/plugin",
+    );
+    let mut first = fake_pkg("plugin", "1.0.0", false);
+    first.instance_id = Some(first_id);
+    let mut second = first.clone();
+    second.instance_id = Some(second_id);
+
+    let error = validate_store_graph_compatibility(&[first, second], lpm_store::StoreVersion::V1)
+        .expect_err("v1 cannot represent two contextual instances of one artifact");
+
+    assert!(error.to_string().contains("LPM_STORE_VERSION=v2"));
 }
 
 #[test]
@@ -296,6 +325,9 @@ fn build_test_tarball() -> Vec<u8> {
 
 fn install_package_for_tarball(url: &str, integrity: Option<&str>) -> InstallPackage {
     InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "test-tarball-pkg".to_string(),
         version: "1.0.0".to_string(),
         source: format!("tarball+{url}"),
@@ -313,6 +345,7 @@ fn install_package_for_tarball(url: &str, integrity: Option<&str>) -> InstallPac
         optional: false,
         tarball_url: Some(url.to_string()),
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     }
 }
 

@@ -115,13 +115,34 @@ pub(super) fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
 
 /// Fix: reconcile `lpm.lockb` with `lpm.lock`.
 pub(super) fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
-    let lock_path = lpm_lockfile::Lockfile::read_for_project(project_dir)
+    let expected_lock_path = lpm_lockfile::Lockfile::read_for_project(project_dir)
         .map_err(|_| "lpm.lock not found — cannot reconcile lpm.lockb".to_string())?
         .path;
-    let lf = lpm_lockfile::Lockfile::read_from_file(&lock_path)
-        .map_err(|e| format!("read lpm.lock failed: {e}"))?;
-    lf.write_all(&lock_path)
-        .map_err(|e| format!("write lockfiles failed: {e}"))
+    let lock_root = expected_lock_path.parent().ok_or_else(|| {
+        format!(
+            "cannot determine the project root for {}",
+            expected_lock_path.display()
+        )
+    })?;
+    lpm_common::with_exclusive_lock(lpm_common::project_install_lock(lock_root), || {
+        let lock_path = lpm_lockfile::Lockfile::read_for_project(project_dir)
+            .map_err(|error| lpm_common::LpmError::Script(format!("read lpm.lock failed: {error}")))?
+            .path;
+        if lock_path != expected_lock_path {
+            return Err(lpm_common::LpmError::Script(format!(
+                "the owning lockfile changed from {} to {} while waiting for the install transaction; retry lpm doctor --fix",
+                expected_lock_path.display(),
+                lock_path.display(),
+            )));
+        }
+        let lockfile = lpm_lockfile::Lockfile::read_from_file(&lock_path).map_err(|error| {
+            lpm_common::LpmError::Script(format!("read lpm.lock failed: {error}"))
+        })?;
+        lockfile.write_all(&lock_path).map_err(|error| {
+            lpm_common::LpmError::Script(format!("write lockfiles failed: {error}"))
+        })
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Fix: ensure `.gitattributes` marks `lpm.lockb` as binary.
@@ -204,6 +225,12 @@ mod tests {
     use super::*;
     use crate::doctor_catalog::Severity;
 
+    fn binary_representable_lockfile() -> lpm_lockfile::Lockfile {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+        lockfile
+    }
+
     #[test]
     fn deps_sync_uses_exact_name_matching() {
         // Bug: naive string search with `contains("name = \"a\"")` would match
@@ -225,12 +252,16 @@ mod tests {
         .unwrap();
 
         // Create lockfile with "react" but NOT "a"
-        let mut lockfile = lpm_lockfile::Lockfile::new();
+        let mut lockfile = binary_representable_lockfile();
         lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "react".to_string(),
             version: "18.0.0".to_string(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -241,6 +272,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lockfile
@@ -275,12 +307,16 @@ mod tests {
         )
         .unwrap();
 
-        let mut lockfile = lpm_lockfile::Lockfile::new();
+        let mut lockfile = binary_representable_lockfile();
         lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "react".to_string(),
             version: "18.0.0".to_string(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -291,6 +327,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lockfile
@@ -320,7 +357,7 @@ mod tests {
     #[test]
     fn lockfile_check_representable_toml_warns_missing_binary() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 
         let checks = check_lockfile_state(dir.path());
@@ -333,12 +370,16 @@ mod tests {
     }
 
     fn lockfile_with_platform_metadata() -> lpm_lockfile::Lockfile {
-        let mut lf = lpm_lockfile::Lockfile::new();
+        let mut lf = binary_representable_lockfile();
         lf.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "native-pkg".to_string(),
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: vec!["darwin".to_string()],
@@ -349,6 +390,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf
@@ -369,7 +411,7 @@ mod tests {
     #[test]
     fn lockfile_check_toml_only_metadata_warns_on_stale_binary() {
         let dir = tempfile::tempdir().unwrap();
-        let representable = lpm_lockfile::Lockfile::new();
+        let representable = binary_representable_lockfile();
         lpm_lockfile::binary::write_binary(&representable, &dir.path().join("lpm.lockb")).unwrap();
 
         let lf = lockfile_with_platform_metadata();
@@ -386,7 +428,7 @@ mod tests {
     #[test]
     fn lockfile_check_both_in_sync_passes() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         // Write TOML first, then binary (so binary is newer)
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -403,7 +445,7 @@ mod tests {
     #[test]
     fn lockfile_check_stale_binary_warns() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         // Write binary first (older), then TOML (newer)
         lpm_lockfile::binary::write_binary(&lf, &dir.path().join("lpm.lockb")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -419,7 +461,7 @@ mod tests {
     #[test]
     fn lockfile_check_corrupt_binary_warns() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         // Write corrupt binary (newer than TOML)
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -445,7 +487,7 @@ mod tests {
     #[test]
     fn gitattributes_check_missing_warns() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         // No .gitattributes file
 
@@ -458,7 +500,7 @@ mod tests {
     #[test]
     fn gitattributes_check_without_marker_warns() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         std::fs::write(dir.path().join(".gitattributes"), "*.png binary\n").unwrap();
 
@@ -471,7 +513,7 @@ mod tests {
     #[test]
     fn gitattributes_check_with_marker_passes() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         std::fs::write(
             dir.path().join(".gitattributes"),
@@ -490,12 +532,16 @@ mod tests {
     #[test]
     fn fix_binary_lockfile_regenerates_from_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let mut lf = lpm_lockfile::Lockfile::new();
+        let mut lf = binary_representable_lockfile();
         lf.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "react".to_string(),
             version: "18.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -506,6 +552,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
@@ -530,7 +577,7 @@ mod tests {
     #[test]
     fn fix_binary_lockfile_overwrites_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        let lf = lpm_lockfile::Lockfile::new();
+        let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 
         // Write corrupt binary
@@ -544,6 +591,58 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(reader.package_count(), 0);
+    }
+
+    #[test]
+    fn fix_binary_lockfile_waits_for_install_transaction_and_uses_latest_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = binary_representable_lockfile();
+        initial.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let lock_path = lpm_common::project_install_lock(&project_dir);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+        lpm_common::with_exclusive_lock(&lock_path, || {
+            let repair_project_dir = project_dir.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                finished_tx
+                    .send(fix_binary_lockfile(&repair_project_dir))
+                    .unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                finished_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "lockfile repair must wait for the active install transaction"
+            );
+
+            let mut updated = binary_representable_lockfile();
+            updated.add_package(lpm_lockfile::LockedPackage {
+                name: "latest".to_string(),
+                version: "2.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+                ..Default::default()
+            });
+            updated
+                .write_to_file(&project_dir.join("lpm.lock"))
+                .unwrap();
+            Ok::<_, lpm_common::LpmError>(())
+        })
+        .unwrap();
+
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("repair must finish after the install transaction releases its lock")
+            .unwrap();
+        let reader = lpm_lockfile::binary::BinaryLockfileReader::open(
+            &project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reader.find_package("latest").is_some());
     }
 
     #[test]

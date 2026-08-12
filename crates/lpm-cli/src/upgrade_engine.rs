@@ -342,10 +342,14 @@ mod tests {
         let mut lf = Lockfile::new();
         for (name, version) in entries {
             lf.add_package(lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: name.to_string(),
                 version: version.to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -357,6 +361,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
         }

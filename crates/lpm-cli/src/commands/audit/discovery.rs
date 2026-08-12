@@ -909,13 +909,13 @@ lockfile-version = 1
 resolved-with = "pubgrub"
 
 [[packages]]
+name = "accepts"
+version = "1.3.8"
+
+[[packages]]
 name = "express"
 version = "4.22.1"
 dependencies = ["accepts@1.3.8", "qs@6.14.0"]
-
-[[packages]]
-name = "accepts"
-version = "1.3.8"
 
 [[packages]]
 name = "qs"

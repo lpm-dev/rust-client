@@ -90,18 +90,31 @@ fn seed_project() -> TempProject {
     );
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "ansi-regex".to_string(),
         version: "5.0.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "left-pad".to_string(),
         version: "1.3.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         dependencies: vec!["ansi-regex@5.0.1".to_string()],
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[
+            ("left-pad", "left-pad", "1.3.0"),
+            ("ansi-regex", "ansi-regex", "5.0.1"),
+        ],
+    );
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write lpm.lock");
@@ -200,6 +213,9 @@ fn licenses_scope_marks_dev_only_alias_transitives_as_excluded() {
         .root_aliases
         .insert("ansi-regex-dev".to_string(), "ansi-regex".to_string());
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "ansi-regex".to_string(),
         version: "5.0.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
@@ -207,11 +223,18 @@ fn licenses_scope_marks_dev_only_alias_transitives_as_excluded() {
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "strip-ansi".to_string(),
         version: "6.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[("ansi-regex-dev", "ansi-regex", "5.0.1")],
+    );
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write aliased dev-only lockfile");
@@ -266,24 +289,40 @@ fn licenses_scope_keeps_dev_only_duplicate_versions_excluded() {
     );
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "2.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "dev-parent".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         dependencies: vec!["foo@2.0.0".to_string()],
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[
+            ("foo", "foo", "1.0.0"),
+            ("dev-parent", "dev-parent", "1.0.0"),
+        ],
+    );
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write duplicate-name lockfile");
@@ -354,24 +393,40 @@ fn licenses_ignores_stale_v1_copy_when_virtual_install_is_missing_version() {
     );
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "foo".to_string(),
         version: "2.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "dev-parent".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         dependencies: vec!["foo@2.0.0".to_string()],
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[
+            ("foo", "foo", "1.0.0"),
+            ("dev-parent", "dev-parent", "1.0.0"),
+        ],
+    );
     lockfile
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write duplicate-name lockfile");

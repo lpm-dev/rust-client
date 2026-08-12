@@ -374,10 +374,26 @@ fn migrate_pnpm_translates_patches_to_lpm_section() {
     // package.json was backed up because the plan had entries.
     assertions::assert_backup_exists(project.path(), "package.json");
 
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("migrated lockfile must remain readable");
+    assert_eq!(
+        lockfile.metadata.lockfile_version,
+        lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS,
+        "--no-install migration cannot claim exact package-instance identity"
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("Translated 1 `pnpm.patchedDependencies`"),
         "stderr should report translation count, got:\n{stderr}"
+    );
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "patch metadata makes the staging lockfile TOML-only"
+    );
+    assert!(
+        !stderr.contains("wrote:   lpm.lockb"),
+        "migrate must not report a binary artifact removed by the final TOML-only write: {stderr}"
     );
 }
 

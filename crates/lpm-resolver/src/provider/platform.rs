@@ -52,40 +52,32 @@ impl Platform {
 
 /// Check if a platform filter matches, following npm's semantics.
 ///
-/// Platform filtering follows npm's semantics:
-/// - If ANY entry starts with '!', the filter is treated as exclusion-only
-///   e.g., `["darwin", "!win32"]` → exclusion mode → only "!win32" matters, "darwin" is ignored
-/// - If no entries start with '!', the filter is treated as inclusion
-///   e.g., `["darwin", "linux"]` → only these platforms are allowed
-///
-/// This matches npm's behavior: <https://docs.npmjs.com/cli/v9/configuring-npm/package-json#os>
+/// A value must match none of the negative entries and, when positive entries
+/// are present, at least one positive entry. A sole `"any"` entry allows all.
+/// Matches npm-install-checks' `checkList` predicate.
 pub(super) fn check_platform_filter(entries: &[String], current: &str, field_name: &str) -> bool {
     if entries.is_empty() {
         return true;
     }
-
-    let has_exclusions = entries.iter().any(|e| e.starts_with('!'));
-    let has_inclusions = entries.iter().any(|e| !e.starts_with('!'));
-
-    if has_exclusions && has_inclusions {
-        tracing::debug!(
-            "mixed include/exclude in {field_name} filter: {entries:?} — using exclusion mode (positive entries ignored)"
-        );
+    if entries.len() == 1 && entries[0] == "any" {
+        return true;
     }
 
-    if has_exclusions {
-        // Exclusion mode: ALL exclusions must not match
-        entries.iter().all(|e| {
-            if let Some(stripped) = e.strip_prefix('!') {
-                stripped != current
-            } else {
-                true
+    let mut negative_count = 0usize;
+    let mut positive_match = false;
+    for entry in entries {
+        if let Some(negative) = entry.strip_prefix('!') {
+            negative_count += 1;
+            if negative == current {
+                return false;
             }
-        })
-    } else {
-        // Inclusion mode: at least one must match
-        entries.iter().any(|e| e == current)
+        } else if entry == current {
+            positive_match = true;
+        }
     }
+    let compatible = positive_match || negative_count == entries.len();
+    tracing::debug!(field_name, current, compatible, "checked platform filter");
+    compatible
 }
 
 /// Check if a package version is compatible with the current platform.

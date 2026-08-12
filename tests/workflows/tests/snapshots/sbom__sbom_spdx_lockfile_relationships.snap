@@ -50,7 +50,7 @@ expression: envelope
       ],
       "attributionTexts": [
         "lpm:source=registry+https://registry.npmjs.org",
-        "lpm:integrity=sha512-ansi"
+        "lpm:integrity=sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
       ]
     },
     {
@@ -72,7 +72,7 @@ expression: envelope
       "description": "left pad test fixture",
       "attributionTexts": [
         "lpm:source=registry+https://registry.npmjs.org",
-        "lpm:integrity=sha512-leftpad",
+        "lpm:integrity=sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
         "lpm:patch:path=patches/left-pad@1.3.0.patch",
         "lpm:patch:originalIntegrity=sha512-leftpad-original",
         "lpm:patch:sha256=sha256-2692094a267de7e28825147fd6cb2ebde098a4e68c25dfa3976ac806f4a1a784"

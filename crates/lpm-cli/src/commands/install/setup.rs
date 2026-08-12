@@ -45,6 +45,7 @@ pub(super) struct InstallSetupContext {
     pub(super) linker_mode: lpm_linker::LinkerMode,
     pub(super) store_version: lpm_store::StoreVersion,
     pub(super) manifest_deps: HashMap<String, String>,
+    pub(super) root_optional_dependency_names: HashSet<String>,
     pub(super) production_dependency_names: HashSet<String>,
 }
 
@@ -185,7 +186,14 @@ pub(super) fn prepare_install_setup_context(
     let store_version = lpm_store::StoreVersion::from_env();
     let mut manifest_deps = manifest_install_deps(&pkg);
     normalize_jsr_manifest_deps(&mut manifest_deps)?;
-    let production_dependency_names: HashSet<String> = pkg.dependencies.keys().cloned().collect();
+    let root_optional_dependency_names: HashSet<String> =
+        pkg.optional_dependencies.keys().cloned().collect();
+    let production_dependency_names: HashSet<String> = pkg
+        .dependencies
+        .keys()
+        .chain(pkg.optional_dependencies.keys())
+        .cloned()
+        .collect();
     reject_remote_tarball_url_deps_with_policy_extensions(
         &policy_extension_configs,
         &manifest_deps,
@@ -223,6 +231,7 @@ pub(super) fn prepare_install_setup_context(
         linker_mode,
         store_version,
         manifest_deps,
+        root_optional_dependency_names,
         production_dependency_names,
     })
 }

@@ -1928,12 +1928,10 @@ async fn install_with_partial_node_modules_re_links_to_full_state() {
     );
 }
 
-/// **E.3 — `lpm install` with truncated `lpm.lockb` falls back to TOML.**
+/// **E.3 — `lpm install` ignores an obsolete truncated `lpm.lockb`.**
 ///
-/// `lpm.lockb` is the binary mmap variant of the lockfile; `lpm.lock`
-/// is the TOML source of truth. If the binary copy is truncated /
-/// corrupt, the install must fall back to re-parsing the TOML — never
-/// panic, never silently produce wrong results.
+/// V13 lockfiles are TOML-only. If an obsolete binary companion remains and
+/// is corrupt, install must use the authoritative TOML without panicking.
 #[tokio::test]
 async fn install_with_truncated_lockb_falls_back_to_toml() {
     let mock = MockRegistry::start().await;
@@ -1953,41 +1951,8 @@ async fn install_with_truncated_lockb_falls_back_to_toml() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let lockfile_path = project.path().join("lpm.lock");
-    let mut lockfile =
-        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("read setup lockfile");
-    lockfile.importers.clear();
-    lockfile.patches.clear();
-    lockfile.catalogs.clear();
-    lockfile.root_aliases.clear();
-    lockfile.root_resolutions.clear();
-    lockfile.ambient_peer_installs.clear();
-    lockfile.metadata.auto_isolated_peer_conflicts = false;
-    for package in &mut lockfile.packages {
-        package.alias_dependencies.clear();
-        package.peers.clear();
-        package.os.clear();
-        package.cpu.clear();
-        package.libc.clear();
-        package.node_engine = None;
-        package.optional = false;
-        package.registry_signatures.clear();
-        package.registry_published_at = None;
-    }
-    assert!(
-        lpm_lockfile::binary::binary_format_supports(&lockfile),
-        "fixture must produce a binary lockfile before truncation",
-    );
-    lockfile
-        .write_all(&lockfile_path)
-        .expect("write legacy binary-representable lockfile");
-
-    // Truncate lpm.lockb to a few random bytes — not a valid header.
+    // Plant an obsolete truncated companion beside the authoritative TOML.
     let lockb_path = project.path().join("lpm.lockb");
-    assert!(
-        lockb_path.exists(),
-        "lpm.lockb wasn't written by first install"
-    );
     std::fs::write(&lockb_path, b"corrupt").expect("truncate lpm.lockb");
 
     // Run install again. Must NOT panic; must produce a coherent end

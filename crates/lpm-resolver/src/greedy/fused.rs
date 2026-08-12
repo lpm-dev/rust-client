@@ -24,7 +24,7 @@ pub struct SharedMetadataConcurrency {
 impl SharedMetadataConcurrency {
     /// Creates a metadata permit pool with at least one permit.
     pub fn new(limit: usize) -> Self {
-        let limit = limit.max(1);
+        let limit = limit.clamp(1, crate::MAX_NPM_FANOUT);
         Self {
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
             limit,
@@ -51,6 +51,13 @@ impl SharedMetadataConcurrency {
 #[cfg(test)]
 mod shared_metadata_concurrency_tests {
     use super::*;
+
+    #[test]
+    fn metadata_permit_pool_caps_untrusted_limits() {
+        let concurrency = SharedMetadataConcurrency::new(usize::MAX);
+
+        assert_eq!(concurrency.limit(), crate::MAX_NPM_FANOUT);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cloned_handles_enforce_one_global_permit_limit() {
@@ -108,14 +115,13 @@ mod shared_metadata_concurrency_tests {
         let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
-            metadata_sem: &metadata_sem,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
             policy: &policy,
             trace_metadata_fetches: false,
         };
-        let mut jobs = tokio::task::JoinSet::new();
+        let mut jobs = MetadataFetchScheduler::new(Arc::clone(&metadata_sem));
 
         spawn_metadata_fetch_job(&mut jobs, &dispatch, CanonicalKey::npm(package), false);
         let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -148,7 +154,6 @@ struct FusedTreeProvider<'a> {
 }
 
 struct MetadataFetchDispatch<'a> {
-    metadata_sem: &'a Arc<tokio::sync::Semaphore>,
     telemetry: &'a Arc<MetadataFetchTelemetry>,
     client: &'a Arc<RegistryClient>,
     route_table: &'a RouteTable,
@@ -515,71 +520,197 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
     }
 }
 
-fn spawn_metadata_fetch_job(
-    metadata_jobs: &mut tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
-    dispatch: &MetadataFetchDispatch<'_>,
+struct PendingMetadataFetch {
     canonical: CanonicalKey,
+    client: Arc<RegistryClient>,
+    route_table: RouteTable,
+    policy: ResolverPolicy,
     include_speculation: bool,
-) {
-    let client_c = dispatch.client.clone();
-    let permit = Arc::clone(dispatch.metadata_sem);
-    let route_table_c = dispatch.route_table.clone();
-    let policy_c = dispatch.policy.clone();
-    let trace_metadata_fetches = dispatch.trace_metadata_fetches;
-    let telemetry = Arc::clone(dispatch.telemetry);
-    let memory_cached = if trace_metadata_fetches {
-        None
-    } else if let CanonicalKey::Npm { name } = &canonical
-        && matches!(
-            route_table_c.route_for_package(name),
-            UpstreamRoute::NpmDirect
-        )
-    {
-        client_c.npm_metadata_direct_memory_cache(name)
-    } else {
-        None
-    };
-    metadata_jobs.spawn(async move {
-        if let Some(metadata) = memory_cached
+    trace_metadata_fetches: bool,
+    telemetry: Arc<MetadataFetchTelemetry>,
+    queued_at: Instant,
+}
+
+struct MetadataFetchScheduler {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
+    pending: VecDeque<PendingMetadataFetch>,
+    ready: VecDeque<(CanonicalKey, FetchResult)>,
+}
+
+impl MetadataFetchScheduler {
+    fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            semaphore,
+            jobs: tokio::task::JoinSet::new(),
+            pending: VecDeque::new(),
+            ready: VecDeque::new(),
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        dispatch: &MetadataFetchDispatch<'_>,
+        canonical: CanonicalKey,
+        include_speculation: bool,
+    ) {
+        let client = dispatch.client.clone();
+        let route_table = dispatch.route_table.clone();
+        let policy = dispatch.policy.clone();
+        if !dispatch.trace_metadata_fetches
+            && let CanonicalKey::Npm { name } = &canonical
+            && matches!(
+                route_table.route_for_package(name),
+                UpstreamRoute::NpmDirect
+            )
+            && let Some(metadata) = client.npm_metadata_direct_memory_cache(name)
             && let Some(fetched) = parse_cached_metadata_for_resolver(
                 &metadata,
                 &canonical,
-                &policy_c,
+                &policy,
                 include_speculation,
             )
         {
-            return (canonical, Ok(fetched));
+            self.ready.push_back((canonical, Ok(fetched)));
+            return;
         }
-        let _permit = match Arc::clone(&permit).try_acquire_owned() {
-            Ok(permit) => permit,
+
+        let pending = PendingMetadataFetch {
+            canonical,
+            client,
+            route_table,
+            policy,
+            include_speculation,
+            trace_metadata_fetches: dispatch.trace_metadata_fetches,
+            telemetry: Arc::clone(dispatch.telemetry),
+            queued_at: Instant::now(),
+        };
+        match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(permit) => self.spawn(pending, permit),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                telemetry
+                pending
+                    .telemetry
                     .semaphore_wait_count
                     .fetch_add(1, Ordering::Relaxed);
-                let wait_started = Instant::now();
-                let permit = permit
-                    .acquire_owned()
-                    .await
-                    .expect("metadata semaphore must outlive the resolver");
-                telemetry.record_wait_duration(wait_started.elapsed());
-                permit
+                self.pending.push_back(pending);
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 panic!("metadata semaphore must outlive the resolver")
             }
+        }
+    }
+
+    fn spawn(&mut self, pending: PendingMetadataFetch, permit: tokio::sync::OwnedSemaphorePermit) {
+        if pending.queued_at.elapsed() != Duration::ZERO {
+            pending
+                .telemetry
+                .record_wait_duration(pending.queued_at.elapsed());
+        }
+        self.jobs.spawn(async move {
+            let _permit = permit;
+            let _active_fetch = pending.telemetry.enter();
+            let result = fetch_metadata_for_resolver_with_trace_detail(
+                &pending.client,
+                &pending.route_table,
+                &pending.canonical,
+                &pending.policy,
+                pending.include_speculation,
+                pending.trace_metadata_fetches,
+            )
+            .await;
+            (pending.canonical, result)
+        });
+    }
+
+    fn fill_available(&mut self) {
+        while !self.pending.is_empty() {
+            let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => break,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    panic!("metadata semaphore must outlive the resolver")
+                }
+            };
+            let pending = self.pending.pop_front().expect("checked non-empty");
+            self.spawn(pending, permit);
+        }
+    }
+
+    async fn join_next(
+        &mut self,
+    ) -> Option<Result<(CanonicalKey, FetchResult), tokio::task::JoinError>> {
+        if let Some(ready) = self.ready.pop_front() {
+            return Some(Ok(ready));
+        }
+        self.fill_available();
+        if self.jobs.is_empty() && !self.pending.is_empty() {
+            let permit = Arc::clone(&self.semaphore)
+                .acquire_owned()
+                .await
+                .expect("metadata semaphore must outlive the resolver");
+            let pending = self.pending.pop_front().expect("checked non-empty");
+            self.spawn(pending, permit);
+        }
+        let joined = self.jobs.join_next().await;
+        self.fill_available();
+        joined
+    }
+
+    #[cfg(test)]
+    fn queued_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(test)]
+    fn spawned_len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.jobs.is_empty() && self.pending.is_empty() && self.ready.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod metadata_fetch_scheduler_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ten_thousand_requests_create_only_bounded_tokio_tasks() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_cache_dir(None)
+                .clone_with_metadata_memory_cache(),
+        );
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
         };
-        let _active_fetch = telemetry.enter();
-        let result = fetch_metadata_for_resolver_with_trace_detail(
-            &client_c,
-            &route_table_c,
-            &canonical,
-            &policy_c,
-            include_speculation,
-            trace_metadata_fetches,
-        )
-        .await;
-        (canonical, result)
-    });
+        let mut scheduler = MetadataFetchScheduler::new(Arc::clone(&semaphore));
+        for index in 0..10_000 {
+            let package = format!("stress-package-{index}");
+            scheduler.enqueue(&dispatch, CanonicalKey::npm(&package), false);
+        }
+        assert_eq!(scheduler.spawned_len(), 4);
+        assert_eq!(scheduler.queued_len(), 9_996);
+        scheduler.jobs.abort_all();
+    }
+}
+
+fn spawn_metadata_fetch_job(
+    metadata_jobs: &mut MetadataFetchScheduler,
+    dispatch: &MetadataFetchDispatch<'_>,
+    canonical: CanonicalKey,
+    include_speculation: bool,
+) {
+    metadata_jobs.enqueue(dispatch, canonical, include_speculation);
 }
 
 fn release_age_names_from_root_deps(
@@ -979,7 +1110,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     auto_install_peers: bool,
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
-    selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+    selected_package_tx: Option<tokio::sync::mpsc::Sender<SelectedPackageEvent>>,
 ) -> Result<ResolveResult, ResolveError> {
     resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
         client,
@@ -1017,10 +1148,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     auto_install_peers: bool,
     include_optional_dependencies: bool,
     policy: ResolverPolicy,
-    selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+    selected_package_tx: Option<tokio::sync::mpsc::Sender<SelectedPackageEvent>>,
     shared_fact_cache: Option<SharedCache>,
     shared_metadata_concurrency: Option<SharedMetadataConcurrency>,
 ) -> Result<ResolveResult, ResolveError> {
+    let npm_fanout = npm_fanout.clamp(1, crate::MAX_NPM_FANOUT);
     let pass_start = Instant::now();
 
     // Reset profiling accumulators so substage telemetry zeroes correctly
@@ -1074,7 +1206,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let metadata_sem = metadata_concurrency.semaphore();
     let metadata_fetch_telemetry = Arc::new(MetadataFetchTelemetry::default());
     let metadata_dispatch = MetadataFetchDispatch {
-        metadata_sem: &metadata_sem,
         telemetry: &metadata_fetch_telemetry,
         client: &client,
         route_table: &route_table,
@@ -1109,8 +1240,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     let mut counted_metadata_edge_misses =
         trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
-    let mut metadata_jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)> =
-        tokio::task::JoinSet::new();
+    let mut metadata_jobs = MetadataFetchScheduler::new(Arc::clone(&metadata_sem));
     let mut worker_batch_stream = None;
     let mut worker_batch_stream_package_specs: Vec<(String, String)> = Vec::new();
     let mut worker_stream_can_batch_waiting = false;
@@ -1406,6 +1536,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     tree_policy_ns = tree_policy_ns.saturating_add(duration_ns(started.elapsed()));
                 }
                 process_edge_with_preferred(&edge, &info_arc, preferred, &mut state)?;
+                state.flush_selected_packages().await;
                 pending_root_constraints.complete_root_edge(&edge, &mut state.task_queue);
                 continue;
             }
@@ -1998,6 +2129,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         .collect();
     let platform_skipped = state.platform_skipped;
     let root_aliases = std::mem::take(&mut state.root_aliases);
+    let root_resolutions = state.root_resolutions();
     // Same drain semantic as walker arm: dedup + sort the ambient
     // install set so the install pipeline gets a clean, deterministic
     // list to union with `pkg.dependencies`.
@@ -2013,7 +2145,6 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let applied_overrides = state.overrides.take_hits();
     let work_stats = state.work_stats;
     let peer_timing = state.peer_work_stats.snapshot();
-    let root_resolutions = state.root_resolutions();
     let packages = state.into_resolved_packages(&cache, &root_aliases);
     let (
         selected_package_count,
@@ -2030,7 +2161,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let policy_snap = crate::profile::policy_summary();
     Ok(ResolveResult {
         packages,
-        cache,
+        cache: Arc::new(cache),
         applied_overrides,
         platform_skipped,
         root_aliases,

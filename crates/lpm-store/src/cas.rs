@@ -122,6 +122,20 @@ impl PackageStore {
         self.store_at_dir(dir, &label, tarball_data)
     }
 
+    /// File-backed variant of [`Self::store_tarball_at_cas_path`].
+    pub fn store_tarball_at_cas_path_from_file(
+        &self,
+        integrity_sri: &str,
+        tarball_path: &std::path::Path,
+    ) -> Result<PathBuf, LpmError> {
+        let dir = self.tarball_store_path(integrity_sri)?;
+        let label = format!(
+            "tarball:{}",
+            integrity_sri.chars().take(24).collect::<String>()
+        );
+        self.store_tarball_from_file_at(dir, &label, tarball_path, integrity_sri)
+    }
+
     /// Extract a local-file tarball into the content-addressable
     /// `tarball-local` CAS path keyed by content SHA-256.
     ///

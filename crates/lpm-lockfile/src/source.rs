@@ -59,10 +59,8 @@ pub enum Source {
 pub enum SourceParseError {
     #[error("source string is empty")]
     Empty,
-    #[error(
-        "unknown source kind {0:?} (expected one of: registry+, tarball+, directory+, link+, git+)"
-    )]
-    UnknownKind(String),
+    #[error("unknown source kind (expected one of: registry+, tarball+, directory+, link+, git+)")]
+    UnknownKind,
     #[error("source kind '{kind}' has empty value")]
     EmptyValue { kind: String },
 }
@@ -104,6 +102,20 @@ impl Source {
         }
     }
 
+    /// Source identity safe for logs and user-facing diagnostics.
+    pub fn safe_identity(&self) -> String {
+        match self {
+            Source::Registry { url } => safe_url_origin(url).map_or_else(
+                || format!("registry:{}", self.source_id()),
+                |origin| format!("registry+{origin}"),
+            ),
+            Source::Tarball { .. } => format!("tarball:{}", self.source_id()),
+            Source::Directory { .. } => format!("directory:{}", self.source_id()),
+            Source::Link { .. } => format!("link:{}", self.source_id()),
+            Source::Git { .. } => format!("git:{}", self.source_id()),
+        }
+    }
+
     /// Parse a lockfile source string into a typed [`Source`].
     ///
     /// Recognized prefixes — see module docs for the wire format.
@@ -138,12 +150,22 @@ impl Source {
             return Ok(Source::Git { url: s.to_string() });
         }
 
-        // No known prefix matched. Surface the user-typed kind for
-        // a clearer error message; everything before the first '+'
-        // (or the whole string if there's no '+') is what they wrote.
-        let kind = s.split_once('+').map_or(s, |(k, _)| k);
-        Err(SourceParseError::UnknownKind(kind.to_string()))
+        Err(SourceParseError::UnknownKind)
     }
+}
+
+/// Source identity safe for logs and user-facing diagnostics.
+pub fn safe_source_identity(raw: &str) -> String {
+    Source::parse(raw).map_or_else(
+        |_| "unknown-source".to_owned(),
+        |source| source.safe_identity(),
+    )
+}
+
+fn safe_url_origin(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let origin = parsed.origin().ascii_serialization();
+    (origin != "null").then_some(origin)
 }
 
 /// Compute the 16-hex truncated SHA-256 digest of `s`.
@@ -300,18 +322,46 @@ mod tests {
     fn parse_unknown_kind_with_plus() {
         assert_eq!(
             Source::parse("ftp+ftp://example.com"),
-            Err(SourceParseError::UnknownKind("ftp".into()))
+            Err(SourceParseError::UnknownKind)
         );
     }
 
     #[test]
     fn parse_no_prefix_returns_unknown_kind() {
-        // Bare URLs are NOT recognized — the lockfile always uses
-        // discriminator+value form. The error includes the whole
-        // typed value (no '+') so the user sees what they wrote.
         assert_eq!(
             Source::parse("https://example.com"),
-            Err(SourceParseError::UnknownKind("https://example.com".into()))
+            Err(SourceParseError::UnknownKind)
+        );
+    }
+
+    #[test]
+    fn safe_registry_identity_removes_credentials_path_query_and_fragment() {
+        assert_eq!(
+            safe_source_identity(
+                "registry+https://user:password@example.test/private?token=secret#fragment"
+            ),
+            "registry+https://example.test"
+        );
+    }
+
+    #[test]
+    fn safe_non_registry_identity_is_opaque() {
+        let identity = safe_source_identity(
+            "git+https://user:password@example.test/private.git?token=secret#fragment",
+        );
+
+        assert!(identity.starts_with("git:g-"));
+        assert!(!identity.contains("example.test"));
+        assert!(!identity.contains("secret"));
+    }
+
+    #[test]
+    fn safe_malformed_source_identity_is_opaque() {
+        assert_eq!(
+            safe_source_identity(
+                "https://user:password@example.test/private?token=secret#fragment"
+            ),
+            "unknown-source"
         );
     }
 

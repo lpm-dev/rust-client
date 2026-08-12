@@ -162,6 +162,76 @@ pub(crate) async fn download_github_archive(
     Ok((bytes, computed))
 }
 
+pub(crate) async fn download_github_archive_to_file(
+    archive_url: &str,
+    expected_integrity: &str,
+) -> Result<lpm_registry::DownloadedTarball, LpmError> {
+    let endpoints = GitHubEndpoints::from_env()?;
+    let url = Url::parse(archive_url)
+        .map_err(|_| LpmError::Registry("locked GitHub archive URL is malformed".to_string()))?;
+    if !endpoints.codeload_url_is_allowed(&url) {
+        return Err(LpmError::Registry(
+            "locked GitHub archive URL is outside the configured direct GitHub origin".to_string(),
+        ));
+    }
+
+    let client = github_http_client()?;
+    let mut response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "lpm-rs")
+        .send()
+        .await
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "GitHub archive request failed: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
+    ensure_success_status(response.status(), "GitHub archive")?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GITHUB_ARCHIVE_BYTES)
+    {
+        return Err(response_size_error(
+            "GitHub archive",
+            MAX_GITHUB_ARCHIVE_BYTES,
+        ));
+    }
+
+    let mut file = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(LpmError::Io)?;
+    }
+    let mut compressed_size = 0_u64;
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        LpmError::Network(format!("failed to read GitHub archive response: {error}"))
+    })? {
+        compressed_size = compressed_size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| response_size_error("GitHub archive", MAX_GITHUB_ARCHIVE_BYTES))?;
+        if compressed_size > MAX_GITHUB_ARCHIVE_BYTES {
+            return Err(response_size_error(
+                "GitHub archive",
+                MAX_GITHUB_ARCHIVE_BYTES,
+            ));
+        }
+        std::io::Write::write_all(&mut file, &chunk).map_err(LpmError::Io)?;
+    }
+    std::io::Write::flush(&mut file).map_err(LpmError::Io)?;
+    let integrity = Integrity::parse(expected_integrity)?;
+    integrity.verify_file(file.path())?;
+
+    Ok(lpm_registry::DownloadedTarball {
+        file,
+        sri: integrity.to_string(),
+        compressed_size,
+    })
+}
+
 async fn resolve_github_commit(
     repository: &GitHubRepository,
     reference: &str,

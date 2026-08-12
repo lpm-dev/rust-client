@@ -23,8 +23,7 @@ pub use dispatch::{
 };
 #[allow(unused_imports)]
 pub use error::ResolveError;
-pub(crate) use format::{dedupe_peer_superset_packages, mark_optional_reachability};
-pub(crate) use peers::resolve_peer_binding_version;
+pub(crate) use format::mark_optional_reachability;
 #[allow(unused_imports)]
 pub use peers::{
     CompiledPeerRules, PeerWarning, check_unmet_peers, validate_allowed_versions_range,
@@ -49,11 +48,11 @@ mod prelude {
         ResolveError, extract_conflicting_packages, extract_conflicts_fallback,
         extract_conflicts_primary, map_pubgrub_error, no_solution_error,
     };
+    #[cfg(test)]
+    pub(super) use super::format::dedupe_peer_superset_packages;
     #[allow(unused_imports)]
     pub(super) use super::format::{
-        aliases_are_superset, dedupe_peer_superset_packages, entries_are_superset, format_solution,
-        mark_optional_reachability, resolved_package_can_replace, resolved_package_identity_key,
-        resolved_package_is_strict_superset, root_resolutions_from_solution,
+        format_solution, mark_optional_reachability, root_resolutions_from_solution,
     };
     #[allow(unused_imports)]
     pub(super) use super::peers::{

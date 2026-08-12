@@ -5,7 +5,7 @@
 //! 2. Detect source package manager, parse foreign lockfile, convert
 //! 3. Write lpm.lock + lpm.lockb (with backup of source lockfile + .npmrc)
 //! 4. Optionally configure .npmrc
-//! 5. Run `lpm install` (lockfile fast path — no re-resolution)
+//! 5. Run `lpm install` to resolve exact package-instance identities
 //! 6. Optionally verify build+test scripts pass
 //! 7. Optionally generate CI template
 //! 8. Print summary
@@ -255,12 +255,6 @@ pub async fn run(
         }
     }
 
-    if !json {
-        install_ui::done("Converted lockfile");
-        render_written_file(LOCKFILE_NAME);
-        render_written_file("lpm.lockb");
-    }
-
     // Apply the validated `pnpm.overrides` translation to
     // `package.json > lpm.overrides`. The plan was already checked for
     // blocking errors before any disk mutation; reaching here means every
@@ -439,6 +433,14 @@ pub async fn run(
                 platform,
                 "lpm migrate --ci".bold(),
             );
+        }
+    }
+
+    if !json {
+        install_ui::done("Converted lockfile");
+        render_written_file(LOCKFILE_NAME);
+        if lockb_path.exists() {
+            render_written_file("lpm.lockb");
         }
     }
 
@@ -1422,7 +1424,6 @@ fn record_migrated_patch_records(
         return Ok(());
     }
 
-    lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
     for t in to_apply {
         lockfile.patches.insert(
             t.lpm_key.clone(),

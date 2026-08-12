@@ -605,28 +605,16 @@ pub fn short_registry_host(url: &str) -> String {
         )
 }
 
+pub fn safe_url_origin(raw: &str) -> String {
+    reqwest::Url::parse(raw)
+        .ok()
+        .map(|parsed| parsed.origin().ascii_serialization())
+        .filter(|origin| origin != "null")
+        .unwrap_or_else(|| "remote-url".to_owned())
+}
+
 pub fn safe_package_source_identity(raw: &str) -> String {
-    let Ok(source) = lpm_lockfile::Source::parse(raw) else {
-        return "unknown-source".to_owned();
-    };
-    let source_id = source.source_id();
-    match source {
-        lpm_lockfile::Source::Registry { url } => {
-            let Ok(parsed) = reqwest::Url::parse(&url) else {
-                return format!("registry:{source_id}");
-            };
-            let origin = parsed.origin().ascii_serialization();
-            if origin == "null" {
-                format!("registry:{source_id}")
-            } else {
-                format!("registry+{origin}")
-            }
-        }
-        lpm_lockfile::Source::Tarball { .. } => format!("tarball:{source_id}"),
-        lpm_lockfile::Source::Directory { .. } => format!("directory:{source_id}"),
-        lpm_lockfile::Source::Link { .. } => format!("link:{source_id}"),
-        lpm_lockfile::Source::Git { .. } => format!("git:{source_id}"),
-    }
+    lpm_lockfile::safe_source_identity(raw)
 }
 
 /// Success terminus: `✓ {msg}`.
@@ -972,8 +960,8 @@ pub fn format_audit_advisory(
 mod tests {
     use super::{
         LineKind, TerminalLine, assert_positional_terminal_format, format_line,
-        safe_package_source_identity, spinner_animation_enabled, static_spin_fallback_line,
-        usage_bar_filled_cells,
+        safe_package_source_identity, safe_url_origin, spinner_animation_enabled,
+        static_spin_fallback_line, usage_bar_filled_cells,
     };
     use std::borrow::Cow;
 
@@ -1062,6 +1050,16 @@ mod tests {
         );
 
         assert_eq!(identity, "registry+https://example.test");
+    }
+
+    #[test]
+    fn safe_url_origin_removes_credentials_path_query_and_fragment() {
+        assert_eq!(
+            safe_url_origin(
+                "https://user:password@example.test/private?token=secret#fragment-secret"
+            ),
+            "https://example.test"
+        );
     }
 
     #[test]

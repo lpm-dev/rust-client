@@ -85,6 +85,7 @@ fn parse_metadata_to_cache_info_inner(
     let mut deps: HashMap<String, HashMap<String, String>> =
         HashMap::with_capacity(dependency_entry_count);
     let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut peer_aliases: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut optional_peer_names: HashMap<String, HashSet<String>> = HashMap::new();
     let mut node_engines: HashMap<String, String> = HashMap::new();
@@ -171,14 +172,30 @@ fn parse_metadata_to_cache_info_inner(
 
             if !ver_meta.peer_dependencies.is_empty() {
                 let mut ver_peers = HashMap::with_capacity(ver_meta.peer_dependencies.len());
+                let mut ver_peer_aliases = HashMap::new();
                 for (dep_name, dep_range) in &ver_meta.peer_dependencies {
                     if !is_valid_dep_name(dep_name) {
                         tracing::debug!("skipping invalid peer dep name: {dep_name:?}");
                         continue;
                     }
-                    ver_peers.insert(dep_name.clone(), dep_range.clone());
+                    let (inner_range, target) = split_alias(dep_range);
+                    if let Some(target) = target {
+                        if !is_valid_dep_name(&target) {
+                            tracing::debug!(
+                                "skipping peer alias {dep_name:?}: invalid target name {target:?}"
+                            );
+                            continue;
+                        }
+                        ver_peer_aliases.insert(dep_name.clone(), target);
+                    }
+                    ver_peers.insert(dep_name.clone(), inner_range);
                 }
-                peer_deps.insert(ver_str.clone(), ver_peers);
+                if !ver_peers.is_empty() {
+                    peer_deps.insert(ver_str.clone(), ver_peers);
+                }
+                if !ver_peer_aliases.is_empty() {
+                    peer_aliases.insert(ver_str.clone(), ver_peer_aliases);
+                }
             }
 
             // Collect bundled dep names. The extractor preserves
@@ -278,6 +295,7 @@ fn parse_metadata_to_cache_info_inner(
         versions,
         deps,
         peer_deps,
+        peer_aliases,
         optional_dep_names,
         optional_peer_names,
         node_engines,

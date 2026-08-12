@@ -67,20 +67,49 @@ pub(super) fn strict_peer_dependency_error(
     Some(LpmError::PeerDependency(details.join("\n")))
 }
 
+pub(super) fn retain_peer_issues_for_packages(
+    peer_warnings: &mut Vec<PeerWarning>,
+    peer_conflicts: &mut Vec<PeerConflictReport>,
+    packages: &[InstallPackage],
+) {
+    let consumer_identities = packages
+        .iter()
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect::<HashSet<_>>();
+    let consumer_names = packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect::<HashSet<_>>();
+
+    peer_warnings.retain(|warning| {
+        consumer_identities.contains(&(warning.package.as_str(), warning.version.as_str()))
+    });
+    for conflict in peer_conflicts.iter_mut() {
+        conflict
+            .unsatisfied_consumers
+            .retain(|(consumer, _)| consumer_names.contains(consumer.as_str()));
+    }
+    peer_conflicts.retain(|conflict| !conflict.unsatisfied_consumers.is_empty());
+}
+
 pub(super) fn peer_warning_json_value(warning: &PeerWarning) -> serde_json::Value {
     let issue_type = if warning.resolved_version.is_some() {
         "bad"
     } else {
         "missing"
     };
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "type": issue_type,
         "package": warning.package.as_str(),
         "version": warning.version.as_str(),
         "peer": warning.peer.as_str(),
         "required_range": warning.required_range.as_str(),
         "resolved_version": warning.resolved_version.as_deref(),
-    })
+    });
+    if warning.peer != warning.target {
+        value["target"] = serde_json::Value::String(warning.target.clone());
+    }
+    value
 }
 
 pub(super) fn peer_conflict_json_value(report: &PeerConflictReport) -> serde_json::Value {

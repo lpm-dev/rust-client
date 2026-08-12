@@ -8,6 +8,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+const VALID_SHA512_SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -47,12 +49,17 @@ fn isolated_wrapper_segments(project_dir: &Path) -> Vec<String> {
 #[test]
 fn lockfile_toml_binary_roundtrip() {
     let mut lf = lpm_lockfile::Lockfile::new();
+    lf.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
     for i in 0..100 {
         lf.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: format!("pkg-{i:04}"),
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
-            integrity: Some("sha512-test".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -68,6 +75,7 @@ fn lockfile_toml_binary_roundtrip() {
             },
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
     }
@@ -94,11 +102,16 @@ fn lockfile_toml_binary_roundtrip() {
 #[test]
 fn lockfile_binary_corrupt_falls_back_to_toml() {
     let mut lf = lpm_lockfile::Lockfile::new();
+    lf.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
     lf.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "express".to_string(),
         version: "4.22.1".to_string(),
         source: None,
         integrity: None,
+        manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         os: Vec::new(),
@@ -110,6 +123,7 @@ fn lockfile_binary_corrupt_falls_back_to_toml() {
         dependencies: vec![],
         alias_dependencies: vec![],
         peers: vec![],
+        peer_edges: Vec::new(),
         tarball: None,
     });
 
@@ -402,6 +416,10 @@ fn migrate_writes_valid_lockfile() {
     .unwrap();
 
     let result = lpm_migrate::migrate(dir.path()).unwrap();
+    assert_eq!(
+        result.lockfile.metadata.lockfile_version,
+        lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+    );
 
     // Write the lockfile
     let lockfile_path = dir.path().join("lpm.lock");
@@ -417,6 +435,12 @@ fn migrate_writes_valid_lockfile() {
     // Verify binary lockfile was also created
     let lockb_path = dir.path().join("lpm.lockb");
     assert!(lockb_path.exists(), "lpm.lockb should exist");
+
+    let restored = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    assert_eq!(
+        restored.metadata.lockfile_version,
+        lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+    );
 }
 
 // ─── Migration: Backup & Rollback ───────────────────────────────
@@ -443,6 +467,10 @@ fn migrate_backup_and_rollback_cycle() {
 
     // Write migration result
     let result = lpm_migrate::migrate(dir.path()).unwrap();
+    assert_eq!(
+        result.lockfile.metadata.lockfile_version,
+        lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+    );
     let lockfile_path = dir.path().join("lpm.lock");
     result.lockfile.write_all(&lockfile_path).unwrap();
 

@@ -1360,6 +1360,9 @@ mod tests {
             ("leaf", Vec::new()),
         ] {
             lockfile.add_package(lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: name.into(),
                 version: "1.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),

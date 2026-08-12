@@ -154,19 +154,16 @@ fn edge_is_optional_in_context(edge: &Edge, state: &ResolveState) -> bool {
     edge.behavior.optional || state.nodes[edge.parent as usize].optional
 }
 
-fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
-    let idx = node_id as usize;
-    if !state.nodes[idx].optional {
-        return;
-    }
-    state.nodes[idx].optional = false;
-    let children: Vec<NodeId> = state.nodes[idx]
-        .children
-        .iter()
-        .map(|(_, child_id)| *child_id)
-        .collect();
-    for child_id in children {
-        mark_node_required_closure(state, child_id);
+pub(super) fn mark_node_required_closure(state: &mut ResolveState, node_id: NodeId) {
+    let mut pending = Vec::with_capacity(64);
+    pending.push(node_id);
+    while let Some(node_id) = pending.pop() {
+        let node = &mut state.nodes[node_id as usize];
+        if !node.optional {
+            continue;
+        }
+        node.optional = false;
+        pending.extend(node.children.iter().map(|(_, child_id)| *child_id));
     }
 }
 
@@ -344,7 +341,7 @@ fn process_edge_inner(
             let key = (edge.canonical.clone(), target_version.clone());
             if !state.children_enqueued.contains(&key) {
                 state.children_enqueued.insert(key);
-                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state);
+                enqueue_child_deps(new_id, &edge.canonical, &target_version, info, state)?;
             }
             state.emit_selected_package(&edge.canonical, &target_version, info, incoming_optional);
             new_id
@@ -360,6 +357,57 @@ fn process_edge_inner(
     state.nodes[edge.parent as usize]
         .children
         .push((edge.local_name.clone(), child_id));
+    if is_root_edge {
+        state.resolve_pending_peer_bindings(&edge.canonical, &target_version, child_id);
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEEP_PROMOTION_CHILD: &str = "LPM_TEST_DEEP_REQUIRED_PROMOTION_CHILD";
+
+    #[test]
+    fn required_promotion_handles_deep_optional_chain_without_stack_growth() {
+        if std::env::var_os(DEEP_PROMOTION_CHILD).is_some() {
+            let depth = 100_000usize;
+            let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+            state.nodes.reserve(depth);
+            for index in 0..depth {
+                let children = (index + 1 < depth)
+                    .then(|| ("child".to_string(), (index + 1) as NodeId))
+                    .into_iter()
+                    .collect();
+                state.nodes.push(ResolvedNodeBuilder {
+                    canonical: CanonicalKey::Root,
+                    version: NpmVersion::new(0, 0, 0),
+                    optional: true,
+                    children,
+                });
+            }
+
+            mark_node_required_closure(&mut state, 0);
+
+            assert!(state.nodes.iter().all(|node| !node.optional));
+            return;
+        }
+
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "greedy::edge::tests::required_promotion_handles_deep_optional_chain_without_stack_growth",
+                    "--nocapture",
+                ])
+                .env(DEEP_PROMOTION_CHILD, "1")
+                .status()
+                .expect("run deep-promotion child process");
+        assert!(
+            status.success(),
+            "deep required promotion aborted: {status}"
+        );
+    }
 }

@@ -90,28 +90,36 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
 }
 
 fn write_lockfile_at(base_dir: &std::path::Path, entries: &[(&str, &str, &[&str])]) {
-    let pkgs: Vec<String> = entries
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("pubgrub");
+    for (name, version, dependencies) in entries {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: (*name).to_string(),
+            version: (*version).to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| (*dependency).to_string())
+                .collect(),
+            ..Default::default()
+        });
+    }
+    let roots = entries
         .iter()
-        .map(|(name, version, deps)| {
-            let deps_block = if deps.is_empty() {
-                String::new()
-            } else {
-                let inner = deps
-                    .iter()
-                    .map(|d| format!("\"{d}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("\ndependencies = [{inner}]")
-            };
-            format!("[[packages]]\nname = \"{name}\"\nversion = \"{version}\"{deps_block}\n")
-        })
+        .map(|(name, version, _)| (*name, *name, *version))
+        .collect::<Vec<_>>();
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &roots);
+    let dependencies = roots
+        .iter()
+        .map(|(local_name, _, version)| ((*local_name).to_string(), (*version).to_string()))
         .collect();
-    let toml = format!(
-        "[metadata]\nlockfile-version = {}\nresolved-with = \"pubgrub\"\n\n{}\n",
-        lpm_lockfile::LOCKFILE_VERSION,
-        pkgs.join("\n")
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies,
+            ..Default::default()
+        },
     );
-    std::fs::write(base_dir.join("lpm.lock"), toml).unwrap();
+    lockfile.write_all(&base_dir.join("lpm.lock")).unwrap();
 }
 
 fn patch_sha256_at(base_dir: &std::path::Path, rel_path: &str) -> String {

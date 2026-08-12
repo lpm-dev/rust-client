@@ -188,18 +188,7 @@ fn check_fast_lane_admission(
 }
 
 fn lockfile_contains_lpm_package(project_dir: &std::path::Path) -> bool {
-    let project_lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir);
-    let binary_path = project_lockfile.as_ref().map_or_else(
-        |_| project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME),
-        |project| project.path.with_extension("lockb"),
-    );
-    if let Ok(Some(reader)) = lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
-        return reader
-            .iter()
-            .any(|package| package.name().starts_with("@lpm.dev/"));
-    }
-
-    project_lockfile.map_or(true, |project| {
+    lpm_lockfile::Lockfile::read_for_project(project_dir).map_or(true, |project| {
         project
             .lockfile
             .packages
@@ -3224,8 +3213,12 @@ mod tests {
 
     fn lockfile_with_packages(names: &[&str]) -> lpm_lockfile::Lockfile {
         let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
         for name in names {
             lockfile.add_package(lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: (*name).to_string(),
                 version: "1.0.0".to_string(),
                 ..lpm_lockfile::LockedPackage::default()
@@ -3263,6 +3256,23 @@ mod tests {
             .unwrap();
         lpm_lockfile::binary::write_binary(
             &lockfile,
+            &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
+        )
+        .unwrap();
+
+        assert!(lockfile_contains_lpm_package(directory.path()));
+    }
+
+    #[test]
+    fn binary_lockfile_cannot_hide_lpm_package_from_authoritative_toml() {
+        let directory = tempfile::tempdir().unwrap();
+        let authoritative = lockfile_with_packages(&["react", "@lpm.dev/alice.alpha"]);
+        authoritative
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+        let crafted_binary = lockfile_with_packages(&["react"]);
+        lpm_lockfile::binary::write_binary(
+            &crafted_binary,
             &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
         )
         .unwrap();

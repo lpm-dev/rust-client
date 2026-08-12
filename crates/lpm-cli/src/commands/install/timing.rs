@@ -354,6 +354,7 @@ impl SpeculativeKeyTracker {
 pub(super) const SPECULATION_MAX_DEPTH: u32 = 5;
 pub(super) const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
 pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 32;
+pub(super) const MAX_NPM_FANOUT: usize = lpm_resolver::MAX_NPM_FANOUT;
 pub(super) const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
 pub(super) const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
 pub(super) const ENV_VERIFY_REGISTRY_SIGNATURES: &str = "LPM_VERIFY_REGISTRY_SIGNATURES";
@@ -374,7 +375,7 @@ pub(super) fn parse_positive_usize_or_default(value: &str, default: usize) -> us
         .parse::<usize>()
         .ok()
         .filter(|&n| n > 0)
-        .unwrap_or(default)
+        .map_or(default, |n| n.min(MAX_NPM_FANOUT))
 }
 
 pub(super) fn positive_usize_env_or_default(name: &str, default: usize) -> usize {

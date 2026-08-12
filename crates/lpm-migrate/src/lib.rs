@@ -3,8 +3,9 @@
 //! Parses foreign lockfiles into a common intermediate (`MigratedPackage`),
 //! then converts to `lpm_lockfile::Lockfile` for writing.
 //!
-//! The converted lockfile is used by `lpm install`'s lockfile fast path
-//! (skips PubGrub resolution entirely, goes straight to download + link).
+//! The converted lockfile uses the newest schema that does not require
+//! LPM-specific package-instance identities. A mutable `lpm install`
+//! resolves those identities and writes the current lockfile schema.
 
 pub mod backup;
 pub mod bun;

@@ -65,7 +65,9 @@ pub use resolve::{
 };
 pub use specifier::{Specifier, SpecifierParseError, normalize_jsr_dependency};
 pub use speculation::SpeculativePackageMetadata;
-pub use walker::{BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, WalkerError, WalkerSummary};
+pub use walker::{
+    BfsWalker, DEFAULT_NPM_FANOUT, LevelTiming, MAX_NPM_FANOUT, WalkerError, WalkerSummary,
+};
 
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]

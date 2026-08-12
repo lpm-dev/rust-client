@@ -379,7 +379,7 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                 };
                 break Ok(ResolveResult {
                     packages,
-                    cache,
+                    cache: std::sync::Arc::new(cache),
                     applied_overrides,
                     platform_skipped,
                     root_aliases,

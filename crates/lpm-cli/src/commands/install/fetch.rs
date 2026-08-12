@@ -9,7 +9,7 @@ pub(super) type FetchExtractLimiter = Option<Arc<tokio::sync::Semaphore>>;
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
 // APFS store finalization contends on filesystem metadata above this width.
-const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
+pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ArtifactSelection {
@@ -96,15 +96,12 @@ fn configured_fetch_extract_permits(
     match explicit_permits {
         Some(value) => parse_fetch_extract_permits(value),
         None if experimental_resolver == Some("1") => Some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS),
-        None => platform_default_fetch_extract_permits(v2_store_active, cfg!(target_os = "macos")),
+        None => default_fetch_extract_permits(v2_store_active),
     }
 }
 
-fn platform_default_fetch_extract_permits(
-    v2_store_active: bool,
-    target_is_macos: bool,
-) -> Option<usize> {
-    (target_is_macos && v2_store_active).then_some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
+fn default_fetch_extract_permits(v2_store_active: bool) -> Option<usize> {
+    v2_store_active.then_some(DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS)
 }
 
 pub(super) fn configured_fetch_extract_limiter(v2_store_active: bool) -> FetchExtractLimiter {
@@ -245,6 +242,43 @@ pub(super) fn locked_provenance_names(
     names
 }
 
+pub(super) fn event_link_targets_by_instance(
+    packages: &[InstallPackage],
+    targets: &[Arc<lpm_linker::v2::V2Target>],
+) -> Result<HashMap<lpm_common::PackageInstanceId, Arc<lpm_linker::v2::V2Target>>, LpmError> {
+    if packages.len() != targets.len() {
+        return Err(LpmError::Store(format!(
+            "virtual-store event linker: package/target cardinality mismatch ({} != {})",
+            packages.len(),
+            targets.len()
+        )));
+    }
+    let mut by_instance = HashMap::with_capacity(targets.len());
+    for (package, target) in packages.iter().zip(targets) {
+        let instance_id = package.instance_id.ok_or_else(|| {
+            LpmError::Store(format!(
+                "virtual-store event linker: missing exact instance ID for {}@{}",
+                package.name, package.version
+            ))
+        })?;
+        if instance_id != target.instance_id {
+            return Err(LpmError::Store(format!(
+                "virtual-store event linker: package/target instance mismatch for {}@{}",
+                package.name, package.version
+            )));
+        }
+        if by_instance
+            .insert(instance_id, Arc::clone(target))
+            .is_some()
+        {
+            return Err(LpmError::Store(format!(
+                "virtual-store event linker: duplicate package instance {instance_id}"
+            )));
+        }
+    }
+    Ok(by_instance)
+}
+
 fn provenance_downgrade_error(name: &str, version: &str, reason: &str) -> LpmError {
     LpmError::ProvenanceVerification(format!(
         "trust-policy no-downgrade blocked {name}@{version} because an earlier locked version had verified provenance and {reason}"
@@ -254,6 +288,8 @@ fn provenance_downgrade_error(name: &str, version: &str, reason: &str) -> LpmErr
 pub(super) async fn run_online_fetch_phase(
     input: OnlineFetchPhaseInput<'_>,
 ) -> Result<OnlineFetchPhaseResult, LpmError> {
+    maybe_test_pause_before_local_materialization();
+    verify_local_packages_match_resolution(input.project_dir, &input.packages)?;
     let OnlineFetchPhaseInput {
         start,
         arc_client,
@@ -459,7 +495,10 @@ pub(super) async fn run_online_fetch_phase(
             match lt.materialization {
                 lpm_linker::Materialization::CasBacked => match p.integrity.as_deref() {
                     Some(sri) => acc.push(lpm_linker::v2::V2Target {
+                        instance_id: p.instance_id.expect("link inputs have exact instance IDs"),
                         target: Arc::new(lt.clone()),
+                        dependency_targets: p.dependency_targets.clone(),
+                        peer_targets: p.peer_targets.clone(),
                         source_sri: sri.to_string(),
                         verified_object_integrity: None,
                         fresh_object: None,
@@ -471,7 +510,10 @@ pub(super) async fn run_online_fetch_phase(
                 },
                 lpm_linker::Materialization::DirectorySource => {
                     acc.push(lpm_linker::v2::V2Target {
+                        instance_id: p.instance_id.expect("link inputs have exact instance IDs"),
                         target: Arc::new(lt.clone()),
+                        dependency_targets: p.dependency_targets.clone(),
+                        peer_targets: p.peer_targets.clone(),
                         source_sri: local_source_sri_for_target(lt),
                         verified_object_integrity: None,
                         fresh_object: None,
@@ -555,16 +597,10 @@ pub(super) async fn run_online_fetch_phase(
     } else {
         None
     };
-    let v2_target_by_key: std::collections::HashMap<String, Arc<lpm_linker::v2::V2Target>> =
-        v2_plan
-            .as_ref()
-            .map_or_else(std::collections::HashMap::new, |plan| {
-                packages
-                    .iter()
-                    .zip(&plan.augmented_targets)
-                    .map(|(package, target)| (install_pkg_key(package), Arc::clone(target)))
-                    .collect()
-            });
+    let v2_target_by_instance = match v2_plan.as_ref() {
+        Some(plan) => event_link_targets_by_instance(&packages, &plan.augmented_targets)?,
+        None => HashMap::new(),
+    };
 
     // Per-package v2 link handles populated by both the cache-hit
     // short-circuits below and the fetch tasks further down. Drained
@@ -572,7 +608,7 @@ pub(super) async fn run_online_fetch_phase(
     let v2_link_task_semaphore = workspace_coordinator.as_ref().map_or_else(
         || {
             Arc::new(Semaphore::new(v2_link_task_concurrency(
-                v2_target_by_key.len(),
+                v2_target_by_instance.len(),
             )))
         },
         |coordinator| coordinator.v2_link_task_semaphore(),
@@ -643,7 +679,10 @@ pub(super) async fn run_online_fetch_phase(
             cached += 1;
             if v2_event_driven
                 && let Some(plan) = v2_plan.as_ref()
-                && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
+                && let Some(target) = p
+                    .instance_id
+                    .and_then(|instance_id| v2_target_by_instance.get(&instance_id))
+                    .cloned()
             {
                 let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                 let plan_arc = std::sync::Arc::clone(plan);
@@ -702,7 +741,10 @@ pub(super) async fn run_online_fetch_phase(
             // sibling fetches. Awaited at the link stage below.
             if v2_event_driven
                 && let Some(plan) = v2_plan.as_ref()
-                && let Some(target) = v2_target_by_key.get(&package_key).cloned()
+                && let Some(target) = p
+                    .instance_id
+                    .and_then(|instance_id| v2_target_by_instance.get(&instance_id))
+                    .cloned()
             {
                 let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                 let mut target = (*target).clone();
@@ -771,7 +813,10 @@ pub(super) async fn run_online_fetch_phase(
                     // v2 link entry immediately.
                     if v2_event_driven
                         && let Some(plan) = v2_plan.as_ref()
-                        && let Some(target) = v2_target_by_key.get(&install_pkg_key(p)).cloned()
+                        && let Some(target) = p
+                            .instance_id
+                            .and_then(|instance_id| v2_target_by_instance.get(&instance_id))
+                            .cloned()
                     {
                         let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
                         let plan_arc = std::sync::Arc::clone(plan);
@@ -1657,7 +1702,9 @@ pub(super) async fn run_online_fetch_phase(
             // once so the per-task closure doesn't carry the whole index map.
             let v2_plan_arc = v2_plan.as_ref().map(std::sync::Arc::clone);
             let v2_target_for_pkg = if v2_event_driven {
-                v2_target_by_key.get(&install_pkg_key(&p)).cloned()
+                p.instance_id
+                    .and_then(|instance_id| v2_target_by_instance.get(&instance_id))
+                    .cloned()
             } else {
                 None
             };
@@ -2126,6 +2173,45 @@ pub(super) async fn run_online_fetch_phase(
     })
 }
 
+fn verify_local_packages_match_resolution(
+    project_dir: &Path,
+    packages: &[InstallPackage],
+) -> Result<(), LpmError> {
+    for package in packages {
+        let source_path = match package.source_kind() {
+            Ok(lpm_lockfile::Source::Directory { path })
+            | Ok(lpm_lockfile::Source::Link { path }) => path,
+            Ok(_) | Err(_) => continue,
+        };
+        let expected = package.manifest_fingerprint.as_deref().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "local package {}@{} has no resolution-time manifest fingerprint",
+                package.name, package.version
+            ))
+        })?;
+        let canonical = project_dir
+            .join(source_path)
+            .canonicalize()
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "local source for {}@{} could not be resolved before materialization: {error}",
+                    package.name, package.version
+                ))
+            })?;
+        let current = read_local_manifest_semantics(&canonical)?;
+        if current.name != package.name
+            || current.version != package.version
+            || current.fingerprint != expected
+        {
+            return Err(LpmError::Registry(format!(
+                "local source for {}@{} changed before materialization; rerun `lpm install`",
+                package.name, package.version
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2169,18 +2255,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extract_permits_default_to_four_for_macos_v2_installs() {
-        assert_eq!(platform_default_fetch_extract_permits(true, true), Some(4));
+    fn fetch_extract_permits_default_to_four_for_v2_installs() {
+        assert_eq!(default_fetch_extract_permits(true), Some(4));
     }
 
     #[test]
-    fn fetch_extract_permits_stay_unbounded_for_macos_v1_installs() {
-        assert_eq!(platform_default_fetch_extract_permits(false, true), None);
-    }
-
-    #[test]
-    fn fetch_extract_permits_stay_unbounded_for_non_macos_v2_installs() {
-        assert_eq!(platform_default_fetch_extract_permits(true, false), None);
+    fn fetch_extract_permits_stay_unbounded_for_v1_installs() {
+        assert_eq!(default_fetch_extract_permits(false), None);
     }
 
     #[test]
@@ -2826,9 +2907,13 @@ pub(super) async fn speculative_download_and_store(
         // are bounded (a few hundred packages parallel, each typically
         // <500 KB compressed). The semaphore upstream caps the
         // concurrent allocator pressure.
-        let body = response.bytes().await.map_err(|e| {
-            LpmError::Registry(format!("spec body fetch failed for {name}@{version}: {e}"))
-        })?;
+        let body = read_buffered_tarball_body(response, lpm_registry::MAX_COMPRESSED_TARBALL_SIZE)
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "spec body fetch failed for {name}@{version}: {error}"
+                ))
+            })?;
         let (_extract_permit, _) =
             handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
@@ -3610,10 +3695,8 @@ pub(super) async fn fetch_and_store_streaming(
     // bodies waiting for extraction bounded by the download pool instead of
     // allowing the entire install graph to queue compressed tarballs.
     let download_start = std::time::Instant::now();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("tarball stream failed: {e}")))?;
+    let body =
+        read_buffered_tarball_body(response, lpm_registry::MAX_COMPRESSED_TARBALL_SIZE).await?;
     let download_ms = download_start.elapsed().as_millis();
 
     let name = p.name.clone();
@@ -3645,11 +3728,8 @@ pub(super) async fn fetch_and_store_streaming(
                 // — v2 path. Bytes flow through
                 // `extract_object_from_bytes`: SHA-512 hash → integrity
                 // verify → extract into `objects/<sri>/` → security
-                // analysis → atomic rename. SizeLimit is enforced
-                // upstream by `download_tarball_streaming`'s
-                // Content-Length check (same as the v1 streaming path's
-                // `SizeLimitedReader`), so the buffered `body` is
-                // already bounded.
+                // analysis → atomic rename. The buffered reader enforces
+                // the compressed-size limit for declared and chunked bodies.
                 let (object, sri, timings) = store_v2
                     .extract_object_from_bytes_with_fresh_integrity(
                         &body,
@@ -3692,4 +3772,36 @@ pub(super) async fn fetch_and_store_streaming(
         final_url,
         fresh_object,
     ))
+}
+
+pub(super) async fn read_buffered_tarball_body(
+    response: reqwest::Response,
+    max_compressed_size: u64,
+) -> Result<Vec<u8>, LpmError> {
+    use futures::StreamExt;
+
+    if let Some(content_length) = response.content_length()
+        && content_length > max_compressed_size
+    {
+        return Err(LpmError::Registry(format!(
+            "tarball Content-Length exceeds maximum compressed size ({content_length} bytes > {max_compressed_size} bytes limit)"
+        )));
+    }
+    let initial_capacity = usize::try_from(max_compressed_size.min(64 * 1024)).unwrap_or(64 * 1024);
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| LpmError::Network(format!("tarball stream failed: {error}")))?;
+        let new_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
+            LpmError::Registry("tarball compressed size overflowed platform limits".to_string())
+        })?;
+        if u64::try_from(new_len).unwrap_or(u64::MAX) > max_compressed_size {
+            return Err(LpmError::Registry(format!(
+                "tarball exceeds maximum compressed size of {max_compressed_size} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }

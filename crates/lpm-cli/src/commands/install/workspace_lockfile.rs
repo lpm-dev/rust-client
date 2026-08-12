@@ -13,6 +13,7 @@ pub(super) struct WorkspaceLockfileCoordinator {
     root: PathBuf,
     existing: Option<lpm_lockfile::ValidatedLockfile>,
     migration_pending: bool,
+    exact_graph_migration_pending: bool,
     valid_importers: BTreeSet<String>,
     existing_projection_metadata: Mutex<BTreeMap<String, Arc<lpm_lockfile::Lockfile>>>,
     projection_content: Mutex<BTreeMap<String, (u64, Arc<str>)>>,
@@ -40,9 +41,23 @@ impl WorkspaceLockfileCoordinator {
         } else {
             None
         };
-        let mut migration_pending = root_lockfile.as_ref().is_some_and(|lockfile| {
+        let exact_graph_migration_pending = root_lockfile.as_ref().is_some_and(|lockfile| {
             lockfile.as_lockfile().metadata.lockfile_version
+                < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+        });
+        let mut migration_pending = root_lockfile.as_ref().is_some_and(|lockfile| {
+            let lockfile = lockfile.as_lockfile();
+            lockfile.metadata.lockfile_version
                 < lpm_lockfile::LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS
+                || lockfile.metadata.lockfile_version
+                    < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+                || lockfile.metadata.lockfile_version
+                    < lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+                    && lockfile
+                        .packages
+                        .iter()
+                        .chain(lockfile.workspace_packages.values())
+                        .any(|package| !package.peers.is_empty())
         });
         let mut union = match root_lockfile {
             Some(lockfile)
@@ -98,6 +113,7 @@ impl WorkspaceLockfileCoordinator {
             root: root.to_path_buf(),
             existing,
             migration_pending,
+            exact_graph_migration_pending,
             valid_importers,
             existing_projection_metadata: Mutex::new(BTreeMap::new()),
             projection_content: Mutex::new(BTreeMap::new()),
@@ -296,55 +312,91 @@ impl WorkspaceLockfileCoordinator {
         {
             return Ok(true);
         }
-        let mut projections = BTreeMap::new();
-        if let Some(existing) = &self.existing {
-            for importer in existing
-                .as_lockfile()
-                .importers
-                .keys()
-                .filter(|importer| self.valid_importers.contains(*importer))
-            {
-                #[cfg(test)]
-                self.projection_materializations
-                    .fetch_add(1, Ordering::Relaxed);
-                projections.insert(
-                    importer.clone(),
-                    existing
-                        .project_importer(importer)
-                        .map_err(lockfile_error)?,
-                );
-            }
-        }
-        for (importer, lockfile) in staged.iter() {
+        for importer in staged.keys() {
             if !self.valid_importers.contains(importer) {
                 return Err(LpmError::Registry(format!(
                     "workspace importer {importer:?} is no longer a member; no lockfile changes were committed"
                 )));
             }
-            projections.insert(importer.clone(), lockfile.as_ref().clone());
         }
         for importer in required_importers {
-            if !projections.contains_key(importer) && !non_persisting_importers.contains(importer) {
+            let has_projection = staged.contains_key(importer)
+                || self.existing.as_ref().is_some_and(|existing| {
+                    self.valid_importers.contains(importer)
+                        && existing.as_lockfile().importers.contains_key(importer)
+                });
+            if !has_projection && !non_persisting_importers.contains(importer) {
                 return Err(LpmError::Registry(format!(
                     "workspace importer {importer:?} completed without producing a lockfile projection"
                 )));
             }
         }
-
-        if projections.is_empty() {
-            return Ok(false);
+        if self.exact_graph_migration_pending
+            && let Some(existing) = &self.existing
+            && let Some(importer) = existing
+                .as_lockfile()
+                .importers
+                .keys()
+                .filter(|importer| self.valid_importers.contains(*importer))
+                .find(|importer| {
+                    !staged.contains_key(*importer) && !non_persisting_importers.contains(*importer)
+                })
+        {
+            return Err(LpmError::Registry(format!(
+                "workspace lockfile upgrade requires a fresh projection for importer {importer:?}; run `lpm install --recursive` from the workspace root"
+            )));
         }
 
-        let resolver = projections
-            .values()
-            .find_map(|lockfile| lockfile.metadata.resolved_with.as_deref())
-            .unwrap_or(lpm_lockfile::DEFAULT_RESOLVED_WITH);
-        let mut union = lpm_lockfile::Lockfile::new_with_resolver(resolver);
-        for (importer, projection) in projections {
+        let union = if let Some(existing) = &self.existing
+            && !self.migration_pending
+        {
+            let replacements = staged
+                .iter()
+                .map(|(importer, lockfile)| (importer.clone(), lockfile.as_ref().clone()))
+                .collect();
+            existing
+                .update_workspace_importers(&self.valid_importers, replacements)
+                .map_err(lockfile_error)?
+        } else {
+            let mut projections = BTreeMap::new();
+            if let Some(existing) = &self.existing
+                && !self.exact_graph_migration_pending
+            {
+                for importer in existing
+                    .as_lockfile()
+                    .importers
+                    .keys()
+                    .filter(|importer| self.valid_importers.contains(*importer))
+                {
+                    #[cfg(test)]
+                    self.projection_materializations
+                        .fetch_add(1, Ordering::Relaxed);
+                    projections.insert(
+                        importer.clone(),
+                        existing
+                            .project_importer(importer)
+                            .map_err(lockfile_error)?,
+                    );
+                }
+            }
+            for (importer, lockfile) in staged.iter() {
+                projections.insert(importer.clone(), lockfile.as_ref().clone());
+            }
+            if projections.is_empty() {
+                return Ok(false);
+            }
+            let resolver = projections
+                .values()
+                .find_map(|lockfile| lockfile.metadata.resolved_with.as_deref())
+                .unwrap_or(lpm_lockfile::DEFAULT_RESOLVED_WITH);
+            let mut union = lpm_lockfile::Lockfile::new_with_resolver(resolver);
+            for (importer, projection) in projections {
+                union
+                    .absorb_importer(&importer, projection)
+                    .map_err(lockfile_error)?;
+            }
             union
-                .absorb_importer(&importer, projection)
-                .map_err(lockfile_error)?;
-        }
+        };
 
         let path = self.root.join(lpm_lockfile::LOCKFILE_NAME);
         lpm_lockfile::ensure_gitattributes(&self.root).map_err(lockfile_error)?;
@@ -843,22 +895,60 @@ pub(crate) fn active_lockfile_content(project_dir: &Path) -> Arc<str> {
 mod tests {
     use super::*;
 
+    const TEST_REGISTRY_SOURCE: &str = "registry+https://registry.npmjs.org";
+
+    fn exact_package(name: &str, version: &str, graph_path: &str) -> lpm_lockfile::LockedPackage {
+        lpm_lockfile::LockedPackage {
+            instance_id: Some(lpm_common::PackageInstanceId::derive(
+                name,
+                version,
+                TEST_REGISTRY_SOURCE,
+                graph_path,
+            )),
+            name: name.to_string(),
+            version: version.to_string(),
+            source: Some(TEST_REGISTRY_SOURCE.to_string()),
+            ..lpm_lockfile::LockedPackage::default()
+        }
+    }
+
+    fn add_exact_root(
+        lockfile: &mut lpm_lockfile::Lockfile,
+        local_name: &str,
+        requested: &str,
+        package: lpm_lockfile::LockedPackage,
+    ) {
+        let instance_id = package.instance_id.expect("exact fixture package id");
+        let package_name = package.name.clone();
+        let version = package.version.clone();
+        let source = package.source.clone();
+        lockfile.add_package(package);
+        lockfile
+            .importers
+            .entry(".".to_string())
+            .or_default()
+            .dependencies
+            .insert(local_name.to_string(), requested.to_string());
+        lockfile.root_resolutions.insert(
+            local_name.to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: package_name,
+                version,
+                source,
+            },
+        );
+    }
+
     fn coordinator_with_existing_projection() -> (tempfile::TempDir, WorkspaceLockfileCoordinator) {
         let directory = tempfile::tempdir().expect("create workspace directory");
         let mut standalone = lpm_lockfile::Lockfile::new();
-        standalone.importers.insert(
-            ".".to_string(),
-            lpm_lockfile::ImporterSnapshot {
-                dependencies: [("axois".to_string(), "^1.0.0".to_string())].into(),
-                ..lpm_lockfile::ImporterSnapshot::default()
-            },
+        add_exact_root(
+            &mut standalone,
+            "axois",
+            "^1.0.0",
+            exact_package("dependency", "1.0.0", "root/dependency"),
         );
-        standalone.add_package(lpm_lockfile::LockedPackage {
-            name: "dependency".to_string(),
-            version: "1.0.0".to_string(),
-            source: Some("registry+https://registry.npmjs.org".to_string()),
-            ..lpm_lockfile::LockedPackage::default()
-        });
         let mut union = lpm_lockfile::Lockfile::new();
         union
             .absorb_importer(".", standalone)
@@ -934,15 +1024,12 @@ mod tests {
             .projection(".")
             .expect("cache existing projection");
         let mut staged = lpm_lockfile::Lockfile::new();
-        staged
-            .importers
-            .insert(".".to_string(), lpm_lockfile::ImporterSnapshot::default());
-        staged.add_package(lpm_lockfile::LockedPackage {
-            name: "replacement".to_string(),
-            version: "2.0.0".to_string(),
-            source: Some("registry+https://registry.npmjs.org".to_string()),
-            ..lpm_lockfile::LockedPackage::default()
-        });
+        add_exact_root(
+            &mut staged,
+            "replacement",
+            "2.0.0",
+            exact_package("replacement", "2.0.0", "root/replacement"),
+        );
         coordinator.stage(".", staged.clone());
 
         assert_eq!(coordinator.projection(".").unwrap(), staged);
@@ -978,14 +1065,17 @@ mod tests {
         let mut union = lpm_lockfile::Lockfile::new();
         for importer in [".", "packages/removed"] {
             let mut standalone = lpm_lockfile::Lockfile::new();
-            standalone
-                .importers
-                .insert(".".to_string(), lpm_lockfile::ImporterSnapshot::default());
-            standalone.add_package(lpm_lockfile::LockedPackage {
-                name: format!("dependency-{importer}"),
-                version: "1.0.0".to_string(),
-                ..lpm_lockfile::LockedPackage::default()
-            });
+            let name = if importer == "." {
+                "dependency-root"
+            } else {
+                "dependency-removed"
+            };
+            add_exact_root(
+                &mut standalone,
+                name,
+                "1.0.0",
+                exact_package(name, "1.0.0", &format!("{importer}/{name}")),
+            );
             union
                 .absorb_importer(importer, standalone)
                 .expect("build workspace union");
@@ -1008,6 +1098,215 @@ mod tests {
                 .importers
                 .contains_key("packages/removed")
         );
+    }
+
+    #[test]
+    fn changed_commit_reuses_untouched_union_rows_without_materializing_importers() {
+        let directory = tempfile::tempdir().expect("create workspace directory");
+        let importers = ["packages/first", "packages/second"];
+        let mut union = lpm_lockfile::Lockfile::new();
+        for (index, importer) in importers.iter().enumerate() {
+            let mut standalone = lpm_lockfile::Lockfile::new();
+            let name = format!("dependency-{index}");
+            add_exact_root(
+                &mut standalone,
+                &name,
+                "1.0.0",
+                exact_package(&name, "1.0.0", &format!("{importer}/{name}")),
+            );
+            union
+                .absorb_importer(importer, standalone)
+                .expect("build workspace union");
+        }
+        union
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("write workspace union");
+        let legacy_importers = importers
+            .iter()
+            .map(|importer| (importer.to_string(), directory.path().join(importer)))
+            .collect::<Vec<_>>();
+        let coordinator = WorkspaceLockfileCoordinator::new(directory.path(), &legacy_importers)
+            .expect("load workspace union");
+        let mut replacement = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut replacement,
+            "replacement",
+            "2.0.0",
+            exact_package("replacement", "2.0.0", "packages/first/replacement"),
+        );
+        coordinator.stage("packages/first", replacement);
+
+        coordinator
+            .commit(&["packages/first".to_string()])
+            .expect("commit changed importer");
+
+        assert_eq!(coordinator.projection_materialization_count(), 0);
+    }
+
+    #[test]
+    fn current_projections_upgrade_v12_workspace_union_to_exact_instance_graph() {
+        let directory = tempfile::tempdir().expect("create workspace directory");
+        let importers = [".", "packages/app"];
+        let source = "registry+https://registry.npmjs.org";
+        let mut union = lpm_lockfile::Lockfile::new();
+        for (index, importer) in importers.iter().enumerate() {
+            let mut legacy = lpm_lockfile::Lockfile::new();
+            legacy.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+            legacy
+                .importers
+                .insert(".".to_string(), lpm_lockfile::ImporterSnapshot::default());
+            legacy.add_package(lpm_lockfile::LockedPackage {
+                name: format!("legacy-{index}"),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            union
+                .absorb_importer(importer, legacy)
+                .expect("build legacy workspace union");
+        }
+        union
+            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .expect("write legacy workspace union");
+
+        let legacy_importers = vec![(
+            "packages/app".to_string(),
+            directory.path().join("packages/app"),
+        )];
+        let coordinator = WorkspaceLockfileCoordinator::new(directory.path(), &legacy_importers)
+            .expect("load legacy workspace union");
+        for (index, importer) in importers.iter().enumerate() {
+            let parent_name = format!("parent-{index}");
+            let child_name = format!("child-{index}");
+            let parent_id = lpm_common::PackageInstanceId::derive(
+                &parent_name,
+                "1.0.0",
+                source,
+                &format!("{importer}/parent"),
+            );
+            let child_id = lpm_common::PackageInstanceId::derive(
+                &child_name,
+                "1.0.0",
+                source,
+                &format!("{importer}/parent/child"),
+            );
+            let mut projection = lpm_lockfile::Lockfile::new();
+            add_exact_root(
+                &mut projection,
+                &parent_name,
+                "1.0.0",
+                lpm_lockfile::LockedPackage {
+                    instance_id: Some(parent_id),
+                    name: parent_name.clone(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                    dependencies: vec![format!("{child_name}@1.0.0")],
+                    dependency_targets: [(child_name.clone(), child_id)].into(),
+                    ..lpm_lockfile::LockedPackage::default()
+                },
+            );
+            projection.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(child_id),
+                name: child_name.clone(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            coordinator.stage(importer, projection);
+        }
+
+        coordinator
+            .commit(&importers.map(str::to_string))
+            .expect("commit exact workspace projections");
+
+        let committed = lpm_lockfile::ValidatedLockfile::read_fast(
+            &directory.path().join(lpm_lockfile::LOCKFILE_NAME),
+        )
+        .expect("read upgraded workspace union");
+        assert_eq!(
+            committed.as_lockfile().metadata.lockfile_version,
+            lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES,
+        );
+        for importer in importers {
+            let projection = committed.project_importer(importer).unwrap();
+            assert!(
+                projection
+                    .packages
+                    .iter()
+                    .all(|package| package.instance_id.is_some())
+            );
+            assert!(
+                projection
+                    .packages
+                    .iter()
+                    .any(|package| !package.dependency_targets.is_empty())
+            );
+            assert!(
+                projection
+                    .root_resolutions
+                    .values()
+                    .all(|root| root.instance_id.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn partial_v13_workspace_upgrade_fails_without_rewriting_v12_union() {
+        let directory = tempfile::tempdir().expect("create workspace directory");
+        let source = "registry+https://registry.npmjs.org";
+        let mut union = lpm_lockfile::Lockfile::new();
+        for importer in [".", "packages/app"] {
+            let mut legacy = lpm_lockfile::Lockfile::new();
+            legacy.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+            legacy
+                .importers
+                .insert(".".to_string(), lpm_lockfile::ImporterSnapshot::default());
+            legacy.add_package(lpm_lockfile::LockedPackage {
+                name: format!("legacy-{}", importer.replace(['.', '/'], "root")),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                ..lpm_lockfile::LockedPackage::default()
+            });
+            union.absorb_importer(importer, legacy).unwrap();
+        }
+        let lockfile_path = directory.path().join(lpm_lockfile::LOCKFILE_NAME);
+        union.write_to_file(&lockfile_path).unwrap();
+        let before = std::fs::read(&lockfile_path).unwrap();
+
+        let legacy_importers = vec![(
+            "packages/app".to_string(),
+            directory.path().join("packages/app"),
+        )];
+        let coordinator =
+            WorkspaceLockfileCoordinator::new(directory.path(), &legacy_importers).unwrap();
+        let instance_id = lpm_common::PackageInstanceId::derive(
+            "current-root",
+            "1.0.0",
+            source,
+            "root/current-root",
+        );
+        let mut current = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut current,
+            "current-root",
+            "1.0.0",
+            lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "current-root".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                ..lpm_lockfile::LockedPackage::default()
+            },
+        );
+        coordinator.stage(".", current);
+
+        let error = coordinator
+            .commit(&[".".to_string()])
+            .expect_err("partial exact-graph migration must fail");
+
+        assert!(error.to_string().contains("packages/app"));
+        assert!(error.to_string().contains("--recursive"));
+        assert_eq!(std::fs::read(&lockfile_path).unwrap(), before);
     }
 
     #[tokio::test]
@@ -1034,14 +1333,12 @@ mod tests {
         })
         .await;
         let mut staged = lpm_lockfile::Lockfile::new();
-        staged
-            .importers
-            .insert(".".to_string(), lpm_lockfile::ImporterSnapshot::default());
-        staged.add_package(lpm_lockfile::LockedPackage {
-            name: "replacement".to_string(),
-            version: "2.0.0".to_string(),
-            ..lpm_lockfile::LockedPackage::default()
-        });
+        add_exact_root(
+            &mut staged,
+            "replacement",
+            "2.0.0",
+            exact_package("replacement", "2.0.0", "root/replacement"),
+        );
         coordinator.stage(".", staged);
 
         let after = scope(Arc::clone(&coordinator), Arc::<str>::from("."), async {

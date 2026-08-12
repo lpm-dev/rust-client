@@ -3,6 +3,37 @@ use std::fmt;
 
 use crate::discovery::Workspace;
 
+pub fn validate_workspace_protocol_version(
+    package_name: &str,
+    raw_specifier: &str,
+    member_version: &str,
+) -> Result<(), String> {
+    let Some(protocol) = raw_specifier.strip_prefix("workspace:") else {
+        return Err(format!(
+            "dependency {package_name:?} has non-workspace specifier {raw_specifier:?}"
+        ));
+    };
+    if matches!(protocol, "" | "*" | "^" | "~") {
+        return Ok(());
+    }
+    let requirement = lpm_semver::VersionReq::parse(protocol).map_err(|error| {
+        format!(
+            "{raw_specifier} for package {package_name:?} has invalid workspace version range {protocol:?}: {error}"
+        )
+    })?;
+    let version = lpm_semver::Version::parse(member_version).map_err(|error| {
+        format!(
+            "workspace package {package_name:?} has invalid version {member_version:?}: {error}"
+        )
+    })?;
+    if requirement.matches(&version) {
+        return Ok(());
+    }
+    Err(format!(
+        "{raw_specifier} requires package {package_name:?} to match {protocol:?}, but the workspace member version is {member_version}"
+    ))
+}
+
 pub fn resolve_workspace_protocol(
     deps: &mut HashMap<String, String>,
     workspace: &Workspace,
@@ -29,6 +60,7 @@ pub fn resolve_workspace_protocol(
 
         if let Some(&member_version) = member_versions.get(name.as_str()) {
             let original = range.clone();
+            validate_workspace_protocol_version(name, &original, member_version)?;
             *range = match protocol {
                 "*" | "" => member_version.to_string(),
                 "^" => format!("^{member_version}"),
@@ -301,7 +333,7 @@ mod tests {
 
     #[test]
     fn workspace_explicit_version() {
-        let ws = make_workspace(vec![("utils", "1.0.0")]);
+        let ws = make_workspace(vec![("utils", "1.2.3")]);
         let mut deps = HashMap::from([("utils".to_string(), "workspace:1.2.3".to_string())]);
         resolve_workspace_protocol(&mut deps, &ws).unwrap();
         assert_eq!(deps["utils"], "1.2.3"); // exact passthrough
@@ -316,6 +348,18 @@ mod tests {
         resolve_workspace_protocol(&mut deps, &ws).unwrap();
         // The range after "workspace:" is kept as-is — the member's actual version is irrelevant
         assert_eq!(deps["utils"], ">=1.0.0");
+    }
+
+    #[test]
+    fn workspace_explicit_range_rejects_a_nonmatching_member_version() {
+        let ws = make_workspace(vec![("utils", "2.0.0")]);
+        let mut deps = HashMap::from([("utils".to_string(), "workspace:^1.0.0".to_string())]);
+
+        let error = resolve_workspace_protocol(&mut deps, &ws)
+            .expect_err("an explicit workspace range must constrain the local member");
+
+        assert!(error.contains("workspace:^1.0.0"), "{error}");
+        assert!(error.contains("2.0.0"), "{error}");
     }
 
     #[test]

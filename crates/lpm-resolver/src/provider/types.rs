@@ -136,6 +136,9 @@ pub struct CachedPackageInfo {
     /// A same-named regular or optional dependency takes precedence and is omitted here.
     /// Checked post-resolution against the actual resolved tree (not during resolution).
     pub peer_deps: HashMap<String, HashMap<String, String>>,
+    /// npm-alias peer edges per version: local peer name → canonical provider name.
+    /// Kept separate from [`Self::aliases`] because peers are not dependency edges.
+    pub peer_aliases: HashMap<String, HashMap<String, String>>,
     /// Optional dependency names (per version). Included in deps but resolution failure
     /// for these is non-fatal.
     pub optional_dep_names: HashMap<String, HashSet<String>>,
@@ -250,6 +253,12 @@ impl CachedPackageInfo {
                 peers.retain(|name, _| !regular.contains_key(name));
             }
             !peers.is_empty()
+        });
+        self.peer_aliases.retain(|version, aliases| {
+            if let Some(regular) = deps.get(version) {
+                aliases.retain(|name, _| !regular.contains_key(name));
+            }
+            !aliases.is_empty()
         });
         self.optional_peer_names.retain(|version, peers| {
             if let Some(regular) = deps.get(version) {

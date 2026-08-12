@@ -988,6 +988,12 @@ mod tests {
             .populate_object_from_local_source(&source, &second_sri)
             .unwrap();
         let first_target = lpm_linker::v2::V2Target {
+            instance_id: lpm_common::PackageInstanceId::derive(
+                "shared",
+                "1.0.0",
+                "registry+npm",
+                "first-source-identity",
+            ),
             target: Arc::new(lpm_linker::LinkTarget {
                 name: "shared".to_string(),
                 version: "1.0.0".to_string(),
@@ -1001,6 +1007,8 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             }),
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             source_sri: first_sri,
             verified_object_integrity: None,
             fresh_object: None,
@@ -1059,6 +1067,12 @@ mod tests {
             .populate_object_from_local_source(&source, &source_sri)
             .unwrap();
         let direct_target = lpm_linker::v2::V2Target {
+            instance_id: lpm_common::PackageInstanceId::derive(
+                "shared",
+                "1.0.0",
+                "registry+npm",
+                "direct-context",
+            ),
             target: Arc::new(lpm_linker::LinkTarget {
                 name: "shared".to_string(),
                 version: "1.0.0".to_string(),
@@ -1072,6 +1086,8 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             }),
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             source_sri,
             verified_object_integrity: None,
             fresh_object: None,
@@ -1137,6 +1153,12 @@ mod tests {
             .populate_object_from_local_source(&source, &second_sri)
             .unwrap();
         let first_target = lpm_linker::v2::V2Target {
+            instance_id: lpm_common::PackageInstanceId::derive(
+                "shared",
+                "1.0.0",
+                "registry+npm",
+                "first-spawned-source",
+            ),
             target: Arc::new(lpm_linker::LinkTarget {
                 name: "shared".to_string(),
                 version: "1.0.0".to_string(),
@@ -1150,6 +1172,8 @@ mod tests {
                 peers: Vec::new(),
                 patch_fingerprint: None,
             }),
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             source_sri: first_sri,
             verified_object_integrity: None,
             fresh_object: None,
