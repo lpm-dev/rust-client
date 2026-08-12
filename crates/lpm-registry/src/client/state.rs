@@ -4,16 +4,70 @@ pub(super) type MetadataMemoryCache = Arc<std::sync::Mutex<HashMap<String, Arc<P
 pub(super) type ReleaseTimeMemoryCache =
     Arc<std::sync::Mutex<HashMap<String, Arc<ReleaseTimeMetadata>>>>;
 
+/// Aggregate capacity retained by one file-backed compressed archive.
+#[derive(Debug)]
+pub struct CompressedTarballSpoolReservation {
+    pub(super) permit: tokio::sync::OwnedSemaphorePermit,
+    pub(super) reserved_bytes: u64,
+}
+
+impl CompressedTarballSpoolReservation {
+    /// Reject a spool that would retain more bytes than it reserved.
+    pub fn ensure_size(&self, bytes: u64) -> Result<(), LpmError> {
+        if bytes > self.reserved_bytes {
+            return Err(LpmError::Registry(format!(
+                "compressed tarball exceeded its reserved spool size ({bytes} bytes > {} bytes reserved)",
+                self.reserved_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn retain_bytes(&mut self, bytes: u64) -> Result<(), LpmError> {
+        self.ensure_size(bytes)?;
+        let retained_permits = super::tarball::compressed_tarball_spool_permits(bytes);
+        let excess = self.permit.num_permits().saturating_sub(retained_permits);
+        if excess > 0 {
+            drop(self.permit.split(excess));
+        }
+        self.reserved_bytes = bytes;
+        Ok(())
+    }
+}
+
 /// Result of a verified tarball download. The tarball is spooled to a temp file
 /// on disk — only the SRI hash and byte count are kept in memory.
 #[derive(Debug)]
 pub struct DownloadedTarball {
     /// Temp file containing the raw compressed tarball. Deleted on drop.
     pub file: tempfile::NamedTempFile,
-    /// SRI hash computed during download (e.g., "sha512-...").
+    /// Verified SRI in the declaration's algorithm, or SHA-512 for TOFU.
     pub sri: String,
+    /// Canonical SHA-512 SRI used for content-addressed object storage.
+    pub sha512_sri: String,
     /// Compressed size in bytes.
     pub compressed_size: u64,
+    _spool_reservation: CompressedTarballSpoolReservation,
+}
+
+impl DownloadedTarball {
+    /// Build a file-backed archive while retaining its aggregate spool budget.
+    pub fn new(
+        file: tempfile::NamedTempFile,
+        sri: String,
+        sha512_sri: String,
+        compressed_size: u64,
+        mut spool_reservation: CompressedTarballSpoolReservation,
+    ) -> Result<Self, LpmError> {
+        spool_reservation.retain_bytes(compressed_size)?;
+        Ok(Self {
+            file,
+            sri,
+            sha512_sri,
+            compressed_size,
+            _spool_reservation: spool_reservation,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

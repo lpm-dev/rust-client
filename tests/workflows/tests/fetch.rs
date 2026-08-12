@@ -366,6 +366,69 @@ async fn fetch_uses_store_cache_without_downloading_again() {
 }
 
 #[tokio::test]
+async fn fetch_sha256_lockfile_warms_reusable_offline_store() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let mock = MockRegistry::start().await;
+    mount_ms(&mock).await;
+    let lockfile = seed_lockfile(&mock).await;
+    let project = project_with_lockfile(&lockfile);
+    let lockfile_path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut lockfile =
+        lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("lockfile should parse");
+    let tarball = make_tarball("ms", "2.1.3");
+    let sha256 = Integrity::from_bytes(HashAlgorithm::Sha256, &tarball).to_string();
+    lockfile
+        .packages
+        .iter_mut()
+        .find(|package| package.name == "ms" && package.version == "2.1.3")
+        .expect("seed lockfile should contain ms@2.1.3")
+        .integrity = Some(sha256);
+    lockfile
+        .write_to_file(&lockfile_path)
+        .expect("rewrite lockfile with SHA-256 integrity");
+    let _ = std::fs::remove_file(lockfile_path.with_extension("lockb"));
+    let requests_before_fetch = tarball_request_count(&mock, "ms", "2.1.3").await;
+
+    for attempt in ["first", "second"] {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["fetch"])
+            .output()
+            .expect("run lpm fetch");
+        assert!(
+            output.status.success(),
+            "{attempt} SHA-256 fetch failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        tarball_request_count(&mock, "ms", "2.1.3").await,
+        requests_before_fetch + 1,
+        "the second SHA-256 fetch must reuse the warmed object"
+    );
+
+    project.write_file("package.json", PACKAGE_JSON);
+    let offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline frozen install");
+    assert!(
+        offline.status.success(),
+        "offline frozen install must consume the SHA-256 fetch cache:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&offline.stdout),
+        String::from_utf8_lossy(&offline.stderr)
+    );
+}
+
+#[tokio::test]
 async fn fetch_firewall_enforce_blocks_public_npm_lockfile_package_before_tarball_fetch() {
     let mock = MockRegistry::start().await;
     mount_ms(&mock).await;

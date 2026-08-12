@@ -124,47 +124,9 @@ pub(crate) fn github_archive_url(locked_source: &str) -> Result<String, LpmError
     GitHubEndpoints::from_env()?.archive_url(&repository, commit)
 }
 
-pub(crate) async fn download_github_archive(
-    archive_url: &str,
-    expected_integrity: Option<&str>,
-) -> Result<(Vec<u8>, String), LpmError> {
-    let endpoints = GitHubEndpoints::from_env()?;
-    let url = Url::parse(archive_url)
-        .map_err(|_| LpmError::Registry("locked GitHub archive URL is malformed".to_string()))?;
-    if !endpoints.codeload_url_is_allowed(&url) {
-        return Err(LpmError::Registry(
-            "locked GitHub archive URL is outside the configured direct GitHub origin".to_string(),
-        ));
-    }
-
-    let client = github_http_client()?;
-    let mut response = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "lpm-rs")
-        .send()
-        .await
-        .map_err(|error| {
-            LpmError::Network(format!(
-                "GitHub archive request failed: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-    ensure_success_status(response.status(), "GitHub archive")?;
-    let bytes =
-        read_response_body_limited(&mut response, MAX_GITHUB_ARCHIVE_BYTES, "GitHub archive")
-            .await?;
-
-    let computed = Integrity::from_bytes(HashAlgorithm::Sha512, &bytes).to_string();
-    if let Some(expected) = expected_integrity {
-        Integrity::parse(expected)?.verify(&bytes)?;
-        return Ok((bytes, expected.to_string()));
-    }
-    Ok((bytes, computed))
-}
-
 pub(crate) async fn download_github_archive_to_file(
     archive_url: &str,
-    expected_integrity: &str,
+    expected_integrity: Option<&str>,
 ) -> Result<lpm_registry::DownloadedTarball, LpmError> {
     let endpoints = GitHubEndpoints::from_env()?;
     let url = Url::parse(archive_url)
@@ -197,6 +159,11 @@ pub(crate) async fn download_github_archive_to_file(
             MAX_GITHUB_ARCHIVE_BYTES,
         ));
     }
+    let spool_reservation = lpm_registry::reserve_compressed_tarball_spool(
+        response.content_length(),
+        MAX_GITHUB_ARCHIVE_BYTES,
+    )
+    .await?;
 
     let mut file = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
     #[cfg(unix)]
@@ -206,6 +173,9 @@ pub(crate) async fn download_github_archive_to_file(
             .set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(LpmError::Io)?;
     }
+    use sha2::Digest;
+
+    let mut sha512 = sha2::Sha512::new();
     let mut compressed_size = 0_u64;
     while let Some(chunk) = response.chunk().await.map_err(|error| {
         LpmError::Network(format!("failed to read GitHub archive response: {error}"))
@@ -219,17 +189,32 @@ pub(crate) async fn download_github_archive_to_file(
                 MAX_GITHUB_ARCHIVE_BYTES,
             ));
         }
+        spool_reservation.ensure_size(compressed_size)?;
+        sha512.update(&chunk);
         std::io::Write::write_all(&mut file, &chunk).map_err(LpmError::Io)?;
     }
     std::io::Write::flush(&mut file).map_err(LpmError::Io)?;
-    let integrity = Integrity::parse(expected_integrity)?;
-    integrity.verify_file(file.path())?;
+    let sha512_sri = Integrity {
+        algorithm: HashAlgorithm::Sha512,
+        hash: sha512.finalize().to_vec(),
+    }
+    .to_string();
+    let sri = match expected_integrity {
+        Some(expected) => {
+            let integrity = Integrity::parse(expected)?;
+            let path = file.path().to_path_buf();
+            let integrity_for_verification = integrity.clone();
+            tokio::task::spawn_blocking(move || integrity_for_verification.verify_file(&path))
+                .await
+                .map_err(|error| {
+                    LpmError::Registry(format!("GitHub integrity task panicked: {error}"))
+                })??;
+            integrity.to_string()
+        }
+        None => sha512_sri.clone(),
+    };
 
-    Ok(lpm_registry::DownloadedTarball {
-        file,
-        sri: integrity.to_string(),
-        compressed_size,
-    })
+    lpm_registry::DownloadedTarball::new(file, sri, sha512_sri, compressed_size, spool_reservation)
 }
 
 async fn resolve_github_commit(
@@ -500,6 +485,41 @@ mod security_and_resolution_tests {
             url,
             format!("https://codeload.github.com/rhashimoto/wa-sqlite/tar.gz/{COMMIT}")
         );
+    }
+
+    #[tokio::test]
+    async fn github_file_download_supports_tofu_and_declared_integrity() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let archive = b"github archive fixture";
+        let sha256 = Integrity::from_bytes(HashAlgorithm::Sha256, archive).to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/owner/repository/tar.gz/{COMMIT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.to_vec()))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/", server.uri());
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_GITHUB_CODELOAD_BASE_URL",
+            endpoint.clone().into(),
+        )]);
+        let url = format!("{endpoint}owner/repository/tar.gz/{COMMIT}");
+
+        let tofu = download_github_archive_to_file(&url, None)
+            .await
+            .expect("TOFU download must succeed");
+        assert!(tofu.sri.starts_with("sha512-"));
+        assert_eq!(tofu.sri, tofu.sha512_sri);
+
+        let declared = download_github_archive_to_file(&url, Some(&sha256))
+            .await
+            .expect("matching declared integrity must succeed");
+        assert_eq!(declared.sri, sha256);
+        assert!(declared.sha512_sri.starts_with("sha512-"));
     }
 }
 

@@ -78,8 +78,8 @@ pub(crate) use firewall::{
     run_prepared_npm_firewall_materialization_preflight,
 };
 pub(crate) use github_source::download_github_archive_to_file;
+pub(crate) use github_source::github_archive_url;
 use github_source::resolve_github_source;
-pub(crate) use github_source::{download_github_archive, github_archive_url};
 pub use gitignore::ensure_skills_gitignore;
 use gitignore::*;
 use lifecycle::*;

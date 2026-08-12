@@ -326,7 +326,7 @@ async fn fetch_artifact(
 
     let downloaded = match &source {
         FetchSource::GitHub { url } => {
-            crate::commands::install::download_github_archive_to_file(url, &integrity).await?
+            crate::commands::install::download_github_archive_to_file(url, Some(&integrity)).await?
         }
         FetchSource::Registry { .. } | FetchSource::RemoteTarball { .. } => {
             client

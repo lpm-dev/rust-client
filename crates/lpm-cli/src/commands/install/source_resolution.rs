@@ -974,30 +974,43 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
 
     for (local_name, raw_spec, url, reference) in git_specs {
         let resolved = resolve_github_source(&url, reference.as_deref()).await?;
-        let (archive, downloaded_sri) =
-            match download_github_archive(&resolved.archive_url, None).await {
-                Ok(downloaded) => downloaded,
-                Err(error) if inherited_optional_registry_roots.contains(&local_name) => {
-                    tracing::warn!(
-                        dependency = %local_name,
-                        source = %resolved.locked_source,
-                        error = %error,
-                        "skipping unavailable optional GitHub dependency"
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-        let (package_dir, integrity) = if let Some(store_v2) = store_v2 {
-            let (object_dir, integrity, _) =
-                store_v2.extract_object_from_bytes(&archive, Some(&downloaded_sri))?;
-            (object_dir, integrity)
-        } else {
-            (
-                store.store_tarball_at_cas_path(&downloaded_sri, &archive)?,
-                downloaded_sri,
-            )
+        let downloaded = match download_github_archive_to_file(&resolved.archive_url, None).await {
+            Ok(downloaded) => downloaded,
+            Err(error) if inherited_optional_registry_roots.contains(&local_name) => {
+                tracing::warn!(
+                    dependency = %local_name,
+                    source = %resolved.locked_source,
+                    error = %error,
+                    "skipping unavailable optional GitHub dependency"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
         };
+        let store_v2 = store_v2.cloned();
+        let store = store.clone();
+        let (package_dir, integrity) =
+            tokio::task::spawn_blocking(move || -> Result<_, LpmError> {
+                if let Some(store_v2) = store_v2 {
+                    let (_, integrity, _) = store_v2
+                        .extract_object_from_file_with_fresh_integrity(
+                            downloaded.file.path(),
+                            &downloaded.sha512_sri,
+                            Some(&downloaded.sri),
+                        )?;
+                    Ok((store_v2.paths().object_dir(&integrity)?, integrity))
+                } else {
+                    let package_dir = store.store_tarball_at_cas_path_from_file(
+                        &downloaded.sri,
+                        downloaded.file.path(),
+                    )?;
+                    Ok((package_dir, downloaded.sri))
+                }
+            })
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!("GitHub extract task panicked: {error}"))
+            })??;
         let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &package_dir,
             &format!("GitHub dependency {}", resolved.locked_source),
@@ -1094,10 +1107,22 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // into the CAS. If the CAS dir already exists for the same
         // computed SRI, store_tarball_at_cas_path's fast path skips
         // re-extraction.
-        let (data, computed_sri) = client
-            .download_tarball_with_integrity(&url, declared_integrity.as_deref())
-            .await?;
-        let cas_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
+        let downloaded = match declared_integrity.as_deref() {
+            Some(expected) => {
+                client
+                    .download_tarball_to_file_with_integrity(&url, expected)
+                    .await?
+            }
+            None => client.download_tarball_to_file(&url).await?,
+        };
+        let computed_sri = downloaded.sri.clone();
+        let store_sri = computed_sri.clone();
+        let store = store.clone();
+        let cas_path = tokio::task::spawn_blocking(move || {
+            store.store_tarball_at_cas_path_from_file(&store_sri, downloaded.file.path())
+        })
+        .await
+        .map_err(|error| LpmError::Registry(format!("tarball extract task panicked: {error}")))??;
 
         let (real_name, real_version, node_engine) =
             read_pkg_json_name_version(&cas_path, &format!("tarball at {display_url}"))?;
