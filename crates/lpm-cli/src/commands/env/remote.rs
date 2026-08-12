@@ -82,8 +82,9 @@ pub(super) async fn env_share(
     // refuses the silent-overwrite path on RotationRequired and
     // prompts for step-up reauth on NeedsInitialSet before the
     // organization payload is encrypted for the current member set.
-    super::rotation::ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "share")
-        .await?;
+    let private_key =
+        super::rotation::ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "share")
+            .await?;
 
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
@@ -111,14 +112,17 @@ pub(super) async fn env_share(
         ));
     }
 
-    let result = lpm_vault::sync::push_org_with_keys(
+    let result = lpm_vault::sync::push_org(
         &registry_url,
         &auth_token,
-        org_slug,
-        &vault_id,
-        &secrets_json,
-        super::sync_payload::expected_org_sync_version(project_dir, org_slug),
-        Some(&push_metadata),
+        lpm_vault::sync::OrgPushRequest {
+            org_slug,
+            vault_id: &vault_id,
+            secrets_json: &secrets_json,
+            expected_version: super::sync_payload::expected_org_sync_version(project_dir, org_slug),
+            metadata: Some(&push_metadata),
+        },
+        &private_key,
     )
     .await
     .map_err(LpmError::Script)?;

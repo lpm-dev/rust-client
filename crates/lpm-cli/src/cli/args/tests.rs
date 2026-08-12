@@ -488,6 +488,35 @@ fn publish_wait_timeout_enforces_supported_range() {
 }
 
 #[test]
+fn publish_otp_flag_parses_for_non_interactive_lpm_publish() {
+    let cli = Cli::try_parse_from(["lpm", "publish", "--lpm", "--otp", "123456"]).unwrap();
+
+    match cli.command {
+        Some(Commands::Publish(registry::PublishArgs { otp, .. })) => {
+            assert_eq!(otp.as_deref(), Some("123456"));
+        }
+        _ => panic!("expected publish command"),
+    }
+}
+
+#[test]
+fn release_publish_otp_flag_parses_for_non_interactive_lpm_publish() {
+    let cli = Cli::try_parse_from([
+        "lpm", "release", "publish", "--all", "--lpm", "--otp", "123456",
+    ])
+    .unwrap();
+
+    match cli.command {
+        Some(Commands::Release(super::release::ReleaseArgs {
+            command: super::release::ReleaseCommands::Publish { otp, .. },
+        })) => {
+            assert_eq!(otp.as_deref(), Some("123456"));
+        }
+        _ => panic!("expected release publish command"),
+    }
+}
+
+#[test]
 fn stage_publish_provenance_file_flag_parses() {
     let cli = Cli::try_parse_from([
         "lpm",

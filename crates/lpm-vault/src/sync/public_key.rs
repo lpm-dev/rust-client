@@ -402,6 +402,14 @@ pub struct MemberPublicKey {
     pub has_public_key: bool,
 }
 
+/// Organization member keys together with the caller's key-management capability.
+pub struct OrgMemberKeyAccess {
+    /// Current organization members and their registered sharing keys.
+    pub members: Vec<MemberPublicKey>,
+    /// Whether the caller may replace the organization content-key wraps.
+    pub can_replace_wrapped_keys: bool,
+}
+
 /// Returns the lowercase SHA-256 fingerprint for a canonical X25519 public key.
 pub fn public_key_fingerprint(public_key: &[u8; 32]) -> String {
     use sha2::{Digest, Sha256};
@@ -415,6 +423,19 @@ pub async fn get_org_member_keys(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<Vec<MemberPublicKey>, String> {
+    Ok(
+        get_org_member_key_access(registry_url, auth_token, org_slug)
+            .await?
+            .members,
+    )
+}
+
+/// Fetch member keys and the caller's wrapped-key write capability.
+pub async fn get_org_member_key_access(
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+) -> Result<OrgMemberKeyAccess, String> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -436,10 +457,26 @@ pub async fn get_org_member_keys(
         return Err(format!("failed to fetch member keys: {body}"));
     }
 
-    response
+    let can_replace_wrapped_keys = match response
+        .headers()
+        .get("X-LPM-Org-Wrapped-Keys-Write")
+        .map(|value| value.to_str())
+        .transpose()
+        .map_err(|_| "invalid organization wrapped-key capability header")?
+    {
+        Some("allowed") | None => true,
+        Some("forbidden") => false,
+        Some(_) => return Err("invalid organization wrapped-key capability header".into()),
+    };
+    let members = response
         .json()
         .await
-        .map_err(|e| format!("parse error: {e}"))
+        .map_err(|e| format!("parse error: {e}"))?;
+
+    Ok(OrgMemberKeyAccess {
+        members,
+        can_replace_wrapped_keys,
+    })
 }
 
 /// Honoured only on macOS — the keychain backend is the default there

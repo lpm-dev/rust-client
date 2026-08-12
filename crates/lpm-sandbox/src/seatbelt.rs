@@ -141,6 +141,15 @@ pub(crate) fn render_profile_with_isolation(
     out.push_str("  (subpath \"/System\")\n");
     out.push_str("  (subpath \"/Library/Developer/CommandLineTools\")\n");
     out.push_str("  (subpath \"/Library/Preferences\")\n");
+    // Apple Silicon Homebrew binaries resolve from /opt/homebrew/bin
+    // into the versioned Cellar and load formula libraries through
+    // /opt/homebrew/opt. Homebrew Node also loads the OpenSSL formula's
+    // startup configuration. Keep the allowlist to these runtime paths;
+    // other Homebrew configuration and state stay denied.
+    out.push_str("  (subpath \"/opt/homebrew/bin\")\n");
+    out.push_str("  (subpath \"/opt/homebrew/Cellar\")\n");
+    out.push_str("  (subpath \"/opt/homebrew/opt\")\n");
+    out.push_str("  (subpath \"/opt/homebrew/etc/openssl@3\")\n");
     out.push_str("  (subpath \"/private/etc\")\n");
     out.push_str("  (subpath \"/private/var/db/dyld\")\n");
     out.push_str("  (subpath \"/private/var/db/timezone\")\n");
@@ -628,6 +637,17 @@ mod tests {
         assert!(p.contains("/home/u/.node-gyp"));
         assert!(p.contains("/home/u/.npm"));
         assert!(p.contains("/home/u/.nvm/versions"));
+    }
+
+    #[test]
+    fn profile_allows_apple_silicon_homebrew_runtime_dependencies_without_broad_opt_access() {
+        let p = render_profile(&spec(), false).unwrap();
+        assert!(p.contains("(subpath \"/opt/homebrew/Cellar\")"));
+        assert!(p.contains("(subpath \"/opt/homebrew/opt\")"));
+        assert!(p.contains("(subpath \"/opt/homebrew/bin\")"));
+        assert!(p.contains("(subpath \"/opt/homebrew/etc/openssl@3\")"));
+        assert!(!p.contains("(subpath \"/opt/homebrew\")\n"));
+        assert!(!p.contains("(subpath \"/opt/homebrew/etc\")\n"));
     }
 
     #[test]

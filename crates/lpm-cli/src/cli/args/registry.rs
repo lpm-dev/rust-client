@@ -77,6 +77,10 @@ pub(crate) struct PublishArgs {
     )]
     pub(crate) wait_timeout: Option<u64>,
 
+    /// Six-digit authenticator code for an MFA-protected LPM publish.
+    #[arg(long, value_name = "CODE")]
+    pub(crate) otp: Option<String>,
+
     /// Skip confirmation prompt.
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,

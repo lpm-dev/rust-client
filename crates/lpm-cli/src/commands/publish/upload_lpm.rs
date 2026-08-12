@@ -18,6 +18,7 @@ pub(super) async fn publish_to_lpm(
     tarball_files: &[TarballFile],
     version_data: &serde_json::Value,
     quality_result: &Option<quality::QualityResult>,
+    provided_otp: Option<&str>,
     json_output: bool,
     detected_ecosystem: &str,
     swift_manifest: &Option<serde_json::Value>,
@@ -55,16 +56,22 @@ pub(super) async fn publish_to_lpm(
         .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?;
 
     // 2FA check — prompt before uploading
-    let otp_code: Option<String> = if whoami.mfa_enabled == Some(true) {
+    let otp_code: Option<String> = if let Some(code) = provided_otp {
+        if !is_valid_otp(code) {
+            return Err(LpmError::Registry(
+                "--otp must be exactly six ASCII digits".into(),
+            ));
+        }
+        Some(code.to_owned())
+    } else if whoami.mfa_enabled == Some(true) {
         if json_output {
             return Err(LpmError::Registry(
-                "2FA required but running in JSON mode — use --token with a CI token instead"
-                    .into(),
+                "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
             ));
         }
         let code: String = cliclack::input("Enter 2FA code")
             .validate(|input: &String| {
-                if input.len() == 6 && input.chars().all(|c| c.is_ascii_digit()) {
+                if is_valid_otp(input) {
                     Ok(())
                 } else {
                     Err("Must be a 6-digit code")
@@ -161,4 +168,25 @@ pub(super) async fn publish_to_lpm(
             tarball_data.len(),
         )
         .await
+}
+
+fn is_valid_otp(value: &str) -> bool {
+    value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_otp;
+
+    #[test]
+    fn lpm_publish_otp_accepts_exactly_six_ascii_digits() {
+        assert!(is_valid_otp("123456"));
+    }
+
+    #[test]
+    fn lpm_publish_otp_rejects_invalid_codes() {
+        for code in ["12345", "1234567", "１２３４５６", "12345a"] {
+            assert!(!is_valid_otp(code), "unexpected valid OTP: {code}");
+        }
+    }
 }

@@ -2,7 +2,7 @@ use super::http::{read_verified_response, sync_http_client_builder, url_path_seg
 use super::personal::{
     PushMetadata, PushResponse, RemoteVault, format_push_error, list_remote_from_url,
 };
-use super::public_key::{MemberPublicKey, get_org_member_keys, public_key_fingerprint};
+use super::public_key::{MemberPublicKey, get_org_member_key_access, public_key_fingerprint};
 use crate::crypto;
 
 /// Decrypted organization env payload and its remote concurrency epochs.
@@ -14,6 +14,26 @@ pub struct PulledOrgVault {
     pub version: i32,
     /// Version of the organization content key that encrypted the payload.
     pub content_key_version: i32,
+}
+
+struct DecryptedOrgVault {
+    pulled: PulledOrgVault,
+    content_key: [u8; 32],
+}
+
+/// Inputs for one organization env project write.
+#[derive(Clone, Copy)]
+pub struct OrgPushRequest<'a> {
+    /// Organization slug that owns the env project.
+    pub org_slug: &'a str,
+    /// Stable project identifier from `lpm.json`.
+    pub vault_id: &'a str,
+    /// Complete plaintext JSON payload to encrypt.
+    pub secrets_json: &'a str,
+    /// Last server version observed by the caller.
+    pub expected_version: Option<i32>,
+    /// Optional project name and schema projection.
+    pub metadata: Option<&'a PushMetadata<'a>>,
 }
 
 #[derive(serde::Serialize)]
@@ -48,6 +68,20 @@ pub async fn pull_org(
     vault_id: &str,
     private_key: &[u8; 32],
 ) -> Result<PulledOrgVault, String> {
+    Ok(
+        pull_org_with_content_key(registry_url, auth_token, org_slug, vault_id, private_key)
+            .await?
+            .pulled,
+    )
+}
+
+async fn pull_org_with_content_key(
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+    vault_id: &str,
+    private_key: &[u8; 32],
+) -> Result<DecryptedOrgVault, String> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -100,15 +134,52 @@ pub async fn pull_org(
     }
 
     // Unwrap AES key with our X25519 private key, then decrypt
-    let aes_key = crypto::unwrap_key_from_sender(&data.wrapped_key, private_key)?;
-    let plaintext = crypto::decrypt(&aes_key, &data.encrypted_blob)?;
+    let content_key = crypto::unwrap_key_from_sender(&data.wrapped_key, private_key)?;
+    let plaintext = crypto::decrypt(&content_key, &data.encrypted_blob)?;
     let json = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
 
-    Ok(PulledOrgVault {
-        raw_json: json,
-        version: data.version,
-        content_key_version: data.content_key_version,
+    Ok(DecryptedOrgVault {
+        pulled: PulledOrgVault {
+            raw_json: json,
+            version: data.version,
+            content_key_version: data.content_key_version,
+        },
+        content_key,
     })
+}
+
+/// Push an organization env project while preserving the caller's key-management boundary.
+pub async fn push_org(
+    registry_url: &str,
+    auth_token: &str,
+    request: OrgPushRequest<'_>,
+    private_key: &[u8; 32],
+) -> Result<PushResponse, String> {
+    let access = get_org_member_key_access(registry_url, auth_token, request.org_slug).await?;
+    if access.can_replace_wrapped_keys {
+        return push_org_with_member_access(registry_url, auth_token, request, &access.members)
+            .await;
+    }
+
+    let expected_version = request.expected_version.ok_or_else(|| {
+        "organization maintainers must pull the current env project before updating it".to_string()
+    })?;
+    let current = pull_org_with_content_key(
+        registry_url,
+        auth_token,
+        request.org_slug,
+        request.vault_id,
+        private_key,
+    )
+    .await?;
+    if current.pulled.version != expected_version {
+        return Err(format!(
+            "organization env version changed from {expected_version} to {}; pull and retry",
+            current.pulled.version
+        ));
+    }
+    let encrypted_blob = crypto::encrypt(&current.content_key, request.secrets_json.as_bytes())?;
+    post_org_update(registry_url, auth_token, request, encrypted_blob, None).await
 }
 
 /// Push an org vault with proper X25519 key wrapping for all members.
@@ -121,32 +192,72 @@ pub async fn push_org_with_keys(
     expected_version: Option<i32>,
     metadata: Option<&PushMetadata<'_>>,
 ) -> Result<PushResponse, String> {
-    let members = get_org_member_keys(registry_url, auth_token, org_slug).await?;
+    let access = get_org_member_key_access(registry_url, auth_token, org_slug).await?;
+    if !access.can_replace_wrapped_keys {
+        return Err("only organization owners and admins can replace wrapped content keys".into());
+    }
+    push_org_with_member_access(
+        registry_url,
+        auth_token,
+        OrgPushRequest {
+            org_slug,
+            vault_id,
+            secrets_json,
+            expected_version,
+            metadata,
+        },
+        &access.members,
+    )
+    .await
+}
 
-    let members_with_keys = select_members_with_keys(&members)?;
+async fn push_org_with_member_access(
+    registry_url: &str,
+    auth_token: &str,
+    request: OrgPushRequest<'_>,
+    members: &[MemberPublicKey],
+) -> Result<PushResponse, String> {
+    let members_with_keys = select_members_with_keys(members)?;
 
     let aes_key = crypto::generate_aes_key();
-    let encrypted_blob = crypto::encrypt(&aes_key, secrets_json.as_bytes())?;
+    let encrypted_blob = crypto::encrypt(&aes_key, request.secrets_json.as_bytes())?;
 
     let wrapped_keys = wrap_keys_for_members(&aes_key, &members_with_keys)?;
 
+    post_org_update(
+        registry_url,
+        auth_token,
+        request,
+        encrypted_blob,
+        Some(wrapped_keys),
+    )
+    .await
+}
+
+async fn post_org_update(
+    registry_url: &str,
+    auth_token: &str,
+    request: OrgPushRequest<'_>,
+    encrypted_blob: String,
+    wrapped_keys: Option<Vec<WrappedMemberKey>>,
+) -> Result<PushResponse, String> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
     let url = format!(
         "{registry_url}/api/orgs/{}/vaults/{}",
-        url_path_segment(org_slug),
-        url_path_segment(vault_id)
+        url_path_segment(request.org_slug),
+        url_path_segment(request.vault_id)
     );
 
-    let mut body = serde_json::json!({
-        "encryptedBlob": encrypted_blob,
-        "wrappedKeys": wrapped_keys,
-    });
-    if let Some(version) = expected_version {
+    let mut body = serde_json::json!({ "encryptedBlob": encrypted_blob });
+    if let Some(wrapped_keys) = wrapped_keys {
+        body["wrappedKeys"] = serde_json::json!(wrapped_keys);
+    }
+    if let Some(version) = request.expected_version {
         body["expectedVersion"] = serde_json::json!(version);
     }
-    if let Some(meta) = metadata {
+    if let Some(meta) = request.metadata {
         if let Some(name) = meta.name {
             body["name"] = serde_json::json!(name);
         }
@@ -521,6 +632,109 @@ mod tests {
         );
         assert!(push_body.contains("\"encryptedBlob\":\""));
         assert!(push_body.contains("\"wrappedKeys\":["));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn push_org_preserves_wrapped_keys_when_caller_cannot_replace_them() {
+        #[derive(Clone)]
+        struct CapturePushResponder {
+            body: Arc<StdMutex<Option<String>>>,
+            auth_token: &'static str,
+        }
+
+        impl Respond for CapturePushResponder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body = String::from_utf8(request.body.clone())
+                    .expect("organization update body should be valid JSON");
+                *self.body.lock().unwrap() = Some(body);
+                let response_body = serde_json::json!({
+                    "version": 8,
+                    "contentKeyVersion": 3,
+                    "status": "synced"
+                });
+                let body_str = serde_json::to_string(&response_body).expect("serialize response");
+                let signature = signature::sign_body(body_str.as_bytes(), self.auth_token);
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .insert_header(signature::SIGNATURE_HEADER, signature.as_str())
+                    .set_body_string(body_str)
+            }
+        }
+
+        let server = MockServer::start().await;
+        let captured_body = Arc::new(StdMutex::new(None));
+        let private_key = [41u8; 32];
+        let public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
+        let content_key = [17u8; 32];
+        let current_body = serde_json::json!({
+            "encryptedBlob": crypto::encrypt(&content_key, br#"{"environments":{"default":{"OLD":"value"}}}"#)
+                .expect("encrypt current payload"),
+            "wrappedKey": crypto::wrap_key_for_recipient(&content_key, public_key.as_bytes())
+                .expect("wrap current content key"),
+            "version": 7,
+            "contentKeyVersion": 3,
+            "recipientPublicKeyVersion": 4,
+            "recipientPublicKeyFingerprint": public_key_fingerprint(public_key.as_bytes()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/members/public-keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-LPM-Org-Wrapped-Keys-Write", "forbidden")
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/vaults/vault-maintainer"))
+            .respond_with(signed_ok_response(current_body, "auth-token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orgs/acme/vaults/vault-maintainer"))
+            .respond_with(CapturePushResponder {
+                body: Arc::clone(&captured_body),
+                auth_token: "auth-token",
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = push_org(
+            &server.uri(),
+            "auth-token",
+            OrgPushRequest {
+                org_slug: "acme",
+                vault_id: "vault-maintainer",
+                secrets_json: r#"{"environments":{"default":{"NEW":"value"}}}"#,
+                expected_version: Some(7),
+                metadata: None,
+            },
+            &private_key,
+        )
+        .await
+        .expect("maintainer update should preserve the current content key");
+
+        assert_eq!(result.version, Some(8));
+        let raw = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("capture organization update");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse update body");
+        assert!(parsed.get("wrappedKeys").is_none());
+        assert_eq!(parsed.get("expectedVersion"), Some(&serde_json::json!(7)));
+        let encrypted_blob = parsed["encryptedBlob"].as_str().expect("encrypted blob");
+        let decrypted = crypto::decrypt(&content_key, encrypted_blob).expect("decrypt update");
+        assert_eq!(
+            decrypted,
+            br#"{"environments":{"default":{"NEW":"value"}}}"#
+        );
     }
 
     #[cfg(debug_assertions)]
