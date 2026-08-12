@@ -1,5 +1,128 @@
 use super::*;
 
+fn populate_v2_scripted_package(
+    store: &lpm_store::v2::Store,
+    wrapper_id: &str,
+    script_body: &str,
+) -> String {
+    use std::io::Write;
+
+    use lpm_store::v2::{GraphKey, GraphKeyInputs, LinkEntryRequest, LinkerModeTag, PlatformTuple};
+
+    let mut tar_data = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_data);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": "scripted",
+            "version": "1.0.0",
+            "scripts": {"postinstall": script_body},
+        }))
+        .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/package.json", manifest.as_slice())
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&tar_data).unwrap();
+    let tarball = encoder.finish().unwrap();
+    let sri = lpm_store::compute_sri_hash(&tarball);
+    let object_dir = store.extract_object(&sri, &tarball).unwrap();
+    let graph_key = GraphKey::derive(
+        &GraphKeyInputs::new(
+            "scripted",
+            "1.0.0",
+            PlatformTuple::current(),
+            LinkerModeTag::Isolated,
+        )
+        .with_wrapper_id(Some(wrapper_id.into())),
+    );
+    store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: std::sync::Arc::new(graph_key),
+            source_sri: sri.clone(),
+            object_dir,
+            deps: vec![],
+            platform: std::sync::Arc::new(lpm_store::v2::LinkMetaPlatform {
+                os: std::env::consts::OS.into(),
+                cpu: std::env::consts::ARCH.into(),
+                libc: None,
+            }),
+        })
+        .unwrap();
+    sri
+}
+
+#[test]
+fn amber_advisor_requests_read_scripts_from_default_v2_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path().join("lpm-home"));
+    let store = lpm_store::PackageStore::from_root(&lpm_root);
+    let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+    let sri = populate_v2_scripted_package(&v2_store, "tarball-a", "node install.js");
+
+    let baseline_index = lpm_store::V2BaselineIndex::build(&lpm_root).unwrap();
+    let requests = collect_amber_classification_requests(
+        &store,
+        &lpm_root,
+        Some(&baseline_index),
+        &[("scripted".into(), "1.0.0".into(), Some(sri))],
+        &std::collections::HashMap::new(),
+        0,
+    );
+
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn amber_advisor_requests_use_source_identity_when_v2_coordinates_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path().join("lpm-home"));
+    let store = lpm_store::PackageStore::from_root(&lpm_root);
+    let v2_store = lpm_store::v2::Store::from_lpm_root(&lpm_root);
+    let first_sri = populate_v2_scripted_package(&v2_store, "tarball-a", "node install.js --first");
+    let second_sri =
+        populate_v2_scripted_package(&v2_store, "tarball-b", "node install.js --second");
+    let baseline_index = lpm_store::V2BaselineIndex::build(&lpm_root).unwrap();
+    let coordinate_sri = &baseline_index
+        .lookup("scripted", "1.0.0")
+        .unwrap()
+        .integrity;
+    let (requested_sri, expected_body) = if coordinate_sri == &first_sri {
+        (second_sri, "node install.js --second")
+    } else {
+        (first_sri, "node install.js --first")
+    };
+
+    let requests = collect_amber_classification_requests(
+        &store,
+        &lpm_root,
+        Some(&baseline_index),
+        &[(
+            "scripted".into(),
+            "1.0.0".into(),
+            Some(requested_sri.clone()),
+        )],
+        &std::collections::HashMap::new(),
+        0,
+    );
+    let [request] = requests.as_slice() else {
+        panic!("the exact V2 package identity should produce one advisor request");
+    };
+
+    assert_eq!(
+        (&request.integrity, request.amber_phases.as_slice()),
+        (
+            &Some(requested_sri),
+            [("postinstall".into(), expected_body.into())].as_slice(),
+        )
+    );
+}
+
 #[test]
 fn blocked_set_metadata_candidates_include_only_registry_packages_with_scripts() {
     let dir = tempfile::tempdir().unwrap();
