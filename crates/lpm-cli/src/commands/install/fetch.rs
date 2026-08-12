@@ -142,6 +142,16 @@ pub(super) async fn handoff_buffered_download_to_extract<P>(
     Ok((extract_permit, wait_ms))
 }
 
+pub(super) async fn handoff_file_download_to_extract<P>(
+    download_permit: P,
+    limiter: &FetchExtractLimiter,
+) -> Result<(Option<tokio::sync::OwnedSemaphorePermit>, u128), LpmError> {
+    drop(download_permit);
+    let wait_start = std::time::Instant::now();
+    let extract_permit = acquire_fetch_extract_permit(limiter).await?;
+    Ok((extract_permit, wait_start.elapsed().as_millis()))
+}
+
 pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) start: Instant,
     pub(super) arc_client: Arc<RegistryClient>,
@@ -2495,9 +2505,9 @@ pub(super) fn spawn_speculation_dispatcher(
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
     spec_tracker: SpeculativeKeyTracker,
-    // — under v2 mode the dispatcher routes downloaded
-    // bytes through `v2::Store::extract_object_from_bytes` instead of
-    // v1's per-`(name, version)` slot. `None` keeps the legacy v1 path
+    // Under v2 mode, the dispatcher routes downloaded files through the
+    // content-addressed object store instead of v1's per-`(name, version)` slot.
+    // `None` keeps the legacy v1 path
     // for callers running with the env var unset (and for the migration-
     // window code paths that still write v1 alongside).
     store_v2: Option<Arc<lpm_store::v2::Store>>,
@@ -2542,19 +2552,9 @@ pub(super) fn spawn_speculation_dispatcher(
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
-        // — under v2 mode the dispatcher writes to
-        // v2's `objects/<sri>/` via `extract_object_from_bytes`. The
-        // store handle threads through `speculative_download_and_store`
-        // below; when `store_v2_spec` is `Some`, the spec download
-        // collects bytes (rather than streaming straight to disk) and
-        // hands them to the v2 store's idempotent extract. The legacy
-        // v1 path runs when `store_v2_spec` is `None`.
-        //
-        // Pre-this branch drained the channel as a no-op,
-        // forcing the real fetch loop to do all download work — v2
-        // installs paid full per-package fetch latency on the hot
-        // path. With this wired, v2 cold installs match v1's
-        // pipelined-fetch shape.
+        // V2 speculation spools compressed bytes under the process-wide byte
+        // budget before the idempotent object extraction. V1 streams directly
+        // into its per-package store slot.
 
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
@@ -2805,7 +2805,7 @@ pub(super) fn spawn_speculation_dispatcher(
     )
 }
 
-///: one speculative download — stream tarball → store,
+/// One speculative download into the active store,
 /// identical to `fetch_and_store_streaming` but without the
 /// `InstallPackage`-shaped plumbing or `TaskTimings` accounting. Errors
 /// are swallowed by the dispatcher (best-effort speculation); the real
@@ -2815,9 +2815,8 @@ pub(super) async fn speculative_download_and_store(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
     store: &PackageStore,
-    // — when `Some`, route the downloaded bytes through
-    // v2's `extract_object_from_bytes` (idempotent on object hits)
-    // instead of v1's `stream_and_store_package`. Each spec task
+    // When `Some`, route the downloaded file through v2's idempotent object
+    // extraction instead of v1's `stream_and_store_package`. Each spec task
     // gets its own clone of the `Arc<Store>`.
     store_v2: Option<&lpm_store::v2::Store>,
     semaphore: &Arc<Semaphore>,
@@ -2894,39 +2893,33 @@ pub(super) async fn speculative_download_and_store(
         }
     };
 
-    // Keep speculative downloads on the auth-aware route so custom registries
-    // use the same credentials and origin checks as authoritative fetches.
-    let response = client
-        .download_tarball_streaming_routed_managed(route_table, name, url, install_accounting)
-        .await?;
-
     if let Some(v2) = store_v2 {
-        // v2 path: collect bytes, extract via v2 store. Streaming-to-
-        // disk into v2 is a future optimization; for
-        // speculation the in-memory shape is fine because spec sets
-        // are bounded (a few hundred packages parallel, each typically
-        // <500 KB compressed). The semaphore upstream caps the
-        // concurrent allocator pressure.
-        let body = read_buffered_tarball_body(response, lpm_registry::MAX_COMPRESSED_TARBALL_SIZE)
-            .await
-            .map_err(|error| {
-                LpmError::Registry(format!(
-                    "spec body fetch failed for {name}@{version}: {error}"
-                ))
-            })?;
-        let (_extract_permit, _) =
-            handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
+        let downloaded = client
+            .download_tarball_routed_managed(route_table, name, url, install_accounting)
+            .await?;
+        drop(permit);
+        let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
-        let integrity_c = integrity.map(|s| s.to_string());
+        let expected_integrity = integrity.map(str::to_string);
         tokio::task::spawn_blocking(move || {
             v2_clone
-                .extract_object_from_bytes(&body, integrity_c.as_deref())
+                .extract_object_from_file_with_fresh_integrity(
+                    downloaded.file.path(),
+                    &downloaded.sha512_sri,
+                    expected_integrity.as_deref(),
+                )
                 .map(|_| ())
         })
         .await
         .map_err(|e| LpmError::Registry(format!("spec virtual-store blocking task: {e}")))??;
         return Ok(SpeculativeFetchOutcome::Stored);
     }
+
+    // Keep speculative downloads on the auth-aware route so custom registries
+    // use the same credentials and origin checks as authoritative fetches.
+    let response = client
+        .download_tarball_streaming_routed_managed(route_table, name, url, install_accounting)
+        .await?;
 
     // v1 path: streaming straight to the per-`(name, version)` slot.
     let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -3358,60 +3351,53 @@ pub(super) async fn fetch_and_store_legacy(
     // proceed while this task finishes its post-download work.
     drop(permit);
 
-    let computed_sri = downloaded.sri.clone();
-
-    // Verify integrity before storing. SHA-512 is the common case: computed
-    // during download, so match is a string compare. Non-sha512 expected
-    // values stream-verify from the temp file in 64 KB chunks.
-    let integrity_start = std::time::Instant::now();
-    if let Some(ref integrity) = p.integrity {
-        if computed_sri != *integrity
-            && let Err(e) = lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
-        {
-            return Err(LpmError::Registry(format!(
-                "integrity verification failed for {}@{}: {e}",
-                p.name, p.version
-            )));
-        }
-    } else {
-        tracing::warn!(
-            "no integrity hash for {}@{} — skipping verification",
-            p.name,
-            p.version
-        );
-    }
-    let integrity_ms = integrity_start.elapsed().as_millis();
-
     let extract_permit_wait_start = std::time::Instant::now();
     let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
+    let integrity = p.integrity.clone();
+    let name = p.name.clone();
+    let version = p.version.clone();
+    let store = store.clone();
+    let store_v2 = store_v2.cloned();
+    let ((stage, fresh_object, result_sri), integrity_ms) =
+        tokio::task::spawn_blocking(move || {
+            let computed_sri = downloaded.sri.clone();
+            if let Some(store_v2) = store_v2 {
+                let (object, sri, timings, integrity_ms) = store_v2
+                    .extract_object_from_file_with_fresh_integrity_timed(
+                        downloaded.file.path(),
+                        &downloaded.sha512_sri,
+                        integrity.as_deref(),
+                    )?;
+                return Ok(((timings, Some(object), sri), integrity_ms));
+            }
 
-    let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
-        // — v2 path. Read the on-disk tarball into
-        // memory and route through `extract_object_from_bytes`. The
-        // legacy fetch path's whole point is to spool the download
-        // to a temp file (vs the streaming path's in-memory body), so
-        // we incur the read-to-bytes cost here rather than refactor
-        // the streaming abstraction; the perf delta is bounded by
-        // tarball size which already passed the size limit upstream.
-        let bytes = std::fs::read(downloaded.file.path()).map_err(|e| {
-            LpmError::Registry(format!(
-                "virtual store: failed to re-read downloaded tarball at {}: {e}",
-                downloaded.file.path().display()
-            ))
-        })?;
-        let (object, sri, timings) = store_v2
-            .extract_object_from_bytes_with_fresh_integrity(&bytes, p.integrity.as_deref())?;
-        (timings, Some(object), sri)
-    } else {
-        let (_, stage) = store.store_package_from_file_timed(
-            &p.name,
-            &p.version,
-            downloaded.file.path(),
-            &computed_sri,
-        )?;
-        (stage, None, computed_sri)
-    };
+            let integrity_start = std::time::Instant::now();
+            if let Some(ref integrity) = integrity {
+                if computed_sri != *integrity
+                    && let Err(error) =
+                        lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
+                {
+                    return Err(LpmError::Registry(format!(
+                        "integrity verification failed for {name}@{version}: {error}"
+                    )));
+                }
+            } else {
+                tracing::warn!("no integrity hash for {name}@{version} — skipping verification");
+            }
+            let integrity_ms = integrity_start.elapsed().as_millis();
+            let (_, stage) = store.store_package_from_file_timed(
+                &name,
+                &version,
+                downloaded.file.path(),
+                &computed_sri,
+            )?;
+            Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
+        })
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("file-backed extract task panicked: {error}"))
+        })??;
 
     Ok((
         result_sri,
@@ -3436,11 +3422,10 @@ pub(super) async fn fetch_and_store_legacy(
 /// 1. **No URL resolution.** The tarball URL is the dep specifier;
 ///    it's already in `p.tarball_url`. No registry metadata
 ///    round-trip, no `route_table` lookup, no `resolve_tarball_url`.
-/// 2. **No registry-routed download.** Uses
-///    [`RegistryClient::download_tarball_with_integrity`] which
-///    fetches an arbitrary URL and verifies an optional pre-declared
-///    SRI. Trust-on-first-use when `p.integrity` is `None`; hard
-///    error on mismatch when `Some`.
+/// 2. **No registry-routed download.** Fetches the arbitrary URL into a
+///    bounded-memory temp file and verifies an optional pre-declared SRI.
+///    Trust-on-first-use applies when `p.integrity` is `None`; a mismatch is
+///    a hard error when it is `Some`.
 /// 3. **Content-addressable store path.** Extraction lands at
 ///    [`PackageStore::store_tarball_at_cas_path`] (keyed by the
 ///    computed SRI), NOT the `(name, version)`-keyed
@@ -3483,45 +3468,53 @@ pub(super) async fn fetch_and_store_tarball_url(
     })?;
 
     let download_start = std::time::Instant::now();
-    let (data, computed_sri) = if matches!(p.source_kind(), Ok(lpm_lockfile::Source::Git { .. })) {
-        download_github_archive(url, p.integrity.as_deref()).await?
-    } else {
+    let downloaded = if matches!(p.source_kind(), Ok(lpm_lockfile::Source::Git { .. })) {
+        download_github_archive_to_file(url, p.integrity.as_deref()).await?
+    } else if let Some(expected_integrity) = p.integrity.as_deref() {
         client
-            .download_tarball_with_integrity(url, p.integrity.as_deref())
+            .download_tarball_to_file_with_integrity(url, expected_integrity)
             .await?
+    } else {
+        client.download_tarball_to_file(url).await?
     };
     let download_ms = download_start.elapsed().as_millis();
 
-    // download_tarball_with_integrity already verified the SRI when
-    // p.integrity was Some; on trust-on-first-use it returned the
-    // computed SRI we need to record. integrity_ms folds into
-    // download_ms because the verify is a single string compare.
+    // The file download already verified a declared SRI. On trust-on-first-use
+    // it computed the SRI that must be recorded. Verification is included in
+    // download_ms because it completes before the downloader returns.
     let integrity_ms = 0;
 
     let (_extract_permit, extract_permit_wait_ms) =
-        handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
+        handoff_file_download_to_extract(permit, fetch_extract_limiter).await?;
 
-    let (stage, fresh_object, result_sri) = if let Some(store_v2) = store_v2 {
-        // — v2 path. The Source::Tarball case
-        // already has bytes + SRI in hand; route them straight into
-        // `extract_object_from_bytes`. The downloader returns the
-        // declaration's algorithm when one was supplied, while v2
-        // objects are keyed by the extractor's canonical sha512 SRI.
-        let (object, sri, stage) =
-            store_v2.extract_object_from_bytes_with_fresh_integrity(&data, Some(&computed_sri))?;
-        (stage, Some(object), sri)
-    } else {
-        let extract_start = std::time::Instant::now();
-        let _store_path = store.store_tarball_at_cas_path(&computed_sri, &data)?;
-        (
-            lpm_store::StageTimings {
-                extract_ms: extract_start.elapsed().as_millis(),
-                ..Default::default()
-            },
-            None,
-            computed_sri,
-        )
-    };
+    let store = store.clone();
+    let store_v2 = store_v2.cloned();
+    let expected_integrity = p.integrity.clone();
+    let (stage, fresh_object, result_sri) =
+        tokio::task::spawn_blocking(move || -> Result<_, LpmError> {
+            if let Some(store_v2) = store_v2 {
+                let (object, sri, stage) = store_v2.extract_object_from_file_with_fresh_integrity(
+                    downloaded.file.path(),
+                    &downloaded.sha512_sri,
+                    expected_integrity.as_deref(),
+                )?;
+                Ok((stage, Some(object), sri))
+            } else {
+                let extract_start = std::time::Instant::now();
+                store
+                    .store_tarball_at_cas_path_from_file(&downloaded.sri, downloaded.file.path())?;
+                Ok((
+                    lpm_store::StageTimings {
+                        extract_ms: extract_start.elapsed().as_millis(),
+                        ..Default::default()
+                    },
+                    None,
+                    downloaded.sri.clone(),
+                ))
+            }
+        })
+        .await
+        .map_err(|error| LpmError::Registry(format!("tarball extract task panicked: {error}")))??;
 
     let timings = TaskTimings::from_stage(
         queue_wait_ms,
@@ -3535,9 +3528,10 @@ pub(super) async fn fetch_and_store_tarball_url(
     Ok((result_sri, timings, url.to_string(), fresh_object))
 }
 
-/// streaming fetch path — bytes flow from reqwest directly
-/// into the store's extractor via `StreamReader` + `SyncIoBridge`. No
-/// temp file spool, no re-read. Hash computed inline as bytes flow.
+/// V1 streaming fetch path — bytes flow from reqwest directly into the
+/// store's extractor via `StreamReader` + `SyncIoBridge`. V2 uses the
+/// file-backed path so completed downloads cannot retain compressed bodies
+/// while waiting for a bounded extraction slot.
 ///
 /// Because download + decode + extract + hash happen in one interleaved
 /// pipeline, `download_ms` and `integrity_ms` collapse into
@@ -3570,6 +3564,23 @@ pub(super) async fn fetch_and_store_streaming(
     ),
     LpmError,
 > {
+    if store_v2.is_some() {
+        return fetch_and_store_legacy(
+            client,
+            route_table,
+            store,
+            store_v2,
+            p,
+            queue_wait_ms,
+            artifact_selection,
+            gate_stats,
+            permit,
+            fetch_extract_limiter,
+            install_accounting,
+        )
+        .await;
+    }
+
     use std::sync::atomic::Ordering;
 
     // URL resolution — times this into `url_lookup_ms` and
@@ -3703,11 +3714,6 @@ pub(super) async fn fetch_and_store_streaming(
     let version = p.version.clone();
     let expected_integrity = p.integrity.clone();
     let store_owned = store.clone();
-    // — capture the Optional v2 handle into the
-    // blocking task. Cloning an `Option<Store>` is cheap (the inner
-    // `Store` derives Clone over a single PathBuf), and `None` keeps
-    // the existing v1 path byte-for-byte.
-    let store_v2_owned = store_v2.cloned();
 
     let (_extract_permit, extract_permit_wait_ms) =
         handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
@@ -3715,41 +3721,18 @@ pub(super) async fn fetch_and_store_streaming(
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
-    let (computed_sri, stage, fresh_object) = tokio::task::spawn_blocking(
-        move || -> Result<
-            (
-                String,
-                lpm_store::StageTimings,
-                Option<lpm_store::v2::ExtractedObject>,
-            ),
-            LpmError,
-        > {
-            if let Some(store_v2) = store_v2_owned {
-                // — v2 path. Bytes flow through
-                // `extract_object_from_bytes`: SHA-512 hash → integrity
-                // verify → extract into `objects/<sri>/` → security
-                // analysis → atomic rename. The buffered reader enforces
-                // the compressed-size limit for declared and chunked bodies.
-                let (object, sri, timings) = store_v2
-                    .extract_object_from_bytes_with_fresh_integrity(
-                        &body,
-                        expected_integrity.as_deref(),
-                    )?;
-                Ok((sri, timings, Some(object)))
-            } else {
-                let cursor = std::io::Cursor::new(body);
-                store_owned
-                    .stream_and_store_package(
-                        &name,
-                        &version,
-                        cursor,
-                        expected_integrity.as_deref(),
-                        lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-                    )
-                    .map(|(_path, sri, timings)| (sri, timings, None))
-            }
-        },
-    )
+    let (computed_sri, stage) = tokio::task::spawn_blocking(move || {
+        let cursor = std::io::Cursor::new(body);
+        store_owned
+            .stream_and_store_package(
+                &name,
+                &version,
+                cursor,
+                expected_integrity.as_deref(),
+                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+            )
+            .map(|(_path, sri, timings)| (sri, timings))
+    })
     .await
     .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
     let pipeline_ms = extract_start.elapsed().as_millis();
@@ -3770,7 +3753,7 @@ pub(super) async fn fetch_and_store_streaming(
             stage,
         ),
         final_url,
-        fresh_object,
+        None,
     ))
 }
 

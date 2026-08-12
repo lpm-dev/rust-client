@@ -438,6 +438,68 @@ async fn download_to_file_streams_and_hashes() {
 }
 
 #[tokio::test]
+async fn file_spools_share_an_aggregate_compressed_size_budget() {
+    use std::sync::Arc;
+
+    use super::super::tarball::CompressedTarballSpoolBudget;
+
+    let reservation_size = super::super::tarball::COMPRESSED_TARBALL_SPOOL_PERMIT_BYTES;
+    let budget = Arc::new(CompressedTarballSpoolBudget::new(4 * reservation_size));
+    let mut retained = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let reservation = budget.reserve(None, reservation_size).await.unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"data").unwrap();
+        retained.push(
+            DownloadedTarball::new(
+                file,
+                "sha512-fixture".to_string(),
+                "sha512-fixture".to_string(),
+                4,
+                reservation,
+            )
+            .unwrap(),
+        );
+    }
+
+    let waiting_budget = Arc::clone(&budget);
+    let mut waiting =
+        tokio::spawn(async move { waiting_budget.reserve(None, reservation_size).await });
+    tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiting)
+        .await
+        .expect_err("a fifth unknown-size spool must wait for aggregate capacity");
+
+    drop(retained.pop());
+    tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("releasing one spool must unblock the waiting download")
+        .expect("reservation task must not panic")
+        .expect("reservation must succeed");
+}
+
+#[tokio::test]
+async fn file_spool_rejects_retention_larger_than_its_reservation() {
+    use super::super::tarball::CompressedTarballSpoolBudget;
+
+    let budget = CompressedTarballSpoolBudget::new(4);
+    let reservation = budget.reserve(Some(4), 4).await.unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let error = DownloadedTarball::new(
+        file,
+        "sha512-fixture".to_string(),
+        "sha512-fixture".to_string(),
+        5,
+        reservation,
+    )
+    .expect_err("the retained spool must not exceed its reserved capacity");
+
+    assert!(
+        error.to_string().contains("reserved spool size"),
+        "error must explain the aggregate spool invariant: {error}"
+    );
+}
+
+#[tokio::test]
 async fn download_to_file_rejects_oversized_tarball() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1092,6 +1154,45 @@ async fn routed_npm_tarball_download_does_not_attach_lpm_bearer() {
     assert!(
         !saw_authorization.load(Ordering::SeqCst),
         "routed npm tarballs must not receive the LPM session bearer"
+    );
+}
+
+#[tokio::test]
+async fn routed_npm_file_spool_refuses_unconfigured_tarball_origin_before_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let configured_registry = MockServer::start().await;
+    let unconfigured_origin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo/-/foo-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"poisoned-tarball"))
+        .mount(&unconfigured_origin)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_npm_registry_url(configured_registry.uri());
+    let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+    let poisoned_url = format!("{}/foo/-/foo-1.0.0.tgz", unconfigured_origin.uri());
+
+    let error = client
+        .download_tarball_routed(&route_table, "foo", &poisoned_url)
+        .await
+        .expect_err("an unconfigured tarball origin must be rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("origin is not in the configured set")
+    );
+    assert!(
+        unconfigured_origin
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty(),
+        "origin validation must run before starting the request"
     );
 }
 

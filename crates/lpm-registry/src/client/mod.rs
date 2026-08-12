@@ -45,10 +45,13 @@ pub use self::install_accounting::{
 };
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{
-    DownloadedTarball, FanOutStats, HttpClients, PackageMetadataFetchTimings, RegistryClient,
-    TimedPackageMetadata, TimedReleaseTimeMetadata,
+    CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
+    PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata, TimedReleaseTimeMetadata,
 };
-pub use self::tarball::MAX_COMPRESSED_TARBALL_SIZE;
+pub use self::tarball::{
+    MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
+    reserve_compressed_tarball_spool,
+};
 pub use self::url_gate::{
     GateDecision, evaluate_cached_url, is_http_url, is_https_url, is_localhost_url,
 };

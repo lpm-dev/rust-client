@@ -2007,6 +2007,33 @@ fn extract_object_from_file_preserves_integrity_and_security_contract() {
 }
 
 #[test]
+fn extract_object_from_file_returns_fresh_identity_and_canonical_sri() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"file-object\",\"version\":\"1.0.0\"}",
+    )]);
+    let declared_integrity = Integrity::from_bytes(HashAlgorithm::Sha256, &tarball).to_string();
+    let canonical_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &tarball).to_string();
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, &tarball).unwrap();
+
+    let (object, sri, _) = store
+        .extract_object_from_file_with_fresh_integrity(
+            file.path(),
+            &canonical_sri,
+            Some(&declared_integrity),
+        )
+        .unwrap();
+
+    assert_eq!(object.source_sri, canonical_sri);
+    assert_eq!(sri, canonical_sri);
+}
+
+#[test]
 fn extract_object_from_file_rejects_integrity_mismatch_without_publishing_object() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());

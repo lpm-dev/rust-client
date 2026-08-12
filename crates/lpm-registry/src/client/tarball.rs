@@ -4,6 +4,74 @@ use super::*;
 /// malicious registries from exhausting memory or disk before extraction even starts.
 /// Extraction-time limits (5 GB total, 500 MB per file) remain as a second defense.
 pub const MAX_COMPRESSED_TARBALL_SIZE: u64 = 500 * 1024 * 1024;
+/// Maximum aggregate compressed bytes retained in install temp files.
+pub const MAX_COMPRESSED_TARBALL_SPOOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(super) const COMPRESSED_TARBALL_SPOOL_PERMIT_BYTES: u64 = 64 * 1024;
+
+pub(super) fn compressed_tarball_spool_permits(bytes: u64) -> usize {
+    bytes.div_ceil(COMPRESSED_TARBALL_SPOOL_PERMIT_BYTES) as usize
+}
+
+#[derive(Debug)]
+pub(super) struct CompressedTarballSpoolBudget {
+    capacity: Arc<tokio::sync::Semaphore>,
+}
+
+impl CompressedTarballSpoolBudget {
+    pub(super) fn new(bytes: u64) -> Self {
+        Self {
+            capacity: Arc::new(tokio::sync::Semaphore::new(
+                compressed_tarball_spool_permits(bytes),
+            )),
+        }
+    }
+
+    pub(super) async fn reserve(
+        &self,
+        content_length: Option<u64>,
+        per_archive_limit: u64,
+    ) -> Result<CompressedTarballSpoolReservation, LpmError> {
+        let bytes = content_length.unwrap_or(per_archive_limit);
+        if bytes > MAX_COMPRESSED_TARBALL_SPOOL_BYTES {
+            return Err(LpmError::Registry(format!(
+                "compressed tarball spool reservation exceeds aggregate limit ({bytes} bytes > {} bytes limit)",
+                MAX_COMPRESSED_TARBALL_SPOOL_BYTES
+            )));
+        }
+        let permits = u32::try_from(compressed_tarball_spool_permits(bytes)).map_err(|_| {
+            LpmError::Registry(format!(
+                "compressed tarball spool reservation exceeds supported size ({bytes} bytes)"
+            ))
+        })?;
+        let permit = Arc::clone(&self.capacity)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| {
+                LpmError::Registry("compressed tarball spool budget closed unexpectedly".into())
+            })?;
+        Ok(CompressedTarballSpoolReservation {
+            permit,
+            reserved_bytes: bytes,
+        })
+    }
+}
+
+/// Reserve process-wide temp-file capacity for one compressed archive.
+///
+/// A response without `Content-Length` reserves its full per-archive limit so
+/// several incomplete downloads cannot deadlock while incrementally competing
+/// for the remaining capacity. Excess capacity is returned after the spool
+/// completes and its actual size is known.
+pub async fn reserve_compressed_tarball_spool(
+    content_length: Option<u64>,
+    per_archive_limit: u64,
+) -> Result<CompressedTarballSpoolReservation, LpmError> {
+    static BUDGET: std::sync::OnceLock<CompressedTarballSpoolBudget> = std::sync::OnceLock::new();
+    BUDGET
+        .get_or_init(|| CompressedTarballSpoolBudget::new(MAX_COMPRESSED_TARBALL_SPOOL_BYTES))
+        .reserve(content_length, per_archive_limit)
+        .await
+}
 
 impl RegistryClient {
     /// Download a tarball as raw bytes.
@@ -87,6 +155,9 @@ impl RegistryClient {
                 content_length, max_compressed_size
             )));
         }
+        let spool_reservation =
+            reserve_compressed_tarball_spool(response.content_length(), max_compressed_size)
+                .await?;
 
         use base64::Engine;
         use sha2::{Digest, Sha512};
@@ -120,6 +191,7 @@ impl RegistryClient {
                     compressed_size, max_compressed_size
                 )));
             }
+            spool_reservation.ensure_size(compressed_size)?;
             hasher.update(&chunk);
             write_tarball_chunk(&mut temp_file, &chunk)?;
         }
@@ -132,11 +204,13 @@ impl RegistryClient {
             base64::engine::general_purpose::STANDARD.encode(hash)
         );
 
-        Ok(DownloadedTarball {
-            file: temp_file,
+        DownloadedTarball::new(
+            temp_file,
+            sri.clone(),
             sri,
             compressed_size,
-        })
+            spool_reservation,
+        )
     }
 
     /// Streaming variant of [`Self::download_tarball_to_file_with_auth`].
@@ -203,6 +277,9 @@ impl RegistryClient {
                 content_length, max_compressed_size
             )));
         }
+        let spool_reservation =
+            reserve_compressed_tarball_spool(response.content_length(), max_compressed_size)
+                .await?;
 
         use base64::Engine;
         use sha2::{Digest, Sha512};
@@ -239,6 +316,7 @@ impl RegistryClient {
                     compressed_size, max_compressed_size
                 )));
             }
+            spool_reservation.ensure_size(compressed_size)?;
             hasher.update(&chunk);
             write_tarball_chunk(&mut temp_file, &chunk)?;
         }
@@ -252,11 +330,13 @@ impl RegistryClient {
             base64::engine::general_purpose::STANDARD.encode(hash)
         );
 
-        Ok(DownloadedTarball {
-            file: temp_file,
+        DownloadedTarball::new(
+            temp_file,
+            sri.clone(),
             sri,
             compressed_size,
-        })
+            spool_reservation,
+        )
     }
 
     /// Streaming tarball download — low-allocation fast path.
@@ -343,9 +423,11 @@ impl RegistryClient {
                 self.download_tarball_to_file_with_auth(url, auth).await
             }
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
+                self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_to_file(url).await
             }
             crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
+                self.ensure_configured_tarball_origin(url)?;
                 self.download_tarball_to_file_with_auth(url, None).await
             }
         }
@@ -546,12 +628,16 @@ impl RegistryClient {
 
         let downloaded = self.download_tarball_to_file(url).await?;
         let expected = Integrity::parse(expected_integrity)?;
-        expected.verify_file(downloaded.file.path())?;
-        Ok(DownloadedTarball {
-            file: downloaded.file,
-            sri: expected.to_string(),
-            compressed_size: downloaded.compressed_size,
-        })
+        let path = downloaded.file.path().to_path_buf();
+        let expected_for_verification = expected.clone();
+        tokio::task::spawn_blocking(move || expected_for_verification.verify_file(&path))
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!("tarball integrity task panicked: {error}"))
+            })??;
+        let mut downloaded = downloaded;
+        downloaded.sri = expected.to_string();
+        Ok(downloaded)
     }
 }
 

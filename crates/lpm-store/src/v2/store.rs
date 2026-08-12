@@ -1069,6 +1069,54 @@ impl Store {
         .map(|(object, timings)| (object.path, timings))
     }
 
+    /// Extract a downloaded file-backed tarball and return the fresh object
+    /// proof used by same-task link population. The caller must supply the
+    /// SHA-512 SRI computed while writing this exact file. The object key is
+    /// therefore canonical, independent of the declaration's algorithm.
+    pub fn extract_object_from_file_with_fresh_integrity(
+        &self,
+        tarball_path: &Path,
+        canonical_sri: &str,
+        expected_integrity: Option<&str>,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        self.extract_object_from_file_with_fresh_integrity_timed(
+            tarball_path,
+            canonical_sri,
+            expected_integrity,
+        )
+        .map(|(object, sri, timings, _)| (object, sri, timings))
+    }
+
+    /// File-backed extraction with the integrity-verification wall time.
+    pub fn extract_object_from_file_with_fresh_integrity_timed(
+        &self,
+        tarball_path: &Path,
+        canonical_sri: &str,
+        expected_integrity: Option<&str>,
+    ) -> Result<(ExtractedObject, String, StageTimings, u128), LpmError> {
+        if Integrity::parse(canonical_sri)?.algorithm != HashAlgorithm::Sha512 {
+            return Err(LpmError::InvalidIntegrity(
+                "virtual-store object identity must use sha512".to_string(),
+            ));
+        }
+        let expected = expected_integrity
+            .filter(|expected| *expected != canonical_sri)
+            .map(Integrity::parse)
+            .transpose()?;
+        let verification_start = std::time::Instant::now();
+        if let Some(expected) = &expected {
+            expected.verify_file(tarball_path)?;
+        }
+        let verification_ms = verification_start.elapsed().as_millis();
+        let file = std::fs::File::open(tarball_path).map_err(LpmError::Io)?;
+        let (object, timings) = self.extract_object_from_input_with_policy(
+            canonical_sri,
+            TarballInput::File(std::io::BufReader::new(file)),
+            self.object_integrity_policy,
+        )?;
+        Ok((object, canonical_sri.to_string(), timings, verification_ms))
+    }
+
     fn extract_object_with_timings_and_policy(
         &self,
         sri: &str,
@@ -1229,7 +1277,7 @@ impl Store {
                 inspect_entry,
             ),
             (TarballInput::File(reader), true) => {
-                lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                lpm_extractor::extract_tarball_from_reader_hybrid_with_entry_digests(
                     reader,
                     &tmp_dir,
                     buffer_predicate,
@@ -1237,7 +1285,7 @@ impl Store {
                 )
             }
             (TarballInput::File(reader), false) => {
-                lpm_extractor::extract_tarball_from_reader_streaming_with_inspector(
+                lpm_extractor::extract_tarball_from_reader_hybrid_with_inspector(
                     reader,
                     &tmp_dir,
                     buffer_predicate,
@@ -1415,16 +1463,13 @@ impl Store {
     /// `expected_integrity` if provided, then delegates to
     /// [`Self::extract_object_with_timings`].
     ///
-    /// This is the install pipeline's v2 entry point: it pairs with
-    /// the post-W6a flow that buffers `response.bytes()` into memory
-    /// before extracting (the permit is released between download
-    /// and extract, so the buffer doesn't pin a network slot).
+    /// This remains the byte-slice entry point for callers that already own
+    /// an archive buffer. Install downloads use the file-backed sibling so
+    /// compressed bodies do not accumulate on the heap.
     ///
     /// `expected_integrity` is the registry-supplied SRI. If `Some`
-    /// and starts with `sha512-`, mismatch returns
-    /// [`LpmError::IntegrityMismatch`]. Non-sha512 expected values
-    /// are logged + trusted (matches v1's
-    /// `stream_and_store_package` policy at lib.rs:644-658).
+    /// and uses SHA-1, SHA-256, or SHA-512, mismatch returns
+    /// [`LpmError::IntegrityMismatch`].
     pub fn extract_object_from_bytes(
         &self,
         tarball_data: &[u8],

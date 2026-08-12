@@ -476,6 +476,212 @@ async fn buffered_download_keeps_its_slot_until_extraction_can_start() {
 }
 
 #[tokio::test]
+async fn tarball_url_download_releases_network_slot_while_extraction_is_blocked() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/foo.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/foo.tgz", server.uri());
+
+    let store_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let package = install_package_for_tarball(&url, None);
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let download_permit = download_semaphore.clone().acquire_owned().await.unwrap();
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let held_extract_permit = extract_semaphore.clone().acquire_owned().await.unwrap();
+    let limiter = Some(extract_semaphore);
+
+    let fetch = tokio::spawn(async move {
+        fetch_and_store_tarball_url(
+            &client,
+            &store,
+            None,
+            &package,
+            0,
+            download_permit,
+            &limiter,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if download_semaphore.available_permits() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a completed file-backed download must release its network slot before extraction");
+
+    drop(held_extract_permit);
+    fetch
+        .await
+        .expect("tarball fetch task must not panic")
+        .expect("tarball fetch must finish after extraction unblocks");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tarball_url_v2_extraction_does_not_block_async_progress() {
+    use std::io::Read;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    let size = 128 * 1024 * 1024;
+    let mut header = tar::Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(
+            &mut header,
+            "package/payload.bin",
+            std::io::repeat(0).take(size),
+        )
+        .unwrap();
+    let encoder = builder.into_inner().unwrap();
+    let body = encoder.finish().unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/large.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/large.tgz", server.uri());
+
+    let store_root = tempfile::tempdir().unwrap();
+    let store_v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(store_v2_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let package = install_package_for_tarball(&url, None);
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let download_permit = download_semaphore.clone().acquire_owned().await.unwrap();
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let held_extract_permit = extract_semaphore.clone().acquire_owned().await.unwrap();
+    let limiter = Some(extract_semaphore);
+
+    let fetch = tokio::spawn(async move {
+        fetch_and_store_tarball_url(
+            &client,
+            &store,
+            Some(&store_v2),
+            &package,
+            0,
+            download_permit,
+            &limiter,
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while download_semaphore.available_permits() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("download must finish before the responsiveness check");
+
+    drop(held_extract_permit);
+    let yield_start = std::time::Instant::now();
+    tokio::task::yield_now().await;
+    assert!(
+        yield_start.elapsed() < std::time::Duration::from_millis(50),
+        "file verification and extraction must leave the async worker responsive"
+    );
+    fetch
+        .await
+        .expect("tarball fetch task must not panic")
+        .expect("tarball fetch must succeed");
+}
+
+#[tokio::test]
+async fn default_v2_registry_download_releases_network_slot_while_extraction_is_blocked() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!(
+        "{}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz",
+        server.uri()
+    );
+
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(server.uri()));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+{}", server.uri());
+    package.integrity = Some(integrity);
+    package.tarball_url = Some(url);
+    let gate_stats = Arc::new(GateStats::default());
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let download_permit = download_semaphore.clone().acquire_owned().await.unwrap();
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let held_extract_permit = extract_semaphore.clone().acquire_owned().await.unwrap();
+    let limiter = Some(extract_semaphore);
+
+    let fetch = tokio::spawn(async move {
+        fetch_and_store_streaming(
+            &client,
+            &route_table,
+            &store,
+            Some(&store_v2),
+            &package,
+            0,
+            ArtifactSelection::LockfileReplay,
+            &gate_stats,
+            download_permit,
+            &limiter,
+            ManagedInstallAccounting,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if download_semaphore.available_permits() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a completed V2 download must release its network slot before extraction");
+
+    drop(held_extract_permit);
+    fetch
+        .await
+        .expect("registry fetch task must not panic")
+        .expect("registry fetch must finish after extraction unblocks");
+}
+
+#[tokio::test]
 async fn tarball_url_install_v2_returns_canonical_sri_for_sha256_declaration() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
