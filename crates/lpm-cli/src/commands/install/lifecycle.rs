@@ -347,6 +347,8 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         if session.is_active() {
             let amber_requests = collect_amber_classification_requests(
                 store,
+                lpm_root,
+                baseline_index.as_ref(),
                 &installed_with_integrity,
                 publish_ages,
                 min_release_age_secs,
@@ -846,6 +848,8 @@ pub(super) fn read_trusted_deps_from_manifest(
 /// both downstream consumers on which packages are amber-eligible.
 pub(super) fn collect_amber_classification_requests(
     store: &lpm_store::PackageStore,
+    lpm_root: &lpm_common::LpmRoot,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
     packages: &[(String, String, Option<String>)],
     publish_ages: &std::collections::HashMap<(String, String), u64>,
     min_release_age_secs: u64,
@@ -854,7 +858,21 @@ pub(super) fn collect_amber_classification_requests(
     use lpm_security::triage::StaticTier;
     let mut out = Vec::new();
     for (name, version, integrity) in packages {
-        let pkg_dir = store.package_dir(name, version);
+        let pkg_dir = match baseline_index {
+            Some(index) => {
+                let Some(baseline) = lpm_store::find_installed_package_baseline_by_identity_indexed(
+                    index,
+                    lpm_root,
+                    name,
+                    version,
+                    integrity.as_deref(),
+                ) else {
+                    continue;
+                };
+                baseline.package_dir
+            }
+            None => store.package_dir(name, version),
+        };
         let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
         if bodies.is_empty() {
             continue;
