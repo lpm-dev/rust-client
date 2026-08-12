@@ -206,6 +206,7 @@ pub(crate) async fn run_recursive_workspace_install(
                         workspace_resolution::root_provider_fingerprint_from_projection(
                             &workspace.root,
                             &lockfile,
+                            options.omit_policy,
                         )
                     })
             })
@@ -1054,16 +1055,23 @@ fn target_lockfile_is_replay_ready(
         return false;
     }
 
+    let Ok(route_table) = RouteTable::from_env_and_filesystem(project_dir) else {
+        return false;
+    };
+    let client = RegistryClient::new();
     super::lockfile::lockfile_satisfies_fast_path_with_packages(
         lockfile,
         packages,
-        project_dir,
-        &deps,
-        &catalog_resolutions,
-        Some(workspace),
-        super::lockfile::LockfileReplayPolicy {
-            accept_unsafe_sources: false,
-            emit_warnings: false,
+        super::lockfile::LockfileReplayInput {
+            lockfile_dir: project_dir,
+            deps: &deps,
+            catalog_resolutions: &catalog_resolutions,
+            workspace: Some(workspace),
+            registry_source: RegistrySourceContext::new(&route_table, &client),
+            policy: super::lockfile::LockfileReplayPolicy {
+                accept_unsafe_sources: false,
+                emit_warnings: false,
+            },
         },
     )
 }
@@ -2216,6 +2224,9 @@ mod tests {
         importer_spec: &str,
     ) {
         let mut lockfile = lpm_lockfile::Lockfile::new();
+        let source = "registry+https://registry.npmjs.org";
+        let instance_id =
+            lpm_common::PackageInstanceId::derive("lodash", "4.17.21", source, "root/lodash");
         let mut importer = validation::importer_snapshot_for_current_manifest(
             package,
             &HashMap::new(),
@@ -2230,10 +2241,14 @@ mod tests {
             .insert("lodash".to_string(), importer_spec.to_string());
         lockfile.importers.insert(".".to_string(), importer);
         lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
-            source: Some("registry+https://registry.npmjs.org".to_string()),
+            source: Some(source.to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2244,8 +2259,18 @@ mod tests {
             dependencies: Vec::new(),
             alias_dependencies: Vec::new(),
             peers: Vec::new(),
+            peer_edges: Vec::new(),
             tarball: None,
         });
+        lockfile.root_resolutions.insert(
+            "lodash".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: "lodash".to_string(),
+                version: "4.17.21".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
         lockfile
             .write_to_file(&project_dir.join(lpm_lockfile::LOCKFILE_NAME))
             .expect("write replay-ready lockfile");

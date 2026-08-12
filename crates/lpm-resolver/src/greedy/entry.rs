@@ -248,6 +248,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
             )
             .await;
             process_edge_with_preferred(&edge, &info, preferred, &mut state)?;
+            state.flush_selected_packages().await;
         }
 
         // Outer: peer-drain pass. Skips synthesis when
@@ -322,6 +323,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     // consumes the state.
     let platform_skipped = state.platform_skipped;
     let root_aliases = std::mem::take(&mut state.root_aliases);
+    let root_resolutions = state.root_resolutions();
     // Drain ambient peer installs and dedup+sort. Same canonical
     // can be synthesized once per fixed-point iteration (a transitive
     // peer chain), so dedup before exposing.
@@ -340,7 +342,6 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     let applied_overrides = state.overrides.take_hits();
     let work_stats = state.work_stats;
     let peer_timing = state.peer_work_stats.snapshot();
-    let root_resolutions = state.root_resolutions();
     let packages = state.into_resolved_packages(&cache, &root_aliases);
     let (
         selected_package_count,
@@ -352,7 +353,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     let policy_snap = crate::profile::policy_summary();
     Ok(ResolveResult {
         packages,
-        cache,
+        cache: Arc::new(cache),
         applied_overrides,
         platform_skipped,
         // Root aliases: populated during seed_root_edges when a root dep

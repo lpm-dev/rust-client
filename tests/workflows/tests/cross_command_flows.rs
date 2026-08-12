@@ -73,6 +73,8 @@ fn bind_lockfile_integrity(project: &TempProject, name: &str, version: &str, int
         .find(|package| package.name == name && package.version == version)
         .expect("fixture lockfile must contain seeded package");
     package.integrity = Some(integrity);
+    lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(name, name, version)]);
     lockfile
         .write_all(&lockfile_path)
         .expect("bind fixture lockfile to seeded v2 object");
@@ -274,7 +276,7 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
     );
     assert!(
         project.file_exists("lpm.lockb"),
-        "migrate must produce lpm.lockb"
+        "the v12 migration staging lockfile must retain its supported binary companion"
     );
 
     // Step 2: seed the store with the package referenced in the
@@ -345,8 +347,8 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
         String::from_utf8_lossy(&out_rebuild.stderr)
     );
     assert!(
-        project.file_exists("lpm.lockb"),
-        "rebuild --dry-run mutated state: lpm.lockb disappeared. \
+        !project.file_exists("lpm.lockb"),
+        "rebuild --dry-run created a binary companion that cannot represent v13 exact instances. \
          stderr={}",
         String::from_utf8_lossy(&out_rebuild.stderr)
     );
@@ -499,15 +501,17 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
   "dependencies": { "ms": "^2.1.3" }
 }"#,
     );
-    // Author a toml-only lockfile so doctor --fix has work to do
-    // (regenerate lpm.lockb + write .gitattributes).
-    let lockfile = format!(
-        "[metadata]\nlockfile-version = {}\nresolved-with = \"greedy-fusion\"\n\n\
-         [[packages]]\nname = \"ms\"\nversion = \"2.1.3\"\nintegrity = \"{}\"\n",
-        lpm_lockfile::LOCKFILE_VERSION,
-        integrity,
-    );
-    project.write_file("lpm.lock", &lockfile);
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "ms".to_string(),
+        version: "2.1.3".to_string(),
+        integrity: Some(integrity),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[("ms", "ms", "2.1.3")]);
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .expect("write doctor fixture lockfile");
     assert!(
         !project.file_exists(".gitattributes"),
         "precondition: .gitattributes must be absent so doctor --fix has work"

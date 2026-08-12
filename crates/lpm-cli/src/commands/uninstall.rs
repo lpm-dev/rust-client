@@ -498,14 +498,6 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
     };
     reconcile_importer_dependencies(&mut lockfile, &manifest);
 
-    let package_key = |name: &str, version: &str| -> String {
-        let mut key = String::with_capacity(name.len() + 1 + version.len());
-        key.push_str(name);
-        key.push('\x00');
-        key.push_str(version);
-        key
-    };
-
     if direct_specs.is_empty() {
         let removed_packages = lockfile
             .packages
@@ -517,73 +509,75 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
             .collect();
         lockfile.packages.clear();
         lockfile.root_aliases.clear();
+        lockfile.root_resolutions.clear();
         lockfile.ambient_peer_installs.clear();
         workspace_lockfile::write(project_dir, lockfile)
             .map_err(|e| LpmError::Registry(e.to_string()))?;
         return Ok(LockfilePruneReport { removed_packages });
     }
 
-    let package_index: HashMap<String, &lpm_lockfile::LockedPackage> = lockfile
-        .packages
-        .iter()
-        .map(|pkg| (package_key(&pkg.name, &pkg.version), pkg))
-        .collect();
-    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-
-    for (local, requested_spec) in &direct_specs {
-        let target = lockfile
-            .root_aliases
-            .get(local)
-            .cloned()
-            .unwrap_or_else(|| local.clone());
-        if let Some(candidate) =
-            select_locked_package_for_requested_spec(&lockfile, &target, requested_spec)
-        {
-            queue.push_back(package_key(&candidate.name, &candidate.version));
-        }
-    }
-
-    while let Some(next) = queue.pop_front() {
-        if !reachable.insert(next.clone()) {
-            continue;
-        }
-        let Some(pkg) = package_index.get(&next) else {
-            continue;
-        };
-
-        for dep in pkg.dependencies.iter().chain(pkg.peers.iter()) {
-            let Some((local_name, version)) = split_locked_dependency(dep) else {
-                continue;
-            };
-            let target = pkg
-                .alias_dependencies
-                .iter()
-                .find(|pair| pair[0] == local_name)
-                .map_or(local_name, |pair| pair[1].as_str());
-            let dep_key = package_key(target, version);
-            if package_index.contains_key(&dep_key) {
-                queue.push_back(dep_key);
-            }
-        }
-    }
+    let exact_schema =
+        lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES;
+    let reachable_instances = if exact_schema {
+        Some(
+            exact_reachable_instances(&lockfile, &direct_specs).ok_or_else(|| {
+                LpmError::Registry(
+                    "current lockfile is missing an exact dependency target; run lpm install"
+                        .to_string(),
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    let reachable_artifacts = if exact_schema {
+        None
+    } else {
+        Some(legacy_reachable_artifacts(&lockfile, &direct_specs))
+    };
 
     let removed_packages = lockfile
         .packages
         .iter()
-        .filter(|pkg| !reachable.contains(&package_key(&pkg.name, &pkg.version)))
+        .filter(|package| {
+            if let Some(reachable) = reachable_instances.as_ref() {
+                package
+                    .instance_id
+                    .is_none_or(|instance_id| !reachable.contains(&instance_id))
+            } else {
+                reachable_artifacts.as_ref().is_none_or(|reachable| {
+                    !reachable.contains(&(package.name.clone(), package.version.clone()))
+                })
+            }
+        })
         .map(|pkg| PackageVersion {
             name: pkg.name.clone(),
             version: pkg.version.clone(),
         })
         .collect();
 
-    lockfile
-        .packages
-        .retain(|pkg| reachable.contains(&package_key(&pkg.name, &pkg.version)));
+    lockfile.packages.retain(|package| {
+        if let Some(reachable) = reachable_instances.as_ref() {
+            package
+                .instance_id
+                .is_some_and(|instance_id| reachable.contains(&instance_id))
+        } else {
+            reachable_artifacts.as_ref().is_some_and(|reachable| {
+                reachable.contains(&(package.name.clone(), package.version.clone()))
+            })
+        }
+    });
     lockfile
         .root_aliases
         .retain(|local, _| direct_specs.contains_key(local));
+    lockfile.root_resolutions.retain(|local, root| {
+        direct_specs.contains_key(local)
+            && root.instance_id.is_none_or(|instance_id| {
+                reachable_instances
+                    .as_ref()
+                    .is_none_or(|reachable| reachable.contains(&instance_id))
+            })
+    });
 
     let kept_names: std::collections::HashSet<&str> = lockfile
         .packages
@@ -598,6 +592,80 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
         .map_err(|e| LpmError::Registry(e.to_string()))?;
 
     Ok(LockfilePruneReport { removed_packages })
+}
+
+fn exact_reachable_instances(
+    lockfile: &lpm_lockfile::Lockfile,
+    direct_specs: &HashMap<String, String>,
+) -> Option<HashSet<lpm_common::PackageInstanceId>> {
+    let package_index = lockfile
+        .packages
+        .iter()
+        .filter_map(|package| package.instance_id.map(|id| (id, package)))
+        .collect::<HashMap<_, _>>();
+    let mut queue = std::collections::VecDeque::with_capacity(lockfile.packages.len());
+    for local in direct_specs.keys() {
+        queue.push_back(lockfile.root_resolutions.get(local)?.instance_id?);
+    }
+
+    let mut reachable = HashSet::with_capacity(lockfile.packages.len());
+    while let Some(instance_id) = queue.pop_front() {
+        if !reachable.insert(instance_id) {
+            continue;
+        }
+        let package = package_index.get(&instance_id)?;
+        queue.extend(package.dependency_targets.values().copied());
+        queue.extend(package.peer_targets.values().copied());
+    }
+    Some(reachable)
+}
+
+fn legacy_reachable_artifacts(
+    lockfile: &lpm_lockfile::Lockfile,
+    direct_specs: &HashMap<String, String>,
+) -> HashSet<(String, String)> {
+    let package_index = lockfile
+        .packages
+        .iter()
+        .map(|package| ((package.name.clone(), package.version.clone()), package))
+        .collect::<HashMap<_, _>>();
+    let mut queue = std::collections::VecDeque::new();
+    for (local, requested_spec) in direct_specs {
+        let target = lockfile
+            .root_aliases
+            .get(local)
+            .map_or(local.as_str(), String::as_str);
+        if let Some(candidate) =
+            select_locked_package_for_requested_spec(lockfile, target, requested_spec)
+        {
+            queue.push_back((candidate.name.clone(), candidate.version.clone()));
+        }
+    }
+
+    let mut reachable = HashSet::new();
+    while let Some(next) = queue.pop_front() {
+        if !reachable.insert(next.clone()) {
+            continue;
+        }
+        let Some(package) = package_index.get(&next) else {
+            continue;
+        };
+        for dependency in package.dependencies.iter().chain(&package.peers) {
+            let Some((local_name, version)) = split_locked_dependency(dependency) else {
+                continue;
+            };
+            let target = package
+                .alias_dependencies
+                .iter()
+                .find(|pair| pair[0] == local_name)
+                .map_or(local_name, |pair| pair[1].as_str());
+            let key = (target.to_string(), version.to_string());
+            if package_index.contains_key(&key) {
+                queue.push_back(key);
+            }
+        }
+    }
+    reachable
 }
 
 /// per-manifest uninstall helper.
@@ -1308,6 +1376,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lockfile_prune_keeps_only_the_exact_contextual_dependency_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "registry+https://registry.npmjs.org";
+        let parent_id =
+            lpm_common::PackageInstanceId::derive("parent", "1.0.0", source, "root/parent");
+        let selected_child_id =
+            lpm_common::PackageInstanceId::derive("child", "1.0.0", source, "root/parent/child");
+        let unrelated_child_id =
+            lpm_common::PackageInstanceId::derive("child", "1.0.0", source, "root/unrelated/child");
+        write_package_json(
+            directory.path(),
+            &json!({"name": "demo", "dependencies": {"parent": "1.0.0"}}),
+        );
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(parent_id),
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            dependencies: vec!["child@1.0.0".to_string()],
+            dependency_targets: BTreeMap::from([("child".to_string(), selected_child_id)]),
+            ..Default::default()
+        });
+        for instance_id in [selected_child_id, unrelated_child_id] {
+            lockfile.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: "child".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                ..Default::default()
+            });
+        }
+        lockfile.root_resolutions.insert(
+            "parent".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(parent_id),
+                package: "parent".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
+        lockfile.root_resolutions.insert(
+            "unrelated-child".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(unrelated_child_id),
+                package: "child".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
+        lockfile
+            .write_all(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
+            .unwrap();
+
+        prune_lockfile_to_current_manifest(directory.path()).unwrap();
+
+        let pruned = lpm_lockfile::Lockfile::read_for_project(directory.path())
+            .unwrap()
+            .lockfile;
+        assert_eq!(pruned.packages.len(), 2);
+        assert!(
+            pruned
+                .packages
+                .iter()
+                .any(|package| package.instance_id == Some(selected_child_id))
+        );
+        assert!(
+            !pruned
+                .packages
+                .iter()
+                .any(|package| package.instance_id == Some(unrelated_child_id))
+        );
+        assert_eq!(
+            pruned.root_resolutions["parent"].instance_id,
+            Some(parent_id)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn uninstall_from_project_removes_symlink_in_node_modules() {
@@ -1491,12 +1638,30 @@ mod tests {
     fn write_workspace_union_lockfile(root: &Path, importers: &[(&str, &str, &str)]) {
         let mut union = lpm_lockfile::Lockfile::new();
         for (importer, package, version) in importers {
+            let source = "registry+https://registry.npmjs.org";
+            let instance_id = lpm_common::PackageInstanceId::derive(
+                package,
+                version,
+                source,
+                &format!("{importer}/{package}"),
+            );
             let mut projection = lpm_lockfile::Lockfile::new();
             projection.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
                 name: (*package).to_string(),
                 version: (*version).to_string(),
+                source: Some(source.to_string()),
                 ..lpm_lockfile::LockedPackage::default()
             });
+            projection.root_resolutions.insert(
+                (*package).to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: (*package).to_string(),
+                    version: (*version).to_string(),
+                    source: Some(source.to_string()),
+                },
+            );
             projection.importers.insert(
                 ".".to_string(),
                 lpm_lockfile::ImporterSnapshot {
@@ -1504,6 +1669,7 @@ mod tests {
                         (*package).to_string(),
                         (*version).to_string(),
                     )]),
+                    root_resolutions: projection.root_resolutions.clone(),
                     ..lpm_lockfile::ImporterSnapshot::default()
                 },
             );

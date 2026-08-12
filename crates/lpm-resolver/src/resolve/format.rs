@@ -5,6 +5,7 @@ pub(super) fn root_resolutions_from_solution(
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
 ) -> HashMap<String, RootResolution> {
+    let resolution_ids = resolution_ids_from_solution(solution);
     let mut resolutions = HashMap::with_capacity(root_dependencies.dependencies.len());
     for local_name in root_dependencies.dependencies.keys() {
         let target = root_aliases
@@ -20,12 +21,32 @@ pub(super) fn root_resolutions_from_solution(
         resolutions.insert(
             local_name.clone(),
             RootResolution {
+                target: resolution_ids[package],
                 package: package.canonical_name(),
                 version: version.to_string(),
             },
         );
     }
     resolutions
+}
+
+fn resolution_ids_from_solution(
+    solution: &pubgrub::SelectedDependencies<LpmDependencyProvider>,
+) -> HashMap<ResolverPackage, lpm_common::ResolutionNodeId> {
+    let mut packages = solution
+        .keys()
+        .filter(|package| !package.is_root())
+        .cloned()
+        .collect::<Vec<_>>();
+    packages.sort_by_key(ResolverPackage::to_string);
+    packages
+        .into_iter()
+        .enumerate()
+        .map(|(index, package)| {
+            let id = u32::try_from(index).unwrap_or(u32::MAX);
+            (package, lpm_common::ResolutionNodeId::new(id))
+        })
+        .collect()
 }
 
 /// Convert PubGrub solution + cached metadata into `ResolvedPackage` list
@@ -37,19 +58,19 @@ pub(super) fn format_solution(
     root_aliases: &HashMap<String, String>,
     skipped_dependencies: Vec<SkippedDependency>,
 ) -> Result<(Vec<ResolvedPackage>, usize), ResolveError> {
-    // Build a lookup: canonical_name → resolved_version for cross-referencing deps
-    let resolved_versions: HashMap<String, String> = solution
+    let resolution_ids = resolution_ids_from_solution(&solution);
+    let resolved_versions: HashMap<ResolverPackage, String> = solution
         .iter()
         .filter(|(pkg, _)| !pkg.is_root())
-        .map(|(pkg, ver)| (pkg.canonical_name(), ver.to_string()))
+        .map(|(pkg, ver)| (pkg.clone(), ver.to_string()))
         .collect();
-    let resolved_peer_versions: HashMap<String, Vec<(Option<String>, String)>> = solution
+    let resolved_peer_versions: HashMap<String, Vec<(ResolverPackage, String)>> = solution
         .iter()
         .filter(|(pkg, _)| !pkg.is_root())
         .fold(HashMap::new(), |mut acc, (pkg, ver)| {
             acc.entry(pkg.canonical_name())
                 .or_default()
-                .push((pkg.context().map(str::to_string), ver.to_string()));
+                .push((pkg.clone(), ver.to_string()));
             acc
         });
 
@@ -58,6 +79,7 @@ pub(super) fn format_solution(
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(package, version)| {
             let ver_str = version.to_string();
+            let parent_identity = package.to_string();
             // Cache is canonical-keyed. Split-retry identities of the
             // same canonical package share one entry, so every lookup
             // canonicalizes.
@@ -75,11 +97,10 @@ pub(super) fn format_solution(
 
             // Look up this package's declared deps from the provider
             // cache. `ver_deps` is keyed by the LOCAL dep name (what
-            // appears in the parent's `dependencies` map). To look up
-            // the resolved version in `resolved_versions` (keyed by
-            // the child's canonical registry name) we redirect through
-            // the per-version alias map.
-            let dependencies = cache
+            // appears in the parent's `dependencies` map). Alias targets
+            // and split children must use the same resolver identity that
+            // the provider constructed for this parent.
+            let resolved_dependencies = cache
                 .get(&key)
                 .and_then(|info| info.deps.get(&ver_str))
                 .map(|ver_deps| {
@@ -89,12 +110,40 @@ pub(super) fn format_solution(
                             let target_name = cached_aliases
                                 .get(local_name)
                                 .map_or(local_name.as_str(), String::as_str);
+                            let target = ResolverPackage::from_dep_name(target_name);
+                            let split_target = target.with_context(&parent_identity);
                             resolved_versions
-                                .get(target_name)
-                                .map(|resolved_ver| (local_name.clone(), resolved_ver.clone()))
+                                .get(&split_target)
+                                .or_else(|| resolved_versions.get(&target))
+                                .map(|resolved_ver| {
+                                    let exact_target =
+                                        if resolved_versions.contains_key(&split_target) {
+                                            split_target
+                                        } else {
+                                            target
+                                        };
+                                    (
+                                        local_name.clone(),
+                                        resolved_ver.clone(),
+                                        resolution_ids[&exact_target],
+                                    )
+                                })
                         })
                         .collect::<Vec<_>>()
                 })
+                .unwrap_or_default();
+            let dependencies = resolved_dependencies
+                .iter()
+                .map(|(local, version, _)| (local.clone(), version.clone()))
+                .collect::<Vec<_>>();
+            let dependency_targets = resolved_dependencies
+                .iter()
+                .map(|(local, _, target)| (local.clone(), *target))
+                .collect::<HashMap<_, _>>();
+            let optional_dependencies = cache
+                .get(&key)
+                .and_then(|info| info.optional_dep_names.get(&ver_str))
+                .cloned()
                 .unwrap_or_default();
 
             // Only surface aliases that actually survived resolution —
@@ -130,26 +179,42 @@ pub(super) fn format_solution(
             // versions lookup. Missing peers simply don't appear in
             // the output Vec — the linker / GraphKey only cares about
             // peers that ARE present.
-            let peers = compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions);
+            let peer_bindings =
+                compute_resolved_peers(&package, &ver_str, cache, &resolved_peer_versions)?;
+            let peer_targets = peer_bindings
+                .iter()
+                .filter_map(|(peer, provider)| {
+                    resolution_ids
+                        .get(provider)
+                        .copied()
+                        .map(|target| (peer.local_name.clone(), target))
+                })
+                .collect();
+            let peers = peer_bindings.into_iter().map(|(peer, _)| peer).collect();
 
-            ResolvedPackage {
+            Ok(ResolvedPackage {
+                resolution_id: resolution_ids[&package],
                 package,
                 version,
                 dependencies,
+                dependency_targets,
+                optional_dependencies,
                 aliases,
                 peers,
+                peer_targets,
                 tarball_url,
                 integrity,
                 platform,
                 node_engine,
                 optional: false,
-            }
+            })
         })
-        .collect();
-    mark_optional_reachability(&mut resolved, cache, root_dependencies, root_aliases);
+        .collect::<Result<_, ResolveError>>()?;
+    let root_resolutions =
+        root_resolutions_from_solution_for_ids(&resolved, root_dependencies, root_aliases);
+    mark_optional_reachability(&mut resolved, root_dependencies, &root_resolutions);
     let platform_skipped =
         validate_selected_dependency_skips(&resolved, cache, skipped_dependencies)?;
-    dedupe_peer_superset_packages(&mut resolved);
     resolved.sort_by_key(|a| a.package.to_string());
     Ok((resolved, platform_skipped))
 }
@@ -218,27 +283,44 @@ fn validate_selected_dependency_skips(
     Ok(platform_skipped)
 }
 
-pub(crate) fn mark_optional_reachability(
-    packages: &mut [ResolvedPackage],
-    cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+fn root_resolutions_from_solution_for_ids(
+    packages: &[ResolvedPackage],
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
+) -> HashMap<String, RootResolution> {
+    let mut roots = HashMap::with_capacity(root_dependencies.dependencies.len());
+    for local in root_dependencies.dependencies.keys() {
+        let target = root_aliases
+            .get(local)
+            .map_or(local.as_str(), String::as_str);
+        if let Some(package) = packages.iter().find(|package| {
+            package.package.canonical_name() == target && package.package.context().is_none()
+        }) {
+            roots.insert(
+                local.clone(),
+                RootResolution {
+                    target: package.resolution_id,
+                    package: target.to_string(),
+                    version: package.version.to_string(),
+                },
+            );
+        }
+    }
+    roots
+}
+
+pub(crate) fn mark_optional_reachability(
+    packages: &mut [ResolvedPackage],
+    root_dependencies: &RootDependencies,
+    root_resolutions: &HashMap<String, RootResolution>,
 ) {
     if packages.is_empty() {
         return;
     }
 
-    let mut by_name: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
-    let mut by_name_version: HashMap<(String, String), Vec<usize>> =
-        HashMap::with_capacity(packages.len());
+    let mut by_id = HashMap::with_capacity(packages.len());
     for (idx, package) in packages.iter().enumerate() {
-        let name = package.package.canonical_name();
-        let version = package.version.to_string();
-        by_name.entry(name.clone()).or_default().push(idx);
-        by_name_version
-            .entry((name, version))
-            .or_default()
-            .push(idx);
+        by_id.insert(package.resolution_id, idx);
     }
 
     let mut required = vec![false; packages.len()];
@@ -247,42 +329,29 @@ pub(crate) fn mark_optional_reachability(
         if root_dependencies.is_optional(local_name) {
             continue;
         }
-        let target = root_aliases
-            .get(local_name)
-            .map_or(local_name.as_str(), String::as_str);
-        if let Some(indices) = by_name.get(target) {
-            for &idx in indices {
-                if !required[idx] {
-                    required[idx] = true;
-                    queue.push_back(idx);
-                }
-            }
+        if let Some(root) = root_resolutions.get(local_name)
+            && let Some(&idx) = by_id.get(&root.target)
+            && !required[idx]
+        {
+            required[idx] = true;
+            queue.push_back(idx);
         }
     }
 
     while let Some(idx) = queue.pop_front() {
         let package = &packages[idx];
-        let key = CanonicalKey::from(&package.package);
-        let version = package.version.to_string();
-        let optional_names = cache
-            .get(&key)
-            .and_then(|info| info.optional_dep_names.get(&version));
-
-        for (local_name, dep_version) in &package.dependencies {
-            if optional_names.is_some_and(|names| names.contains(local_name)) {
+        for (local_name, _) in &package.dependencies {
+            if package.optional_dependencies.contains(local_name) {
                 continue;
             }
-            let target = package
-                .aliases
-                .get(local_name)
-                .map_or(local_name.as_str(), String::as_str);
-            if let Some(indices) = by_name_version.get(&(target.to_string(), dep_version.clone())) {
-                for &next_idx in indices {
-                    if !required[next_idx] {
-                        required[next_idx] = true;
-                        queue.push_back(next_idx);
-                    }
-                }
+            let Some(&target) = package.dependency_targets.get(local_name) else {
+                continue;
+            };
+            if let Some(&next_idx) = by_id.get(&target)
+                && !required[next_idx]
+            {
+                required[next_idx] = true;
+                queue.push_back(next_idx);
             }
         }
     }
@@ -292,105 +361,11 @@ pub(crate) fn mark_optional_reachability(
     }
 }
 
-/// Collapse same-package/same-version rows when one materialization graph can
-/// safely stand in for another.
-///
-/// The resolver can temporarily produce multiple rows for the same canonical
-/// package and version when peer-bound contexts differ. A row whose dependency
-/// edges, alias edges, and resolved peer bindings are all subsets of another
-/// row is interchangeable with that larger wrapper: the larger wrapper exposes
-/// everything the smaller one needs. Non-comparable peer contexts stay distinct.
-pub(crate) fn dedupe_peer_superset_packages(packages: &mut Vec<ResolvedPackage>) {
-    if packages.len() < 2 {
-        return;
-    }
-
-    let mut groups: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
-    for (idx, package) in packages.iter().enumerate() {
-        groups
-            .entry(resolved_package_identity_key(package))
-            .or_default()
-            .push(idx);
-    }
-
-    let mut dominated = vec![false; packages.len()];
-    for indices in groups.values().filter(|indices| indices.len() > 1) {
-        for &idx in indices {
-            for &candidate_idx in indices {
-                if idx == candidate_idx {
-                    continue;
-                }
-                let package = &packages[idx];
-                let candidate = &packages[candidate_idx];
-                if !resolved_package_can_replace(candidate, package) {
-                    continue;
-                }
-                if resolved_package_is_strict_superset(candidate, package) || candidate_idx < idx {
-                    dominated[idx] = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut idx = 0usize;
-    packages.retain(|_| {
-        let keep = !dominated[idx];
-        idx += 1;
-        keep
-    });
-}
-
-pub(super) fn resolved_package_identity_key(package: &ResolvedPackage) -> String {
-    let name = package.package.canonical_name();
-    let version = package.version.to_string();
-    let mut key = String::with_capacity(name.len() + 1 + version.len());
-    key.push_str(&name);
-    key.push('\0');
-    key.push_str(&version);
-    key
-}
-
-pub(super) fn resolved_package_can_replace(
-    candidate: &ResolvedPackage,
-    package: &ResolvedPackage,
-) -> bool {
-    candidate.tarball_url == package.tarball_url
-        && candidate.integrity == package.integrity
-        && candidate.node_engine == package.node_engine
-        && entries_are_superset(&candidate.dependencies, &package.dependencies)
-        && aliases_are_superset(&candidate.aliases, &package.aliases)
-        && entries_are_superset(&candidate.peers, &package.peers)
-}
-
-pub(super) fn resolved_package_is_strict_superset(
-    candidate: &ResolvedPackage,
-    package: &ResolvedPackage,
-) -> bool {
-    candidate.dependencies.len() > package.dependencies.len()
-        || candidate.aliases.len() > package.aliases.len()
-        || candidate.peers.len() > package.peers.len()
-}
-
-pub(super) fn entries_are_superset(
-    candidate: &[(String, String)],
-    package: &[(String, String)],
-) -> bool {
-    package.iter().all(|entry| {
-        candidate
-            .iter()
-            .any(|candidate_entry| candidate_entry == entry)
-    })
-}
-
-pub(super) fn aliases_are_superset(
-    candidate: &HashMap<String, String>,
-    package: &HashMap<String, String>,
-) -> bool {
-    package
-        .iter()
-        .all(|(local, target)| candidate.get(local) == Some(target))
-}
+/// Retain every exact resolver node until stable package-instance identities
+/// have been assigned. Artifact-coordinate supersets are not interchangeable:
+/// their incoming edges and peer environments can be different.
+#[cfg(test)]
+pub(crate) fn dedupe_peer_superset_packages(_packages: &mut Vec<ResolvedPackage>) {}
 
 #[cfg(test)]
 mod skipped_dependency_tests {
@@ -401,6 +376,10 @@ mod skipped_dependency_tests {
     fn skipped_dependency_from_discarded_parent_version_does_not_affect_solution() {
         let parent = ResolverPackage::npm("parent");
         let packages = vec![ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::new(1),
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: parent.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
             dependencies: Vec::new(),
@@ -459,6 +438,7 @@ mod root_resolution_tests {
         assert_eq!(
             resolutions.get("peer-host"),
             Some(&RootResolution {
+                target: lpm_common::ResolutionNodeId::new(0),
                 package: "peer-host".to_string(),
                 version: "1.0.0".to_string(),
             })

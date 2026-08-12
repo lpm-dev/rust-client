@@ -21,7 +21,12 @@ fn seed_dlx_cache(
         .expect("failed to seed dlx package.json");
     std::fs::write(package_dir.join("package.json"), installed_package_json)
         .expect("failed to seed installed package.json");
-    seed_lockfile_identity(&cache_dir, package_name, "1.0.0", "sha512-cache");
+    seed_lockfile_identity(
+        &cache_dir,
+        package_name,
+        "1.0.0",
+        support::VALID_TEST_INTEGRITY,
+    );
     cache_dir
 }
 
@@ -33,11 +38,23 @@ fn seed_lockfile_identity(
 ) {
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            package_name,
+            version,
+            "registry+unknown",
+            "fixture/dlx-root",
+        )),
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: package_name.to_string(),
         version: version.to_string(),
         integrity: Some(integrity.to_string()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[(package_name, package_name, version)],
+    );
     lockfile
         .write_to_file(&root.join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to seed dlx cache lockfile");
@@ -215,7 +232,7 @@ fn dlx_cache_hit_executes_cached_binary_without_extending_ttl() {
         "dlx should print the cached package identity; stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("sha512-cache"),
+        stderr.contains(support::VALID_TEST_INTEGRITY),
         "dlx should print the cached package integrity; stderr:\n{stderr}"
     );
 

@@ -68,6 +68,14 @@ async fn mutable_install_refreshes_legacy_lockfile_for_future_frozen_installs() 
         lpm_lockfile::Lockfile::read_from_file(&lockfile_path).expect("initial lockfile parses");
     legacy_lockfile.metadata.lockfile_version = 4;
     legacy_lockfile.importers.clear();
+    legacy_lockfile.root_resolutions.clear();
+    for package in &mut legacy_lockfile.packages {
+        package.instance_id = None;
+        package.dependency_targets.clear();
+        package.peer_targets.clear();
+        package.peer_edges.clear();
+        package.manifest_fingerprint = None;
+    }
     legacy_lockfile
         .write_to_file(&lockfile_path)
         .expect("failed to write simulated legacy lockfile");
@@ -525,7 +533,7 @@ fn lpm_ci_accepts_workspace_member_trusted_dependencies_without_rewriting_lockfi
 }
 
 #[test]
-fn lpm_ci_replays_workspace_member_manifest_change_when_lockfile_can_satisfy_link() {
+fn lpm_ci_rejects_workspace_member_dependency_edge_absent_from_lockfile() {
     let project = TempProject::empty(
         r#"{
   "name": "workspace-frozen-member-drift-root",
@@ -577,18 +585,34 @@ fn lpm_ci_replays_workspace_member_manifest_change_when_lockfile_can_satisfy_lin
         .expect("failed to run lpm ci after member manifest edit");
 
     assert!(
-        output.status.success(),
-        "lpm ci must replay a workspace-member-only manifest edit when all links are locally satisfiable:\nstdout: {}\nstderr: {}",
+        !output.status.success(),
+        "lpm ci must reject a workspace dependency edge absent from the committed lockfile:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        project.path().join("node_modules/bar").exists(),
-        "frozen replay must materialize the newly reachable workspace sibling"
+        String::from_utf8_lossy(&output.stderr).contains("Frozen lockfile mismatch"),
+        "lpm ci must explain that the workspace dependency graph drifted:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !project.path().join("node_modules/bar").exists(),
+        "frozen replay must not invent a workspace edge absent from the lockfile"
     );
     assert_eq!(
         project.read_file("lpm.lock"),
         lock_before,
-        "locally satisfiable workspace link replay must not rewrite lpm.lock"
+        "rejected frozen replay must not rewrite lpm.lock"
+    );
+
+    install_workspace_once(&project);
+    assert!(
+        project.path().join("node_modules/bar").exists(),
+        "a mutable install must reconcile the changed workspace dependency graph"
+    );
+    assert_ne!(
+        project.read_file("lpm.lock"),
+        lock_before,
+        "a mutable install must record the new workspace dependency edge"
     );
 }

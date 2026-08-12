@@ -783,6 +783,11 @@ fn parse_positive_usize_or_default_rejects_zero_and_invalid_values() {
     assert_eq!(parse_positive_usize_or_default("8", 3), 8);
     assert_eq!(parse_positive_usize_or_default("0", 3), 3);
     assert_eq!(parse_positive_usize_or_default("not-a-number", 3), 3);
+    assert_eq!(
+        parse_positive_usize_or_default("1000000", 3),
+        512,
+        "untrusted environment input must not create unbounded resolver queues and permit pools"
+    );
 }
 
 #[tokio::test]

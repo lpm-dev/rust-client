@@ -102,6 +102,7 @@ fn make_graph(n: usize) -> (SharedCache, HashMap<String, String>) {
             versions,
             deps,
             peer_deps: HashMap::new(),
+            peer_aliases: HashMap::new(),
             optional_dep_names: HashMap::new(),
             optional_peer_names: HashMap::new(),
             node_engines: HashMap::new(),

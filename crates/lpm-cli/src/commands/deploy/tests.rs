@@ -1015,23 +1015,72 @@ fn write_pruned_deploy_lockfile_keeps_only_reachable_registry_packages() {
     let workspace_root = tmp.path().join("workspace");
     write_workspace_fixture(&workspace_root, &[("api", "packages/api")]);
 
+    let source = "registry+https://registry.npmjs.org";
+    let runtime_id =
+        lpm_common::PackageInstanceId::derive("runtime", "1.2.3", source, "root/runtime");
+    let first_transitive_id =
+        lpm_common::PackageInstanceId::derive("transitive", "2.0.0", source, "root/runtime/first");
+    let second_transitive_id =
+        lpm_common::PackageInstanceId::derive("transitive", "2.0.0", source, "root/runtime/second");
+    let selected_transitive_id = first_transitive_id.max(second_transitive_id);
+    let unrelated_id =
+        lpm_common::PackageInstanceId::derive("unrelated", "9.9.9", source, "root/unrelated");
     let mut lockfile = lpm_lockfile::Lockfile::new();
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(runtime_id),
+        dependency_targets: std::collections::BTreeMap::from([(
+            "transitive".to_string(),
+            selected_transitive_id,
+        )]),
         name: "runtime".to_string(),
         version: "1.2.3".to_string(),
+        source: Some(source.to_string()),
         dependencies: vec!["transitive@2.0.0".to_string()],
         ..Default::default()
     });
+    for instance_id in [first_transitive_id, second_transitive_id] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: "transitive".to_string(),
+            version: "2.0.0".to_string(),
+            source: Some(source.to_string()),
+            ..Default::default()
+        });
+    }
     lockfile.add_package(lpm_lockfile::LockedPackage {
-        name: "transitive".to_string(),
-        version: "2.0.0".to_string(),
-        ..Default::default()
-    });
-    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(unrelated_id),
         name: "unrelated".to_string(),
         version: "9.9.9".to_string(),
+        source: Some(source.to_string()),
+        dependencies: vec!["transitive@2.0.0".to_string()],
+        dependency_targets: std::collections::BTreeMap::from([(
+            "transitive".to_string(),
+            if selected_transitive_id == first_transitive_id {
+                second_transitive_id
+            } else {
+                first_transitive_id
+            },
+        )]),
         ..Default::default()
     });
+    lockfile.root_resolutions.insert(
+        "runtime".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(runtime_id),
+            package: "runtime".to_string(),
+            version: "1.2.3".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
+    lockfile.root_resolutions.insert(
+        "unrelated".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(unrelated_id),
+            package: "unrelated".to_string(),
+            version: "9.9.9".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
     lockfile
         .write_all(&workspace_root.join(lpm_lockfile::LOCKFILE_NAME))
         .unwrap();
@@ -1061,6 +1110,25 @@ fn write_pruned_deploy_lockfile_keeps_only_reachable_registry_packages() {
     assert!(names.contains("runtime"));
     assert!(names.contains("transitive"));
     assert!(!names.contains("unrelated"));
+    assert_eq!(
+        deployed_lockfile.root_resolutions["runtime"].instance_id,
+        Some(runtime_id)
+    );
+    let runtime = deployed_lockfile
+        .packages
+        .iter()
+        .find(|package| package.instance_id == Some(runtime_id))
+        .expect("runtime instance must remain");
+    assert_eq!(
+        runtime.dependency_targets.get("transitive"),
+        Some(&selected_transitive_id)
+    );
+    assert!(
+        deployed_lockfile
+            .packages
+            .iter()
+            .any(|package| package.instance_id == Some(selected_transitive_id))
+    );
 }
 
 #[cfg(unix)]

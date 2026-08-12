@@ -412,13 +412,13 @@ lockfile-version = 2
 resolved-with = "greedy-fusion"
 
 [[packages]]
+name = "@scope/leaf"
+version = "1.0.0"
+
+[[packages]]
 name = "@scope/root"
 version = "1.0.0"
 dependencies = ["@scope/leaf@1.0.0"]
-
-[[packages]]
-name = "@scope/leaf"
-version = "1.0.0"
 "#,
     );
     project.write_file(

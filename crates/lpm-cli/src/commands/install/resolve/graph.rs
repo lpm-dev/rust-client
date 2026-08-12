@@ -52,19 +52,24 @@ pub(super) fn load_lockfile_graph_packages(
     project_dir: &Path,
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    route_table: &RouteTable,
     client: &RegistryClient,
     gate_stats: &GateStats,
     auto_install_peers: bool,
 ) -> Result<Vec<InstallPackage>, LpmError> {
     let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let fast = try_lockfile_fast_path(
-        &lockfile_path,
-        deps,
-        catalog_resolutions,
-        None,
-        client,
-        gate_stats,
-        false,
+    let fast = try_lockfile_fast_path_with_optional_roots(
+        TryLockfileFastPathInput {
+            lockfile_path: &lockfile_path,
+            deps,
+            optional_root_names: &HashSet::new(),
+            catalog_resolutions,
+            workspace: None,
+            route_table,
+            client,
+            gate_stats,
+            accept_unsafe_sources: false,
+        },
     )
     .ok_or_else(|| {
         LpmError::Registry(format!(
@@ -368,6 +373,9 @@ pub(super) fn merge_node_into_packages(
             let is_lpm = name.starts_with("@lpm.dev/");
             let dist = node.info.dist.get(&version);
             let mut package = InstallPackage {
+                instance_id: None,
+                dependency_targets: HashMap::new(),
+                peer_targets: HashMap::new(),
                 name,
                 version: version.clone(),
                 source,
@@ -385,6 +393,7 @@ pub(super) fn merge_node_into_packages(
                 optional: node.request.optional,
                 tarball_url: dist.and_then(|dist| dist.tarball_url.clone()),
                 metadata_checked_for_tarball: true,
+                manifest_fingerprint: None,
             };
             if node.request.root {
                 append_root_link(&mut package, &node.request.local_name);

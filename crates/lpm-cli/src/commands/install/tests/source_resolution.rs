@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn read_pkg_json_name_version_defaults_versionless_local_directory_to_zero() {
+fn read_local_manifest_semantics_defaults_versionless_directory_to_zero() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join("package.json"),
@@ -9,12 +9,9 @@ fn read_pkg_json_name_version_defaults_versionless_local_directory_to_zero() {
     )
     .unwrap();
 
-    let (_, version, _) = read_pkg_json_name_version(
-        directory.path(),
-        "versionless local directory",
-        MissingVersionPolicy::DefaultToZero,
-    )
-    .unwrap();
+    let version = read_local_manifest_semantics(directory.path())
+        .unwrap()
+        .version;
 
     assert_eq!(version, "0.0.0");
 }
@@ -28,14 +25,152 @@ fn read_pkg_json_name_version_rejects_versionless_tarball_manifest() {
     )
     .unwrap();
 
-    let error = read_pkg_json_name_version(
-        directory.path(),
-        "versionless tarball",
-        MissingVersionPolicy::Require,
-    )
-    .unwrap_err();
+    let error = read_pkg_json_name_version(directory.path(), "versionless tarball").unwrap_err();
 
     assert!(error.to_string().contains("has no `version` field"));
+}
+
+#[test]
+fn read_pkg_json_name_version_rejects_path_unsafe_package_name() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        br#"{"name":"../escape","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let error = read_pkg_json_name_version(directory.path(), "unsafe local package")
+        .expect_err("path-unsafe package names must be rejected before store path construction");
+
+    assert!(error.to_string().contains("invalid package name"));
+}
+
+#[test]
+fn read_pkg_json_name_version_rejects_non_version_manifest_value() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        br#"{"name":"safe-name","version":"../1.0.0"}"#,
+    )
+    .unwrap();
+
+    let error = read_pkg_json_name_version(directory.path(), "unsafe local package")
+        .expect_err("non-version values must be rejected before store path construction");
+
+    assert!(error.to_string().contains("invalid package version"));
+}
+
+fn local_manifest_fingerprint(manifest: &[u8]) -> String {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("package.json"), manifest).unwrap();
+    read_local_manifest_semantics(directory.path())
+        .unwrap()
+        .fingerprint
+}
+
+#[test]
+fn local_manifest_fingerprint_ignores_formatting_order_and_utf8_bom() {
+    let compact = br#"{"name":"local","version":"1.0.0","dependencies":{"b":"^2","a":"^1"},"os":["linux","darwin","linux"],"bin":{"z":"z.js","a":"a.js"}}"#;
+    let reordered = b"\xEF\xBB\xBF{\n\
+      \"bin\": { \"a\": \"a.js\", \"z\": \"z.js\" },\n\
+      \"os\": [\"darwin\", \"linux\"],\n\
+      \"dependencies\": { \"a\": \"^1\", \"b\": \"^2\" },\n\
+      \"version\": \"1.0.0\",\n\
+      \"name\": \"local\"\n\
+    }";
+
+    assert_eq!(
+        local_manifest_fingerprint(compact),
+        local_manifest_fingerprint(reordered),
+    );
+}
+
+#[test]
+fn local_manifest_fingerprint_uses_effective_version_and_runtime_metadata_only() {
+    let versionless = br#"{"name":"local","dependencies":{"dep":"^1"}}"#;
+    let explicit_zero = br#"{
+      "name":"local",
+      "version":"0.0.0",
+      "dependencies":{"dep":"^1"},
+      "devDependencies":{"test-only":"^9"},
+      "description":"ignored",
+      "scripts":{"test":"ignored"}
+    }"#;
+
+    assert_eq!(
+        local_manifest_fingerprint(versionless),
+        local_manifest_fingerprint(explicit_zero),
+    );
+}
+
+#[test]
+fn local_manifest_fingerprint_changes_for_graph_engine_platform_and_bin_semantics() {
+    let base = br#"{
+      "name":"local",
+      "version":"1.0.0",
+      "dependencies":{"dep":"^1"},
+      "engines":{"node":">=20"},
+      "os":["linux"],
+      "cpu":["arm64"],
+      "libc":["glibc"],
+      "bin":{"local":"cli.js"}
+    }"#;
+    let baseline = local_manifest_fingerprint(base);
+    let variants: &[&[u8]] = &[
+        br#"{"name":"local","version":"2.0.0","dependencies":{"dep":"^1"},"engines":{"node":">=20"},"os":["linux"],"cpu":["arm64"],"libc":["glibc"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^2"},"engines":{"node":">=20"},"os":["linux"],"cpu":["arm64"],"libc":["glibc"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","peerDependencies":{"dep":"^1"},"engines":{"node":">=20"},"os":["linux"],"cpu":["arm64"],"libc":["glibc"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^1"},"engines":{"node":">=22"},"os":["linux"],"cpu":["arm64"],"libc":["glibc"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^1"},"engines":{"node":">=20"},"os":["darwin"],"cpu":["arm64"],"libc":["glibc"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^1"},"engines":{"node":">=20"},"os":["linux"],"cpu":["x64"],"libc":["glibc"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^1"},"engines":{"node":">=20"},"os":["linux"],"cpu":["arm64"],"libc":["musl"],"bin":{"local":"cli.js"}}"#,
+        br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^1"},"engines":{"node":">=20"},"os":["linux"],"cpu":["arm64"],"libc":["glibc"],"bin":{"local":"other.js"}}"#,
+    ];
+
+    for variant in variants {
+        assert_ne!(baseline, local_manifest_fingerprint(variant));
+    }
+}
+
+#[test]
+fn local_manifest_fingerprint_tracks_optional_shadowing_and_peer_optionality() {
+    let required = br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^1"}}"#;
+    let optional_shadow = br#"{"name":"local","version":"1.0.0","dependencies":{"dep":"^9"},"optionalDependencies":{"dep":"^1"}}"#;
+    let required_peer = br#"{"name":"local","version":"1.0.0","peerDependencies":{"dep":"^1"}}"#;
+    let optional_peer = br#"{"name":"local","version":"1.0.0","peerDependencies":{"dep":"^1"},"peerDependenciesMeta":{"dep":{"optional":true}}}"#;
+
+    assert_ne!(
+        local_manifest_fingerprint(required),
+        local_manifest_fingerprint(optional_shadow),
+    );
+    assert_ne!(
+        local_manifest_fingerprint(required_peer),
+        local_manifest_fingerprint(optional_peer),
+    );
+}
+
+#[test]
+fn local_manifest_fingerprint_hashes_normalized_jsr_edges() {
+    let jsr = br#"{"name":"local","version":"1.0.0","dependencies":{"@std/path":"jsr:^1.1.0"}}"#;
+    let npm_alias = br#"{"name":"local","version":"1.0.0","dependencies":{"@std/path":"npm:@jsr/std__path@^1.1.0"}}"#;
+
+    assert_eq!(
+        local_manifest_fingerprint(jsr),
+        local_manifest_fingerprint(npm_alias),
+    );
+}
+
+#[test]
+fn read_local_manifest_semantics_rejects_malformed_and_oversized_manifests() {
+    let malformed = tempfile::tempdir().unwrap();
+    std::fs::write(malformed.path().join("package.json"), b"{").unwrap();
+    assert!(read_local_manifest_semantics(malformed.path()).is_err());
+
+    let oversized = tempfile::tempdir().unwrap();
+    let bytes = vec![b' '; lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize + 1];
+    std::fs::write(oversized.path().join("package.json"), bytes).unwrap();
+    let error = read_local_manifest_semantics(oversized.path()).unwrap_err();
+    assert!(error.to_string().contains("exceeds"));
 }
 
 // ── local-tarball path traversal ─────────────
@@ -448,6 +583,38 @@ async fn pre_resolve_strict_integrity_rejects_undeclared_sri() {
 }
 
 #[tokio::test]
+async fn strict_integrity_error_redacts_tarball_url_credentials_and_tokens() {
+    let store_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let mut deps = HashMap::from([(
+        "foo".to_string(),
+        "https://user:secret@example.test/private/token-value.tgz?token=query-secret".to_string(),
+    )]);
+
+    let error = pre_resolve_non_registry_deps(
+        &client,
+        &store,
+        store_root.path(),
+        &mut deps,
+        true,
+        true,
+        &[],
+    )
+    .await
+    .expect_err("strict integrity must reject a tarball without declared SRI")
+    .to_string();
+
+    assert!(error.contains("https://example.test"), "{error}");
+    for secret in ["user", "secret", "private", "token-value", "query-secret"] {
+        assert!(
+            !error.contains(secret),
+            "strict-integrity diagnostic exposed {secret:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn pre_resolve_strict_integrity_accepts_declared_sri() {
     // Same posture, but the spec DECLARES an SRI inline:
     // `https://e.com/foo.tgz#sha512-…`. Strict-integrity passes.
@@ -807,6 +974,9 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
 
     for (source, want_prefix, want_mat) in cases {
         let pkg = InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
             source: (*source).to_string(),
@@ -824,6 +994,7 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         };
         let wid = pkg.wrapper_id_for_source();
         match want_prefix {
@@ -856,6 +1027,9 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
 #[test]
 fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
     let remote = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: "tarball+https://example.com/foo-1.0.0.tgz".to_string(),
@@ -873,8 +1047,12 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
     let local = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: "tarball+file:./vendor/foo-1.0.0.tgz".to_string(),
@@ -892,6 +1070,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
 
     let remote_wid = remote
@@ -1192,6 +1371,93 @@ async fn pre_resolve_does_not_auto_install_optional_peer_from_local_source() {
     assert!(peer.optional && !peer.auto_install);
 }
 
+#[test]
+fn local_source_expansion_respects_auto_install_peers_false() {
+    let project = tempfile::tempdir().unwrap();
+    let source_dir = project.path().join("packages/local-package");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(
+        source_dir.join("package.json"),
+        br#"{
+          "name": "local-package",
+          "version": "1.0.0",
+          "peerDependencies": { "runtime": "^2.0.0" }
+        }"#,
+    )
+    .unwrap();
+    let mut packages = vec![InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
+        name: "local-package".to_string(),
+        version: "1.0.0".to_string(),
+        source: "directory+packages/local-package".to_string(),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        root_link_names: Some(vec!["local-package".to_string()]),
+        is_direct: true,
+        is_lpm: false,
+        peers: Vec::new(),
+        integrity: None,
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        platform: None,
+        node_engine: None,
+        optional: false,
+        tarball_url: None,
+        metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
+    }];
+    let mut resolver_dependencies = HashMap::new();
+
+    let expansion = expand_local_source_install_packages(
+        project.path(),
+        &mut resolver_dependencies,
+        &mut packages,
+        &[],
+        true,
+        WorkspaceTransitiveMode::RootSymlinkOnly,
+        false,
+    )
+    .expect("local source expansion");
+
+    assert!(!resolver_dependencies.contains_key("runtime"));
+    let peer = &expansion.source_deps["directory+packages/local-package"][0];
+    assert!(matches!(peer.role, SourceDepRole::Peer));
+    assert!(!peer.auto_install);
+}
+
+#[test]
+fn git_source_expansion_respects_auto_install_peers_false() {
+    let package = tempfile::tempdir().unwrap();
+    std::fs::write(
+        package.path().join("package.json"),
+        br#"{
+          "name": "git-package",
+          "version": "1.0.0",
+          "peerDependencies": { "runtime": "^2.0.0" }
+        }"#,
+    )
+    .unwrap();
+    let mut resolver_dependencies = HashMap::new();
+    let mut source_dependencies = HashMap::new();
+
+    collect_git_source_dependencies(
+        package.path(),
+        "git+https://github.com/example/package.git#0123456789abcdef0123456789abcdef01234567",
+        &mut resolver_dependencies,
+        &mut source_dependencies,
+        false,
+    )
+    .expect("Git source dependency expansion");
+
+    assert!(!resolver_dependencies.contains_key("runtime"));
+    let peer = &source_dependencies["git+https://github.com/example/package.git#0123456789abcdef0123456789abcdef01234567"]
+        [0];
+    assert!(matches!(peer.role, SourceDepRole::Peer));
+    assert!(!peer.auto_install);
+}
+
 #[tokio::test]
 async fn pre_resolve_marks_duplicate_local_dependency_optional_after_override() {
     let store_root = tempfile::tempdir().unwrap();
@@ -1226,7 +1492,7 @@ async fn pre_resolve_marks_duplicate_local_dependency_optional_after_override() 
         pre_resolve_non_registry_deps(&client, &store, project.path(), &mut deps, true, false, &[])
             .await
             .expect("pre-resolve duplicate local dependency");
-    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps);
+    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps).unwrap();
 
     let native = result
         .install_pkgs
@@ -1282,6 +1548,7 @@ async fn workspace_transitive_with_matching_member_does_not_pollute_resolver_dep
         version: "2.5.0".to_string(),
         package_dir: bar_dir.clone(),
         source_dir: bar_dir,
+        optional: false,
     }];
 
     let mut deps = HashMap::from([("foo".to_string(), "file:./packages/foo".to_string())]);
@@ -1313,6 +1580,50 @@ async fn workspace_transitive_with_matching_member_does_not_pollute_resolver_dep
     assert_eq!(result.install_pkgs[0].name, "foo");
 }
 
+#[tokio::test]
+async fn workspace_transitive_rejects_a_nonmatching_explicit_range() {
+    let store_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let client = Arc::new(RegistryClient::new());
+    let project_dir = tempfile::tempdir().unwrap();
+    let foo_dir = make_local_pkg(
+        &project_dir.path().join("packages"),
+        "foo",
+        "1.0.0",
+        r#"{"bar":"workspace:^1.0.0"}"#,
+    );
+    let bar_dir = make_local_pkg(
+        &project_dir.path().join("workspace-members"),
+        "bar",
+        "2.0.0",
+        "",
+    );
+    let workspace_members = vec![WorkspaceMemberLink {
+        name: "bar".to_string(),
+        link_name: "bar".to_string(),
+        version: "2.0.0".to_string(),
+        package_dir: bar_dir.clone(),
+        source_dir: bar_dir,
+        optional: false,
+    }];
+    let mut deps = HashMap::from([("foo".to_string(), format!("file:{}", foo_dir.display()))]);
+
+    let error = pre_resolve_non_registry_deps(
+        &client,
+        &store,
+        project_dir.path(),
+        &mut deps,
+        true,
+        false,
+        &workspace_members,
+    )
+    .await
+    .expect_err("a transitive workspace range must constrain the local member");
+
+    assert!(error.to_string().contains("workspace:^1.0.0"));
+    assert!(error.to_string().contains("2.0.0"));
+}
+
 #[test]
 fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
     let project_dir = tempfile::tempdir().unwrap();
@@ -1328,6 +1639,7 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         version: "1.0.0".to_string(),
         package_dir: foo_dir.clone(),
         source_dir: foo_dir,
+        optional: false,
     };
     let bar = WorkspaceMemberLink {
         name: "bar".to_string(),
@@ -1335,6 +1647,7 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         version: "1.0.0".to_string(),
         package_dir: bar_dir.clone(),
         source_dir: bar_dir,
+        optional: false,
     };
     let mut deps = HashMap::new();
 
@@ -1343,6 +1656,8 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         &mut deps,
         std::slice::from_ref(&foo),
         &[foo.clone(), bar.clone()],
+        &HashSet::new(),
+        true,
         true,
     )
     .expect("virtual-store direct workspace pre-resolve should promote workspace child");
@@ -1372,7 +1687,7 @@ fn v2_direct_workspace_pre_resolve_promotes_workspace_child_to_source_graph() {
         Some(bar_source.as_str())
     );
 
-    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps);
+    apply_post_resolve_directory_link_fixup(&mut result.install_pkgs, &result.source_deps).unwrap();
     let bar_source_id = lpm_lockfile::Source::parse(&bar_source)
         .unwrap()
         .source_id();
@@ -1473,6 +1788,9 @@ async fn store_path_or_err_routes_directory_to_canonical_realpath() {
     // InstallPackage shape mimicking the pre_resolve output for
     // `file:./packages/p1`.
     let pkg = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "p1".to_string(),
         version: "0.1.0".to_string(),
         source: "directory+./packages/p1".to_string(),
@@ -1490,6 +1808,7 @@ async fn store_path_or_err_routes_directory_to_canonical_realpath() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
 
     let path = pkg
@@ -1511,6 +1830,9 @@ async fn store_path_or_err_directory_errors_on_missing_source() {
     let project_dir = tempfile::tempdir().unwrap();
 
     let pkg = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "missing".to_string(),
         version: "0.1.0".to_string(),
         source: "directory+./does-not-exist".to_string(),
@@ -1528,6 +1850,7 @@ async fn store_path_or_err_directory_errors_on_missing_source() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
 
     let err = pkg
@@ -2061,6 +2384,9 @@ async fn pre_resolve_link_dep_routes_through_store_path_to_canonical_realpath() 
     .unwrap();
 
     let pkg = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "linked".to_string(),
         version: "1.0.0".to_string(),
         source: "link+./linked".to_string(),
@@ -2078,6 +2404,7 @@ async fn pre_resolve_link_dep_routes_through_store_path_to_canonical_realpath() 
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
 
     let path = pkg
@@ -2430,6 +2757,9 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
     // field has [(lodash, 4.17.21), (b, f-...)].
     let mut packages = vec![
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "a".to_string(),
             version: "1.0.0".to_string(),
             source: "directory+./packages/a".to_string(),
@@ -2447,8 +2777,12 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
         },
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
             source: "registry+https://registry.npmjs.org".to_string(),
@@ -2466,8 +2800,12 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         },
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "b".to_string(),
             version: "1.0.0".to_string(),
             source: "directory+./packages/b".to_string(),
@@ -2485,6 +2823,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: Some(format!("sha256-{}", "cd".repeat(32))),
         },
     ];
 
@@ -2496,6 +2835,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 local_name: "lodash".to_string(),
                 raw_spec: "^4.0.0".to_string(),
                 kind: DepKind::Registry,
+                role: SourceDepRole::Dependency,
                 optional: false,
                 auto_install: true,
                 target_source: None,
@@ -2504,6 +2844,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 local_name: "b".to_string(),
                 raw_spec: "file:../b".to_string(),
                 kind: DepKind::FileDir,
+                role: SourceDepRole::Dependency,
                 optional: false,
                 auto_install: true,
                 target_source: Some("directory+./packages/b".to_string()),
@@ -2511,7 +2852,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
         ],
     );
 
-    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
 
     let a = packages.iter().find(|p| p.name == "a").unwrap();
     assert_eq!(a.dependencies.len(), 2);
@@ -2532,12 +2873,25 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
         "A's deps must reference B by source-id, got {:?}",
         a.dependencies,
     );
+
+    dedupe_install_packages_by_identity(&mut packages).unwrap();
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for package in &packages {
+        lockfile.add_package(locked_package_from_install_package(package));
+    }
+    lockfile.root_resolutions = root_resolutions_for_lockfile(&packages);
+    lockfile
+        .to_toml()
+        .expect("the finalized local-source graph must contain exact dependency targets");
 }
 
 #[test]
 fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
     let mut packages = vec![
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "consumer".to_string(),
             version: "1.0.0".to_string(),
             source: "directory+./packages/consumer".to_string(),
@@ -2555,8 +2909,12 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         },
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "@jsr/std__path".to_string(),
             version: "1.1.6".to_string(),
             source: "registry+https://npm.jsr.io".to_string(),
@@ -2574,6 +2932,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         },
     ];
 
@@ -2584,13 +2943,14 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             local_name: "@std/path".to_string(),
             raw_spec: "npm:@jsr/std__path@^1.1.0".to_string(),
             kind: DepKind::Registry,
+            role: SourceDepRole::Dependency,
             optional: false,
             auto_install: true,
             target_source: None,
         }],
     );
 
-    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
 
     let consumer = packages.iter().find(|p| p.name == "consumer").unwrap();
     assert_eq!(
@@ -2612,6 +2972,9 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
     .source_id();
     let mut packages = vec![
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "consumer".to_string(),
             version: "1.0.0".to_string(),
             source: "directory+./packages/consumer".to_string(),
@@ -2629,8 +2992,12 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         },
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "react".to_string(),
             version: "19.0.0".to_string(),
             source: "registry+https://registry.npmjs.org".to_string(),
@@ -2648,8 +3015,12 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         },
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "react".to_string(),
             version: "19.0.0".to_string(),
             source: fork_source.clone(),
@@ -2667,6 +3038,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         },
     ];
 
@@ -2677,18 +3049,363 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             local_name: "react".to_string(),
             raw_spec: "file:../react-fork".to_string(),
             kind: DepKind::FileDir,
+            role: SourceDepRole::Dependency,
             optional: false,
             auto_install: true,
             target_source: Some(fork_source),
         }],
     );
 
-    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
 
     let consumer = packages.iter().find(|p| p.name == "consumer").unwrap();
     assert_eq!(
         consumer.dependencies,
         vec![("react".to_string(), fork_source_id)]
+    );
+}
+
+#[test]
+fn apply_post_resolve_fixup_preserves_source_backed_peer_role() {
+    let peer_source = "directory+./packages/react-fork".to_string();
+    let peer_source_id = lpm_lockfile::Source::Directory {
+        path: "./packages/react-fork".to_string(),
+    }
+    .source_id();
+    let mut packages = vec![
+        InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
+            name: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            source: "directory+./packages/consumer".to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(vec!["consumer".to_string()]),
+            is_direct: true,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
+        },
+        InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
+            name: "react".to_string(),
+            version: "19.0.0".to_string(),
+            source: peer_source.clone(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: Some(Vec::new()),
+            is_direct: false,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
+        },
+    ];
+    let mut source_deps = HashMap::new();
+    source_deps.insert(
+        "directory+./packages/consumer".to_string(),
+        vec![SourceDep {
+            local_name: "react-compat".to_string(),
+            raw_spec: "file:../react-fork".to_string(),
+            kind: DepKind::FileDir,
+            role: SourceDepRole::Peer,
+            optional: false,
+            auto_install: true,
+            target_source: Some(peer_source),
+        }],
+    );
+
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
+
+    let consumer = packages
+        .iter()
+        .find(|package| package.name == "consumer")
+        .unwrap();
+    assert!(
+        consumer.dependencies.is_empty(),
+        "a peer edge must not be converted into a dependency edge"
+    );
+    assert_eq!(
+        consumer.peers,
+        vec![lpm_common::PeerEdge {
+            local_name: "react-compat".to_string(),
+            target_name: "react".to_string(),
+            target_version: "19.0.0".to_string(),
+            target_wrapper_id: Some(peer_source_id),
+        }],
+        "the peer must retain its local slot and exact source identity"
+    );
+}
+
+fn fixup_package(name: &str, version: &str, source: &str) -> InstallPackage {
+    InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
+        name: name.to_string(),
+        version: version.to_string(),
+        source: source.to_string(),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        root_link_names: None,
+        is_direct: false,
+        is_lpm: false,
+        peers: Vec::new(),
+        integrity: None,
+        registry_signatures: Vec::new(),
+        registry_published_at: None,
+        platform: None,
+        node_engine: None,
+        optional: false,
+        tarball_url: None,
+        metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
+    }
+}
+
+#[test]
+fn local_source_fixup_rebuilds_exact_dependency_and_peer_targets() {
+    let consumer_source = "directory+packages/consumer";
+    let registry_source = "registry+https://registry.npmjs.org";
+    let stale_id =
+        lpm_common::PackageInstanceId::derive("stale", "1.0.0", registry_source, "root/stale");
+    let provider_id =
+        lpm_common::PackageInstanceId::derive("runtime", "1.5.0", registry_source, "root/runtime");
+    let mut consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    consumer.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        "consumer",
+        "1.0.0",
+        consumer_source,
+        "root/consumer",
+    ));
+    consumer
+        .dependency_targets
+        .insert("removed".to_string(), stale_id);
+    consumer
+        .peer_targets
+        .insert("removed-peer".to_string(), stale_id);
+    let mut provider = fixup_package("runtime", "1.5.0", registry_source);
+    provider.instance_id = Some(provider_id);
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![
+            SourceDep {
+                local_name: "runtime-dep".to_string(),
+                raw_spec: "npm:runtime@^1.0.0".to_string(),
+                kind: DepKind::Registry,
+                role: SourceDepRole::Dependency,
+                optional: false,
+                auto_install: true,
+                target_source: None,
+            },
+            SourceDep {
+                local_name: "runtime-peer".to_string(),
+                raw_spec: "npm:runtime@^1.0.0".to_string(),
+                kind: DepKind::Registry,
+                role: SourceDepRole::Peer,
+                optional: false,
+                auto_install: true,
+                target_source: None,
+            },
+        ],
+    )]);
+
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
+
+    let consumer = packages
+        .iter()
+        .find(|package| package.name == "consumer")
+        .unwrap();
+    assert_eq!(
+        consumer.dependency_targets,
+        HashMap::from([("runtime-dep".to_string(), provider_id)])
+    );
+    assert_eq!(
+        consumer.peer_targets,
+        HashMap::from([("runtime-peer".to_string(), provider_id)])
+    );
+}
+
+#[test]
+fn local_source_required_peer_rejects_incompatible_registry_provider() {
+    let consumer_source = "directory+packages/consumer";
+    let mut consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    consumer.root_link_names = Some(vec!["consumer".to_string()]);
+    let mut provider = fixup_package("runtime", "2.0.0", "registry+https://registry.npmjs.org");
+    provider.is_direct = true;
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![SourceDep {
+            local_name: "runtime".to_string(),
+            raw_spec: "^1.0.0".to_string(),
+            kind: DepKind::Registry,
+            role: SourceDepRole::Peer,
+            optional: false,
+            auto_install: true,
+            target_source: None,
+        }],
+    )]);
+
+    let error = apply_post_resolve_directory_link_fixup(&mut packages, &source_deps)
+        .expect_err("an incompatible required peer provider must fail");
+
+    assert!(error.to_string().contains("runtime"));
+    assert!(error.to_string().contains("^1.0.0"));
+    assert!(error.to_string().contains("2.0.0"));
+}
+
+#[test]
+fn local_source_npm_alias_peer_rejects_incompatible_provider() {
+    let consumer_source = "directory+packages/consumer";
+    let consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    let provider = fixup_package("react", "19.0.0", "registry+https://registry.npmjs.org");
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![SourceDep {
+            local_name: "react-compat".to_string(),
+            raw_spec: "npm:react@^18.0.0".to_string(),
+            kind: DepKind::Registry,
+            role: SourceDepRole::Peer,
+            optional: false,
+            auto_install: true,
+            target_source: None,
+        }],
+    )]);
+
+    let error = apply_post_resolve_directory_link_fixup(&mut packages, &source_deps)
+        .expect_err("an incompatible npm-alias peer provider must fail");
+
+    assert!(error.to_string().contains("react-compat"));
+    assert!(error.to_string().contains("npm:react@^18.0.0"));
+    assert!(error.to_string().contains("19.0.0"));
+}
+
+#[test]
+fn local_source_required_peer_rejects_malformed_range() {
+    let consumer_source = "directory+packages/consumer";
+    let consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    let provider = fixup_package("runtime", "1.0.0", "registry+https://registry.npmjs.org");
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![SourceDep {
+            local_name: "runtime".to_string(),
+            raw_spec: "~X0^.00".to_string(),
+            kind: DepKind::Registry,
+            role: SourceDepRole::Peer,
+            optional: false,
+            auto_install: true,
+            target_source: None,
+        }],
+    )]);
+
+    let error = apply_post_resolve_directory_link_fixup(&mut packages, &source_deps)
+        .expect_err("a malformed required peer range must fail");
+
+    assert!(error.to_string().contains("runtime"));
+    assert!(error.to_string().contains("~X0^.00"));
+}
+
+#[test]
+fn local_source_optional_peer_skips_incompatible_provider() {
+    let consumer_source = "directory+packages/consumer";
+    let consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    let provider = fixup_package("runtime", "2.0.0", "registry+https://registry.npmjs.org");
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![SourceDep {
+            local_name: "runtime".to_string(),
+            raw_spec: "^1.0.0".to_string(),
+            kind: DepKind::Registry,
+            role: SourceDepRole::Peer,
+            optional: true,
+            auto_install: false,
+            target_source: None,
+        }],
+    )]);
+
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
+
+    assert!(packages[0].peers.is_empty());
+}
+
+#[test]
+fn local_source_workspace_peer_rejects_incompatible_member() {
+    let consumer_source = "directory+packages/consumer";
+    let provider_source = "directory+packages/runtime";
+    let consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    let provider = fixup_package("runtime", "2.0.0", provider_source);
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![SourceDep {
+            local_name: "runtime".to_string(),
+            raw_spec: "workspace:^1.0.0".to_string(),
+            kind: DepKind::Workspace,
+            role: SourceDepRole::Peer,
+            optional: false,
+            auto_install: true,
+            target_source: Some(provider_source.to_string()),
+        }],
+    )]);
+
+    let error = apply_post_resolve_directory_link_fixup(&mut packages, &source_deps)
+        .expect_err("an incompatible workspace peer provider must fail");
+
+    assert!(error.to_string().contains("runtime"));
+    assert!(error.to_string().contains("workspace:^1.0.0"));
+    assert!(error.to_string().contains("2.0.0"));
+}
+
+#[test]
+fn local_source_peer_links_existing_provider_when_auto_install_is_disabled() {
+    let consumer_source = "directory+packages/consumer";
+    let consumer = fixup_package("consumer", "1.0.0", consumer_source);
+    let provider = fixup_package("runtime", "1.5.0", "registry+https://registry.npmjs.org");
+    let mut packages = vec![consumer, provider];
+    let source_deps = HashMap::from([(
+        consumer_source.to_string(),
+        vec![SourceDep {
+            local_name: "runtime".to_string(),
+            raw_spec: "^1.0.0".to_string(),
+            kind: DepKind::Registry,
+            role: SourceDepRole::Peer,
+            optional: false,
+            auto_install: false,
+            target_source: None,
+        }],
+    )]);
+
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
+
+    assert_eq!(
+        packages[0].peers,
+        vec![lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "1.5.0"
+        )]
     );
 }
 
@@ -2700,6 +3417,9 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
     // dependencies. The linker won't try to create a symlink
     // pointing at a missing wrapper.
     let mut packages = vec![InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "a".to_string(),
         version: "1.0.0".to_string(),
         source: "directory+./packages/a".to_string(),
@@ -2717,6 +3437,7 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     }];
 
     let mut source_deps = HashMap::new();
@@ -2726,13 +3447,14 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
             local_name: "missing-from-resolver".to_string(),
             raw_spec: "^1.0.0".to_string(),
             kind: DepKind::Registry,
+            role: SourceDepRole::Dependency,
             optional: false,
             auto_install: true,
             target_source: None,
         }],
     );
 
-    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps);
+    apply_post_resolve_directory_link_fixup(&mut packages, &source_deps).unwrap();
     assert!(packages[0].dependencies.is_empty());
 }
 
@@ -2753,6 +3475,7 @@ fn make_workspace_member(parent: &Path, name: &str, version: &str) -> WorkspaceM
         version: version.to_string(),
         package_dir: dir.clone(),
         source_dir: dir,
+        optional: false,
     }
 }
 
@@ -2868,6 +3591,7 @@ async fn pre_resolve_overlap_with_version_mismatch_is_hard_error() {
         version: "1.0.0".to_string(),
         package_dir: pkg_dir.canonicalize().unwrap(),
         source_dir: pkg_dir.canonicalize().unwrap(),
+        optional: false,
     };
 
     let mut deps = HashMap::from([("foo".to_string(), "file:./packages/foo".to_string())]);
@@ -2939,6 +3663,7 @@ fn detect_workspace_overlap_realpath_byte_equal_match() {
         version: "1.0.0".to_string(),
         package_dir: canon.clone(),
         source_dir: canon.clone(),
+        optional: false,
     };
     match detect_workspace_overlap(
         &canon,
@@ -2967,6 +3692,7 @@ fn detect_workspace_overlap_no_overlap_when_paths_differ() {
         version: "1.0.0".to_string(),
         package_dir: a.canonicalize().unwrap(),
         source_dir: a.canonicalize().unwrap(),
+        optional: false,
     };
     let result = detect_workspace_overlap(
         &b.canonicalize().unwrap(),

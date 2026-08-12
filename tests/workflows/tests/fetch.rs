@@ -89,6 +89,14 @@ fn rewrite_lockfile_registry_source_to_legacy_public_npm_tarball(project: &TempP
         "{}/ms/-/ms-2.1.3.tgz",
         lpm_common::NPM_REGISTRY_URL.trim_end_matches('/')
     ));
+    let instance_id = package.instance_id.expect("seed instance id");
+    if let Some(root) = lockfile
+        .root_resolutions
+        .values_mut()
+        .find(|root| root.instance_id == Some(instance_id))
+    {
+        root.source = None;
+    }
     lockfile
         .write_to_file(&lockfile_path)
         .expect("rewrite lockfile as legacy public npm tarball row");
@@ -109,6 +117,14 @@ fn rewrite_lockfile_registry_source_to_canonical_public_npm_tarball(project: &Te
         lpm_common::NPM_REGISTRY_URL.trim_end_matches('/')
     ));
     package.tarball = None;
+    let instance_id = package.instance_id.expect("seed instance id");
+    if let Some(root) = lockfile
+        .root_resolutions
+        .values_mut()
+        .find(|root| root.instance_id == Some(instance_id))
+    {
+        root.source = package.source.clone();
+    }
     lockfile
         .write_to_file(&lockfile_path)
         .expect("rewrite lockfile as canonical public npm tarball row");
@@ -205,6 +221,14 @@ async fn fetch_materializes_commit_pinned_github_source_with_security_analysis()
 
     let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion");
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            "wa-sqlite",
+            "1.0.9",
+            &format!("git+https://github.com/rhashimoto/wa-sqlite.git#{COMMIT}"),
+            "fixture/fetch-github",
+        )),
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "wa-sqlite".to_string(),
         version: "1.0.9".to_string(),
         source: Some(format!(
@@ -213,6 +237,7 @@ async fn fetch_materializes_commit_pinned_github_source_with_security_analysis()
         integrity: Some(integrity.clone()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[("wa-sqlite", "wa-sqlite", "1.0.9")]);
     let project = TempProject::empty(r#"{"name":"fetch-github-fixture","version":"1.0.0"}"#);
     std::fs::remove_file(project.path().join("package.json")).expect("remove package manifest");
     project.write_file(
@@ -257,6 +282,14 @@ async fn fetch_rejects_github_archive_that_does_not_match_lockfile_integrity() {
 
     let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion");
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(lpm_common::PackageInstanceId::derive(
+            "wa-sqlite",
+            "1.0.9",
+            &format!("git+https://github.com/rhashimoto/wa-sqlite.git#{COMMIT}"),
+            "fixture/fetch-github-mismatch",
+        )),
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "wa-sqlite".to_string(),
         version: "1.0.9".to_string(),
         source: Some(format!(
@@ -265,6 +298,7 @@ async fn fetch_rejects_github_archive_that_does_not_match_lockfile_integrity() {
         integrity: Some(compute_integrity(b"different archive bytes")),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[("wa-sqlite", "wa-sqlite", "1.0.9")]);
     let project = TempProject::empty(r#"{"name":"fetch-github-mismatch","version":"1.0.0"}"#);
     std::fs::remove_file(project.path().join("package.json")).expect("remove package manifest");
     project.write_file(
@@ -533,12 +567,27 @@ async fn fetch_platform_option_skips_incompatible_lockfile_entries() {
     let mut native = parsed.packages[0].clone();
     native.name = "native-musl".to_string();
     native.version = "1.0.0".to_string();
+    native.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &native.name,
+        &native.version,
+        native.source.as_deref().expect("registry source"),
+        "fixture/native-musl",
+    ));
     native.integrity = Some(compute_integrity(&native_tarball));
     native.tarball = Some(mock.tarball_url("native-musl", "1.0.0"));
     native.os = vec!["linux".to_string()];
     native.cpu = vec!["x64".to_string()];
     native.libc = vec!["musl".to_string()];
     parsed.add_package(native);
+    for package in &mut parsed.packages {
+        package.instance_id = None;
+        package.dependency_targets.clear();
+        package.peer_targets.clear();
+    }
+    for root in parsed.root_resolutions.values_mut() {
+        root.instance_id = None;
+    }
+    parsed.metadata.lockfile_version = 12;
     parsed
         .write_to_file(&lockfile_path)
         .expect("write lockfile with platform package");
@@ -595,4 +644,82 @@ async fn fetch_json_envelope_reports_lockfile_counts() {
     }, {
         insta::assert_json_snapshot!("fetch_json_envelope_reports_lockfile_counts", envelope);
     });
+}
+
+#[tokio::test]
+async fn fetch_downloads_shared_contextual_artifact_once_and_reports_each_instance() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("shared-artifact", "1.0.0");
+    mock.with_package("shared-artifact", "1.0.0", &tarball)
+        .await;
+    let integrity = compute_integrity(&tarball);
+    let source = format!("registry+{}", mock.url());
+    let tarball_url = mock.tarball_url("shared-artifact", "1.0.0");
+    let first_id = lpm_common::PackageInstanceId::derive(
+        "shared-artifact",
+        "1.0.0",
+        &source,
+        "root/first/shared-artifact",
+    );
+    let second_id = lpm_common::PackageInstanceId::derive(
+        "shared-artifact",
+        "1.0.0",
+        &source,
+        "root/second/shared-artifact",
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for instance_id in [first_id, second_id] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: "shared-artifact".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.clone()),
+            integrity: Some(integrity.clone()),
+            tarball: Some(tarball_url.clone()),
+            ..Default::default()
+        });
+    }
+    for (local_name, instance_id) in [("first", first_id), ("second", second_id)] {
+        lockfile.root_resolutions.insert(
+            local_name.to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: "shared-artifact".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.clone()),
+            },
+        );
+    }
+    let project = TempProject::empty(r#"{"name":"fetch-shared","version":"1.0.0"}"#);
+    std::fs::remove_file(project.path().join("package.json")).expect("remove package manifest");
+    project.write_file(
+        "lpm.lock",
+        &lockfile.to_toml().expect("serialize exact lockfile"),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["fetch", "--json"])
+        .output()
+        .expect("run lpm fetch");
+
+    assert!(
+        output.status.success(),
+        "fetch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        mock.tarball_request_count("shared-artifact", "1.0.0").await,
+        1,
+        "contextual rows for one artifact must share one download"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("fetch JSON parses");
+    assert_eq!(envelope["counts"]["total"], serde_json::json!(2));
+    assert_eq!(envelope["counts"]["fetched"], serde_json::json!(2));
+    assert_eq!(
+        envelope["packages"].as_array().map(Vec::len),
+        Some(2),
+        "reporting remains per lockfile instance"
+    );
 }

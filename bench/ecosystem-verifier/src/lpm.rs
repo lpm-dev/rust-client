@@ -854,6 +854,9 @@ mod tests {
 
     fn registry_package(name: &str, version: &str) -> LockedPackage {
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: name.into(),
             version: version.into(),
             source: Some("registry+https://registry.npmjs.org".into()),
@@ -963,6 +966,7 @@ mod tests {
             root_resolutions: BTreeMap::from([(
                 "peer-host".into(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: None,
                     package: "peer-host".into(),
                     version: "1.0.0".into(),
                     source: Some(source.into()),
@@ -994,6 +998,7 @@ mod tests {
             root_resolutions: BTreeMap::from([(
                 "react".into(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: None,
                     package: "react".into(),
                     version: "19.2.8".into(),
                     source: Some(source.into()),
@@ -1057,6 +1062,7 @@ mod tests {
             root_resolutions: BTreeMap::from([(
                 "shared".into(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: None,
                     package: "shared".into(),
                     version: "1.0.0".into(),
                     source: Some("registry+https://registry.npmjs.org".into()),
@@ -1121,6 +1127,9 @@ mod tests {
     #[test]
     fn source_wrapper_dependency_resolves_to_the_package_manifest_version() {
         let mut git_package = LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "wa-sqlite".into(),
             version: "1.0.9".into(),
             source: Some(
@@ -1155,6 +1164,7 @@ mod tests {
             root_resolutions: BTreeMap::from([(
                 "parent".into(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: None,
                     package: "parent".into(),
                     version: "1.0.0".into(),
                     source: Some("registry+https://registry.npmjs.org".into()),
@@ -1182,6 +1192,9 @@ mod tests {
         let mut parent = registry_package("parent", "1.0.0");
         parent.dependencies.push("plugin@1.0.0".into());
         let source_plugin = LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "plugin".into(),
             version: "1.0.0".into(),
             source: Some("directory+packages/plugin".into()),
@@ -1199,6 +1212,7 @@ mod tests {
             root_resolutions: BTreeMap::from([(
                 "parent".into(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: None,
                     package: "parent".into(),
                     version: "1.0.0".into(),
                     source: Some("registry+https://registry.npmjs.org".into()),

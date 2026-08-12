@@ -199,6 +199,80 @@ struct LinkOutcomeWithTimings {
     finalize_ms: u128,
 }
 
+pub(super) enum ArtifactLinkTargets {
+    One(Arc<lpm_linker::v2::V2Target>),
+    Many(Vec<Arc<lpm_linker::v2::V2Target>>),
+}
+
+impl ArtifactLinkTargets {
+    fn push(&mut self, target: Arc<lpm_linker::v2::V2Target>) {
+        match self {
+            Self::One(first) => {
+                let first = Arc::clone(first);
+                *self = Self::Many(vec![first, target]);
+            }
+            Self::Many(targets) => targets.push(target),
+        }
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &Arc<lpm_linker::v2::V2Target>> {
+        match self {
+            Self::One(target) => std::slice::from_ref(target).iter(),
+            Self::Many(targets) => targets.iter(),
+        }
+    }
+}
+
+pub(super) fn index_v2_targets_by_artifact(
+    packages: &[InstallPackage],
+    targets: &[Arc<lpm_linker::v2::V2Target>],
+) -> Result<HashMap<String, ArtifactLinkTargets>, LpmError> {
+    if packages.len() != targets.len() {
+        return Err(LpmError::Store(format!(
+            "experimental event linker: package/target cardinality mismatch ({} != {})",
+            packages.len(),
+            targets.len()
+        )));
+    }
+    let mut by_artifact = HashMap::with_capacity(packages.len());
+    for (package, target) in packages.iter().zip(targets) {
+        let instance_id = package.instance_id.ok_or_else(|| {
+            LpmError::Store(format!(
+                "experimental event linker: missing exact instance ID for {}@{}",
+                package.name, package.version
+            ))
+        })?;
+        if instance_id != target.instance_id {
+            return Err(LpmError::Store(format!(
+                "experimental event linker: package/target instance mismatch for {}@{}",
+                package.name, package.version
+            )));
+        }
+        let target = Arc::clone(target);
+        by_artifact
+            .entry(install_pkg_key(package))
+            .and_modify(|targets: &mut ArtifactLinkTargets| targets.push(Arc::clone(&target)))
+            .or_insert(ArtifactLinkTargets::One(target));
+    }
+    Ok(by_artifact)
+}
+
+pub(super) fn apply_computed_sri_to_artifact(
+    packages: &mut [InstallPackage],
+    artifact_key: &str,
+    computed_sri: String,
+) {
+    let mut parts = artifact_key.splitn(3, '\0');
+    let name = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    let source = parts.next().unwrap_or_default();
+    for package in packages.iter_mut().filter(|package| {
+        package.name == name && package.version == version && package.source == source
+    }) {
+        package.integrity = Some(computed_sri.clone());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::commands::install) async fn run(
     client: Arc<RegistryClient>,
@@ -413,18 +487,18 @@ pub(in crate::commands::install) async fn run(
                 &mut fetch_handles,
                 &mut stats,
             )?;
-            attach_peer_edges_to_drafts(&mut packages);
+            attach_peer_edges_to_drafts(&mut packages)?;
             let mut install_packages: Vec<InstallPackage> =
                 packages.into_values().map(|draft| draft.package).collect();
             install_packages
                 .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
-            dedupe_install_packages_by_identity(&mut install_packages);
+            dedupe_install_packages_by_identity(&mut install_packages)?;
             stage_timings.package_graph_ms = package_graph_start.elapsed().as_millis();
             merge_pre_resolved_packages(
                 &mut install_packages,
                 pre_resolved_install_pkgs,
                 pre_resolved_source_deps,
-            );
+            )?;
             spawn_fetches_for_packages(
                 pre_resolved_install_pkgs,
                 &store,
@@ -449,11 +523,12 @@ pub(in crate::commands::install) async fn run(
                 project_dir,
                 deps,
                 catalog_resolutions,
+                &route_table,
                 client.as_ref(),
                 gate_stats.as_ref(),
                 auto_install_peers,
             )?;
-            dedupe_install_packages_by_identity(&mut install_packages);
+            dedupe_install_packages_by_identity(&mut install_packages)?;
             install_packages
                 .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
             stage_timings.package_graph_ms = package_graph_start.elapsed().as_millis();
@@ -465,7 +540,7 @@ pub(in crate::commands::install) async fn run(
                 &mut install_packages,
                 pre_resolved_install_pkgs,
                 pre_resolved_source_deps,
-            );
+            )?;
             install_packages
         }
         ExperimentalResolverGraphSource::Invalid => {
@@ -545,11 +620,8 @@ pub(in crate::commands::install) async fn run(
                 )?;
             stage_timings.v2_prepare_ms = v2_prepare_start.elapsed().as_millis();
             let v2_index_start = Instant::now();
-            let target_by_key: HashMap<String, Arc<lpm_linker::v2::V2Target>> = install_packages
-                .iter()
-                .zip(&plan.augmented_targets)
-                .map(|(package, target)| (install_pkg_key(package), Arc::clone(target)))
-                .collect();
+            let target_by_key =
+                index_v2_targets_by_artifact(&install_packages, &plan.augmented_targets)?;
             stage_timings.v2_index_ms = v2_index_start.elapsed().as_millis();
             Some((Arc::new(plan), target_by_key))
         }
@@ -587,27 +659,21 @@ pub(in crate::commands::install) async fn run(
             fetch_breakdown.record(timings);
         }
         if let Some(computed_sri) = outcome.computed_sri {
-            let mut parts = outcome.key.split('\0');
-            let name = parts.next().unwrap_or_default();
-            let version = parts.next().unwrap_or_default();
-            if let Some(package) = install_packages
-                .iter_mut()
-                .find(|package| package.name == name && package.version == version)
-            {
-                package.integrity = Some(computed_sri);
-            }
+            apply_computed_sri_to_artifact(&mut install_packages, &outcome.key, computed_sri);
         }
         if let (Some((plan, target_by_key)), Some(store_v2)) =
             (v2_event_plan.as_ref(), store_v2_handle.as_ref())
-            && let Some(target) = target_by_key.get(&outcome.key).cloned()
+            && let Some(targets) = target_by_key.get(&outcome.key)
         {
-            v2_link_handles.push(spawn_v2_link_task(
-                Arc::clone(plan),
-                target,
-                Arc::clone(store_v2),
-                Arc::clone(&v2_link_task_semaphore),
-                workspace_materialization::current(),
-            )?);
+            for target in targets.iter() {
+                v2_link_handles.push(spawn_v2_link_task(
+                    Arc::clone(plan),
+                    Arc::clone(target),
+                    Arc::clone(store_v2),
+                    Arc::clone(&v2_link_task_semaphore),
+                    workspace_materialization::current(),
+                )?);
+            }
         }
     }
     let fetch_ms = fetch_start.elapsed().as_millis();
@@ -807,14 +873,15 @@ fn merge_pre_resolved_packages(
     packages: &mut Vec<InstallPackage>,
     pre_resolved_install_pkgs: &[InstallPackage],
     pre_resolved_source_deps: &HashMap<String, Vec<SourceDep>>,
-) {
+) -> Result<(), LpmError> {
     if !pre_resolved_install_pkgs.is_empty() {
         packages.extend(pre_resolved_install_pkgs.iter().cloned());
     }
     if !pre_resolved_source_deps.is_empty() {
-        apply_post_resolve_directory_link_fixup(packages, pre_resolved_source_deps);
+        apply_post_resolve_directory_link_fixup(packages, pre_resolved_source_deps)?;
     }
-    dedupe_install_packages_by_identity(packages);
+    dedupe_install_packages_by_identity(packages)?;
+    Ok(())
 }
 
 fn populate_v2_local_source_objects(
@@ -930,7 +997,7 @@ async fn compute_parity_if_requested(
                 &resolve_result.ambient_peer_installs,
                 &resolve_result.cache,
                 RegistrySourceContext::new(&route_table, client.as_ref()),
-            );
+            )?;
             let optional_dependency_names =
                 optional_dependency_names_from_resolver_cache(&packages, &resolve_result.cache);
             normalize_install_package_optional_reachability(
@@ -941,20 +1008,24 @@ async fn compute_parity_if_requested(
                 &mut packages,
                 pre_resolved_install_pkgs,
                 pre_resolved_source_deps,
-            );
+            )?;
             packages
         }
         ExperimentalResolverParityMode::Lockfile { .. } => {
             let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
             let gate_stats = GateStats::default();
-            try_lockfile_fast_path(
-                &lockfile_path,
-                deps,
-                catalog_resolutions,
-                None,
-                client.as_ref(),
-                &gate_stats,
-                true,
+            try_lockfile_fast_path_with_optional_roots(
+                TryLockfileFastPathInput {
+                    lockfile_path: &lockfile_path,
+                    deps,
+                    optional_root_names: &HashSet::new(),
+                    catalog_resolutions,
+                    workspace: None,
+                    route_table: &route_table,
+                    client: client.as_ref(),
+                    gate_stats: &gate_stats,
+                    accept_unsafe_sources: true,
+                },
             )
             .map(|fast| fast.packages)
             .ok_or_else(|| {
@@ -965,7 +1036,7 @@ async fn compute_parity_if_requested(
             })?
         }
     };
-    dedupe_install_packages_by_identity(&mut baseline_packages);
+    dedupe_install_packages_by_identity(&mut baseline_packages)?;
     filter_dependency_engine_packages(&mut baseline_packages, dependency_engine_policy)?;
     let _ = filter_platform_packages(&mut baseline_packages)?;
 

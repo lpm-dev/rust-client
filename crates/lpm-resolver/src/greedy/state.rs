@@ -419,7 +419,8 @@ pub(super) struct ResolveState {
     /// installs would share a single link entry and contaminate each other's
     /// `node_modules/`.
     pub(super) peer_requirements: Vec<PeerRequirement>,
-    pub(super) peer_bindings: AHashMap<NodeId, AHashMap<String, NpmVersion>>,
+    pub(super) peer_bindings: AHashMap<NodeId, AHashMap<String, NodeId>>,
+    pub(super) pending_peer_bindings: AHashMap<(CanonicalKey, NpmVersion), Vec<(NodeId, String)>>,
     /// Canonical names of packages the peer-drain pass synthesized as
     /// ambient root-scoped installs. Drained into
     /// `ResolveResult.ambient_peer_installs` at each arm's tail. The install
@@ -446,7 +447,8 @@ pub(super) struct ResolveState {
     pub(super) policy: ResolverPolicy,
     pub(super) work_stats: ResolveWorkStats,
     pub(super) peer_work_stats: PeerWorkStats,
-    selected_package_tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+    selected_package_tx: Option<tokio::sync::mpsc::Sender<SelectedPackageEvent>>,
+    pending_selected_packages: VecDeque<SelectedPackageEvent>,
 }
 
 /// In-flight resolved node — accumulated during the loop, finalized
@@ -520,6 +522,7 @@ impl ResolveState {
             // across 250+ packages. Start small; Vec::push amortizes.
             peer_requirements: Vec::new(),
             peer_bindings: AHashMap::new(),
+            pending_peer_bindings: AHashMap::new(),
             // Typically 0 (most installs don't need ambient peer
             // synthesis). Allocated lazily on first push.
             ambient_peer_installs: Vec::new(),
@@ -532,18 +535,61 @@ impl ResolveState {
             work_stats: ResolveWorkStats::default(),
             peer_work_stats: PeerWorkStats::default(),
             selected_package_tx: None,
+            pending_selected_packages: VecDeque::new(),
         }
     }
 
     pub(super) fn set_selected_package_tx(
         &mut self,
-        tx: Option<tokio::sync::mpsc::UnboundedSender<SelectedPackageEvent>>,
+        tx: Option<tokio::sync::mpsc::Sender<SelectedPackageEvent>>,
     ) {
         self.selected_package_tx = tx;
     }
 
+    pub(super) fn record_exact_peer_binding(
+        &mut self,
+        consumer: NodeId,
+        local_name: String,
+        target: NodeId,
+    ) {
+        self.peer_bindings
+            .entry(consumer)
+            .or_default()
+            .insert(local_name, target);
+    }
+
+    pub(super) fn record_pending_peer_binding(
+        &mut self,
+        consumer: NodeId,
+        local_name: String,
+        canonical: CanonicalKey,
+        version: NpmVersion,
+    ) {
+        self.pending_peer_bindings
+            .entry((canonical, version))
+            .or_default()
+            .push((consumer, local_name));
+    }
+
+    pub(super) fn resolve_pending_peer_bindings(
+        &mut self,
+        canonical: &CanonicalKey,
+        version: &NpmVersion,
+        target: NodeId,
+    ) {
+        let Some(bindings) = self
+            .pending_peer_bindings
+            .remove(&(canonical.clone(), version.clone()))
+        else {
+            return;
+        };
+        for (consumer, local_name) in bindings {
+            self.record_exact_peer_binding(consumer, local_name, target);
+        }
+    }
+
     pub(super) fn emit_selected_package(
-        &self,
+        &mut self,
         canonical: &CanonicalKey,
         version: &NpmVersion,
         info: &CachedPackageInfo,
@@ -569,7 +615,26 @@ impl ResolveState {
             node_engine: info.node_engines.get(&version).cloned(),
             optional,
         };
-        let _ = tx.send(event);
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                self.pending_selected_packages.push_back(event);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    pub(super) async fn flush_selected_packages(&mut self) {
+        let Some(tx) = self.selected_package_tx.as_ref() else {
+            self.pending_selected_packages.clear();
+            return;
+        };
+        while let Some(event) = self.pending_selected_packages.pop_front() {
+            if tx.send(event).await.is_err() {
+                self.pending_selected_packages.clear();
+                break;
+            }
+        }
     }
 
     /// Seed the queue with one Edge per root dependency. The pseudo-node
@@ -656,7 +721,12 @@ impl ResolveState {
         };
         let mut resolutions = HashMap::with_capacity(self.root_deps.len());
         for (local_name, node_id) in &root.children {
-            if !self.root_deps.contains_key(local_name) || resolutions.contains_key(local_name) {
+            let is_manifest_root = self.root_deps.contains_key(local_name);
+            let is_ambient_peer = self
+                .ambient_peer_installs
+                .iter()
+                .any(|peer| peer == local_name);
+            if (!is_manifest_root && !is_ambient_peer) || resolutions.contains_key(local_name) {
                 continue;
             }
             let Some(selected) = self.nodes.get(*node_id as usize) else {
@@ -665,6 +735,7 @@ impl ResolveState {
             resolutions.insert(
                 local_name.clone(),
                 RootResolution {
+                    target: lpm_common::ResolutionNodeId::new(*node_id),
                     package: selected.canonical.to_string(),
                     version: selected.version.to_string(),
                 },
@@ -678,8 +749,9 @@ impl ResolveState {
     pub(super) fn into_resolved_packages(
         self,
         cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
-        root_aliases: &HashMap<String, String>,
+        _root_aliases: &HashMap<String, String>,
     ) -> Vec<ResolvedPackage> {
+        let root_resolutions = self.root_resolutions();
         let root_dependencies = crate::resolve::RootDependencies::with_optional_names(
             self.root_deps,
             self.optional_root_names,
@@ -692,22 +764,6 @@ impl ResolveState {
         // time, so children[i].1 is always the correct node id).
         let id_to_version: Vec<String> = nodes.iter().map(|n| n.version.to_string()).collect();
 
-        // canonical-name → resolved-version lookup for peer resolution.
-        // Mirrors `format_solution`'s peer-candidate lookup. Built from the
-        // same node table (filtered to non-root) so peer name-lookups
-        // intersect the active install set. `CanonicalKey`'s Display impl
-        // emits the canonical-name form (`@lpm.dev/owner.name` or `react`),
-        // matching how `peerDependencies` keys are spelled in package.json.
-        let resolved_by_canonical: HashMap<String, Vec<(Option<String>, String)>> = nodes
-            .iter()
-            .filter(|n| !matches!(n.canonical, CanonicalKey::Root))
-            .fold(HashMap::new(), |mut acc, n| {
-                acc.entry(n.canonical.to_string())
-                    .or_default()
-                    .push((None, n.version.to_string()));
-                acc
-            });
-
         let mut out: Vec<ResolvedPackage> = nodes
             .into_iter()
             .enumerate()
@@ -716,6 +772,7 @@ impl ResolveState {
                 let pkg = canonical_to_resolver_package(&n.canonical);
                 let ver_str = n.version.to_string();
                 let selected_peer_bindings = peer_bindings.get(&(node_index as NodeId));
+                let resolution_id = lpm_common::ResolutionNodeId::new(node_index as NodeId);
 
                 let cached_aliases: HashMap<String, String> = cache
                     .get(&n.canonical)
@@ -741,6 +798,18 @@ impl ResolveState {
                     })
                     .collect();
                 dependencies.sort_by(|a, b| a.0.cmp(&b.0));
+                let dependency_targets = n
+                    .children
+                    .iter()
+                    .map(|(local, child_id)| {
+                        (local.clone(), lpm_common::ResolutionNodeId::new(*child_id))
+                    })
+                    .collect();
+                let optional_dependencies = cache
+                    .get(&n.canonical)
+                    .and_then(|info| info.optional_dep_names.get(&ver_str))
+                    .cloned()
+                    .unwrap_or_default();
 
                 let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
                 let aliases: HashMap<String, String> = cached_aliases
@@ -766,39 +835,58 @@ impl ResolveState {
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
                 // from the same node table.
-                let peers: Vec<(String, String)> = cache
+                let peers: Vec<lpm_common::PeerEdge> = cache
                     .get(&n.canonical)
                     .and_then(|info| info.peer_deps.get(&ver_str))
                     .map(|peer_deps| {
-                        let mut out: Vec<(String, String)> = peer_deps
+                        let peer_aliases = cache
+                            .get(&n.canonical)
+                            .and_then(|info| info.peer_aliases.get(&ver_str));
+                        let mut out: Vec<lpm_common::PeerEdge> = peer_deps
                             .iter()
                             .filter_map(|(peer_name, peer_range)| {
-                                if let Some(version) = selected_peer_bindings
+                                let target_name = peer_aliases
+                                    .and_then(|aliases| aliases.get(peer_name))
+                                    .unwrap_or(peer_name);
+                                if let Some(&target_id) = selected_peer_bindings
                                     .and_then(|bindings| bindings.get(peer_name))
                                 {
-                                    return Some((peer_name.clone(), version.to_string()));
+                                    let version = &id_to_version[target_id as usize];
+                                    return Some(lpm_common::PeerEdge::registry(
+                                        peer_name,
+                                        target_name,
+                                        version,
+                                    ));
                                 }
-                                let parsed_range = NpmRange::parse(peer_range).ok();
-                                resolve_peer_binding_version(
-                                    &pkg,
-                                    peer_name,
-                                    parsed_range.as_ref(),
-                                    &resolved_by_canonical,
-                                )
-                                .map(|(ver, _)| (peer_name.clone(), ver.clone()))
+                                let _ = peer_range;
+                                None
                             })
                             .collect();
-                        out.sort_by(|a, b| a.0.cmp(&b.0));
+                        out.sort_by(|a, b| a.local_name.cmp(&b.local_name));
                         out
                     })
                     .unwrap_or_default();
+                let peer_targets = selected_peer_bindings
+                    .into_iter()
+                    .flat_map(|bindings| bindings.iter())
+                    .map(|(local_name, target)| {
+                        (
+                            local_name.clone(),
+                            lpm_common::ResolutionNodeId::new(*target),
+                        )
+                    })
+                    .collect();
 
                 ResolvedPackage {
+                    resolution_id,
                     package: pkg,
                     version: n.version,
                     dependencies,
+                    dependency_targets,
+                    optional_dependencies,
                     aliases,
                     peers,
+                    peer_targets,
                     tarball_url,
                     integrity,
                     platform,
@@ -808,13 +896,7 @@ impl ResolveState {
             })
             .collect();
 
-        crate::resolve::mark_optional_reachability(
-            &mut out,
-            cache,
-            &root_dependencies,
-            root_aliases,
-        );
-        crate::resolve::dedupe_peer_superset_packages(&mut out);
+        crate::resolve::mark_optional_reachability(&mut out, &root_dependencies, &root_resolutions);
 
         // Match `format_solution`'s deterministic order so lockfile
         // serialization is stable regardless of resolution order.
@@ -911,6 +993,7 @@ mod tests {
             versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
             deps: HashMap::new(),
             peer_deps: HashMap::new(),
+            peer_aliases: HashMap::new(),
             optional_dep_names: HashMap::new(),
             optional_peer_names: HashMap::new(),
             node_engines: HashMap::new(),
@@ -979,6 +1062,7 @@ mod tests {
         assert_eq!(
             state.root_resolutions().get("peer-host"),
             Some(&RootResolution {
+                target: lpm_common::ResolutionNodeId::new(1),
                 package: "peer-host".to_string(),
                 version: "1.0.0".to_string(),
             })

@@ -65,6 +65,7 @@ const MAX_WALK_DEPTH: u32 = 16;
 /// overlap scheduler. Current install defaults can choose a narrower
 /// fused-path cap without changing this exported walker default.
 pub const DEFAULT_NPM_FANOUT: usize = 256;
+pub const MAX_NPM_FANOUT: usize = 512;
 
 async fn fetch_walker_metadata_with_trace(
     client: Arc<RegistryClient>,
@@ -366,7 +367,7 @@ impl BfsWalker {
 
     /// Override the npm parallel-fetch concurrency.
     pub fn with_npm_fanout(mut self, fanout: usize) -> Self {
-        self.npm_fanout = fanout;
+        self.npm_fanout = fanout.clamp(1, MAX_NPM_FANOUT);
         self
     }
 
@@ -385,7 +386,7 @@ impl BfsWalker {
             && let Ok(n) = s.parse::<usize>()
             && n > 0
         {
-            self.npm_fanout = n;
+            self.npm_fanout = n.min(MAX_NPM_FANOUT);
         }
         if std::env::var("LPM_WALKER").as_deref() == Ok("stream") {
             self.run_stream().await
@@ -1142,6 +1143,26 @@ mod tests {
     /// (a) all 4 manifests land in shared_cache, (b) roots_ready fires
     /// exactly once, (c) spec_tx receives all 4 frames, (d) summary
     /// reflects the walk.
+    #[test]
+    fn explicit_npm_fanout_is_bounded() {
+        let client = Arc::new(RegistryClient::new().with_cache_dir(None));
+        let (spec_tx, _spec_rx) = mpsc::channel(1);
+        let (roots_ready_tx, _roots_ready_rx) = oneshot::channel();
+        let walker = BfsWalker::new(
+            client,
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+            make_walker_done(),
+            spec_tx,
+            roots_ready_tx,
+            Vec::new(),
+            RouteTable::from_mode_only(RouteMode::Direct),
+        )
+        .with_npm_fanout(usize::MAX);
+
+        assert_eq!(walker.npm_fanout, MAX_NPM_FANOUT);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn walker_end_to_end_discovery_and_signals() {
         let server = MockServer::start().await;

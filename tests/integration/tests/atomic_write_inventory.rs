@@ -252,7 +252,7 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "writes are inside an extraction directory that is published as a directory transaction",
     ),
     (
-        "crates/lpm-store/src/extraction.rs::store_package_from_file_timed",
+        "crates/lpm-store/src/extraction.rs::store_from_file_at_timed",
         "writes are inside an extraction directory that is published as a directory transaction",
     ),
     (
@@ -284,7 +284,7 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes or discards a complete local-source object directory after a concurrent transaction",
     ),
     (
-        "crates/lpm-store/src/v2/store.rs::extract_object_with_timings_and_policy",
+        "crates/lpm-store/src/v2/store.rs::extract_object_from_input_with_policy",
         "writes are inside an object staging directory that is published as a directory transaction",
     ),
     (

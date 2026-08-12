@@ -97,6 +97,9 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
     );
     for (name, version, package_dependencies) in entries {
         lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: (*name).to_string(),
             version: (*version).to_string(),
             dependencies: package_dependencies
@@ -109,6 +112,7 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
             lockfile.root_resolutions.insert(
                 (*name).to_string(),
                 lpm_lockfile::LockedRootResolution {
+                    instance_id: None,
                     package: (*name).to_string(),
                     version: (*version).to_string(),
                     source: None,
@@ -116,6 +120,12 @@ fn write_lockfile(project: &TempProject, entries: &[(&str, &str, &[&str])]) {
             );
         }
     }
+    let roots = entries
+        .iter()
+        .filter(|(name, _, _)| root_dependencies.contains_key(*name))
+        .map(|(name, version, _)| (*name, *name, *version))
+        .collect::<Vec<_>>();
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &roots);
     lockfile
         .write_to_file(&project.path().join("lpm.lock"))
         .expect("write fixture lockfile");
@@ -1041,5 +1051,13 @@ async fn install_override_applies_to_required_peer_binding() {
         .iter()
         .find(|package| package.name == "peer-consumer")
         .expect("peer-consumer must be locked");
-    assert_eq!(peer_consumer.peers, ["peer-host@1.0.0"]);
+    assert_eq!(
+        peer_consumer.peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "peer-host",
+            "peer-host",
+            "1.0.0",
+        )]
+    );
+    assert_eq!(peer_consumer.peer_targets.len(), 1);
 }

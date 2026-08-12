@@ -1154,16 +1154,34 @@ mod managed_runtime_tests {
             r#"{"private":true,"dependencies":{"@lpm-registry/mcp-server":"latest"}}"#,
         )
         .unwrap();
+        let source = "registry+https://registry.npmjs.org";
+        let instance_id = lpm_common::PackageInstanceId::derive(
+            "@lpm-registry/mcp-server",
+            "1.0.0",
+            source,
+            "root/@lpm-registry/mcp-server",
+        );
         let mut lockfile = lpm_lockfile::Lockfile::new();
         lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
             name: "@lpm-registry/mcp-server".to_string(),
             version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
             integrity: Some(
                 "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg=="
                     .to_string(),
             ),
             ..Default::default()
         });
+        lockfile.root_resolutions.insert(
+            "@lpm-registry/mcp-server".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: "@lpm-registry/mcp-server".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
         lockfile
             .write_to_file(&root.join(lpm_lockfile::LOCKFILE_NAME))
             .unwrap();
@@ -1193,16 +1211,44 @@ mod managed_runtime_tests {
         for integrity in [None, Some("sha512-invalid".to_string())] {
             let temp = tempfile::tempdir().unwrap();
             seed_managed_runtime(temp.path());
+            let source = "registry+https://registry.npmjs.org";
+            let instance_id = lpm_common::PackageInstanceId::derive(
+                "@lpm-registry/mcp-server",
+                "1.0.0",
+                source,
+                "root/@lpm-registry/mcp-server",
+            );
             let mut lockfile = lpm_lockfile::Lockfile::new();
             lockfile.add_package(lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
                 name: "@lpm-registry/mcp-server".to_string(),
                 version: "1.0.0".to_string(),
-                integrity,
+                source: Some(source.to_string()),
+                integrity: integrity.clone(),
                 ..Default::default()
             });
-            lockfile
-                .write_to_file(&temp.path().join(lpm_lockfile::LOCKFILE_NAME))
+            lockfile.root_resolutions.insert(
+                "@lpm-registry/mcp-server".to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: "@lpm-registry/mcp-server".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(source.to_string()),
+                },
+            );
+            let lockfile_path = temp.path().join(lpm_lockfile::LOCKFILE_NAME);
+            if integrity.is_some() {
+                std::fs::write(
+                    &lockfile_path,
+                    format!(
+                        "[metadata]\nlockfile-version = {}\nresolved-with = \"greedy-fusion\"\n\n[[packages]]\nname = \"@lpm-registry/mcp-server\"\nversion = \"1.0.0\"\nintegrity = \"sha512-invalid\"\n",
+                        lpm_lockfile::LOCKFILE_VERSION,
+                    ),
+                )
                 .unwrap();
+            } else {
+                lockfile.write_to_file(&lockfile_path).unwrap();
+            }
             let target = registry_dlx_target("@lpm-registry/mcp-server@latest");
 
             assert!(matches!(

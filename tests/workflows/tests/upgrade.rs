@@ -314,11 +314,18 @@ async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_sp
         .root_aliases
         .insert("strip-ansi-cjs".to_string(), "strip-ansi".to_string());
     lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "strip-ansi".to_string(),
         version: "6.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[("strip-ansi-cjs", "strip-ansi", "6.0.0")],
+    );
     lockfile
         .write_to_file(&project.path().join("lpm.lock"))
         .expect("write aliased lockfile");
@@ -772,11 +779,25 @@ async fn workspace_member_upgrade_preserves_the_sibling_root_lockfile_projection
 
     let mut app_projection = lpm_lockfile::Lockfile::new();
     app_projection.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: pkg.into(),
         version: "1.0.0".into(),
         source: Some("registry+https://lpm.dev".into()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(&mut app_projection, &[(pkg, pkg, "1.0.0")]);
+    app_projection.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                pkg.to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
     let mut sibling_projection = lpm_lockfile::Lockfile::new();
     sibling_projection.patches.insert(
         "sibling@1.0.0".into(),

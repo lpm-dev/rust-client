@@ -166,6 +166,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) pkg_json_path: &'a Path,
     pub(super) lockfile_path: &'a Path,
     pub(super) manifest_deps: &'a HashMap<String, String>,
+    pub(super) root_optional_dependency_names: &'a HashSet<String>,
     pub(super) production_dependency_names: &'a HashSet<String>,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) force: bool,
@@ -269,15 +270,18 @@ pub(super) async fn run_install_freshness_phase(
                 {
                     return Some(Vec::new());
                 }
-                try_lockfile_fast_path(
-                    input.lockfile_path,
-                    &lockfile_deps,
-                    &[],
-                    workspace.as_deref(),
-                    input.client,
-                    &gate_stats,
-                    false,
-                )
+                let route_table = RouteTable::from_env_and_filesystem(input.project_dir).ok()?;
+                try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
+                    lockfile_path: input.lockfile_path,
+                    deps: &lockfile_deps,
+                    optional_root_names: input.root_optional_dependency_names,
+                    catalog_resolutions: &[],
+                    workspace: workspace.as_deref(),
+                    route_table: &route_table,
+                    client: input.client,
+                    gate_stats: &gate_stats,
+                    accept_unsafe_sources: false,
+                })
                 .and_then(|fast| {
                     let locked = fast.lockfile.importers.get(".").and_then(|importer| {
                         importer
@@ -296,6 +300,9 @@ pub(super) async fn run_install_freshness_phase(
         if let Some(mut packages) = fast {
             if input.omit_policy.dev {
                 filter_dev_packages(&mut packages, input.production_dependency_names);
+            }
+            if input.omit_policy.optional {
+                filter_optional_packages(&mut packages, input.root_optional_dependency_names);
             }
             filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
             filter_platform_packages(&mut packages)?;
@@ -595,7 +602,11 @@ fn dependency_engine_freshness_key_for_state(
         let lockfile = workspace_lockfile::active_lockfile_content(project_dir);
         policy.freshness_key(&lockfile)
     } else {
-        let lockfile = std::fs::read_to_string(lockfile_path).unwrap_or_default();
+        let lockfile = lpm_common::read_text_file_capped(
+            lockfile_path,
+            lpm_lockfile::TOML_LOCKFILE_SIZE_CAP_BYTES,
+        )
+        .unwrap_or_default();
         policy.freshness_key(&lockfile)
     }
 }

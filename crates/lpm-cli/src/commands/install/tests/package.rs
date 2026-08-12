@@ -638,6 +638,9 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
 
     for (source, want_prefix, want_mat) in cases {
         let pkg = InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
             source: (*source).to_string(),
@@ -655,6 +658,7 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
             optional: false,
             tarball_url: None,
             metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
         };
         let wid = pkg.wrapper_id_for_source();
         match want_prefix {
@@ -687,6 +691,9 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
 #[test]
 fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
     let remote = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: "tarball+https://example.com/foo-1.0.0.tgz".to_string(),
@@ -704,8 +711,12 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
     let local = InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: "foo".to_string(),
         version: "1.0.0".to_string(),
         source: "tarball+file:./vendor/foo-1.0.0.tgz".to_string(),
@@ -723,6 +734,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         optional: false,
         tarball_url: None,
         metadata_checked_for_tarball: false,
+        manifest_fingerprint: None,
     };
 
     let remote_wid = remote
@@ -791,27 +803,175 @@ fn dedupe_install_packages_by_identity_merges_workspace_reentry_source_graph() {
     resolver_pkg.root_link_names = None;
     resolver_pkg.is_direct = false;
     resolver_pkg.tarball_url = None;
+    let resolver_id = lpm_common::PackageInstanceId::derive(
+        &resolver_pkg.name,
+        &resolver_pkg.version,
+        &resolver_pkg.source,
+        "root/external-reentry/@smoke/cycle-b",
+    );
+    resolver_pkg.instance_id = Some(resolver_id);
 
     let mut source_graph_pkg = resolver_pkg.clone();
+    let generic_id = lpm_common::PackageInstanceId::derive(
+        &source_graph_pkg.name,
+        &source_graph_pkg.version,
+        &source_graph_pkg.source,
+        "legacy-artifact-instance",
+    );
+    source_graph_pkg.instance_id = Some(generic_id);
     source_graph_pkg.dependencies = vec![("@smoke/cycle-a".to_string(), "f-cycle-a".to_string())];
     source_graph_pkg.root_link_names = Some(Vec::new());
 
-    let mut packages = vec![resolver_pkg, source_graph_pkg];
-    dedupe_install_packages_by_identity(&mut packages);
+    let mut external = install_package_for_tarball("ignored", None);
+    external.name = "external-reentry".to_string();
+    external.version = "1.0.0".to_string();
+    external.source = "registry+https://registry.npmjs.org".to_string();
+    external.dependencies = vec![("@smoke/cycle-b".to_string(), "1.0.0".to_string())];
+    external
+        .dependency_targets
+        .insert("@smoke/cycle-b".to_string(), generic_id);
+
+    let mut packages = vec![resolver_pkg, source_graph_pkg, external];
+    dedupe_install_packages_by_identity(&mut packages).expect("coalesce workspace re-entry");
 
     assert_eq!(
         packages.len(),
-        1,
+        2,
         "same name/version/source package reached through resolver re-entry and source graph must collapse before linking"
     );
+    let workspace = packages
+        .iter()
+        .find(|package| package.name == "@smoke/cycle-b")
+        .expect("coalesced workspace package");
+    assert_eq!(workspace.instance_id, Some(resolver_id));
     assert_eq!(
-        packages[0].dependencies,
+        workspace.dependencies,
         vec![("@smoke/cycle-a".to_string(), "f-cycle-a".to_string())],
         "merged package must retain source-graph dependencies"
     );
     assert_eq!(
-        packages[0].root_link_names.as_deref(),
+        workspace.root_link_names.as_deref(),
         Some(&[][..]),
         "merged transitive workspace package must stay off root links"
+    );
+    let external = packages
+        .iter()
+        .find(|package| package.name == "external-reentry")
+        .expect("registry consumer");
+    assert_eq!(
+        external.dependency_targets.get("@smoke/cycle-b"),
+        Some(&resolver_id),
+        "exact edges must follow the retained workspace instance",
+    );
+    assert_eq!(
+        external.dependencies,
+        [(
+            "@smoke/cycle-b".to_string(),
+            workspace.wrapper_id_for_source().unwrap()
+        )],
+        "edge metadata must describe the retained workspace source",
+    );
+}
+
+#[test]
+fn dedupe_install_packages_by_identity_rejects_conflicting_dependency_targets() {
+    let mut left = install_package_for_tarball("https://e.com/consumer.tgz", None);
+    left.name = "consumer".to_string();
+    left.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &left.name,
+        &left.version,
+        &left.source,
+        "root/consumer",
+    ));
+    left.dependencies = vec![("child".to_string(), "1.0.0".to_string())];
+    left.dependency_targets.insert(
+        "child".to_string(),
+        lpm_common::PackageInstanceId::derive(
+            "child",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/left/child",
+        ),
+    );
+
+    let mut right = left.clone();
+    right.dependency_targets.insert(
+        "child".to_string(),
+        lpm_common::PackageInstanceId::derive(
+            "child",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/right/child",
+        ),
+    );
+
+    let mut packages = vec![left, right];
+    let original = format!("{packages:?}");
+    let error = dedupe_install_packages_by_identity(&mut packages)
+        .expect_err("conflicting exact dependency targets must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("conflicting exact dependency targets"),
+        "unexpected error: {error}",
+    );
+    assert_eq!(
+        format!("{packages:?}"),
+        original,
+        "failed validation must not partially mutate the install graph",
+    );
+}
+
+#[test]
+fn dedupe_install_packages_by_identity_rejects_conflicting_peer_targets() {
+    let mut left = install_package_for_tarball("https://e.com/consumer.tgz", None);
+    left.name = "consumer".to_string();
+    left.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &left.name,
+        &left.version,
+        &left.source,
+        "root/consumer",
+    ));
+    left.peers = vec![lpm_common::PeerEdge {
+        local_name: "host".to_string(),
+        target_name: "host".to_string(),
+        target_version: "1.0.0".to_string(),
+        target_wrapper_id: None,
+    }];
+    left.peer_targets.insert(
+        "host".to_string(),
+        lpm_common::PackageInstanceId::derive(
+            "host",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/left/host",
+        ),
+    );
+
+    let mut right = left.clone();
+    right.peer_targets.insert(
+        "host".to_string(),
+        lpm_common::PackageInstanceId::derive(
+            "host",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/right/host",
+        ),
+    );
+
+    let mut packages = vec![left, right];
+    let original = format!("{packages:?}");
+    let error = dedupe_install_packages_by_identity(&mut packages)
+        .expect_err("conflicting exact peer targets must fail closed");
+
+    assert!(
+        error.to_string().contains("conflicting exact peer targets"),
+        "unexpected error: {error}",
+    );
+    assert_eq!(
+        format!("{packages:?}"),
+        original,
+        "failed validation must not partially mutate the install graph",
     );
 }

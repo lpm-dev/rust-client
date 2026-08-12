@@ -399,6 +399,9 @@ mod tests {
 
     fn locked_package(name: &str, optional: bool) -> LockedPackage {
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: name.to_string(),
             version: "1.0.0".to_string(),
             optional,

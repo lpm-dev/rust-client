@@ -35,6 +35,15 @@ fn append_unique_pairs_by_left(dst: &mut Vec<(String, String)>, src: Vec<(String
     }
 }
 
+fn append_unique_peer_edges(dst: &mut Vec<lpm_common::PeerEdge>, src: Vec<lpm_common::PeerEdge>) {
+    let mut seen: HashSet<String> = dst.iter().map(|edge| edge.local_name.clone()).collect();
+    for edge in src {
+        if seen.insert(edge.local_name.clone()) {
+            dst.push(edge);
+        }
+    }
+}
+
 fn normalize_implicit_root_links(pkg: &mut InstallPackage) {
     if pkg.root_link_names.is_none() && pkg.is_direct {
         pkg.root_link_names = Some(vec![pkg.name.clone()]);
@@ -52,16 +61,27 @@ fn merge_install_package(dst: &mut InstallPackage, mut src: InstallPackage) {
     }
 
     append_unique_pairs_by_left(&mut dst.dependencies, src.dependencies);
+    for (local, target) in src.dependency_targets {
+        dst.dependency_targets.entry(local).or_insert(target);
+    }
     for (alias, target) in src.aliases {
         dst.aliases.entry(alias).or_insert(target);
     }
-    append_unique_pairs_by_left(&mut dst.peers, src.peers);
+    append_unique_peer_edges(&mut dst.peers, src.peers);
+    for (local, target) in src.peer_targets {
+        dst.peer_targets.entry(local).or_insert(target);
+    }
 
     dst.is_direct |= src.is_direct;
     dst.is_lpm |= src.is_lpm;
     dst.optional &= src.optional;
     if dst.integrity.is_none() {
         dst.integrity = src.integrity;
+    }
+    match (&dst.manifest_fingerprint, src.manifest_fingerprint) {
+        (None, fingerprint) => dst.manifest_fingerprint = fingerprint,
+        (Some(left), Some(right)) => debug_assert_eq!(left, &right),
+        (Some(_), None) => {}
     }
     if dst.registry_signatures.is_empty() {
         dst.registry_signatures = src.registry_signatures;
@@ -81,15 +101,201 @@ fn merge_install_package(dst: &mut InstallPackage, mut src: InstallPackage) {
     dst.metadata_checked_for_tarball |= src.metadata_checked_for_tarball;
 }
 
-pub(super) fn dedupe_install_packages_by_identity(packages: &mut Vec<InstallPackage>) {
-    if packages.len() < 2 {
-        return;
+#[derive(Default)]
+struct LocalArtifactInstances {
+    exact: Option<lpm_common::PackageInstanceId>,
+    ambiguous: bool,
+    generic: Option<lpm_common::PackageInstanceId>,
+}
+
+fn local_artifact_instance_remaps(
+    packages: &[InstallPackage],
+) -> HashMap<lpm_common::PackageInstanceId, lpm_common::PackageInstanceId> {
+    let mut instances_by_artifact: HashMap<String, LocalArtifactInstances> =
+        HashMap::with_capacity(packages.len());
+    for package in packages {
+        if !matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Directory { .. })
+        ) {
+            continue;
+        }
+        let instance_id = install_package_instance_id(package);
+        let generic = lpm_common::PackageInstanceId::derive(
+            &package.name,
+            &package.version,
+            &package.source,
+            "legacy-artifact-instance",
+        );
+        let instances = instances_by_artifact
+            .entry(install_pkg_key(package))
+            .or_default();
+        if instance_id == generic {
+            instances.generic = Some(generic);
+        } else if instances.exact.is_some_and(|exact| exact != instance_id) {
+            instances.ambiguous = true;
+        } else {
+            instances.exact = Some(instance_id);
+        }
     }
 
-    let mut index_by_key: HashMap<String, usize> = HashMap::with_capacity(packages.len());
+    instances_by_artifact
+        .into_values()
+        .filter_map(|instances| {
+            (!instances.ambiguous).then_some((instances.generic?, instances.exact?))
+        })
+        .collect()
+}
+
+fn install_package_instance_id(package: &InstallPackage) -> lpm_common::PackageInstanceId {
+    package.instance_id.unwrap_or_else(|| {
+        lpm_common::PackageInstanceId::derive(
+            &package.name,
+            &package.version,
+            &package.source,
+            "legacy-artifact-instance",
+        )
+    })
+}
+
+fn remapped_instance_id(
+    instance_id: lpm_common::PackageInstanceId,
+    local_instance_remaps: &HashMap<lpm_common::PackageInstanceId, lpm_common::PackageInstanceId>,
+) -> lpm_common::PackageInstanceId {
+    local_instance_remaps
+        .get(&instance_id)
+        .copied()
+        .unwrap_or(instance_id)
+}
+
+fn validate_exact_edge_merge(
+    packages: &[InstallPackage],
+    local_instance_remaps: &HashMap<lpm_common::PackageInstanceId, lpm_common::PackageInstanceId>,
+) -> Result<(), LpmError> {
+    let mut dependency_targets = HashMap::with_capacity(packages.len());
+    let mut peer_targets = HashMap::with_capacity(packages.len());
+
+    for package in packages {
+        let package_id =
+            remapped_instance_id(install_package_instance_id(package), local_instance_remaps);
+        for (local_name, target) in &package.dependency_targets {
+            let target = remapped_instance_id(*target, local_instance_remaps);
+            if let Some(previous) =
+                dependency_targets.insert((package_id, local_name.as_str()), target)
+                && previous != target
+            {
+                return Err(LpmError::Registry(format!(
+                    "resolved package graph has conflicting exact dependency targets for {}@{} instance {package_id}, local name {local_name:?}: {previous} and {target}",
+                    package.name, package.version,
+                )));
+            }
+        }
+        for (local_name, target) in &package.peer_targets {
+            let target = remapped_instance_id(*target, local_instance_remaps);
+            if let Some(previous) = peer_targets.insert((package_id, local_name.as_str()), target)
+                && previous != target
+            {
+                return Err(LpmError::Registry(format!(
+                    "resolved package graph has conflicting exact peer targets for {}@{} instance {package_id}, local name {local_name:?}: {previous} and {target}",
+                    package.name, package.version,
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn synchronize_exact_edge_metadata(packages: &mut [InstallPackage]) {
+    let mut metadata_by_instance = HashMap::with_capacity(packages.len());
+    for package in packages.iter() {
+        let Some(instance_id) = package.instance_id else {
+            continue;
+        };
+        metadata_by_instance.insert(
+            instance_id,
+            (
+                package.name.clone(),
+                package.version.clone(),
+                package.wrapper_id_for_source(),
+            ),
+        );
+    }
+
+    for package in packages {
+        for (local_name, instance_id) in &package.dependency_targets {
+            let Some((target_name, target_version, target_wrapper_id)) =
+                metadata_by_instance.get(instance_id)
+            else {
+                continue;
+            };
+            if let Some((_, target)) = package
+                .dependencies
+                .iter_mut()
+                .find(|(local, _)| local == local_name)
+            {
+                target.clone_from(target_wrapper_id.as_ref().unwrap_or(target_version));
+                if local_name == target_name {
+                    package.aliases.remove(local_name);
+                } else {
+                    package
+                        .aliases
+                        .insert(local_name.clone(), target_name.clone());
+                }
+            }
+        }
+        for peer in &mut package.peers {
+            let Some(instance_id) = package.peer_targets.get(&peer.local_name) else {
+                continue;
+            };
+            let Some((target_name, target_version, target_wrapper_id)) =
+                metadata_by_instance.get(instance_id)
+            else {
+                continue;
+            };
+            peer.target_name.clone_from(target_name);
+            peer.target_version.clone_from(target_version);
+            peer.target_wrapper_id.clone_from(target_wrapper_id);
+        }
+    }
+}
+
+pub(super) fn dedupe_install_packages_by_identity(
+    packages: &mut Vec<InstallPackage>,
+) -> Result<(), LpmError> {
+    if packages.len() < 2 {
+        ensure_install_package_instance_ids(packages);
+        return Ok(());
+    }
+
+    let local_instance_remaps = local_artifact_instance_remaps(packages);
+    validate_exact_edge_merge(packages, &local_instance_remaps)?;
+    ensure_install_package_instance_ids(packages);
+    for package in packages.iter_mut() {
+        if let Some(instance_id) = package.instance_id.as_mut()
+            && let Some(exact) = local_instance_remaps.get(instance_id)
+        {
+            *instance_id = *exact;
+        }
+        for target in package.dependency_targets.values_mut() {
+            if let Some(exact) = local_instance_remaps.get(target) {
+                *target = *exact;
+            }
+        }
+        for target in package.peer_targets.values_mut() {
+            if let Some(exact) = local_instance_remaps.get(target) {
+                *target = *exact;
+            }
+        }
+    }
+
+    let mut index_by_key: HashMap<lpm_common::PackageInstanceId, usize> =
+        HashMap::with_capacity(packages.len());
     let mut deduped = Vec::with_capacity(packages.len());
     for package in packages.drain(..) {
-        let key = install_pkg_key(&package);
+        let key = package
+            .instance_id
+            .expect("package instance id assigned immediately above");
         if let Some(existing_index) = index_by_key.get(&key).copied() {
             merge_install_package(&mut deduped[existing_index], package);
         } else {
@@ -97,13 +303,32 @@ pub(super) fn dedupe_install_packages_by_identity(packages: &mut Vec<InstallPack
             deduped.push(package);
         }
     }
+    synchronize_exact_edge_metadata(&mut deduped);
     *packages = deduped;
+    Ok(())
+}
+
+pub(super) fn ensure_install_package_instance_ids(packages: &mut [InstallPackage]) {
+    for package in packages {
+        if package.instance_id.is_none() {
+            package.instance_id = Some(lpm_common::PackageInstanceId::derive(
+                &package.name,
+                &package.version,
+                &package.source,
+                "legacy-artifact-instance",
+            ));
+        }
+    }
 }
 
 /// Lightweight representation of a resolved package for the install pipeline.
 /// Used both for fresh resolution results and lockfile-restored packages.
 #[derive(Debug, Clone)]
 pub(super) struct InstallPackage {
+    /// Exact package-instance identity. `None` is permitted only while older
+    /// source resolvers are assembling a graph; normalization assigns it
+    /// before deduplication, persistence, or linking.
+    pub(super) instance_id: Option<lpm_common::PackageInstanceId>,
     pub(super) name: String,
     pub(super) version: String,
     /// Source registry for lockfile
@@ -111,6 +336,8 @@ pub(super) struct InstallPackage {
     /// Dependencies: (dep_name_in_parent, dep_version). The name is the
     /// LOCAL label THIS package uses for the dep in its own `package.json`
     pub(super) dependencies: Vec<(String, String)>,
+    /// Exact graph target for each manifest-local dependency name.
+    pub(super) dependency_targets: HashMap<String, lpm_common::PackageInstanceId>,
     /// npm alias edges declared by this package: local dep name -> canonical target name.
     pub(super) aliases: HashMap<String, String>,
     pub(super) root_link_names: Option<Vec<String>>,
@@ -118,9 +345,9 @@ pub(super) struct InstallPackage {
     pub(super) is_direct: bool,
     /// Whether this is an LPM package (for tarball fetching)
     pub(super) is_lpm: bool,
-    /// resolved peers in scope for THIS package's
-    /// instance in this install graph: `(peer_name, resolved_version)`.
-    /// Sorted by peer_name for deterministic GraphKey hashing.
+    /// Resolved peer edges in scope for this package instance, including
+    /// local slot, canonical target, exact version, and source identity.
+    /// Sorted by local name for deterministic GraphKey hashing.
     ///
     /// Carried verbatim from the resolver's
     /// [`lpm_resolver::ResolvedPackage::peers`] field. The v2 linker
@@ -132,7 +359,9 @@ pub(super) struct InstallPackage {
     /// invariant). v1 ignores this field — its relative-symlink
     /// wrappers walk up to the project root for peers, so threading
     /// is informational under v1.
-    pub(super) peers: Vec<(String, String)>,
+    pub(super) peers: Vec<lpm_common::PeerEdge>,
+    /// Exact graph target for each manifest-local peer name.
+    pub(super) peer_targets: HashMap<String, lpm_common::PackageInstanceId>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     pub(super) integrity: Option<String>,
     /// Registry package-signature payload from `dist.signatures`.
@@ -153,10 +382,12 @@ pub(super) struct InstallPackage {
     /// Distinguishes a fresh-resolution `dist.tarball` miss from an older
     /// lockfile entry that simply has no cached tarball URL yet.
     pub(super) metadata_checked_for_tarball: bool,
+    /// Resolution-time semantic digest for mutable directory/link sources.
+    pub(super) manifest_fingerprint: Option<String>,
 }
 
 impl InstallPackage {
-    /// parse the
+    /// Parse the
     /// `source` string into a typed [`lpm_lockfile::Source`]. Used
     /// by the fetch-dispatch site to route non-Registry sources
     /// (`Source::Tarball` etc.) through their dedicated install

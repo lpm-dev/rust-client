@@ -34,6 +34,7 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
                 let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
                 if !globs.is_empty() {
                     let members = discover_members(&current, &globs)?;
+                    validate_unique_package_names(&current, &root_package, &members)?;
                     warn_on_member_catalogs(&members);
                     let workspace = Workspace {
                         root: current.clone(),
@@ -73,6 +74,42 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     }
 
     Ok(None)
+}
+
+fn validate_unique_package_names(
+    root: &Path,
+    root_package: &PackageJson,
+    members: &[WorkspaceMember],
+) -> Result<(), WorkspaceError> {
+    let mut paths_by_name = std::collections::BTreeMap::<&str, Vec<&Path>>::new();
+    if let Some(name) = root_package.name.as_deref() {
+        paths_by_name.entry(name).or_default().push(root);
+    }
+    for member in members {
+        if let Some(name) = member.package.name.as_deref() {
+            paths_by_name.entry(name).or_default().push(&member.path);
+        }
+    }
+    let conflicts = paths_by_name
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(name, mut paths)| {
+            paths.sort_unstable();
+            let paths = paths
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name:?}: {paths}")
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(WorkspaceError::Parse(format!(
+        "duplicate workspace package names are not allowed: {}",
+        conflicts.join("; ")
+    )))
 }
 
 fn workspace_member_globs(
@@ -579,6 +616,48 @@ mod tests {
 
         let ws = discover_workspace(dir.path()).unwrap().unwrap();
         assert_eq!(ws.members.len(), 1);
+    }
+
+    #[test]
+    fn discover_workspace_rejects_duplicate_member_package_names() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(dir.path(), r#"{"name":"root","workspaces":["packages/*"]}"#);
+        let first = dir.path().join("packages/first");
+        let second = dir.path().join("packages/second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        create_package_json(&first, r#"{"name":"duplicate"}"#);
+        create_package_json(&second, r#"{"name":"duplicate"}"#);
+
+        let error = discover_workspace(dir.path())
+            .expect_err("duplicate workspace package names must be rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("duplicate"), "{message}");
+        assert!(message.contains(&first.display().to_string()), "{message}");
+        assert!(message.contains(&second.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn discover_workspace_rejects_root_and_member_package_name_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"duplicate","workspaces":["packages/*"]}"#,
+        );
+        let member = dir.path().join("packages/member");
+        fs::create_dir_all(&member).unwrap();
+        create_package_json(&member, r#"{"name":"duplicate"}"#);
+
+        let error = discover_workspace(dir.path())
+            .expect_err("the workspace root and a member must not share a package name");
+        let message = error.to_string();
+
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains(&member.display().to_string()), "{message}");
     }
 
     #[test]

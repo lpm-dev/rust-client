@@ -136,6 +136,9 @@ fn read_i64_le(bytes: &[u8], off: usize) -> i64 {
 /// Returns `true` for lockfiles whose metadata fits the current binary
 /// slots; `false` the moment any TOML-only field is populated.
 pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
+    if lockfile.metadata.lockfile_version >= crate::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        return false;
+    }
     if !lockfile.importers.is_empty() {
         return false;
     }
@@ -167,10 +170,12 @@ pub fn binary_format_supports(lockfile: &Lockfile) -> bool {
     lockfile.packages.iter().all(|p| {
         p.alias_dependencies.is_empty()
             && p.peers.is_empty()
+            && p.peer_edges.is_empty()
             && p.os.is_empty()
             && p.cpu.is_empty()
             && p.libc.is_empty()
             && p.node_engine.is_none()
+            && p.manifest_fingerprint.is_none()
             && !p.optional
             && p.registry_signatures.is_empty()
             && p.registry_published_at.is_none()
@@ -191,6 +196,7 @@ pub fn to_binary(lockfile: &Lockfile) -> Result<Vec<u8>, LockfileError> {
                 .to_string(),
         ));
     }
+    Lockfile::validate_loaded_packages(&lockfile.packages)?;
     lockfile
         .validate_provenance()
         .map_err(LockfileError::Serialize)?;
@@ -421,25 +427,48 @@ pub struct BinaryLockfileReader {
 impl BinaryLockfileReader {
     /// Open and mmap a binary lockfile. Returns None if file doesn't exist.
     pub fn open(path: &Path) -> Result<Option<Self>, LockfileError> {
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let file = std::fs::File::open(path)
-            .map_err(|e| LockfileError::Io(format!("failed to open {}: {e}", path.display())))?;
-
-        // SAFETY: we only read the file, no concurrent writes expected during install
-        let mmap = unsafe {
-            memmap2::Mmap::map(&file)
-                .map_err(|e| LockfileError::Io(format!("failed to mmap {}: {e}", path.display())))?
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(LockfileError::Io(format!(
+                    "failed to open {}: {error}",
+                    path.display()
+                )));
+            }
         };
-
-        // Validate header
-        if mmap.len() < HEADER_SIZE {
+        let file_len = file
+            .metadata()
+            .map_err(|error| {
+                LockfileError::Io(format!("failed to inspect {}: {error}", path.display()))
+            })?
+            .len();
+        if file_len > crate::TOML_LOCKFILE_SIZE_CAP_BYTES {
+            return Err(LockfileError::Deserialize(format!(
+                "binary lockfile size {file_len} bytes exceeds limit of {} bytes",
+                crate::TOML_LOCKFILE_SIZE_CAP_BYTES
+            )));
+        }
+        let map_len = usize::try_from(file_len).map_err(|_| {
+            LockfileError::Deserialize(format!(
+                "binary lockfile size {file_len} bytes cannot be represented on this platform"
+            ))
+        })?;
+        if map_len < HEADER_SIZE {
             return Err(LockfileError::Deserialize(
                 "binary lockfile too small".into(),
             ));
         }
+
+        // SAFETY: we only read the file, no concurrent writes expected during install
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .len(map_len)
+                .map(&file)
+                .map_err(|e| LockfileError::Io(format!("failed to mmap {}: {e}", path.display())))?
+        };
+
+        // Validate header
         if &mmap[0..4] != MAGIC {
             return Err(LockfileError::Deserialize(
                 "invalid binary lockfile magic".into(),
@@ -527,6 +556,29 @@ impl BinaryLockfileReader {
         let total_dep_entries = deps_section_len / DEP_ENTRY_SIZE;
         // Strings section runs from string_table_off to EOF.
         let string_table_len = mmap.len() - string_table_off;
+        std::str::from_utf8(&mmap[string_table_off..]).map_err(|error| {
+            LockfileError::Deserialize(format!(
+                "binary lockfile string table is not valid UTF-8: {error}"
+            ))
+        })?;
+        for dependency_index in 0..total_dep_entries {
+            let base = entries_end + dependency_index * DEP_ENTRY_SIZE;
+            let off = read_u32_le(&mmap, base) as usize;
+            let len = read_u16_le(&mmap, base + 4) as usize;
+            if len == 0 {
+                return Err(LockfileError::Deserialize(
+                    "dependency string has zero length".into(),
+                ));
+            }
+            let end = off.checked_add(len).ok_or_else(|| {
+                LockfileError::Deserialize("dependency string range overflows string table".into())
+            })?;
+            if end > string_table_len {
+                return Err(LockfileError::Deserialize(
+                    "dependency string range extends past string table".into(),
+                ));
+            }
+        }
         for idx in 0..pkg_count {
             let base = HEADER_SIZE + idx * ENTRY_SIZE;
             let deps_off = read_u32_le(&mmap, base + 24) as usize;
@@ -890,7 +942,7 @@ impl BinaryLockfileReader {
         }
         let lockfile = Lockfile {
             metadata: crate::LockfileMetadata {
-                lockfile_version: crate::LOCKFILE_VERSION,
+                lockfile_version: crate::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS,
                 resolved_with: Some(crate::DEFAULT_RESOLVED_WITH.to_string()),
                 auto_isolated_peer_conflicts: false,
             },
@@ -1036,10 +1088,14 @@ impl<'a> PackageEntryView<'a> {
     /// Convert to owned `LockedPackage`.
     pub fn to_locked_package(&self) -> LockedPackage {
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: self.name().to_string(),
             version: self.version().to_string(),
             source: self.source().map(|s| s.to_string()),
             integrity: self.integrity().map(|s| s.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1063,6 +1119,7 @@ impl<'a> PackageEntryView<'a> {
             // so any binary entry we round-trip here is by construction
             // peer-free.
             peers: Vec::new(),
+            peer_edges: Vec::new(),
             // v2+ — read the tarball URL directly from the mmap via
             // the accessor; `None` when the slot is the `(0, 0)` null
             // sentinel.
@@ -1140,13 +1197,27 @@ mod tests {
     use super::*;
     use crate::{LockedPackage, Lockfile};
 
+    const VALID_SHA512_SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    const VALID_SHA512_SRI_ALT: &str = "sha512-AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ==";
+    const VALID_SHA256_SRI: &str = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    fn legacy_lockfile() -> Lockfile {
+        let mut lockfile = Lockfile::new();
+        lockfile.metadata.lockfile_version = crate::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+        lockfile
+    }
+
     fn sample_lockfile() -> Lockfile {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "@lpm.dev/neo.highlight".to_string(),
             version: "1.1.1".to_string(),
             source: Some("registry+https://lpm.dev".to_string()),
-            integrity: Some("sha512-abc123".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1158,13 +1229,18 @@ mod tests {
             dependencies: vec!["react@18.2.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "react".to_string(),
             version: "18.2.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1176,6 +1252,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf
@@ -1241,7 +1318,7 @@ mod tests {
         let highlight = reader.find_package("@lpm.dev/neo.highlight").unwrap();
         assert_eq!(highlight.version(), "1.1.1");
         assert_eq!(highlight.dependencies(), vec!["react@18.2.0"]);
-        assert_eq!(highlight.integrity(), Some("sha512-abc123"));
+        assert_eq!(highlight.integrity(), Some(VALID_SHA512_SRI));
 
         assert!(reader.find_package("nonexistent").is_none());
     }
@@ -1254,13 +1331,17 @@ mod tests {
     // the binary search lands on — silently shadowing one side.
 
     fn cross_source_collision_lockfile() -> Lockfile {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         // Registry react@19.0.0 (the upstream)
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "react".to_string(),
             version: "19.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
-            integrity: Some("sha512-registry".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1272,14 +1353,19 @@ mod tests {
             dependencies: vec!["loose-envify@1.4.0".to_string()],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         // Tarball-URL react@19.0.0 (a fork bundling the same name+version)
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "react".to_string(),
             version: "19.0.0".to_string(),
             source: Some("tarball+https://example.com/react-fork-19.0.0.tgz".to_string()),
-            integrity: Some("sha512-fork".to_string()),
+            integrity: Some(VALID_SHA512_SRI_ALT.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1291,6 +1377,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf
@@ -1329,7 +1416,7 @@ mod tests {
             .expect("registry side resolvable by key");
         assert_eq!(
             registry_entry.integrity(),
-            Some("sha512-registry"),
+            Some(VALID_SHA512_SRI),
             "registry key must return the registry entry, not the fork"
         );
 
@@ -1338,7 +1425,7 @@ mod tests {
             .expect("tarball side resolvable by key");
         assert_eq!(
             tarball_entry.integrity(),
-            Some("sha512-fork"),
+            Some(VALID_SHA512_SRI_ALT),
             "tarball key must return the fork, not the registry entry"
         );
 
@@ -1427,8 +1514,22 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_binary_lockfile_larger_than_the_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.lockb");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(crate::TOML_LOCKFILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let error = BinaryLockfileReader::open(&path)
+            .expect_err("an oversized binary lockfile must be rejected before mapping");
+
+        assert!(error.to_string().contains("exceeds limit"), "{error}");
+    }
+
+    #[test]
     fn binary_empty_lockfile() {
-        let lf = Lockfile::new();
+        let lf = legacy_lockfile();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lpm.lockb");
         write_binary(&lf, &path).unwrap();
@@ -1505,6 +1606,32 @@ mod tests {
             err.contains("name range") && (err.contains("overflows") || err.contains("past")),
             "error must name the bounds failure: {err}"
         );
+    }
+
+    #[test]
+    fn open_rejects_invalid_utf8_in_string_table() {
+        let mut binary = sample_binary();
+        let string_table_off = read_u32_le(&binary, 12) as usize;
+        let name_off = read_u32_le(&binary, HEADER_SIZE) as usize;
+        binary[string_table_off + name_off] = 0xFF;
+
+        let (_dir, result) = open_bytes(&binary);
+
+        let error = result.expect_err("invalid UTF-8 must be rejected during open");
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[test]
+    fn open_rejects_dependency_string_range_past_table() {
+        let mut binary = sample_binary();
+        let package_count = read_u32_le(&binary, 8) as usize;
+        let dependency_entry = HEADER_SIZE + package_count * ENTRY_SIZE;
+        binary[dependency_entry..dependency_entry + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let (_dir, result) = open_bytes(&binary);
+
+        let error = result.expect_err("dependency strings must be range-checked during open");
+        assert!(error.to_string().contains("dependency string range"));
     }
 
     #[test]
@@ -1644,13 +1771,17 @@ mod tests {
 
     #[test]
     fn large_lockfile_1000_packages() {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         for i in 0..1000 {
             lf.add_package(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("pkg-{i:04}"),
                 version: format!("{}.0.0", i),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
-                integrity: Some("sha512-test".to_string()),
+                integrity: Some(VALID_SHA512_SRI.to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1666,6 +1797,7 @@ mod tests {
                 },
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
         }
@@ -1685,13 +1817,17 @@ mod tests {
 
     #[test]
     fn package_with_many_deps() {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         let deps: Vec<String> = (0..100).map(|i| format!("dep-{i:03}@1.0.0")).collect();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "big-pkg".to_string(),
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -1703,14 +1839,19 @@ mod tests {
             dependencies: deps,
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         for i in 0..100 {
             lf.add_package(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("dep-{i:03}"),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1722,6 +1863,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
         }
@@ -1738,13 +1880,17 @@ mod tests {
 
     #[test]
     fn large_lockfile_10000_packages() {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         for i in 0..10000 {
             lf.add_package(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("pkg-{i:05}"),
                 version: format!("{}.0.0", i),
                 source: Some("registry+https://registry.npmjs.org".to_string()),
-                integrity: Some("sha512-abcdef1234567890".to_string()),
+                integrity: Some(VALID_SHA512_SRI.to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1760,6 +1906,7 @@ mod tests {
                 },
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
         }
@@ -1936,14 +2083,18 @@ mod tests {
     #[test]
     fn string_dedup_reduces_size() {
         let source = "registry+https://registry.npmjs.org";
-        let integrity = "sha512-test";
-        let mut lf = Lockfile::new();
+        let integrity = VALID_SHA512_SRI;
+        let mut lf = legacy_lockfile();
         for i in 0..100 {
             lf.add_package(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: format!("pkg-{i:03}"),
                 version: "1.0.0".to_string(),
                 source: Some(source.to_string()),
                 integrity: Some(integrity.to_string()),
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -1955,6 +2106,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             });
         }
@@ -2041,12 +2193,16 @@ mod tests {
 
     #[test]
     fn tarball_roundtrips_through_binary() {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
-            integrity: Some("sha512-xyz".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2058,6 +2214,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
 
@@ -2084,12 +2241,16 @@ mod tests {
         // Rollout window — some entries have URL, some don't.
         // None must round-trip as None (null sentinel); Some must
         // preserve the exact bytes.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "express".to_string(),
             version: "4.22.1".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2101,13 +2262,18 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2119,6 +2285,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
 
@@ -2140,12 +2307,16 @@ mod tests {
         // sentinel. An empty-string tarball inserted into an empty
         // StringTable would yield exactly `(0, 0)` and become
         // indistinguishable from `None`. The writer must refuse.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "empty-url-pkg".to_string(),
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2157,6 +2328,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: Some(String::new()),
         });
 
@@ -2175,12 +2347,16 @@ mod tests {
         // the `(0, 0)` null sentinel, confusing readers into seeing
         // `None` where `Some("")` was intended). The writer rejects
         // empty strings across all three optional fields for consistency.
-        let mut lf_source = Lockfile::new();
+        let mut lf_source = legacy_lockfile();
         lf_source.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "pkg-with-empty-source".to_string(),
             version: "1.0.0".to_string(),
             source: Some(String::new()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2192,20 +2368,25 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         let err = to_binary(&lf_source).expect_err("empty source must be rejected");
         assert!(
-            err.to_string().contains("empty 'source'"),
+            err.to_string().contains("source") && err.to_string().contains("empty"),
             "expected empty source rejection, got: {err}"
         );
 
-        let mut lf_integ = Lockfile::new();
+        let mut lf_integ = legacy_lockfile();
         lf_integ.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "pkg-with-empty-integrity".to_string(),
             version: "1.0.0".to_string(),
             source: None,
             integrity: Some(String::new()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2217,6 +2398,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         let err = to_binary(&lf_integ).expect_err("empty integrity must be rejected");
@@ -2277,12 +2459,16 @@ mod tests {
         // for any in-bounds `off`. Combined with `tarball()`
         // treating "not both zero" as Some, this surfaces `Some("")`
         // on a corrupt pair. Explicit rejection closes the gap.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "victim".to_string(),
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2294,6 +2480,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: Some("https://example.com/foo/-/foo-1.0.0.tgz".to_string()),
         });
         let mut binary = to_binary(&lf).unwrap();
@@ -2324,12 +2511,16 @@ mod tests {
         // pair with an out-of-bounds offset that should trigger the
         // open-time validation.
         let lf = {
-            let mut lf = Lockfile::new();
+            let mut lf = legacy_lockfile();
             lf.add_package(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "victim".to_string(),
                 version: "1.0.0".to_string(),
                 source: None,
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -2341,6 +2532,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: Some("https://example.com/foo/-/foo-1.0.0.tgz".to_string()),
             });
             lf
@@ -2369,12 +2561,16 @@ mod tests {
         // not accidentally as `Some("")`. Exercises the (0, 0) =
         // None path of `tarball()` and confirms the writer didn't
         // emit spurious string-table bytes for the null case.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "null-tarball-pkg".to_string(),
             version: "1.0.0".to_string(),
             source: None,
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2386,6 +2582,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
 
@@ -2409,12 +2606,16 @@ mod tests {
         // the source string verbatim; readers parse it via
         // `Source::parse` downstream. No special wire format needed
         // for non-registry sources at the binary layer.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "local-foo".to_string(),
             version: "0.1.0".to_string(),
             source: Some("directory+./packages/foo".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2426,6 +2627,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
 
@@ -2444,12 +2646,16 @@ mod tests {
 
     #[test]
     fn link_source_round_trips_through_binary() {
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "linked".to_string(),
             version: "0.1.0".to_string(),
             source: Some("link+../shared/linked".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2461,6 +2667,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
 
@@ -2480,12 +2687,16 @@ mod tests {
         // `Source::Tarball { url: "file:..." }` — local-file tarball.
         // The wire format reuses `tarball+`; the URL prefix
         // discriminates downstream.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "local-bundle".to_string(),
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local-bundle.tgz".to_string()),
-            integrity: Some("sha256-deadbeefcafebabe".to_string()),
+            integrity: Some(VALID_SHA256_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2497,6 +2708,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
 
@@ -2510,7 +2722,7 @@ mod tests {
             entry.source(),
             Some("tarball+file:./vendor/local-bundle.tgz"),
         );
-        assert_eq!(entry.integrity(), Some("sha256-deadbeefcafebabe"));
+        assert_eq!(entry.integrity(), Some(VALID_SHA256_SRI));
         // tarball field-hint is None for non-Registry sources.
         assert_eq!(entry.tarball(), None);
         let restored = reader.to_lockfile().unwrap();
@@ -2522,12 +2734,16 @@ mod tests {
         // Cross-source identity at the binary layer: registry +
         // tarball-remote + tarball-local + directory + link all
         // co-exist with distinct source strings preserved.
-        let mut lf = Lockfile::new();
+        let mut lf = legacy_lockfile();
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
-            integrity: Some("sha512-lodash".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2539,13 +2755,18 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
         });
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "remote-fork".to_string(),
             version: "1.0.0".to_string(),
             source: Some("tarball+https://e.com/remote.tgz".to_string()),
-            integrity: Some("sha512-remote".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2557,13 +2778,18 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "local-tarball".to_string(),
             version: "1.0.0".to_string(),
             source: Some("tarball+file:./vendor/local.tgz".to_string()),
-            integrity: Some("sha256-local".to_string()),
+            integrity: Some(VALID_SHA256_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2575,13 +2801,18 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "local-dir".to_string(),
             version: "0.1.0".to_string(),
             source: Some("directory+./packages/local-dir".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2593,13 +2824,18 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
         lf.add_package(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "linked".to_string(),
             version: "0.1.0".to_string(),
             source: Some("link+../shared/linked".to_string()),
             integrity: None,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -2611,6 +2847,7 @@ mod tests {
             dependencies: vec![],
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
 

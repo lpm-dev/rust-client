@@ -8,7 +8,9 @@
 //! - Sorting output for deterministic lockfiles
 
 use crate::{MigratedPackage, SkippedPackage};
-use lpm_lockfile::{LOCKFILE_VERSION, LockedPackage, Lockfile, LockfileMetadata};
+use lpm_lockfile::{
+    LOCKFILE_VERSION_WITH_STRUCTURED_PEERS, LockedPackage, Lockfile, LockfileMetadata,
+};
 use std::collections::HashSet;
 
 /// Prefixes that indicate non-registry dependencies (to be skipped).
@@ -90,10 +92,14 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             .collect();
 
         locked_packages.push(LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: pkg.name,
             version: pkg.version,
             source: Some(source),
             integrity: pkg.integrity,
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -112,6 +118,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             // re-derives peers through the resolver and writes them
             // into the lockfile.
             peers: Vec::new(),
+            peer_edges: Vec::new(),
             tarball: None,
         });
     }
@@ -121,7 +128,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
 
     let lockfile = Lockfile {
         metadata: LockfileMetadata {
-            lockfile_version: LOCKFILE_VERSION,
+            lockfile_version: LOCKFILE_VERSION_WITH_STRUCTURED_PEERS,
             resolved_with: Some("migrate".to_string()),
             auto_isolated_peer_conflicts: false,
         },
@@ -237,7 +244,10 @@ mod tests {
         assert!(skipped.is_empty());
         assert_eq!(lockfile.packages.len(), 2);
         assert_eq!(lockfile.metadata.resolved_with.as_deref(), Some("migrate"));
-        assert_eq!(lockfile.metadata.lockfile_version, LOCKFILE_VERSION);
+        assert_eq!(
+            lockfile.metadata.lockfile_version,
+            LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+        );
 
         // Sorted by name
         assert_eq!(lockfile.packages[0].name, "express");

@@ -109,6 +109,121 @@ async fn required_peer_dependency_missing_warns_and_succeeds_without_strict_mode
 }
 
 #[tokio::test]
+async fn aliased_peer_uses_canonical_provider_and_survives_warm_reinstall() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "react",
+            "version": "18.2.0"
+        }),
+        &[("index.js", b"module.exports = 'canonical-react';\n")],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "aliased-peer-host",
+            "version": "1.0.0",
+            "peerDependencies": {
+                "react-compat": "npm:react@^18.0.0"
+            }
+        }),
+        &[("index.js", b"module.exports = require('react-compat');\n")],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": {
+                "aliased-peer-host": "1.0.0",
+                "react": "18.2.0"
+            }
+        }"#,
+    );
+
+    for pass in 0..2 {
+        if pass == 1 {
+            std::fs::remove_dir_all(project.path().join("node_modules"))
+                .expect("remove node_modules before warm reinstall");
+        }
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(INSTALL_ARGS)
+            .env("LPM_STORE_VERSION", "v2")
+            .output()
+            .expect("run aliased peer install");
+        assert!(
+            output.status.success(),
+            "aliased peer install pass {pass} must succeed\n{}",
+            output_text(&output)
+        );
+        let runtime = std::process::Command::new("node")
+            .args(["-e", "process.stdout.write(require('aliased-peer-host'))"])
+            .current_dir(project.path())
+            .output()
+            .expect("run package through its aliased peer slot");
+        assert!(
+            runtime.status.success(),
+            "aliased peer must resolve on pass {pass}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&runtime.stdout),
+            String::from_utf8_lossy(&runtime.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&runtime.stdout), "canonical-react");
+    }
+
+    let lockfile = lpm_lockfile::Lockfile::read_fast(&project.path().join("lpm.lock"))
+        .expect("aliased peer lockfile parses");
+    let host = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "aliased-peer-host")
+        .expect("aliased peer host is locked");
+    assert_eq!(
+        host.peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "react-compat",
+            "react",
+            "18.2.0",
+        )]
+    );
+    assert!(host.peers.is_empty());
+}
+
+#[tokio::test]
+async fn aliased_missing_peer_json_reports_local_and_canonical_names() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "aliased-peer-host",
+            "version": "1.0.0",
+            "peerDependencies": {
+                "react-compat": "npm:react@^18.0.0"
+            }
+        }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "pnpm-compat-peer",
+            "version": "1.0.0",
+            "dependencies": { "aliased-peer-host": "1.0.0" },
+            "lpm": { "autoInstallPeers": false }
+        }"#,
+    );
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("--json")
+        .args(INSTALL_ARGS)
+        .output()
+        .expect("run aliased missing-peer JSON install");
+    let json = json_output(&output, "aliased missing peer install --json");
+
+    assert_eq!(json["peer_issues"]["missing"][0]["peer"], "react-compat");
+    assert_eq!(json["peer_issues"]["missing"][0]["target"], "react");
+}
+
+#[tokio::test]
 async fn peer_top_dependency_satisfies_peer_without_missing_warning() {
     let mock = MockRegistry::start().await;
     mount_top_dependency_peer_graph(&mock).await;
@@ -815,8 +930,18 @@ fn assert_lockfile_has_peer_binding(
         .iter()
         .find(|pkg| pkg.name == package_name && pkg.version == version)
         .unwrap_or_else(|| panic!("expected {package_name}@{version} in lpm.lock"));
+    let (peer_name, peer_version) = peer_binding
+        .rfind('@')
+        .map(|at| (&peer_binding[..at], &peer_binding[at + 1..]))
+        .expect("peer binding uses name@version format");
     assert!(
-        package.peers.contains(&peer_binding.to_string()),
+        package.peers.contains(&peer_binding.to_string())
+            || package.peer_edges.iter().any(|peer| {
+                peer.local_name == peer_name
+                    && peer.target_name == peer_name
+                    && peer.target_version == peer_version
+                    && peer.target_wrapper_id.is_none()
+            }),
         "lockfile must retain peer binding {peer_binding} for {package_name}@{version}\n{}",
         project.read_file("lpm.lock")
     );

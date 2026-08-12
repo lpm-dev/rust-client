@@ -1980,6 +1980,52 @@ fn build_test_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+#[test]
+fn extract_object_from_file_preserves_integrity_and_security_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"file-object\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"eval('file-backed')"),
+    ]);
+    let integrity = crate::compute_sri_hash(&tarball);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, &tarball).unwrap();
+
+    let (object, _) = store
+        .extract_object_from_file(file.path(), &integrity)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(object.join(".integrity")).unwrap(),
+        integrity
+    );
+    assert!(object.join(".lpm-security.json").is_file());
+}
+
+#[test]
+fn extract_object_from_file_rejects_integrity_mismatch_without_publishing_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"file-mismatch\",\"version\":\"1.0.0\"}",
+    )]);
+    let wrong_integrity = crate::compute_sri_hash(b"wrong file-backed bytes");
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, &tarball).unwrap();
+
+    let error = store
+        .extract_object_from_file(file.path(), &wrong_integrity)
+        .unwrap_err();
+
+    assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+    assert!(!store.paths().object_dir(&wrong_integrity).unwrap().exists());
+}
+
 fn v3_blob_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let blobs = root.join("blobs").join("blake3");
@@ -3882,9 +3928,8 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     let analysis = lpm_security::behavioral::analyze_package(&v1_pkg_dir);
     lpm_security::behavioral::write_cached_analysis(&v1_pkg_dir, &analysis).unwrap();
     let expected_security_cache = std::fs::read(v1_pkg_dir.join(".lpm-security.json")).unwrap();
-    std::fs::write(v1_pkg_dir.join(".integrity"), b"sha512-stale").unwrap();
-
     let sri = synthetic_sri(b"populate_object_from_v1");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert_eq!(object_dir, store.paths().object_dir(&sri).unwrap());
     // Package contents copied through.
@@ -3905,8 +3950,6 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
         std::fs::read(object_dir.join(".lpm-security.json")).unwrap(),
         expected_security_cache
     );
-    // `.integrity` rewritten to the caller-supplied SRI rather
-    // than v1's stale value.
     assert_eq!(
         std::fs::read(object_dir.join(".integrity")).unwrap(),
         sri.as_bytes()
@@ -3916,6 +3959,29 @@ fn populate_object_from_v1_copies_extracted_package_dir() {
     // touching anything.
     let again = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert_eq!(again, object_dir);
+}
+
+#[test]
+fn populate_object_from_v1_rejects_mismatched_integrity_without_creating_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let v1_pkg_dir = dir.path().join("fake-v1/pkg-mismatch/1.0.0");
+    std::fs::create_dir_all(&v1_pkg_dir).unwrap();
+    std::fs::write(
+        v1_pkg_dir.join("package.json"),
+        b"{\"name\":\"mismatch\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    let recorded_sri = synthetic_sri(b"recorded-v1-integrity");
+    let requested_sri = synthetic_sri(b"lockfile-requested-integrity");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &recorded_sri).unwrap();
+
+    let error = store
+        .populate_object_from_v1(&v1_pkg_dir, &requested_sri)
+        .expect_err("a V1 object must not migrate under a different content identity");
+
+    assert!(error.to_string().contains("integrity mismatch"));
+    assert!(!store.paths().object_dir(&requested_sri).unwrap().exists());
 }
 
 /// When `.lpm-security.json` is missing in v1 (rare, e.g. a
@@ -3935,6 +4001,7 @@ fn populate_object_from_v1_runs_analysis_when_security_cache_missing() {
     .unwrap();
 
     let sri = synthetic_sri(b"populate_object_from_v1_no_cache");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     assert!(
         object_dir.join(".lpm-security.json").is_file(),
@@ -3961,6 +4028,7 @@ fn populate_object_from_v1_refreshes_outdated_security_cache() {
     .unwrap();
 
     let sri = synthetic_sri(b"populate_object_from_v1_outdated_cache");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
     let analysis = lpm_security::behavioral::read_cached_analysis(&object_dir).unwrap();
 
@@ -3986,6 +4054,7 @@ fn disabled_populate_object_from_v1_leaves_missing_security_cache_absent() {
     std::fs::write(v1_pkg_dir.join("index.js"), b"eval('code')").unwrap();
 
     let sri = synthetic_sri(b"populate_object_from_v1_disabled");
+    std::fs::write(v1_pkg_dir.join(".integrity"), &sri).unwrap();
     let object_dir = store.populate_object_from_v1(&v1_pkg_dir, &sri).unwrap();
 
     assert!(!object_dir.join(".lpm-security.json").exists());

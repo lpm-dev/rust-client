@@ -22,11 +22,47 @@ fn read_manifest_text(path: &Path) -> Result<String, LpmError> {
 }
 
 pub(super) fn manifest_install_deps(pkg: &lpm_workspace::PackageJson) -> HashMap<String, String> {
-    let mut deps = pkg.dependencies.clone();
+    let mut deps = HashMap::with_capacity(
+        pkg.dependencies.len() + pkg.dev_dependencies.len() + pkg.optional_dependencies.len(),
+    );
+    deps.extend(
+        pkg.dependencies
+            .iter()
+            .map(|(name, range)| (name.clone(), range.clone())),
+    );
     for (name, range) in &pkg.dev_dependencies {
         deps.entry(name.clone()).or_insert_with(|| range.clone());
     }
+    deps.extend(
+        pkg.optional_dependencies
+            .iter()
+            .map(|(name, range)| (name.clone(), range.clone())),
+    );
     deps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_dependency_overrides_duplicate_regular_and_dev_dependencies() {
+        let package: lpm_workspace::PackageJson = serde_json::from_value(serde_json::json!({
+            "name": "manifest-merge",
+            "version": "1.0.0",
+            "dependencies": { "shared": "1.0.0" },
+            "devDependencies": { "shared": "2.0.0" },
+            "optionalDependencies": { "shared": "3.0.0" }
+        }))
+        .expect("valid package manifest");
+
+        assert_eq!(
+            manifest_install_deps(&package)
+                .get("shared")
+                .map(String::as_str),
+            Some("3.0.0")
+        );
+    }
 }
 
 pub(super) fn normalize_jsr_manifest_deps(

@@ -148,6 +148,65 @@ async fn download_tarball_with_integrity_match_succeeds() {
 }
 
 #[tokio::test]
+async fn download_tarball_to_file_with_integrity_preserves_verified_file_and_algorithm() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = b"file-backed sha256 content";
+    let expected_sri = Integrity::from_bytes(HashAlgorithm::Sha256, body).to_string();
+    Mock::given(method("GET"))
+        .and(path("/file-backed.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new();
+    let downloaded = client
+        .download_tarball_to_file_with_integrity(
+            &format!("{}/file-backed.tgz", server.uri()),
+            &expected_sri,
+        )
+        .await
+        .expect("matching file-backed SRI must succeed");
+
+    assert_eq!(downloaded.sri, expected_sri);
+    assert_eq!(downloaded.compressed_size, body.len() as u64);
+    assert_eq!(std::fs::read(downloaded.file.path()).unwrap(), body);
+}
+
+#[tokio::test]
+async fn download_tarball_to_file_with_integrity_rejects_mismatch() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = b"file-backed actual content";
+    let expected_sri =
+        Integrity::from_bytes(HashAlgorithm::Sha512, b"different expected content").to_string();
+    Mock::given(method("GET"))
+        .and(path("/tampered-file-backed.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = RegistryClient::new();
+    let error = client
+        .download_tarball_to_file_with_integrity(
+            &format!("{}/tampered-file-backed.tgz", server.uri()),
+            &expected_sri,
+        )
+        .await
+        .expect_err("mismatched file-backed SRI must fail");
+
+    assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+}
+
+#[tokio::test]
 async fn download_tarball_with_integrity_sha256_match_succeeds() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};

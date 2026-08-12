@@ -13,7 +13,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
-struct PeerRequirement {
+pub(super) struct PeerRequirement {
     target_name: String,
     range: lpm_resolver::NpmRange,
     optional: bool,
@@ -199,7 +199,7 @@ async fn ambient_peer_plans(
     ambient_done: &HashSet<String>,
 ) -> Result<Vec<AmbientPeerPlan>, LpmError> {
     let mut grouped: BTreeMap<String, Vec<PeerRequirement>> = BTreeMap::new();
-    for requirement in collect_peer_requirements(packages) {
+    for requirement in collect_peer_requirements(packages)? {
         grouped
             .entry(requirement.target_name.clone())
             .or_default()
@@ -239,20 +239,28 @@ async fn ambient_peer_plans(
     Ok(plans)
 }
 
-fn collect_peer_requirements(
+pub(super) fn collect_peer_requirements(
     packages: &HashMap<PackageIdentity, PackageDraft>,
-) -> Vec<PeerRequirement> {
+) -> Result<Vec<PeerRequirement>, LpmError> {
     let mut requirements = Vec::new();
     for draft in packages.values() {
         let version = &draft.package.version;
         let Some(peer_deps) = draft.info.peer_deps.get(version) else {
             continue;
         };
-        let aliases = draft.info.aliases.get(version);
+        let aliases = draft.info.peer_aliases.get(version);
         let optional_peers = draft.info.optional_peer_names.get(version);
         for (peer_name, peer_range) in peer_deps {
-            let Ok(range) = lpm_resolver::NpmRange::parse(peer_range) else {
-                continue;
+            let optional = optional_peers.is_some_and(|peers| peers.contains(peer_name));
+            let range = match lpm_resolver::NpmRange::parse(peer_range) {
+                Ok(range) => range,
+                Err(_) if optional => continue,
+                Err(error) => {
+                    return Err(LpmError::Registry(format!(
+                        "experimental resolver: invalid required peer range {peer_range:?} for {peer_name:?} declared by {}@{}: {error}",
+                        draft.package.name, draft.package.version
+                    )));
+                }
             };
             let target_name = aliases
                 .and_then(|aliases| aliases.get(peer_name))
@@ -261,11 +269,11 @@ fn collect_peer_requirements(
             requirements.push(PeerRequirement {
                 target_name,
                 range,
-                optional: optional_peers.is_some_and(|peers| peers.contains(peer_name)),
+                optional,
             });
         }
     }
-    requirements
+    Ok(requirements)
 }
 
 fn peer_group_satisfied_by_existing(
@@ -329,7 +337,9 @@ fn platform_allows_peer_version(
         .is_none_or(lpm_resolver::is_platform_compatible)
 }
 
-pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity, PackageDraft>) {
+pub(super) fn attach_peer_edges_to_drafts(
+    packages: &mut HashMap<PackageIdentity, PackageDraft>,
+) -> Result<(), LpmError> {
     let available: HashMap<String, Vec<(lpm_resolver::NpmVersion, String)>> = packages
         .values()
         .filter_map(|package| {
@@ -350,22 +360,39 @@ pub(super) fn attach_peer_edges_to_drafts(packages: &mut HashMap<PackageIdentity
             continue;
         };
         let mut peers = Vec::with_capacity(peer_deps.len());
+        let peer_aliases = draft.info.peer_aliases.get(&draft.package.version);
+        let optional_peers = draft.info.optional_peer_names.get(&draft.package.version);
         for (peer_name, peer_range) in peer_deps {
-            let Some(candidates) = available.get(peer_name) else {
+            let target_name = peer_aliases
+                .and_then(|aliases| aliases.get(peer_name))
+                .unwrap_or(peer_name);
+            let Some(candidates) = available.get(target_name) else {
                 continue;
             };
-            let Ok(range) = lpm_resolver::NpmRange::parse(peer_range) else {
-                continue;
+            let range = match lpm_resolver::NpmRange::parse(peer_range) {
+                Ok(range) => range,
+                Err(_) if optional_peers.is_some_and(|peers| peers.contains(peer_name)) => continue,
+                Err(error) => {
+                    return Err(LpmError::Registry(format!(
+                        "experimental resolver: invalid required peer range {peer_range:?} for {peer_name:?} declared by {}@{}: {error}",
+                        draft.package.name, draft.package.version
+                    )));
+                }
             };
             if let Some((_, version)) = candidates
                 .iter()
                 .filter(|(version, _)| range.satisfies(version))
                 .max_by(|(left, _), (right, _)| left.cmp(right))
             {
-                peers.push((peer_name.clone(), version.clone()));
+                peers.push(lpm_common::PeerEdge::registry(
+                    peer_name,
+                    target_name,
+                    version,
+                ));
             }
         }
-        peers.sort();
+        peers.sort_by(|left, right| left.local_name.cmp(&right.local_name));
         draft.package.peers = peers;
     }
+    Ok(())
 }

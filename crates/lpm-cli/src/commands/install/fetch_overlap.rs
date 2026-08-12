@@ -3,6 +3,24 @@ use super::*;
 const ENV_FETCH_OVERLAP: &str = "LPM_FETCH_OVERLAP";
 const ENV_FETCH_OVERLAP_MIN_SELECTED: &str = "LPM_FETCH_OVERLAP_MIN_SELECTED";
 const DEFAULT_FETCH_OVERLAP_MIN_SELECTED: usize = 64;
+const FETCH_OVERLAP_QUEUE_MULTIPLIER: usize = 4;
+
+fn fetch_overlap_queue_capacity(download_concurrency: usize) -> usize {
+    download_concurrency
+        .max(1)
+        .saturating_mul(FETCH_OVERLAP_QUEUE_MULTIPLIER)
+}
+
+pub(super) fn selected_package_channel(
+    fetch_semaphore: &Semaphore,
+) -> (
+    tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
+    tokio::sync::mpsc::Receiver<lpm_resolver::SelectedPackageEvent>,
+) {
+    tokio::sync::mpsc::channel(fetch_overlap_queue_capacity(
+        fetch_semaphore.available_permits(),
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct FetchOverlapOutcome {
@@ -77,17 +95,18 @@ struct WorkspaceFetchRequest {
 }
 
 pub(super) struct WorkspaceFetchOverlapHub {
-    tx: tokio::sync::mpsc::UnboundedSender<WorkspaceFetchRequest>,
+    tx: tokio::sync::mpsc::Sender<WorkspaceFetchRequest>,
 }
 
 impl WorkspaceFetchOverlapHub {
-    pub(super) fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(run_workspace_fetch_overlap_hub(rx));
+    pub(super) fn new(download_concurrency: usize) -> Self {
+        let capacity = fetch_overlap_queue_capacity(download_concurrency);
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        tokio::spawn(run_workspace_fetch_overlap_hub(rx, capacity));
         Self { tx }
     }
 
-    fn dispatch(
+    async fn dispatch(
         &self,
         package: InstallPackage,
         context: Arc<WorkspaceFetchRequestContext>,
@@ -98,8 +117,9 @@ impl WorkspaceFetchOverlapHub {
             context,
             completion,
         };
-        if let Err(error) = self.tx.send(request) {
-            let _ = error.0.completion.send(WorkspaceFetchCompletion {
+        if let Err(error) = self.tx.send(request).await {
+            let request = error.0;
+            let _ = request.completion.send(WorkspaceFetchCompletion {
                 status: Arc::new(FetchOverlapTaskStatus::Failed),
                 dispatched: false,
             });
@@ -109,7 +129,8 @@ impl WorkspaceFetchOverlapHub {
 }
 
 async fn run_workspace_fetch_overlap_hub(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<WorkspaceFetchRequest>,
+    mut rx: tokio::sync::mpsc::Receiver<WorkspaceFetchRequest>,
+    task_limit: usize,
 ) {
     let mut pool = None;
     let mut states: HashMap<String, WorkspaceFetchState> = HashMap::new();
@@ -118,7 +139,7 @@ async fn run_workspace_fetch_overlap_hub(
 
     loop {
         tokio::select! {
-            request = rx.recv() => {
+            request = rx.recv(), if tasks.len() < task_limit => {
                 let Some(request) = request else {
                     break;
                 };
@@ -315,7 +336,7 @@ pub(super) fn fetch_overlap_min_selected() -> usize {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_fetch_overlap_dispatcher(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<lpm_resolver::SelectedPackageEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<lpm_resolver::SelectedPackageEvent>,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     store: PackageStore,
@@ -337,10 +358,12 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
         let mut outcomes = Vec::new();
         let mut stats = FetchOverlapStats::default();
         let mut dispatching = min_selected <= 1;
+        let task_limit = fetch_overlap_queue_capacity(fetch_semaphore.available_permits())
+            .max(min_selected.max(1));
 
         loop {
             tokio::select! {
-                event = rx.recv() => {
+                event = rx.recv(), if tasks.len() < task_limit => {
                     let Some(event) = event else {
                         break;
                     };
@@ -420,7 +443,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
     hub: Arc<WorkspaceFetchOverlapHub>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<lpm_resolver::SelectedPackageEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<lpm_resolver::SelectedPackageEvent>,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     store: PackageStore,
@@ -434,6 +457,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
     dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
     streaming_fetch: bool,
 ) -> FetchOverlapJoin {
+    let completion_limit = fetch_overlap_queue_capacity(fetch_semaphore.available_permits());
     let context = Arc::new(WorkspaceFetchRequestContext {
         client,
         route_table,
@@ -449,7 +473,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
     });
     let handle = tokio::spawn(async move {
         let mut seen = HashSet::new();
-        let mut completions = Vec::new();
+        let mut completions = VecDeque::new();
         let mut outcomes = Vec::new();
         let mut stats = FetchOverlapStats::default();
 
@@ -473,7 +497,24 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
             }
             let identity = workspace_fetch_identity(&package);
             if seen.insert(identity) {
-                completions.push(hub.dispatch(package, Arc::clone(&context)));
+                completions.push_back(hub.dispatch(package, Arc::clone(&context)).await);
+                if completions.len() >= completion_limit {
+                    let completion = completions
+                        .pop_front()
+                        .expect("completion queue reached its non-zero limit");
+                    match completion.await {
+                        Ok(completion) => {
+                            record_workspace_fetch_completion(
+                                completion,
+                                &mut stats,
+                                &mut outcomes,
+                            );
+                        }
+                        Err(_) => {
+                            stats.failed_count = stats.failed_count.saturating_add(1);
+                        }
+                    }
+                }
             }
         }
 
@@ -554,8 +595,13 @@ pub(super) fn spawn_fetch_overlap_for_packages(
         let mut tasks = tokio::task::JoinSet::new();
         let mut outcomes = Vec::new();
         let mut stats = FetchOverlapStats::default();
+        let task_limit = fetch_overlap_queue_capacity(fetch_semaphore.available_permits());
 
         for package in packages {
+            if tasks.len() >= task_limit {
+                let joined = tasks.join_next().await;
+                record_overlap_task(joined, &mut stats, &mut outcomes);
+            }
             stats.selected_count = stats.selected_count.saturating_add(1);
             dispatch_install_package(
                 package,
@@ -723,6 +769,9 @@ fn install_package_from_selected_event(
 ) -> InstallPackage {
     let registry_url = registry_source_url_for(&event.name, route_table, registry_client);
     InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: event.name,
         version: event.version,
         source: format!("registry+{registry_url}"),
@@ -740,6 +789,7 @@ fn install_package_from_selected_event(
         optional: event.optional,
         tarball_url: event.tarball_url,
         metadata_checked_for_tarball: true,
+        manifest_fingerprint: None,
     }
 }
 
@@ -842,6 +892,9 @@ mod tests {
 
     fn workspace_fetch_package(integrity: &str, tarball_url: &str) -> InstallPackage {
         InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
             name: "shared-package".to_string(),
             version: "1.0.0".to_string(),
             source: "registry+https://registry.npmjs.org".to_string(),
@@ -859,6 +912,7 @@ mod tests {
             optional: false,
             tarball_url: Some(tarball_url.to_string()),
             metadata_checked_for_tarball: true,
+            manifest_fingerprint: None,
         }
     }
 
@@ -898,7 +952,7 @@ mod tests {
         let first = workspace_fetch_package("sha512-shared", "https://registry.test/shared.tgz");
         let mut second = first.clone();
         second.dependencies = vec![("child".to_string(), "2.0.0".to_string())];
-        second.peers = vec![("peer".to_string(), "3.0.0".to_string())];
+        second.peers = vec![lpm_common::PeerEdge::registry("peer", "peer", "3.0.0")];
         second.is_direct = true;
         second.root_link_names = Some(vec!["alias".to_string()]);
 

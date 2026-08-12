@@ -54,6 +54,121 @@ use tempfile::TempDir;
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
 pub const LOCK_CONTENTION_MARKER_ENV: &str = "LPM_TEST_LOCK_CONTENTION_MARKER";
+pub const VALID_TEST_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
+pub fn finalize_exact_lockfile_fixture(
+    lockfile: &mut lpm_lockfile::Lockfile,
+    roots: &[(&str, &str, &str)],
+) {
+    for (index, package) in lockfile.packages.iter_mut().enumerate() {
+        let source = package.source.as_deref().unwrap_or("registry+unknown");
+        let context = format!("fixture/{index}/{}/{}", package.name, package.version);
+        package.instance_id = Some(lpm_common::PackageInstanceId::derive(
+            &package.name,
+            &package.version,
+            source,
+            &context,
+        ));
+        package.dependency_targets.clear();
+        package.peer_targets.clear();
+    }
+
+    let package_snapshot = lockfile.packages.clone();
+    for package in &mut lockfile.packages {
+        for dependency in &package.dependencies {
+            let separator = dependency
+                .rfind('@')
+                .unwrap_or_else(|| panic!("malformed fixture dependency {dependency:?}"));
+            let local_name = &dependency[..separator];
+            let target_value = &dependency[separator + 1..];
+            let target_name = package
+                .alias_dependencies
+                .iter()
+                .find_map(|alias| (alias[0] == local_name).then_some(alias[1].as_str()))
+                .unwrap_or(local_name);
+            let target = unique_fixture_target(&package_snapshot, target_name, target_value);
+            package
+                .dependency_targets
+                .insert(local_name.to_string(), target);
+        }
+        for peer in &package.peer_edges {
+            let target = unique_fixture_target(
+                &package_snapshot,
+                &peer.target_name,
+                peer.target_wrapper_id
+                    .as_deref()
+                    .unwrap_or(&peer.target_version),
+            );
+            package.peer_targets.insert(peer.local_name.clone(), target);
+        }
+    }
+
+    lockfile.root_resolutions.clear();
+    for &(local_name, package_name, version) in roots {
+        let matches = lockfile
+            .packages
+            .iter()
+            .filter(|package| package.name == package_name && package.version == version)
+            .collect::<Vec<_>>();
+        let [package] = matches.as_slice() else {
+            panic!(
+                "fixture root {local_name:?} must select one {package_name}@{version}; found {}",
+                matches.len(),
+            );
+        };
+        lockfile.root_resolutions.insert(
+            local_name.to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: package.instance_id,
+                package: package.name.clone(),
+                version: package.version.clone(),
+                source: package.source.clone(),
+            },
+        );
+    }
+
+    lockfile.packages.sort_unstable_by(|left, right| {
+        let left_key = left.package_key();
+        let right_key = right.package_key();
+        left_key
+            .name
+            .cmp(&right_key.name)
+            .then_with(|| left_key.version.cmp(&right_key.version))
+            .then_with(|| left_key.source_id.cmp(&right_key.source_id))
+            .then_with(|| left.instance_id.cmp(&right.instance_id))
+    });
+}
+
+fn unique_fixture_target(
+    packages: &[lpm_lockfile::LockedPackage],
+    target_name: &str,
+    target_value: &str,
+) -> lpm_common::PackageInstanceId {
+    let matches = packages
+        .iter()
+        .filter(|candidate| {
+            if candidate.name != target_name {
+                return false;
+            }
+            match candidate.source_kind() {
+                Some(Ok(lpm_lockfile::Source::Registry { .. })) | None => {
+                    candidate.version == target_value
+                }
+                Some(Ok(source)) => source.source_id() == target_value,
+                Some(Err(_)) => false,
+            }
+        })
+        .collect::<Vec<_>>();
+    let [target] = matches.as_slice() else {
+        panic!(
+            "fixture edge must select one {target_name}@{target_value}; found {}",
+            matches.len(),
+        );
+    };
+    target
+        .instance_id
+        .expect("fixture package instance assigned")
+}
 
 /// A temporary project directory copied from a fixture, with fully isolated
 /// HOME, store, cache, and config directories.
@@ -182,6 +297,7 @@ fn write_private_file(path: &Path, content: impl AsRef<[u8]>) {
 /// member's node_modules directory so command tests prove isolation comes from
 /// the lockfile projection rather than missing local metadata.
 pub fn workspace_projection_project() -> TempProject {
+    const VALID_TEST_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     let project = TempProject::empty(
         r#"{
             "name": "projection-workspace",
@@ -208,17 +324,57 @@ pub fn workspace_projection_project() -> TempProject {
         }"#,
     );
 
-    let package = |name: &str| lpm_lockfile::LockedPackage {
-        name: name.to_string(),
-        version: "1.0.0".to_string(),
-        source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some(format!("sha512-{name}")),
-        ..Default::default()
+    let source = "registry+https://registry.npmjs.org";
+    let package = |name: &str, importer: &str| {
+        let instance_id = lpm_common::PackageInstanceId::derive(name, "1.0.0", source, importer);
+        (
+            lpm_lockfile::LockedPackage {
+                instance_id: Some(instance_id),
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+                integrity: Some(VALID_TEST_INTEGRITY.to_string()),
+                ..Default::default()
+            },
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        )
     };
+    let (app_package, app_root) = package("app-only", "packages/app/app-only");
     let mut app = lpm_lockfile::Lockfile::new();
-    app.add_package(package("app-only"));
+    app.add_package(app_package);
+    app.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                "app-only".to_string(),
+                "1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+    app.root_resolutions
+        .insert("app-only".to_string(), app_root);
+    let (sibling_package, sibling_root) = package("sibling-only", "packages/sibling/sibling-only");
     let mut sibling = lpm_lockfile::Lockfile::new();
-    sibling.add_package(package("sibling-only"));
+    sibling.add_package(sibling_package);
+    sibling.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                "sibling-only".to_string(),
+                "1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
+    sibling
+        .root_resolutions
+        .insert("sibling-only".to_string(), sibling_root);
 
     let mut root = lpm_lockfile::Lockfile::new();
     root.absorb_importer("packages/app", app)

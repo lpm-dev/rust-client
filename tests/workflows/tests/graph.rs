@@ -11,8 +11,6 @@
 
 mod support;
 
-use std::fmt::Write as _;
-
 use support::TempProject;
 use support::lpm;
 use support::workspace_projection_project;
@@ -60,6 +58,75 @@ fn graph_from_workspace_member_excludes_sibling_lockfile_projection() {
     );
     assert!(stdout.contains("app-only"), "member graph: {stdout}");
     assert!(!stdout.contains("sibling-only"), "member graph: {stdout}");
+}
+
+#[test]
+fn graph_includes_optional_root_by_default_and_in_prod_but_not_dev() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "optional-graph",
+            "version": "1.0.0",
+            "optionalDependencies": { "optional-root": "1.0.0" },
+            "devDependencies": { "dev-root": "1.0.0" }
+        }"#,
+    );
+    let source = "registry+https://registry.npmjs.org";
+    let optional_id = lpm_common::PackageInstanceId::derive(
+        "optional-root",
+        "1.0.0",
+        source,
+        "root/optional-root",
+    );
+    let dev_id =
+        lpm_common::PackageInstanceId::derive("dev-root", "1.0.0", source, "root/dev-root");
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for (name, instance_id) in [("optional-root", optional_id), ("dev-root", dev_id)] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            ..Default::default()
+        });
+        lockfile.root_resolutions.insert(
+            name.to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        );
+    }
+    project.write_file(
+        "lpm.lock",
+        &lockfile.to_toml().expect("serialize graph lockfile"),
+    );
+
+    let render = |flag: Option<&str>| {
+        let mut command = lpm(&project);
+        command.args(["graph", "--format", "json"]);
+        if let Some(flag) = flag {
+            command.arg(flag);
+        }
+        let output = command.output().expect("run lpm graph");
+        assert!(
+            output.status.success(),
+            "graph failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("graph output is UTF-8")
+    };
+
+    let default = render(None);
+    let prod = render(Some("--prod"));
+    let dev = render(Some("--dev"));
+    assert!(default.contains("optional-root"));
+    assert!(prod.contains("optional-root"));
+    assert!(!dev.contains("optional-root"));
+    assert!(!prod.contains("dev-root"));
+    assert!(dev.contains("dev-root"));
 }
 
 // ─── bare `lpm graph` (tree default): --json error envelope ──────────
@@ -501,33 +568,32 @@ fn dense_why_project(depth: usize) -> TempProject {
     let mut lockfile = String::with_capacity(depth.saturating_mul(512));
     lockfile.push_str("[metadata]\nlockfile-version = 2\nresolved-with = \"pubgrub\"\n\n");
 
+    let mut packages = Vec::with_capacity(depth.saturating_mul(3).saturating_add(1));
     for level in 0..depth {
         for branch in ['a', 'b'] {
-            writeln!(
-                lockfile,
+            packages.push(format!(
                 "[[packages]]\nname = \"branch-{level}-{branch}\"\nversion = \"1.0.0\"\ndependencies = [\"shared-{level}@1.0.0\"]\n"
-            )
-            .expect("write branch package");
+            ));
         }
 
         if level + 1 == depth {
-            writeln!(
-                lockfile,
+            packages.push(format!(
                 "[[packages]]\nname = \"shared-{level}\"\nversion = \"1.0.0\"\ndependencies = [\"target@1.0.0\"]\n"
-            )
-            .expect("write final shared package");
+            ));
         } else {
-            writeln!(
-                lockfile,
+            packages.push(format!(
                 "[[packages]]\nname = \"shared-{level}\"\nversion = \"1.0.0\"\ndependencies = [\"branch-{}-a@1.0.0\", \"branch-{}-b@1.0.0\"]\n",
                 level + 1,
                 level + 1,
-            )
-            .expect("write shared package");
+            ));
         }
     }
 
-    lockfile.push_str("[[packages]]\nname = \"target\"\nversion = \"1.0.0\"\n");
+    packages.push("[[packages]]\nname = \"target\"\nversion = \"1.0.0\"\n".to_string());
+    packages.sort_unstable();
+    for package in packages {
+        lockfile.push_str(&package);
+    }
     project.write_file("lpm.lock", &lockfile);
     project
 }

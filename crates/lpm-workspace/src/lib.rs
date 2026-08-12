@@ -39,7 +39,7 @@ pub use package_json::{
 };
 pub use protocols::{
     CatalogProtocolError, CatalogProtocolResolution, resolve_catalog_protocol,
-    resolve_workspace_protocol,
+    resolve_workspace_protocol, validate_workspace_protocol_version,
 };
 pub use trust::{
     ApprovalMetadata, ProvenanceSnapshot, ProvenanceStatus, TrustMatch, TrustedDependencies,

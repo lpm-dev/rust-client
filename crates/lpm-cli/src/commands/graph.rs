@@ -66,6 +66,11 @@ pub async fn run(
                 deps.insert(key.clone());
             }
         }
+        if !dev_only && let Some(d) = pkg.get("optionalDependencies").and_then(|d| d.as_object()) {
+            for key in d.keys() {
+                deps.insert(key.clone());
+            }
+        }
         if !prod_only && let Some(d) = pkg.get("devDependencies").and_then(|d| d.as_object()) {
             for key in d.keys() {
                 deps.insert(key.clone());
@@ -92,8 +97,7 @@ pub async fn run(
         "project@0.0.0".to_string()
     };
 
-    // Build graph
-    let mut graph = DepGraph::from_lockfile(&lockfile.packages, &direct_deps, &root_name);
+    let mut graph = build_graph(&lockfile, &direct_deps, &root_name, pkg_json.is_some());
 
     // When filtering by --prod or --dev, prune transitive deps that are no longer reachable
     if prod_only || dev_only {
@@ -109,14 +113,19 @@ pub async fn run(
 
     // If a specific package was requested, filter the graph to its subtree
     if let Some(pkg_name) = package {
-        let subtree_root = find_package_key(&graph, pkg_name);
-        match subtree_root {
-            Some(key) => {
+        match find_package_key(&graph, pkg_name) {
+            Ok(Some(key)) => {
                 restrict_to_subtree(&mut graph, &key);
             }
-            None => {
+            Ok(None) => {
                 return Err(LpmError::Script(format!(
                     "package '{pkg_name}' is not in your dependency tree."
+                )));
+            }
+            Err(choices) => {
+                return Err(LpmError::Script(format!(
+                    "package selector '{pkg_name}' matches multiple dependency contexts. Use one exact key: {}",
+                    choices.join(", ")
                 )));
             }
         }
@@ -212,27 +221,37 @@ pub async fn run(
             print!("{}", graph_render::render_mermaid(&graph));
         }
         "json" => {
-            let output = graph_render::render_json(&graph)
+            let stdout = std::io::stdout();
+            let mut output = BufWriter::new(stdout.lock());
+            graph_render::write_json(&mut output, &graph)
                 .map_err(|e| LpmError::Script(format!("failed to serialize graph JSON: {e}")))?;
-            println!("{output}");
+            output
+                .flush()
+                .map_err(|e| LpmError::Script(format!("failed to write graph JSON: {e}")))?;
         }
         "stats" => {
             print!("{}", graph_render::render_stats(&graph));
         }
         "html" => {
-            let html = graph_render::render_html(&graph)
-                .map_err(|e| LpmError::Script(format!("failed to render graph HTML: {e}")))?;
             let out_dir = project_dir.join(".lpm");
             std::fs::create_dir_all(&out_dir)
                 .map_err(|e| LpmError::Script(format!("failed to create .lpm dir: {e}")))?;
             let out_path = out_dir.join("graph.html");
-            std::fs::write(&out_path, &html)
-                .map_err(|e| LpmError::Script(format!("failed to write graph.html: {e}")))?;
+            lpm_common::write_file_atomic_with(
+                &out_path,
+                lpm_common::AtomicWriteOptions::new(),
+                |file| {
+                    graph_render::write_html(file, &graph).map_err(|error| {
+                        LpmError::Script(format!("failed to render graph HTML: {error}"))
+                    })
+                },
+            )?;
+            let html_size = std::fs::metadata(&out_path).map_err(LpmError::Io)?.len();
 
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Generated {} ({})",
                 out_path.display().to_string(),
-                format_byte_size(html.len()),
+                format_byte_size(html_size),
             ));
 
             // Open in browser unless suppressed (headless / CI).
@@ -257,30 +276,57 @@ pub async fn run(
     Ok(())
 }
 
+fn build_graph(
+    lockfile: &lpm_lockfile::Lockfile,
+    direct_deps: &HashSet<String>,
+    root_name: &str,
+    has_package_manifest: bool,
+) -> DepGraph {
+    if has_package_manifest
+        && lockfile.metadata.lockfile_version
+            >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+    {
+        DepGraph::from_lockfile_with_root_resolutions(
+            &lockfile.packages,
+            direct_deps,
+            &lockfile.root_resolutions,
+            root_name,
+        )
+    } else {
+        DepGraph::from_lockfile(&lockfile.packages, direct_deps, root_name)
+    }
+}
+
 /// Find a package key in the graph by name (with or without version).
-/// Matches "express" → first node named "express", or "express@4.22.1" → exact key.
-fn find_package_key(graph: &DepGraph, query: &str) -> Option<String> {
-    // Try exact key match first (name@version)
-    if graph.nodes.contains_key(query) {
-        return Some(query.to_string());
+/// Matches "express" or "express@4.22.1" and resolves ties deterministically.
+fn find_package_key(graph: &DepGraph, query: &str) -> Result<Option<String>, Vec<String>> {
+    if graph.nodes.get(query).is_some_and(|node| !node.is_root) {
+        return Ok(Some(query.to_string()));
     }
 
-    // Try name-only match — return the shallowest (most direct) match
-    let mut best: Option<(String, usize)> = None;
-    for (key, node) in &graph.nodes {
-        if node.name == query && !node.is_root {
-            match &best {
-                Some((_, d)) if node.depth < *d => {
-                    best = Some((key.clone(), node.depth));
-                }
-                None => {
-                    best = Some((key.clone(), node.depth));
-                }
-                _ => {}
-            }
-        }
+    let coordinate = query
+        .rsplit_once('@')
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty());
+    let mut matches: Vec<(&String, &graph_render::DepNode)> = graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            !node.is_root
+                && coordinate.map_or_else(
+                    || node.name == query,
+                    |(name, version)| node.name == name && node.version == version,
+                )
+        })
+        .collect();
+    matches.sort_unstable_by(|(left_key, left), (right_key, right)| {
+        left.depth
+            .cmp(&right.depth)
+            .then_with(|| left_key.cmp(right_key))
+    });
+    if coordinate.is_some() && matches.len() > 1 {
+        return Err(matches.into_iter().map(|(key, _)| key.clone()).collect());
     }
-    best.map(|(k, _)| k)
+    Ok(matches.first().map(|(key, _)| (*key).clone()))
 }
 
 /// Restrict the graph to only the subtree rooted at the given key.
@@ -322,7 +368,9 @@ fn restrict_to_subtree(graph: &mut DepGraph, subtree_root: &str) {
         }
         if let Some(node) = graph.nodes.get_mut(&key) {
             node.depth = depth;
-            for dep_key in &node.dependencies.clone() {
+        }
+        if let Some(node) = graph.nodes.get(&key) {
+            for dep_key in &node.dependencies {
                 if !visited.contains(dep_key) {
                     bfs_queue.push_back((dep_key.clone(), depth + 1));
                 }
@@ -366,9 +414,9 @@ fn prune_unreachable(graph: &mut DepGraph) {
 /// Format a byte count as a short human-readable string. Uses 1024-based
 /// units to match `du -h` / file managers; switches unit at the natural
 /// boundary so a 900-byte HTML never reads as "0 KB".
-fn format_byte_size(bytes: usize) -> String {
-    const KIB: usize = 1024;
-    const MIB: usize = 1024 * 1024;
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
     if bytes >= MIB {
         format!("{:.1} MB", bytes as f64 / MIB as f64)
     } else if bytes >= KIB {
@@ -387,10 +435,14 @@ mod tests {
     fn test_packages() -> Vec<LockedPackage> {
         vec![
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "express".into(),
                 version: "4.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -401,13 +453,18 @@ mod tests {
                 dependencies: vec!["accepts@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "accepts".into(),
                 version: "1.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -418,13 +475,18 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "test-lib".into(),
                 version: "1.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -435,13 +497,18 @@ mod tests {
                 dependencies: vec!["test-util@1.0.0".into()],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
             LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "test-util".into(),
                 version: "1.0.0".into(),
                 source: Some("registry+https://registry.npmjs.org".into()),
                 integrity: None,
+                manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
                 os: Vec::new(),
@@ -452,6 +519,7 @@ mod tests {
                 dependencies: vec![],
                 alias_dependencies: vec![],
                 peers: vec![],
+                peer_edges: Vec::new(),
                 tarball: None,
             },
         ]
@@ -508,20 +576,134 @@ mod tests {
         // Exact key match
         assert_eq!(
             find_package_key(&graph, "express@4.0.0"),
-            Some("express@4.0.0".into())
+            Ok(Some("express@4.0.0".into()))
         );
 
         // Name-only match
         assert_eq!(
             find_package_key(&graph, "accepts"),
-            Some("accepts@1.0.0".into())
+            Ok(Some("accepts@1.0.0".into()))
         );
 
         // No match
-        assert_eq!(find_package_key(&graph, "lodash"), None);
+        assert_eq!(find_package_key(&graph, "lodash"), Ok(None));
 
         // Should not match root node
-        assert_eq!(find_package_key(&graph, "my-app"), None);
+        assert_eq!(find_package_key(&graph, "my-app"), Ok(None));
+    }
+
+    #[test]
+    fn find_package_key_does_not_select_project_root_by_exact_coordinate() {
+        let direct_deps: HashSet<String> = ["express"].into_iter().map(str::to_string).collect();
+        let graph = DepGraph::from_lockfile(&test_packages(), &direct_deps, "my-app@1.0.0");
+
+        assert_eq!(find_package_key(&graph, "my-app@1.0.0"), Ok(None));
+    }
+
+    #[test]
+    fn find_package_key_rejects_ambiguous_public_coordinate_for_contextual_instances() {
+        let source = "registry+https://registry.npmjs.org";
+        let first_id =
+            lpm_common::PackageInstanceId::derive("plugin", "1.0.0", source, "root/first/plugin");
+        let second_id =
+            lpm_common::PackageInstanceId::derive("plugin", "1.0.0", source, "root/second/plugin");
+        let packages = vec![
+            LockedPackage {
+                instance_id: Some(first_id),
+                name: "plugin".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(second_id),
+                name: "plugin".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+        ];
+        let graph = DepGraph::from_lockfile(
+            &packages,
+            &HashSet::from(["plugin".to_string()]),
+            "app@1.0.0",
+        );
+        let mut expected_keys = [
+            format!("plugin@1.0.0#{first_id}"),
+            format!("plugin@1.0.0#{second_id}"),
+        ];
+        expected_keys.sort_unstable();
+
+        assert_eq!(
+            find_package_key(&graph, "plugin@1.0.0"),
+            Err(expected_keys.to_vec())
+        );
+    }
+
+    #[test]
+    fn find_package_key_name_ties_use_the_lexicographically_first_key() {
+        let packages: Vec<LockedPackage> = (0..16)
+            .map(|version| LockedPackage {
+                name: "plugin".into(),
+                version: format!("{version:02}.0.0"),
+                ..Default::default()
+            })
+            .collect();
+        let graph = DepGraph::from_lockfile(
+            &packages,
+            &HashSet::from(["plugin".to_string()]),
+            "app@1.0.0",
+        );
+
+        assert_eq!(
+            find_package_key(&graph, "plugin"),
+            Ok(Some("plugin@00.0.0".to_string()))
+        );
+    }
+
+    #[test]
+    fn graph_without_package_manifest_roots_every_exact_package_instance() {
+        let source = "registry+https://registry.npmjs.org";
+        let parent_id =
+            lpm_common::PackageInstanceId::derive("parent", "1.0.0", source, "root/parent");
+        let leaf_id =
+            lpm_common::PackageInstanceId::derive("leaf", "1.0.0", source, "root/parent/leaf");
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.packages = vec![
+            LockedPackage {
+                instance_id: Some(leaf_id),
+                name: "leaf".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                ..Default::default()
+            },
+            LockedPackage {
+                instance_id: Some(parent_id),
+                name: "parent".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+                dependencies: vec!["leaf@1.0.0".into()],
+                dependency_targets: std::collections::BTreeMap::from([("leaf".into(), leaf_id)]),
+                ..Default::default()
+            },
+        ];
+        lockfile.root_resolutions.insert(
+            "parent".into(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(parent_id),
+                package: "parent".into(),
+                version: "1.0.0".into(),
+                source: Some(source.into()),
+            },
+        );
+        let all_package_names = HashSet::from(["leaf".to_string(), "parent".to_string()]);
+
+        let graph = build_graph(&lockfile, &all_package_names, "project@0.0.0", false);
+
+        assert_eq!(
+            graph.nodes["project@0.0.0"].dependencies,
+            vec!["leaf@1.0.0".to_string(), "parent@1.0.0".to_string()]
+        );
     }
 
     /// restrict_to_subtree should keep only the package and its transitive deps.
@@ -549,7 +731,8 @@ mod tests {
         assert!(!graph.nodes.contains_key("my-app@1.0.0"));
 
         // Stats are correct
-        assert_eq!(graph.stats.total_packages, 1); // accepts only (express is root)
+        assert_eq!(graph.stats.total_packages, 2);
+        assert_eq!(graph.stats.npm_packages, 2);
     }
 
     // ── Integration tests: real fixture lockfile ─────────────────────

@@ -40,6 +40,9 @@ impl RootDependencies {
 /// A resolved package: name + selected version + its dependencies.
 #[derive(Debug, Clone)]
 pub struct ResolvedPackage {
+    /// Exact resolver node represented by this row. This value is transient and
+    /// is converted to a stable package-instance identity after sources are known.
+    pub resolution_id: lpm_common::ResolutionNodeId,
     pub package: ResolverPackage,
     pub version: NpmVersion,
     /// Dependencies of this package: (dep_name_in_parent, resolved_version_string).
@@ -53,6 +56,10 @@ pub struct ResolvedPackage {
     /// edge key means the linker can build `node_modules/<local>/`
     /// directly from the edge without a second lookup.
     pub dependencies: Vec<(String, String)>,
+    /// Exact target node for each dependency's manifest-local name.
+    pub dependency_targets: HashMap<String, lpm_common::ResolutionNodeId>,
+    /// Dependency locals whose edges are optional in this package version.
+    pub optional_dependencies: HashSet<String>,
     /// npm-alias edges. Key = `dep_name_in_parent`
     /// from the `dependencies` vec; value = target canonical package
     /// name (what to fetch from the registry + how the `.lpm/` store
@@ -76,7 +83,9 @@ pub struct ResolvedPackage {
     /// same edge graph but different peer pinning produce distinct
     /// keys. Without this field, v2's `links/<key>/` entries silently
     /// shared across peer-divergent installs.
-    pub peers: Vec<(String, String)>,
+    pub peers: Vec<lpm_common::PeerEdge>,
+    /// Exact provider node for each resolved peer's manifest-local name.
+    pub peer_targets: HashMap<String, lpm_common::ResolutionNodeId>,
     /// Tarball download URL from registry metadata.
     /// Carried from resolution → download to avoid re-fetching metadata.
     pub tarball_url: Option<String>,
@@ -94,6 +103,7 @@ pub struct ResolvedPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootResolution {
+    pub target: lpm_common::ResolutionNodeId,
     pub package: String,
     pub version: String,
 }
@@ -137,13 +147,10 @@ pub struct ResolveResult {
     /// Metadata cache from resolution. Contains peer_deps, platform info, etc.
     /// Used by `check_unmet_peers()` for post-resolution peer checking.
     ///
-    /// Values are `Arc<CachedPackageInfo>` so the resolver's
-    /// end-of-resolve materialization is an `Arc::clone` per entry
-    /// (refcount bump) rather than a deep-clone of seven nested
-    /// HashMaps. Consumers that need an owned `CachedPackageInfo` can
-    /// `(*arc).clone()` at their use site; everything in the codebase
-    /// today reads fields through `&Arc<CachedPackageInfo>` (auto-deref).
-    pub cache: HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
+    /// The map is shared so workspace projections do not allocate one
+    /// identical key table per importer. Values are also
+    /// `Arc<CachedPackageInfo>`, avoiding deep clones of their nested maps.
+    pub cache: std::sync::Arc<HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>>,
     /// Override apply trace. Empty when no
     /// `lpm.overrides` / `overrides` / `resolutions` were declared OR
     /// when none of them matched any resolved package. Sorted by

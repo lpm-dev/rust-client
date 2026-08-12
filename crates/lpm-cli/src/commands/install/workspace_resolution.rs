@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::{InstallPackage, LpmError, PeerWarning, install_pkg_key};
+use super::{InstallOmitPolicy, InstallPackage, LpmError, PeerWarning, install_pkg_key};
 
 pub(super) struct WorkspaceResolutionCoordinator {
     resolution_permits: Arc<Semaphore>,
@@ -94,10 +94,11 @@ impl WorkspaceResolutionCoordinator {
     }
 
     fn fetch_overlap_hub(&self) -> Arc<super::fetch_overlap::WorkspaceFetchOverlapHub> {
-        Arc::clone(
-            self.fetch_overlap_hub
-                .get_or_init(|| Arc::new(super::fetch_overlap::WorkspaceFetchOverlapHub::new())),
-        )
+        Arc::clone(self.fetch_overlap_hub.get_or_init(|| {
+            Arc::new(super::fetch_overlap::WorkspaceFetchOverlapHub::new(
+                super::max_concurrent_downloads(),
+            ))
+        }))
     }
 
     fn publish_root_providers(&self, snapshot: RootProviderSnapshot) {
@@ -717,6 +718,9 @@ pub(super) async fn reconcile_root_peer_providers(
     packages: &mut Vec<InstallPackage>,
     peer_warnings: &mut Vec<PeerWarning>,
     ephemeral_workspace_packages: &[InstallPackage],
+    omit_policy: InstallOmitPolicy,
+    root_optional_dependency_names: &HashSet<String>,
+    production_dependency_names: &HashSet<String>,
 ) -> Result<Option<String>, LpmError> {
     if let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) {
         if task.is_root() {
@@ -725,6 +729,9 @@ pub(super) async fn reconcile_root_peer_providers(
                     project_dir,
                     packages.clone(),
                     ephemeral_workspace_packages,
+                    omit_policy,
+                    root_optional_dependency_names,
+                    production_dependency_names,
                 ));
             return Ok(None);
         }
@@ -743,6 +750,9 @@ pub(super) async fn reconcile_root_peer_providers(
             project_dir,
             packages.clone(),
             ephemeral_workspace_packages,
+            omit_policy,
+            root_optional_dependency_names,
+            production_dependency_names,
         ));
         return Ok(None);
     }
@@ -751,11 +761,104 @@ pub(super) async fn reconcile_root_peer_providers(
     Ok(used_root_provider.then(|| snapshot.fingerprint.to_string()))
 }
 
-pub(super) fn publish_root_peer_providers_for_empty_install(project_dir: &Path) {
+pub(super) fn reconcile_ambient_peer_roots(
+    packages: &mut [InstallPackage],
+    ambient_peer_installs: &mut Vec<String>,
+    manifest_dependencies: &HashMap<String, String>,
+) -> Result<(), LpmError> {
+    let manifest_root_instances = packages
+        .iter()
+        .filter(|package| {
+            package.root_link_names.as_ref().is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| manifest_dependencies.contains_key(name))
+            })
+        })
+        .filter_map(|package| package.instance_id)
+        .collect::<HashSet<_>>();
+    for package in packages.iter() {
+        for peer in &package.peers {
+            let Some(target) = package.peer_targets.get(&peer.local_name) else {
+                continue;
+            };
+            if manifest_root_instances.contains(target)
+                && !manifest_dependencies.contains_key(&peer.target_name)
+            {
+                ambient_peer_installs.push(peer.target_name.clone());
+            }
+        }
+    }
+
+    let declared_root_links = packages
+        .iter()
+        .filter_map(|package| package.root_link_names.as_ref())
+        .flatten()
+        .filter(|name| manifest_dependencies.contains_key(*name))
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    ambient_peer_installs.retain(|name| !declared_root_links.contains(name.as_str()));
+    ambient_peer_installs.sort_unstable();
+    ambient_peer_installs.dedup();
+
+    for ambient in ambient_peer_installs.iter() {
+        if packages.iter().any(|package| {
+            package
+                .root_link_names
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|name| name == ambient))
+        }) {
+            continue;
+        }
+
+        let mut targets = packages
+            .iter()
+            .flat_map(|package| {
+                package.peers.iter().filter_map(|peer| {
+                    (peer.target_name == *ambient)
+                        .then(|| package.peer_targets.get(&peer.local_name).copied())
+                        .flatten()
+                })
+            })
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.dedup();
+        let [target] = targets.as_slice() else {
+            return Err(LpmError::Registry(format!(
+                "ambient peer {ambient:?} does not have one exact root provider"
+            )));
+        };
+        let provider = packages
+            .iter_mut()
+            .find(|package| package.instance_id == Some(*target))
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "ambient peer {ambient:?} references a missing exact root provider"
+                ))
+            })?;
+        let link_names = provider.root_link_names.get_or_insert_with(Vec::new);
+        link_names.push(ambient.clone());
+        link_names.sort_unstable();
+        link_names.dedup();
+    }
+    Ok(())
+}
+
+pub(super) fn publish_root_peer_providers_for_empty_install(
+    project_dir: &Path,
+    omit_policy: InstallOmitPolicy,
+) {
     if let Ok(task) = ACTIVE_TASK.try_with(Arc::clone) {
         if task.is_root() {
             task.coordinator
-                .publish_root_providers(RootProviderSnapshot::new(project_dir, Vec::new(), &[]));
+                .publish_root_providers(RootProviderSnapshot::new(
+                    project_dir,
+                    Vec::new(),
+                    &[],
+                    omit_policy,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ));
         }
         return;
     }
@@ -763,14 +866,21 @@ pub(super) fn publish_root_peer_providers_for_empty_install(project_dir: &Path) 
     if let Ok(task) = ACTIVE_ROOT_PROVIDER_TASK.try_with(Arc::clone)
         && task.is_root
     {
-        task.coordinator
-            .publish(RootProviderSnapshot::new(project_dir, Vec::new(), &[]));
+        task.coordinator.publish(RootProviderSnapshot::new(
+            project_dir,
+            Vec::new(),
+            &[],
+            omit_policy,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
     }
 }
 
 pub(super) fn root_provider_fingerprint_from_projection(
     root_dir: &Path,
     lockfile: &lpm_lockfile::Lockfile,
+    omit_policy: InstallOmitPolicy,
 ) -> Option<String> {
     let manifest = root_manifest_bytes(root_dir);
     let package = lpm_workspace::read_workspace_root_package(root_dir).unwrap_or_default();
@@ -782,7 +892,13 @@ pub(super) fn root_provider_fingerprint_from_projection(
         .map(FingerprintPackage::from_locked)
         .collect::<Vec<_>>();
     let local = local_provider_fingerprints(root_dir, &local_packages);
-    Some(root_provider_fingerprint(&manifest, &direct, &rows, &local))
+    Some(root_provider_fingerprint(
+        &manifest,
+        &direct,
+        &rows,
+        &local,
+        omit_policy,
+    ))
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -810,9 +926,13 @@ struct RootProviderSnapshot {
 impl RootProviderSnapshot {
     fn new(
         root_dir: &Path,
-        packages: Vec<InstallPackage>,
+        mut packages: Vec<InstallPackage>,
         workspace_packages: &[InstallPackage],
+        omit_policy: InstallOmitPolicy,
+        root_optional_dependency_names: &HashSet<String>,
+        production_dependency_names: &HashSet<String>,
     ) -> Self {
+        super::ensure_install_package_instance_ids(&mut packages);
         let mut lockfile = lpm_lockfile::Lockfile::new();
         for package in &packages {
             lockfile.add_package(super::lockfile::locked_package_from_install_package(
@@ -824,6 +944,20 @@ impl RootProviderSnapshot {
         lockfile.root_aliases = super::root_aliases_for_lockfile(&packages, &deps);
         lockfile.root_resolutions = super::root_resolutions_for_lockfile(&packages);
         let direct = direct_provider_identities(&package, &lockfile, workspace_packages);
+        let rows = lockfile
+            .packages
+            .iter()
+            .map(FingerprintPackage::from_locked)
+            .collect::<Vec<_>>();
+        let local = local_provider_fingerprints(root_dir, workspace_packages);
+        let manifest = root_manifest_bytes(root_dir);
+        let fingerprint = root_provider_fingerprint(&manifest, &direct, &rows, &local, omit_policy);
+        if omit_policy.dev {
+            super::filter_dev_packages(&mut packages, production_dependency_names);
+        }
+        if omit_policy.optional {
+            super::filter_optional_packages(&mut packages, root_optional_dependency_names);
+        }
         let mut direct_by_name = BTreeMap::<String, Vec<usize>>::new();
         for (index, package) in packages.iter().enumerate() {
             if package.is_direct {
@@ -841,14 +975,6 @@ impl RootProviderSnapshot {
                     .then_with(|| packages[*left].source.cmp(&packages[*right].source))
             });
         }
-        let rows = lockfile
-            .packages
-            .iter()
-            .map(FingerprintPackage::from_locked)
-            .collect::<Vec<_>>();
-        let local = local_provider_fingerprints(root_dir, workspace_packages);
-        let manifest = root_manifest_bytes(root_dir);
-        let fingerprint = root_provider_fingerprint(&manifest, &direct, &rows, &local);
         Self {
             root_dir: root_dir.to_path_buf(),
             packages: Arc::from(packages),
@@ -882,12 +1008,13 @@ impl RootProviderSnapshot {
         packages: &mut Vec<InstallPackage>,
         warning: &PeerWarning,
     ) -> bool {
+        super::ensure_install_package_instance_ids(packages);
         let Ok(range) = lpm_resolver::NpmRange::parse(&warning.required_range) else {
             return false;
         };
         let Some(provider_index) = self
             .direct_by_name
-            .get(&warning.peer)
+            .get(&warning.target)
             .into_iter()
             .flatten()
             .copied()
@@ -899,66 +1026,156 @@ impl RootProviderSnapshot {
         else {
             return false;
         };
-        if !packages
+        let mut consumer_indices = packages
             .iter()
-            .any(|package| package.name == warning.package && package.version == warning.version)
-        {
+            .enumerate()
+            .filter(|(_, package)| {
+                package.name == warning.package && package.version == warning.version
+            })
+            .map(|(index, _)| index);
+        let Some(consumer_index) = consumer_indices.next() else {
+            return false;
+        };
+        if consumer_indices.next().is_some() {
             return false;
         }
 
-        let closure = self.provider_closure(provider_index);
+        let Some(closure) = self.provider_closure(provider_index) else {
+            return false;
+        };
         let mut imports = Vec::with_capacity(closure.len());
+        let mut rebased_wrapper_ids = HashMap::with_capacity(closure.len());
+        let mut rebased_instance_ids = HashMap::with_capacity(closure.len());
         for index in closure {
             let mut imported = self.packages[index].clone();
+            let old_source = imported.source.clone();
+            let old_wrapper_id = imported.wrapper_id_for_source();
             imported.source = rebase_local_source(&imported.source, &self.root_dir, project_dir);
+            if imported.source != old_source {
+                let Some(old_instance_id) = imported.instance_id else {
+                    return false;
+                };
+                let new_instance_id = old_instance_id.rebase_source(
+                    &imported.name,
+                    &imported.version,
+                    &imported.source,
+                );
+                imported.instance_id = Some(new_instance_id);
+                rebased_instance_ids.insert(old_instance_id, new_instance_id);
+            }
+            if let (Some(old_wrapper_id), Some(new_wrapper_id)) =
+                (old_wrapper_id, imported.wrapper_id_for_source())
+            {
+                rebased_wrapper_ids.insert(old_wrapper_id, new_wrapper_id);
+            }
             if !package_can_be_imported(packages, &imported) {
                 return false;
             }
             imports.push(imported);
         }
 
+        for imported in &mut imports {
+            for target in imported.dependency_targets.values_mut() {
+                if let Some(rebased) = rebased_instance_ids.get(target) {
+                    *target = *rebased;
+                }
+            }
+            for target in imported.peer_targets.values_mut() {
+                if let Some(rebased) = rebased_instance_ids.get(target) {
+                    *target = *rebased;
+                }
+            }
+            for (_, target) in &mut imported.dependencies {
+                if let Some(rebased) = rebased_wrapper_ids.get(target) {
+                    target.clone_from(rebased);
+                }
+            }
+            for peer in &mut imported.peers {
+                if let Some(wrapper_id) = peer.target_wrapper_id.as_mut()
+                    && let Some(rebased) = rebased_wrapper_ids.get(wrapper_id)
+                {
+                    wrapper_id.clone_from(rebased);
+                }
+            }
+        }
+        if complete_imported_exact_targets(&mut imports).is_none() {
+            return false;
+        }
+
+        let Some(imported_by_instance) = verified_imported_exact_target_index(&imports) else {
+            return false;
+        };
+
+        let Some(mut provider_instance_id) = self.packages[provider_index].instance_id else {
+            return false;
+        };
+        if let Some(rebased) = rebased_instance_ids.get(&provider_instance_id) {
+            provider_instance_id = *rebased;
+        }
+        let Some(&provider_position) = imported_by_instance.get(&provider_instance_id) else {
+            return false;
+        };
+
+        let provider = &imports[provider_position];
+        let peer_binding = lpm_common::PeerEdge {
+            local_name: warning.peer.clone(),
+            target_name: warning.target.clone(),
+            target_version: provider.version.clone(),
+            target_wrapper_id: provider.wrapper_id_for_source(),
+        };
+
         for mut imported in imports {
-            if packages
-                .iter()
-                .any(|package| install_pkg_key(package) == install_pkg_key(&imported))
-            {
+            if packages.iter().any(|package| {
+                imported.instance_id.map_or_else(
+                    || install_pkg_key(package) == install_pkg_key(&imported),
+                    |instance_id| package.instance_id == Some(instance_id),
+                )
+            }) {
                 continue;
             }
             imported.is_direct = false;
             imported.root_link_names = None;
             packages.push(imported);
         }
-
-        let provider_version = self.packages[provider_index].version.clone();
-        for consumer in packages
+        let consumer = &mut packages[consumer_index];
+        if let Some(edge) = consumer
+            .peers
             .iter_mut()
-            .filter(|package| package.name == warning.package && package.version == warning.version)
+            .find(|edge| edge.local_name == warning.peer)
         {
-            if let Some((_, version)) = consumer
+            edge.clone_from(&peer_binding);
+        } else {
+            consumer.peers.push(peer_binding);
+            consumer
                 .peers
-                .iter_mut()
-                .find(|(name, _)| name == &warning.peer)
-            {
-                *version = provider_version.clone();
-            } else {
-                consumer
-                    .peers
-                    .push((warning.peer.clone(), provider_version.clone()));
-                consumer
-                    .peers
-                    .sort_unstable_by(|left, right| left.0.cmp(&right.0));
-            }
+                .sort_unstable_by(|left, right| left.local_name.cmp(&right.local_name));
         }
+        consumer
+            .peer_targets
+            .insert(warning.peer.clone(), provider_instance_id);
         true
     }
 
-    fn provider_closure(&self, provider_index: usize) -> Vec<usize> {
-        let mut by_name_version = HashMap::<(&str, &str), Vec<usize>>::new();
+    fn provider_closure(&self, provider_index: usize) -> Option<Vec<usize>> {
+        let mut by_instance = HashMap::with_capacity(self.packages.len());
+        let mut registry_by_name_version = HashMap::<(&str, &str), Vec<usize>>::new();
+        let mut source_by_wrapper = HashMap::<String, Vec<usize>>::new();
         for (index, package) in self.packages.iter().enumerate() {
-            by_name_version
-                .entry((&package.name, &package.version))
-                .or_default()
-                .push(index);
+            if let Some(instance_id) = package.instance_id {
+                by_instance.insert(instance_id, index);
+            }
+            if matches!(
+                package.source_kind(),
+                Ok(lpm_lockfile::Source::Registry { .. })
+            ) {
+                registry_by_name_version
+                    .entry((&package.name, &package.version))
+                    .or_default()
+                    .push(index);
+            }
+            if let Some(wrapper_id) = package.wrapper_id_for_source() {
+                source_by_wrapper.entry(wrapper_id).or_default().push(index);
+            }
         }
         let mut seen = HashSet::new();
         let mut queue = VecDeque::from([provider_index]);
@@ -967,20 +1184,175 @@ impl RootProviderSnapshot {
                 continue;
             }
             let package = &self.packages[index];
-            for (local_name, version) in package.dependencies.iter().chain(&package.peers) {
+            for (local_name, version) in &package.dependencies {
+                if let Some(target_id) = package.dependency_targets.get(local_name) {
+                    queue.push_back(*by_instance.get(target_id)?);
+                    continue;
+                }
                 let target = package
                     .aliases
                     .get(local_name)
                     .map_or(local_name, |name| name);
-                if let Some(children) = by_name_version.get(&(target.as_str(), version.as_str())) {
-                    queue.extend(children.iter().copied());
+                let candidates = source_by_wrapper.get(version).or_else(|| {
+                    registry_by_name_version.get(&(target.as_str(), version.as_str()))
+                })?;
+                let [child] = candidates.as_slice() else {
+                    return None;
+                };
+                queue.push_back(*child);
+            }
+            for peer in &package.peers {
+                if let Some(target_id) = package.peer_targets.get(&peer.local_name) {
+                    queue.push_back(*by_instance.get(target_id)?);
+                    continue;
                 }
+                let candidates = match peer.target_wrapper_id.as_ref() {
+                    Some(wrapper_id) => source_by_wrapper.get(wrapper_id),
+                    None => registry_by_name_version
+                        .get(&(peer.target_name.as_str(), peer.target_version.as_str())),
+                }?;
+                let [child] = candidates.as_slice() else {
+                    return None;
+                };
+                queue.push_back(*child);
             }
         }
         let mut closure = seen.into_iter().collect::<Vec<_>>();
         closure.sort_unstable();
-        closure
+        Some(closure)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static IMPORTED_EXACT_TARGET_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_imported_exact_target_operation() {
+    IMPORTED_EXACT_TARGET_OPERATIONS.with(|operations| operations.set(operations.get() + 1));
+}
+
+fn verified_imported_exact_target_index(
+    packages: &[InstallPackage],
+) -> Option<HashMap<lpm_common::PackageInstanceId, usize>> {
+    let mut by_instance = HashMap::with_capacity(packages.len());
+    for (index, package) in packages.iter().enumerate() {
+        #[cfg(test)]
+        record_imported_exact_target_operation();
+        if by_instance.insert(package.instance_id?, index).is_some() {
+            return None;
+        }
+    }
+
+    for imported in packages {
+        if imported.dependency_targets.len() != imported.dependencies.len()
+            || imported.peer_targets.len() != imported.peers.len()
+        {
+            return None;
+        }
+        for (local_name, target_value) in &imported.dependencies {
+            let target_id = imported.dependency_targets.get(local_name)?;
+            #[cfg(test)]
+            record_imported_exact_target_operation();
+            let target = &packages[*by_instance.get(target_id)?];
+            let target_name = imported.aliases.get(local_name).unwrap_or(local_name);
+            if target.name != *target_name
+                || target_value != &target.version
+                    && target.wrapper_id_for_source().as_deref() != Some(target_value.as_str())
+            {
+                return None;
+            }
+        }
+        for peer in &imported.peers {
+            let target_id = imported.peer_targets.get(&peer.local_name)?;
+            #[cfg(test)]
+            record_imported_exact_target_operation();
+            let target = &packages[*by_instance.get(target_id)?];
+            if target.name != peer.target_name
+                || target.version != peer.target_version
+                || target.wrapper_id_for_source() != peer.target_wrapper_id
+            {
+                return None;
+            }
+        }
+    }
+    Some(by_instance)
+}
+
+fn complete_imported_exact_targets(packages: &mut [InstallPackage]) -> Option<()> {
+    let mut registry_by_coordinate = HashMap::<String, Vec<lpm_common::PackageInstanceId>>::new();
+    let mut source_by_wrapper = HashMap::<String, Vec<lpm_common::PackageInstanceId>>::new();
+    for package in packages.iter() {
+        let instance_id = package.instance_id?;
+        if matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Registry { .. })
+        ) {
+            registry_by_coordinate
+                .entry(super::link_target_lookup_key(
+                    &package.name,
+                    &package.version,
+                ))
+                .or_default()
+                .push(instance_id);
+        }
+        if let Some(wrapper_id) = package.wrapper_id_for_source() {
+            source_by_wrapper
+                .entry(wrapper_id)
+                .or_default()
+                .push(instance_id);
+        }
+    }
+    for instances in registry_by_coordinate.values_mut() {
+        instances.sort_unstable();
+        instances.dedup();
+    }
+    for instances in source_by_wrapper.values_mut() {
+        instances.sort_unstable();
+        instances.dedup();
+    }
+
+    for package in packages {
+        for (local_name, target_value) in &package.dependencies {
+            if package.dependency_targets.contains_key(local_name) {
+                continue;
+            }
+            let target_name = package.aliases.get(local_name).unwrap_or(local_name);
+            let candidates = source_by_wrapper.get(target_value).or_else(|| {
+                registry_by_coordinate
+                    .get(&super::link_target_lookup_key(target_name, target_value))
+            })?;
+            let [instance_id] = candidates.as_slice() else {
+                return None;
+            };
+            package
+                .dependency_targets
+                .insert(local_name.clone(), *instance_id);
+        }
+        for peer in &package.peers {
+            if package.peer_targets.contains_key(&peer.local_name) {
+                continue;
+            }
+            let candidates = peer
+                .target_wrapper_id
+                .as_ref()
+                .and_then(|wrapper_id| source_by_wrapper.get(wrapper_id))
+                .or_else(|| {
+                    registry_by_coordinate.get(&super::link_target_lookup_key(
+                        &peer.target_name,
+                        &peer.target_version,
+                    ))
+                })?;
+            let [instance_id] = candidates.as_slice() else {
+                return None;
+            };
+            package
+                .peer_targets
+                .insert(peer.local_name.clone(), *instance_id);
+        }
+    }
+    Some(())
 }
 
 fn root_workspace_install_packages(
@@ -988,6 +1360,7 @@ fn root_workspace_install_packages(
     package: &lpm_workspace::PackageJson,
 ) -> Option<Vec<InstallPackage>> {
     let mut deps = super::manifest_install_deps(package);
+    let optional_names = package.optional_dependencies.keys().cloned().collect();
     let context =
         super::prepare_workspace_install_context(root_dir, package, &mut deps, true, true).ok()?;
     super::pre_resolve_v2_direct_workspace_member_deps(
@@ -995,7 +1368,13 @@ fn root_workspace_install_packages(
         &mut deps,
         &context.direct_workspace_member_deps,
         &context.all_workspace_members,
+        &optional_names,
         true,
+        package
+            .lpm
+            .as_ref()
+            .and_then(|lpm| lpm.auto_install_peers)
+            .unwrap_or(true),
     )
     .ok()
     .map(|result| result.install_pkgs)
@@ -1127,7 +1506,7 @@ struct FingerprintPackage {
     integrity: String,
     dependencies: Vec<String>,
     aliases: Vec<[String; 2]>,
-    peers: Vec<String>,
+    peers: Vec<lpm_common::PeerEdge>,
     platform: Vec<String>,
     node_engine: String,
     optional: bool,
@@ -1139,7 +1518,19 @@ impl FingerprintPackage {
         dependencies.sort_unstable();
         let mut aliases = package.alias_dependencies.clone();
         aliases.sort_unstable();
-        let mut peers = package.peers.clone();
+        let mut peers = if package.peer_edges.is_empty() {
+            package
+                .peers
+                .iter()
+                .filter_map(|value| {
+                    value.rfind('@').map(|at| {
+                        lpm_common::PeerEdge::registry(&value[..at], &value[..at], &value[at + 1..])
+                    })
+                })
+                .collect()
+        } else {
+            package.peer_edges.clone()
+        };
         peers.sort_unstable();
         let mut platform: Vec<String> = package
             .os
@@ -1172,9 +1563,14 @@ fn root_provider_fingerprint(
     direct: &[ProviderIdentity],
     packages: &[FingerprintPackage],
     local: &[LocalProviderFingerprint],
+    omit_policy: InstallOmitPolicy,
 ) -> String {
     let mut hasher = Sha256::new();
     hash_bytes(&mut hasher, b"lpm-workspace-root-peer-providers-v2");
+    hash_bytes(
+        &mut hasher,
+        &[u8::from(omit_policy.dev), u8::from(omit_policy.optional)],
+    );
     hash_bytes(&mut hasher, manifest);
     let mut direct = direct.to_vec();
     direct.sort_unstable();
@@ -1199,7 +1595,13 @@ fn root_provider_fingerprint(
             hash_bytes(&mut hasher, alias[1].as_bytes());
         }
         for peer in &package.peers {
-            hash_bytes(&mut hasher, peer.as_bytes());
+            hash_bytes(&mut hasher, peer.local_name.as_bytes());
+            hash_bytes(&mut hasher, peer.target_name.as_bytes());
+            hash_bytes(&mut hasher, peer.target_version.as_bytes());
+            hash_bytes(
+                &mut hasher,
+                peer.target_wrapper_id.as_deref().unwrap_or("").as_bytes(),
+            );
         }
         for platform in &package.platform {
             hash_bytes(&mut hasher, platform.as_bytes());
@@ -1301,6 +1703,32 @@ mod tests {
         workspace_union_request_with_route_table(lpm_registry::RouteTable::from_mode_only(
             lpm_registry::RouteMode::Direct,
         ))
+    }
+
+    fn install_package(name: &str, source: &str, is_direct: bool) -> InstallPackage {
+        InstallPackage {
+            instance_id: None,
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: source.to_string(),
+            dependencies: Vec::new(),
+            aliases: HashMap::new(),
+            root_link_names: is_direct.then(|| vec![name.to_string()]),
+            is_direct,
+            is_lpm: false,
+            peers: Vec::new(),
+            integrity: None,
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+            tarball_url: None,
+            metadata_checked_for_tarball: false,
+            manifest_fingerprint: None,
+        }
     }
 
     fn credentialed_route_table(token: &str) -> lpm_registry::RouteTable {
@@ -1478,10 +1906,522 @@ mod tests {
         )
         .unwrap();
         let fingerprint = coordinator.projection(".").ok().and_then(|lockfile| {
-            root_provider_fingerprint_from_projection(directory.path(), &lockfile)
+            root_provider_fingerprint_from_projection(
+                directory.path(),
+                &lockfile,
+                InstallOmitPolicy::default(),
+            )
         });
 
         assert_eq!(fingerprint, None);
+    }
+
+    #[test]
+    fn root_provider_reconciliation_binds_aliased_peer_to_exact_local_source() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("package.json"), b"{}").unwrap();
+        std::fs::create_dir_all(workspace.path().join("provider")).unwrap();
+        std::fs::write(
+            workspace.path().join("provider/package.json"),
+            br#"{"name":"react","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let project_dir = workspace.path().join("packages/app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let mut provider = install_package("react", "directory+provider", true);
+        let provider_id = lpm_common::PackageInstanceId::derive(
+            "react",
+            "1.0.0",
+            "directory+provider",
+            "root/react",
+        );
+        provider.instance_id = Some(provider_id);
+        let snapshot = RootProviderSnapshot::new(
+            workspace.path(),
+            vec![provider],
+            &[],
+            InstallOmitPolicy::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let mut consumer = install_package(
+            "compat-consumer",
+            "registry+https://registry.npmjs.org",
+            false,
+        );
+        consumer.instance_id = Some(lpm_common::PackageInstanceId::derive(
+            "compat-consumer",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/compat-consumer",
+        ));
+        let mut packages = vec![consumer];
+        let mut warnings = vec![PeerWarning {
+            package: "compat-consumer".to_string(),
+            version: "1.0.0".to_string(),
+            peer: "react-compat".to_string(),
+            target: "react".to_string(),
+            required_range: "*".to_string(),
+            resolved_version: None,
+        }];
+
+        assert!(snapshot.reconcile(&project_dir, &mut packages, &mut warnings));
+        assert!(warnings.is_empty());
+        let imported_provider = packages
+            .iter()
+            .find(|package| package.name == "react")
+            .expect("root provider imported");
+        assert_eq!(
+            imported_provider.instance_id,
+            Some(provider_id.rebase_source("react", "1.0.0", &imported_provider.source,)),
+            "rebased local sources must receive identities derived from their projected source",
+        );
+        let consumer = packages
+            .iter()
+            .find(|package| package.name == "compat-consumer")
+            .unwrap();
+        assert_eq!(
+            consumer.peers,
+            [lpm_common::PeerEdge {
+                local_name: "react-compat".to_string(),
+                target_name: "react".to_string(),
+                target_version: "1.0.0".to_string(),
+                target_wrapper_id: imported_provider.wrapper_id_for_source(),
+            }]
+        );
+        assert_eq!(
+            consumer.peer_targets.get("react-compat"),
+            imported_provider.instance_id.as_ref()
+        );
+    }
+
+    #[test]
+    fn root_provider_closure_imports_exact_local_dependency_without_same_coordinate_registry_row() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("package.json"), b"{}").unwrap();
+        let project_dir = workspace.path().join("packages/app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let mut provider = install_package("provider", "directory+provider", true);
+        let provider_id = lpm_common::PackageInstanceId::derive(
+            "provider",
+            "1.0.0",
+            "directory+provider",
+            "root/provider",
+        );
+        provider.instance_id = Some(provider_id);
+        let mut local_child = install_package("child", "directory+local-child", false);
+        let local_child_id = lpm_common::PackageInstanceId::derive(
+            "child",
+            "1.0.0",
+            "directory+local-child",
+            "root/provider/child",
+        );
+        local_child.instance_id = Some(local_child_id);
+        let local_wrapper = local_child.wrapper_id_for_source().unwrap();
+        provider
+            .dependencies
+            .push(("child".to_string(), local_wrapper.clone()));
+        provider
+            .dependency_targets
+            .insert("child".to_string(), local_child_id);
+        let registry_child = install_package("child", "registry+https://registry.npmjs.org", false);
+        let snapshot = RootProviderSnapshot::new(
+            workspace.path(),
+            vec![provider, registry_child, local_child],
+            &[],
+            InstallOmitPolicy::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let mut packages = vec![install_package(
+            "consumer",
+            "registry+https://registry.npmjs.org",
+            false,
+        )];
+        let mut warnings = vec![PeerWarning {
+            package: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            peer: "provider".to_string(),
+            target: "provider".to_string(),
+            required_range: "*".to_string(),
+            resolved_version: None,
+        }];
+
+        assert!(snapshot.reconcile(&project_dir, &mut packages, &mut warnings));
+
+        let children = packages
+            .iter()
+            .filter(|package| package.name == "child")
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+        let imported_wrapper = children[0].wrapper_id_for_source().unwrap();
+        let imported_provider = packages
+            .iter()
+            .find(|package| package.name == "provider")
+            .expect("provider imported");
+        assert_ne!(imported_wrapper, local_wrapper);
+        assert_eq!(imported_provider.dependencies[0].1, imported_wrapper);
+        let imported_child_id = children[0].instance_id.unwrap();
+        assert_eq!(
+            imported_provider.instance_id,
+            Some(provider_id.rebase_source("provider", "1.0.0", &imported_provider.source,))
+        );
+        assert_eq!(
+            imported_child_id,
+            local_child_id.rebase_source("child", "1.0.0", &children[0].source)
+        );
+        assert_eq!(
+            imported_provider.dependency_targets.get("child"),
+            Some(&imported_child_id),
+            "exact dependency targets must follow the rebased local instance",
+        );
+    }
+
+    #[test]
+    fn reconciled_manifest_workspace_peer_is_not_persisted_as_ambient() {
+        let provider_id = lpm_common::PackageInstanceId::derive(
+            "workspace-lib",
+            "1.0.0",
+            "directory+../workspace-lib",
+            "root/workspace-lib",
+        );
+        let consumer_id = lpm_common::PackageInstanceId::derive(
+            "consumer",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/consumer",
+        );
+        let mut provider = install_package("workspace-lib", "directory+../workspace-lib", true);
+        provider.instance_id = Some(provider_id);
+        provider.root_link_names = Some(vec!["workspace-lib".to_string()]);
+        let mut consumer = install_package("consumer", "registry+https://registry.npmjs.org", true);
+        consumer.instance_id = Some(consumer_id);
+        consumer.peers = vec![lpm_common::PeerEdge {
+            local_name: "workspace-lib".to_string(),
+            target_name: "workspace-lib".to_string(),
+            target_version: "1.0.0".to_string(),
+            target_wrapper_id: provider.wrapper_id_for_source(),
+        }];
+        consumer
+            .peer_targets
+            .insert("workspace-lib".to_string(), provider_id);
+        let mut packages = vec![consumer, provider];
+        let mut ambient = vec!["workspace-lib".to_string()];
+
+        reconcile_ambient_peer_roots(
+            &mut packages,
+            &mut ambient,
+            &HashMap::from([("workspace-lib".to_string(), "workspace:*".to_string())]),
+        )
+        .expect("reconcile declared workspace provider");
+
+        assert!(ambient.is_empty());
+    }
+
+    #[test]
+    fn manifest_alias_does_not_suppress_canonical_ambient_peer_root() {
+        let provider_id = lpm_common::PackageInstanceId::derive(
+            "react",
+            "17.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/react-17",
+        );
+        let consumer_id = lpm_common::PackageInstanceId::derive(
+            "consumer",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/consumer",
+        );
+        let mut provider = install_package("react", "registry+https://registry.npmjs.org", true);
+        provider.version = "17.0.0".to_string();
+        provider.instance_id = Some(provider_id);
+        provider.root_link_names = Some(vec!["react-17".to_string()]);
+        let mut consumer = install_package("consumer", "registry+https://registry.npmjs.org", true);
+        consumer.instance_id = Some(consumer_id);
+        consumer.peers = vec![lpm_common::PeerEdge {
+            local_name: "react".to_string(),
+            target_name: "react".to_string(),
+            target_version: "17.0.0".to_string(),
+            target_wrapper_id: provider.wrapper_id_for_source(),
+        }];
+        consumer
+            .peer_targets
+            .insert("react".to_string(), provider_id);
+        let mut packages = vec![consumer, provider];
+        let mut ambient = Vec::new();
+
+        reconcile_ambient_peer_roots(
+            &mut packages,
+            &mut ambient,
+            &HashMap::from([("react-17".to_string(), "npm:react@17".to_string())]),
+        )
+        .expect("reconcile canonical peer beside manifest alias");
+
+        let provider = packages
+            .iter()
+            .find(|package| package.name == "react")
+            .expect("provider remains present");
+        assert_eq!(
+            (ambient.as_slice(), provider.root_link_names.as_deref()),
+            (
+                &["react".to_string()][..],
+                Some(&["react".to_string(), "react-17".to_string()][..]),
+            ),
+        );
+    }
+
+    #[test]
+    fn imported_exact_target_validation_scales_linearly_with_package_count() {
+        const PACKAGE_COUNT: usize = 64;
+        let source = "registry+https://registry.npmjs.org";
+        let mut packages = (0..PACKAGE_COUNT)
+            .map(|index| {
+                let name = format!("node-{index}");
+                let mut package = install_package(&name, source, false);
+                package.instance_id = Some(lpm_common::PackageInstanceId::derive(
+                    &name,
+                    "1.0.0",
+                    source,
+                    &format!("root/{name}"),
+                ));
+                package
+            })
+            .collect::<Vec<_>>();
+        for index in 0..PACKAGE_COUNT - 1 {
+            let target_name = packages[index + 1].name.clone();
+            let target_id = packages[index + 1].instance_id.unwrap();
+            packages[index]
+                .dependencies
+                .push(("next".to_string(), "1.0.0".to_string()));
+            packages[index]
+                .aliases
+                .insert("next".to_string(), target_name);
+            packages[index]
+                .dependency_targets
+                .insert("next".to_string(), target_id);
+        }
+
+        IMPORTED_EXACT_TARGET_OPERATIONS.with(|operations| operations.set(0));
+        let index = verified_imported_exact_target_index(&packages)
+            .expect("the exact imported graph must validate");
+        let operations = IMPORTED_EXACT_TARGET_OPERATIONS.with(std::cell::Cell::get);
+
+        assert_eq!(index.len(), PACKAGE_COUNT);
+        assert!(
+            operations <= PACKAGE_COUNT * 2,
+            "exact-target validation performed {operations} indexed operations for {PACKAGE_COUNT} packages"
+        );
+    }
+
+    #[test]
+    fn imported_exact_target_validation_rejects_duplicate_instance_ids() {
+        let source = "registry+https://registry.npmjs.org";
+        let mut first = install_package("first", source, false);
+        let mut second = install_package("second", source, false);
+        let duplicate =
+            lpm_common::PackageInstanceId::derive("first", "1.0.0", source, "root/first");
+        first.instance_id = Some(duplicate);
+        second.instance_id = Some(duplicate);
+
+        assert!(verified_imported_exact_target_index(&[first, second]).is_none());
+    }
+
+    #[test]
+    fn imported_exact_target_validation_rejects_missing_instance_ids() {
+        let package = install_package(
+            "missing-instance",
+            "registry+https://registry.npmjs.org",
+            false,
+        );
+
+        assert!(verified_imported_exact_target_index(&[package]).is_none());
+    }
+
+    #[test]
+    fn imported_exact_target_validation_rejects_incomplete_dependency_targets() {
+        let source = "registry+https://registry.npmjs.org";
+        let mut parent = install_package("parent", source, false);
+        let mut child = install_package("child", source, false);
+        parent.instance_id = Some(lpm_common::PackageInstanceId::derive(
+            "parent",
+            "1.0.0",
+            source,
+            "root/parent",
+        ));
+        child.instance_id = Some(lpm_common::PackageInstanceId::derive(
+            "child",
+            "1.0.0",
+            source,
+            "root/parent/child",
+        ));
+        parent
+            .dependencies
+            .push(("child".to_string(), "1.0.0".to_string()));
+
+        assert!(verified_imported_exact_target_index(&[parent, child]).is_none());
+    }
+
+    #[test]
+    fn root_provider_closure_follows_exact_contextual_dependency_target() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("package.json"), b"{}").unwrap();
+        let project_dir = workspace.path().join("packages/app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let source = "registry+https://registry.npmjs.org";
+
+        let mut provider = install_package("provider", source, true);
+        let provider_id =
+            lpm_common::PackageInstanceId::derive("provider", "1.0.0", source, "root/provider");
+        let unused_child_id =
+            lpm_common::PackageInstanceId::derive("child", "1.0.0", source, "root/unused/child");
+        let selected_child_id =
+            lpm_common::PackageInstanceId::derive("child", "1.0.0", source, "root/provider/child");
+        provider.instance_id = Some(provider_id);
+        provider
+            .dependencies
+            .push(("child".to_string(), "1.0.0".to_string()));
+        provider
+            .dependency_targets
+            .insert("child".to_string(), selected_child_id);
+        let mut unused_child = install_package("child", source, false);
+        unused_child.instance_id = Some(unused_child_id);
+        let mut selected_child = unused_child.clone();
+        selected_child.instance_id = Some(selected_child_id);
+        let snapshot = RootProviderSnapshot::new(
+            workspace.path(),
+            vec![provider, unused_child, selected_child],
+            &[],
+            InstallOmitPolicy::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let mut consumer = install_package("consumer", source, false);
+        consumer.instance_id = Some(lpm_common::PackageInstanceId::derive(
+            "consumer",
+            "1.0.0",
+            source,
+            "root/consumer",
+        ));
+        let mut packages = vec![consumer];
+        let mut warnings = vec![PeerWarning {
+            package: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            peer: "provider".to_string(),
+            target: "provider".to_string(),
+            required_range: "*".to_string(),
+            resolved_version: None,
+        }];
+
+        assert!(snapshot.reconcile(&project_dir, &mut packages, &mut warnings));
+
+        let imported_children = packages
+            .iter()
+            .filter(|package| package.name == "child")
+            .map(|package| package.instance_id.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(imported_children, vec![selected_child_id]);
+    }
+
+    #[test]
+    fn root_provider_closure_imports_only_exact_peer_wrapper() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("package.json"), b"{}").unwrap();
+        let project_dir = workspace.path().join("packages/app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let mut provider = install_package("provider", "directory+provider", true);
+        let local_peer = install_package("runtime", "directory+runtime", false);
+        let local_wrapper = local_peer.wrapper_id_for_source().unwrap();
+        provider.peers = vec![lpm_common::PeerEdge {
+            local_name: "runtime".to_string(),
+            target_name: "runtime".to_string(),
+            target_version: "1.0.0".to_string(),
+            target_wrapper_id: Some(local_wrapper.clone()),
+        }];
+        let registry_peer =
+            install_package("runtime", "registry+https://registry.npmjs.org", false);
+        let snapshot = RootProviderSnapshot::new(
+            workspace.path(),
+            vec![provider, registry_peer, local_peer],
+            &[],
+            InstallOmitPolicy::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let mut packages = vec![install_package(
+            "consumer",
+            "registry+https://registry.npmjs.org",
+            false,
+        )];
+        let mut warnings = vec![PeerWarning {
+            package: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            peer: "provider".to_string(),
+            target: "provider".to_string(),
+            required_range: "*".to_string(),
+            resolved_version: None,
+        }];
+
+        assert!(snapshot.reconcile(&project_dir, &mut packages, &mut warnings));
+
+        let peers = packages
+            .iter()
+            .filter(|package| package.name == "runtime")
+            .collect::<Vec<_>>();
+        assert_eq!(peers.len(), 1);
+        let imported_wrapper = peers[0].wrapper_id_for_source().unwrap();
+        let imported_provider = packages
+            .iter()
+            .find(|package| package.name == "provider")
+            .expect("provider imported");
+        assert_ne!(imported_wrapper, local_wrapper);
+        assert_eq!(
+            imported_provider.peers[0].target_wrapper_id.as_deref(),
+            Some(imported_wrapper.as_str())
+        );
+    }
+
+    #[test]
+    fn root_provider_reconciliation_rejects_ambiguous_consumer_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("package.json"), b"{}").unwrap();
+        std::fs::create_dir_all(workspace.path().join("provider")).unwrap();
+        std::fs::write(
+            workspace.path().join("provider/package.json"),
+            br#"{"name":"runtime","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let project_dir = workspace.path().join("packages/app");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let provider = install_package("runtime", "directory+provider", true);
+        let snapshot = RootProviderSnapshot::new(
+            workspace.path(),
+            vec![provider],
+            &[],
+            InstallOmitPolicy::default(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let registry_consumer =
+            install_package("consumer", "registry+https://registry.npmjs.org", false);
+        let local_consumer = install_package("consumer", "directory+consumer", false);
+        let mut packages = vec![registry_consumer, local_consumer];
+        let mut warnings = vec![PeerWarning {
+            package: "consumer".to_string(),
+            version: "1.0.0".to_string(),
+            peer: "runtime".to_string(),
+            target: "runtime".to_string(),
+            required_range: "*".to_string(),
+            resolved_version: None,
+        }];
+
+        assert!(!snapshot.reconcile(&project_dir, &mut packages, &mut warnings));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(packages.len(), 2);
+        assert!(packages.iter().all(|package| package.peers.is_empty()));
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) force: bool,
     pub(in crate::commands::install) offline: bool,
     pub(in crate::commands::install) omit_policy: InstallOmitPolicy,
+    pub(in crate::commands::install) root_optional_dependency_names: &'a HashSet<String>,
     pub(in crate::commands::install) production_dependency_names: &'a HashSet<String>,
     pub(in crate::commands::install) pubgrub_opt_out: bool,
     pub(in crate::commands::install) auto_install_peers: bool,
@@ -111,6 +112,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         force,
         offline,
         omit_policy,
+        root_optional_dependency_names,
         production_dependency_names,
         pubgrub_opt_out,
         auto_install_peers,
@@ -155,6 +157,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             all_workspace_members,
             &v2_workspace_root_pre_resolve.optional_registry_roots,
             &v2_workspace_root_pre_resolve.promoted_git_root_names,
+            auto_install_peers,
         )
         .await?
     };
@@ -177,6 +180,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         ),
     );
     expand_workspace_member_deps_with_transitives(workspace_member_deps, all_workspace_members)?;
+    if omit_policy.optional {
+        filter_optional_workspace_member_links(workspace_member_deps);
+    }
     if !requested_v2_mode {
         enforce_required_workspace_member_engines(
             workspace_member_deps,
@@ -201,7 +207,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let mut applied_overrides: Vec<OverrideHit> = Vec::new();
     let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
     let mut peer_warnings: Vec<PeerWarning> = Vec::new();
-    let mut ambient_peer_installs_for_lockfile: Vec<String> = Vec::new();
+    let mut ambient_peer_installs_for_lockfile: Vec<String>;
     let mut auto_isolated_peer_conflicts = auto_isolated_peer_conflicts;
     let mut linker_mode = linker_mode;
     let resolve_ahead = workspace_resolution::active();
@@ -217,6 +223,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 }
                 lockfile_peer_context_authoritative = fast_path.lockfile.metadata.lockfile_version
                     >= MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE;
+                ambient_peer_installs_for_lockfile =
+                    fast_path.lockfile.ambient_peer_installs.clone();
                 fast_path_lockfile = Some(fast_path.lockfile);
                 needs_binary_upgrade = fast_path.needs_binary_upgrade;
                 (fast_path.packages, 0u128, true, 0usize, HashMap::new())
@@ -242,21 +250,25 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 } else {
                     "greedy-fusion"
                 };
-                let speculation_deps: HashMap<String, String> = if omit_policy.dev {
-                    deps.iter()
-                        .filter(|(name, _)| production_dependency_names.contains(*name))
-                        .map(|(name, range)| (name.clone(), range.clone()))
-                        .collect()
-                } else {
-                    deps.clone()
-                };
+                let speculation_deps: HashMap<String, String> = deps
+                    .iter()
+                    .filter(|(name, _)| {
+                        (!omit_policy.dev || production_dependency_names.contains(*name))
+                            && (!omit_policy.optional
+                                || !root_optional_dependency_names.contains(*name))
+                    })
+                    .map(|(name, range)| (name.clone(), range.clone()))
+                    .collect();
 
                 let (resolve_res, initial_batch_ms_measured): (
                     Result<lpm_resolver::ResolveResult, LpmError>,
                     u128,
                 ) = if fusion_enabled_local {
-                    let fetch_overlap_allowed_local =
-                        fetch_overlap_enabled(fusion_enabled_local, force, omit_policy.dev);
+                    let fetch_overlap_allowed_local = fetch_overlap_enabled(
+                        fusion_enabled_local,
+                        force,
+                        omit_policy.dev || omit_policy.optional,
+                    );
                     let preflight_disables_tarball_prefetch = npm_firewall_mode
                         .disables_tarball_prefetch()
                         || policy_extensions_disable_tarball_prefetch(policy_extension_configs);
@@ -294,6 +306,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         Some(Arc::new(Semaphore::new(speculation_permits))),
                         fetch_coord.clone(),
                         if resolve_ahead
+                            || omit_policy.optional
                             || npm_firewall_mode.disables_tarball_prefetch()
                             || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
                         {
@@ -314,8 +327,9 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         if serialize_fetch_after_workspace_firewall {
                             None
                         } else if npm_firewall_mode.is_enabled() {
-                            let (selected_tx, selected_rx) = tokio::sync::mpsc::unbounded_channel();
-                            let (fetch_tx, fetch_rx) = tokio::sync::mpsc::unbounded_channel();
+                            let (selected_tx, selected_rx) =
+                                selected_package_channel(&fetch_semaphore);
+                            let (fetch_tx, fetch_rx) = selected_package_channel(&fetch_semaphore);
                             fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
                                 fetch_rx,
                                 arc_client.clone(),
@@ -350,7 +364,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else if route_table.supports_workspace_fetch_sharing()
                             && let Some(hub) = workspace_resolution::fetch_overlap_hub()
                         {
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            let (tx, rx) = selected_package_channel(&fetch_semaphore);
                             fetch_overlap_join = Some(spawn_workspace_fetch_overlap_dispatcher(
                                 hub,
                                 rx,
@@ -371,7 +385,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else if resolve_ahead {
                             None
                         } else {
-                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                            let (tx, rx) = selected_package_channel(&fetch_semaphore);
                             fetch_overlap_join = Some(spawn_fetch_overlap_dispatcher(
                                 rx,
                                 arc_client.clone(),
@@ -402,7 +416,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             npm_fanout,
                             shared_cache: Arc::clone(&shared_cache),
                             auto_install_peers,
-                            include_optional_dependencies: !omit_policy.optional,
+                            include_optional_dependencies: true,
                             policy: resolver_policy.clone(),
                         },
                     )
@@ -421,7 +435,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                             (!resolve_ahead).then_some(spec_tx),
                             shared_cache,
                             auto_install_peers,
-                            !omit_policy.optional,
+                            true,
                             resolver_policy.clone(),
                             selected_package_tx,
                             workspace_resolution::resolver_fact_cache_for_importer(&route_table),
@@ -498,6 +512,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         None,
                         fetch_coord.clone(),
                         if resolve_ahead
+                            || omit_policy.optional
                             || npm_firewall_mode.disables_tarball_prefetch()
                             || policy_extensions_disable_tarball_prefetch(policy_extension_configs)
                         {
@@ -537,7 +552,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                                 route_table.clone(),
                                 streaming_metrics_for_resolve,
                                 auto_install_peers,
-                                !omit_policy.optional,
+                                true,
                                 resolver_policy.clone(),
                             )
                             .await
@@ -592,22 +607,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 applied_overrides = resolve_result.applied_overrides.clone();
                 peer_conflicts = resolve_result.peer_conflicts.clone();
 
-                if peer_conflict_auto_isolation_allowed {
-                    auto_isolated_peer_conflicts = !peer_conflicts.is_empty();
-                    linker_mode = if auto_isolated_peer_conflicts {
-                        if matches!(configured_linker_mode, lpm_linker::LinkerMode::Hoisted)
-                            && !json_output
-                        {
-                            output::info(
-                                "Peer conflicts detected; using isolated linker for this install.",
-                            );
-                        }
-                        lpm_linker::LinkerMode::Isolated
-                    } else {
-                        configured_linker_mode
-                    };
-                }
-
                 let platform_skipped = resolve_result.platform_skipped;
                 resolver_stage_timing = resolve_result.stage_timing;
                 ambient_peer_installs_for_lockfile = resolve_result.ambient_peer_installs.clone();
@@ -622,51 +621,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     RegistrySourceContext::new(&route_table, arc_client.as_ref()),
                     all_workspace_members,
                     project_dir,
-                );
+                )?;
                 let latest_stable = build_latest_stable_versions(&resolve_result.cache);
                 packages.extend(tarball_url_install_pkgs.iter().cloned());
-                apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps);
-                enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
-
-                if !json_output {
-                    let reported_install_count = requested_add_count.unwrap_or(packages.len());
-                    let firewall_active = npm_firewall_mode.is_enabled()
-                        && npm_firewall_has_packages(
-                            &packages,
-                            &route_table,
-                            arc_client.as_ref(),
-                            npm_firewall_lookup_mode,
-                        );
-                    let install_message = install_ui::TerminalLine::new("Installing ")
-                        .bold(&reported_install_count.to_string())
-                        .text(" ")
-                        .text(install_ui::packages_word(reported_install_count));
-                    install_ui::phase_line(install_ui::with_firewall_badge(
-                        install_message,
-                        firewall_active,
-                    ));
-                    for report in &resolve_result.peer_conflicts {
-                        let unsatisfied_str = report
-                            .unsatisfied_consumers
-                            .iter()
-                            .map(|(consumer, range)| {
-                                format!(
-                                    "{} wants {}",
-                                    lpm_common::sanitize_terminal_inline(consumer),
-                                    lpm_common::sanitize_terminal_inline(range)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ");
-                        output::warn_line(crate::install_ui::terminal_line!(
-                            "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
-                            install_ui::bold(&report.canonical),
-                            &report.chosen_version,
-                            report.unsatisfied_consumers.len(),
-                            unsatisfied_str,
-                        ));
-                    }
-                }
+                apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps)?;
                 (packages, ms, false, platform_skipped, latest_stable)
             }
         };
@@ -674,9 +632,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
 
     if requested_v2_mode && !v2_workspace_root_pre_resolve.install_pkgs.is_empty() {
         packages.extend(v2_workspace_root_pre_resolve.install_pkgs.iter().cloned());
-        apply_post_resolve_directory_link_fixup(&mut packages, v2_source_deps);
+        dedupe_install_packages_by_identity(&mut packages)?;
+        apply_post_resolve_directory_link_fixup(&mut packages, v2_source_deps)?;
     }
-    dedupe_install_packages_by_identity(&mut packages);
+    dedupe_install_packages_by_identity(&mut packages)?;
 
     let workspace_root_peer_providers_fingerprint =
         workspace_resolution::reconcile_root_peer_providers(
@@ -684,9 +643,82 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &mut packages,
             &mut peer_warnings,
             &v2_workspace_root_pre_resolve.install_pkgs,
+            omit_policy,
+            root_optional_dependency_names,
+            production_dependency_names,
         )
         .await?;
-    if !peer_warnings.is_empty() && !json_output {
+    workspace_resolution::reconcile_ambient_peer_roots(
+        &mut packages,
+        &mut ambient_peer_installs_for_lockfile,
+        &super::super::manifest_install_deps(pkg),
+    )?;
+    let packages_for_lockfile = packages.clone();
+    if omit_policy.dev {
+        filter_dev_packages(&mut packages, production_dependency_names);
+    }
+    if omit_policy.optional {
+        filter_optional_packages_for_install(
+            &mut packages,
+            root_optional_dependency_names,
+            &ambient_peer_installs_for_lockfile,
+        );
+    }
+    filter_dependency_engine_packages(&mut packages, dependency_engine_policy.as_ref())?;
+    platform_skipped += filter_platform_packages(&mut packages)?;
+    retain_peer_issues_for_packages(&mut peer_warnings, &mut peer_conflicts, &packages);
+
+    if !used_lockfile && peer_conflict_auto_isolation_allowed {
+        auto_isolated_peer_conflicts = !peer_conflicts.is_empty();
+        linker_mode = if auto_isolated_peer_conflicts {
+            if matches!(configured_linker_mode, lpm_linker::LinkerMode::Hoisted) && !json_output {
+                output::info("Peer conflicts detected; using isolated linker for this install.");
+            }
+            lpm_linker::LinkerMode::Isolated
+        } else {
+            configured_linker_mode
+        };
+    }
+
+    enforce_registry_integrity_policy(&packages, strict_integrity, json_output)?;
+    if !json_output {
+        let reported_install_count = requested_add_count.unwrap_or(packages.len());
+        let firewall_active = npm_firewall_mode.is_enabled()
+            && npm_firewall_has_packages(
+                &packages,
+                &route_table,
+                arc_client.as_ref(),
+                npm_firewall_lookup_mode,
+            );
+        let install_message = install_ui::TerminalLine::new("Installing ")
+            .bold(&reported_install_count.to_string())
+            .text(" ")
+            .text(install_ui::packages_word(reported_install_count));
+        install_ui::phase_line(install_ui::with_firewall_badge(
+            install_message,
+            firewall_active,
+        ));
+        for report in &peer_conflicts {
+            let unsatisfied_str = report
+                .unsatisfied_consumers
+                .iter()
+                .map(|(consumer, range)| {
+                    format!(
+                        "{} wants {}",
+                        lpm_common::sanitize_terminal_inline(consumer),
+                        lpm_common::sanitize_terminal_inline(range)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            output::warn_line(crate::install_ui::terminal_line!(
+                "peer {} pinned to {} but {} unsatisfied consumer(s): {}",
+                install_ui::bold(&report.canonical),
+                &report.chosen_version,
+                report.unsatisfied_consumers.len(),
+                unsatisfied_str,
+            ));
+        }
         for warning in &peer_warnings {
             output::warn(&format!(
                 "peer dep: {}",
@@ -699,13 +731,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     {
         return Err(error);
     }
-
-    let packages_for_lockfile = packages.clone();
-    if omit_policy.dev {
-        filter_dev_packages(&mut packages, production_dependency_names);
-    }
-    filter_dependency_engine_packages(&mut packages, dependency_engine_policy.as_ref())?;
-    platform_skipped += filter_platform_packages(&mut packages)?;
 
     Ok(OnlineResolutionPhaseResult {
         packages,

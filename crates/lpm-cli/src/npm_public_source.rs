@@ -99,6 +99,9 @@ mod tests {
             catalogs: Default::default(),
             provenance: Default::default(),
             packages: vec![lpm_lockfile::LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: "ms".into(),
                 version: "2.1.3".into(),
                 source: Some(source.into()),

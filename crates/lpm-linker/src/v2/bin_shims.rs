@@ -122,7 +122,7 @@ pub(super) fn create_bin_links_v2(
         if !is_direct(&v2t.target) {
             continue;
         }
-        let key = match key_map.get_for(&v2t.target) {
+        let key = match key_map.get_for(v2t) {
             Some(k) => k,
             None => continue,
         };

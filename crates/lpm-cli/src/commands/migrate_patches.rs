@@ -479,6 +479,9 @@ mod tests {
             packages: packages
                 .iter()
                 .map(|(n, v, integ)| LockedPackage {
+                    instance_id: None,
+                    dependency_targets: std::collections::BTreeMap::new(),
+                    peer_targets: std::collections::BTreeMap::new(),
                     name: n.to_string(),
                     version: v.to_string(),
                     integrity: integ.map(String::from),

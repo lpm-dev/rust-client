@@ -81,27 +81,15 @@ fn ci_with(
         .expect("failed to run lpm ci")
 }
 
-fn capture_lockfiles(project: &TempProject) -> (Vec<u8>, Vec<u8>) {
-    let lock = std::fs::read(project.path().join("lpm.lock")).expect("read established lpm.lock");
-    let lockb_path = project.path().join("lpm.lockb");
-    if !lockb_path.exists() {
-        lpm_lockfile::binary::write_binary(&lpm_lockfile::Lockfile::new(), &lockb_path)
-            .expect("seed a valid preexisting binary companion");
-    }
-    let lockb = std::fs::read(lockb_path).expect("read established lpm.lockb");
-    (lock, lockb)
+fn capture_lockfile(project: &TempProject) -> Vec<u8> {
+    std::fs::read(project.path().join("lpm.lock")).expect("read established lpm.lock")
 }
 
-fn assert_lockfiles_unchanged(project: &TempProject, expected: &(Vec<u8>, Vec<u8>)) {
+fn assert_lockfile_unchanged(project: &TempProject, expected: &[u8]) {
     assert_eq!(
         std::fs::read(project.path().join("lpm.lock")).expect("read preserved lpm.lock"),
-        expected.0,
+        expected,
         "artifact failure must preserve lpm.lock byte-for-byte"
-    );
-    assert_eq!(
-        std::fs::read(project.path().join("lpm.lockb")).expect("read preserved lpm.lockb"),
-        expected.1,
-        "artifact failure must preserve lpm.lockb byte-for-byte"
     );
 }
 
@@ -135,7 +123,7 @@ fn assert_pinned_artifact_failure(output: &std::process::Output, package_name: &
 async fn establish_lockfile_then_yank(
     project_name: &str,
     package_name: &str,
-) -> (FaultRegistry, TempProject, (Vec<u8>, Vec<u8>)) {
+) -> (FaultRegistry, TempProject, Vec<u8>) {
     establish_project_lockfile_then_yank(
         project_with_dep(project_name, package_name, "1.0.0"),
         package_name,
@@ -146,7 +134,7 @@ async fn establish_lockfile_then_yank(
 async fn establish_project_lockfile_then_yank(
     project: TempProject,
     package_name: &str,
-) -> (FaultRegistry, TempProject, (Vec<u8>, Vec<u8>)) {
+) -> (FaultRegistry, TempProject, Vec<u8>) {
     let registry = FaultRegistry::start().await;
     let version = "1.0.0";
     let tarball = make_tarball(package_name, version);
@@ -171,7 +159,7 @@ async fn establish_project_lockfile_then_yank(
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr),
     );
-    let lockfiles = capture_lockfiles(&project);
+    let lockfiles = capture_lockfile(&project);
     clear_materialized_state(&project);
 
     (registry, project, lockfiles)
@@ -365,7 +353,7 @@ async fn mutable_lockfile_replay_preserves_pins_when_tarball_is_yanked() {
 
     let second = install(&project, &registry);
     assert_pinned_artifact_failure(&second, package_name);
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     assert!(
         !package_install_path(&project, package_name).exists(),
         "failed replay must not materialize node_modules/{package_name}"
@@ -381,7 +369,7 @@ async fn frozen_lockfile_replay_preserves_pins_when_tarball_is_yanked() {
     let output = install_with(&project, &registry, &["--frozen-lockfile"], &[], false);
 
     assert_pinned_artifact_failure(&output, package_name);
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
 }
 
 #[tokio::test]
@@ -393,7 +381,7 @@ async fn ci_replay_preserves_pins_when_tarball_is_yanked() {
     let output = ci_with(&project, &registry, &[]);
 
     assert_pinned_artifact_failure(&output, package_name);
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("mutable development environment") && stderr.contains("commit"),
@@ -410,7 +398,7 @@ async fn install_automatically_frozen_by_ci_preserves_pins_when_tarball_is_yanke
     let output = install_with(&project, &registry, &[], &[("CI", "true")], false);
 
     assert_pinned_artifact_failure(&output, package_name);
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
 }
 
 #[tokio::test]
@@ -458,13 +446,13 @@ async fn frozen_replay_does_not_select_newer_version_when_pinned_tarball_is_yank
         "initial install must pin {package_name}@{pinned_version}:\n{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let lockfiles = capture_lockfiles(&project);
+    let lockfiles = capture_lockfile(&project);
     clear_materialized_state(&project);
 
     let output = install_with(&project, &registry, &["--frozen-lockfile"], &[], false);
 
     assert_pinned_artifact_failure(&output, package_name);
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     assert_eq!(
         newer_hits.get(),
         0,
@@ -509,7 +497,7 @@ async fn metadata_refresh_server_error_keeps_http_classification_and_lockfiles()
         "initial install must establish lockfiles:\n{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let lockfiles = capture_lockfiles(&project);
+    let lockfiles = capture_lockfile(&project);
     clear_materialized_state(&project);
 
     let output = install(&project, &registry);
@@ -518,7 +506,7 @@ async fn metadata_refresh_server_error_keeps_http_classification_and_lockfiles()
         !output.status.success(),
         "metadata refresh HTTP 500 must fail the replay"
     );
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("500")
@@ -586,7 +574,7 @@ async fn lockfile_artifact_failures_preserve_files_across_authoritative_and_expe
             String::from_utf8_lossy(&first.stdout),
             String::from_utf8_lossy(&first.stderr)
         );
-        let lockfiles = capture_lockfiles(&project);
+        let lockfiles = capture_lockfile(&project);
         clear_materialized_state(&project);
 
         let extra_args: &[&str] = if json { &["--frozen-lockfile"] } else { &[] };
@@ -612,7 +600,7 @@ async fn lockfile_artifact_failures_preserve_files_across_authoritative_and_expe
         } else {
             assert_pinned_artifact_failure(&output, &package_name);
         }
-        assert_lockfiles_unchanged(&project, &lockfiles);
+        assert_lockfile_unchanged(&project, &lockfiles);
     }
 }
 
@@ -628,7 +616,7 @@ async fn direct_dependency_pinned_artifact_json_error_uses_manifest_key() {
         !output.status.success(),
         "JSON install must fail when its pinned artifact is unavailable"
     );
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(
@@ -673,7 +661,7 @@ async fn aliased_dependency_pinned_artifact_json_error_uses_alias_manifest_key()
         !output.status.success(),
         "JSON install must fail when an aliased dependency artifact is unavailable"
     );
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(
@@ -741,7 +729,7 @@ async fn transitive_dependency_pinned_artifact_json_error_has_no_command_action(
         "initial install must establish a transitive lockfile graph:\n{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let lockfiles = capture_lockfiles(&project);
+    let lockfiles = capture_lockfile(&project);
     clear_materialized_state(&project);
 
     let output = install_with(&project, &registry, &[], &[], true);
@@ -750,7 +738,7 @@ async fn transitive_dependency_pinned_artifact_json_error_has_no_command_action(
         !output.status.success(),
         "JSON replay must fail when a transitive artifact is unavailable"
     );
-    assert_lockfiles_unchanged(&project, &lockfiles);
+    assert_lockfile_unchanged(&project, &lockfiles);
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(

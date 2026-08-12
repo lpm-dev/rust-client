@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+const VALID_SHA512_SRI: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+
 // ─── Skills Security Scanning ────────────────────────────────────
 
 #[test]
@@ -401,12 +403,17 @@ fn binary_lockfile_corrupt_data_no_panic() {
 #[test]
 fn binary_lockfile_roundtrip_100_packages() {
     let mut lf = lpm_lockfile::Lockfile::new();
+    lf.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
     for i in 0..100 {
         lf.add_package(lpm_lockfile::LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: format!("pkg-{i:04}"),
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
-            integrity: Some("sha512-test".to_string()),
+            integrity: Some(VALID_SHA512_SRI.to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -422,6 +429,7 @@ fn binary_lockfile_roundtrip_100_packages() {
             },
             alias_dependencies: vec![],
             peers: vec![],
+            peer_edges: Vec::new(),
             tarball: None,
         });
     }

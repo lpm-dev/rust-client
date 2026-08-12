@@ -1091,17 +1091,44 @@ fn patch_commit_fails_on_binary_change() {
 /// Write a synthetic `lpm.lock` listing `(name, version)` pairs. Used
 /// to set up selector-resolution fixtures. `source` defaults to npm.
 fn write_lockfile(project: &TempProject, entries: &[(&str, &str)]) {
-    let mut toml = format!(
-        "[metadata]\nlockfile-version = {}\nresolved-with = \"test\"\n\n",
-        lpm_lockfile::LOCKFILE_VERSION
-    );
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("test");
     for (name, version) in entries {
-        toml.push_str(&format!(
-            "[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n\
-             source = \"registry+https://registry.npmjs.org\"\n\n",
-        ));
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: (*name).to_string(),
+            version: (*version).to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..Default::default()
+        });
     }
-    project.write_file("lpm.lock", &toml);
+    if entries.iter().all(|(name, _)| {
+        entries
+            .iter()
+            .filter(|(candidate, _)| candidate == name)
+            .count()
+            == 1
+    }) {
+        let roots = entries
+            .iter()
+            .map(|(name, version)| (*name, *name, *version))
+            .collect::<Vec<_>>();
+        support::finalize_exact_lockfile_fixture(&mut lockfile, &roots);
+    } else {
+        for (index, package) in lockfile.packages.iter_mut().enumerate() {
+            package.instance_id = Some(lpm_common::PackageInstanceId::derive(
+                &package.name,
+                &package.version,
+                package.source.as_deref().expect("registry source"),
+                &format!("fixture/patch-selector/{index}"),
+            ));
+        }
+        lockfile.metadata.lockfile_version = 12;
+        for package in &mut lockfile.packages {
+            package.instance_id = None;
+        }
+    }
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .expect("write patch selector lockfile");
 }
 
 fn patch_sha256(project: &TempProject, rel_path: &str) -> String {

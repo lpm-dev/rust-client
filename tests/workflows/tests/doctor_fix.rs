@@ -599,7 +599,7 @@ fn workspace_member_doctor_uses_its_projection_and_repairs_root_lockfile_hygiene
     );
     project.write_file(
         "packages/sibling/package.json",
-        r#"{"name":"doctor-sibling","version":"1.0.0","private":true}"#,
+        r#"{"name":"doctor-sibling","version":"1.0.0","private":true,"dependencies":{"sibling-only":"^1.0.0"}}"#,
     );
     let app_dir = project.path().join("packages/app");
     std::fs::create_dir_all(app_dir.join("node_modules")).unwrap();
@@ -612,18 +612,52 @@ fn workspace_member_doctor_uses_its_projection_and_repairs_root_lockfile_hygiene
 
     let mut app_projection = lpm_lockfile::Lockfile::new();
     app_projection.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "member-only".into(),
         version: "1.0.0".into(),
         source: Some("registry+https://registry.npmjs.org".into()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut app_projection,
+        &[("member-only", "member-only", "1.0.0")],
+    );
+    app_projection.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                "member-only".to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
     let mut sibling_projection = lpm_lockfile::Lockfile::new();
     sibling_projection.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
         name: "sibling-only".into(),
         version: "1.0.0".into(),
         source: Some("registry+https://registry.npmjs.org".into()),
         ..Default::default()
     });
+    support::finalize_exact_lockfile_fixture(
+        &mut sibling_projection,
+        &[("sibling-only", "sibling-only", "1.0.0")],
+    );
+    sibling_projection.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                "sibling-only".to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        },
+    );
     let mut root_lockfile = lpm_lockfile::Lockfile::new();
     root_lockfile
         .absorb_importer("packages/app", app_projection)

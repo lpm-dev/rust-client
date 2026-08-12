@@ -357,7 +357,7 @@ pub struct LinkTarget {
     /// informational. The field is populated regardless so a future
     /// hoisted-mode v1 wanting to share wrappers across projects
     /// can fold it in.
-    pub peers: Vec<(String, String)>,
+    pub peers: Vec<lpm_common::PeerEdge>,
     /// Patch identity, plumbed through to v2's
     /// [`GraphKeyInputs::patch_fingerprint`].
     ///

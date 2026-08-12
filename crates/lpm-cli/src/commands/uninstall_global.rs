@@ -1167,6 +1167,8 @@ mod tests {
     fn write_install_lockfile(install_root: &Path, packages: &[(&str, &str)]) {
         std::fs::create_dir_all(install_root).unwrap();
         let mut body = String::from("[metadata]\nlockfile-version = 2\n");
+        let mut packages = packages.to_vec();
+        packages.sort_unstable();
         for (name, version) in packages {
             body.push_str(&format!(
                 "\n[[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n"

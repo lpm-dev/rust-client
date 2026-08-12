@@ -1460,6 +1460,9 @@ mod tests {
         let mut lf = Lockfile::new_with_resolver("test");
         for (name, version, source) in packages {
             lf.add_package(LockedPackage {
+                instance_id: None,
+                dependency_targets: std::collections::BTreeMap::new(),
+                peer_targets: std::collections::BTreeMap::new(),
                 name: name.to_string(),
                 version: version.to_string(),
                 source: Some(source.to_string()),

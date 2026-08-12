@@ -13,11 +13,12 @@ pub(super) fn enqueue_child_deps(
     version: &NpmVersion,
     info: &CachedPackageInfo,
     state: &mut ResolveState,
-) {
+) -> Result<(), ResolveError> {
     let ver_str = version.to_string();
     let aliases = info.aliases.get(&ver_str);
     let optional_names = info.optional_dep_names.get(&ver_str);
     let bundled_names = info.bundled_dep_names.get(&ver_str);
+    let selected_from_workspace = info.workspace_versions.contains(version);
 
     if let Some(deps) = info.deps.get(&ver_str) {
         // Sort for deterministic edge ordering — keeps test diffs stable
@@ -47,40 +48,6 @@ pub(super) fn enqueue_child_deps(
                 Some(target) => CanonicalKey::from_dep_name(target),
                 None => CanonicalKey::from_dep_name(local_name),
             };
-
-            // Registry-published packages should
-            // never declare `workspace:` deps (npm rejects at publish
-            // time), but a malformed cache entry or a future regression
-            // could land one here. Skip with a specific log line rather
-            // than the generic "invalid range" branch so the diagnosis
-            // points at the actual cause.
-            if is_workspace_specifier(range_str) {
-                tracing::warn!(
-                    "ignoring transitive `workspace:` dep '{}' from {}@{} → {} \
-                     (workspace: must be resolved upstream by lpm-workspace; \
-                     a registry-published package should not declare it)",
-                    range_str,
-                    parent_canonical,
-                    ver_str,
-                    local_name,
-                );
-                continue;
-            }
-
-            let range = match NpmRange::parse(range_str) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        "invalid range '{}' on {}@{} → {}: {e}",
-                        range_str,
-                        parent_canonical,
-                        ver_str,
-                        local_name,
-                    );
-                    continue;
-                }
-            };
-
             let optional = state.nodes[parent_id as usize].optional
                 || optional_names.is_some_and(|set| set.contains(local_name));
             if optional && !state.include_optional_dependencies {
@@ -92,6 +59,53 @@ pub(super) fn enqueue_child_deps(
                 );
                 continue;
             }
+
+            // Registry-published packages should
+            // never declare `workspace:` deps (npm rejects at publish
+            // time), but a malformed cache entry or a future regression
+            // could land one here. Skip with a specific log line rather
+            // than the generic "invalid range" branch so the diagnosis
+            // points at the actual cause.
+            if is_workspace_specifier(range_str) {
+                if selected_from_workspace {
+                    continue;
+                }
+                let detail = format!(
+                    "invalid range for {local_name}@{range_str}: registry-published packages \
+                     cannot declare workspace dependencies"
+                );
+                if optional {
+                    tracing::warn!(
+                        "optional dependency {local_name}@{range_str} from \
+                         {parent_canonical}@{ver_str} is invalid: {detail}"
+                    );
+                    continue;
+                }
+                return Err(ResolveError::DependencyFetch {
+                    package: parent_canonical.to_string(),
+                    version: ver_str,
+                    detail,
+                });
+            }
+
+            let range = match NpmRange::parse(range_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    let detail = format!("invalid range for {local_name}@{range_str}: {e}");
+                    if optional {
+                        tracing::warn!(
+                            "optional dependency {local_name}@{range_str} from \
+                             {parent_canonical}@{ver_str} is invalid: {e}"
+                        );
+                        continue;
+                    }
+                    return Err(ResolveError::DependencyFetch {
+                        package: parent_canonical.to_string(),
+                        version: ver_str,
+                        detail,
+                    });
+                }
+            };
 
             state.task_queue.push_back(Edge {
                 parent: parent_id,
@@ -120,7 +134,7 @@ pub(super) fn enqueue_child_deps(
     // peerBundle interactions; no real package ships both).
     if let Some(peer_deps) = info.peer_deps.get(&ver_str) {
         let optional_peers = info.optional_peer_names.get(&ver_str);
-        let peer_aliases = info.aliases.get(&ver_str);
+        let peer_aliases = info.peer_aliases.get(&ver_str);
         let mut peer_entries: Vec<(&String, &String)> = peer_deps.iter().collect();
         peer_entries.sort_by_key(|(name, _)| *name);
 
@@ -138,6 +152,9 @@ pub(super) fn enqueue_child_deps(
             // Skip with a specific log rather than letting
             // `NpmRange::parse` emit an opaque error.
             if is_workspace_specifier(peer_range_str) {
+                if selected_from_workspace {
+                    continue;
+                }
                 tracing::warn!(
                     "ignoring `workspace:` peer dep '{}' from {}@{} → {} \
                      (workspace: must be resolved upstream by lpm-workspace; \
@@ -147,7 +164,16 @@ pub(super) fn enqueue_child_deps(
                     ver_str,
                     peer_name,
                 );
-                continue;
+                if optional_peers.is_some_and(|set| set.contains(peer_name)) {
+                    continue;
+                }
+                return Err(ResolveError::DependencyFetch {
+                    package: parent_canonical.to_string(),
+                    version: ver_str,
+                    detail: format!(
+                        "invalid peer range for {peer_name}@{peer_range_str}: registry-published packages cannot declare workspace peers"
+                    ),
+                });
             }
 
             // Alias-aware canonical lookup. Mirrors the regular-deps
@@ -162,6 +188,15 @@ pub(super) fn enqueue_child_deps(
             let range = match NpmRange::parse(peer_range_str) {
                 Ok(r) => r,
                 Err(e) => {
+                    if !optional_peers.is_some_and(|set| set.contains(peer_name)) {
+                        return Err(ResolveError::DependencyFetch {
+                            package: parent_canonical.to_string(),
+                            version: ver_str,
+                            detail: format!(
+                                "invalid peer range for {peer_name}@{peer_range_str}: {e}"
+                            ),
+                        });
+                    }
                     tracing::warn!(
                         "invalid peer range '{}' on {}@{} → {}: {e}",
                         peer_range_str,
@@ -186,4 +221,5 @@ pub(super) fn enqueue_child_deps(
                 state.work_stats.peer_requirement_count.saturating_add(1);
         }
     }
+    Ok(())
 }

@@ -1,6 +1,85 @@
 use super::*;
 
 #[test]
+fn event_link_target_index_preserves_same_artifact_instances() {
+    let first_id = lpm_common::PackageInstanceId::derive(
+        "plugin",
+        "1.0.0",
+        "registry+npm",
+        "root/first/plugin",
+    );
+    let second_id = lpm_common::PackageInstanceId::derive(
+        "plugin",
+        "1.0.0",
+        "registry+npm",
+        "root/second/plugin",
+    );
+    let mut first_package = fake_pkg("plugin", "1.0.0", false);
+    first_package.instance_id = Some(first_id);
+    let mut second_package = first_package.clone();
+    second_package.instance_id = Some(second_id);
+    let packages = [first_package, second_package];
+    let link_target = lpm_linker::LinkTarget {
+        name: "plugin".to_string(),
+        version: "1.0.0".to_string(),
+        store_path: std::path::PathBuf::new(),
+        dependencies: Vec::new(),
+        aliases: HashMap::new(),
+        is_direct: false,
+        root_link_names: Some(Vec::new()),
+        wrapper_id: None,
+        materialization: lpm_linker::Materialization::CasBacked,
+        peers: Vec::new(),
+        patch_fingerprint: None,
+    };
+    let targets = [first_id, second_id].map(|instance_id| {
+        Arc::new(lpm_linker::v2::V2Target {
+            instance_id,
+            target: Arc::new(link_target.clone()),
+            dependency_targets: HashMap::new(),
+            peer_targets: HashMap::new(),
+            source_sri: "sha512-fixture".to_string(),
+            verified_object_integrity: None,
+            fresh_object: None,
+        })
+    });
+
+    let indexed = super::super::fetch::event_link_targets_by_instance(&packages, &targets)
+        .expect("exact instances must remain addressable");
+
+    assert_eq!(indexed.len(), 2);
+}
+
+#[tokio::test]
+async fn buffered_tarball_reader_rejects_chunked_body_above_compressed_size_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\n1234\r\n4\r\n5678\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let response = reqwest::get(format!("http://{address}/package.tgz"))
+        .await
+        .unwrap();
+
+    let error = read_buffered_tarball_body(response, 7)
+        .await
+        .expect_err("chunked tarball must stop at the compressed-size limit");
+
+    assert!(error.to_string().contains("maximum compressed size"));
+}
+
+#[test]
 fn locked_provenance_name_index_preserves_prefixes_and_scopes() {
     let evidence = lpm_lockfile::LockedProvenance {
         snapshot: lpm_common::ProvenanceSnapshot {

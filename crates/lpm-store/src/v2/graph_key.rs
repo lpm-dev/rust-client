@@ -7,20 +7,22 @@
 //!
 //! # Inputs hashed (stable order)
 //!
-//! 1. Schema version tag (`v=2`)
+//! 1. Schema version tag (`v=5`)
 //! 2. `name`
 //! 3. `version`
 //! 4. Platform tuple `(os, cpu, libc)` — libc empty on non-Linux
 //! 5. Linker mode tag (`isolated` | `hoisted`)
-//! 6. Sorted peer-context: `peer_name@peer_version` joined by `,`
-//!    (always empty in hoisted mode)
+//! 6. Sorted structured peer context, including local and canonical names,
+//!    version, source identity, and wrapper identity
 //! 7. Sorted dep edges: `local => target_name@target_version`
 //!    joined by `,`
-//! 8. Sorted aliases: `local => canonical_target_name`
+//! 8. Exact dependency targets: `local => PackageInstanceId`
+//! 9. Sorted aliases: `local => canonical_target_name`
 //!    joined by `,`
-//! 9. Sorted root-link names joined by `,`
-//! 10. Source-identity disambiguator (`wrapper_id`)
-//! 11. Patch fingerprint — `Some("p-…")` for any package carrying a
+//! 10. Exact peer targets: `local => PackageInstanceId`
+//! 11. Sorted root-link names joined by `,`
+//! 12. Source-identity disambiguator (`wrapper_id`)
+//! 13. Patch fingerprint — `Some("p-…")` for any package carrying a
 //!     `lpm.patchedDependencies` entry, `None` otherwise. Folded in so
 //!     a project applying a patch gets a distinct link entry: without
 //!     it, v2's cross-project sharing of `<store>/v2/links/<key>/...`
@@ -41,6 +43,8 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+
+use lpm_common::PackageInstanceId;
 
 use crate::v2::platform::PlatformTuple;
 
@@ -68,12 +72,10 @@ impl LinkerModeTag {
     }
 }
 
-/// Single peer-context entry: a peer that resolved to a specific version.
+/// Compatibility input for a registry peer whose local and canonical names match.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerEntry {
-    /// Canonical registry name of the peer (e.g. `react`).
     pub name: String,
-    /// Exact resolved version (e.g. `18.3.0`).
     pub version: String,
 }
 
@@ -109,9 +111,11 @@ pub struct GraphKeyInputs {
     /// Linker mode under which this wrapper would materialize.
     pub linker_mode: LinkerModeTag,
     /// Peer-context. Empty in hoisted mode (not part of the graph key).
-    pub peers: Vec<PeerEntry>,
+    pub peers: Vec<lpm_common::PeerEdge>,
     /// Dep edges declared in this package's manifest.
     pub deps: Vec<DepEdge>,
+    /// Exact provider instance for each dependency-local slot.
+    pub dependency_targets: BTreeMap<String, PackageInstanceId>,
     /// npm-alias edges: `local_name → canonical_target_name`.
     /// Subset of [`Self::deps`]; an entry appears iff the dep is aliased
     /// (i.e., consumer's `local` differs from the dep's canonical
@@ -120,6 +124,8 @@ pub struct GraphKeyInputs {
     /// `LinkTarget.aliases` as identity-bearing alongside
     /// `LinkTarget.dependencies` — stays explicit in the key.
     pub aliases: BTreeMap<String, String>,
+    /// Exact provider instance for each peer-local slot.
+    pub peer_targets: BTreeMap<String, PackageInstanceId>,
     /// Root-link names this materialization would expose at the project
     /// root (corresponds to [`LinkTarget::root_link_names`]). `None`
     /// means "no override; inherit the linker's default behavior" —
@@ -164,7 +170,9 @@ impl GraphKeyInputs {
             linker_mode,
             peers: Vec::new(),
             deps: Vec::new(),
+            dependency_targets: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            peer_targets: BTreeMap::new(),
             root_link_names: None,
             wrapper_id: None,
             patch_fingerprint: None,
@@ -188,6 +196,18 @@ impl GraphKeyInputs {
 
     /// Replace the peer-context. Order doesn't matter (hashing sorts).
     pub fn with_peers(mut self, peers: impl IntoIterator<Item = PeerEntry>) -> Self {
+        self.peers = peers
+            .into_iter()
+            .map(|peer| lpm_common::PeerEdge::registry(peer.name.clone(), peer.name, peer.version))
+            .collect();
+        self
+    }
+
+    /// Replace the peer context with fully structured identities.
+    pub fn with_peer_edges(
+        mut self,
+        peers: impl IntoIterator<Item = lpm_common::PeerEdge>,
+    ) -> Self {
         self.peers = peers.into_iter().collect();
         self
     }
@@ -195,6 +215,19 @@ impl GraphKeyInputs {
     /// Replace the dep edges. Order doesn't matter (hashing sorts).
     pub fn with_deps(mut self, deps: impl IntoIterator<Item = DepEdge>) -> Self {
         self.deps = deps.into_iter().collect();
+        self
+    }
+
+    /// Replace the exact dependency-provider map.
+    pub fn with_dependency_targets<I, K>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = (K, PackageInstanceId)>,
+        K: Into<String>,
+    {
+        self.dependency_targets = targets
+            .into_iter()
+            .map(|(local, target)| (local.into(), target))
+            .collect();
         self
     }
 
@@ -208,6 +241,19 @@ impl GraphKeyInputs {
         self.aliases = aliases
             .into_iter()
             .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
+    /// Replace the exact peer-provider map.
+    pub fn with_peer_targets<I, K>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = (K, PackageInstanceId)>,
+        K: Into<String>,
+    {
+        self.peer_targets = targets
+            .into_iter()
+            .map(|(local, target)| (local.into(), target))
             .collect();
         self
     }
@@ -256,7 +302,7 @@ impl std::hash::Hash for GraphKey {
 impl GraphKey {
     /// Schema version tag. Bump if the input layout changes — older
     /// wrappers will produce different keys and naturally GC.
-    const SCHEMA: &'static [u8] = b"v=3";
+    const SCHEMA: &'static [u8] = b"v=5";
 
     /// Length of the directory-name suffix in hex chars (16 = 64 bits
     /// of the BLAKE3 digest, ~10⁻¹⁹ collision probability for 10⁹ keys).
@@ -292,8 +338,16 @@ impl GraphKey {
         let edges_str = format_deps(&inputs.deps);
         write_field(&mut hasher, b"edges", edges_str.as_bytes());
 
+        write_exact_targets_btree(
+            &mut hasher,
+            b"dependency_targets",
+            &inputs.dependency_targets,
+        );
+
         let aliases_str = format_aliases(&inputs.aliases);
         write_field(&mut hasher, b"aliases", aliases_str.as_bytes());
+
+        write_exact_targets_btree(&mut hasher, b"peer_targets", &inputs.peer_targets);
 
         let root_names_str = format_root_link_names(inputs.root_link_names.as_deref());
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
@@ -348,6 +402,70 @@ impl GraphKey {
         wrapper_id: Option<&str>,
         patch_fingerprint: Option<&str>,
     ) -> Self {
+        let peer_edges = peers
+            .iter()
+            .map(|(name, version)| lpm_common::PeerEdge::registry(name, name, version))
+            .collect::<Vec<_>>();
+        Self::derive_raw_peer_edges(
+            name,
+            version,
+            platform,
+            linker_tag,
+            raw_deps,
+            aliases,
+            &peer_edges,
+            root_link_names,
+            wrapper_id,
+            patch_fingerprint,
+        )
+    }
+
+    /// Fully structured variant of [`Self::derive_raw`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_raw_peer_edges(
+        name: &str,
+        version: &str,
+        platform: &PlatformTuple,
+        linker_tag: LinkerModeTag,
+        raw_deps: &[(String, String)],
+        aliases: &HashMap<String, String>,
+        peers: &[lpm_common::PeerEdge],
+        root_link_names: Option<&[String]>,
+        wrapper_id: Option<&str>,
+        patch_fingerprint: Option<&str>,
+    ) -> Self {
+        Self::derive_raw_exact_peer_edges(
+            name,
+            version,
+            platform,
+            linker_tag,
+            raw_deps,
+            &HashMap::new(),
+            aliases,
+            peers,
+            &HashMap::new(),
+            root_link_names,
+            wrapper_id,
+            patch_fingerprint,
+        )
+    }
+
+    /// Fully structured raw derivation with exact dependency and peer targets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_raw_exact_peer_edges(
+        name: &str,
+        version: &str,
+        platform: &PlatformTuple,
+        linker_tag: LinkerModeTag,
+        raw_deps: &[(String, String)],
+        dependency_targets: &HashMap<String, PackageInstanceId>,
+        aliases: &HashMap<String, String>,
+        peers: &[lpm_common::PeerEdge],
+        peer_targets: &HashMap<String, PackageInstanceId>,
+        root_link_names: Option<&[String]>,
+        wrapper_id: Option<&str>,
+        patch_fingerprint: Option<&str>,
+    ) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(Self::SCHEMA);
         hasher.update(b"\0");
@@ -360,7 +478,9 @@ impl GraphKey {
 
         write_peers_raw_direct(&mut hasher, peers);
         write_deps_raw_direct(&mut hasher, raw_deps, aliases);
+        write_exact_targets_hash(&mut hasher, b"dependency_targets", dependency_targets);
         write_aliases_raw_direct(&mut hasher, aliases);
+        write_exact_targets_hash(&mut hasher, b"peer_targets", peer_targets);
 
         let root_names_str = format_root_link_names(root_link_names);
         write_field(&mut hasher, b"root_link_names", root_names_str.as_bytes());
@@ -446,6 +566,44 @@ impl GraphKey {
     }
 }
 
+fn write_exact_targets_btree(
+    hasher: &mut blake3::Hasher,
+    label: &[u8],
+    targets: &BTreeMap<String, PackageInstanceId>,
+) {
+    hasher.update(label);
+    hasher.update(b"=");
+    for (index, (local, target)) in targets.iter().enumerate() {
+        if index > 0 {
+            hasher.update(b",");
+        }
+        hasher.update(local.as_bytes());
+        hasher.update(b"=>");
+        hasher.update(target.as_bytes());
+    }
+    hasher.update(b"\0");
+}
+
+fn write_exact_targets_hash(
+    hasher: &mut blake3::Hasher,
+    label: &[u8],
+    targets: &HashMap<String, PackageInstanceId>,
+) {
+    hasher.update(label);
+    hasher.update(b"=");
+    let mut sorted = targets.iter().collect::<Vec<_>>();
+    sorted.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (index, (local, target)) in sorted.into_iter().enumerate() {
+        if index > 0 {
+            hasher.update(b",");
+        }
+        hasher.update(local.as_bytes());
+        hasher.update(b"=>");
+        hasher.update(target.as_bytes());
+    }
+    hasher.update(b"\0");
+}
+
 /// Pre-compute the filesystem-safe directory name for a GraphKey once at
 /// construction. Called from `derive`, `derive_raw`, and `from_recorded`.
 fn compute_dir_name(name: &str, version: &str, digest: &[u8; 32]) -> String {
@@ -474,13 +632,21 @@ fn format_platform(p: &PlatformTuple) -> String {
     }
 }
 
-fn format_peers(peers: &[PeerEntry]) -> String {
+fn format_peers(peers: &[lpm_common::PeerEdge]) -> String {
     if peers.is_empty() {
         return String::new();
     }
     let mut sorted: Vec<String> = peers
         .iter()
-        .map(|p| format!("{}@{}", p.name, p.version))
+        .map(|p| {
+            format!(
+                "{}=>{}@{}#{}",
+                p.local_name,
+                p.target_name,
+                p.target_version,
+                p.target_wrapper_id.as_deref().unwrap_or("")
+            )
+        })
         .collect();
     sorted.sort();
     sorted.join(",")
@@ -547,40 +713,9 @@ fn write_platform_direct(hasher: &mut blake3::Hasher, p: &PlatformTuple) {
     hasher.update(b"\0");
 }
 
-fn write_peers_raw_direct(hasher: &mut blake3::Hasher, peers: &[(String, String)]) {
-    hasher.update(b"peers=");
-    if !peers.is_empty() {
-        let mut sorted: Vec<(&str, &str)> = peers
-            .iter()
-            .map(|(n, v)| (n.as_str(), v.as_str()))
-            .collect();
-        // Must sort by the byte sequence "name@ver", not by (name, ver) tuple.
-        // Tuple sort puts "react" before "react-dom" (prefix is shorter);
-        // string sort of "react@v" vs "react-dom@v" puts "react-dom" first
-        // because '-' (0x2D) < '@' (0x40) at position 5. The comparator below
-        // simulates string sort without allocating the formatted strings.
-        sorted.sort_unstable_by(|(a_name, a_ver), (b_name, b_ver)| {
-            a_name
-                .bytes()
-                .chain(std::iter::once(b'@'))
-                .chain(a_ver.bytes())
-                .cmp(
-                    b_name
-                        .bytes()
-                        .chain(std::iter::once(b'@'))
-                        .chain(b_ver.bytes()),
-                )
-        });
-        for (i, (name, ver)) in sorted.iter().enumerate() {
-            if i > 0 {
-                hasher.update(b",");
-            }
-            hasher.update(name.as_bytes());
-            hasher.update(b"@");
-            hasher.update(ver.as_bytes());
-        }
-    }
-    hasher.update(b"\0");
+fn write_peers_raw_direct(hasher: &mut blake3::Hasher, peers: &[lpm_common::PeerEdge]) {
+    let peers = format_peers(peers);
+    write_field(hasher, b"peers", peers.as_bytes());
 }
 
 fn write_deps_raw_direct(
@@ -708,6 +843,46 @@ mod tests {
         let a = base_inputs().with_deps([d1.clone(), d2.clone()]);
         let b = base_inputs().with_deps([d2, d1]);
         assert_eq!(GraphKey::derive(&a), GraphKey::derive(&b));
+    }
+
+    #[test]
+    fn exact_dependency_target_change_yields_different_key() {
+        let first = PackageInstanceId::derive("scheduler", "0.23.0", "registry+npm", "first");
+        let second = PackageInstanceId::derive("scheduler", "0.23.0", "registry+npm", "second");
+        let edge = DepEdge {
+            local: "scheduler".into(),
+            target_name: "scheduler".into(),
+            target_version: "0.23.0".into(),
+        };
+        let first_target = base_inputs()
+            .with_deps([edge.clone()])
+            .with_dependency_targets([("scheduler", first)]);
+        let second_target = base_inputs()
+            .with_deps([edge])
+            .with_dependency_targets([("scheduler", second)]);
+
+        assert_ne!(
+            GraphKey::derive(&first_target),
+            GraphKey::derive(&second_target)
+        );
+    }
+
+    #[test]
+    fn exact_peer_target_change_yields_different_key() {
+        let first = PackageInstanceId::derive("react", "18.3.0", "registry+npm", "first");
+        let second = PackageInstanceId::derive("react", "18.3.0", "registry+npm", "second");
+        let peer = lpm_common::PeerEdge::registry("react", "react", "18.3.0");
+        let first_target = base_inputs()
+            .with_peer_edges([peer.clone()])
+            .with_peer_targets([("react", first)]);
+        let second_target = base_inputs()
+            .with_peer_edges([peer])
+            .with_peer_targets([("react", second)]);
+
+        assert_ne!(
+            GraphKey::derive(&first_target),
+            GraphKey::derive(&second_target)
+        );
     }
 
     #[test]
@@ -887,6 +1062,36 @@ mod tests {
             GraphKey::derive(&react_and_dom),
             "different peer sets must split link entries"
         );
+    }
+
+    #[test]
+    fn every_structured_peer_identity_field_changes_the_key() {
+        let base = lpm_common::PeerEdge::registry("react-slot", "react", "18.3.1");
+        let base_key = GraphKey::derive(&base_inputs().with_peer_edges([base.clone()]));
+        let variants = [
+            lpm_common::PeerEdge {
+                local_name: "other-slot".into(),
+                ..base.clone()
+            },
+            lpm_common::PeerEdge {
+                target_name: "preact-compat".into(),
+                ..base.clone()
+            },
+            lpm_common::PeerEdge {
+                target_version: "19.0.0".into(),
+                ..base.clone()
+            },
+            lpm_common::PeerEdge {
+                target_wrapper_id: Some("f-local-source".into()),
+                ..base
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                base_key,
+                GraphKey::derive(&base_inputs().with_peer_edges([variant]))
+            );
+        }
     }
 
     // ── F1 — patch_fingerprint identity ─────────────────────────────

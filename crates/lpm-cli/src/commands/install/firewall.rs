@@ -472,8 +472,8 @@ pub(super) struct NpmFirewallChunkedPreflightConfig {
 }
 
 pub(super) fn spawn_chunked_npm_firewall_preflight(
-    mut selected_rx: tokio::sync::mpsc::UnboundedReceiver<lpm_resolver::SelectedPackageEvent>,
-    fetch_tx: tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
+    mut selected_rx: tokio::sync::mpsc::Receiver<lpm_resolver::SelectedPackageEvent>,
+    fetch_tx: tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     client: Arc<RegistryClient>,
     config: NpmFirewallChunkedPreflightConfig,
 ) -> NpmFirewallPreflightJoin {
@@ -489,7 +489,9 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
 
         if !mode.is_enabled() {
             while let Some(event) = selected_rx.recv().await {
-                let _ = fetch_tx.send(event);
+                if fetch_tx.send(event).await.is_err() {
+                    break;
+                }
             }
             return Ok(NpmFirewallPreflightResult::empty(mode, lookup_mode));
         }
@@ -515,7 +517,9 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                 {
                     stats.checked_count = stats.checked_count.saturating_add(1);
                 }
-                let _ = fetch_tx.send(event);
+                if fetch_tx.send(event).await.is_err() {
+                    break;
+                }
             }
             report_error = Some(format!(
                 "{NPM_FIREWALL_OFFLINE_HINT}; continuing because monitor mode is active"
@@ -554,7 +558,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                     policy_profile,
                                     &mut stats,
                                     &mut tasks,
-                                );
+                                )
+                                .await;
                             }
                         }
                         None => {
@@ -567,7 +572,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                                 policy_profile,
                                 &mut stats,
                                 &mut tasks,
-                            );
+                            )
+                            .await;
                         }
                     }
                 }
@@ -582,7 +588,8 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                         &mut stats,
                         &mut decisions,
                         &mut report_error,
-                    );
+                    )
+                    .await;
                     if matches!(mode, NpmFirewallMode::Enforce) && stats.block_count > 0 {
                         tasks.abort_all();
                         stats.batch_ms = total_started.elapsed().as_millis();
@@ -628,9 +635,9 @@ fn push_firewall_chunk_event(
     chunk.events.push(event);
 }
 
-fn spawn_or_release_firewall_chunk(
+async fn spawn_or_release_firewall_chunk(
     chunk: &mut FirewallSelectedChunk,
-    fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
+    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     client: &NpmFirewallPreflightClient,
     mode: NpmFirewallMode,
     policy_profile: NpmFirewallPolicyProfile,
@@ -641,7 +648,7 @@ fn spawn_or_release_firewall_chunk(
         return;
     }
     if chunk.verdict_packages.is_empty() {
-        release_firewall_events(fetch_tx, chunk.events.drain(..));
+        release_firewall_events(fetch_tx, chunk.events.drain(..)).await;
         chunk.clear();
         return;
     }
@@ -724,9 +731,9 @@ fn normalize_npm_firewall_preflight_error(error: LpmError) -> LpmError {
     }
 }
 
-fn apply_firewall_chunk_result(
+async fn apply_firewall_chunk_result(
     chunk_result: FirewallChunkResult,
-    fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
+    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     mode: NpmFirewallMode,
     stats: &mut NpmFirewallPreflightStats,
     decisions: &mut Vec<NpmFirewallDecision>,
@@ -740,12 +747,12 @@ fn apply_firewall_chunk_result(
         if report_error.is_none() {
             *report_error = Some(error);
         }
-        release_firewall_events(fetch_tx, chunk_result.events);
+        release_firewall_events(fetch_tx, chunk_result.events).await;
         return;
     }
 
     let Some(response) = chunk_result.response else {
-        release_firewall_events(fetch_tx, chunk_result.events);
+        release_firewall_events(fetch_tx, chunk_result.events).await;
         return;
     };
 
@@ -769,16 +776,18 @@ fn apply_firewall_chunk_result(
             .any(|decision| decision.action == NpmFirewallAction::Block);
     decisions.extend(response.decisions);
     if matches!(mode, NpmFirewallMode::Monitor) || !chunk_has_block {
-        release_firewall_events(fetch_tx, chunk_result.events);
+        release_firewall_events(fetch_tx, chunk_result.events).await;
     }
 }
 
-fn release_firewall_events(
-    fetch_tx: &tokio::sync::mpsc::UnboundedSender<lpm_resolver::SelectedPackageEvent>,
+async fn release_firewall_events(
+    fetch_tx: &tokio::sync::mpsc::Sender<lpm_resolver::SelectedPackageEvent>,
     events: impl IntoIterator<Item = lpm_resolver::SelectedPackageEvent>,
 ) {
     for event in events {
-        let _ = fetch_tx.send(event);
+        if fetch_tx.send(event).await.is_err() {
+            break;
+        }
     }
 }
 

@@ -1,6 +1,7 @@
+use super::edge::mark_node_required_closure;
 use super::prelude::*;
 use super::state::ResolveState;
-use super::types::{DepBehavior, Edge, PeerConflictReport, PeerRequirement};
+use super::types::{DepBehavior, Edge, NodeId, PeerConflictReport, PeerRequirement};
 use super::version::{VersionPick, find_best_version_with_policy};
 
 // ── Eager peer auto-install drain ─────────────────────────────────
@@ -104,12 +105,19 @@ enum PeerDrainOutcome {
 /// (warn + synthesize the most-satisfying version) or a silent skip
 /// (all consumers optional).
 fn find_version_satisfying_all(
+    canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     reqs: &[&PeerRequirement],
+    policy: &ResolverPolicy,
 ) -> Option<NpmVersion> {
-    for v in &info.versions {
+    for v in peer_versions_by_npm_preference(info, reqs) {
         // Every requirement's range must accept this version.
-        if !reqs.iter().all(|r| r.range.satisfies(v)) {
+        if !reqs.iter().all(|requirement| {
+            requirement
+                .range
+                .satisfies_with_latest_bound(v, info.latest_version.as_ref())
+        }) || !version_allowed_by_policy(canonical, info, v, policy)
+        {
             continue;
         }
         // Platform filter — same gate the regular dep path uses, so
@@ -150,8 +158,10 @@ fn find_version_satisfying_all(
 /// installs (e.g. nestjs/typescript-starter's transitive
 /// ajv-keywords@5 vs @8 chain).
 fn find_version_satisfying_most<'a>(
+    canonical: &CanonicalKey,
     info: &CachedPackageInfo,
     reqs: &'a [&'a PeerRequirement],
+    policy: &ResolverPolicy,
 ) -> Option<(NpmVersion, Vec<usize>)> {
     let required_indices: Vec<usize> = reqs
         .iter()
@@ -163,19 +173,22 @@ fn find_version_satisfying_most<'a>(
     }
 
     let mut best: Option<(NpmVersion, usize, Vec<usize>)> = None;
-    for v in &info.versions {
+    for v in peer_versions_by_npm_preference(info, reqs) {
         let platform_ok = info.platform.is_empty()
             || info
                 .platform
                 .get(&v.to_string())
                 .is_none_or(crate::provider::is_platform_compatible);
-        if !platform_ok {
+        if !platform_ok || !version_allowed_by_policy(canonical, info, v, policy) {
             continue;
         }
         let mut hits = 0usize;
         let mut misses: Vec<usize> = Vec::new();
         for &i in &required_indices {
-            if reqs[i].range.satisfies(v) {
+            if reqs[i]
+                .range
+                .satisfies_with_latest_bound(v, info.latest_version.as_ref())
+            {
                 hits += 1;
             } else {
                 misses.push(i);
@@ -196,18 +209,40 @@ fn find_version_satisfying_most<'a>(
     best.map(|(v, _, misses)| (v, misses))
 }
 
+fn peer_versions_by_npm_preference<'a>(
+    info: &'a CachedPackageInfo,
+    reqs: &'a [&PeerRequirement],
+) -> impl Iterator<Item = &'a NpmVersion> {
+    let preferred_latest = info.latest_version.as_ref().filter(|latest| {
+        reqs.iter().any(|requirement| {
+            requirement
+                .range
+                .satisfies_with_latest_bound(latest, info.latest_version.as_ref())
+        })
+    });
+    preferred_latest.into_iter().chain(
+        info.versions
+            .iter()
+            .filter(move |version| preferred_latest != Some(*version)),
+    )
+}
+
 fn newest_existing_version_for_requirement(
     state: &ResolveState,
     canonical: &CanonicalKey,
     requirement: &PeerRequirement,
-) -> Option<NpmVersion> {
+    latest_version: Option<&NpmVersion>,
+) -> Option<(NpmVersion, NodeId)> {
     let nodes = state.resolved.get(canonical)?;
     nodes
         .iter()
-        .filter(|(version, _)| requirement.range.satisfies(version))
-        .map(|(version, _)| version)
-        .max()
-        .cloned()
+        .filter(|(version, _)| {
+            requirement
+                .range
+                .satisfies_with_latest_bound(version, latest_version)
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(version, target)| (version.clone(), *target))
 }
 
 async fn apply_peer_overrides<F, Fut>(
@@ -281,13 +316,23 @@ fn record_peer_bindings(
     state: &mut ResolveState,
     requirements: &[&PeerRequirement],
     chosen: &NpmVersion,
+    exact_target: Option<NodeId>,
 ) {
     for requirement in requirements {
-        state
-            .peer_bindings
-            .entry(requirement.consumer)
-            .or_default()
-            .insert(requirement.peer_name.clone(), chosen.clone());
+        if let Some(target) = exact_target {
+            state.record_exact_peer_binding(
+                requirement.consumer,
+                requirement.peer_name.clone(),
+                target,
+            );
+        } else {
+            state.record_pending_peer_binding(
+                requirement.consumer,
+                requirement.peer_name.clone(),
+                requirement.canonical.clone(),
+                chosen.clone(),
+            );
+        }
     }
 }
 
@@ -333,6 +378,22 @@ fn unsatisfied_required_consumers(
         .filter(|req| !req.optional && !req.range.satisfies(chosen))
         .map(|req| peer_conflict_consumer_entry(state, req))
         .collect()
+}
+
+pub(super) fn required_peer_consumer_counts(
+    reqs: &[&PeerRequirement],
+    chosen: &NpmVersion,
+) -> (usize, usize) {
+    let mut satisfied = 0usize;
+    let mut total = 0usize;
+    for req in reqs {
+        if req.optional {
+            continue;
+        }
+        total += 1;
+        satisfied += usize::from(req.range.satisfies(chosen));
+    }
+    (satisfied, total)
 }
 
 fn unsatisfied_required_consumers_at_indices(
@@ -414,7 +475,7 @@ pub(super) fn pick_peer_prefetch_candidates(
             continue;
         }
         if reqs.iter().filter(|req| !req.optional).all(|requirement| {
-            newest_existing_version_for_requirement(state, canonical, requirement).is_some()
+            newest_existing_version_for_requirement(state, canonical, requirement, None).is_some()
         }) {
             continue;
         }
@@ -479,12 +540,27 @@ where
         state.peer_work_stats.record_group();
         let mut reqs_owned = grouped.remove(&canonical).expect("just collected key");
         apply_peer_overrides(state, &canonical, &mut reqs_owned, &mut fetch_manifest).await?;
+        let info = if reqs_owned
+            .iter()
+            .any(|requirement| requirement.range.is_latest_tag())
+        {
+            Some(fetch_peer_manifest(state, canonical.clone(), &mut fetch_manifest).await?)
+        } else {
+            None
+        };
         let mut reqs = Vec::with_capacity(reqs_owned.len());
         for requirement in &reqs_owned {
-            if let Some(chosen) =
-                newest_existing_version_for_requirement(state, &canonical, requirement)
-            {
-                record_peer_bindings(state, &[requirement], &chosen);
+            if let Some((chosen, target)) = newest_existing_version_for_requirement(
+                state,
+                &canonical,
+                requirement,
+                info.as_deref()
+                    .and_then(|info| info.latest_version.as_ref()),
+            ) {
+                if !requirement.optional {
+                    mark_node_required_closure(state, target);
+                }
+                record_peer_bindings(state, &[requirement], &chosen, Some(target));
             } else {
                 reqs.push(requirement);
             }
@@ -509,7 +585,7 @@ where
                 continue;
             }
             PeerDrainOutcome::Synthesize { chosen } => {
-                record_peer_bindings(state, &reqs, &chosen);
+                record_peer_bindings(state, &reqs, &chosen, None);
                 synthesize_ambient_edge(
                     state,
                     &canonical,
@@ -523,12 +599,9 @@ where
                 chosen,
                 unsatisfied,
             } => {
-                let required_consumer_count = reqs.iter().filter(|req| !req.optional).count();
-                let satisfied_consumer_count = reqs
-                    .iter()
-                    .filter(|req| !req.optional && req.range.satisfies(&chosen))
-                    .count();
-                record_peer_bindings(state, &reqs, &chosen);
+                let (satisfied_consumer_count, required_consumer_count) =
+                    required_peer_consumer_counts(&reqs, &chosen);
+                record_peer_bindings(state, &reqs, &chosen, None);
                 synthesize_ambient_edge(
                     state,
                     &canonical,
@@ -651,7 +724,7 @@ where
     // `ajv-keywords@8` peer'ing ajv@^8). npm v7+ + pnpm hoist a single top-level peer
     // and warn about the stuck consumers; lpm now matches.
     let info = fetch_peer_manifest(state, canonical.clone(), fetch_manifest).await?;
-    if let Some(chosen) = find_version_satisfying_all(&info, reqs) {
+    if let Some(chosen) = find_version_satisfying_all(canonical, &info, reqs, &state.policy) {
         let outcome = PeerDrainOutcome::Synthesize {
             chosen: chosen.clone(),
         };
@@ -660,7 +733,9 @@ where
             .insert(cache_key, CachedPeerResolution::Synthesize { chosen });
         return Ok(outcome);
     }
-    if let Some((chosen, unsatisfied_idx)) = find_version_satisfying_most(&info, reqs) {
+    if let Some((chosen, unsatisfied_idx)) =
+        find_version_satisfying_most(canonical, &info, reqs, &state.policy)
+    {
         let unsatisfied = unsatisfied_required_consumers_at_indices(state, reqs, unsatisfied_idx);
         let outcome = PeerDrainOutcome::BestEffortSynthesize {
             chosen: chosen.clone(),

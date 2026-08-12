@@ -4,6 +4,9 @@ use super::super::{PackageIdentity, ResolveRequest};
 
 pub(super) fn fake_package(name: &str, version: &str, deps: &[(&str, &str)]) -> InstallPackage {
     InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: name.to_string(),
         version: version.to_string(),
         source: "registry+https://registry.npmjs.org".to_string(),
@@ -26,6 +29,7 @@ pub(super) fn fake_package(name: &str, version: &str, deps: &[(&str, &str)]) -> 
             "https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"
         )),
         metadata_checked_for_tarball: true,
+        manifest_fingerprint: None,
     }
 }
 
@@ -42,6 +46,7 @@ pub(super) fn empty_info_value() -> lpm_resolver::CachedPackageInfo {
         versions: Vec::new(),
         deps: HashMap::new(),
         peer_deps: HashMap::new(),
+        peer_aliases: HashMap::new(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
         node_engines: HashMap::new(),

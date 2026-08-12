@@ -175,7 +175,14 @@ fn resolved_pkg_with_graph(
         Some(context) => ResolverPackage::npm(name).with_context(context),
         None => ResolverPackage::npm(name),
     };
+    let resolution_id = lpm_common::ResolutionNodeId::new(
+        u32::try_from(resolved_pkg_with_graph_id(name, version, context)).unwrap(),
+    );
     ResolvedPackage {
+        resolution_id,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
         package,
         version: NpmVersion::parse(version).unwrap(),
         dependencies: dependencies
@@ -185,7 +192,7 @@ fn resolved_pkg_with_graph(
         aliases: HashMap::new(),
         peers: peers
             .iter()
-            .map(|(name, version)| ((*name).to_string(), (*version).to_string()))
+            .map(|(name, version)| lpm_common::PeerEdge::registry(*name, *name, *version))
             .collect(),
         tarball_url: None,
         integrity: None,
@@ -195,8 +202,18 @@ fn resolved_pkg_with_graph(
     }
 }
 
+fn resolved_pkg_with_graph_id(name: &str, version: &str, context: Option<&str>) -> u64 {
+    name.bytes()
+        .chain(version.bytes())
+        .chain(context.into_iter().flat_map(str::bytes))
+        .fold(0_u64, |hash, byte| {
+            hash.wrapping_mul(16_777_619) ^ u64::from(byte)
+        })
+        & u64::from(u32::MAX - 1)
+}
+
 #[test]
-fn peer_superset_dedup_prefers_row_with_superset_edges_and_peers() {
+fn peer_superset_dedup_preserves_row_with_subset_edges_and_peers() {
     let mut packages = vec![
         resolved_pkg_with_graph(
             "plugin",
@@ -216,26 +233,15 @@ fn peer_superset_dedup_prefers_row_with_superset_edges_and_peers() {
 
     dedupe_peer_superset_packages(&mut packages);
 
-    assert_eq!(packages.len(), 1);
     assert_eq!(
-        packages[0].dependencies,
-        vec![
-            ("shared".to_string(), "1.0.0".to_string()),
-            ("extra".to_string(), "1.0.0".to_string())
-        ],
-        "the retained row must be the graph superset"
-    );
-    assert_eq!(
-        packages[0].peers,
-        vec![
-            ("react".to_string(), "18.2.0".to_string()),
-            ("react-dom".to_string(), "18.2.0".to_string())
-        ]
+        packages.len(),
+        2,
+        "a superset materialization is not the same package instance"
     );
 }
 
 #[test]
-fn peer_superset_dedup_collapses_identical_split_contexts() {
+fn peer_superset_dedup_preserves_identical_split_contexts() {
     let mut packages = vec![
         resolved_pkg_with_graph(
             "cross-spawn",
@@ -257,8 +263,8 @@ fn peer_superset_dedup_collapses_identical_split_contexts() {
 
     assert_eq!(
         packages.len(),
-        1,
-        "identical same-version split contexts must collapse before install conversion"
+        2,
+        "distinct exact graph nodes must survive until stable instance IDs are assigned"
     );
 }
 
@@ -291,6 +297,28 @@ fn peer_superset_dedup_keeps_non_comparable_peer_contexts() {
 }
 
 #[test]
+fn peer_superset_dedup_keeps_context_where_optional_peer_is_absent() {
+    let mut packages = vec![
+        resolved_pkg_with_graph("plugin", "1.0.0", Some("without-runtime"), &[], &[]),
+        resolved_pkg_with_graph(
+            "plugin",
+            "1.0.0",
+            Some("with-runtime"),
+            &[],
+            &[("optional-runtime", "1.0.0")],
+        ),
+    ];
+
+    dedupe_peer_superset_packages(&mut packages);
+
+    assert_eq!(
+        packages.len(),
+        2,
+        "a context with an optional peer in scope cannot replace one where it is absent"
+    );
+}
+
+#[test]
 fn peer_superset_dedup_keeps_non_comparable_dependency_edges() {
     let mut packages = vec![
         resolved_pkg_with_graph(
@@ -315,6 +343,39 @@ fn peer_superset_dedup_keeps_non_comparable_dependency_edges() {
         packages.len(),
         2,
         "peer supersets cannot replace rows with unrelated dependency edges"
+    );
+}
+
+#[test]
+fn required_root_reachability_does_not_promote_split_sibling_contexts() {
+    let mut packages = vec![
+        resolved_pkg_with_graph("child", "1.0.0", None, &[], &[]),
+        resolved_pkg_with_graph("child", "1.0.0", Some("optional-parent"), &[], &[]),
+    ];
+    for package in &mut packages {
+        package.optional = true;
+    }
+    let root_dependencies =
+        RootDependencies::required(HashMap::from([("child".to_string(), "^1".to_string())]));
+
+    let root_resolutions = HashMap::from([(
+        "child".to_string(),
+        RootResolution {
+            target: packages[0].resolution_id,
+            package: "child".to_string(),
+            version: "1.0.0".to_string(),
+        },
+    )]);
+
+    mark_optional_reachability(&mut packages, &root_dependencies, &root_resolutions);
+
+    assert!(
+        !packages[0].optional,
+        "the exact root target must be required"
+    );
+    assert!(
+        packages[1].optional,
+        "an unrelated split context must remain optional"
     );
 }
 
@@ -365,6 +426,7 @@ fn make_cached_info(
                 )
             })
             .collect(),
+        peer_aliases: HashMap::new(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
         node_engines: HashMap::new(),
@@ -423,6 +485,56 @@ fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageM
         latest_version: Some(latest_version),
         ecosystem: None,
     }
+}
+
+#[tokio::test]
+async fn pubgrub_rejects_malformed_required_peer_range() {
+    let _lock = env_lock().lock().await;
+    let _env = PubgrubEnvGuard::new();
+    let mut consumer = make_version_metadata("consumer", "1.0.0", vec![], vec![], vec![], vec![]);
+    consumer
+        .peer_dependencies
+        .insert("runtime".to_string(), "~X0^.00".to_string());
+    let prefetched = HashMap::from([
+        (
+            "consumer".to_string(),
+            make_package_metadata("consumer", vec![consumer]),
+        ),
+        (
+            "runtime".to_string(),
+            make_package_metadata(
+                "runtime",
+                vec![make_version_metadata(
+                    "runtime",
+                    "1.0.0",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        ),
+    ]);
+
+    let error = match resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([
+            ("consumer".to_string(), "1.0.0".to_string()),
+            ("runtime".to_string(), "1.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        Some(prefetched),
+    )
+    .await
+    {
+        Ok(_) => panic!("PubGrub must reject malformed required peer ranges"),
+        Err(error) => error,
+    };
+
+    let message = error.to_string();
+    assert!(message.contains("consumer"), "{message}");
+    assert!(message.contains("runtime"), "{message}");
+    assert!(message.contains("~X0^.00"), "{message}");
 }
 
 #[tokio::test]
@@ -934,7 +1046,7 @@ async fn resolve_regular_dep_with_no_platform_compatible_version_still_resolves(
 }
 
 #[tokio::test]
-async fn resolve_with_prefetch_retries_until_all_conflicts_are_split() {
+async fn resolve_with_prefetch_preserves_versions_and_edges_for_all_split_conflicts() {
     // PubGrub-arm-specific: split-retry conflict resolution.
     let _env = env_lock().lock().await;
     let _guard = PubgrubEnvGuard::new();
@@ -1049,6 +1161,24 @@ async fn resolve_with_prefetch_retries_until_all_conflicts_are_split() {
         resolved_versions.get("y[c]").map(String::as_str),
         Some("2.0.0")
     );
+
+    let resolved_dependency = |parent: &str, dependency: &str| {
+        result
+            .packages
+            .iter()
+            .find(|package| package.package.canonical_name() == parent)
+            .and_then(|package| {
+                package
+                    .dependencies
+                    .iter()
+                    .find(|(name, _)| name == dependency)
+            })
+            .map(|(_, version)| version.as_str())
+    };
+    assert_eq!(resolved_dependency("a", "x"), Some("1.0.0"));
+    assert_eq!(resolved_dependency("b", "x"), Some("2.0.0"));
+    assert_eq!(resolved_dependency("b", "y"), Some("1.0.0"));
+    assert_eq!(resolved_dependency("c", "y"), Some("2.0.0"));
 }
 
 /// Nested-scope propagation.
@@ -1228,6 +1358,10 @@ fn peer_check_satisfied_peer_no_warning() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: sc_pkg.clone(),
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![],
@@ -1240,6 +1374,10 @@ fn peer_check_satisfied_peer_no_warning() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -1283,6 +1421,10 @@ fn peer_check_wrong_version_produces_warning() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: sc_pkg.clone(),
             version: NpmVersion::parse("6.0.0").unwrap(),
             dependencies: vec![],
@@ -1295,6 +1437,10 @@ fn peer_check_wrong_version_produces_warning() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -1330,6 +1476,73 @@ fn peer_check_wrong_version_produces_warning() {
 }
 
 #[test]
+fn peer_check_latest_warns_when_resolved_version_exceeds_the_dist_tag() {
+    let consumer = ResolverPackage::npm("peer-consumer");
+    let provider = ResolverPackage::npm("peer-host");
+    let resolved = vec![
+        resolved_pkg_with_graph("peer-consumer", "1.0.0", None, &[], &[]),
+        resolved_pkg_with_graph("peer-host", "4.0.0", None, &[], &[]),
+    ];
+    let consumer_info = make_cached_info(
+        &["1.0.0"],
+        vec![],
+        vec![("1.0.0", vec![("peer-host", "latest")])],
+    );
+    let mut provider_info = make_cached_info(&["4.0.0", "3.1.0"], vec![], vec![]);
+    Arc::get_mut(&mut provider_info).unwrap().latest_version =
+        Some(NpmVersion::parse("3.1.0").unwrap());
+    let cache = HashMap::from([
+        (CanonicalKey::from(&consumer), consumer_info),
+        (CanonicalKey::from(&provider), provider_info),
+    ]);
+
+    let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].required_range, "latest");
+    assert_eq!(warnings[0].resolved_version.as_deref(), Some("4.0.0"));
+}
+
+#[test]
+fn peer_check_aliased_missing_warning_preserves_local_and_canonical_names() {
+    let consumer = ResolverPackage::npm("compat-consumer");
+    let resolved = vec![ResolvedPackage {
+        resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
+        package: consumer.clone(),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        dependencies: vec![],
+        aliases: HashMap::new(),
+        peers: Vec::new(),
+        tarball_url: None,
+        integrity: None,
+        platform: None,
+        node_engine: None,
+        optional: false,
+    }];
+
+    let mut info = make_cached_info(
+        &["1.0.0"],
+        vec![],
+        vec![("1.0.0", vec![("react-compat", "^18.0.0")])],
+    );
+    Arc::get_mut(&mut info).unwrap().peer_aliases.insert(
+        "1.0.0".to_string(),
+        HashMap::from([("react-compat".to_string(), "react".to_string())]),
+    );
+    let mut cache = HashMap::new();
+    cache.insert(CanonicalKey::from(&consumer), info);
+
+    let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
+
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].peer, "react-compat");
+    assert_eq!(warnings[0].target, "react");
+}
+
+#[test]
 fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
     let plugin_pkg = ResolverPackage::npm("esbuild-plugins-node-modules-polyfill");
     let esbuild_nested_a = ResolverPackage::npm("esbuild").with_context("vite");
@@ -1337,6 +1550,10 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: plugin_pkg.clone(),
             version: NpmVersion::parse("1.8.1").unwrap(),
             dependencies: vec![],
@@ -1349,6 +1566,10 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: esbuild_nested_a.clone(),
             version: NpmVersion::parse("0.25.12").unwrap(),
             dependencies: vec![],
@@ -1361,6 +1582,10 @@ fn peer_check_multiple_satisfying_versions_do_not_report_peer_missing() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: esbuild_nested_b,
             version: NpmVersion::parse("0.17.6").unwrap(),
             dependencies: vec![],
@@ -1404,6 +1629,10 @@ fn peer_check_optional_peer_missing_no_warning() {
     let pkg = ResolverPackage::npm("react-redux");
 
     let resolved = vec![ResolvedPackage {
+        resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
         package: pkg.clone(),
         version: NpmVersion::parse("9.0.0").unwrap(),
         dependencies: vec![],
@@ -1449,6 +1678,10 @@ fn peer_check_optional_peer_wrong_version_still_warns() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: pkg.clone(),
             version: NpmVersion::parse("9.0.0").unwrap(),
             dependencies: vec![],
@@ -1461,6 +1694,10 @@ fn peer_check_optional_peer_wrong_version_still_warns() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -1508,6 +1745,10 @@ fn peer_check_missing_peer_produces_warning() {
     let sc_pkg = ResolverPackage::npm("styled-components");
 
     let resolved = vec![ResolvedPackage {
+        resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
         package: sc_pkg.clone(),
         version: NpmVersion::parse("5.0.0").unwrap(),
         dependencies: vec![],
@@ -1557,6 +1798,10 @@ fn peer_check_version_specific_no_cross_contamination() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: sc_pkg.clone(),
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![],
@@ -1569,6 +1814,10 @@ fn peer_check_version_specific_no_cross_contamination() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -1615,6 +1864,10 @@ fn peer_check_prefers_same_split_context_peer_version() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: plugin_pkg.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
             dependencies: vec![],
@@ -1627,6 +1880,10 @@ fn peer_check_prefers_same_split_context_peer_version() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_host_a.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -1639,6 +1896,10 @@ fn peer_check_prefers_same_split_context_peer_version() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_host_b.clone(),
             version: NpmVersion::parse("18.2.0").unwrap(),
             dependencies: vec![],
@@ -1684,6 +1945,10 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: plugin_pkg.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
             dependencies: vec![],
@@ -1696,6 +1961,10 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -1708,6 +1977,10 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("18.2.0").unwrap(),
             dependencies: vec![],
@@ -1735,18 +2008,21 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
         make_cached_info(&["18.2.0", "17.0.2"], vec![], vec![]),
     );
 
-    let peer_candidates: HashMap<String, Vec<(Option<String>, String)>> =
+    let peer_candidates: HashMap<String, Vec<(ResolverPackage, String)>> =
         resolved.iter().fold(HashMap::new(), |mut acc, pkg| {
-            acc.entry(pkg.package.canonical_name()).or_default().push((
-                pkg.package.context().map(str::to_string),
-                pkg.version.to_string(),
-            ));
+            acc.entry(pkg.package.canonical_name())
+                .or_default()
+                .push((pkg.package.clone(), pkg.version.to_string()));
             acc
         });
-    let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates);
+    let bound_peers = compute_resolved_peers(&plugin_pkg, "1.0.0", &cache, &peer_candidates)
+        .unwrap()
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .collect::<Vec<_>>();
     assert_eq!(
         bound_peers,
-        vec![("react".to_string(), "17.0.2".to_string())],
+        vec![lpm_common::PeerEdge::registry("react", "react", "17.0.2")],
         "graph/link peer binding must choose the version satisfying the consumer range"
     );
 
@@ -1758,6 +2034,57 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
 }
 
 #[test]
+fn peer_binding_from_split_fallback_retains_exact_target_id() {
+    let plugin = ResolverPackage::npm("plugin");
+    let react = ResolverPackage::npm("react").with_context("host-a");
+    let mut solution: pubgrub::SelectedDependencies<LpmDependencyProvider> =
+        pubgrub::Map::default();
+    solution.insert(
+        plugin.clone(),
+        NpmVersion::parse("1.0.0").expect("valid plugin version"),
+    );
+    solution.insert(
+        react.clone(),
+        NpmVersion::parse("17.0.2").expect("valid react version"),
+    );
+
+    let cache = HashMap::from([
+        (
+            CanonicalKey::from(&plugin),
+            make_cached_info(
+                &["1.0.0"],
+                vec![],
+                vec![("1.0.0", vec![("react", "^17.0.0")])],
+            ),
+        ),
+        (
+            CanonicalKey::from(&react),
+            make_cached_info(&["17.0.2"], vec![], vec![]),
+        ),
+    ]);
+
+    let (packages, _) = format_solution(
+        solution,
+        &cache,
+        &RootDependencies::default(),
+        &HashMap::new(),
+        Vec::new(),
+    )
+    .expect("solution should format");
+    let react_id = packages
+        .iter()
+        .find(|package| package.package == react)
+        .expect("split react provider")
+        .resolution_id;
+    let plugin = packages
+        .iter()
+        .find(|package| package.package == plugin)
+        .expect("plugin consumer");
+
+    assert_eq!(plugin.peer_targets.get("react"), Some(&react_id));
+}
+
+#[test]
 fn peer_check_multiple_packages_multiple_peers() {
     // Two packages with different peers
     let pkg_a = ResolverPackage::npm("pkg-a");
@@ -1766,6 +2093,10 @@ fn peer_check_multiple_packages_multiple_peers() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: pkg_a.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
             dependencies: vec![],
@@ -1778,6 +2109,10 @@ fn peer_check_multiple_packages_multiple_peers() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: pkg_b.clone(),
             version: NpmVersion::parse("2.0.0").unwrap(),
             dependencies: vec![],
@@ -1790,6 +2125,10 @@ fn peer_check_multiple_packages_multiple_peers() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("18.2.0").unwrap(),
             dependencies: vec![],
@@ -1847,6 +2186,10 @@ fn peer_check_no_peers_no_warnings() {
     let pkg = ResolverPackage::npm("lodash");
 
     let resolved = vec![ResolvedPackage {
+        resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
         package: pkg.clone(),
         version: NpmVersion::parse("4.17.21").unwrap(),
         dependencies: vec![],
@@ -1875,6 +2218,7 @@ fn peer_warning_display_format() {
         package: "styled-components".to_string(),
         version: "5.0.0".to_string(),
         peer: "react".to_string(),
+        target: "react".to_string(),
         required_range: "^16.8.0".to_string(),
         resolved_version: None,
     };
@@ -1884,6 +2228,7 @@ fn peer_warning_display_format() {
         package: "styled-components".to_string(),
         version: "6.0.0".to_string(),
         peer: "react".to_string(),
+        target: "react".to_string(),
         required_range: "^18.0.0".to_string(),
         resolved_version: Some("17.0.2".to_string()),
     };
@@ -1963,6 +2308,10 @@ fn peer_rules_ignore_missing_suppresses_missing_warning() {
     let sc_pkg = ResolverPackage::npm("styled-components");
 
     let resolved = vec![ResolvedPackage {
+        resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
         package: sc_pkg.clone(),
         version: NpmVersion::parse("5.0.0").unwrap(),
         dependencies: vec![],
@@ -2015,6 +2364,10 @@ fn peer_rules_allowed_versions_widens_match() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: sc_pkg.clone(),
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![("react".into(), "17.0.2".into())],
@@ -2027,6 +2380,10 @@ fn peer_rules_allowed_versions_widens_match() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.2").unwrap(),
             dependencies: vec![],
@@ -2096,6 +2453,10 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
     // Variant A: peer in tree at wrong version.
     let resolved_present = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: sc_pkg.clone(),
             version: NpmVersion::parse("5.0.0").unwrap(),
             dependencies: vec![("@babel/core".into(), "7.5.0".into())],
@@ -2108,6 +2469,10 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: babel_pkg.clone(),
             version: NpmVersion::parse("7.5.0").unwrap(),
             dependencies: vec![],
@@ -2123,6 +2488,10 @@ fn peer_rules_allow_any_suppresses_version_mismatch_only() {
 
     // Variant B: peer not in tree at all.
     let resolved_missing = vec![ResolvedPackage {
+        resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+        dependency_targets: HashMap::new(),
+        optional_dependencies: HashSet::new(),
+        peer_targets: HashMap::new(),
         package: sc_pkg.clone(),
         version: NpmVersion::parse("5.0.0").unwrap(),
         dependencies: vec![],
@@ -2301,6 +2670,10 @@ fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
 
     let resolved = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: button_pkg.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
             dependencies: vec![("react".into(), "17.0.0".into())],
@@ -2313,6 +2686,10 @@ fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: card_pkg.clone(),
             version: NpmVersion::parse("1.0.0").unwrap(),
             dependencies: vec![("react".into(), "17.0.0".into())],
@@ -2325,6 +2702,10 @@ fn peer_rules_allowed_versions_parent_selector_only_matches_named_consumer() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.0").unwrap(),
             dependencies: vec![],
@@ -2389,6 +2770,10 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
     // Variant A: foo@2.5 (in range) → rule matches → no warning.
     let resolved_in_range = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: foo_pkg.clone(),
             version: NpmVersion::parse("2.5.0").unwrap(),
             dependencies: vec![("react".into(), "17.0.0".into())],
@@ -2401,6 +2786,10 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.0").unwrap(),
             dependencies: vec![],
@@ -2416,6 +2805,10 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
     // Variant B: foo@1.5 (out of range) → rule doesn't apply → warning.
     let resolved_out_of_range = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: foo_pkg.clone(),
             version: NpmVersion::parse("1.5.0").unwrap(),
             dependencies: vec![("react".into(), "17.0.0".into())],
@@ -2428,6 +2821,10 @@ fn peer_rules_allowed_versions_parent_range_filters_consumer_version() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: react_pkg.clone(),
             version: NpmVersion::parse("17.0.0").unwrap(),
             dependencies: vec![],

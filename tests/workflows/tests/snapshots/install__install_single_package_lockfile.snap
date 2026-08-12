@@ -1,9 +1,10 @@
 ---
 source: tests/workflows/tests/install.rs
+assertion_line: 4192
 expression: lockfile
 ---
 [metadata]
-lockfile-version = 10
+lockfile-version = 13
 resolved-with = "greedy-fusion"
 
 [importers."."]
@@ -13,6 +14,7 @@ auto-install-peers = true
 ms = "^2.1.3"
 
 [[packages]]
+instance-id = "99579ad47d3e5c59ae02a39ef05cac9b2ec1f25999415e58bd189eb3fdfd82f4"
 name = "ms"
 version = "2.1.3"
 source = "registry+https://registry.npmjs.org"
@@ -21,6 +23,7 @@ registry-published-at = "2025-01-01T00:00:00.000Z"
 tarball = "[REGISTRY]/tarballs/ms/-/ms-2.1.3.tgz"
 
 [root-resolutions.ms]
+instance-id = "99579ad47d3e5c59ae02a39ef05cac9b2ec1f25999415e58bd189eb3fdfd82f4"
 package = "ms"
 version = "2.1.3"
 source = "registry+https://registry.npmjs.org"

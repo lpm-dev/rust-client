@@ -136,6 +136,8 @@ fn node_available() -> bool {
 }
 
 fn write_lockfile_for_packages(project: &TempProject, packages: &[(&str, &str)]) {
+    let mut packages = packages.to_vec();
+    packages.sort_unstable();
     let pkg_entries: Vec<String> = packages
         .iter()
         .map(|(n, v)| format!("[[packages]]\nname = \"{n}\"\nversion = \"{v}\"\n"))
@@ -347,7 +349,10 @@ fn rebuild_deny_policy_keeps_trusted_only_filter() {
         .expect("spawn lpm rebuild");
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(out.status.success(), "exit 0 expected; stdout:\n{stdout}");
+    assert!(
+        out.status.success(),
+        "exit 0 expected; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 
     // No trusted entries + no --all → empty default set under deny.
     assert!(
@@ -521,9 +526,11 @@ fn rebuild_deny_skips_all_packages_and_keeps_legacy_pointer() {
         .args(["rebuild"])
         .output()
         .expect("spawn lpm rebuild");
-    assert!(out.status.success(), "rebuild must exit 0 under deny too");
-
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "rebuild must exit 0 under deny too; stderr:\n{stderr}"
+    );
     assert!(
         stderr.contains("package.json > lpm > trustedDependencies")
             || stderr.contains("lpm rebuild --all"),

@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -101,6 +102,11 @@ impl PackageKey {
 /// - **v9**: Git dependency sources are pinned to an exact commit.
 /// - **v10**: recursive workspace installs use one root lockfile. Importers
 ///   carry graph projections into a content-addressed union package table.
+/// - **v11**: mutable directory/link rows carry semantic manifest fingerprints.
+/// - **v12**: peer edges preserve local, canonical, version, and source identity.
+/// - **v13**: package rows, dependency edges, peer edges, and root selections
+///   carry exact package-instance IDs. Multiple graph instances may share one
+///   artifact identity without being collapsed.
 ///
 /// **Why this matters:** install.rs's lockfile fast path uses the
 /// version to decide whether the absence of `ambient-peer-installs`
@@ -113,7 +119,10 @@ pub const LOCKFILE_VERSION_WITH_PROVENANCE: u32 = 7;
 pub const LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS: u32 = 8;
 pub const LOCKFILE_VERSION_WITH_GIT_RESOLUTIONS: u32 = 9;
 pub const LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS: u32 = 10;
-pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS;
+pub const LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS: u32 = 11;
+pub const LOCKFILE_VERSION_WITH_STRUCTURED_PEERS: u32 = 12;
+pub const LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES: u32 = 13;
+pub const LOCKFILE_VERSION: u32 = LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES;
 
 /// Default lockfile filename.
 pub const LOCKFILE_NAME: &str = "lpm.lock";
@@ -124,6 +133,11 @@ pub type CatalogSnapshots = BTreeMap<String, BTreeMap<String, CatalogSnapshotEnt
 /// Importer snapshots keyed by importer path relative to the lockfile root.
 pub type ImporterSnapshots = BTreeMap<String, ImporterSnapshot>;
 
+type WorkspaceUnionRows = (
+    BTreeMap<String, LockedPackage>,
+    BTreeMap<String, ImporterSnapshot>,
+);
+
 /// Lockfile-recorded patch evidence keyed by `<package-name>@<version>`.
 pub type LockfilePatches = BTreeMap<String, LockfilePatch>;
 
@@ -133,6 +147,13 @@ pub type RootResolutions = BTreeMap<String, LockedRootResolution>;
 /// One exact package identity selected for a project root link.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct LockedRootResolution {
+    /// Exact selected graph instance.
+    #[serde(
+        default,
+        rename = "instance-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub instance_id: Option<lpm_common::PackageInstanceId>,
     /// Canonical package name after npm-alias resolution.
     pub package: String,
     /// Exact selected package version.
@@ -329,14 +350,25 @@ fn hash_strings(hasher: &mut Sha256, values: &[String]) {
     }
 }
 
-fn workspace_package_id(package: &LockedPackage) -> String {
+fn valid_sha256_prefixed_hex(value: &str) -> bool {
+    value.strip_prefix("sha256-").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn workspace_package_id_for_version(package: &LockedPackage, lockfile_version: u32) -> String {
     #[cfg(test)]
     WORKSPACE_PACKAGE_ID_CALLS.with(|calls| calls.set(calls.get() + 1));
     let LockedPackage {
+        instance_id,
         name,
         version,
         source,
         integrity,
+        manifest_fingerprint,
         registry_signatures,
         registry_published_at,
         os,
@@ -345,16 +377,37 @@ fn workspace_package_id(package: &LockedPackage) -> String {
         node_engine,
         optional,
         dependencies,
+        dependency_targets,
         alias_dependencies,
         peers,
+        peer_edges,
+        peer_targets,
         tarball,
     } = package;
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-workspace-package-v1\0");
+    if lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        hasher.update(b"lpm-workspace-package-v3\0");
+    } else if lockfile_version >= LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS {
+        hasher.update(b"lpm-workspace-package-v2\0");
+    } else {
+        hasher.update(b"lpm-workspace-package-v1\0");
+    }
     hash_length_prefixed(&mut hasher, name.as_bytes());
     hash_length_prefixed(&mut hasher, version.as_bytes());
     hash_optional_string(&mut hasher, source.as_deref());
+    if lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        match instance_id {
+            Some(instance_id) => {
+                hasher.update([1]);
+                hasher.update(instance_id.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
     hash_optional_string(&mut hasher, integrity.as_deref());
+    if lockfile_version >= LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS {
+        hash_optional_string(&mut hasher, manifest_fingerprint.as_deref());
+    }
     hasher.update((registry_signatures.len() as u64).to_le_bytes());
     for signature in registry_signatures {
         hash_optional_string(&mut hasher, signature.keyid.as_deref());
@@ -367,12 +420,35 @@ fn workspace_package_id(package: &LockedPackage) -> String {
     hash_optional_string(&mut hasher, node_engine.as_deref());
     hasher.update([u8::from(*optional)]);
     hash_strings(&mut hasher, dependencies);
+    if lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        hasher.update((dependency_targets.len() as u64).to_le_bytes());
+        for (local_name, target) in dependency_targets {
+            hash_length_prefixed(&mut hasher, local_name.as_bytes());
+            hasher.update(target.as_bytes());
+        }
+    }
     hasher.update((alias_dependencies.len() as u64).to_le_bytes());
     for alias in alias_dependencies {
         hash_length_prefixed(&mut hasher, alias[0].as_bytes());
         hash_length_prefixed(&mut hasher, alias[1].as_bytes());
     }
     hash_strings(&mut hasher, peers);
+    if lockfile_version >= LOCKFILE_VERSION_WITH_STRUCTURED_PEERS {
+        hasher.update((peer_edges.len() as u64).to_le_bytes());
+        for peer in peer_edges {
+            hash_length_prefixed(&mut hasher, peer.local_name.as_bytes());
+            hash_length_prefixed(&mut hasher, peer.target_name.as_bytes());
+            hash_length_prefixed(&mut hasher, peer.target_version.as_bytes());
+            hash_optional_string(&mut hasher, peer.target_wrapper_id.as_deref());
+        }
+    }
+    if lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+        hasher.update((peer_targets.len() as u64).to_le_bytes());
+        for (local_name, target) in peer_targets {
+            hash_length_prefixed(&mut hasher, local_name.as_bytes());
+            hasher.update(target.as_bytes());
+        }
+    }
     hash_optional_string(&mut hasher, tarball.as_deref());
     let digest = hasher.finalize();
     let mut id = String::with_capacity(7 + digest.len() * 2);
@@ -397,8 +473,11 @@ pub(crate) fn workspace_package_id_call_count() -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn workspace_package_id_for_test(package: &LockedPackage) -> String {
-    workspace_package_id(package)
+pub(crate) fn workspace_package_id_for_test(
+    package: &LockedPackage,
+    lockfile_version: u32,
+) -> String {
+    workspace_package_id_for_version(package, lockfile_version)
 }
 
 /// One lockfile-recorded catalog resolution.
@@ -555,6 +634,13 @@ fn is_false(value: &bool) -> bool {
 /// A single resolved package in the lockfile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct LockedPackage {
+    /// Exact identity of this row in the resolved graph.
+    #[serde(
+        default,
+        rename = "instance-id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub instance_id: Option<lpm_common::PackageInstanceId>,
     /// Package name (e.g., `@lpm.dev/neo.highlight` or `react`).
     pub name: String,
     /// Exact resolved version.
@@ -565,6 +651,13 @@ pub struct LockedPackage {
     /// SRI integrity hash (sha512-...). Populated when registry provides it.
     #[serde(default)]
     pub integrity: Option<String>,
+    /// Semantic manifest digest for mutable directory/link sources.
+    #[serde(
+        default,
+        rename = "manifest-fingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub manifest_fingerprint: Option<String>,
     /// Registry package signatures from npm-compatible `dist.signatures`.
     #[serde(
         default,
@@ -607,6 +700,13 @@ pub struct LockedPackage {
     /// in [`Self::alias_dependencies`] below.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    /// Exact target instance for each dependency-local name.
+    #[serde(
+        default,
+        rename = "dependency-targets",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub dependency_targets: BTreeMap<String, lpm_common::PackageInstanceId>,
     /// Npm-alias dep edges. Each entry is `[local_name,
     /// target_canonical_name]`. The matching `<local_name>@<version>`
     /// entry in `dependencies` keys the resolved version; this map
@@ -646,6 +746,17 @@ pub struct LockedPackage {
     /// [`GraphKey`]: <internal v2 store identity type — see lpm-store crate>
     #[serde(default, rename = "peers", skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<String>,
+    /// Exact peer identities. Legacy `peers` entries remain readable for
+    /// pre-v12 lockfiles; current writers use this field exclusively.
+    #[serde(default, rename = "peer-edges", skip_serializing_if = "Vec::is_empty")]
+    pub peer_edges: Vec<lpm_common::PeerEdge>,
+    /// Exact target instance for each peer-local name.
+    #[serde(
+        default,
+        rename = "peer-targets",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub peer_targets: BTreeMap<String, lpm_common::PackageInstanceId>,
     /// Tarball URL as returned by the registry at resolve time (e.g.,
     /// `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`).
     /// Populated by the writer from `InstallPackage.tarball_url`;
@@ -733,8 +844,8 @@ impl LockedPackage {
         }
     }
 
-    /// Returns `Some(url)` if this is a `@lpm.dev/*` package pointing
-    /// at a non-lpm.dev origin. Scoped names must always resolve
+    /// Returns a safe source identity if this is a `@lpm.dev/*`
+    /// package pointing at a non-lpm.dev origin. Scoped names must always resolve
     /// through the LPM origin (or `http://localhost` for dev),
     /// regardless of what other registries the client is configured to
     /// talk to.
@@ -742,10 +853,15 @@ impl LockedPackage {
         if !self.name.starts_with("@lpm.dev/") {
             return None;
         }
-        let Some(Ok(Source::Registry { url })) = self.source_kind() else {
+        let source = self.source.as_deref()?;
+        let Ok(Source::Registry { url }) = Source::parse(source) else {
             return None;
         };
-        if is_lpm_origin(&url) { None } else { Some(url) }
+        if is_lpm_origin(&url) {
+            None
+        } else {
+            Some(crate::safe_source_identity(source))
+        }
     }
 
     pub fn git_metadata_error(&self) -> Option<&'static str> {
@@ -802,6 +918,64 @@ fn is_lpm_origin(url_str: &str) -> bool {
     false
 }
 
+fn validate_package_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("name is empty".to_string());
+    }
+    if name.len() > 214 {
+        return Err(format!("name is {} bytes; maximum is 214", name.len()));
+    }
+    if name.chars().any(|character| {
+        character.is_control()
+            || matches!(character, '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    }) {
+        return Err("name contains a control character or unsafe path character".to_string());
+    }
+
+    let mut components = name.split('/');
+    if name.starts_with('@') {
+        let scope = components.next().unwrap_or_default();
+        let package = components.next().unwrap_or_default();
+        if scope.len() == 1 || package.is_empty() || components.next().is_some() {
+            return Err("scoped name must have exactly the form @scope/package".to_string());
+        }
+        validate_package_name_component(scope)?;
+        validate_package_name_component(package)?;
+    } else {
+        if components.clone().count() != 1 {
+            return Err("unscoped name must contain exactly one path component".to_string());
+        }
+        validate_package_name_component(name)?;
+    }
+    Ok(())
+}
+
+fn validate_package_name_component(component: &str) -> Result<(), String> {
+    if component.is_empty() || matches!(component, "." | "..") {
+        return Err("name contains an empty, `.` or `..` path component".to_string());
+    }
+    if component.ends_with([' ', '.']) {
+        return Err("name component cannot end with a space or dot".to_string());
+    }
+    let device_stem = component
+        .trim_start_matches('@')
+        .split('.')
+        .next()
+        .unwrap_or_default();
+    let upper = device_stem.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || upper
+            .strip_prefix("COM")
+            .or_else(|| upper.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+    {
+        return Err("name contains a reserved Windows path component".to_string());
+    }
+    Ok(())
+}
+
 /// Default resolver-name string baked into [`Lockfile::new`]. Matches
 /// the current install default (greedy-fusion). Production write sites
 /// should pass an explicit name via [`Lockfile::new_with_resolver`] —
@@ -851,32 +1025,82 @@ impl Lockfile {
     }
 
     /// Add a resolved package. Maintains sorted order by
-    /// `(name, version, source_id)` triple. Two packages with the
-    /// same name but different `(version, source_id)` no longer race
-    /// for the same slot, preventing cross-source collision.
+    /// artifact identity and then exact instance ID. Distinct graph instances
+    /// of one artifact occupy separate rows.
     pub fn add_package(&mut self, pkg: LockedPackage) {
         let key = pkg.package_key();
-        let pos = self
-            .packages
-            .binary_search_by(|p| {
-                let other = p.package_key();
-                other
-                    .name
-                    .cmp(&key.name)
-                    .then_with(|| other.version.cmp(&key.version))
-                    .then_with(|| other.source_id.cmp(&key.source_id))
-            })
-            .unwrap_or_else(|pos| pos);
-        self.packages.insert(pos, pkg);
+        let instance_id = pkg.instance_id;
+        match self.packages.binary_search_by(|p| {
+            let other = p.package_key();
+            other
+                .name
+                .cmp(&key.name)
+                .then_with(|| other.version.cmp(&key.version))
+                .then_with(|| other.source_id.cmp(&key.source_id))
+                .then_with(|| p.instance_id.cmp(&instance_id))
+        }) {
+            Ok(pos) => self.packages[pos] = pkg,
+            Err(pos) => self.packages.insert(pos, pkg),
+        }
     }
 
     /// Add one standalone importer graph to a workspace union lockfile.
     pub fn absorb_importer(
         &mut self,
         importer: &str,
-        standalone: Lockfile,
+        mut standalone: Lockfile,
     ) -> Result<(), LockfileError> {
         validate_importer_path(importer)?;
+        let union_version = self
+            .metadata
+            .lockfile_version
+            .min(standalone.metadata.lockfile_version)
+            .clamp(
+                LOCKFILE_VERSION_WITH_WORKSPACE_PROJECTIONS,
+                LOCKFILE_VERSION,
+            );
+        let mut existing_packages = self.packages.iter().chain(self.workspace_packages.values());
+        let existing_has_legacy_peers = existing_packages
+            .clone()
+            .any(|package| !package.peers.is_empty());
+        let existing_has_structured_peers =
+            existing_packages.any(|package| !package.peer_edges.is_empty());
+        let incoming_has_legacy_peers = standalone
+            .packages
+            .iter()
+            .any(|package| !package.peers.is_empty());
+        let incoming_has_structured_peers = standalone
+            .packages
+            .iter()
+            .any(|package| !package.peer_edges.is_empty());
+        let mixes_incompatible_peer_schemas =
+            if union_version >= LOCKFILE_VERSION_WITH_STRUCTURED_PEERS {
+                existing_has_legacy_peers || incoming_has_legacy_peers
+            } else {
+                existing_has_structured_peers || incoming_has_structured_peers
+            };
+        if mixes_incompatible_peer_schemas {
+            return Err(LockfileError::Serialize(format!(
+                "workspace importer {importer:?} cannot be combined without losing exact peer identity; fresh resolution is required"
+            )));
+        }
+        if union_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+            let mut artifact_identities = HashSet::with_capacity(standalone.packages.len());
+            if let Some(package) = standalone
+                .packages
+                .iter()
+                .find(|package| !artifact_identities.insert(package.package_key()))
+            {
+                return Err(LockfileError::Serialize(format!(
+                    "workspace importer {importer:?} contains an ambiguous package identity {:?}",
+                    package.package_key().lockfile_id()
+                )));
+            }
+        }
+        standalone.metadata.lockfile_version = union_version;
+        for package in &mut standalone.packages {
+            Self::downgrade_package_to_version(package, union_version);
+        }
         let mut snapshot = standalone
             .importers
             .get(".")
@@ -890,49 +1114,137 @@ impl Lockfile {
         snapshot.catalog_resolutions = standalone.catalogs;
         snapshot.provenance = standalone.provenance;
         snapshot.auto_isolated_peer_conflicts = standalone.metadata.auto_isolated_peer_conflicts;
+        if union_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+            for root in snapshot.root_resolutions.values_mut() {
+                root.instance_id = None;
+            }
+        }
 
         let mut addressed_packages = Vec::with_capacity(standalone.packages.len());
         for package in standalone.packages {
             let key = package.package_key();
-            let id = workspace_package_id(&package);
+            let id = workspace_package_id_for_version(&package, union_version);
             addressed_packages.push((key, id, package));
         }
-        addressed_packages.sort_unstable_by(|(left, _, _), (right, _, _)| {
-            left.name
-                .cmp(&right.name)
-                .then_with(|| left.version.cmp(&right.version))
-                .then_with(|| left.source_id.cmp(&right.source_id))
-        });
-        if let Some(pair) = addressed_packages
-            .windows(2)
-            .find(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
-        {
-            return Err(LockfileError::Serialize(format!(
-                "workspace importer {importer:?} contains an ambiguous package identity {:?}",
-                pair[0].0.lockfile_id()
-            )));
-        }
+        addressed_packages.sort_unstable_by(
+            |(left, _, left_package), (right, _, right_package)| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.version.cmp(&right.version))
+                    .then_with(|| left.source_id.cmp(&right.source_id))
+                    .then_with(|| left_package.instance_id.cmp(&right_package.instance_id))
+            },
+        );
         addressed_packages.dedup_by(|right, left| right.1 == left.1);
+
+        if union_version < self.metadata.lockfile_version {
+            let (mut workspace_packages, mut importers) =
+                self.workspace_union_remapped_to_version(union_version)?;
+            Self::insert_workspace_importer(
+                &mut workspace_packages,
+                &mut importers,
+                importer,
+                snapshot,
+                addressed_packages,
+            )?;
+            self.workspace_packages = workspace_packages;
+            self.importers = importers;
+        } else {
+            Self::insert_workspace_importer(
+                &mut self.workspace_packages,
+                &mut self.importers,
+                importer,
+                snapshot,
+                addressed_packages,
+            )?;
+        }
+        self.metadata.lockfile_version = union_version;
+        Ok(())
+    }
+
+    fn insert_workspace_importer(
+        workspace_packages: &mut BTreeMap<String, LockedPackage>,
+        importers: &mut BTreeMap<String, ImporterSnapshot>,
+        importer: &str,
+        mut snapshot: ImporterSnapshot,
+        addressed_packages: Vec<(PackageKey, String, LockedPackage)>,
+    ) -> Result<(), LockfileError> {
+        for (_, id, package) in &addressed_packages {
+            if let Some(existing) = workspace_packages.get(id)
+                && existing != package
+            {
+                return Err(LockfileError::Serialize(format!(
+                    "workspace package id collision for {id}"
+                )));
+            }
+        }
 
         let mut ids = Vec::with_capacity(addressed_packages.len());
         for (_, id, package) in addressed_packages {
-            match self.workspace_packages.get(&id) {
-                Some(existing) if existing != &package => {
-                    return Err(LockfileError::Serialize(format!(
-                        "workspace package id collision for {id}"
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    self.workspace_packages.insert(id.clone(), package);
-                }
+            if !workspace_packages.contains_key(&id) {
+                workspace_packages.insert(id.clone(), package);
             }
             ids.push(id);
         }
         snapshot.locked_packages = ids;
-        self.metadata.lockfile_version = LOCKFILE_VERSION;
-        self.importers.insert(importer.to_string(), snapshot);
+        importers.insert(importer.to_string(), snapshot);
         Ok(())
+    }
+
+    fn workspace_union_remapped_to_version(
+        &self,
+        lockfile_version: u32,
+    ) -> Result<WorkspaceUnionRows, LockfileError> {
+        let mut remapped_ids = HashMap::with_capacity(self.workspace_packages.len());
+        let mut downgraded = BTreeMap::new();
+        for (old_id, existing_package) in &self.workspace_packages {
+            let mut package = existing_package.clone();
+            Self::downgrade_package_to_version(&mut package, lockfile_version);
+            let new_id = workspace_package_id_for_version(&package, lockfile_version);
+            if let Some(existing) = downgraded.get(&new_id)
+                && existing != &package
+            {
+                return Err(LockfileError::Serialize(format!(
+                    "workspace package id collision for {new_id}"
+                )));
+            }
+            remapped_ids.insert(old_id.clone(), new_id.clone());
+            downgraded.insert(new_id, package);
+        }
+        let mut remapped_importers = self.importers.clone();
+        for snapshot in remapped_importers.values_mut() {
+            let mut remapped_snapshot_ids = HashSet::with_capacity(snapshot.locked_packages.len());
+            for id in &mut snapshot.locked_packages {
+                *id = remapped_ids.get(id.as_str()).cloned().ok_or_else(|| {
+                    LockfileError::Serialize(format!(
+                        "workspace importer references missing package id {id:?}"
+                    ))
+                })?;
+                if !remapped_snapshot_ids.insert(id.clone()) {
+                    return Err(LockfileError::Serialize(
+                        "workspace importer contains package instances that cannot be represented by the downgraded lockfile schema"
+                            .to_string(),
+                    ));
+                }
+            }
+            if lockfile_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+                for root in snapshot.root_resolutions.values_mut() {
+                    root.instance_id = None;
+                }
+            }
+        }
+        Ok((downgraded, remapped_importers))
+    }
+
+    fn downgrade_package_to_version(package: &mut LockedPackage, lockfile_version: u32) {
+        if lockfile_version < LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS {
+            package.manifest_fingerprint = None;
+        }
+        if lockfile_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+            package.instance_id = None;
+            package.dependency_targets.clear();
+            package.peer_targets.clear();
+        }
     }
 
     /// Replace one importer projection and prune union rows no longer
@@ -950,23 +1262,37 @@ impl Lockfile {
             return Ok(());
         }
 
-        let resolver = self
-            .metadata
-            .resolved_with
-            .as_deref()
-            .unwrap_or(DEFAULT_RESOLVED_WITH)
-            .to_string();
-        let mut projections = BTreeMap::new();
-        for key in self.importers.keys().filter(|key| key.as_str() != importer) {
-            projections.insert(key.clone(), self.project_importer(key)?);
-        }
-        projections.insert(importer.to_string(), standalone);
-        let mut rebuilt = Lockfile::new_with_resolver(&resolver);
-        for (key, projection) in projections {
-            rebuilt.absorb_importer(&key, projection)?;
-        }
-        *self = rebuilt;
+        let mut updated = self.clone();
+        updated.replace_workspace_importer_in_place(importer, standalone)?;
+        *self = updated;
         Ok(())
+    }
+
+    fn replace_workspace_importer_in_place(
+        &mut self,
+        importer: &str,
+        standalone: Lockfile,
+    ) -> Result<(), LockfileError> {
+        validate_importer_path(importer)?;
+        self.importers.remove(importer);
+        self.prune_unreachable_workspace_packages();
+        self.absorb_importer(importer, standalone)
+    }
+
+    fn retain_workspace_importers(&mut self, retained_importers: &BTreeSet<String>) {
+        self.importers
+            .retain(|importer, _| retained_importers.contains(importer));
+        self.prune_unreachable_workspace_packages();
+    }
+
+    fn prune_unreachable_workspace_packages(&mut self) {
+        let referenced = self
+            .importers
+            .values()
+            .flat_map(|snapshot| snapshot.locked_packages.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        self.workspace_packages
+            .retain(|id, _| referenced.contains(id.as_str()));
     }
 
     /// Materialize the standalone lockfile view consumed by one importer.
@@ -1021,26 +1347,31 @@ impl Lockfile {
                     "workspace importer {importer:?} references missing package id {id:?}"
                 ))
             })?;
-            if workspace_package_id(package) != *id {
+            if workspace_package_id_for_version(package, self.metadata.lockfile_version) != *id {
                 return Err(LockfileError::Deserialize(format!(
                     "workspace package {id:?} does not match its content address"
                 )));
             }
             keyed_packages.push((package.package_key(), package.clone()));
         }
-        keyed_packages.sort_unstable_by(|(left, _), (right, _)| {
+        keyed_packages.sort_unstable_by(|(left, left_package), (right, right_package)| {
             left.name
                 .cmp(&right.name)
                 .then_with(|| left.version.cmp(&right.version))
                 .then_with(|| left.source_id.cmp(&right.source_id))
+                .then_with(|| left_package.instance_id.cmp(&right_package.instance_id))
         });
-        if keyed_packages.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        if self.metadata.lockfile_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+            && keyed_packages.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        {
             return Err(LockfileError::Deserialize(format!(
                 "workspace importer {importer:?} contains an ambiguous package identity"
             )));
         }
         packages.extend(keyed_packages.into_iter().map(|(_, package)| package));
         projected.packages = packages;
+        projected.validate_peer_edge_targets()?;
+        projected.validate_instance_graph()?;
         Ok(projected)
     }
 
@@ -1129,20 +1460,22 @@ impl Lockfile {
 
         let mut validated_packages = HashMap::with_capacity(self.workspace_packages.len());
         for (id, package) in &self.workspace_packages {
-            if workspace_package_id(package) != *id {
+            if workspace_package_id_for_version(package, self.metadata.lockfile_version) != *id {
                 return Err(LockfileError::Deserialize(format!(
                     "workspace package {id:?} does not match its content address"
                 )));
             }
-            validated_packages.insert(id.as_str(), package.package_key());
+            validated_packages.insert(id.as_str(), (package.package_key(), package.instance_id));
         }
 
         let mut referenced = HashSet::with_capacity(self.workspace_packages.len());
         for (importer, snapshot) in &self.importers {
             validate_importer_path(importer)?;
-            let mut previous: Option<(&str, &PackageKey)> = None;
+            let mut previous: Option<(&str, &(PackageKey, Option<lpm_common::PackageInstanceId>))> =
+                None;
+            let mut importer_packages = Vec::with_capacity(snapshot.locked_packages.len());
             for id in &snapshot.locked_packages {
-                let package_key = validated_packages.get(id.as_str()).ok_or_else(|| {
+                let package_identity = validated_packages.get(id.as_str()).ok_or_else(|| {
                     LockfileError::Deserialize(format!(
                         "workspace importer {importer:?} references missing package id {id:?}"
                     ))
@@ -1154,11 +1487,16 @@ impl Lockfile {
                         )));
                     }
                     let ordering = previous_key
+                        .0
                         .name
-                        .cmp(&package_key.name)
-                        .then_with(|| previous_key.version.cmp(&package_key.version))
-                        .then_with(|| previous_key.source_id.cmp(&package_key.source_id));
-                    if ordering.is_eq() {
+                        .cmp(&package_identity.0.name)
+                        .then_with(|| previous_key.0.version.cmp(&package_identity.0.version))
+                        .then_with(|| previous_key.0.source_id.cmp(&package_identity.0.source_id))
+                        .then_with(|| previous_key.1.cmp(&package_identity.1));
+                    if ordering.is_eq()
+                        || self.metadata.lockfile_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+                            && previous_key.0 == package_identity.0
+                    {
                         return Err(LockfileError::Deserialize(format!(
                             "workspace importer {importer:?} contains an ambiguous package identity"
                         )));
@@ -1169,8 +1507,22 @@ impl Lockfile {
                         )));
                     }
                 }
-                previous = Some((id, package_key));
+                previous = Some((id, package_identity));
                 referenced.insert(id.as_str());
+                importer_packages.push(&self.workspace_packages[id]);
+            }
+            Self::validate_peer_edge_targets_in_packages(
+                Some(importer),
+                importer_packages.iter().copied(),
+            )?;
+            if self.metadata.lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+                Self::validate_instance_graph_in_packages(
+                    Some(importer),
+                    importer_packages.iter().copied(),
+                    &snapshot.root_resolutions,
+                    &snapshot.ambient_peer_installs,
+                    Some(snapshot),
+                )?;
             }
             if !snapshot.provenance.is_empty() {
                 self.project_validated_importer(importer)?
@@ -1208,20 +1560,594 @@ impl Lockfile {
     }
 
     /// Package-shape invariants that hold for both the TOML and
-    /// binary read sides. Currently: `@lpm.dev/*` scope-pinning.
-    pub fn validate_loaded_packages(packages: &[LockedPackage]) -> Result<(), LockfileError> {
-        for pkg in packages {
-            if let Some(url) = pkg.lpm_scope_origin_mismatch() {
-                return Err(LockfileError::InvalidScopeOrigin {
+    /// binary read sides.
+    pub fn validate_loaded_package(pkg: &LockedPackage) -> Result<(), LockfileError> {
+        Self::validate_package_identity(pkg)?;
+        match pkg.source_kind() {
+            Some(Err(error)) => {
+                return Err(LockfileError::InvalidPackageField {
                     package: pkg.name.clone(),
-                    url,
+                    field: "source",
+                    reason: error.to_string(),
                 });
             }
-            if let Some(reason) = pkg.git_metadata_error() {
+            Some(Ok(Source::Tarball { .. })) if pkg.integrity.is_none() => {
+                return Err(LockfileError::MissingPackageIntegrity {
+                    package: pkg.name.clone(),
+                    source_kind: "tarball",
+                });
+            }
+            Some(Ok(Source::Git { .. })) if pkg.integrity.is_none() => {
+                return Err(LockfileError::MissingPackageIntegrity {
+                    package: pkg.name.clone(),
+                    source_kind: "Git",
+                });
+            }
+            Some(Ok(Source::Directory { .. })) if pkg.integrity.is_some() => {
+                return Err(LockfileError::UnexpectedPackageIntegrity {
+                    package: pkg.name.clone(),
+                    source_kind: "directory",
+                });
+            }
+            Some(Ok(Source::Link { .. })) if pkg.integrity.is_some() => {
+                return Err(LockfileError::UnexpectedPackageIntegrity {
+                    package: pkg.name.clone(),
+                    source_kind: "link",
+                });
+            }
+            Some(Ok(Source::Directory { .. } | Source::Link { .. })) => {
+                if let Some(fingerprint) = pkg.manifest_fingerprint.as_deref()
+                    && !valid_sha256_prefixed_hex(fingerprint)
+                {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?} has an invalid local manifest fingerprint",
+                        pkg.name
+                    )));
+                }
+            }
+            Some(Ok(_)) | None => {}
+        }
+        if pkg.manifest_fingerprint.is_some()
+            && !matches!(
+                pkg.source_kind(),
+                Some(Ok(Source::Directory { .. } | Source::Link { .. }))
+            )
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} has a local manifest fingerprint on a non-local source",
+                pkg.name
+            )));
+        }
+        if let Some(source) = pkg.lpm_scope_origin_mismatch() {
+            return Err(LockfileError::InvalidScopeOrigin {
+                package: pkg.name.clone(),
+                source_identity: source,
+            });
+        }
+        if let Some(reason) = pkg.git_metadata_error() {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} has invalid git metadata: {reason}",
+                pkg.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_package_schema(
+        pkg: &LockedPackage,
+        lockfile_version: u32,
+    ) -> Result<(), LockfileError> {
+        let local_source = matches!(
+            pkg.source_kind(),
+            Some(Ok(Source::Directory { .. } | Source::Link { .. }))
+        );
+        if lockfile_version >= LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS
+            && local_source
+            && pkg.manifest_fingerprint.is_none()
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} is a mutable local source without a manifest fingerprint",
+                pkg.name
+            )));
+        }
+        if lockfile_version < LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS
+            && pkg.manifest_fingerprint.is_some()
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} uses local manifest fingerprint metadata before lockfile version {}",
+                pkg.name, LOCKFILE_VERSION_WITH_LOCAL_MANIFEST_FINGERPRINTS
+            )));
+        }
+        if lockfile_version >= LOCKFILE_VERSION_WITH_STRUCTURED_PEERS && !pkg.peers.is_empty() {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} uses legacy peer metadata in lockfile version {}",
+                pkg.name, LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+            )));
+        }
+        if lockfile_version < LOCKFILE_VERSION_WITH_STRUCTURED_PEERS && !pkg.peer_edges.is_empty() {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} uses structured peer metadata before lockfile version {}",
+                pkg.name, LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
+            )));
+        }
+        let exact_instance_schema = lockfile_version >= LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES;
+        if exact_instance_schema && pkg.instance_id.is_none() {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} is missing instance-id in lockfile version {}",
+                pkg.name, LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+            )));
+        }
+        if !exact_instance_schema
+            && (pkg.instance_id.is_some()
+                || !pkg.dependency_targets.is_empty()
+                || !pkg.peer_targets.is_empty())
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} uses exact instance metadata before lockfile version {}",
+                pkg.name, LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+            )));
+        }
+        let mut dependency_slots = HashSet::with_capacity(pkg.dependencies.len());
+        for dependency in &pkg.dependencies {
+            let Some(at) = dependency.rfind('@') else {
                 return Err(LockfileError::Deserialize(format!(
-                    "package {:?} has invalid git metadata: {reason}",
+                    "package {:?} has malformed dependency edge {:?}: missing exact version separator",
+                    pkg.name, dependency
+                )));
+            };
+            let (local_name, version_with_separator) = dependency.split_at(at);
+            let version = &version_with_separator[1..];
+            if local_name.is_empty() || version.is_empty() {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} has malformed dependency edge {:?}: local name and exact version are required",
+                    pkg.name, dependency
+                )));
+            }
+            validate_package_name(local_name).map_err(|reason| {
+                LockfileError::Deserialize(format!(
+                    "package {:?} has invalid dependency local name {:?}: {reason}",
+                    pkg.name, local_name
+                ))
+            })?;
+            if let Err(error) = node_semver::Version::parse(version)
+                && !(exact_instance_schema && is_source_dependency_id(version))
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} has invalid dependency exact version or source identity {:?}: {error}",
+                    pkg.name, version
+                )));
+            }
+            if !dependency_slots.insert(local_name) {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} contains duplicate dependency slot {:?}",
+                    pkg.name, local_name
+                )));
+            }
+        }
+        if exact_instance_schema
+            && pkg
+                .dependency_targets
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                != dependency_slots
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} dependency-target slots do not match dependency slots",
+                pkg.name
+            )));
+        }
+        let mut alias_slots = HashSet::with_capacity(pkg.alias_dependencies.len());
+        for [local_name, target_name] in &pkg.alias_dependencies {
+            validate_package_name(local_name).map_err(|reason| {
+                LockfileError::Deserialize(format!(
+                    "package {:?} has invalid alias local name {:?}: {reason}",
+                    pkg.name, local_name
+                ))
+            })?;
+            validate_package_name(target_name).map_err(|reason| {
+                LockfileError::Deserialize(format!(
+                    "package {:?} has invalid alias target name {:?}: {reason}",
+                    pkg.name, target_name
+                ))
+            })?;
+            if !alias_slots.insert(local_name.as_str()) {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} contains duplicate alias slot {:?}",
+                    pkg.name, local_name
+                )));
+            }
+            if !dependency_slots.contains(local_name.as_str()) {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} alias slot {:?} has no matching dependency edge",
+                    pkg.name, local_name
+                )));
+            }
+        }
+        let mut peer_slots = HashSet::with_capacity(pkg.peer_edges.len());
+        for peer in &pkg.peer_edges {
+            if peer.local_name.is_empty()
+                || peer.target_name.is_empty()
+                || peer.target_version.is_empty()
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} has a structured peer edge with an empty identity field",
                     pkg.name
                 )));
+            }
+            validate_package_name(&peer.local_name).map_err(|reason| {
+                LockfileError::Deserialize(format!(
+                    "package {:?} has invalid peer local name {:?}: {reason}",
+                    pkg.name, peer.local_name
+                ))
+            })?;
+            Self::validate_package_name_and_version(&peer.target_name, &peer.target_version)?;
+            if !peer_slots.insert(peer.local_name.as_str()) {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} contains duplicate peer slot {:?}",
+                    pkg.name, peer.local_name
+                )));
+            }
+            if dependency_slots.contains(peer.local_name.as_str()) {
+                return Err(LockfileError::Deserialize(format!(
+                    "package {:?} uses local slot {:?} as both dependency and peer",
+                    pkg.name, peer.local_name
+                )));
+            }
+        }
+        if exact_instance_schema
+            && pkg
+                .peer_targets
+                .keys()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                != peer_slots
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?} peer-target slots do not match peer slots",
+                pkg.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_root_resolution_schema(
+        root_resolutions: &RootResolutions,
+        lockfile_version: u32,
+    ) -> Result<(), LockfileError> {
+        if lockfile_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+            && let Some(local_name) = root_resolutions
+                .iter()
+                .find_map(|(local_name, root)| root.instance_id.map(|_| local_name))
+        {
+            return Err(LockfileError::Deserialize(format!(
+                "root resolution {local_name:?} uses instance-id metadata before lockfile version {}",
+                LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn validate_package_name_and_version(
+        name: &str,
+        version: &str,
+    ) -> Result<(), LockfileError> {
+        validate_package_name(name).map_err(|reason| LockfileError::InvalidPackageField {
+            package: name.to_string(),
+            field: "name",
+            reason,
+        })?;
+        node_semver::Version::parse(version).map_err(|error| {
+            LockfileError::InvalidPackageField {
+                package: name.to_string(),
+                field: "version",
+                reason: error.to_string(),
+            }
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_package_identity(pkg: &LockedPackage) -> Result<(), LockfileError> {
+        Self::validate_package_name_and_version(&pkg.name, &pkg.version)?;
+        if let Some(integrity) = pkg.integrity.as_deref() {
+            if integrity.is_empty() {
+                return Err(LockfileError::InvalidPackageField {
+                    package: pkg.name.clone(),
+                    field: "integrity",
+                    reason: "empty 'integrity' is invalid".to_string(),
+                });
+            }
+            lpm_common::Integrity::parse(integrity).map_err(|error| {
+                LockfileError::InvalidPackageField {
+                    package: pkg.name.clone(),
+                    field: "integrity",
+                    reason: error.to_string(),
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_loaded_packages(packages: &[LockedPackage]) -> Result<(), LockfileError> {
+        for pkg in packages {
+            Self::validate_loaded_package(pkg)?;
+        }
+        Self::validate_standalone_package_order(packages)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_standalone_package_order(
+        packages: &[LockedPackage],
+    ) -> Result<(), LockfileError> {
+        let mut previous: Option<(PackageKey, Option<lpm_common::PackageInstanceId>)> = None;
+        for package in packages {
+            let key = package.package_key();
+            let identity = (key, package.instance_id);
+            if let Some((previous_key, previous_instance_id)) = previous.as_ref() {
+                let ordering = previous_key
+                    .name
+                    .cmp(&identity.0.name)
+                    .then_with(|| previous_key.version.cmp(&identity.0.version))
+                    .then_with(|| previous_key.source_id.cmp(&identity.0.source_id))
+                    .then_with(|| previous_instance_id.cmp(&identity.1));
+                if ordering.is_eq() {
+                    return Err(LockfileError::Deserialize(format!(
+                        "duplicate package identity {:?}",
+                        identity.0.lockfile_id()
+                    )));
+                }
+                if ordering.is_gt() {
+                    return Err(LockfileError::Deserialize(
+                        "standalone packages are not in package identity order".to_string(),
+                    ));
+                }
+            }
+            previous = Some(identity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_instance_graph(&self) -> Result<(), LockfileError> {
+        if self.metadata.lockfile_version < LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES {
+            return Ok(());
+        }
+        Self::validate_instance_graph_in_packages(
+            None,
+            self.packages.iter(),
+            &self.root_resolutions,
+            &self.ambient_peer_installs,
+            self.importers.get("."),
+        )
+    }
+
+    fn validate_instance_graph_in_packages<'a>(
+        importer: Option<&str>,
+        mut packages: impl Iterator<Item = &'a LockedPackage> + Clone,
+        root_resolutions: &RootResolutions,
+        ambient_peer_installs: &[String],
+        importer_snapshot: Option<&ImporterSnapshot>,
+    ) -> Result<(), LockfileError> {
+        let importer_context = importer
+            .map(|importer| format!(" in workspace importer {importer:?}"))
+            .unwrap_or_default();
+        let mut by_instance = HashMap::new();
+        for package in packages.clone() {
+            Self::validate_package_schema(package, LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES)?;
+            let instance_id = package.instance_id.ok_or_else(|| {
+                LockfileError::Deserialize(format!(
+                    "package {:?}{importer_context} is missing instance-id",
+                    package.name
+                ))
+            })?;
+            if by_instance.insert(instance_id, package).is_some() {
+                return Err(LockfileError::Deserialize(format!(
+                    "duplicate package instance-id {instance_id}{importer_context}"
+                )));
+            }
+        }
+        for package in packages.clone() {
+            let aliases = package
+                .alias_dependencies
+                .iter()
+                .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+                .collect::<HashMap<_, _>>();
+            let dependency_versions = package
+                .dependencies
+                .iter()
+                .filter_map(|dependency| {
+                    dependency
+                        .rfind('@')
+                        .map(|at| (&dependency[..at], &dependency[at + 1..]))
+                })
+                .collect::<HashMap<_, _>>();
+            for (local_name, target_id) in &package.dependency_targets {
+                let target = by_instance.get(target_id).ok_or_else(|| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} dependency slot {:?} references missing instance {target_id}",
+                        package.name, local_name
+                    ))
+                })?;
+                let expected_name = aliases
+                    .get(local_name.as_str())
+                    .copied()
+                    .unwrap_or(local_name.as_str());
+                let expected_version = dependency_versions.get(local_name.as_str()).ok_or_else(|| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} dependency target {:?} has no matching dependency edge",
+                        package.name, local_name
+                    ))
+                })?;
+                let expected_target_value = match target.source_kind() {
+                    Some(Ok(Source::Registry { .. })) | None => target.version.clone(),
+                    Some(Ok(source)) => source.source_id(),
+                    Some(Err(_)) => continue,
+                };
+                if target.name != expected_name || expected_target_value != **expected_version {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} dependency slot {:?} metadata disagrees with target instance {target_id}",
+                        package.name, local_name
+                    )));
+                }
+            }
+            for peer in &package.peer_edges {
+                let target_id = package.peer_targets.get(&peer.local_name).ok_or_else(|| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} peer slot {:?} has no exact target",
+                        package.name, peer.local_name
+                    ))
+                })?;
+                let target = by_instance.get(target_id).ok_or_else(|| {
+                    LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} peer slot {:?} references missing instance {target_id}",
+                        package.name, peer.local_name
+                    ))
+                })?;
+                let wrapper_id = match target.source_kind() {
+                    Some(Ok(Source::Registry { .. })) | None => None,
+                    Some(Ok(source)) => Some(source.source_id()),
+                    Some(Err(_)) => continue,
+                };
+                if target.name != peer.target_name
+                    || target.version != peer.target_version
+                    || wrapper_id != peer.target_wrapper_id
+                {
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} peer slot {:?} metadata disagrees with target instance {target_id}",
+                        package.name, peer.local_name
+                    )));
+                }
+            }
+        }
+        let declared_roots = importer_snapshot.map(|snapshot| {
+            snapshot
+                .dependencies
+                .keys()
+                .chain(snapshot.dev_dependencies.keys())
+                .chain(snapshot.optional_dependencies.keys())
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        });
+        if !ambient_peer_installs.is_empty() && declared_roots.is_none() {
+            return Err(LockfileError::Deserialize(format!(
+                "ambient peer roots{importer_context} require an importer snapshot"
+            )));
+        }
+
+        let mut pending = Vec::with_capacity(root_resolutions.len());
+        for (local_name, root) in root_resolutions {
+            let target_id = root.instance_id.ok_or_else(|| {
+                LockfileError::Deserialize(format!(
+                    "root resolution {local_name:?}{importer_context} is missing instance-id"
+                ))
+            })?;
+            let target = by_instance.get(&target_id).ok_or_else(|| {
+                LockfileError::Deserialize(format!(
+                    "root resolution {local_name:?}{importer_context} references missing instance {target_id}"
+                ))
+            })?;
+            if target.name != root.package
+                || target.version != root.version
+                || target.source != root.source
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "root resolution {local_name:?}{importer_context} metadata disagrees with target instance {target_id}"
+                )));
+            }
+            if declared_roots
+                .as_ref()
+                .is_none_or(|declared| declared.contains(local_name.as_str()))
+            {
+                pending.push(target_id);
+            }
+        }
+        let mut reachable = HashSet::with_capacity(by_instance.len());
+        while let Some(instance_id) = pending.pop() {
+            if !reachable.insert(instance_id) {
+                continue;
+            }
+            let package = by_instance[&instance_id];
+            pending.extend(package.dependency_targets.values().copied());
+            pending.extend(package.peer_targets.values().copied());
+        }
+        let mut ambient_names = HashSet::with_capacity(ambient_peer_installs.len());
+        for local_name in ambient_peer_installs {
+            if !ambient_names.insert(local_name.as_str()) {
+                return Err(LockfileError::Deserialize(format!(
+                    "duplicate ambient peer root {local_name:?}{importer_context}"
+                )));
+            }
+            if declared_roots
+                .as_ref()
+                .is_some_and(|declared| declared.contains(local_name.as_str()))
+            {
+                return Err(LockfileError::Deserialize(format!(
+                    "ambient peer root {local_name:?}{importer_context} is already manifest-declared"
+                )));
+            }
+            let target_id = root_resolutions
+                .get(local_name)
+                .and_then(|root| root.instance_id)
+                .ok_or_else(|| {
+                    LockfileError::Deserialize(format!(
+                        "ambient peer root {local_name:?}{importer_context} has no exact root resolution"
+                    ))
+                })?;
+            if !reachable.contains(&target_id) {
+                return Err(LockfileError::Deserialize(format!(
+                    "ambient peer root {local_name:?}{importer_context} is unreachable from manifest-declared dependencies"
+                )));
+            }
+        }
+        if let Some(package) = packages.find(|package| {
+            package
+                .instance_id
+                .is_some_and(|instance_id| !reachable.contains(&instance_id))
+        }) {
+            return Err(LockfileError::Deserialize(format!(
+                "package {:?}{importer_context} is unreachable from every exact root",
+                package.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_peer_edge_targets(&self) -> Result<(), LockfileError> {
+        Self::validate_peer_edge_targets_in_packages(None, self.packages.iter())
+    }
+
+    fn validate_peer_edge_targets_in_packages<'a>(
+        importer: Option<&str>,
+        packages: impl Iterator<Item = &'a LockedPackage> + Clone,
+    ) -> Result<(), LockfileError> {
+        let mut targets: HashSet<(&str, &str, Option<Cow<'_, str>>)> = HashSet::new();
+        for package in packages.clone() {
+            let wrapper_id = match package.source_kind() {
+                Some(Ok(Source::Registry { .. })) | None => None,
+                Some(Ok(source)) => Some(Cow::Owned(source.source_id())),
+                Some(Err(_)) => continue,
+            };
+            targets.insert((package.name.as_str(), package.version.as_str(), wrapper_id));
+        }
+        for package in packages {
+            for peer in &package.peer_edges {
+                let identity = (
+                    peer.target_name.as_str(),
+                    peer.target_version.as_str(),
+                    peer.target_wrapper_id.as_deref().map(Cow::Borrowed),
+                );
+                if !targets.contains(&identity) {
+                    let importer_context = importer
+                        .map(|importer| format!(" in workspace importer {importer:?}"))
+                        .unwrap_or_default();
+                    return Err(LockfileError::Deserialize(format!(
+                        "package {:?}{importer_context} peer slot {:?} references missing or source-mismatched target {}@{} wrapper_id={:?}",
+                        package.name,
+                        peer.local_name,
+                        peer.target_name,
+                        peer.target_version,
+                        peer.target_wrapper_id,
+                    )));
+                }
             }
         }
         Ok(())
@@ -1421,6 +2347,20 @@ impl ValidatedLockfile {
     pub fn importer_packages(&self, importer: &str) -> Result<Vec<&LockedPackage>, LockfileError> {
         self.0.validated_importer_packages(importer)
     }
+
+    /// Reuse validated union rows while pruning removed importers and replacing changed ones.
+    pub fn update_workspace_importers(
+        &self,
+        retained_importers: &BTreeSet<String>,
+        replacements: BTreeMap<String, Lockfile>,
+    ) -> Result<Lockfile, LockfileError> {
+        let mut updated = self.0.clone();
+        updated.retain_workspace_importers(retained_importers);
+        for (importer, replacement) in replacements {
+            updated.replace_workspace_importer_in_place(&importer, replacement)?;
+        }
+        Ok(updated)
+    }
 }
 
 impl Default for ValidatedLockfile {
@@ -1435,21 +2375,31 @@ impl Default for Lockfile {
     }
 }
 
+fn is_source_dependency_id(value: &str) -> bool {
+    matches!(value.as_bytes(), [b'f' | b'l' | b't' | b'g', b'-', hex @ ..]
+        if hex.len() == 16
+            && hex.iter().all(u8::is_ascii_hexdigit)
+            && hex.iter().all(|byte| !byte.is_ascii_uppercase()))
+}
+
 /// Validate that a package source URL in the lockfile is safe.
 ///
 /// Accepts HTTPS registries, localhost registries used for development,
 /// and public GitHub repositories pinned to an exact lowercase commit.
 /// Returns `false` for insecure or credential-bearing network sources.
 pub fn is_safe_source(source: &str) -> bool {
-    // Allow HTTPS registries (any host)
-    if source.starts_with("registry+https://") {
-        return true;
-    }
-    // Allow localhost/loopback for development
-    if source.starts_with("registry+http://localhost")
-        || source.starts_with("registry+http://127.0.0.1")
-    {
-        return true;
+    if let Some(raw_url) = source.strip_prefix("registry+") {
+        let Ok(url) = url::Url::parse(raw_url) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        if !url.username().is_empty() || url.password().is_some() {
+            return false;
+        }
+        return url.scheme() == "https"
+            || url.scheme() == "http" && lpm_common::is_loopback_host(host);
     }
     is_safe_github_source(source)
 }

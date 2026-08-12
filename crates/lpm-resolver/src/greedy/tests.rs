@@ -14,34 +14,9 @@ use super::version::*;
 use crate::policy::{TrustPolicyMode, parse_npm_time_unix};
 use crate::provider::{CachedDistInfo, CachedPackageInfo};
 use std::future::Future;
-use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::instrument::WithSubscriber as _;
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct TraceBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl Write for TraceBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("trace buffer poisoned").extend(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'writer> MakeWriter<'writer> for TraceBuffer {
-    type Writer = TraceBuffer;
-
-    fn make_writer(&'writer self) -> Self::Writer {
-        self.clone()
-    }
-}
 
 struct ScopedEnvVars {
     originals: Vec<(&'static str, Option<String>)>,
@@ -150,6 +125,7 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
         versions: parsed,
         deps: deps_map,
         peer_deps: HashMap::new(),
+        peer_aliases: HashMap::new(),
         optional_dep_names: HashMap::new(),
         optional_peer_names: HashMap::new(),
         node_engines: HashMap::new(),
@@ -1567,6 +1543,10 @@ fn process_edge_counts_override_path_no_version_attempt() {
 fn selected_package_cardinality_counts_duplicate_canonicals() {
     let packages = vec![
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: ResolverPackage::Npm {
                 name: "debug".to_string(),
                 context: None,
@@ -1582,6 +1562,10 @@ fn selected_package_cardinality_counts_duplicate_canonicals() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: ResolverPackage::Npm {
                 name: "debug".to_string(),
                 context: None,
@@ -1597,6 +1581,10 @@ fn selected_package_cardinality_counts_duplicate_canonicals() {
             optional: false,
         },
         ResolvedPackage {
+            resolution_id: lpm_common::ResolutionNodeId::UNASSIGNED,
+            dependency_targets: HashMap::new(),
+            optional_dependencies: HashSet::new(),
+            peer_targets: HashMap::new(),
             package: ResolverPackage::Npm {
                 name: "ms".to_string(),
                 context: None,
@@ -1622,7 +1610,7 @@ fn process_edge_emits_selected_package_event_only_for_new_nodes() {
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), "^4.0.0".to_string());
     let mut state = ResolveState::new(deps, OverrideSet::empty());
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     state.set_selected_package_tx(Some(tx));
     state.seed_root_edges().unwrap();
 
@@ -2124,7 +2112,8 @@ fn enqueue_child_deps_skips_bundled_names() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .unwrap();
 
     let queued: Vec<&str> = state
         .task_queue
@@ -2163,7 +2152,8 @@ fn enqueue_child_deps_no_bundled_names_unchanged() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .unwrap();
 
     let mut queued: Vec<&str> = state
         .task_queue
@@ -2199,7 +2189,8 @@ fn enqueue_child_deps_omits_optional_dependencies_when_disabled() {
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .unwrap();
 
     let queued: Vec<&str> = state
         .task_queue
@@ -2233,12 +2224,7 @@ fn seed_root_edges_rejects_workspace_specifier() {
 }
 
 #[test]
-fn enqueue_child_deps_skips_workspace_specifier_with_warn() {
-    // Registry-published packages should not declare `workspace:`
-    // deps. If a malformed cache entry slips one in, the transitive
-    // edge is silently skipped (continue) rather than failing the
-    // whole resolve. Mirrors the existing "invalid range" branch's
-    // skip-with-warn semantic.
+fn enqueue_child_deps_rejects_required_workspace_specifier() {
     let mut info = mk_info(&["1.0.0"], &[]);
     let mut deps_of_latest = HashMap::new();
     deps_of_latest.insert("workspace-leak".to_string(), "workspace:^1".to_string());
@@ -2252,22 +2238,103 @@ fn enqueue_child_deps_skips_workspace_specifier_with_warn() {
         optional: false,
         children: Vec::new(),
     });
-    enqueue_child_deps(
+    let error = enqueue_child_deps(
         0,
         &CanonicalKey::npm("parent"),
         &NpmVersion::parse("1.0.0").unwrap(),
         &info,
         &mut state,
-    );
+    )
+    .expect_err("required workspace dependency must fail");
 
-    // Only `plain-dep` should have been enqueued; `workspace-leak`
-    // got skipped at the workspace-specifier guard.
-    let queued: Vec<&str> = state
-        .task_queue
-        .iter()
-        .map(|e| e.local_name.as_str())
-        .collect();
-    assert_eq!(queued, vec!["plain-dep"]);
+    assert!(error.to_string().contains("workspace-leak"));
+}
+
+#[test]
+fn enqueue_child_deps_skips_workspace_edge_for_selected_workspace_version() {
+    let mut info = mk_info(
+        &["1.0.0"],
+        &[
+            ("registry-child", "^2.0.0"),
+            ("workspace-child", "workspace:*"),
+        ],
+    );
+    info.workspace_versions
+        .insert(NpmVersion::parse("1.0.0").unwrap());
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("workspace-parent"),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+
+    enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("workspace-parent"),
+        &NpmVersion::parse("1.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .unwrap();
+
+    assert_eq!(state.task_queue.len(), 1);
+    assert_eq!(state.task_queue[0].local_name, "registry-child");
+}
+
+#[test]
+fn enqueue_child_deps_rejects_workspace_edge_for_unmarked_selected_version() {
+    let mut info = mk_info(&["2.0.0"], &[("workspace-child", "workspace:*")]);
+    info.workspace_versions
+        .insert(NpmVersion::parse("1.0.0").unwrap());
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("registry-parent"),
+        version: NpmVersion::parse("2.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+
+    let error = enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("registry-parent"),
+        &NpmVersion::parse("2.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .expect_err("workspace marker for another version must not exempt registry metadata");
+
+    assert!(error.to_string().contains("workspace-child"));
+}
+
+#[test]
+fn enqueue_child_deps_rejects_invalid_required_range() {
+    let mut info = mk_info(&["1.0.0"], &[]);
+    info.deps.insert(
+        "1.0.0".to_string(),
+        HashMap::from([("malformed-child".to_string(), "not-a-range".to_string())]),
+    );
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("parent"),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+
+    let error = enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("parent"),
+        &NpmVersion::parse("1.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .expect_err("invalid required range must fail");
+
+    let message = error.to_string();
+    assert!(message.contains("parent@1.0.0"));
+    assert!(message.contains("malformed-child"));
+    assert!(message.contains("not-a-range"));
 }
 
 #[test]
@@ -2346,7 +2413,8 @@ fn enqueue_for_parent(parent_canonical: CanonicalKey, info: &CachedPackageInfo) 
         &NpmVersion::parse("1.0.0").unwrap(),
         info,
         &mut state,
-    );
+    )
+    .unwrap();
     state
 }
 
@@ -2486,7 +2554,7 @@ fn peer_collection_alias_aware() {
     // Inject the alias map for the latest version.
     let mut aliases = HashMap::new();
     aliases.insert("my-react".to_string(), "react".to_string());
-    info.aliases.insert("1.0.0".to_string(), aliases);
+    info.peer_aliases.insert("1.0.0".to_string(), aliases);
 
     let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
     assert_eq!(state.peer_requirements.len(), 1);
@@ -2500,55 +2568,101 @@ fn peer_collection_alias_aware() {
 }
 
 #[test]
-fn peer_collection_skips_workspace_specifier() {
-    // A registry-published manifest declaring a `workspace:` peer
-    // is malformed (npm rejects at publish time). The collector
-    // skips it with a workspace-specific log rather than letting
-    // `NpmRange::parse` emit an opaque semver error. Mirrors the
-    // regular-deps loop.
+fn peer_collection_rejects_required_workspace_specifier() {
     let info = mk_info_with_peers(
         &["1.0.0"],
         &[],
         &[("legit-peer", "^1.0.0"), ("internal-peer", "workspace:*")],
         &[],
     );
-    let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
-
-    let names: Vec<&str> = state
-        .peer_requirements
-        .iter()
-        .map(|r| r.peer_name.as_str())
-        .collect();
-    assert_eq!(
-        names,
-        vec!["legit-peer"],
-        "workspace: peer skipped; legit peer recorded"
-    );
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("parent"),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+    let error = enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("parent"),
+        &NpmVersion::parse("1.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .expect_err("required workspace peer must fail");
+    assert!(error.to_string().contains("internal-peer"));
 }
 
 #[test]
-fn peer_collection_skips_invalid_range() {
-    // Defense: an unparseable peer range emits a debug warn and
-    // is skipped. Does NOT panic / propagate an error — the
-    // resolver must continue resolving the rest of the graph.
+fn peer_collection_skips_workspace_peer_for_selected_workspace_version() {
+    let mut info = mk_info_with_peers(
+        &["1.0.0"],
+        &[],
+        &[
+            ("registry-peer", "^1.0.0"),
+            ("workspace-peer", "workspace:*"),
+        ],
+        &[],
+    );
+    info.workspace_versions
+        .insert(NpmVersion::parse("1.0.0").unwrap());
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("workspace-parent"),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+
+    enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("workspace-parent"),
+        &NpmVersion::parse("1.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .unwrap();
+
+    assert_eq!(state.peer_requirements.len(), 1);
+    assert_eq!(state.peer_requirements[0].peer_name, "registry-peer");
+}
+
+#[test]
+fn peer_collection_rejects_invalid_required_range() {
     let info = mk_info_with_peers(
         &["1.0.0"],
         &[],
         &[("good-peer", "^1.0.0"), ("bad-peer", "this-is-not-semver")],
         &[],
     );
-    let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    state.nodes.push(ResolvedNodeBuilder {
+        canonical: CanonicalKey::npm("parent"),
+        version: NpmVersion::parse("1.0.0").unwrap(),
+        optional: false,
+        children: Vec::new(),
+    });
+    let error = enqueue_child_deps(
+        0,
+        &CanonicalKey::npm("parent"),
+        &NpmVersion::parse("1.0.0").unwrap(),
+        &info,
+        &mut state,
+    )
+    .expect_err("invalid required peer range must fail");
+    assert!(error.to_string().contains("bad-peer"));
+}
 
-    let names: Vec<&str> = state
-        .peer_requirements
-        .iter()
-        .map(|r| r.peer_name.as_str())
-        .collect();
-    assert_eq!(
-        names,
-        vec!["good-peer"],
-        "unparseable peer range skipped silently"
+#[test]
+fn peer_collection_skips_invalid_optional_range() {
+    let info = mk_info_with_peers(
+        &["1.0.0"],
+        &[],
+        &[("bad-peer", "this-is-not-semver")],
+        &["bad-peer"],
     );
+    let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
+    assert!(state.peer_requirements.is_empty());
 }
 
 #[test]
@@ -2776,9 +2890,10 @@ fn root_edge_allocates_best_version_when_only_lower_existing_version_satisfies_r
 fn into_resolved_packages_binds_peer_by_consumer_range() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     push_node(&mut state, CanonicalKey::Root, "0.0.0");
-    push_node(&mut state, CanonicalKey::npm("plugin"), "1.0.0");
-    push_node(&mut state, CanonicalKey::npm("react"), "17.0.2");
+    let plugin_id = push_node(&mut state, CanonicalKey::npm("plugin"), "1.0.0");
+    let react_17_id = push_node(&mut state, CanonicalKey::npm("react"), "17.0.2");
     push_node(&mut state, CanonicalKey::npm("react"), "18.2.0");
+    state.record_exact_peer_binding(plugin_id, "react".to_string(), react_17_id);
 
     let mut cache = HashMap::new();
     cache.insert(
@@ -2802,8 +2917,12 @@ fn into_resolved_packages_binds_peer_by_consumer_range() {
         .expect("plugin package present");
     assert_eq!(
         plugin.peers,
-        vec![("react".to_string(), "17.0.2".to_string())],
-        "greedy finalization should bind the peer version satisfying the consumer range"
+        vec![lpm_common::PeerEdge::registry("react", "react", "17.0.2")],
+        "greedy finalization should preserve the peer selected for this exact consumer"
+    );
+    assert_eq!(
+        plugin.peer_targets.get("react"),
+        Some(&lpm_common::ResolutionNodeId::new(react_17_id)),
     );
 }
 
@@ -2935,6 +3054,117 @@ async fn peer_drain_synthesizes_ambient_for_missing_peer() {
 }
 
 #[tokio::test]
+async fn peer_drain_skips_a_too_new_version_when_release_age_is_active() {
+    let policy = ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default());
+    let mut state = ResolveState::new_with_options_and_policy(
+        HashMap::new(),
+        OverrideSet::empty(),
+        true,
+        policy,
+    );
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("peer-consumer"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "peer-host",
+        CanonicalKey::npm("peer-host"),
+        "^1.0.0",
+        false,
+    ));
+    let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "1.1.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    let info = Arc::new(info);
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = Arc::clone(&info);
+        async move { Ok(info) }
+    })
+    .await
+    .expect("an older policy-compliant peer version should be selected");
+
+    assert_eq!(synthesized.len(), 1);
+    assert!(
+        synthesized[0]
+            .range
+            .satisfies(&NpmVersion::parse("1.0.0").unwrap())
+    );
+    assert!(
+        !synthesized[0]
+            .range
+            .satisfies(&NpmVersion::parse("1.1.0").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn peer_drain_latest_never_selects_above_the_dist_tag_target() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("peer-consumer"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "peer-host",
+        CanonicalKey::npm("peer-host"),
+        "latest",
+        false,
+    ));
+    let mut info = mk_info(&["4.0.0", "3.1.0", "3.0.0"], &[]);
+    info.latest_version = Some(NpmVersion::parse("3.1.0").unwrap());
+    let info = Arc::new(info);
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = Arc::clone(&info);
+        async move { Ok(info) }
+    })
+    .await
+    .expect("the latest peer tag should synthesize an ambient provider");
+
+    assert_eq!(synthesized.len(), 1);
+    assert!(
+        synthesized[0]
+            .range
+            .satisfies(&NpmVersion::parse("3.1.0").unwrap())
+    );
+    assert!(
+        !synthesized[0]
+            .range
+            .satisfies(&NpmVersion::parse("4.0.0").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn peer_drain_latest_does_not_bind_an_existing_version_above_the_dist_tag() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    push_node(&mut state, CanonicalKey::npm("peer-host"), "4.0.0");
+    let consumer = push_node(&mut state, CanonicalKey::npm("peer-consumer"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "peer-host",
+        CanonicalKey::npm("peer-host"),
+        "latest",
+        false,
+    ));
+    let mut info = mk_info(&["4.0.0", "3.1.0"], &[]);
+    info.latest_version = Some(NpmVersion::parse("3.1.0").unwrap());
+    let info = Arc::new(info);
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = Arc::clone(&info);
+        async move { Ok(info) }
+    })
+    .await
+    .expect("latest must synthesize the dist-tag target instead of binding 4.0.0");
+
+    assert_eq!(synthesized.len(), 1);
+    assert!(
+        synthesized[0]
+            .range
+            .satisfies(&NpmVersion::parse("3.1.0").unwrap())
+    );
+}
+
+#[tokio::test]
 async fn peer_drain_reuses_resolution_for_same_parent_peer_context_regardless_order() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
@@ -3062,6 +3292,31 @@ async fn peer_drain_telemetry_distinguishes_repeated_cached_and_satisfied_work()
         ),
         (2, 4, 3, 4, 1, 3, 1, 1, 1, 1, 2)
     );
+}
+
+#[tokio::test]
+async fn required_peer_binding_promotes_an_existing_optional_provider() {
+    let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
+    push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let provider = push_node(&mut state, CanonicalKey::npm("peer-host"), "1.0.0");
+    state.nodes[provider as usize].optional = true;
+    let consumer = push_node(&mut state, CanonicalKey::npm("peer-consumer"), "1.0.0");
+    state.peer_requirements.push(mk_peer_req(
+        consumer,
+        "peer-host",
+        CanonicalKey::npm("peer-host"),
+        "^1.0.0",
+        false,
+    ));
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |canonical| async move {
+        panic!("existing peer provider must not fetch {canonical}")
+    })
+    .await
+    .expect("bind existing peer provider");
+
+    assert!(synthesized.is_empty());
+    assert!(!state.nodes[provider as usize].optional);
 }
 
 #[tokio::test]
@@ -3297,8 +3552,60 @@ async fn peer_drain_best_effort_synthesizes_for_incompatible_required_ranges() {
     assert_eq!(report.unsatisfied_consumers[0].1, "^17.0.0");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn peer_drain_best_effort_warning_excludes_optional_consumers_from_satisfied_count() {
+#[tokio::test]
+async fn peer_drain_best_effort_skips_a_trust_downgrade_candidate() {
+    let policy = ResolverPolicy::new(0, TrustPolicyMode::NoDowngrade);
+    let mut state = ResolveState::new_with_options_and_policy(
+        HashMap::new(),
+        OverrideSet::empty(),
+        true,
+        policy,
+    );
+    let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
+    let modern_a = push_node(&mut state, CanonicalKey::npm("modern-a"), "1.0.0");
+    let modern_b = push_node(&mut state, CanonicalKey::npm("modern-b"), "1.0.0");
+    let legacy = push_node(&mut state, CanonicalKey::npm("legacy"), "1.0.0");
+
+    for (consumer, range) in [
+        (modern_a, "^2.0.0"),
+        (modern_b, "^2.0.0"),
+        (legacy, "^1.0.0"),
+    ] {
+        state.peer_requirements.push(mk_peer_req(
+            consumer,
+            "peer",
+            CanonicalKey::npm("peer"),
+            range,
+            false,
+        ));
+    }
+
+    let mut info = mk_info(&["2.0.0", "1.0.0"], &[]);
+    set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
+    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
+        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_published_at(&mut info, "2.0.0", "2025-01-02T00:00:00.000Z");
+    let info = Arc::new(info);
+
+    let synthesized = drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
+        let info = Arc::clone(&info);
+        async move { Ok(info) }
+    })
+    .await
+    .expect("an allowed best-effort peer candidate remains available");
+
+    assert_eq!(synthesized.len(), 1);
+    assert!(
+        synthesized[0]
+            .range
+            .satisfies(&NpmVersion::parse("1.0.0").unwrap()),
+        "trust-policy no-downgrade must reject the untrusted majority candidate"
+    );
+    assert_eq!(state.peer_conflicts[0].chosen_version, "1.0.0");
+}
+
+#[test]
+fn best_effort_consumer_counts_exclude_optional_requirements() {
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     let _root = push_node(&mut state, CanonicalKey::Root, "0.0.0");
     let legacy = push_node(&mut state, CanonicalKey::npm("legacy"), "1.0.0");
@@ -3321,30 +3628,12 @@ async fn peer_drain_best_effort_warning_excludes_optional_consumers_from_satisfi
         ));
     }
 
-    let output = TraceBuffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_target(false)
-        .with_level(false)
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(output.clone())
-        .finish();
-    let info = mk_info_arc(&["18.2.0", "17.0.2"], &[]);
+    let requirements = state.peer_requirements.iter().collect::<Vec<_>>();
+    let chosen = NpmVersion::parse("18.2.0").unwrap();
 
-    drain_peer_requirements_one_pass(&mut state, true, |_canonical| {
-        let info = Arc::clone(&info);
-        async move { Ok(info) }
-    })
-    .with_subscriber(subscriber)
-    .await
-    .expect("best-effort synthesis should succeed");
-
-    let rendered = String::from_utf8(output.0.lock().expect("trace buffer poisoned").clone())
-        .expect("trace output must be UTF-8");
-    assert!(
-        rendered.contains("satisfies 1 of 2 required consumer(s)"),
-        "{rendered}"
+    assert_eq!(
+        required_peer_consumer_counts(&requirements, &chosen),
+        (1, 2)
     );
 }
 
@@ -5092,7 +5381,7 @@ async fn fusion_streaming_worker_batch_emits_selected_root_before_tail_metadata_
             .with_base_url(format!("http://{address}"))
             .with_cache_dir(None),
     );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let mut deps = HashMap::new();
     deps.insert("proxy-stream-root".into(), "^1.0.0".into());
     let resolver = resolve_greedy_fused_with_cache_options_policy_and_selected_events(
@@ -5451,7 +5740,7 @@ async fn fusion_streaming_worker_batch_streams_follow_up_tail_batch() {
             .with_base_url(format!("http://{address}"))
             .with_cache_dir(None),
     );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let mut deps = HashMap::new();
     deps.insert("proxy-tail-stream-root".into(), "^1.0.0".into());
     let resolver = resolve_greedy_fused_with_cache_options_policy_and_selected_events(

@@ -245,11 +245,15 @@ fn validate_frozen_importer_snapshot(
     current: &lpm_lockfile::ImporterSnapshot,
 ) -> Result<(), LpmError> {
     if lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION {
+        let reason = (lockfile.metadata.lockfile_version
+            < lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES)
+            .then_some("\n  reason      lockfile has no exact package-instance graph");
         return Err(LpmError::Registry(format!(
-            "Frozen lockfile mismatch\n  lockfile    {}\n  found       v{}\n  required    v{}\n  hint        run `lpm install` locally and commit lpm.lock before running a frozen install",
+            "Frozen lockfile mismatch\n  lockfile    {}\n  found       v{}\n  required    v{}{}\n  hint        run `lpm install` locally and commit lpm.lock before running a frozen install",
             lockfile_path.display(),
             lockfile.metadata.lockfile_version,
             lpm_lockfile::LOCKFILE_VERSION,
+            reason.unwrap_or(""),
         )));
     }
     let Some(locked) = lockfile.importers.get(".") else {

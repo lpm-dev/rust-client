@@ -148,6 +148,18 @@ impl PackageStore {
             .map(|(path, _)| path)
     }
 
+    /// Extract a tarball file into an explicitly selected store directory.
+    pub fn store_tarball_from_file_at(
+        &self,
+        dir: PathBuf,
+        label: &str,
+        tarball_path: &std::path::Path,
+        sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        self.store_from_file_at_timed(dir, label, tarball_path, sri)
+            .map(|(path, _)| path)
+    }
+
     /// Streaming path: hash + decompress + extract + scan + rename,
     /// all in one pass, no temp file.
     ///
@@ -432,6 +444,17 @@ impl PackageStore {
         sri: &str,
     ) -> Result<(PathBuf, StageTimings), LpmError> {
         let dir = self.package_dir(name, version);
+        let label = format!("{name}@{version}");
+        self.store_from_file_at_timed(dir, &label, tarball_path, sri)
+    }
+
+    fn store_from_file_at_timed(
+        &self,
+        dir: PathBuf,
+        label: &str,
+        tarball_path: &std::path::Path,
+        sri: &str,
+    ) -> Result<(PathBuf, StageTimings), LpmError> {
         let mut timings = StageTimings::default();
 
         // Fast path: already stored. Callers on the install hot path pre-filter
@@ -439,19 +462,19 @@ impl PackageStore {
         // general-purpose API contract.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
-                self.backfill_security_cache_if_enabled(&dir, &format!("{name}@{version}"));
-                tracing::debug!("store hit: {name}@{version}");
+                self.backfill_security_cache_if_enabled(&dir, label);
+                tracing::debug!("store hit: {label}");
                 return Ok((dir, timings));
             }
 
             std::fs::remove_dir_all(&dir).map_err(|e| {
                 LpmError::Store(format!(
-                    "failed to remove incomplete store entry for {name}@{version}: {e}"
+                    "failed to remove incomplete store entry for {label}: {e}"
                 ))
             })?;
         }
 
-        tracing::debug!("extracting {name}@{version} to store (from file)");
+        tracing::debug!("extracting {label} to store (from file)");
 
         let unique_id = std::process::id();
         let thread_id = format!("{:?}", std::thread::current().id());
@@ -496,10 +519,10 @@ impl PackageStore {
                 lpm_security::behavioral::analyze_package_with_timings(&tmp_dir);
             timings.source_scan_ns = analysis_timings.source_scan_ns;
             if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
-                tracing::warn!("failed to write .lpm-security.json for {name}@{version}: {e}");
+                tracing::warn!("failed to write .lpm-security.json for {label}: {e}");
             } else {
                 tracing::debug!(
-                    "security analysis: {name}@{version} — {} files scanned, {} bytes",
+                    "security analysis: {label} — {} files scanned, {} bytes",
                     analysis.meta.files_scanned,
                     analysis.meta.bytes_scanned
                 );

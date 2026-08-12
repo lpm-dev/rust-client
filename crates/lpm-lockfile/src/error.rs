@@ -15,6 +15,25 @@ pub enum LockfileError {
     #[error("lockfile not found: {0}")]
     NotFound(String),
 
+    #[error("package {package:?} has invalid {field}: {reason}")]
+    InvalidPackageField {
+        package: String,
+        field: &'static str,
+        reason: String,
+    },
+
+    #[error("package {package:?} with {source_kind} source is missing integrity")]
+    MissingPackageIntegrity {
+        package: String,
+        source_kind: &'static str,
+    },
+
+    #[error("package {package:?} with {source_kind} source must not have integrity")]
+    UnexpectedPackageIntegrity {
+        package: String,
+        source_kind: &'static str,
+    },
+
     /// A non-Registry source kind is paired with a `tarball`
     /// field-hint. The `tarball` field is a dist-URL cache valid only
     /// for Registry sources; for `Source::Tarball`, `Source::Git`,
@@ -39,9 +58,12 @@ pub enum LockfileError {
     /// registry, even if the SRI in the same file matches the
     /// malicious tarball.
     #[error(
-        "package {package:?} is in the @lpm.dev scope but its source URL {url:?} \
+        "package {package:?} is in the @lpm.dev scope but its source {source_identity:?} \
          is not on the lpm.dev origin — refusing to use an off-origin URL for an \
          LPM-scoped package"
     )]
-    InvalidScopeOrigin { package: String, url: String },
+    InvalidScopeOrigin {
+        package: String,
+        source_identity: String,
+    },
 }

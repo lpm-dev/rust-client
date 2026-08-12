@@ -3,16 +3,17 @@ use crate::commands::install::{
     run_prepared_npm_firewall_materialization_preflight,
 };
 use crate::install_ui;
+use futures::{StreamExt, TryStreamExt};
 use lpm_common::{LpmError, LpmRoot};
 use lpm_lockfile::{LockedPackage, Source};
 use lpm_registry::RegistryClient;
 use lpm_store::PackageStore;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 
 const DEFAULT_MAX_CONCURRENT_DOWNLOADS: usize = 24;
 
@@ -24,7 +25,7 @@ struct FetchPlatform {
     libc: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FetchSource {
     Registry {
         registry_url: String,
@@ -62,6 +63,32 @@ struct FetchTarget {
     version: String,
     integrity: String,
     source: FetchSource,
+}
+
+#[derive(Debug, Eq)]
+struct FetchArtifactKey {
+    integrity: String,
+    source: FetchSource,
+}
+
+impl PartialEq for FetchArtifactKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.integrity == other.integrity && self.source == other.source
+    }
+}
+
+impl Hash for FetchArtifactKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.integrity.hash(state);
+        self.source.hash(state);
+    }
+}
+
+#[derive(Debug)]
+struct FetchWork {
+    integrity: String,
+    source: FetchSource,
+    targets: Vec<FetchTarget>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,24 +196,23 @@ pub async fn run(
     )
     .await?;
 
+    let work = coalesce_fetch_targets(targets);
+    let concurrency = max_concurrent_downloads();
     let client = Arc::new(client.clone_with_config());
     let store = Arc::new(store);
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_downloads()));
-    let mut tasks = JoinSet::new();
-
-    for target in targets {
-        let client = Arc::clone(&client);
-        let store = Arc::clone(&store);
-        let store_v2 = store_v2.clone();
-        let semaphore = Arc::clone(&semaphore);
-        tasks.spawn(async move { fetch_one(client, store, store_v2, semaphore, target).await });
-    }
-
-    while let Some(joined) = tasks.join_next().await {
-        let result = joined
-            .map_err(|e| LpmError::Registry(format!("fetch worker failed to join: {e}")))??;
-        results.push(result);
-    }
+    let fetched: Vec<Vec<FetchPackageResult>> = futures::stream::iter(work)
+        .map(|work| {
+            fetch_artifact(
+                Arc::clone(&client),
+                Arc::clone(&store),
+                store_v2.clone(),
+                work,
+            )
+        })
+        .buffer_unordered(concurrency)
+        .try_collect()
+        .await?;
+    results.extend(fetched.into_iter().flatten());
 
     results.sort_by(|a, b| {
         a.name
@@ -256,56 +282,101 @@ fn configured_v2_store_for_fetch(
     ))
 }
 
-async fn fetch_one(
+fn coalesce_fetch_targets(targets: Vec<FetchTarget>) -> Vec<FetchWork> {
+    let mut artifacts: HashMap<FetchArtifactKey, Vec<FetchTarget>> =
+        HashMap::with_capacity(targets.len());
+    for target in targets {
+        let key = FetchArtifactKey {
+            integrity: target.integrity.clone(),
+            source: target.source.clone(),
+        };
+        artifacts.entry(key).or_default().push(target);
+    }
+    artifacts
+        .into_iter()
+        .map(|(key, targets)| FetchWork {
+            integrity: key.integrity,
+            source: key.source,
+            targets,
+        })
+        .collect()
+}
+
+async fn fetch_artifact(
     client: Arc<RegistryClient>,
     store: Arc<PackageStore>,
     store_v2: Option<Arc<lpm_store::v2::Store>>,
-    semaphore: Arc<Semaphore>,
-    target: FetchTarget,
-) -> Result<FetchPackageResult, LpmError> {
-    if is_cached(&target, &store, store_v2.as_deref()) {
-        return Ok(result_for(&target, FetchPackageStatus::Cached));
+    work: FetchWork,
+) -> Result<Vec<FetchPackageResult>, LpmError> {
+    let FetchWork {
+        integrity,
+        source,
+        targets,
+    } = work;
+    let cached: Vec<bool> = targets
+        .iter()
+        .map(|target| is_cached(target, &store, store_v2.as_deref()))
+        .collect();
+    if cached.iter().all(|cached| *cached) {
+        return Ok(targets
+            .iter()
+            .map(|target| result_for(target, FetchPackageStatus::Cached))
+            .collect());
     }
 
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
-    let (data, computed_sri) = match &target.source {
+    let downloaded = match &source {
         FetchSource::GitHub { url } => {
-            crate::commands::install::download_github_archive(url, Some(&target.integrity)).await?
+            crate::commands::install::download_github_archive_to_file(url, &integrity).await?
         }
         FetchSource::Registry { .. } | FetchSource::RemoteTarball { .. } => {
             client
-                .download_tarball_with_integrity(target.source.url(), Some(&target.integrity))
+                .download_tarball_to_file_with_integrity(source.url(), &integrity)
                 .await?
         }
     };
-    drop(permit);
 
-    let source = target.source.clone();
-    let name = target.name.clone();
-    let version = target.version.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), LpmError> {
+    let targets = tokio::task::spawn_blocking(move || -> Result<Vec<FetchTarget>, LpmError> {
         if let Some(store_v2) = store_v2 {
-            store_v2.extract_object_from_bytes(&data, Some(&computed_sri))?;
-            return Ok(());
-        }
-
-        match source {
-            FetchSource::Registry { .. } => {
-                store.store_package(&name, &version, &data)?;
+            store_v2.extract_object_from_file(downloaded.file.path(), &downloaded.sri)?;
+        } else {
+            match source {
+                FetchSource::Registry { .. } => {
+                    for target in &targets {
+                        store.store_package_from_file(
+                            &target.name,
+                            &target.version,
+                            downloaded.file.path(),
+                            &downloaded.sri,
+                        )?;
+                    }
+                }
+                FetchSource::RemoteTarball { .. } | FetchSource::GitHub { .. } => {
+                    store.store_tarball_at_cas_path_from_file(
+                        &downloaded.sri,
+                        downloaded.file.path(),
+                    )?;
+                }
             }
-            FetchSource::RemoteTarball { .. } | FetchSource::GitHub { .. } => {
-                store.store_tarball_at_cas_path(&computed_sri, &data)?;
-            }
         }
-        Ok(())
+        Ok(targets)
     })
     .await
     .map_err(|e| LpmError::Registry(format!("fetch store worker failed to join: {e}")))??;
 
-    Ok(result_for(&target, FetchPackageStatus::Fetched))
+    Ok(targets
+        .iter()
+        .zip(cached)
+        .map(|(target, cached)| {
+            result_for(
+                target,
+                if cached {
+                    FetchPackageStatus::Cached
+                } else {
+                    FetchPackageStatus::Fetched
+                },
+            )
+        })
+        .collect())
 }
 
 fn classify_package(
@@ -667,10 +738,14 @@ mod tests {
 
     fn locked_package() -> LockedPackage {
         LockedPackage {
+            instance_id: None,
+            dependency_targets: std::collections::BTreeMap::new(),
+            peer_targets: std::collections::BTreeMap::new(),
             name: "pkg".to_string(),
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             os: Vec::new(),
@@ -681,6 +756,7 @@ mod tests {
             dependencies: Vec::new(),
             alias_dependencies: Vec::new(),
             peers: Vec::new(),
+            peer_edges: Vec::new(),
             tarball: Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string()),
         }
     }

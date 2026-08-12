@@ -23,7 +23,7 @@
 //!
 //! # Peer-context
 //!
-//! Each [`LinkTarget`] carries `peers: Vec<(String, String)>`
+//! Each [`LinkTarget`] carries structured peer edges
 //! threaded through from the resolver
 //! (`ResolvedPackage.peers` → `InstallPackage.peers` →
 //! `LinkTarget.peers`). The linker uses these to:
@@ -34,7 +34,7 @@
 //!   Node's symlink-walk-up from inside the link entry never
 //!   reaches the peer.
 //! - Fold the peer-context into [`GraphKey`] via
-//!   `GraphKeyInputs::with_peers`, so two projects sharing the same
+//!   `GraphKeyInputs::with_peer_edges`, so two projects sharing the same
 //!   edge graph but different peer pinning produce distinct keys.
 //!   Without this, cross-project sharing of `links/<key>/` would be
 //!   incorrect for any package whose peer resolution depends on
@@ -57,7 +57,7 @@
 //! distinct GraphKeys via `with_root_link_names` + the dep-edge
 //! disambiguation that flows from each target's own `wrapper_id`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,7 +68,7 @@ use lpm_store::v2::{
 };
 
 use crate::validation::is_safe_node_modules_entry_name as is_safe_root_link_name;
-use crate::{LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
+use crate::{LinkDependency, LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
 
 mod bin_shims;
 mod compat_island;
@@ -93,8 +93,14 @@ use self::reconcile::{
 /// `<HOME>/.lpm/store/v2/objects/<sri>/`.
 #[derive(Debug, Clone)]
 pub struct V2Target {
+    /// Exact identity of this resolved package instance.
+    pub instance_id: lpm_common::PackageInstanceId,
     /// Same identity surface as v1.
     pub target: Arc<LinkTarget>,
+    /// Exact dependency provider for each manifest-local dependency slot.
+    pub dependency_targets: HashMap<String, lpm_common::PackageInstanceId>,
+    /// Exact peer provider for each manifest-local peer slot.
+    pub peer_targets: HashMap<String, lpm_common::PackageInstanceId>,
     /// SRI of the source tarball. Required to locate the object dir
     /// at `<HOME>/.lpm/store/v2/objects/<sri>/`.
     pub source_sri: String,
@@ -144,15 +150,12 @@ pub struct LinkPlanV2 {
 impl LinkPlanV2 {
     /// Return the exact materialization key derived for `target`.
     pub fn graph_key_for(&self, target: &V2Target) -> Result<Arc<GraphKey>, LpmError> {
-        self.key_map
-            .get_for(&target.target)
-            .cloned()
-            .ok_or_else(|| {
-                LpmError::Store(format!(
-                    "virtual-store linker: missing graph key for {}@{} (key map pre-pass failed)",
-                    target.target.name, target.target.version
-                ))
-            })
+        self.key_map.get_for(target).cloned().ok_or_else(|| {
+            LpmError::Store(format!(
+                "virtual-store linker: missing graph key for {}@{} (key map pre-pass failed)",
+                target.target.name, target.target.version
+            ))
+        })
     }
 
     /// Are all targets ready for the event-driven path? True iff every
@@ -510,6 +513,7 @@ fn link_v2_prepare_inner(
     if matches!(peer_context, PeerContextMode::DeriveMissing) {
         ensure_peer_context(&mut augmented_targets, store)?;
     }
+    ensure_exact_edge_targets(&mut augmented_targets)?;
     let platform = PlatformTuple::current();
     let linker_tag = match linker_mode {
         LinkerMode::Isolated => LinkerModeTag::Isolated,
@@ -723,11 +727,13 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
     // intersect declared peers against the install set. Multi-source
     // same-name disambiguation flows through wrapper_id at the GraphKey
     // level.
-    let mut by_name: HashMap<String, String> = HashMap::with_capacity(targets.len());
+    let mut by_name: HashMap<String, Vec<(String, Option<String>)>> =
+        HashMap::with_capacity(targets.len());
     for v2t in targets.iter() {
         by_name
             .entry(v2t.target.name.clone())
-            .or_insert_with(|| v2t.target.version.clone());
+            .or_default()
+            .push((v2t.target.version.clone(), v2t.target.wrapper_id.clone()));
     }
 
     // Scratch `PathBuf` reused across per-package `package.json`
@@ -785,13 +791,27 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         if peer_deps.is_empty() {
             continue;
         }
-        let mut derived: Vec<(String, String)> = Vec::new();
-        for peer_name in peer_deps.keys() {
+        let mut derived: Vec<lpm_common::PeerEdge> = Vec::new();
+        for (peer_name, peer_range) in &peer_deps {
             let is_optional = peer_deps_meta
                 .get(peer_name)
                 .is_some_and(|meta| meta.optional);
-            match by_name.get(peer_name) {
-                Some(ver) => derived.push((peer_name.clone(), ver.clone())),
+            let target_name = npm_alias_target(peer_range).unwrap_or(peer_name);
+            match by_name.get(target_name).map(Vec::as_slice) {
+                Some([(version, wrapper_id)]) => derived.push(lpm_common::PeerEdge {
+                    local_name: peer_name.clone(),
+                    target_name: target_name.to_string(),
+                    target_version: version.clone(),
+                    target_wrapper_id: wrapper_id.clone(),
+                }),
+                Some(candidates) => {
+                    return Err(LpmError::Store(format!(
+                        "virtual-store linker: cannot derive peer {peer_name:?} of {}@{} because {target_name:?} has {} candidate instances; exact peer targets are required",
+                        v2t.target.name,
+                        v2t.target.version,
+                        candidates.len(),
+                    )));
+                }
                 None if !is_optional => {
                     tracing::debug!(
                         "virtual-store linker: REQUIRED peer dep {peer_name} of {}@{} not in install set — \
@@ -807,10 +827,232 @@ fn ensure_peer_context(targets: &mut [V2Target], store: &Store) -> Result<(), Lp
         }
         // Sorted for deterministic GraphKey hashing — must match the
         // sort applied by the resolver-threaded path.
-        derived.sort_by(|a, b| a.0.cmp(&b.0));
+        derived.sort_by(|a, b| a.local_name.cmp(&b.local_name));
         Arc::make_mut(&mut v2t.target).peers = derived;
     }
     Ok(())
+}
+
+struct ExactCoordinateCandidate {
+    first: lpm_common::PackageInstanceId,
+    count: usize,
+}
+
+fn ensure_exact_edge_targets(targets: &mut [V2Target]) -> Result<(), LpmError> {
+    let mut candidates: HashMap<String, ExactCoordinateCandidate> =
+        HashMap::with_capacity(targets.len());
+    let mut instances = HashMap::with_capacity(targets.len());
+    for target in targets.iter() {
+        if instances
+            .insert(target.instance_id, Arc::clone(&target.target))
+            .is_some()
+        {
+            return Err(LpmError::Store(format!(
+                "virtual-store linker: duplicate package instance {}",
+                target.instance_id
+            )));
+        }
+        candidates
+            .entry(exact_coordinate_key(
+                &target.target.name,
+                &target.target.version,
+                target.target.wrapper_id.as_deref(),
+            ))
+            .and_modify(|candidate| candidate.count += 1)
+            .or_insert(ExactCoordinateCandidate {
+                first: target.instance_id,
+                count: 1,
+            });
+    }
+
+    for target in targets.iter_mut() {
+        validate_edge_target_slots(
+            &target.target.dependencies,
+            &target.target.peers,
+            &target.dependency_targets,
+            &target.peer_targets,
+            &target.target.name,
+            &target.target.version,
+        )?;
+        for dependency in &target.target.dependencies {
+            ensure_exact_target(
+                &mut target.dependency_targets,
+                &dependency.local,
+                &dependency.target_name,
+                &dependency.target_version,
+                dependency.target_wrapper_id.as_deref(),
+                "dependency",
+                &target.target.name,
+                &target.target.version,
+                &candidates,
+                &instances,
+            )?;
+        }
+        for peer in &target.target.peers {
+            ensure_exact_target(
+                &mut target.peer_targets,
+                &peer.local_name,
+                &peer.target_name,
+                &peer.target_version,
+                peer.target_wrapper_id.as_deref(),
+                "peer",
+                &target.target.name,
+                &target.target.version,
+                &candidates,
+                &instances,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_exact_target(
+    exact_targets: &mut HashMap<String, lpm_common::PackageInstanceId>,
+    local: &str,
+    target_name: &str,
+    target_version: &str,
+    target_wrapper_id: Option<&str>,
+    edge_kind: &str,
+    consumer_name: &str,
+    consumer_version: &str,
+    candidates: &HashMap<String, ExactCoordinateCandidate>,
+    instances: &HashMap<lpm_common::PackageInstanceId, Arc<LinkTarget>>,
+) -> Result<(), LpmError> {
+    if let Some(instance_id) = exact_targets.get(local) {
+        let exact = instances.get(instance_id).ok_or_else(|| {
+            LpmError::Store(format!(
+                "virtual-store linker: {edge_kind} {local:?} of {consumer_name}@{consumer_version} references missing package instance {instance_id}"
+            ))
+        })?;
+        if exact.name != target_name
+            || exact.version != target_version
+            || exact.wrapper_id.as_deref() != target_wrapper_id
+        {
+            return Err(LpmError::Store(format!(
+                "virtual-store linker: {edge_kind} {local:?} of {consumer_name}@{consumer_version} expects {target_name}@{target_version} wrapper_id={target_wrapper_id:?}, but package instance {instance_id} is {}@{} wrapper_id={:?}",
+                exact.name, exact.version, exact.wrapper_id,
+            )));
+        }
+        return Ok(());
+    }
+
+    let key = exact_coordinate_key(target_name, target_version, target_wrapper_id);
+    match candidates.get(&key) {
+        Some(candidate) if candidate.count == 1 => {
+            exact_targets.insert(local.to_string(), candidate.first);
+            Ok(())
+        }
+        Some(candidate) => Err(LpmError::Store(format!(
+            "virtual-store linker: {edge_kind} {local:?} of {consumer_name}@{consumer_version} matches {} package instances; exact target identity is required",
+            candidate.count,
+        ))),
+        None => Err(LpmError::Store(format!(
+            "virtual-store linker: {edge_kind} {local:?} of {consumer_name}@{consumer_version} references missing target {target_name}@{target_version} wrapper_id={target_wrapper_id:?}"
+        ))),
+    }
+}
+
+fn validate_edge_target_slots(
+    dependencies: &[LinkDependency],
+    peers: &[lpm_common::PeerEdge],
+    dependency_targets: &HashMap<String, lpm_common::PackageInstanceId>,
+    peer_targets: &HashMap<String, lpm_common::PackageInstanceId>,
+    consumer_name: &str,
+    consumer_version: &str,
+) -> Result<(), LpmError> {
+    validate_unique_edge_slots(
+        dependencies.iter().map(|edge| {
+            (
+                edge.local.as_str(),
+                edge.target_name.as_str(),
+                edge.target_version.as_str(),
+                edge.target_wrapper_id.as_deref(),
+            )
+        }),
+        "dependency",
+        consumer_name,
+        consumer_version,
+    )?;
+    validate_unique_edge_slots(
+        peers.iter().map(|edge| {
+            (
+                edge.local_name.as_str(),
+                edge.target_name.as_str(),
+                edge.target_version.as_str(),
+                edge.target_wrapper_id.as_deref(),
+            )
+        }),
+        "peer",
+        consumer_name,
+        consumer_version,
+    )?;
+
+    let dependency_slots = dependencies
+        .iter()
+        .map(|edge| edge.local.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(local) = dependency_targets
+        .keys()
+        .find(|local| !dependency_slots.contains(local.as_str()))
+    {
+        return Err(LpmError::Store(format!(
+            "virtual-store linker: dependency target {local:?} of {consumer_name}@{consumer_version} has no matching dependency edge"
+        )));
+    }
+    let peer_slots = peers
+        .iter()
+        .map(|edge| edge.local_name.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(local) = peer_targets
+        .keys()
+        .find(|local| !peer_slots.contains(local.as_str()))
+    {
+        return Err(LpmError::Store(format!(
+            "virtual-store linker: peer target {local:?} of {consumer_name}@{consumer_version} has no matching peer edge"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unique_edge_slots<'a>(
+    edges: impl Iterator<Item = (&'a str, &'a str, &'a str, Option<&'a str>)>,
+    edge_kind: &str,
+    consumer_name: &str,
+    consumer_version: &str,
+) -> Result<(), LpmError> {
+    let mut slots: HashMap<&str, (&str, &str, Option<&str>)> = HashMap::new();
+    for (local, target_name, target_version, target_wrapper_id) in edges {
+        match slots.insert(local, (target_name, target_version, target_wrapper_id)) {
+            Some(existing) if existing != (target_name, target_version, target_wrapper_id) => {
+                return Err(LpmError::Store(format!(
+                    "virtual-store linker: {edge_kind} {local:?} of {consumer_name}@{consumer_version} metadata disagrees between {}@{} wrapper_id={:?} and {target_name}@{target_version} wrapper_id={target_wrapper_id:?}",
+                    existing.0, existing.1, existing.2,
+                )));
+            }
+            Some(_) | None => {}
+        }
+    }
+    Ok(())
+}
+
+fn exact_coordinate_key(name: &str, version: &str, wrapper_id: Option<&str>) -> String {
+    let wrapper_id = wrapper_id.unwrap_or("");
+    let mut key = String::with_capacity(name.len() + version.len() + wrapper_id.len() + 2);
+    key.push_str(name);
+    key.push('\0');
+    key.push_str(version);
+    key.push('\0');
+    key.push_str(wrapper_id);
+    key
+}
+
+fn npm_alias_target(raw: &str) -> Option<&str> {
+    let body = raw.trim().strip_prefix("npm:")?;
+    match body.rfind('@') {
+        Some(0) | None => Some(body),
+        Some(split) => Some(&body[..split]),
+    }
 }
 
 /// Result handle for a single populated link entry — keeps the key
@@ -828,7 +1070,7 @@ fn populate_one(
     key_map: &KeyMap,
     meta_platform: &Arc<LinkMetaPlatform>,
 ) -> Result<PopulatedEntry, LpmError> {
-    let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+    let key = key_map.get_for(v2t).cloned().ok_or_else(|| {
         LpmError::Store(format!(
             "virtual-store linker: missing graph key for {}@{} (key map pre-pass failed)",
             v2t.target.name, v2t.target.version
@@ -837,10 +1079,8 @@ fn populate_one(
 
     let object_dir = store.paths().object_dir(&v2t.source_sri)?;
 
-    // Dep edges resolve through the alias map (consumer's local name
-    // may differ from the canonical target). Peer edges always use
-    // the canonical name as the local (peers are never npm-aliased
-    // — `peerDependencies` keys ARE the canonical name by spec).
+    // Dependency and peer edges preserve their local slots while resolving
+    // targets through canonical package identities.
     let mut deps: Vec<DepLink> =
         Vec::with_capacity(v2t.target.dependencies.len() + v2t.target.peers.len());
     let mut dependency_targets_by_local: HashMap<&str, &GraphKey> =
@@ -855,7 +1095,7 @@ fn populate_one(
             );
             continue;
         }
-        let dep_key = key_map.get_for_dependency(dep).ok_or_else(|| {
+        let dep_key = key_map.get_for_dependency(v2t, dep).ok_or_else(|| {
             LpmError::Store(format!(
                 "virtual-store linker: dep {}=>{}@{} of {}@{} has no resolved graph key",
                 dep.local,
@@ -890,35 +1130,36 @@ fn populate_one(
     // peer (v2 link entries are absolute paths into the global
     // store, not the project tree).
     if !v2t.target.peers.is_empty() {
-        let peer_extras: Vec<DepLink> = {
-            v2t.target
-                .peers
-                .iter()
-                .filter(|(peer_name, _)| {
-                    if is_safe_root_link_name(peer_name) {
-                        true
-                    } else {
-                        tracing::warn!(
-                            "virtual-store linker: skipping unsafe peer local name {:?} for {}@{}",
-                            peer_name,
-                            v2t.target.name,
-                            v2t.target.version
-                        );
-                        false
-                    }
-                })
-                .filter(|(peer_name, _)| {
-                    !dependency_targets_by_local.contains_key(peer_name.as_str())
-                })
-                .filter_map(|(peer_name, peer_ver)| {
-                    let peer_key = key_map.get_peer(peer_name, peer_ver)?.clone();
-                    Some(DepLink {
-                        local: peer_name.clone(),
-                        target: peer_key,
-                    })
-                })
-                .collect()
-        };
+        let mut peer_extras = Vec::with_capacity(v2t.target.peers.len());
+        for peer in &v2t.target.peers {
+            if !is_safe_root_link_name(&peer.local_name) {
+                tracing::warn!(
+                    "virtual-store linker: skipping unsafe peer local name {:?} for {}@{}",
+                    peer.local_name,
+                    v2t.target.name,
+                    v2t.target.version
+                );
+                continue;
+            }
+            if dependency_targets_by_local.contains_key(peer.local_name.as_str()) {
+                continue;
+            }
+            let peer_key = key_map.get_peer(v2t, peer).ok_or_else(|| {
+                LpmError::Store(format!(
+                    "virtual-store linker: peer {}=>{}@{} wrapper_id={:?} of {}@{} has no unambiguous resolved graph key",
+                    peer.local_name,
+                    peer.target_name,
+                    peer.target_version,
+                    peer.target_wrapper_id,
+                    v2t.target.name,
+                    v2t.target.version,
+                ))
+            })?;
+            peer_extras.push(DepLink {
+                local: peer.local_name.clone(),
+                target: Arc::clone(peer_key),
+            });
+        }
         deps.extend(peer_extras);
     }
 
@@ -958,7 +1199,7 @@ fn existing_link_entry_packages(
 
     let mut materialized = Vec::with_capacity(plan.augmented_targets.len());
     for v2t in &plan.augmented_targets {
-        let key = plan.key_map.get_for(&v2t.target).ok_or_else(|| {
+        let key = plan.key_map.get_for(v2t).ok_or_else(|| {
             LpmError::Store(format!(
                 "virtual-store linker: missing graph key for {}@{} during existing-link validation",
                 v2t.target.name, v2t.target.version

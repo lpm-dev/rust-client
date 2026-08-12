@@ -9,6 +9,9 @@ use crate::npm_firewall_config::NpmFirewallMode;
 
 fn package_with_source(name: &str, source: &str) -> InstallPackage {
     InstallPackage {
+        instance_id: None,
+        dependency_targets: HashMap::new(),
+        peer_targets: HashMap::new(),
         name: name.to_string(),
         version: "1.0.0".to_string(),
         source: source.to_string(),
@@ -26,6 +29,7 @@ fn package_with_source(name: &str, source: &str) -> InstallPackage {
         optional: false,
         tarball_url: Some("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz".to_string()),
         metadata_checked_for_tarball: true,
+        manifest_fingerprint: None,
     }
 }
 
@@ -350,8 +354,8 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
         .mount(&server)
         .await;
 
-    let (selected_tx, selected_rx) = mpsc::unbounded_channel();
-    let (fetch_tx, mut fetch_rx) = mpsc::unbounded_channel();
+    let (selected_tx, selected_rx) = mpsc::channel(1);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
     let join = spawn_chunked_npm_firewall_preflight(
         selected_rx,
         fetch_tx,
@@ -378,20 +382,22 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
                 node_engine: None,
                 optional: false,
             })
+            .await
             .expect("selected package receiver should be open");
     }
     drop(selected_tx);
 
-    let result = join
-        .drain()
-        .await
-        .expect("chunked firewall preflight should use one exchanged token");
+    let drain = join.drain();
+    let collect = async {
+        let mut released = Vec::with_capacity(2);
+        while let Some(event) = fetch_rx.recv().await {
+            released.push(event.name);
+        }
+        released
+    };
+    let (result, mut released) = tokio::join!(drain, collect);
+    let result = result.expect("chunked firewall preflight should use one exchanged token");
     drop(client);
-
-    let mut released = Vec::with_capacity(2);
-    while let Ok(event) = fetch_rx.try_recv() {
-        released.push(event.name);
-    }
 
     released.sort();
 

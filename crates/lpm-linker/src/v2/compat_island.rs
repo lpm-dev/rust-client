@@ -14,7 +14,6 @@ use super::reconcile::{
     ensure_link_parent_dir, ensure_node_modules_dir, ensure_real_dir, is_direct,
     reconcile_scoped_root_dir, remove_node_modules_entry, root_link_names, symlink_points_to,
 };
-use crate::LinkTarget;
 use crate::materialize::link_dir_recursive;
 use crate::validation::is_safe_node_modules_entry_name as is_safe_root_link_name;
 
@@ -559,7 +558,7 @@ fn collect_compatibility_roots_for_bins<'a>(
         if !is_direct(&v2t.target) {
             continue;
         }
-        let Some(key) = key_map.get_for(&v2t.target) else {
+        let Some(key) = key_map.get_for(v2t) else {
             continue;
         };
         let pkg_json_path = store.paths().link_package_dir(key).join("package.json");
@@ -621,7 +620,7 @@ fn collect_compatibility_entries<'a>(
 ) -> Result<Vec<CompatibilityEntry<'a>>, LpmError> {
     let mut targets_by_key_dir: HashMap<String, &V2Target> = HashMap::with_capacity(targets.len());
     for v2t in targets {
-        if let Some(key) = key_map.get_for(&v2t.target) {
+        if let Some(key) = key_map.get_for(v2t) {
             targets_by_key_dir.insert(key.dir_name().to_string(), v2t.as_ref());
         }
     }
@@ -630,7 +629,7 @@ fn collect_compatibility_entries<'a>(
     let mut seen: HashSet<String> = HashSet::with_capacity(targets.len());
     let mut entries = Vec::new();
     while let Some(v2t) = queue.pop_front() {
-        let key = key_map.get_for(&v2t.target).cloned().ok_or_else(|| {
+        let key = key_map.get_for(v2t).cloned().ok_or_else(|| {
             LpmError::Store(format!(
                 "virtual-store linker: missing graph key for compatibility package {}@{}",
                 v2t.target.name, v2t.target.version
@@ -640,7 +639,7 @@ fn collect_compatibility_entries<'a>(
             continue;
         }
 
-        for (_local, dep_key) in compatibility_dependency_links(&v2t.target, key_map)? {
+        for (_local, dep_key) in compatibility_dependency_links(v2t, key_map)? {
             let dep_target = targets_by_key_dir.get(dep_key.dir_name()).ok_or_else(|| {
                 LpmError::Store(format!(
                     "virtual-store linker: compatibility dependency {} for {}@{} is missing from install set",
@@ -657,33 +656,34 @@ fn collect_compatibility_entries<'a>(
 }
 
 fn compatibility_dependency_links(
-    target: &LinkTarget,
+    target: &V2Target,
     key_map: &KeyMap,
 ) -> Result<Vec<(String, Arc<GraphKey>)>, LpmError> {
-    let mut links = Vec::with_capacity(target.dependencies.len() + target.peers.len());
+    let link_target = &target.target;
+    let mut links = Vec::with_capacity(link_target.dependencies.len() + link_target.peers.len());
     let mut seen_local: HashSet<String> =
-        HashSet::with_capacity(target.dependencies.len() + target.peers.len());
+        HashSet::with_capacity(link_target.dependencies.len() + link_target.peers.len());
 
-    for dep in &target.dependencies {
+    for dep in &link_target.dependencies {
         if !is_safe_root_link_name(&dep.local) {
             tracing::warn!(
                 "virtual-store linker: skipping unsafe compatibility dependency local name {:?} for {}@{}",
                 dep.local,
-                target.name,
-                target.version
+                link_target.name,
+                link_target.version
             );
             continue;
         }
         let dep_key = key_map
-            .get_for_dependency(dep)
+            .get_for_dependency(target, dep)
             .ok_or_else(|| {
                 LpmError::Store(format!(
                     "virtual-store linker: compatibility dep {}=>{}@{} of {}@{} has no resolved graph key",
                     dep.local,
                     dep.target_name,
                     dep.graph_key_value(),
-                    target.name,
-                    target.version
+                    link_target.name,
+                    link_target.version
                 ))
             })?
             .clone();
@@ -692,22 +692,31 @@ fn compatibility_dependency_links(
         }
     }
 
-    for (peer_name, peer_version) in &target.peers {
-        if !is_safe_root_link_name(peer_name) {
+    for peer in &link_target.peers {
+        if !is_safe_root_link_name(&peer.local_name) {
             tracing::warn!(
                 "virtual-store linker: skipping unsafe compatibility peer local name {:?} for {}@{}",
-                peer_name,
-                target.name,
-                target.version
+                peer.local_name,
+                link_target.name,
+                link_target.version
             );
             continue;
         }
-        if !seen_local.insert(peer_name.clone()) {
+        if !seen_local.insert(peer.local_name.clone()) {
             continue;
         }
-        if let Some(peer_key) = key_map.get_peer(peer_name, peer_version) {
-            links.push((peer_name.clone(), peer_key.clone()));
-        }
+        let peer_key = key_map.get_peer(target, peer).ok_or_else(|| {
+            LpmError::Store(format!(
+                "virtual-store linker: compatibility peer {}=>{}@{} wrapper_id={:?} of {}@{} has no unambiguous resolved graph key",
+                peer.local_name,
+                peer.target_name,
+                peer.target_version,
+                peer.target_wrapper_id,
+                link_target.name,
+                link_target.version,
+            ))
+        })?;
+        links.push((peer.local_name.clone(), Arc::clone(peer_key)));
     }
 
     Ok(links)
@@ -977,7 +986,7 @@ fn sync_compatibility_entry_links(
     compatibility_links: &CompatibilityLinks,
 ) -> Result<(), LpmError> {
     let node_modules = compatibility_node_modules_dir(compatibility_root, &entry.key);
-    let mut links = compatibility_dependency_links(&entry.target.target, key_map)?;
+    let mut links = compatibility_dependency_links(entry.target, key_map)?;
     let own_local = entry.key.name();
     links.retain(|(local, _)| local != own_local);
     let mut desired: HashSet<String> = HashSet::with_capacity(links.len() + 1);
@@ -1119,7 +1128,7 @@ fn rewire_project_roots_to_compat(
 ) -> Result<(), LpmError> {
     let nm = ensure_node_modules_dir(project_dir)?;
     for v2t in targets {
-        let Some(key) = key_map.get_for(&v2t.target) else {
+        let Some(key) = key_map.get_for(v2t) else {
             continue;
         };
         let Some(package_dir) = compatibility_links.package_dir_for_key(key) else {

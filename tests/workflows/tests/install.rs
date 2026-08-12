@@ -11,8 +11,8 @@ use support::mock_registry::{
     make_tarball_from_pkg_json, make_tarball_with_files,
 };
 use support::{
-    TempProject, configure_fake_node, lpm, lpm_v1, lpm_v1_with_registry, lpm_with_registry,
-    project_bin_path, write_repeated_file, write_signed_unlock,
+    TempProject, configure_fake_node, lpm, lpm_spawnable, lpm_v1, lpm_v1_with_registry,
+    lpm_with_registry, project_bin_path, write_repeated_file, write_signed_unlock,
 };
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -182,6 +182,71 @@ fn install_without_package_json_fails() {
     );
 }
 
+#[test]
+fn install_lockfile_scope_origin_error_redacts_secrets_in_terminal_and_json_output() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "scope-origin-redaction",
+  "version": "1.0.0",
+  "dependencies": { "@lpm.dev/alice.utils": "1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "lpm.lock",
+        r#"[metadata]
+lockfile-version = 1
+
+[[packages]]
+name = "@lpm.dev/alice.utils"
+version = "1.0.0"
+source = "registry+https://source-user:source-password@example.invalid/private-path?token=query-secret#fragment-secret"
+"#,
+    );
+
+    for json in [false, true] {
+        let mut command = lpm_with_registry(&project, "http://127.0.0.1:1");
+        command.env("LPM_TYPOSQUAT_GUARD", "off");
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args(["install", "--offline"])
+            .output()
+            .expect("spawn offline install");
+        assert!(
+            !output.status.success(),
+            "off-origin lockfile source must fail closed"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let rendered = format!("{stdout}\n{stderr}");
+        assert!(
+            rendered.contains("registry+https://example.invalid"),
+            "{} output must retain the safe registry origin:\n{rendered}",
+            if json { "JSON" } else { "terminal" }
+        );
+        for secret in [
+            "source-user",
+            "source-password",
+            "private-path",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "{} output exposed {secret:?}: {rendered}",
+                if json { "JSON" } else { "terminal" }
+            );
+        }
+        if json {
+            let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|error| panic!("JSON error output must parse: {error}\n{stdout}"));
+            assert_eq!(envelope["success"], serde_json::json!(false));
+        }
+    }
+}
+
 #[tokio::test]
 async fn mutable_install_repairs_stale_root_resolutions_after_dependency_ranges_change() {
     let mock = MockRegistry::start().await;
@@ -239,6 +304,11 @@ async fn mutable_install_repairs_stale_root_resolutions_after_dependency_ranges_
         stale_lockfile.root_resolutions.insert(
             name.to_string(),
             lpm_lockfile::LockedRootResolution {
+                instance_id: stale_lockfile
+                    .packages
+                    .iter()
+                    .find(|package| package.name == name && package.version == version)
+                    .and_then(|package| package.instance_id),
                 package: name.to_string(),
                 version: version.to_string(),
                 source,
@@ -296,6 +366,115 @@ async fn mutable_install_repairs_stale_root_resolutions_after_dependency_ranges_
     assert_eq!(installed_version(&project, "range-runner"), "3.2.6");
     assert_eq!(installed_version(&project, "range-coverage"), "3.2.6");
     assert_eq!(installed_version(&project, "range-bundler"), "6.4.3");
+}
+
+#[tokio::test]
+async fn mutable_install_re_resolves_v12_lockfile_and_offline_fails_closed() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("legacy-exact-graph", "1.0.0");
+    mock.with_package("legacy-exact-graph", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "legacy-exact-graph-project",
+            "version": "1.0.0",
+            "dependencies": { "legacy-exact-graph": "1.0.0" }
+        }"#,
+    );
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install current lockfile");
+    assert!(
+        initial.status.success(),
+        "initial install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    let path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut legacy = lpm_lockfile::Lockfile::read_from_file(&path).unwrap();
+    legacy.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+    for package in &mut legacy.packages {
+        package.instance_id = None;
+        package.dependency_targets.clear();
+        package.peer_targets.clear();
+    }
+    for root in legacy.root_resolutions.values_mut() {
+        root.instance_id = None;
+    }
+    legacy.write_to_file(&path).expect("write v12 fixture");
+    let binary_path = project.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    if binary_path.exists() {
+        std::fs::remove_file(&binary_path).unwrap();
+    }
+
+    let frozen = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run frozen legacy replay");
+    assert!(!frozen.status.success());
+    assert!(
+        String::from_utf8_lossy(&frozen.stderr).contains("no exact package-instance graph"),
+        "frozen error must explain why replay is unsafe; stderr:\n{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+
+    let offline = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline legacy replay");
+    assert!(!offline.status.success());
+    assert!(
+        String::from_utf8_lossy(&offline.stderr).contains("no exact package-instance graph"),
+        "offline error must explain why replay is unsafe; stderr:\n{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+
+    let online = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run online legacy upgrade");
+    assert!(
+        online.status.success(),
+        "online legacy upgrade failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&online.stdout),
+        String::from_utf8_lossy(&online.stderr)
+    );
+    let upgraded = lpm_lockfile::Lockfile::read_from_file(&path).unwrap();
+    assert_eq!(
+        upgraded.metadata.lockfile_version,
+        lpm_lockfile::LOCKFILE_VERSION
+    );
+    assert!(
+        upgraded
+            .packages
+            .iter()
+            .all(|package| package.instance_id.is_some())
+    );
 }
 
 #[test]
@@ -3086,6 +3265,97 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
 }
 
 #[tokio::test]
+async fn frozen_install_rejects_unreachable_package_before_any_network_request() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("reachable-lockfile-root", "1.0.0");
+    mock.with_package("reachable-lockfile-root", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "unreachable-lockfile-row",
+            "version": "1.0.0",
+            "dependencies": { "reachable-lockfile-root": "1.0.0" }
+        }"#,
+    );
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("create exact-graph lockfile fixture");
+    assert!(
+        initial.status.success(),
+        "initial install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    let path = project.path().join(lpm_lockfile::LOCKFILE_NAME);
+    let mut tampered = lpm_lockfile::Lockfile::read_from_file(&path).unwrap();
+    let mut orphan = tampered
+        .packages
+        .first()
+        .expect("reachable package row")
+        .clone();
+    orphan.name = "orphan-lockfile-row".to_string();
+    orphan.instance_id = Some(lpm_common::PackageInstanceId::derive(
+        &orphan.name,
+        &orphan.version,
+        orphan.source.as_deref().expect("package source"),
+        "malicious/orphan",
+    ));
+    tampered.add_package(orphan);
+    std::fs::write(
+        &path,
+        toml::to_string_pretty(&tampered).expect("serialize malicious lockfile fixture"),
+    )
+    .expect("write malicious lockfile fixture");
+    let binary_path = project.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    if binary_path.exists() {
+        std::fs::remove_file(binary_path).unwrap();
+    }
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove installed tree before frozen replay");
+    let requests_before = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("read initial registry requests")
+        .len();
+
+    let frozen = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run frozen replay with unreachable package row");
+
+    assert!(!frozen.status.success());
+    assert!(
+        String::from_utf8_lossy(&frozen.stderr).contains("unreachable from every exact root"),
+        "frozen error must identify the unreachable package row; stderr:\n{}",
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("read registry requests after rejected replay")
+            .len(),
+        requests_before,
+        "lockfile validation must fail before frozen replay makes a network request"
+    );
+}
+
+#[tokio::test]
 async fn install_experimental_spike_replays_frozen_lockfile_and_emits_json() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;
@@ -3453,7 +3723,7 @@ async fn install_experimental_spike_live_graph_applies_patched_dependencies() {
 }
 
 #[tokio::test]
-async fn install_experimental_spike_live_graph_preserves_platform_skipped_optional_descendants() {
+async fn install_experimental_spike_prunes_descendants_of_platform_skipped_optional_package() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(
         serde_json::json!({
@@ -3526,7 +3796,7 @@ async fn install_experimental_spike_live_graph_preserves_platform_skipped_option
 
     assert!(
         output.status.success(),
-        "experimental live install must preserve descendants of platform-skipped optional packages under parity deny\nstdout: {}\nstderr: {}",
+        "experimental live install must prune descendants of platform-skipped optional packages under parity deny\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -3536,8 +3806,8 @@ async fn install_experimental_spike_live_graph_preserves_platform_skipped_option
     });
     let parity = &envelope["timing"]["experimental_installer_spike"]["parity"];
     assert_eq!(parity["matches"], serde_json::json!(true));
-    assert_eq!(parity["candidate_count"], serde_json::json!(3));
-    assert_eq!(parity["baseline_count"], serde_json::json!(3));
+    assert_eq!(parity["candidate_count"], serde_json::json!(1));
+    assert_eq!(parity["baseline_count"], serde_json::json!(1));
 
     let package_names: std::collections::HashSet<&str> = envelope["packages"]
         .as_array()
@@ -3546,9 +3816,9 @@ async fn install_experimental_spike_live_graph_preserves_platform_skipped_option
         .filter_map(|package| package["name"].as_str())
         .collect();
     assert!(package_names.contains("optional-platform-parent"));
-    assert!(package_names.contains("optional-runtime"));
-    assert!(package_names.contains("tslib"));
     assert!(!package_names.contains("optional-wasm-child"));
+    assert!(!package_names.contains("optional-runtime"));
+    assert!(!package_names.contains("tslib"));
 }
 
 #[tokio::test]
@@ -7838,10 +8108,11 @@ async fn warm_v2_lockfile_peer_install_resolves_peer_after_relink() {
         .find(|pkg| pkg.name == "peer-consumer")
         .expect("lockfile should contain peer-consumer");
     assert_eq!(
-        consumer.peers,
-        vec!["react@18.3.1".to_string()],
+        consumer.peer_edges,
+        [lpm_common::PeerEdge::registry("react", "react", "18.3.1")],
         "lockfile must persist resolved peer context for warm v2 linking",
     );
+    assert_eq!(consumer.peer_targets.len(), 1);
 
     std::fs::remove_dir_all(project.path().join("node_modules"))
         .expect("remove node_modules before warm relink");
@@ -8656,9 +8927,227 @@ async fn install_auto_installs_required_peer_dependencies_by_default() {
     );
 }
 
+#[tokio::test]
+async fn manifest_alias_preserves_canonical_ambient_peer_across_frozen_offline_replay() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "peer-host",
+            "version": "1.0.0",
+            "peerDependencies": { "react": "^17.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({ "name": "react", "version": "17.0.0" }),
+        &[],
+    )
+    .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "ambient-peer-beside-alias",
+  "version": "1.0.0",
+  "dependencies": {
+    "peer-host": "1.0.0",
+    "react-17": "npm:react@17.0.0"
+  }
+}"#,
+    );
+
+    let initial = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install manifest alias beside canonical ambient peer");
+    assert!(
+        initial.status.success(),
+        "initial install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&initial.stdout),
+        String::from_utf8_lossy(&initial.stderr),
+    );
+    assert!(
+        project.path().join("node_modules/react").exists()
+            && project.path().join("node_modules/react-17").exists(),
+        "initial install must expose canonical and aliased roots\nlockfile: {}\nroot entries: {:?}",
+        project.read_file("lpm.lock"),
+        std::fs::read_dir(project.path().join("node_modules"))
+            .expect("read root node_modules")
+            .map(|entry| entry.expect("read root entry").file_name())
+            .collect::<Vec<_>>(),
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before frozen offline replay");
+    let replay = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("replay manifest alias beside canonical ambient peer");
+
+    assert!(
+        replay.status.success(),
+        "frozen offline replay failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr),
+    );
+    assert!(
+        project.path().join("node_modules/react").exists()
+            && project.path().join("node_modules/react-17").exists(),
+        "frozen offline replay must preserve canonical and aliased roots",
+    );
+}
+
 /// A package whose `optionalDependencies` cannot be satisfied (the optional
 /// is unreachable on the registry) must NOT abort the install. Mandatory
 /// deps and the host package itself must still land.
+#[tokio::test]
+async fn install_resolves_root_optional_dependency() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "root-optional",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "root-optional-project",
+            "version": "1.0.0",
+            "optionalDependencies": { "root-optional": "1.0.0" }
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install root optional dependency");
+
+    assert!(
+        output.status.success(),
+        "root optional dependency must be installable\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/root-optional/package.json")
+            .is_file(),
+        "root optional dependency must be linked into node_modules\nstdout: {}\nstderr: {}\nlockfile: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        project.read_file("lpm.lock"),
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read lockfile after root optional install");
+    let package = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "root-optional")
+        .expect("root optional dependency must be persisted");
+    assert!(package.optional, "root optional package must stay optional");
+}
+
+#[tokio::test]
+async fn install_missing_root_optional_dependency_replays_frozen_and_offline() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+            "name": "missing-root-optional-project",
+            "version": "1.0.0",
+            "optionalDependencies": { "missing-root-optional": "1.0.0" }
+        }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assert!(
+        project.path().join("lpm.lock").is_file(),
+        "an install with only an unavailable optional root must still write a lockfile"
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn install_skips_missing_optional_file_and_link_roots() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "missing-optional-local-roots",
+            "version": "1.0.0",
+            "optionalDependencies": {
+                "missing-file": "file:./does-not-exist-file",
+                "missing-link": "link:./does-not-exist-link"
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install missing optional local roots");
+
+    assert!(
+        output.status.success(),
+        "missing optional file/link roots must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!project.path().join("node_modules/missing-file").exists());
+    assert!(!project.path().join("node_modules/missing-link").exists());
+}
+
 #[tokio::test]
 async fn install_optional_dep_failure_does_not_abort_install() {
     let mock = MockRegistry::start().await;
@@ -9629,6 +10118,139 @@ fn v1_store_rejects_required_workspace_member_with_incompatible_node_engine() {
 }
 
 #[test]
+fn v1_store_skips_optional_workspace_member_with_incompatible_node_engine() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"v1-workspace-engine-optional",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "optionalDependencies":{"workspace-native":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-native/package.json",
+        r#"{
+            "name":"workspace-native",
+            "version":"1.0.0",
+            "engines":{"node":">=999.0.0"}
+        }"#,
+    );
+
+    let mut command = lpm_v1(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+    let output = command
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run v1 optional workspace dependency-engine install");
+
+    assert!(
+        output.status.success(),
+        "v1 must skip an incompatible optional workspace member\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !project
+            .path()
+            .join("node_modules/workspace-native")
+            .exists()
+    );
+}
+
+#[test]
+fn v1_store_omit_optional_does_not_link_workspace_member() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"v1-workspace-omit-optional",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "optionalDependencies":{"workspace-optional":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-optional/package.json",
+        r#"{"name":"workspace-optional","version":"1.0.0"}"#,
+    );
+
+    lpm_v1(&project)
+        .args([
+            "install",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        !project
+            .path()
+            .join("node_modules/workspace-optional")
+            .exists()
+    );
+}
+
+#[test]
+fn offline_v2_omit_optional_does_not_reintroduce_workspace_member() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"v2-workspace-offline-omit-optional",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["packages/*"],
+            "optionalDependencies":{"workspace-optional":"workspace:*"}
+        }"#,
+    );
+    project.write_file(
+        "packages/workspace-optional/package.json",
+        r#"{"name":"workspace-optional","version":"1.0.0"}"#,
+    );
+
+    lpm(&project)
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assertions::assert_in_node_modules(project.path(), "workspace-optional");
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove initial workspace materialization");
+    lpm(&project)
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--offline",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        !project
+            .path()
+            .join("node_modules/workspace-optional")
+            .exists(),
+        "offline omit optional must not append the workspace member after filtering",
+    );
+}
+
+#[test]
 fn optional_dependency_overrides_duplicate_required_local_source_dependency() {
     let project = TempProject::empty(
         r#"{
@@ -9923,6 +10545,426 @@ async fn install_optional_platform_dep_selects_newest_then_skips_current_host() 
             && lock.contains("os = [\"__lpm_no_such_os__\"]")
             && lock.contains("optional = true"),
         "lockfile must preserve the semver-selected incompatible optional package for other hosts:\n{lock}"
+    );
+}
+
+#[tokio::test]
+async fn install_omit_optional_keeps_lockfile_graph_without_fetching_or_linking_it() {
+    let mock = MockRegistry::start().await;
+    let required_tarball = make_tarball("required-root", "1.0.0");
+    let optional_tarball = make_tarball("optional-root", "1.0.0");
+    let optional_leaf_tarball = make_tarball("optional-leaf", "1.0.0");
+    mock.with_package("required-root", "1.0.0", &required_tarball)
+        .await;
+    mock.with_package_and_deps(
+        "optional-root",
+        "1.0.0",
+        &optional_tarball,
+        serde_json::json!({ "optional-leaf": "1.0.0" }),
+    )
+    .await;
+    mock.with_package("optional-leaf", "1.0.0", &optional_leaf_tarball)
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "omit-optional",
+            "version": "1.0.0",
+            "dependencies": { "required-root": "1.0.0" },
+            "optionalDependencies": { "optional-root": "1.0.0" }
+        }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "required-root");
+    assert!(!project.path().join("node_modules/optional-root").exists());
+    assert!(!project.path().join("node_modules/optional-leaf").exists());
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("name = \"optional-root\"")
+            && lockfile.contains("name = \"optional-leaf\""),
+        "omit optional must retain the complete optional graph in the lockfile:\n{lockfile}"
+    );
+
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    for package in ["optional-root", "optional-leaf"] {
+        let tarball_path = MockRegistry::tarball_path(package, "1.0.0");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != tarball_path),
+            "omit optional must not fetch {package}'s tarball"
+        );
+    }
+
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assertions::assert_in_node_modules(project.path(), "required-root");
+    assert!(!project.path().join("node_modules/optional-root").exists());
+    assert!(!project.path().join("node_modules/optional-leaf").exists());
+}
+
+#[tokio::test]
+async fn install_omit_optional_prunes_transitive_optional_dependency_from_required_package() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "required-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "optional-child": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-child",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"omit-transitive-optional",
+            "version":"1.0.0",
+            "dependencies":{"required-host":"1.0.0"}
+        }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "required-host");
+    assert!(!project.path().join("node_modules/optional-child").exists());
+    assert!(
+        project
+            .read_file("lpm.lock")
+            .contains("name = \"optional-child\"")
+    );
+    let optional_tarball_path = MockRegistry::tarball_path("optional-child", "1.0.0");
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != optional_tarball_path),
+        "omit optional must not fetch a transitive optional dependency"
+    );
+}
+
+#[tokio::test]
+async fn install_omit_optional_strict_peers_ignores_missing_peer_of_omitted_package() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "required-peer-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "optional-peer-host": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-peer-host",
+            "version": "1.0.0",
+            "peerDependencies": { "missing-peer": "^1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"omit-optional-strict-peer",
+            "version":"1.0.0",
+            "dependencies":{"required-peer-host":"1.0.0"},
+            "lpm":{"autoInstallPeers":false}
+        }"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=optional",
+            "--strict-peer-dependencies",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run strict omit-optional install");
+    assert!(
+        output.status.success(),
+        "an omitted package's missing peer must not fail strict validation\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assertions::assert_in_node_modules(project.path(), "required-peer-host");
+    assert!(
+        !project
+            .path()
+            .join("node_modules/optional-peer-host")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn install_omit_optional_strict_integrity_ignores_unverified_omitted_package() {
+    let mock = MockRegistry::start().await;
+    let required_tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "integrity-required-host",
+            "version": "1.0.0",
+            "optionalDependencies": { "integrity-optional-child": "1.0.0" }
+        }),
+        &[],
+    );
+    let optional_tarball = make_tarball("integrity-optional-child", "1.0.0");
+    let mut required_metadata =
+        mock.package_metadata("integrity-required-host", "1.0.0", &required_tarball);
+    required_metadata["versions"]["1.0.0"]["optionalDependencies"] =
+        serde_json::json!({ "integrity-optional-child": "1.0.0" });
+    let optional_metadata = serde_json::json!({
+        "name": "integrity-optional-child",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "integrity-optional-child",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": mock.tarball_url("integrity-optional-child", "1.0.0")
+                }
+            }
+        },
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+    mock.with_package_metadata(
+        "integrity-required-host",
+        "1.0.0",
+        &required_tarball,
+        required_metadata.clone(),
+    )
+    .await;
+    mock.with_package_metadata(
+        "integrity-optional-child",
+        "1.0.0",
+        &optional_tarball,
+        optional_metadata.clone(),
+    )
+    .await;
+    mock.with_batch_metadata(vec![required_metadata, optional_metadata])
+        .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"omit-optional-strict-integrity",
+            "version":"1.0.0",
+            "dependencies":{"integrity-required-host":"1.0.0"}
+        }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=optional",
+            "--strict-integrity",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "integrity-required-host");
+    assert!(
+        !project
+            .path()
+            .join("node_modules/integrity-optional-child")
+            .exists()
+    );
+    assert!(
+        project
+            .read_file("lpm.lock")
+            .contains("name = \"integrity-optional-child\"")
+    );
+    let optional_tarball_path = MockRegistry::tarball_path("integrity-optional-child", "1.0.0");
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != optional_tarball_path),
+        "strict integrity must not cause an omitted optional tarball fetch"
+    );
+}
+
+#[tokio::test]
+async fn install_omit_optional_prunes_registry_child_promoted_from_file_source() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-promoted-child",
+            "version": "1.0.0"
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+            "name":"omit-promoted-optional",
+            "version":"1.0.0",
+            "dependencies":{"local-host":"file:./packages/local-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/local-host/package.json",
+        r#"{
+            "name":"local-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"optional-promoted-child":"1.0.0"}
+        }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "local-host");
+    assert!(
+        !project
+            .path()
+            .join("node_modules/optional-promoted-child")
+            .exists()
+    );
+    assert!(
+        project
+            .read_file("lpm.lock")
+            .contains("name = \"optional-promoted-child\"")
+    );
+    let tarball_path = MockRegistry::tarball_path("optional-promoted-child", "1.0.0");
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != tarball_path),
+        "omit optional must not fetch a promoted optional registry child"
+    );
+}
+
+#[tokio::test]
+async fn install_combined_omit_prunes_dev_file_source_and_its_optional_registry_child() {
+    let mock = MockRegistry::start().await;
+    for package in ["required-root", "dev-optional-child"] {
+        mock.with_manifest_package(
+            serde_json::json!({
+                "name": package,
+                "version": "1.0.0"
+            }),
+            &[],
+        )
+        .await;
+    }
+    let project = TempProject::empty(
+        r#"{
+            "name":"combined-omit-local-source",
+            "version":"1.0.0",
+            "dependencies":{"required-root":"1.0.0"},
+            "devDependencies":{"dev-host":"file:./packages/dev-host"}
+        }"#,
+    );
+    project.write_file(
+        "packages/dev-host/package.json",
+        r#"{
+            "name":"dev-host",
+            "version":"1.0.0",
+            "optionalDependencies":{"dev-optional-child":"1.0.0"}
+        }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--omit=dev,optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "required-root");
+    assert!(!project.path().join("node_modules/dev-host").exists());
+    assert!(
+        !project
+            .path()
+            .join("node_modules/dev-optional-child")
+            .exists()
+    );
+    let lockfile = project.read_file("lpm.lock");
+    assert!(
+        lockfile.contains("name = \"dev-host\"")
+            && lockfile.contains("name = \"dev-optional-child\"")
+    );
+    let tarball_path = MockRegistry::tarball_path("dev-optional-child", "1.0.0");
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != tarball_path),
+        "combined omit must not fetch the dev source's optional registry child"
     );
 }
 
@@ -10425,6 +11467,47 @@ async fn install_github_dependency_at_commit_writes_replayable_lockfile_entry() 
         .object_dir(&archive_integrity)
         .expect("Git archive integrity should address the v2 object");
     assert!(object_dir.join(".lpm-security.json").is_file());
+}
+
+#[tokio::test]
+async fn install_skips_unavailable_optional_github_dependency() {
+    const COMMIT: &str = "779219540f66cecaa159da32b3b8936697ba10a7";
+
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/owner/missing/tar.gz/{COMMIT}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&github)
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+            "name":"optional-github-source",
+            "version":"1.0.0",
+            "optionalDependencies":{{
+                "missing-github":"github:owner/missing#{COMMIT}"
+            }}
+        }}"#,
+    ));
+
+    let output = lpm(&project)
+        .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install unavailable optional GitHub dependency");
+
+    assert!(
+        output.status.success(),
+        "an unavailable optional GitHub dependency must be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(!project.path().join("node_modules/missing-github").exists());
 }
 
 #[tokio::test]
@@ -12206,7 +13289,7 @@ fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
         r#"{
   "name": "recursive-aliased-file-member",
   "private": true,
-  "workspaces": ["playground/**"]
+  "workspaces": ["playground/*"]
 }"#,
     );
     project.write_file(
@@ -12266,9 +13349,14 @@ fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
     assert!(
         lockfile.packages.iter().any(|package| {
             package.name == "@test/minify"
-                && package.source.as_deref() == Some("directory+dir/module")
+                && package.source.as_deref() == Some("directory+./dir/module")
         }),
-        "the local alias must not replace the package's canonical identity",
+        "the local alias must not replace the package's canonical identity or source: {:?}",
+        lockfile
+            .packages
+            .iter()
+            .map(|package| (&package.name, &package.version, &package.source))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -12402,10 +13490,15 @@ async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() 
         .find(|package| package.name == "peer-consumer")
         .expect("member lockfile should contain peer-consumer");
     assert_eq!(
-        consumer.peers,
-        vec!["peer-provider@1.0.0"],
+        consumer.peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "peer-provider",
+            "peer-provider",
+            "1.0.0",
+        )],
         "the workspace root dependency must be recorded as the member consumer's peer context",
     );
+    assert_eq!(consumer.peer_targets.len(), 1);
 
     let runtime = std::process::Command::new("node")
         .current_dir(project.path().join("app"))
@@ -12420,6 +13513,101 @@ async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() 
         String::from_utf8_lossy(&runtime.stderr),
     );
     assert_eq!(String::from_utf8_lossy(&runtime.stdout), "1.0.0");
+}
+
+#[tokio::test]
+async fn recursive_omit_optional_does_not_expose_root_optional_peer_provider_to_members() {
+    let mock = MockRegistry::start().await;
+    for manifest in [
+        serde_json::json!({ "name": "optional-peer-provider", "version": "1.0.0" }),
+        serde_json::json!({
+            "name": "peer-consumer",
+            "version": "1.0.0",
+            "peerDependencies": { "optional-peer-provider": "^1.0.0" }
+        }),
+        serde_json::json!({ "name": "sibling-required", "version": "1.0.0" }),
+    ] {
+        mock.with_manifest_package(manifest, &[]).await;
+    }
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "workspace-root-optional-peer-provider",
+  "private": true,
+  "workspaces": ["app", "sibling"],
+  "optionalDependencies": { "optional-peer-provider": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "app/package.json",
+        r#"{
+  "name": "workspace-member-optional-peer-consumer",
+  "private": true,
+  "dependencies": { "peer-consumer": "1.0.0" },
+  "lpm": { "autoInstallPeers": false }
+}"#,
+    );
+    project.write_file(
+        "sibling/package.json",
+        r#"{
+  "name": "workspace-member-required-sibling",
+  "private": true,
+  "dependencies": { "sibling-required": "1.0.0" }
+}"#,
+    );
+
+    let install = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--recursive",
+            "--omit=optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn recursive omit-optional install");
+    assert!(
+        install.status.success(),
+        "recursive omit-optional install should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+
+    let member_lockfile = read_project_lockfile(&project, "app");
+    let consumer = member_lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == "peer-consumer")
+        .expect("member lockfile should contain peer-consumer");
+    assert!(
+        consumer.peer_edges.is_empty() && consumer.peer_targets.is_empty(),
+        "an omitted optional root must not satisfy a member peer: {:?}",
+        consumer.peer_edges,
+    );
+    assert!(
+        member_lockfile
+            .packages
+            .iter()
+            .all(|package| package.name != "optional-peer-provider"),
+        "the omitted provider must not be imported into the member graph",
+    );
+    let sibling_lockfile = read_project_lockfile(&project, "sibling");
+    assert!(
+        sibling_lockfile
+            .packages
+            .iter()
+            .any(|package| package.name == "sibling-required"),
+        "independent sibling dependencies must remain installed",
+    );
+    assert!(
+        !project
+            .path()
+            .join("node_modules/optional-peer-provider")
+            .exists(),
+        "the optional root provider must remain omitted from disk",
+    );
 }
 
 #[tokio::test]
@@ -12613,7 +13801,15 @@ async fn recursive_workspace_root_local_dependency_closure_satisfies_member_tran
         .iter()
         .find(|package| package.name == "peer-consumer")
         .expect("member lockfile should contain peer-consumer");
-    assert_eq!(consumer.peers, vec!["provider-child@1.0.0"]);
+    assert_eq!(
+        consumer.peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "provider-child",
+            "provider-child",
+            "1.0.0",
+        )]
+    );
+    assert_eq!(consumer.peer_targets.len(), 1);
 
     let runtime = std::process::Command::new("node")
         .current_dir(project.path().join("app"))
@@ -12884,7 +14080,15 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
         .iter()
         .find(|package| package.name == "peer-consumer")
         .expect("member lockfile should contain peer-consumer");
-    assert_eq!(consumer.peers, vec!["peer-provider@2.0.0"]);
+    assert_eq!(
+        consumer.peer_edges,
+        [lpm_common::PeerEdge::registry(
+            "peer-provider",
+            "peer-provider",
+            "2.0.0",
+        )]
+    );
+    assert_eq!(consumer.peer_targets.len(), 1);
 }
 
 #[tokio::test]
@@ -14185,6 +15389,196 @@ async fn offline_install_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
     );
     assert_root_symlink_exists(&project, "foo");
     assert_root_symlink_exists(&project, "is-number");
+}
+
+#[test]
+fn local_source_manifest_drift_re_resolves_online_and_fails_offline_and_frozen() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "local-source-drift",
+  "dependencies": { "local": "file:./packages/local" }
+}"#,
+    );
+    project.write_file(
+        "packages/local/package.json",
+        r#"{ "name": "local", "version": "1.0.0" }"#,
+    );
+
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove installed layout before replay");
+    let initial_lockfile = project.read_file("lpm.lock");
+    assert!(initial_lockfile.contains("manifest-fingerprint"));
+    assert!(
+        !project.file_exists("lpm.lockb"),
+        "fingerprinted local sources must remove the lossy binary sidecar",
+    );
+
+    project.write_file(
+        "packages/local/package.json",
+        r#"{
+          "name": "local",
+          "version": "1.0.0",
+          "dependencies": { "nested": "file:../nested" }
+        }"#,
+    );
+    project.write_file(
+        "packages/nested/package.json",
+        r#"{ "name": "nested", "version": "1.0.0" }"#,
+    );
+
+    let offline = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run offline install after local-source drift");
+    assert!(!offline.status.success());
+    assert!(
+        String::from_utf8_lossy(&offline.stderr).contains("Run `lpm install` online"),
+        "offline drift error must instruct an online reconciliation:\n{}",
+        String::from_utf8_lossy(&offline.stderr),
+    );
+
+    let frozen = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run frozen install after local-source drift");
+    assert!(!frozen.status.success());
+    assert!(
+        String::from_utf8_lossy(&frozen.stderr).contains("run `lpm install` locally"),
+        "frozen drift error must instruct a mutable local install:\n{}",
+        String::from_utf8_lossy(&frozen.stderr),
+    );
+
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .assert()
+        .success();
+    let updated_lockfile = project.read_file("lpm.lock");
+    assert_ne!(updated_lockfile, initial_lockfile);
+    assert!(updated_lockfile.contains("name = \"nested\""));
+
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "install",
+            "--offline",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assert_root_symlink_exists(&project, "local");
+}
+
+#[test]
+fn formatting_only_local_manifest_edit_preserves_lockfile_bytes() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "local-source-formatting",
+  "dependencies": { "local": "link:./packages/local" }
+}"#,
+    );
+    project.write_file(
+        "packages/local/package.json",
+        r#"{"name":"local","version":"1.0.0","dependencies":{}}"#,
+    );
+
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .assert()
+        .success();
+    let before = project.read_file("lpm.lock");
+
+    project.write_file(
+        "packages/local/package.json",
+        "\u{feff}{\n  \"dependencies\": {},\n  \"version\": \"1.0.0\",\n  \"name\": \"local\"\n}\n",
+    );
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .assert()
+        .success();
+
+    assert_eq!(project.read_file("lpm.lock"), before);
+}
+
+#[test]
+fn frozen_replay_rejects_local_manifest_mutation_before_materialization() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "local-source-materialization-race",
+  "dependencies": { "local": "file:./packages/local" }
+}"#,
+    );
+    project.write_file(
+        "packages/local/package.json",
+        r#"{ "name": "local", "version": "1.0.0" }"#,
+    );
+    lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(WORKSPACE_INSTALL_FLAGS)
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove installed layout before replay");
+
+    let marker = project.path().join("before-local-materialization");
+    let resume = marker.with_extension("resume");
+    let mut command = lpm_spawnable(&project);
+    command
+        .env("LPM_TEST_PAUSE_BEFORE_LOCAL_MATERIALIZATION", &marker)
+        .args([
+            "install",
+            "--frozen-lockfile",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ]);
+    let mut child = command.spawn().expect("spawn paused frozen install");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the pre-materialization marker",
+        );
+        assert!(
+            child.try_wait().expect("inspect paused install").is_none(),
+            "install exited before reaching the pre-materialization gate",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    project.write_file(
+        "packages/local/package.json",
+        r#"{
+          "name": "local",
+          "version": "1.0.0",
+          "dependencies": { "unexpected": "1.0.0" }
+        }"#,
+    );
+    std::fs::write(&resume, b"resume").expect("release paused install");
+    let output = child.wait_with_output().expect("wait for frozen install");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("changed before materialization"),
+        "frozen install must reject bytes that differ from the validated manifest:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 /// Both online and offline arms must plant the canonical AND the alias
@@ -16588,11 +17982,11 @@ integrity = "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXP
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("pre-R2.5 lockfile"),
+        stderr.contains("no exact package-instance graph"),
         "error message must explain the cause; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("Run `lpm install` (online)"),
+        stderr.contains("Run `lpm install` online once"),
         "error message must offer the remediation path; got:\n{stderr}"
     );
 }
