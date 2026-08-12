@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -73,7 +75,7 @@ pub(super) fn execute_script(
     let output_readers = spawn_sanitized_output_readers(&mut child);
 
     let output = wait_with_timeout(child, timeout);
-    output_readers.join();
+    output_readers.finish_and_join();
 
     match output {
         Ok(status) => {
@@ -203,10 +205,12 @@ pub(super) fn spawn_lifecycle_child(
 struct OutputReaders {
     stdout: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
+    process_finished: Arc<AtomicBool>,
 }
 
 impl OutputReaders {
-    fn join(self) {
+    fn finish_and_join(self) {
+        self.process_finished.store(true, Ordering::Release);
         if let Some(handle) = self.stdout {
             let _ = handle.join();
         }
@@ -217,24 +221,38 @@ impl OutputReaders {
 }
 
 fn spawn_sanitized_output_readers(child: &mut Child) -> OutputReaders {
-    let stdout = child
-        .stdout
-        .take()
-        .map(|stdout| std::thread::spawn(move || copy_sanitized_output(stdout, std::io::stdout())));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| std::thread::spawn(move || copy_sanitized_output(stderr, std::io::stderr())));
-    OutputReaders { stdout, stderr }
+    let process_finished = Arc::new(AtomicBool::new(false));
+    let stdout = child.stdout.take().map(|stdout| {
+        let process_finished = Arc::clone(&process_finished);
+        std::thread::spawn(move || {
+            copy_sanitized_output(stdout, std::io::stdout(), &process_finished)
+        })
+    });
+    let stderr = child.stderr.take().map(|stderr| {
+        let process_finished = Arc::clone(&process_finished);
+        std::thread::spawn(move || {
+            copy_sanitized_output(stderr, std::io::stderr(), &process_finished)
+        })
+    });
+    OutputReaders {
+        stdout,
+        stderr,
+        process_finished,
+    }
 }
 
-fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W)
+#[cfg(unix)]
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
 where
-    R: Read,
+    R: Read + std::os::fd::AsRawFd,
     W: Write,
 {
     let mut buf = [0_u8; 8192];
+    let mut post_finish_bytes = 0_usize;
     loop {
+        if !wait_for_output(reader.as_raw_fd(), process_finished) {
+            break;
+        }
         let read = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => read,
@@ -248,6 +266,284 @@ where
         if writer.flush().is_err() {
             break;
         }
+        if process_finished.load(Ordering::Acquire) {
+            post_finish_bytes = post_finish_bytes.saturating_add(read);
+            if post_finish_bytes >= 1024 * 1024 {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_output(fd: std::os::fd::RawFd, process_finished: &AtomicBool) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: poll_fd points to one initialized pollfd for the duration of
+        // the call. The descriptor remains owned by the reader thread.
+        let timeout_ms = if process_finished.load(Ordering::Acquire) {
+            0
+        } else {
+            50
+        };
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result > 0 {
+            return poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0;
+        }
+        if result == 0 {
+            if process_finished.load(Ordering::Acquire) {
+                return false;
+            }
+            continue;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
+where
+    R: Read + std::os::windows::io::AsRawHandle,
+    W: Write,
+{
+    let mut buf = [0_u8; 8192];
+    let mut post_finish_bytes = 0_usize;
+    loop {
+        if !wait_for_windows_output(reader.as_raw_handle(), process_finished) {
+            break;
+        }
+        let read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let lossy = String::from_utf8_lossy(&buf[..read]);
+        let safe = sanitize_terminal_multiline(&lossy);
+        if writer.write_all(safe.as_bytes()).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+        if process_finished.load(Ordering::Acquire) {
+            post_finish_bytes = post_finish_bytes.saturating_add(read);
+            if post_finish_bytes >= 1024 * 1024 {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_output(
+    handle: std::os::windows::io::RawHandle,
+    process_finished: &AtomicBool,
+) -> bool {
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    loop {
+        let mut available = 0_u32;
+        // SAFETY: handle belongs to the reader thread and remains valid for the
+        // call. The null buffer requests only the available-byte count.
+        let result = unsafe {
+            PeekNamedPipe(
+                handle as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            return false;
+        }
+        if available > 0 {
+            return true;
+        }
+        if process_finished.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
+where
+    R: Read,
+    W: Write,
+{
+    let mut buf = [0_u8; 8192];
+    loop {
+        if process_finished.load(Ordering::Acquire) {
+            break;
+        }
+        let read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let lossy = String::from_utf8_lossy(&buf[..read]);
+        let safe = sanitize_terminal_multiline(&lossy);
+        if writer.write_all(safe.as_bytes()).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod timeout_output_tests {
+    use super::{copy_sanitized_output, spawn_sanitized_output_readers};
+    use crate::commands::rebuild::process_tree::wait_with_timeout;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    struct ProcessGuard(u32);
+
+    impl Drop for ProcessGuard {
+        fn drop(&mut self) {
+            // SAFETY: the PID was written by the isolated fixture process. The
+            // guard exists only to ensure a failed assertion cannot leak it.
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn write_detach_helper(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            r#"import os
+import sys
+import time
+
+if os.fork() != 0:
+    os._exit(0)
+os.setsid()
+if os.fork() != 0:
+    os._exit(0)
+with open(sys.argv[1], "w", encoding="utf-8") as pid_file:
+    pid_file.write(str(os.getpid()))
+    pid_file.flush()
+time.sleep(4)
+"#,
+        )
+        .unwrap();
+    }
+
+    fn wait_for_daemon_pid(pid_file: &std::path::Path) -> u32 {
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(pid_file)
+                && let Ok(pid) = text.parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < pid_deadline,
+                "detached fixture did not publish its PID"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn timed_out_output_readers_do_not_wait_for_reparented_pipe_holder() {
+        let fixture = tempfile::tempdir().unwrap();
+        let helper = fixture.path().join("detach.py");
+        let pid_file = fixture.path().join("daemon.pid");
+        write_detach_helper(&helper);
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"python3 "$1" "$2" & while [ ! -s "$2" ]; do sleep 0.01; done; sleep 4"#,
+                "lpm-timeout-fixture",
+            ])
+            .arg(&helper)
+            .arg(&pid_file)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let output_readers = spawn_sanitized_output_readers(&mut child);
+
+        let daemon_pid = wait_for_daemon_pid(&pid_file);
+        let _daemon_guard = ProcessGuard(daemon_pid);
+
+        let start = Instant::now();
+        let error = wait_with_timeout(child, &Duration::from_millis(100)).unwrap_err();
+        output_readers.finish_and_join();
+        let elapsed = start.elapsed();
+
+        assert!(error.starts_with("timeout after "));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "output readers exceeded lifecycle timeout bound: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn completed_output_readers_do_not_wait_for_reparented_pipe_holder() {
+        let fixture = tempfile::tempdir().unwrap();
+        let helper = fixture.path().join("detach.py");
+        let pid_file = fixture.path().join("daemon.pid");
+        write_detach_helper(&helper);
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"python3 "$1" "$2" & while [ ! -s "$2" ]; do sleep 0.01; done; exit 0"#,
+                "lpm-completed-fixture",
+            ])
+            .arg(&helper)
+            .arg(&pid_file)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let output_readers = spawn_sanitized_output_readers(&mut child);
+        let daemon_pid = wait_for_daemon_pid(&pid_file);
+        let _daemon_guard = ProcessGuard(daemon_pid);
+
+        let start = Instant::now();
+        let status = wait_with_timeout(child, &Duration::from_secs(2)).unwrap();
+        output_readers.finish_and_join();
+        let elapsed = start.elapsed();
+
+        assert!(status.success());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "output readers waited for a completed script's detached pipe holder: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn finished_output_reader_drains_bytes_already_in_pipe() {
+        let (mut pipe_writer, pipe_reader) = UnixStream::pair().unwrap();
+        pipe_writer.write_all(b"lifecycle tail\n").unwrap();
+        let finished = AtomicBool::new(true);
+        let mut output = Vec::new();
+
+        copy_sanitized_output(pipe_reader, &mut output, &finished);
+
+        assert_eq!(output, b"lifecycle tail\n");
     }
 }
 
