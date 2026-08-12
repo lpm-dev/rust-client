@@ -309,7 +309,7 @@ pub fn extract_tarball_from_reader(
 pub struct EntryInfo<'a> {
     /// Path relative to `target_dir` (npm's `package/` prefix already stripped).
     pub relative_path: &'a Path,
-    /// Uncompressed size in bytes, read from the tar header.
+    /// Effective uncompressed size in bytes, including PAX and sparse overrides.
     pub size: u64,
     /// File contents, if the caller's `buffer_predicate` returned `true`
     /// for this entry. `None` when the predicate said skip buffering — in
@@ -785,17 +785,7 @@ where
             }
 
             // Enforce per-file and total size limits
-            let size = match entry.header().size() {
-                Ok(size) => size,
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        LpmError::Registry(format!("invalid tar entry size: {error}")),
-                    );
-                }
-            };
+            let size = entry.size();
             if size > limits.max_file_size {
                 return rollback_extraction(
                     &extraction_root,
@@ -1539,6 +1529,39 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn create_pax_size_override_tarball(raw_size: u64, effective_size: u64) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let effective_size_text = effective_size.to_string();
+            builder
+                .append_pax_extensions([("size", effective_size_text.as_bytes())])
+                .unwrap();
+
+            let mut header = tar::Header::new_ustar();
+            header.set_size(raw_size);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path("package/payload.js").unwrap();
+            header.set_cksum();
+            builder.get_mut().write_all(header.as_bytes()).unwrap();
+            builder
+                .get_mut()
+                .write_all(&vec![0_u8; effective_size as usize])
+                .unwrap();
+            let padding = (512 - effective_size % 512) % 512;
+            builder
+                .get_mut()
+                .write_all(&vec![0_u8; padding as usize])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn streaming_test_limits() -> ExtractionLimits {
         ExtractionLimits {
             max_buffered_compressed_size: 64 * 1024,
@@ -1587,6 +1610,33 @@ mod tests {
             payload
         );
         assert_eq!(inspected, payload);
+    }
+
+    #[test]
+    fn pax_effective_size_cannot_bypass_per_file_limit() {
+        let tgz = create_pax_size_override_tarball(1, 2048);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_file_size: 1024,
+            ..streaming_test_limits()
+        };
+
+        let error = extract_tarball_from_reader_with_inspector_with_limits(
+            std::io::Cursor::new(&tgz),
+            dir.path(),
+            limits,
+            false,
+            |path, _| path.extension() == Some(OsStr::new("js")),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("file too large"),
+            "expected per-file limit rejection, got: {error}"
+        );
+        assert!(!dir.path().join("payload.js").exists());
     }
 
     #[test]
