@@ -85,6 +85,10 @@ pub(crate) enum ReleaseCommands {
         #[arg(long, short = 'y')]
         yes: bool,
 
+        /// Six-digit authenticator code for MFA-protected LPM publishes.
+        #[arg(long, value_name = "CODE")]
+        otp: Option<String>,
+
         /// Minimum quality score required to publish (0-100).
         #[arg(long)]
         min_score: Option<u32>,

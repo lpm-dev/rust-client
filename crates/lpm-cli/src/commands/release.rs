@@ -26,6 +26,7 @@ pub(crate) struct ReleaseSelection {
 pub(crate) struct ReleasePublishOptions {
     pub(crate) dry_run: bool,
     pub(crate) yes: bool,
+    pub(crate) otp: Option<String>,
     pub(crate) min_score: Option<u32>,
     pub(crate) allow_secrets: bool,
     pub(crate) npm: bool,
@@ -125,6 +126,7 @@ pub(crate) async fn publish(
             false,
             false,
             None,
+            options.otp.as_deref(),
             options.yes || json_output,
             json_output,
             options.min_score,
