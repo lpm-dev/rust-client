@@ -183,7 +183,7 @@ pub(super) fn spawn_lifecycle_child(
     let sandbox = new_for_platform_with_options(spec, sandbox_mode, sandbox_options.clone())
         .map_err(|e| format!("sandbox init failed: {e}"))?;
 
-    let (shell_program, shell_args) = platform_shell_invocation(cmd);
+    let (shell_program, shell_args) = platform_shell_invocation(cmd)?;
     let mut sbcmd = SandboxedCommand::new(shell_program);
     for arg in shell_args {
         sbcmd = sbcmd.arg(arg);
@@ -322,33 +322,57 @@ pub(super) fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>
     }
 }
 
-/// Pick the right shell program + argv to run a lifecycle script's
-/// shell-string verbatim. POSIX hosts get `sh -c <cmd>`, matching the
-/// way npm/yarn/pnpm spawn lifecycle scripts. Windows gets
-/// `cmd.exe /D /C <cmd>` — `/D` skips AutoRun (so the script doesn't
-/// inherit shell hooks from `HKCU\Software\Microsoft\Command Processor`),
-/// `/C` runs the command and terminates. Both shells are guaranteed
-/// to be on PATH on their respective platforms.
-///
-/// This was hardcoded to `sh -c` before because the
-/// previous sandbox returned `UnsupportedPlatform` on Windows, so the
-/// lifecycle path never reached spawn there. With the real backend
-/// landed, dispatch has to be platform-aware to make end-to-end
-/// installs work on Windows.
-pub(super) fn platform_shell_invocation(cmd: &str) -> (&'static str, Vec<String>) {
+/// Returns an absolute system shell path so package-local PATH entries cannot
+/// intercept lifecycle execution before the approved command starts.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+pub(super) fn platform_shell_invocation(cmd: &str) -> Result<(PathBuf, Vec<String>), String> {
     #[cfg(unix)]
     {
-        ("sh", vec!["-c".to_string(), cmd.to_string()])
+        Ok((
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), cmd.to_string()],
+        ))
     }
     #[cfg(windows)]
     {
-        (
-            "cmd.exe",
+        Ok((
+            windows_system_directory()?.join("cmd.exe"),
             vec!["/D".to_string(), "/C".to_string(), cmd.to_string()],
-        )
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        ("sh", vec!["-c".to_string(), cmd.to_string()])
+        Ok((
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), cmd.to_string()],
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_system_directory() -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let buffer_len = u32::try_from(buffer.len())
+            .map_err(|_| "Windows system directory path is too long".to_string())?;
+        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_len) };
+        if written == 0 {
+            return Err(format!(
+                "failed to resolve Windows system directory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let written = written as usize;
+        if written < buffer.len() {
+            buffer.truncate(written);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+
+        buffer.resize(written.saturating_add(1), 0);
     }
 }
