@@ -256,6 +256,26 @@ reference snapshots. Legacy proxy routes remain available for focused routing
 checks, but normal knob work should usually compare current lpm against one
 candidate lpm cell, with 5+ samples and round-robin ordering.
 
+For a landing decision, compare the exact `main` and candidate binaries in one
+run. The harness pairs rows by fixture, mode, and sample. It fails on a clear
+wall-time regression or an incomplete pair. It reports exit code 2 when the
+data is inconclusive.
+
+```bash
+node bench/scripts/run-install-readiness.mjs \
+  --samples 10 \
+  --fixtures dogfood,nest,vitepress \
+  --managers lpm,bun,pnpm \
+  --modes cold,warm,up-to-date \
+  --lpm-binary main=/tmp/lpm-main \
+  --lpm-binary candidate=/tmp/lpm-candidate \
+  --lpm-compare main:candidate
+```
+
+The default wall-time limits are 5% for the median and 10% for p95. Stage
+metrics identify the source of a change, but they do not control the verdict.
+Use `--allow-inconclusive` only when a caller records and reviews the result.
+
 Every install subprocess has a timeout, defaulting to 10 minutes. Override it
 with `--timeout-ms` for top-package sweeps that need a different failure bound.
 

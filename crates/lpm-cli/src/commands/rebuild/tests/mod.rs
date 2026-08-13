@@ -3327,8 +3327,12 @@ fn capability_not_approved_reports_not_trusted() {
 #[cfg(windows)]
 #[test]
 fn platform_shell_invocation_uses_cmd_exe_on_windows() {
-    let (prog, args) = platform_shell_invocation("node install.js");
-    assert_eq!(prog, "cmd.exe");
+    let (prog, args) = platform_shell_invocation("node install.js").unwrap();
+    assert!(prog.is_absolute());
+    assert_eq!(
+        prog.file_name().and_then(std::ffi::OsStr::to_str),
+        Some("cmd.exe")
+    );
     assert_eq!(
         args,
         vec![
@@ -3344,12 +3348,12 @@ fn platform_shell_invocation_uses_cmd_exe_on_windows() {
 #[cfg(unix)]
 #[test]
 fn platform_shell_invocation_uses_sh_on_unix() {
-    let (prog, args) = platform_shell_invocation("node install.js");
-    assert_eq!(prog, "sh");
+    let (prog, args) = platform_shell_invocation("node install.js").unwrap();
+    assert_eq!(prog, std::path::Path::new("/bin/sh"));
     assert_eq!(
         args,
         vec!["-c".to_string(), "node install.js".to_string()],
-        "POSIX hosts must run lifecycle scripts under sh -c"
+        "POSIX hosts must use an absolute shell path so package-local PATH entries cannot intercept lifecycle execution"
     );
 }
 

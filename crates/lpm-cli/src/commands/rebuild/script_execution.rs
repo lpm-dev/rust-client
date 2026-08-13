@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -73,7 +75,7 @@ pub(super) fn execute_script(
     let output_readers = spawn_sanitized_output_readers(&mut child);
 
     let output = wait_with_timeout(child, timeout);
-    output_readers.join();
+    output_readers.finish_and_join();
 
     match output {
         Ok(status) => {
@@ -183,7 +185,7 @@ pub(super) fn spawn_lifecycle_child(
     let sandbox = new_for_platform_with_options(spec, sandbox_mode, sandbox_options.clone())
         .map_err(|e| format!("sandbox init failed: {e}"))?;
 
-    let (shell_program, shell_args) = platform_shell_invocation(cmd);
+    let (shell_program, shell_args) = platform_shell_invocation(cmd)?;
     let mut sbcmd = SandboxedCommand::new(shell_program);
     for arg in shell_args {
         sbcmd = sbcmd.arg(arg);
@@ -203,10 +205,12 @@ pub(super) fn spawn_lifecycle_child(
 struct OutputReaders {
     stdout: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
+    process_finished: Arc<AtomicBool>,
 }
 
 impl OutputReaders {
-    fn join(self) {
+    fn finish_and_join(self) {
+        self.process_finished.store(true, Ordering::Release);
         if let Some(handle) = self.stdout {
             let _ = handle.join();
         }
@@ -217,24 +221,38 @@ impl OutputReaders {
 }
 
 fn spawn_sanitized_output_readers(child: &mut Child) -> OutputReaders {
-    let stdout = child
-        .stdout
-        .take()
-        .map(|stdout| std::thread::spawn(move || copy_sanitized_output(stdout, std::io::stdout())));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| std::thread::spawn(move || copy_sanitized_output(stderr, std::io::stderr())));
-    OutputReaders { stdout, stderr }
+    let process_finished = Arc::new(AtomicBool::new(false));
+    let stdout = child.stdout.take().map(|stdout| {
+        let process_finished = Arc::clone(&process_finished);
+        std::thread::spawn(move || {
+            copy_sanitized_output(stdout, std::io::stdout(), &process_finished)
+        })
+    });
+    let stderr = child.stderr.take().map(|stderr| {
+        let process_finished = Arc::clone(&process_finished);
+        std::thread::spawn(move || {
+            copy_sanitized_output(stderr, std::io::stderr(), &process_finished)
+        })
+    });
+    OutputReaders {
+        stdout,
+        stderr,
+        process_finished,
+    }
 }
 
-fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W)
+#[cfg(unix)]
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
 where
-    R: Read,
+    R: Read + std::os::fd::AsRawFd,
     W: Write,
 {
     let mut buf = [0_u8; 8192];
+    let mut post_finish_bytes = 0_usize;
     loop {
+        if !wait_for_output(reader.as_raw_fd(), process_finished) {
+            break;
+        }
         let read = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => read,
@@ -248,6 +266,284 @@ where
         if writer.flush().is_err() {
             break;
         }
+        if process_finished.load(Ordering::Acquire) {
+            post_finish_bytes = post_finish_bytes.saturating_add(read);
+            if post_finish_bytes >= 1024 * 1024 {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_output(fd: std::os::fd::RawFd, process_finished: &AtomicBool) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: poll_fd points to one initialized pollfd for the duration of
+        // the call. The descriptor remains owned by the reader thread.
+        let timeout_ms = if process_finished.load(Ordering::Acquire) {
+            0
+        } else {
+            50
+        };
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result > 0 {
+            return poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0;
+        }
+        if result == 0 {
+            if process_finished.load(Ordering::Acquire) {
+                return false;
+            }
+            continue;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
+where
+    R: Read + std::os::windows::io::AsRawHandle,
+    W: Write,
+{
+    let mut buf = [0_u8; 8192];
+    let mut post_finish_bytes = 0_usize;
+    loop {
+        if !wait_for_windows_output(reader.as_raw_handle(), process_finished) {
+            break;
+        }
+        let read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let lossy = String::from_utf8_lossy(&buf[..read]);
+        let safe = sanitize_terminal_multiline(&lossy);
+        if writer.write_all(safe.as_bytes()).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+        if process_finished.load(Ordering::Acquire) {
+            post_finish_bytes = post_finish_bytes.saturating_add(read);
+            if post_finish_bytes >= 1024 * 1024 {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_output(
+    handle: std::os::windows::io::RawHandle,
+    process_finished: &AtomicBool,
+) -> bool {
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    loop {
+        let mut available = 0_u32;
+        // SAFETY: handle belongs to the reader thread and remains valid for the
+        // call. The null buffer requests only the available-byte count.
+        let result = unsafe {
+            PeekNamedPipe(
+                handle as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            return false;
+        }
+        if available > 0 {
+            return true;
+        }
+        if process_finished.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_sanitized_output<R, W>(mut reader: R, mut writer: W, process_finished: &AtomicBool)
+where
+    R: Read,
+    W: Write,
+{
+    let mut buf = [0_u8; 8192];
+    loop {
+        if process_finished.load(Ordering::Acquire) {
+            break;
+        }
+        let read = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let lossy = String::from_utf8_lossy(&buf[..read]);
+        let safe = sanitize_terminal_multiline(&lossy);
+        if writer.write_all(safe.as_bytes()).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod timeout_output_tests {
+    use super::{copy_sanitized_output, spawn_sanitized_output_readers};
+    use crate::commands::rebuild::process_tree::wait_with_timeout;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    struct ProcessGuard(u32);
+
+    impl Drop for ProcessGuard {
+        fn drop(&mut self) {
+            // SAFETY: the PID was written by the isolated fixture process. The
+            // guard exists only to ensure a failed assertion cannot leak it.
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn write_detach_helper(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            r#"import os
+import sys
+import time
+
+if os.fork() != 0:
+    os._exit(0)
+os.setsid()
+if os.fork() != 0:
+    os._exit(0)
+with open(sys.argv[1], "w", encoding="utf-8") as pid_file:
+    pid_file.write(str(os.getpid()))
+    pid_file.flush()
+time.sleep(4)
+"#,
+        )
+        .unwrap();
+    }
+
+    fn wait_for_daemon_pid(pid_file: &std::path::Path) -> u32 {
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(pid_file)
+                && let Ok(pid) = text.parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < pid_deadline,
+                "detached fixture did not publish its PID"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn timed_out_output_readers_do_not_wait_for_reparented_pipe_holder() {
+        let fixture = tempfile::tempdir().unwrap();
+        let helper = fixture.path().join("detach.py");
+        let pid_file = fixture.path().join("daemon.pid");
+        write_detach_helper(&helper);
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"python3 "$1" "$2" & while [ ! -s "$2" ]; do sleep 0.01; done; sleep 4"#,
+                "lpm-timeout-fixture",
+            ])
+            .arg(&helper)
+            .arg(&pid_file)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let output_readers = spawn_sanitized_output_readers(&mut child);
+
+        let daemon_pid = wait_for_daemon_pid(&pid_file);
+        let _daemon_guard = ProcessGuard(daemon_pid);
+
+        let start = Instant::now();
+        let error = wait_with_timeout(child, &Duration::from_millis(100)).unwrap_err();
+        output_readers.finish_and_join();
+        let elapsed = start.elapsed();
+
+        assert!(error.starts_with("timeout after "));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "output readers exceeded lifecycle timeout bound: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn completed_output_readers_do_not_wait_for_reparented_pipe_holder() {
+        let fixture = tempfile::tempdir().unwrap();
+        let helper = fixture.path().join("detach.py");
+        let pid_file = fixture.path().join("daemon.pid");
+        write_detach_helper(&helper);
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"python3 "$1" "$2" & while [ ! -s "$2" ]; do sleep 0.01; done; exit 0"#,
+                "lpm-completed-fixture",
+            ])
+            .arg(&helper)
+            .arg(&pid_file)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let output_readers = spawn_sanitized_output_readers(&mut child);
+        let daemon_pid = wait_for_daemon_pid(&pid_file);
+        let _daemon_guard = ProcessGuard(daemon_pid);
+
+        let start = Instant::now();
+        let status = wait_with_timeout(child, &Duration::from_secs(2)).unwrap();
+        output_readers.finish_and_join();
+        let elapsed = start.elapsed();
+
+        assert!(status.success());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "output readers waited for a completed script's detached pipe holder: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn finished_output_reader_drains_bytes_already_in_pipe() {
+        let (mut pipe_writer, pipe_reader) = UnixStream::pair().unwrap();
+        pipe_writer.write_all(b"lifecycle tail\n").unwrap();
+        let finished = AtomicBool::new(true);
+        let mut output = Vec::new();
+
+        copy_sanitized_output(pipe_reader, &mut output, &finished);
+
+        assert_eq!(output, b"lifecycle tail\n");
     }
 }
 
@@ -322,33 +618,57 @@ pub(super) fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>
     }
 }
 
-/// Pick the right shell program + argv to run a lifecycle script's
-/// shell-string verbatim. POSIX hosts get `sh -c <cmd>`, matching the
-/// way npm/yarn/pnpm spawn lifecycle scripts. Windows gets
-/// `cmd.exe /D /C <cmd>` — `/D` skips AutoRun (so the script doesn't
-/// inherit shell hooks from `HKCU\Software\Microsoft\Command Processor`),
-/// `/C` runs the command and terminates. Both shells are guaranteed
-/// to be on PATH on their respective platforms.
-///
-/// This was hardcoded to `sh -c` before because the
-/// previous sandbox returned `UnsupportedPlatform` on Windows, so the
-/// lifecycle path never reached spawn there. With the real backend
-/// landed, dispatch has to be platform-aware to make end-to-end
-/// installs work on Windows.
-pub(super) fn platform_shell_invocation(cmd: &str) -> (&'static str, Vec<String>) {
+/// Returns an absolute system shell path so package-local PATH entries cannot
+/// intercept lifecycle execution before the approved command starts.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+pub(super) fn platform_shell_invocation(cmd: &str) -> Result<(PathBuf, Vec<String>), String> {
     #[cfg(unix)]
     {
-        ("sh", vec!["-c".to_string(), cmd.to_string()])
+        Ok((
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), cmd.to_string()],
+        ))
     }
     #[cfg(windows)]
     {
-        (
-            "cmd.exe",
+        Ok((
+            windows_system_directory()?.join("cmd.exe"),
             vec!["/D".to_string(), "/C".to_string(), cmd.to_string()],
-        )
+        ))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        ("sh", vec!["-c".to_string(), cmd.to_string()])
+        Ok((
+            PathBuf::from("/bin/sh"),
+            vec!["-c".to_string(), cmd.to_string()],
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_system_directory() -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let buffer_len = u32::try_from(buffer.len())
+            .map_err(|_| "Windows system directory path is too long".to_string())?;
+        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_len) };
+        if written == 0 {
+            return Err(format!(
+                "failed to resolve Windows system directory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let written = written as usize;
+        if written < buffer.len() {
+            buffer.truncate(written);
+            return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+        }
+
+        buffer.resize(written.saturating_add(1), 0);
     }
 }

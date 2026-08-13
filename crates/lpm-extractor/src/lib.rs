@@ -52,6 +52,13 @@ fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
 /// callers that want a tighter cap can apply their own.
 const MAX_BUFFERED_COMPRESSED_SIZE: u64 = 500 * 1024 * 1024;
 
+/// Compressed-input ceiling for file-backed install extraction.
+///
+/// Small npm archives keep the libdeflate fast path. Larger archives fall
+/// back to streaming decompression without retaining their full compressed
+/// body in memory.
+const MAX_HYBRID_BUFFERED_COMPRESSED_SIZE: u64 = 8 * 1024 * 1024;
+
 /// Maximum decompressed output held by the buffered libdeflate path.
 const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;
 
@@ -309,7 +316,7 @@ pub fn extract_tarball_from_reader(
 pub struct EntryInfo<'a> {
     /// Path relative to `target_dir` (npm's `package/` prefix already stripped).
     pub relative_path: &'a Path,
-    /// Uncompressed size in bytes, read from the tar header.
+    /// Effective uncompressed size in bytes, including PAX and sparse overrides.
     pub size: u64,
     /// File contents, if the caller's `buffer_predicate` returned `true`
     /// for this entry. `None` when the predicate said skip buffering — in
@@ -385,6 +392,31 @@ where
     )
 }
 
+/// Bounded-memory file-backed extraction that buffers only small archives.
+pub fn extract_tarball_from_reader_hybrid_with_inspector<P, I>(
+    reader: impl std::io::Read,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    let limits = ExtractionLimits {
+        max_buffered_compressed_size: MAX_HYBRID_BUFFERED_COMPRESSED_SIZE,
+        ..DEFAULT_EXTRACTION_LIMITS
+    };
+    extract_tarball_from_reader_with_inspector_with_limits(
+        reader,
+        target_dir,
+        limits,
+        false,
+        buffer_predicate,
+        inspector,
+    )
+}
+
 /// Extract a tarball from a reader while computing a BLAKE3 digest for every
 /// regular file in the same write pass.
 pub fn extract_tarball_from_reader_with_entry_digests<P, I>(
@@ -420,6 +452,31 @@ where
 {
     let limits = ExtractionLimits {
         max_buffered_compressed_size: 0,
+        ..DEFAULT_EXTRACTION_LIMITS
+    };
+    extract_tarball_from_reader_with_inspector_with_limits(
+        reader,
+        target_dir,
+        limits,
+        true,
+        buffer_predicate,
+        inspector,
+    )
+}
+
+/// Digest-enabled file-backed extraction that buffers only small archives.
+pub fn extract_tarball_from_reader_hybrid_with_entry_digests<P, I>(
+    reader: impl std::io::Read,
+    target_dir: &Path,
+    buffer_predicate: P,
+    inspector: I,
+) -> Result<Vec<PathBuf>, LpmError>
+where
+    P: Fn(&Path, u64) -> bool,
+    I: FnMut(EntryInfo<'_>),
+{
+    let limits = ExtractionLimits {
+        max_buffered_compressed_size: MAX_HYBRID_BUFFERED_COMPRESSED_SIZE,
         ..DEFAULT_EXTRACTION_LIMITS
     };
     extract_tarball_from_reader_with_inspector_with_limits(
@@ -785,17 +842,7 @@ where
             }
 
             // Enforce per-file and total size limits
-            let size = match entry.header().size() {
-                Ok(size) => size,
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        LpmError::Registry(format!("invalid tar entry size: {error}")),
-                    );
-                }
-            };
+            let size = entry.size();
             if size > limits.max_file_size {
                 return rollback_extraction(
                     &extraction_root,
@@ -1539,6 +1586,39 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn create_pax_size_override_tarball(raw_size: u64, effective_size: u64) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let effective_size_text = effective_size.to_string();
+            builder
+                .append_pax_extensions([("size", effective_size_text.as_bytes())])
+                .unwrap();
+
+            let mut header = tar::Header::new_ustar();
+            header.set_size(raw_size);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path("package/payload.js").unwrap();
+            header.set_cksum();
+            builder.get_mut().write_all(header.as_bytes()).unwrap();
+            builder
+                .get_mut()
+                .write_all(&vec![0_u8; effective_size as usize])
+                .unwrap();
+            let padding = (512 - effective_size % 512) % 512;
+            builder
+                .get_mut()
+                .write_all(&vec![0_u8; padding as usize])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
     fn streaming_test_limits() -> ExtractionLimits {
         ExtractionLimits {
             max_buffered_compressed_size: 64 * 1024,
@@ -1587,6 +1667,72 @@ mod tests {
             payload
         );
         assert_eq!(inspected, payload);
+    }
+
+    #[test]
+    fn pax_effective_size_cannot_bypass_per_file_limit() {
+        let tgz = create_pax_size_override_tarball(1, 2048);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_file_size: 1024,
+            ..streaming_test_limits()
+        };
+
+        let error = extract_tarball_from_reader_with_inspector_with_limits(
+            std::io::Cursor::new(&tgz),
+            dir.path(),
+            limits,
+            false,
+            |path, _| path.extension() == Some(OsStr::new("js")),
+            |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("file too large"),
+            "expected per-file limit rejection, got: {error}"
+        );
+        assert!(!dir.path().join("payload.js").exists());
+    }
+
+    #[test]
+    fn hybrid_reader_streams_archives_larger_than_its_compressed_memory_ceiling() {
+        let payload = vec![0x5a; MAX_HYBRID_BUFFERED_COMPRESSED_SIZE as usize + 1024];
+        let mut tar_data = Vec::with_capacity(payload.len() + 2048);
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/payload.bin", payload.as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(&tar_data).unwrap();
+        let tgz = encoder.finish().unwrap();
+        assert!(tgz.len() as u64 > MAX_HYBRID_BUFFERED_COMPRESSED_SIZE);
+
+        let dir = tempfile::tempdir().unwrap();
+        let files = extract_tarball_from_reader_hybrid_with_inspector(
+            std::io::Cursor::new(tgz),
+            dir.path(),
+            |_, _| false,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(files, [PathBuf::from("payload.bin")]);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("payload.bin"))
+                .unwrap()
+                .len(),
+            payload.len() as u64
+        );
     }
 
     #[test]

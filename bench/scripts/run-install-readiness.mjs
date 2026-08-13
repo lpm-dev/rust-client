@@ -63,6 +63,7 @@ const DEFAULT_MODES = ['cold'];
 const DEFAULT_LPM_ROUTES = ['direct'];
 const DEFAULT_LPM_FIREWALL_MODES = ['off'];
 const INSTALL_DIRS = new Set(['node_modules', '.lpm']);
+const COMPARISON_GATE_METRICS = new Set(['wall_ms']);
 const LOCKFILES = new Set([
   'lpm.lock',
   'lpm.lockb',
@@ -119,23 +120,36 @@ const lpmFirewallModes = parseLpmFirewallModes(
   args.lpmFirewallModes ?? DEFAULT_LPM_FIREWALL_MODES.join(','),
 );
 const lpmCells = parseLpmCells(args.lpmCells);
+if (args.lpmBin && args.lpmBinaries.length > 0) {
+  throw new Error('--lpm-bin and --lpm-binary are mutually exclusive');
+}
+const defaultLpmBin = path.resolve(args.lpmBin ?? path.join(repoRoot, 'target/release/lpm-rs'));
+const lpmBinaries = parseLpmBinaries(args.lpmBinaries, defaultLpmBin);
+const lpmComparison = parseLpmComparison(args.lpmCompare, lpmBinaries);
+const comparisonThresholds = {
+  median_pct: nonNegativeNumber(args.medianRegressionPct, 5, '--median-regression-pct'),
+  p95_pct: nonNegativeNumber(args.p95RegressionPct, 10, '--p95-regression-pct'),
+};
 const lpmTyposquatGuard = args.lpmTyposquatGuard ?? (topNpmFile ? 'off' : 'default');
 const scriptPolicy = args.scriptPolicy ?? 'ignore';
 const timeoutMs = positiveInt(args.timeoutMs, 10 * 60 * 1000, '--timeout-ms');
 const outputDir = path.resolve(
   args.output ?? defaultOutputDir(),
 );
-const lpmBin = path.resolve(args.lpmBin ?? path.join(repoRoot, 'target/release/lpm-rs'));
 const keepProjects = Boolean(args.keepProjects);
 const keepFailedProjects = Boolean(args.keepFailedProjects);
 const allowFailures = Boolean(args.allowFailures);
+const allowInconclusive = Boolean(args.allowInconclusive);
 const dryRun = Boolean(args.dryRun);
 
 validateManagers(managers);
 validateScriptPolicy(scriptPolicy);
 validateLpmTyposquatGuard(lpmTyposquatGuard);
+if (lpmComparison && !managers.includes('lpm')) {
+  throw new Error('--lpm-compare requires lpm in --managers');
+}
 
-const runSpecs = buildRunSpecs(managers, lpmCells, lpmRoutes, lpmFirewallModes);
+const runSpecs = buildRunSpecs(managers, lpmBinaries, lpmCells, lpmRoutes, lpmFirewallModes);
 validateUniqueKeys('fixture', fixtures, (fixture) => fixture.name);
 validateUniqueKeys('run spec', runSpecs, (spec) => spec.id);
 const plan = {
@@ -145,7 +159,14 @@ const plan = {
   modes,
   lpm_routes: lpmRoutes,
   lpm_firewall_modes: lpmFirewallModes,
+  lpm_binaries: lpmBinaries.map((binary) => ({ name: binary.name, path: binary.path })),
   lpm_cells: lpmCells.map((cell) => ({ name: cell.name, env: cell.env })),
+  lpm_comparison: lpmComparison
+    ? {
+        ...lpmComparison,
+        thresholds: comparisonThresholds,
+      }
+    : undefined,
   lpm_typosquat_guard: lpmTyposquatGuard,
   top_npm: topNpmFile
     ? {
@@ -158,7 +179,7 @@ const plan = {
   script_policy: scriptPolicy,
   timeout_ms: timeoutMs,
   output_dir: outputDir,
-  lpm_bin: lpmBin,
+  lpm_bin: lpmBinaries.length === 1 ? lpmBinaries[0].path : undefined,
   run_specs: runSpecs.map((spec) => spec.id),
 };
 
@@ -167,8 +188,12 @@ if (dryRun) {
   process.exit(0);
 }
 
-if (managers.includes('lpm') && !fs.existsSync(lpmBin)) {
-  throw new Error(`lpm binary missing: ${lpmBin}`);
+if (managers.includes('lpm')) {
+  for (const binary of lpmBinaries) {
+    if (!fs.existsSync(binary.path)) {
+      throw new Error(`lpm binary missing (${binary.name}): ${binary.path}`);
+    }
+  }
 }
 
 fs.mkdirSync(outputDir, { recursive: true });
@@ -187,10 +212,21 @@ for (let sample = 1; sample <= samples; sample += 1) {
 
 const summary = summarize(rows);
 const summaryMd = renderSummaryMarkdown(summary);
+const comparisonSummary = lpmComparison
+  ? summarizeLpmComparison(rows, lpmComparison, comparisonThresholds, samples)
+  : null;
+const comparisonMd = comparisonSummary ? renderLpmComparisonMarkdown(comparisonSummary) : null;
 const warningSummary = summarizeWarnings(rows);
 fs.writeFileSync(path.join(outputDir, 'rows.json'), `${JSON.stringify(rows, null, 2)}\n`);
 fs.writeFileSync(path.join(outputDir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
 fs.writeFileSync(path.join(outputDir, 'summary.md'), `${summaryMd}\n`);
+if (comparisonSummary) {
+  fs.writeFileSync(
+    path.join(outputDir, 'comparison.json'),
+    `${JSON.stringify(comparisonSummary, null, 2)}\n`,
+  );
+  fs.writeFileSync(path.join(outputDir, 'comparison.md'), `${comparisonMd}\n`);
+}
 fs.writeFileSync(
   path.join(outputDir, 'warning-summary.json'),
   `${JSON.stringify(warningSummary, null, 2)}\n`,
@@ -202,9 +238,21 @@ fs.writeFileSync(
 
 console.log(`\n[summary] ${outputDir}`);
 console.log(summaryMd);
+if (comparisonMd) {
+  console.log('\n[paired lpm comparison]');
+  console.log(comparisonMd);
+}
 
 if (!allowFailures && rows.some(runFailed)) {
   process.exitCode = 1;
+}
+if (
+  comparisonSummary &&
+  ['execution-failure', 'regression'].includes(comparisonSummary.verdict)
+) {
+  process.exitCode = 1;
+} else if (comparisonSummary?.verdict === 'inconclusive' && !allowInconclusive) {
+  process.exitCode = 2;
 }
 
 function runInstallSpec({ sample, fixture, spec, modes }) {
@@ -341,7 +389,7 @@ function measureInstall({
   const phaseDir = path.join(runDir, phase);
   fs.mkdirSync(phaseDir, { recursive: true });
 
-  const command = installCommand(spec.manager, scriptPolicy);
+  const command = installCommand(spec, scriptPolicy);
   const started = process.hrtime.bigint();
   const result = spawnSync(command[0], command.slice(1), {
     cwd: projectDir,
@@ -384,6 +432,7 @@ function measureInstall({
     fixture: fixture.name,
     fixture_source: fixture.source,
     manager: spec.manager,
+    binary: spec.binaryName,
     cell: spec.cellName,
     route: spec.route,
     firewall_mode: spec.firewallMode,
@@ -423,6 +472,7 @@ function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reas
     fixture: fixture.name,
     fixture_source: fixture.source,
     manager: spec.manager,
+    binary: spec.binaryName,
     cell: spec.cellName,
     route: spec.route,
     firewall_mode: spec.firewallMode,
@@ -440,10 +490,17 @@ function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reas
   return row;
 }
 
-function installCommand(manager, policy) {
-  switch (manager) {
+function installCommand(spec, policy) {
+  switch (spec.manager) {
     case 'lpm':
-      return [lpmBin, '--json', 'install', '--no-security-summary', '--no-skills', '--no-editor-setup'];
+      return [
+        spec.binaryPath,
+        '--json',
+        'install',
+        '--no-security-summary',
+        '--no-skills',
+        '--no-editor-setup',
+      ];
     case 'bun':
       return policy === 'ignore' ? ['bun', 'install', '--ignore-scripts'] : ['bun', 'install'];
     case 'pnpm':
@@ -455,7 +512,7 @@ function installCommand(manager, policy) {
         ? ['npm', 'install', '--ignore-scripts', '--no-audit', '--no-fund']
         : ['npm', 'install', '--no-audit', '--no-fund'];
     default:
-      throw new Error(`unsupported manager: ${manager}`);
+      throw new Error(`unsupported manager: ${spec.manager}`);
   }
 }
 
@@ -759,7 +816,7 @@ function maxFinite(...values) {
   return maximum;
 }
 
-function buildRunSpecs(managers, cells, routes, firewallModes) {
+function buildRunSpecs(managers, binaries, cells, routes, firewallModes) {
   const specs = [];
   for (const manager of managers) {
     if (manager !== 'lpm') {
@@ -773,21 +830,31 @@ function buildRunSpecs(managers, cells, routes, firewallModes) {
       });
       continue;
     }
-    for (const route of routes) {
-      for (const firewallMode of firewallModes) {
-        for (const cell of cells) {
-          const firewallSuffix = firewallMode === 'off' ? '' : `firewall-${firewallMode}`;
-          const suffix = [cell.name, route, firewallSuffix]
-            .filter((part) => part && part !== 'direct')
-            .join('-');
-          specs.push({
-            id: suffix ? `lpm-${suffix}` : 'lpm-current',
-            manager,
-            cellName: cell.name,
-            route,
-            firewallMode,
-            env: cell.env,
-          });
+    for (const binary of binaries) {
+      for (const route of routes) {
+        for (const firewallMode of firewallModes) {
+          for (const cell of cells) {
+            const firewallSuffix = firewallMode === 'off' ? '' : `firewall-${firewallMode}`;
+            const defaultBinary = binaries.length === 1 && binary.name === 'current';
+            const identitySuffix = defaultBinary
+              ? cell.name
+              : [binary.name, cell.name === 'current' ? '' : cell.name]
+                  .filter(Boolean)
+                  .join('-');
+            const suffix = [identitySuffix, route, firewallSuffix]
+              .filter((part) => part && part !== 'direct')
+              .join('-');
+            specs.push({
+              id: `lpm-${suffix}`,
+              manager,
+              binaryName: binary.name,
+              binaryPath: binary.path,
+              cellName: cell.name,
+              route,
+              firewallMode,
+              env: cell.env,
+            });
+          }
         }
       }
     }
@@ -930,6 +997,7 @@ function summarize(rows) {
     out.push({
       fixture,
       manager: first.manager,
+      binary: first.binary,
       spec,
       cell: first.cell,
       route: first.route,
@@ -945,6 +1013,201 @@ function summarize(rows) {
     [a.fixture, a.spec, a.mode].join('\0').localeCompare([b.fixture, b.spec, b.mode].join('\0')),
   );
   return out;
+}
+
+function summarizeLpmComparison(rows, comparison, thresholds, expectedSamples) {
+  const counted = rows.filter((row) => row.counted !== false && row.manager === 'lpm');
+  const groupKeys = new Set(
+    counted.map((row) =>
+      [row.fixture, row.mode, row.cell, row.route, row.firewall_mode].join('\0'),
+    ),
+  );
+  const groups = [];
+  let hasExecutionFailure = false;
+  let hasRegression = false;
+  let hasInconclusive = false;
+
+  for (const key of [...groupKeys].sort()) {
+    const [fixture, mode, cell, route, firewallMode] = key.split('\0');
+    const groupRows = counted.filter(
+      (row) =>
+        row.fixture === fixture &&
+        row.mode === mode &&
+        row.cell === cell &&
+        row.route === route &&
+        row.firewall_mode === firewallMode,
+    );
+    const pairs = [];
+    const failedSamples = [];
+
+    for (let sample = 1; sample <= expectedSamples; sample += 1) {
+      const baseline = groupRows.find(
+        (row) => row.sample === sample && row.binary === comparison.baseline,
+      );
+      const candidate = groupRows.find(
+        (row) => row.sample === sample && row.binary === comparison.candidate,
+      );
+      if (!baseline || !candidate || runFailed(baseline) || runFailed(candidate)) {
+        failedSamples.push({
+          sample,
+          baseline: comparisonRowStatus(baseline),
+          candidate: comparisonRowStatus(candidate),
+        });
+        continue;
+      }
+      pairs.push({ sample, baseline, candidate });
+    }
+
+    const metrics = {};
+    for (const metric of TAIL_METRICS) {
+      const metricPairs = pairs
+        .map((pair) => ({
+          sample: pair.sample,
+          baseline: pair.baseline[metric],
+          candidate: pair.candidate[metric],
+        }))
+        .filter(
+          (pair) =>
+            Number.isFinite(pair.baseline) && Number.isFinite(pair.candidate) && pair.baseline > 0,
+        );
+      if (metricPairs.length === 0) {
+        continue;
+      }
+      metrics[metric] = comparePairedMetric(metricPairs, thresholds);
+      if (COMPARISON_GATE_METRICS.has(metric) && metrics[metric].verdict === 'regression') {
+        hasRegression = true;
+      } else if (
+        COMPARISON_GATE_METRICS.has(metric) &&
+        metrics[metric].verdict === 'inconclusive'
+      ) {
+        hasInconclusive = true;
+      }
+    }
+
+    if (failedSamples.length > 0) {
+      hasExecutionFailure = true;
+    }
+    groups.push({
+      fixture,
+      mode,
+      cell,
+      route,
+      firewall_mode: firewallMode,
+      expected_pairs: expectedSamples,
+      successful_pairs: pairs.length,
+      failed_samples: failedSamples,
+      metrics,
+    });
+  }
+
+  const verdict = hasExecutionFailure
+    ? 'execution-failure'
+    : hasRegression
+      ? 'regression'
+      : hasInconclusive
+        ? 'inconclusive'
+        : 'pass';
+  return {
+    baseline: comparison.baseline,
+    candidate: comparison.candidate,
+    thresholds,
+    verdict,
+    groups,
+  };
+}
+
+function comparePairedMetric(pairs, thresholds) {
+  const baseline = metricDistribution(
+    pairs.map((pair) => ({ value: pair.baseline })),
+    'value',
+  );
+  const candidate = metricDistribution(
+    pairs.map((pair) => ({ value: pair.candidate })),
+    'value',
+  );
+  const pairedDeltas = pairs.map((pair) => ({
+    sample: pair.sample,
+    baseline: pair.baseline,
+    candidate: pair.candidate,
+    delta: pair.candidate - pair.baseline,
+    delta_pct: relativeDeltaPct(pair.baseline, pair.candidate),
+  }));
+  const pairedDeltaPct = metricDistribution(pairedDeltas, 'delta_pct');
+  const medianDeltaPct = relativeDeltaPct(baseline.median, candidate.median);
+  const p95DeltaPct = relativeDeltaPct(baseline.p95, candidate.p95);
+  const medianClearlyRegressed =
+    medianDeltaPct > thresholds.median_pct &&
+    pairedDeltaPct.median - pairedDeltaPct.mad > thresholds.median_pct;
+  const p95ClearlyRegressed =
+    p95DeltaPct > thresholds.p95_pct &&
+    pairedDeltaPct.p95 - pairedDeltaPct.iqr > thresholds.p95_pct;
+  const withinThresholds =
+    medianDeltaPct <= thresholds.median_pct && p95DeltaPct <= thresholds.p95_pct;
+  return {
+    baseline,
+    candidate,
+    median_delta_pct: medianDeltaPct,
+    p95_delta_pct: p95DeltaPct,
+    paired_delta_pct: pairedDeltaPct,
+    pairs: pairedDeltas,
+    verdict: medianClearlyRegressed || p95ClearlyRegressed
+      ? 'regression'
+      : withinThresholds
+        ? 'pass'
+        : 'inconclusive',
+  };
+}
+
+function relativeDeltaPct(baseline, candidate) {
+  return roundDistributionValue(((candidate - baseline) / baseline) * 100);
+}
+
+function comparisonRowStatus(row) {
+  if (!row) {
+    return 'missing';
+  }
+  if (row.skipped) {
+    return `skipped: ${row.skip_reason}`;
+  }
+  if (row.parse_error) {
+    return `parse error: ${row.parse_error}`;
+  }
+  if (row.spawn_error) {
+    return `spawn error: ${row.spawn_error}`;
+  }
+  return `exit ${row.exit_code}`;
+}
+
+function renderLpmComparisonMarkdown(comparison) {
+  const lines = [
+    `Verdict: **${comparison.verdict}**`,
+    '',
+    `Baseline: \`${comparison.baseline}\`. Candidate: \`${comparison.candidate}\`.`,
+    '',
+    `Limits: median ${comparison.thresholds.median_pct}%; p95 ${comparison.thresholds.p95_pct}%.`,
+    '',
+    '| Fixture | Mode | Pairs | Metric | Base med/p95 | Candidate med/p95 | Delta med/p95 | Paired delta med/p95 | Result |',
+    '| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |',
+  ];
+  for (const group of comparison.groups) {
+    for (const [metric, result] of Object.entries(group.metrics)) {
+      lines.push(
+        `| ${group.fixture} | ${group.mode} | ${group.successful_pairs}/${group.expected_pairs} | ${metric} | ${result.baseline.median}/${result.baseline.p95} | ${result.candidate.median}/${result.candidate.p95} | ${result.median_delta_pct}%/${result.p95_delta_pct}% | ${result.paired_delta_pct.median}%/${result.paired_delta_pct.p95}% | ${result.verdict} |`,
+      );
+    }
+  }
+  const failures = comparison.groups.flatMap((group) =>
+    group.failed_samples.map((failure) => ({ group, failure })),
+  );
+  if (failures.length > 0) {
+    lines.push('', '## Execution failures', '');
+    for (const { group, failure } of failures) {
+      lines.push(
+        `- ${group.fixture} ${group.mode} sample ${failure.sample}: baseline=${failure.baseline}; candidate=${failure.candidate}.`,
+      );
+    }
+  }
+  return lines.join('\n');
 }
 
 function summarizeMetrics(rows) {
@@ -1176,7 +1439,7 @@ function renderSummaryMarkdown(summary) {
 }
 
 function parseArgs(argv) {
-  const parsed = { lpmCells: [] };
+  const parsed = { lpmBinaries: [], lpmCells: [] };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--help' || arg === '-h') {
@@ -1203,6 +1466,10 @@ function parseArgs(argv) {
       parsed.allowFailures = true;
       continue;
     }
+    if (arg === '--allow-inconclusive') {
+      parsed.allowInconclusive = true;
+      continue;
+    }
     const valueFlags = new Map([
       ['--samples', 'samples'],
       ['-n', 'samples'],
@@ -1217,6 +1484,10 @@ function parseArgs(argv) {
       ['--lpm-typosquat-guard', 'lpmTyposquatGuard'],
       ['--output', 'output'],
       ['--lpm-bin', 'lpmBin'],
+      ['--lpm-binary', 'lpmBinary'],
+      ['--lpm-compare', 'lpmCompare'],
+      ['--median-regression-pct', 'medianRegressionPct'],
+      ['--p95-regression-pct', 'p95RegressionPct'],
       ['--script-policy', 'scriptPolicy'],
       ['--timeout-ms', 'timeoutMs'],
       ['--lpm-cell', 'lpmCell'],
@@ -1232,6 +1503,8 @@ function parseArgs(argv) {
     index += 1;
     if (key === 'lpmCell') {
       parsed.lpmCells.push(value);
+    } else if (key === 'lpmBinary') {
+      parsed.lpmBinaries.push(value);
     } else {
       parsed[key] = value;
     }
@@ -1361,6 +1634,44 @@ function parseLpmCells(rawCells) {
       env: parseEnvAssignments(assignmentText),
     };
   });
+}
+
+function parseLpmBinaries(rawBinaries, defaultBinary) {
+  if (!rawBinaries || rawBinaries.length === 0) {
+    return [{ name: 'current', path: defaultBinary }];
+  }
+  const binaries = rawBinaries.map((raw) => {
+    const [name, binaryPath] = splitOnce(raw, '=');
+    if (!name || !binaryPath) {
+      throw new Error(`invalid --lpm-binary: ${raw}; expected NAME=PATH`);
+    }
+    return {
+      name: sanitizeName(name),
+      path: path.resolve(binaryPath),
+    };
+  });
+  validateUniqueKeys('lpm binary', binaries, (binary) => binary.name);
+  return binaries;
+}
+
+function parseLpmComparison(raw, binaries) {
+  if (!raw) {
+    return null;
+  }
+  const [rawBaseline, rawCandidate] = splitOnce(raw, ':');
+  if (!rawBaseline || !rawCandidate || rawCandidate.includes(':')) {
+    throw new Error('--lpm-compare must be BASELINE:CANDIDATE with different binary names');
+  }
+  const baseline = sanitizeName(rawBaseline);
+  const candidate = sanitizeName(rawCandidate);
+  if (baseline === candidate) {
+    throw new Error('--lpm-compare must be BASELINE:CANDIDATE with different binary names');
+  }
+  const names = new Set(binaries.map((binary) => binary.name));
+  if (!names.has(baseline) || !names.has(candidate)) {
+    throw new Error('--lpm-compare names must match two --lpm-binary names');
+  }
+  return { baseline, candidate };
 }
 
 function parseEnvAssignments(raw) {
@@ -1496,6 +1807,17 @@ function nonNegativeInt(raw, fallback, flag) {
   const value = Number.parseInt(raw, 10);
   if (!Number.isInteger(value) || value < 0) {
     throw new Error(`${flag} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function nonNegativeNumber(raw, fallback, flag) {
+  if (raw == null) {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${flag} must be a non-negative number`);
   }
   return value;
 }
@@ -1742,6 +2064,74 @@ function isWarningLikeLine(line) {
 function runSelfTests() {
   assert.deepEqual(parseModes('cold,warm,up-to-date'), ['cold', 'warm', 'up-to-date']);
   assert.throws(() => parseModes('repeat'), /unsupported mode/);
+  assert.deepEqual(parseLpmBinaries([], '/tmp/default-lpm'), [
+    { name: 'current', path: '/tmp/default-lpm' },
+  ]);
+  const binarySpecs = parseLpmBinaries(
+    ['main=/tmp/lpm-main', 'candidate=/tmp/lpm-candidate'],
+    '/tmp/unused',
+  );
+  assert.deepEqual(binarySpecs, [
+    { name: 'main', path: '/tmp/lpm-main' },
+    { name: 'candidate', path: '/tmp/lpm-candidate' },
+  ]);
+  assert.deepEqual(parseLpmComparison('main:candidate', binarySpecs), {
+    baseline: 'main',
+    candidate: 'candidate',
+  });
+  assert.throws(
+    () => parseLpmComparison('main:missing', binarySpecs),
+    /must match two --lpm-binary names/,
+  );
+  const pairedRows = (candidateValues, failedCandidateSample = null) =>
+    candidateValues.flatMap((candidateWallMs, index) => {
+      const sample = index + 1;
+      const common = {
+        sample,
+        fixture: 'paired',
+        mode: 'cold',
+        manager: 'lpm',
+        cell: 'current',
+        route: 'direct',
+        firewall_mode: 'off',
+        exit_code: 0,
+      };
+      return [
+        { ...common, binary: 'main', wall_ms: 100 },
+        {
+          ...common,
+          binary: 'candidate',
+          wall_ms: candidateWallMs,
+          exit_code: failedCandidateSample === sample ? 1 : 0,
+        },
+      ];
+    });
+  const comparison = { baseline: 'main', candidate: 'candidate' };
+  const thresholds = { median_pct: 5, p95_pct: 10 };
+  assert.equal(
+    summarizeLpmComparison(pairedRows([104, 104, 104, 104, 104]), comparison, thresholds, 5)
+      .verdict,
+    'pass',
+  );
+  assert.equal(
+    summarizeLpmComparison(pairedRows([120, 120, 120, 120, 120]), comparison, thresholds, 5)
+      .verdict,
+    'regression',
+  );
+  assert.equal(
+    summarizeLpmComparison(pairedRows([100, 104, 106, 108, 112]), comparison, thresholds, 5)
+      .verdict,
+    'inconclusive',
+  );
+  assert.equal(
+    summarizeLpmComparison(
+      pairedRows([100, 100, 100, 100, 100], 3),
+      comparison,
+      thresholds,
+      5,
+    ).verdict,
+    'execution-failure',
+  );
   const tailSummary = summarize([
     { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 100 },
     { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 110 },
@@ -1842,6 +2232,7 @@ function runSelfTests() {
   assert.throws(() => parseLpmFirewallModes('enabled,enforce'), /duplicate lpm firewall mode/);
   const firewallSpecs = buildRunSpecs(
     ['lpm', 'bun'],
+    [{ name: 'current', path: '/tmp/lpm-current' }],
     [{ name: 'current', env: {} }],
     ['direct'],
     ['off', 'enforce'],
@@ -1854,6 +2245,17 @@ function runSelfTests() {
       ['bun', 'default'],
     ],
   );
+  const environmentCellSpecs = buildRunSpecs(
+    ['lpm'],
+    [{ name: 'current', path: '/tmp/lpm-current' }],
+    [
+      { name: 'current', env: {} },
+      { name: 'cap', env: { LPM_V2_FINALIZE_PERMITS: '2' } },
+    ],
+    ['direct'],
+    ['off'],
+  );
+  assert.deepEqual(environmentCellSpecs.map((spec) => spec.id), ['lpm-current', 'lpm-cap']);
 
   const packageNameOnly = classifyInstallWarnings({
     stdout: JSON.stringify(
@@ -2308,6 +2710,11 @@ Options:
                                off,report,enforce for lpm runs (default: off)
       --lpm-cell NAME:ENV      Add an lpm env cell. Repeatable.
                                Example: --lpm-cell cap:LPM_V2_FINALIZE_PERMITS=2
+      --lpm-binary NAME=PATH   Add an lpm binary. Repeatable.
+      --lpm-compare BASE:CAND  Compare two named lpm binaries.
+      --median-regression-pct N
+                               Median wall-time limit (default: 5).
+      --p95-regression-pct N   p95 wall-time limit (default: 10).
       --lpm-typosquat-guard MODE
                                default or off. Defaults to off for --top-npm-file.
       --script-policy MODE     ignore or default for bun/pnpm/npm scripts (default: ignore)
@@ -2317,6 +2724,7 @@ Options:
       --keep-projects          Keep temp projects
       --keep-failed-projects   Keep temp projects for failed runs
       --allow-failures         Exit 0 even if a run fails
+      --allow-inconclusive     Exit 0 when the paired verdict is inconclusive
       --dry-run                Print the plan without running installs
   -h, --help                   Show this help
 
@@ -2332,6 +2740,13 @@ Examples:
 
   # Apples-to-apples reference snapshot.
   node bench/scripts/run-install-readiness.mjs --samples 5 --managers lpm,bun,pnpm,npm
+
+  # Compare two release binaries in one interleaved run.
+  node bench/scripts/run-install-readiness.mjs \
+    --samples 10 \
+    --lpm-binary main=/tmp/lpm-main \
+    --lpm-binary candidate=/tmp/lpm-candidate \
+    --lpm-compare main:candidate
 
   # Compare one lpm candidate knob against current lpm.
   node bench/scripts/run-install-readiness.mjs \\
