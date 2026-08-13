@@ -12,6 +12,7 @@ pub mod error;
 pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
+pub mod lpm_json;
 pub mod package_instance;
 pub mod package_name;
 pub mod paths;
@@ -31,7 +32,8 @@ pub use atomic_write::{
 pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
-    TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped, read_text_file_capped,
+    TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped, read_file_capped_from_open_file,
+    read_text_file_capped, read_text_file_capped_from_open_file,
     read_text_file_capped_with_metadata,
 };
 pub use error::{
@@ -40,6 +42,7 @@ pub use error::{
 };
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
+pub use lpm_json::{LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError, update_lpm_json};
 pub use package_instance::{PackageInstanceId, ResolutionNodeId};
 pub use package_name::PackageName;
 pub use paths::{

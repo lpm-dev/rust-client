@@ -458,61 +458,83 @@ fn validate_npm_name_part(part: &str, label: &str, full_name: &str) -> Result<()
 }
 
 fn ensure_npm_publish_config(project_dir: &Path) -> Result<FileWriteStatus, LpmError> {
-    let path = project_dir.join("lpm.json");
-    let existing =
-        match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
-            Ok(content) => Some(content),
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
-            Err(error) => return Err(error.into()),
+    lpm_common::update_lpm_json(project_dir, |obj, file_state| {
+        let publish = obj
+            .entry("publish".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let publish_obj = publish
+            .as_object_mut()
+            .ok_or_else(|| "lpm.json publish field must be an object".to_string())?;
+
+        let registries = publish_obj
+            .entry("registries".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        let Some(registries_array) = registries.as_array_mut() else {
+            return Err("lpm.json publish.registries must be an array".into());
         };
-    let mut value = match &existing {
-        Some(content) => serde_json::from_str::<serde_json::Value>(content)
-            .map_err(|e| LpmError::Registry(format!("failed to parse lpm.json: {e}")))?,
-        None => serde_json::json!({}),
-    };
 
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| LpmError::Registry("lpm.json must be a JSON object".into()))?;
+        let changed = registries_array.is_empty();
+        if registries_array.is_empty() {
+            registries_array.push(serde_json::json!("npm"));
+        } else if registries_array.len() != 1
+            || registries_array.first().and_then(|v| v.as_str()) != Some("npm")
+        {
+            return Err(
+                "lpm init --npm requires lpm.json publish.registries to be empty or [\"npm\"]"
+                    .into(),
+            );
+        }
 
-    let publish = obj
-        .entry("publish".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let publish_obj = publish
-        .as_object_mut()
-        .ok_or_else(|| LpmError::Registry("lpm.json publish field must be an object".into()))?;
+        let status = match file_state {
+            lpm_common::LpmJsonFileState::Missing => FileWriteStatus::Created,
+            lpm_common::LpmJsonFileState::Existing if changed => FileWriteStatus::Updated,
+            lpm_common::LpmJsonFileState::Existing => FileWriteStatus::Unchanged,
+        };
+        Ok(
+            if changed || matches!(file_state, lpm_common::LpmJsonFileState::Missing) {
+                lpm_common::LpmJsonMutation::Changed(status)
+            } else {
+                lpm_common::LpmJsonMutation::Unchanged(status)
+            },
+        )
+    })
+    .map(lpm_common::LpmJsonMutation::into_inner)
+    .map_err(|error| LpmError::Registry(error.to_string()))
+}
 
-    let registries = publish_obj
-        .entry("registries".to_string())
-        .or_insert_with(|| serde_json::json!([]));
-    let Some(registries_array) = registries.as_array_mut() else {
-        return Err(LpmError::Registry(
-            "lpm.json publish.registries must be an array".into(),
-        ));
-    };
+#[cfg(all(test, unix))]
+mod lpm_json_mutation_tests {
+    use super::*;
 
-    if registries_array.is_empty() {
-        registries_array.push(serde_json::json!("npm"));
-    } else if registries_array.len() != 1
-        || registries_array.first().and_then(|v| v.as_str()) != Some("npm")
-    {
-        return Err(LpmError::Registry(
-            "lpm init --npm requires lpm.json publish.registries to be empty or [\"npm\"]".into(),
-        ));
+    #[test]
+    fn npm_publish_config_does_not_follow_lpm_json_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "{}\n").unwrap();
+        symlink(outside.path(), dir.path().join("lpm.json")).unwrap();
+
+        let error = ensure_npm_publish_config(dir.path())
+            .expect_err("mutating a symlinked lpm.json must be rejected");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), "{}\n");
     }
 
-    let rendered =
-        serde_json::to_string_pretty(&value).map_err(|e| LpmError::Registry(e.to_string()))?;
-    let rendered = format!("{rendered}\n");
-    if let Some(current) = existing {
-        if current == rendered {
-            return Ok(FileWriteStatus::Unchanged);
-        }
-        std::fs::write(path, rendered)?;
-        Ok(FileWriteStatus::Updated)
-    } else {
-        std::fs::write(path, rendered)?;
-        Ok(FileWriteStatus::Created)
+    #[test]
+    fn npm_publish_config_reports_unchanged_when_npm_is_already_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.json");
+        std::fs::write(&path, "{\"publish\":{\"registries\":[\"npm\"]}}\n").unwrap();
+
+        let first = ensure_npm_publish_config(dir.path()).unwrap();
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        let second = ensure_npm_publish_config(dir.path()).unwrap();
+
+        assert_eq!(first, FileWriteStatus::Unchanged);
+        assert_eq!(second, FileWriteStatus::Unchanged);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), after_first);
     }
 }
 

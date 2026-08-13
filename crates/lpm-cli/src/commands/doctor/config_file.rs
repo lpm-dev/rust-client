@@ -53,11 +53,9 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
 
     let mut warnings: Vec<String> = Vec::new();
 
-    // 2. Check for unknown top-level fields
-    for key in obj.keys() {
-        if !lpm_runner::lpm_json::is_supported_top_level_field(key) {
-            warnings.push(format!("unknown field \"{key}\""));
-        }
+    // 2. Check for unknown fields against the canonical generated contract.
+    for path in lpm_runner::lpm_json::unknown_field_paths(&doc) {
+        warnings.push(format!("unknown field \"{path}\""));
     }
 
     // 3. Validate runtime section
@@ -81,14 +79,8 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     // 4. Validate tasks section
     if let Some(tasks) = obj.get("tasks") {
         if let Some(tasks_obj) = tasks.as_object() {
-            let known_task_fields = ["command", "dependsOn", "cache", "outputs", "inputs", "env"];
             for (task_name, task_value) in tasks_obj {
                 if let Some(task_obj) = task_value.as_object() {
-                    for key in task_obj.keys() {
-                        if !known_task_fields.contains(&key.as_str()) {
-                            warnings.push(format!("tasks.{task_name}: unknown field \"{key}\""));
-                        }
-                    }
                     // cache must be bool
                     if let Some(cache) = task_obj.get("cache")
                         && !cache.is_boolean()
@@ -162,8 +154,8 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
         }
     }
 
-    // Also try parsing with the actual struct to catch serde errors
-    if let Err(e) = serde_json::from_str::<lpm_runner::lpm_json::LpmJsonConfig>(&content) {
+    // Use the actual semantic parser so Doctor agrees with command execution.
+    if let Err(e) = lpm_runner::lpm_json::read_lpm_json(project_dir) {
         warnings.push(format!("schema error: {e}"));
     }
 
@@ -268,17 +260,68 @@ mod tests {
     }
 
     #[test]
-    fn validate_lpm_json_vault_field_rejected() {
-        // vault is NOT in LpmJsonConfig — should be flagged as unknown
+    fn validate_lpm_json_accepts_documented_schema_and_env_metadata_fields() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("lpm.json"), r#"{ "vault": {} }"#).unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "$schema": "https://cli.lpm.dev/schemas/lpm.json",
+                "vault": "vault-123",
+                "vaultSync": {
+                    "personalVersion": 7,
+                    "personalSyncedAt": "2026-08-13T09:00:00Z",
+                    "orgVersions": {"acme": 4},
+                    "orgSyncedAt": {"acme": "2026-08-13T09:01:00Z"}
+                }
+            }"#,
+        )
+        .unwrap();
         let result = validate_lpm_json(dir.path()).unwrap();
         assert!(
-            matches!(result.severity, Severity::Warn),
-            "vault should be unknown: {}",
+            matches!(result.severity, Severity::Pass),
+            "documented fields should be accepted: {}",
             result.detail
         );
-        assert!(result.detail.contains("unknown field \"vault\""));
+    }
+
+    #[test]
+    fn validate_lpm_json_warns_for_unknown_nested_fields_with_full_paths() {
+        let cases = [
+            (
+                r#"{"remoteCache":{"readonly":true}}"#,
+                "remoteCache.readonly",
+            ),
+            (
+                r#"{"services":{"web":{"command":"vite","restar":true}}}"#,
+                "services.web.restar",
+            ),
+            (r#"{"proxy":{"httpRediect":true}}"#, "proxy.httpRediect"),
+            (
+                r#"{"publish":{"npm":{"otpRequred":true}}}"#,
+                "publish.npm.otpRequred",
+            ),
+            (
+                r#"{"envSchema":{"vars":{"TOKEN":{"secert":true}}}}"#,
+                "envSchema.vars.TOKEN.secert",
+            ),
+            (
+                r#"{"environments":{"prod":{"extnds":"base"}}}"#,
+                "environments.prod.extnds",
+            ),
+            (r#"{"cert":{"allowPublicDNS":true}}"#, "cert.allowPublicDNS"),
+        ];
+
+        for (input, path) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("lpm.json"), input).unwrap();
+            let result = validate_lpm_json(dir.path()).unwrap();
+            assert!(
+                matches!(result.severity, Severity::Warn),
+                "{path}: {}",
+                result.detail
+            );
+            assert!(result.detail.contains(path), "{path}: {}", result.detail);
+        }
     }
 
     #[test]
@@ -352,7 +395,11 @@ mod tests {
         .unwrap();
         let result = validate_lpm_json(dir.path()).unwrap();
         assert!(matches!(result.severity, Severity::Warn));
-        assert!(result.detail.contains("unknown field \"bogus\""));
+        assert!(
+            result
+                .detail
+                .contains("unknown field \"tasks.build.bogus\"")
+        );
     }
 
     #[test]

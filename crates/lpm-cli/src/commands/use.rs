@@ -674,27 +674,22 @@ fn write_runtime_pin(
     runtime: RuntimeKind,
     version: &str,
 ) -> Result<(), LpmError> {
-    let lpm_json_path = project_dir.join("lpm.json");
-    let mut config: serde_json::Value = match lpm_common::read_text_file_capped(
-        &lpm_json_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(content) => serde_json::from_str(&content)
-            .map_err(|e| LpmError::Script(format!("failed to parse lpm.json: {e}")))?,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => serde_json::json!({}),
-        Err(error) => return Err(error.into()),
-    };
-
-    if config.get("runtime").is_none() {
-        config["runtime"] = serde_json::json!({});
-    }
-    config["runtime"][runtime.as_str()] = serde_json::Value::String(version.to_string());
-
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| LpmError::Script(format!("failed to serialize lpm.json: {e}")))?
-        + "\n";
-
-    lpm_common::write_file_atomic(&lpm_json_path, content).map_err(LpmError::Io)
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        let runtime_value = root
+            .entry("runtime".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let runtime_config = runtime_value
+            .as_object_mut()
+            .ok_or_else(|| "lpm.json runtime field must be an object".to_string())?;
+        let value = serde_json::Value::String(version.to_string());
+        if runtime_config.get(runtime.as_str()) == Some(&value) {
+            return Ok(lpm_common::LpmJsonMutation::Unchanged(()));
+        }
+        runtime_config.insert(runtime.as_str().to_string(), value);
+        Ok(lpm_common::LpmJsonMutation::Changed(()))
+    })
+    .map(|_| ())
+    .map_err(|error| LpmError::Script(error.to_string()))
 }
 
 /// Validate a pin version string.
@@ -884,5 +879,28 @@ mod tests {
         assert_eq!(parsed["name"], "my-project");
         assert_eq!(parsed["runtime"]["node"], "22.5.0");
         assert!(written.ends_with('\n'));
+    }
+
+    #[test]
+    fn write_runtime_pin_rejects_wrong_shaped_config_without_modifying_it() {
+        for input in [r#"[]"#, r#""scalar""#, r#"{"runtime":"22"}"#] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("lpm.json");
+            std::fs::write(&path, input).unwrap();
+
+            let result = std::panic::catch_unwind(|| {
+                write_runtime_pin(dir.path(), RuntimeKind::Node, "22.5.0")
+            });
+
+            assert!(
+                result.is_ok(),
+                "wrong-shaped lpm.json must not panic: {input}"
+            );
+            let error = result
+                .unwrap()
+                .expect_err("wrong-shaped lpm.json must be rejected");
+            assert!(error.to_string().contains("lpm.json"));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), input);
+        }
     }
 }

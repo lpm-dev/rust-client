@@ -22,33 +22,41 @@ pub struct VaultSyncSummary {
 /// Existing IDs are validated by [`is_safe_vault_id`] before being
 /// returned. The file-fallback vault backend joins the ID into a
 /// `~/.lpm/vaults/{id}.enc` path, so an unvalidated `../` or absolute
-/// path in `lpm.json["vault"]` (e.g., from a malicious cloned repo)
-/// would let `lpm env` write/delete `.enc` files outside the vaults
-/// directory. M31.
+/// path in `lpm.json["vault"]` from a malicious cloned repo would let
+/// `lpm env` modify `.enc` files outside the vaults directory.
 pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
-    let (lpm_json_path, mut config) =
-        read_lpm_json_value(project_dir)?.unwrap_or_else(|| empty_lpm_json(project_dir));
-
-    if let Some(vault_id) = config.get("vault").and_then(|v| v.as_str()) {
-        if !is_safe_vault_id(vault_id) {
-            return Err(format!(
-                "lpm.json vault id {vault_id:?} contains path-traversal or non-portable characters; \
-                 refusing to use as a vault filename. Remove the `vault` field to regenerate."
-            ));
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        if let Some(value) = root.get("vault").filter(|value| !value.is_null()) {
+            let vault_id = value
+                .as_str()
+                .ok_or_else(|| "lpm.json vault field must be a string".to_string())?;
+            validate_vault_id(vault_id)?;
+            return Ok(lpm_common::LpmJsonMutation::Unchanged(vault_id.to_string()));
         }
-        return Ok(vault_id.to_string());
-    }
 
-    let vault_id = generate_uuid();
-    config["vault"] = serde_json::Value::String(vault_id.clone());
-    write_lpm_json_value(&lpm_json_path, &config)?;
-
-    Ok(vault_id)
+        let vault_id = generate_uuid();
+        root.insert(
+            "vault".to_string(),
+            serde_json::Value::String(vault_id.clone()),
+        );
+        Ok(lpm_common::LpmJsonMutation::Changed(vault_id))
+    })
+    .map(lpm_common::LpmJsonMutation::into_inner)
+    .map_err(|error| error.to_string())
 }
 
-/// Read the vault ID from lpm.json without creating one. Returns
-/// `None` when missing or when the stored value fails the
-/// [`is_safe_vault_id`] check (per M31).
+fn validate_vault_id(vault_id: &str) -> Result<(), String> {
+    if is_safe_vault_id(vault_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "lpm.json vault id {vault_id:?} contains path-traversal or non-portable characters; \
+         refusing to use as a vault filename. Remove the `vault` field to regenerate."
+    ))
+}
+
+/// Read the vault ID from lpm.json without creating one.
+/// Returns `None` when the field is missing or fails [`is_safe_vault_id`].
 pub fn read_vault_id(project_dir: &Path) -> Option<String> {
     let lpm_json_path = project_dir.join("lpm.json");
     let content =
@@ -81,15 +89,13 @@ pub fn is_safe_vault_id(id: &str) -> bool {
     if id.starts_with('~') {
         return false;
     }
-    // Block any control / path-meaningful byte.
     for c in id.chars() {
         if c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') {
             return false;
         }
     }
-    // Reject `..` substrings to defend against `foo..bar` shapes that
-    // some filesystems normalise. Plain `-..-` wouldn't normalise but
-    // refusing is cheap defense-in-depth.
+    // Reject `..` even outside a path component. This keeps IDs portable
+    // across fallback stores that can apply different path normalization.
     if id.contains("..") {
         return false;
     }
@@ -127,21 +133,17 @@ pub fn write_personal_sync_version_at(
     version: i32,
     synced_at: &str,
 ) -> Result<(), String> {
-    let (lpm_json_path, mut config) =
-        read_lpm_json_value(project_dir)?.unwrap_or_else(|| empty_lpm_json(project_dir));
-
-    let root = config.as_object_mut().ok_or_else(|| {
-        "failed to update lpm.json: top-level config must be an object".to_string()
-    })?;
-
-    let sync = ensure_object_entry(root, "vaultSync");
-    sync.insert("personalVersion".into(), serde_json::json!(version));
-    sync.insert(
-        "personalSyncedAt".into(),
-        serde_json::json!(synced_at.to_string()),
-    );
-
-    write_lpm_json_value(&lpm_json_path, &config)
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        let sync = object_entry(root, "vaultSync")?;
+        sync.insert("personalVersion".into(), serde_json::json!(version));
+        sync.insert(
+            "personalSyncedAt".into(),
+            serde_json::json!(synced_at.to_string()),
+        );
+        Ok(lpm_common::LpmJsonMutation::Changed(()))
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 /// Read the last known org-shared cloud vault version for an org slug.
@@ -182,20 +184,16 @@ pub fn write_org_sync_version_at(
     version: i32,
     synced_at: &str,
 ) -> Result<(), String> {
-    let (lpm_json_path, mut config) =
-        read_lpm_json_value(project_dir)?.unwrap_or_else(|| empty_lpm_json(project_dir));
-
-    let root = config.as_object_mut().ok_or_else(|| {
-        "failed to update lpm.json: top-level config must be an object".to_string()
-    })?;
-
-    let sync = ensure_object_entry(root, "vaultSync");
-    let org_versions = ensure_object_entry(sync, "orgVersions");
-    org_versions.insert(org_slug.to_string(), serde_json::json!(version));
-    let org_synced_at = ensure_object_entry(sync, "orgSyncedAt");
-    org_synced_at.insert(org_slug.to_string(), serde_json::json!(synced_at));
-
-    write_lpm_json_value(&lpm_json_path, &config)
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        let sync = object_entry(root, "vaultSync")?;
+        let org_versions = object_entry(sync, "orgVersions")?;
+        org_versions.insert(org_slug.to_string(), serde_json::json!(version));
+        let org_synced_at = object_entry(sync, "orgSyncedAt")?;
+        org_synced_at.insert(org_slug.to_string(), serde_json::json!(synced_at));
+        Ok(lpm_common::LpmJsonMutation::Changed(()))
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 pub fn read_sync_summary(project_dir: &Path) -> VaultSyncSummary {
@@ -299,10 +297,6 @@ fn generate_uuid() -> String {
     )
 }
 
-fn empty_lpm_json(project_dir: &Path) -> (PathBuf, serde_json::Value) {
-    (project_dir.join("lpm.json"), serde_json::json!({}))
-}
-
 fn read_lpm_json_value(project_dir: &Path) -> Result<Option<(PathBuf, serde_json::Value)>, String> {
     let lpm_json_path = project_dir.join("lpm.json");
     let content = match lpm_common::read_text_file_capped(
@@ -319,29 +313,19 @@ fn read_lpm_json_value(project_dir: &Path) -> Result<Option<(PathBuf, serde_json
     Ok(Some((lpm_json_path, config)))
 }
 
-fn write_lpm_json_value(lpm_json_path: &Path, config: &serde_json::Value) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("failed to serialize lpm.json: {e}"))?
-        + "\n";
-    lpm_common::write_file_atomic(lpm_json_path, content)
-        .map_err(|e| format!("failed to write lpm.json: {e}"))
-}
-
-fn ensure_object_entry<'a>(
+fn object_entry<'a>(
     parent: &'a mut serde_json::Map<String, serde_json::Value>,
     key: &str,
-) -> &'a mut serde_json::Map<String, serde_json::Value> {
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>, String> {
     let value = parent
         .entry(key.to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-    if !value.is_object() {
+    if value.is_null() {
         *value = serde_json::Value::Object(serde_json::Map::new());
     }
-
     value
         .as_object_mut()
-        .expect("vault sync metadata entries should always be objects")
+        .ok_or_else(|| format!("lpm.json {key} field must be an object"))
 }
 
 fn rfc3339_now() -> String {
@@ -494,6 +478,53 @@ mod tests {
     }
 
     #[test]
+    fn vault_mutations_reject_wrong_shaped_fields_without_modifying_them() {
+        let cases = [
+            (r#"{"vault":{}}"#, "vault"),
+            (r#"{"vaultSync":[]}"#, "vaultSync"),
+            (r#"{"vaultSync":{"orgVersions":"wrong"}}"#, "orgVersions"),
+        ];
+
+        for (input, field) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("lpm.json");
+            std::fs::write(&path, input).unwrap();
+
+            let result = match field {
+                "vault" => get_or_create_vault_id(dir.path()).map(|_| ()),
+                "vaultSync" => {
+                    write_personal_sync_version_at(dir.path(), 1, "2026-08-13T09:00:00Z")
+                }
+                _ => write_org_sync_version_at(dir.path(), "acme", 1, "2026-08-13T09:00:00Z"),
+            };
+
+            let error = result.expect_err("malformed owned field must be rejected");
+            assert!(error.contains(field), "{field}: {error}");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn vault_mutations_treat_null_optional_fields_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":null,"vaultSync":null,"custom":true}"#,
+        )
+        .unwrap();
+
+        let vault_id = get_or_create_vault_id(dir.path()).unwrap();
+        write_personal_sync_version_at(dir.path(), 3, "2026-08-13T09:00:00Z").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("lpm.json")).unwrap())
+                .unwrap();
+
+        assert_eq!(config["vault"], vault_id);
+        assert_eq!(config["vaultSync"]["personalVersion"], 3);
+        assert_eq!(config["custom"], true);
+    }
+
+    #[test]
     fn org_sync_versions_are_scoped_by_slug() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
@@ -514,8 +545,6 @@ mod tests {
         );
     }
 
-    /// M31: standard UUIDs and slug-shaped IDs pass; path-traversal
-    /// and absolute-path shapes are refused.
     #[test]
     fn is_safe_vault_id_accepts_uuids_and_slugs() {
         assert!(is_safe_vault_id("550e8400-e29b-41d4-a716-446655440000"));
@@ -564,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_version_writes_recover_from_metadata_drift_across_personal_and_org_modes() {
+    fn sync_version_writes_reject_metadata_drift_without_modifying_the_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("lpm.json"),
@@ -572,29 +601,15 @@ mod tests {
         )
         .unwrap();
 
-        write_org_sync_version_at(dir.path(), "acme", 9, "2026-05-31T08:00:00Z").unwrap();
-        assert_eq!(read_personal_sync_version(dir.path()), Some(5));
-        assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(9));
+        let before = std::fs::read_to_string(dir.path().join("lpm.json")).unwrap();
+        let error = write_org_sync_version_at(dir.path(), "acme", 9, "2026-05-31T08:00:00Z")
+            .expect_err("wrong-shaped orgVersions must be rejected");
 
-        write_personal_sync_version_at(dir.path(), 11, "2026-05-31T08:02:00Z").unwrap();
-        assert_eq!(read_personal_sync_version(dir.path()), Some(11));
-        assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(9));
-
-        let content = std::fs::read_to_string(dir.path().join("lpm.json")).unwrap();
-        let config: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(config["runtime"]["node"], "22");
-        assert_eq!(config["vault"], "vault-123");
-        assert_eq!(config["vaultSync"]["personalVersion"], 11);
+        assert!(error.contains("orgVersions"), "{error}");
         assert_eq!(
-            config["vaultSync"]["personalSyncedAt"],
-            "2026-05-31T08:02:00Z"
+            std::fs::read_to_string(dir.path().join("lpm.json")).unwrap(),
+            before
         );
-        assert_eq!(config["vaultSync"]["orgVersions"]["acme"], 9);
-        assert_eq!(
-            config["vaultSync"]["orgSyncedAt"]["acme"],
-            "2026-05-31T08:00:00Z"
-        );
-        assert!(content.ends_with('\n'));
     }
 
     #[test]
