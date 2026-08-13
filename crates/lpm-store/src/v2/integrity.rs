@@ -297,10 +297,16 @@ pub(crate) fn verified_tree_object_integrity_or_migrate(
 /// callers that will reuse the object must also validate the active
 /// integrity policy.
 pub(crate) fn is_complete_object_dir(dir: &Path) -> bool {
-    dir.is_dir()
+    is_real_directory(dir)
         && is_regular_file_no_symlink(&dir.join("package.json"))
         && is_regular_file_no_symlink(&dir.join(".integrity"))
         && is_regular_file_no_symlink(&dir.join(OBJECT_INTEGRITY_FILENAME))
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata))
+        .unwrap_or(false)
 }
 
 pub(crate) fn is_regular_file_no_symlink(path: &Path) -> bool {

@@ -18,8 +18,20 @@ use crate::validation::{
 
 /// Wipe legacy project link state so the v2 install starts clean.
 pub(super) fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
+    let lpm_dir = project_dir.join(".lpm");
+    match lpm_dir.symlink_metadata() {
+        Ok(_) => ensure_real_dir(&lpm_dir, "legacy project state")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "virtual-store linker: failed to inspect legacy project state at {}: {error}",
+                lpm_dir.display()
+            )));
+        }
+    }
+
     // `<project>/.lpm/wrappers/` — the v1 isolated layout.
-    let v1_wrappers = project_dir.join(".lpm").join("wrappers");
+    let v1_wrappers = lpm_dir.join("wrappers");
     if v1_wrappers.exists() {
         std::fs::remove_dir_all(&v1_wrappers).map_err(|e| {
             LpmError::Store(format!(
@@ -29,7 +41,7 @@ pub(super) fn cleanup_v1_state(project_dir: &Path) -> Result<(), LpmError> {
         })?;
     }
     // `<project>/.lpm/hoisted/` — hoisted layout sidecar.
-    let hoisted = project_dir.join(".lpm").join("hoisted");
+    let hoisted = lpm_dir.join("hoisted");
     if hoisted.exists() {
         std::fs::remove_dir_all(&hoisted).map_err(|e| {
             LpmError::Store(format!(

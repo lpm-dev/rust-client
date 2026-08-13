@@ -44,9 +44,11 @@ pub use package_instance::{PackageInstanceId, ResolutionNodeId};
 pub use package_name::PackageName;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
-    SharedLockHandle, acquire_exclusive_lock, as_extended_path, check_install_path_budget,
-    is_local_fs, project_install_lock, try_acquire_exclusive_lock, try_with_exclusive_lock,
-    with_exclusive_lock, with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
+    SharedLockHandle, SingleFileExclusiveLockHandle, SingleFileSharedLockHandle,
+    acquire_exclusive_lock, acquire_single_file_exclusive_lock, acquire_single_file_shared_lock,
+    as_extended_path, check_install_path_budget, is_local_fs, project_install_lock,
+    try_acquire_exclusive_lock, try_with_exclusive_lock, with_exclusive_lock,
+    with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
 };
 pub use peer::PeerEdge;
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};

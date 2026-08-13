@@ -14,12 +14,14 @@ use super::reconcile::{
     ensure_link_parent_dir, ensure_node_modules_dir, ensure_real_dir, is_direct,
     reconcile_scoped_root_dir, remove_node_modules_entry, root_link_names, symlink_points_to,
 };
-use crate::materialize::link_dir_recursive;
+use crate::materialize::copy_dir_recursive;
 use crate::validation::is_safe_node_modules_entry_name as is_safe_root_link_name;
 
 const PROJECT_COMPAT_DIR: &str = "compat";
 const COMPAT_META_FILENAME: &str = ".lpm-compat-meta";
 const COMPAT_META_FORMAT: &str = "lpm-compat-v1";
+#[cfg(target_os = "macos")]
+const COMPAT_ISLAND_COMPLETE_SCHEMA: u64 = 2;
 
 #[derive(Default)]
 pub(super) struct CompatibilityLinks {
@@ -205,6 +207,7 @@ pub(super) fn create_project_compatibility_links(
     let requested_bins = normalize_compatibility_bin_names(compatibility_bin_names);
 
     if requested_bins.is_empty() {
+        remove_project_compatibility_root(project_dir)?;
         return Ok(CompatibilityLinks::default());
     }
     let roots = collect_compatibility_roots_for_bins(targets, store, key_map, &requested_bins);
@@ -319,6 +322,7 @@ fn create_project_compatibility_links_store_cached(
     refresh_package_copies: bool,
 ) -> Result<CompatibilityLinks, LpmError> {
     let island_key = store_compat_island_key(entries, store)?;
+    let _island_lock = store.acquire_build_entry_lock(&island_key)?;
     let store_island = store.paths().compat_island_dir(&island_key);
     ensure_store_compat_island(
         &store_island,
@@ -376,17 +380,19 @@ fn ensure_store_compat_island(
     key_map: &KeyMap,
     force_refresh: bool,
 ) -> Result<(), LpmError> {
-    if store_compat_island_complete(store_island) {
-        if !force_refresh {
-            // Reuse: refresh the sentinel's mtime so `lpm cache prune
-            // --max-age` treats an actively-used island as live (the clone
-            // that follows only reads the island, so without this an island
-            // built once would age out despite daily use). Best-effort — a
-            // missed touch only widens prune's view by one install cycle.
-            let sentinel = store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME);
-            let _ = std::fs::write(&sentinel, COMPAT_META_FORMAT);
-            return Ok(());
+    if store_compat_island_complete(store_island, entries, store) && !force_refresh {
+        // Reuse: refresh the sentinel's mtime so `lpm cache prune
+        // --max-age` treats an actively-used island as live (the clone
+        // that follows only reads the island, so without this an island
+        // built once would age out despite daily use). Best-effort — a
+        // missed touch only widens prune's view by one install cycle.
+        let sentinel = store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME);
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&sentinel) {
+            let _ = file.set_modified(std::time::SystemTime::now());
         }
+        return Ok(());
+    }
+    if store_island.symlink_metadata().is_ok() {
         remove_node_modules_entry(store_island, "stale store compatibility island")?;
     }
     store.ensure_compat_root_locked()?;
@@ -396,11 +402,7 @@ fn ensure_store_compat_island(
         build_compat_island_at(&tmp, entries, store, key_map, true)?;
         // Completion sentinel written last; the atomic rename below only
         // publishes a tmp that reached this point.
-        std::fs::write(
-            tmp.join(COMPAT_ISLAND_COMPLETE_FILENAME),
-            COMPAT_META_FORMAT,
-        )
-        .map_err(|e| {
+        write_store_compat_island_completion(&tmp, entries, store).map_err(|e| {
             LpmError::Store(format!(
                 "virtual-store linker: failed to write island completion sentinel: {e}"
             ))
@@ -415,7 +417,7 @@ fn ensure_store_compat_island(
         Ok(()) => Ok(()),
         // Lost a concurrent-build race: another install published a complete
         // island at this key first. Discard ours and reuse theirs.
-        Err(_) if store_compat_island_complete(store_island) => {
+        Err(_) if store_compat_island_complete(store_island, entries, store) => {
             let _ = std::fs::remove_dir_all(&tmp);
             Ok(())
         }
@@ -430,8 +432,83 @@ fn ensure_store_compat_island(
 }
 
 #[cfg(target_os = "macos")]
-fn store_compat_island_complete(store_island: &Path) -> bool {
-    store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME).is_file()
+fn store_compat_island_complete(
+    store_island: &Path,
+    entries: &[CompatibilityEntry<'_>],
+    store: &Store,
+) -> bool {
+    let sentinel = store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME);
+    let Ok(metadata) = sentinel.symlink_metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(content) =
+        lpm_common::read_file_capped(&sentinel, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&content) else {
+        return false;
+    };
+    if manifest.get("schema").and_then(serde_json::Value::as_u64)
+        != Some(COMPAT_ISLAND_COMPLETE_SCHEMA)
+    {
+        return false;
+    }
+    let Some(recorded_entries) = manifest
+        .get("entries")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if recorded_entries.len() != entries.len() {
+        return false;
+    }
+    entries.iter().all(|entry| {
+        let entry_dir = compatibility_entry_dir(store_island, &entry.key);
+        let expected = recorded_entries
+            .get(entry.key.dir_name())
+            .and_then(serde_json::Value::as_str);
+        expected.is_some_and(|expected| {
+            compatibility_entry_reusable(&entry_dir, entry)
+                && store
+                    .compat_island_entry_metadata_integrity(&entry_dir)
+                    .is_ok_and(|actual| actual == expected)
+        })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn write_store_compat_island_completion(
+    store_island: &Path,
+    entries: &[CompatibilityEntry<'_>],
+    store: &Store,
+) -> Result<(), LpmError> {
+    let mut recorded_entries = serde_json::Map::new();
+    for entry in entries {
+        let entry_dir = compatibility_entry_dir(store_island, &entry.key);
+        let integrity = store.compat_island_entry_metadata_integrity(&entry_dir)?;
+        recorded_entries.insert(
+            entry.key.dir_name().to_string(),
+            serde_json::Value::String(integrity),
+        );
+    }
+    let manifest = serde_json::json!({
+        "schema": COMPAT_ISLAND_COMPLETE_SCHEMA,
+        "entries": recorded_entries,
+    });
+    let content = serde_json::to_vec(&manifest).map_err(|error| {
+        LpmError::Store(format!(
+            "virtual-store linker: failed to serialize island completion manifest: {error}"
+        ))
+    })?;
+    std::fs::write(store_island.join(COMPAT_ISLAND_COMPLETE_FILENAME), content).map_err(|error| {
+        LpmError::Store(format!(
+            "virtual-store linker: failed to write island completion manifest: {error}"
+        ))
+    })
 }
 
 /// Reproduce the cached store island under the project's
@@ -870,7 +947,7 @@ fn ensure_compatibility_package_copy(
         )));
     }
 
-    if let Err(error) = link_dir_recursive(&source_package_dir, &tmp_package_dir) {
+    if let Err(error) = copy_dir_recursive(&source_package_dir, &tmp_package_dir) {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(error);
     }

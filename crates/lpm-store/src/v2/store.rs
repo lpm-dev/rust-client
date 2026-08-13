@@ -875,6 +875,34 @@ impl Store {
         })
     }
 
+    /// Serialize mutation of one graph-keyed link entry across installs and
+    /// lifecycle rebuilds.
+    pub fn acquire_build_entry_lock(
+        &self,
+        graph_key_digest: &str,
+    ) -> Result<lpm_common::SingleFileExclusiveLockHandle, LpmError> {
+        ensure_store_tier_dir_locked(self.paths.build_entry_locks_root()).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to create virtual-store build-entry locks dir: {error}"
+            ))
+        })?;
+        let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
+        lpm_common::acquire_single_file_exclusive_lock(lock_path)
+    }
+
+    fn acquire_build_entry_read_lock(
+        &self,
+        graph_key_digest: &str,
+    ) -> Result<lpm_common::SingleFileSharedLockHandle, LpmError> {
+        ensure_store_tier_dir_locked(self.paths.build_entry_locks_root()).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to create virtual-store build-entry locks dir: {error}"
+            ))
+        })?;
+        let lock_path = self.paths.build_entry_lock_path(graph_key_digest)?;
+        lpm_common::acquire_single_file_shared_lock(lock_path)
+    }
+
     /// Return the object directory when `sri` is already present and
     /// its object identity is reusable. Incomplete or stale
     /// objects are removed so callers can safely refetch before
@@ -1635,6 +1663,26 @@ impl Store {
             .map(|cas| cas.source_tree_digest(&object_dir, &source_sri))
             .transpose()?;
 
+        if final_dir.exists() {
+            let _entry_read_lock = self.acquire_build_entry_read_lock(&graph_key.digest_hex())?;
+            let reuse_check_start = std::time::Instant::now();
+            if link_entry_is_reusable(
+                &final_dir,
+                &graph_key,
+                &object_dir,
+                &source_sri,
+                verified_object_digest,
+                cas_tree_digest.as_deref(),
+                policy,
+            )? {
+                timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+                return Ok(Self::reused_link_entry(final_dir, total_start, timings));
+            }
+            timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
+        }
+
+        let _entry_lock = self.acquire_build_entry_lock(&graph_key.digest_hex())?;
+
         // Mirrors the v1 store's "incomplete-on-disk → remove and
         // re-populate" recovery (lib.rs:303-315). Without it, a crash
         // mid-populate leaves a partial `links/<graph-key>/` that
@@ -1653,28 +1701,7 @@ impl Store {
                 policy,
             )? {
                 timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
-                // Refresh the sidecar's "last referenced" via a single
-                // set_modified() call instead of read+touch+write+rename.
-                // On a 256-package warm install that's 256 fewer JSON
-                // parses and rename syscall trios. `lpm cache prune
-                // --max-age` reads the effective time via
-                // `LinkMeta::effective_last_referenced_at`, which takes
-                // `max(json_field, file_mtime)`.
-                let sidecar_path = final_dir.join(LINK_META_FILENAME);
-                if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
-                    // Non-fatal: a missed touch only widens prune's
-                    // view of cold entries by one install cycle.
-                    tracing::debug!("virtual store: cache-hit touch failed: {e}");
-                }
-                return Ok(LinkEntry {
-                    link_dir: final_dir,
-                    freshly_populated: false,
-                    sidecar: None,
-                    timings: LinkEntryTimings {
-                        total_ms: total_start.elapsed().as_millis(),
-                        ..timings
-                    },
-                });
+                return Ok(Self::reused_link_entry(final_dir, total_start, timings));
             }
             timings.reuse_check_ms = reuse_check_start.elapsed().as_millis();
 
@@ -1847,6 +1874,26 @@ impl Store {
         }
     }
 
+    fn reused_link_entry(
+        final_dir: PathBuf,
+        total_start: std::time::Instant,
+        timings: LinkEntryTimings,
+    ) -> LinkEntry {
+        let sidecar_path = final_dir.join(LINK_META_FILENAME);
+        if let Err(error) = LinkMeta::touch_on_disk(&sidecar_path) {
+            tracing::debug!("virtual store: cache-hit touch failed: {error}");
+        }
+        LinkEntry {
+            link_dir: final_dir,
+            freshly_populated: false,
+            sidecar: None,
+            timings: LinkEntryTimings {
+                total_ms: total_start.elapsed().as_millis(),
+                ..timings
+            },
+        }
+    }
+
     // ── Read API ─────────────────────────────────────────────────────
 
     /// Iterate every link-entry directory under `links/` that has a
@@ -1996,6 +2043,46 @@ impl Store {
     /// Return the current content digest for a populated link entry.
     pub fn link_entry_content_integrity(&self, key: &GraphKey) -> Result<String, LpmError> {
         self.link_entry_content_integrity_with_policy(key, self.object_integrity_policy)
+    }
+
+    /// Return a metadata digest for a cached compatibility-island entry.
+    pub fn compat_island_entry_metadata_integrity(
+        &self,
+        entry_dir: &Path,
+    ) -> Result<String, LpmError> {
+        let compat_root = self.paths.compat_root();
+        let relative = entry_dir.strip_prefix(compat_root).map_err(|_| {
+            LpmError::Store(format!(
+                "compatibility island entry is outside the store cache at {}",
+                entry_dir.display()
+            ))
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            })
+        {
+            return Err(LpmError::Store(format!(
+                "compatibility island entry is outside the store cache at {}",
+                entry_dir.display()
+            )));
+        }
+        let metadata = entry_dir.symlink_metadata().map_err(|error| {
+            LpmError::Store(format!(
+                "failed to inspect compatibility island entry at {}: {error}",
+                entry_dir.display()
+            ))
+        })?;
+        if !metadata.is_dir() || lpm_common::is_symlink_or_junction(&metadata) {
+            return Err(LpmError::Store(format!(
+                "refusing non-directory compatibility island entry at {}",
+                entry_dir.display()
+            )));
+        }
+        compute_tree_metadata_integrity(entry_dir)
     }
 
     fn link_entry_content_integrity_with_policy(
@@ -3035,18 +3122,22 @@ fn link_tree_matches_object_tree(
     Ok(link_integrities.content == object_integrities.content)
 }
 
-/// Process-wide per-object mutex serializing local-source snapshot
-/// populates. The map only ever holds one entry per distinct local
-/// source consumed in this process, so it is never pruned.
-fn local_source_populate_lock(object_dir: &Path) -> Arc<std::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<std::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Arc::clone(locks.entry(object_dir.to_path_buf()).or_default())
+/// Process-wide striped mutexes serializing local-source snapshot populates.
+/// Hash collisions only reduce concurrency; the fixed stripe count bounds
+/// memory in long-lived processes that consume many distinct local sources.
+fn local_source_populate_lock(object_dir: &Path) -> &'static std::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+
+    const LOCK_SHARDS: usize = 256;
+    static LOCKS: std::sync::OnceLock<Box<[std::sync::Mutex<()>]>> = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| {
+        std::iter::repeat_with(|| std::sync::Mutex::new(()))
+            .take(LOCK_SHARDS)
+            .collect()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    object_dir.hash(&mut hasher);
+    &locks[hasher.finish() as usize % LOCK_SHARDS]
 }
 
 fn record_local_source_fingerprint(

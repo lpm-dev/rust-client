@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, is_symlink_or_junction};
 
 use super::integrity::has_local_source_sentinel;
 use super::tree_hash::{TreeMetadataBuilder, TreeMetadataKind, is_object_metadata_sidecar};
@@ -52,19 +52,49 @@ pub(crate) fn create_tmp_dir_locked(path: &Path) -> std::io::Result<()> {
 /// No-op on platforms without POSIX modes, where the perms knob does
 /// not apply.
 pub(crate) fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !is_symlink_or_junction(&metadata) => metadata,
+        Ok(_) => {
+            return Err(std::io::Error::other(format!(
+                "refusing non-directory store tier at {}",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                builder.mode(0o700);
+                builder.create(path)?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(path)?;
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || is_symlink_or_junction(&metadata) {
+                return Err(std::io::Error::other(format!(
+                    "refusing non-directory store tier at {}",
+                    path.display()
+                )));
+            }
+            metadata
+        }
+        Err(error) => return Err(error),
+    };
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
         use std::os::unix::fs::PermissionsExt;
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        b.mode(0o700);
-        b.create(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        if metadata.permissions().mode() & 0o777 == 0o700 {
+            Ok(())
+        } else {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        }
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(path)
+        Ok(())
     }
 }
 

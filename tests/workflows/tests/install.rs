@@ -2143,6 +2143,67 @@ fn empty_deps_second_install_is_up_to_date() {
     );
 }
 
+#[tokio::test]
+async fn install_empty_graph_removes_links_for_the_last_dependency() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "remove-last-dependency",
+        "version": "1.0.0",
+        "dependencies": { "ms": "2.1.3" }
+    }"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to install the initial dependency");
+    assert!(
+        first.status.success(),
+        "initial install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    assertions::assert_in_node_modules(project.path(), "ms");
+
+    project.write_file(
+        "package.json",
+        r#"{
+        "name": "remove-last-dependency",
+        "version": "1.0.0",
+        "dependencies": {}
+    }"#,
+    );
+    let second = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("failed to install the empty graph");
+
+    assert!(
+        second.status.success(),
+        "empty-graph install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        !project.path().join("node_modules/ms").exists(),
+        "installing an empty graph must remove the final stale dependency link\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+}
+
 #[test]
 fn bare_install_with_importer_snapshot_stays_fresh_without_binary_lockfile() {
     let project = TempProject::empty(
