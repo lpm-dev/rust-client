@@ -123,9 +123,11 @@ It provides:
 
 - isolated temp project, `HOME`, package-manager cache, and `LPM_HOME`
 - cold, lockfile-and-cache-warm rebuild, and up-to-date modes
-- round-robin interleaving by sample to reduce live-network bias
+- adjacent baseline and candidate pairs that alternate `AB` and `BA` order
+- package-manager reference runs outside the measured lpm pairs
 - configurable sample count, fixtures, package managers, lpm routes, lpm firewall modes, and lpm env cells
 - JSON, Markdown, stdout/stderr, resolved fixture source, and per-run metrics artifacts
+- peak resident-set size (RSS) for each install on macOS and Linux
 - median, p95, maximum, IQR, and MAD distributions with material tail warnings
 - expected/unexpected warning classification for known noisy installs
 - top-package sweeps from a package-name file with offset/limit chunking
@@ -140,6 +142,20 @@ resolutions or repeat no-op installs over an already materialized
 
 Up-to-date mode runs one more install over the project materialized by the
 previous successful install, so it measures the no-op state check.
+
+When you use `--lpm-compare`, the harness runs each baseline and candidate
+mode as an adjacent pair. It alternates the pair order for each sample.
+Rows include the pair ID, pair order, sequence number, and start time.
+The comparison fails if a pair is not adjacent.
+
+The comparison uses separate wall-time and RSS limits. A regression must exceed
+the percentage limit and the matching absolute limit. This rule rejects small
+percentage changes in short or low-memory runs. The wall-time defaults are
+20 ms for the median and 50 ms for p95. The RSS defaults are 16 MiB for the
+median and 32 MiB for p95.
+
+Bun, pnpm, and npm runs are reference measurements. They do not adjust the lpm
+comparison for live-network changes. Use a local registry for merge gates.
 
 Build lpm first:
 
@@ -269,12 +285,15 @@ node bench/scripts/run-install-readiness.mjs \
   --modes cold,warm,up-to-date \
   --lpm-binary main=/tmp/lpm-main \
   --lpm-binary candidate=/tmp/lpm-candidate \
-  --lpm-compare main:candidate
+  --lpm-compare main:candidate \
+  --rss-median-regression-pct 5 \
+  --rss-median-regression-mb 16
 ```
 
-The default wall-time limits are 5% for the median and 10% for p95. Stage
-metrics identify the source of a change, but they do not control the verdict.
-Use `--allow-inconclusive` only when a caller records and reviews the result.
+The default wall-time limits are 5% and 20 ms for the median, and 10% and
+50 ms for p95. A regression must exceed both limits. Stage metrics identify
+the source of a change, but they do not control the verdict. Use
+`--allow-inconclusive` only when a caller records and reviews the result.
 
 Every install subprocess has a timeout, defaulting to 10 minutes. Override it
 with `--timeout-ms` for top-package sweeps that need a different failure bound.
