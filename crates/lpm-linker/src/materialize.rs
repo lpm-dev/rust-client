@@ -133,6 +133,19 @@ fn walk_directory_source(
 /// 2. Hardlink (same filesystem, zero disk cost, shared inode)
 /// 3. Copy (fallback for cross-device or permissions)
 pub(crate) fn link_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    materialize_dir_recursive(src, dst, true)
+}
+
+/// Recursively copy a directory without sharing writable file inodes.
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError> {
+    materialize_dir_recursive(src, dst, false)
+}
+
+fn materialize_dir_recursive(
+    src: &Path,
+    dst: &Path,
+    allow_hardlinks: bool,
+) -> Result<(), LpmError> {
     // On macOS, try clonefile first (copies entire directory tree as CoW in one syscall)
     #[cfg(target_os = "macos")]
     {
@@ -151,15 +164,16 @@ pub(crate) fn link_dir_recursive(src: &Path, dst: &Path) -> Result<(), LpmError>
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            link_dir_recursive(&src_path, &dst_path)?;
+            materialize_dir_recursive(&src_path, &dst_path, allow_hardlinks)?;
         } else if file_type.is_symlink() {
             return Err(LpmError::Store(format!(
                 "refusing to follow symlink while linking package store entry: {}",
                 src_path.display()
             )));
         } else if file_type.is_file() {
-            // Try hardlink first (instant, zero disk cost on same filesystem)
-            if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
+            if !allow_hardlinks {
+                std::fs::copy(&src_path, &dst_path)?;
+            } else if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
                 // Hardlink refusals fall into a few classes: cross-volume
                 // mounts, permissions, and Windows junctions inside the CAS
                 // store. Copy fallback is correct but can become a visible

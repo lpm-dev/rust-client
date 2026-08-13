@@ -448,6 +448,11 @@ pub struct SharedLockHandle {
     _data: fd_lock::RwLock<std::fs::File>,
 }
 
+/// RAII handle for a single-file shared advisory lock.
+pub struct SingleFileSharedLockHandle {
+    _data: fd_lock::RwLock<std::fs::File>,
+}
+
 /// RAII handle for a held exclusive (single-writer) lock. Holds the
 /// data lock exclusive, the writer-intent gate exclusive, and the
 /// writer-queue baton shared until drop. Field order matters: drop
@@ -460,6 +465,11 @@ pub struct ExclusiveLockHandle {
     _data: fd_lock::RwLock<std::fs::File>,
     _writer_intent: fd_lock::RwLock<std::fs::File>,
     _writer_queue: fd_lock::RwLock<std::fs::File>,
+}
+
+/// RAII handle for a single-file exclusive advisory lock.
+pub struct SingleFileExclusiveLockHandle {
+    _data: fd_lock::RwLock<std::fs::File>,
 }
 
 fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
@@ -790,6 +800,43 @@ pub fn acquire_exclusive_lock(
     lock_path: impl AsRef<Path>,
 ) -> Result<ExclusiveLockHandle, LpmError> {
     acquire_exclusive_with_hint(lock_path.as_ref(), default_wait_hint)
+}
+
+/// Acquire a shared advisory lock that retains one file descriptor.
+///
+/// Use this with [`acquire_single_file_exclusive_lock`] for high-cardinality,
+/// independent lock domains whose critical sections are bounded. Unlike the
+/// writer-preferred store-wide locks, this compact pair does not allocate
+/// separate queue and intent descriptors per key.
+pub fn acquire_single_file_shared_lock(
+    lock_path: impl AsRef<Path>,
+) -> Result<SingleFileSharedLockHandle, LpmError> {
+    let file = open_lock_file(lock_path.as_ref())?;
+    let mut data = fd_lock::RwLock::new(file);
+    poll_until_acquired(
+        &mut data,
+        LockMode::Shared,
+        Some(Box::new(default_wait_hint)),
+        None,
+    )?;
+    Ok(SingleFileSharedLockHandle { _data: data })
+}
+
+/// Acquire an exclusive advisory lock that retains one file descriptor.
+///
+/// This is the exclusive half of [`acquire_single_file_shared_lock`].
+pub fn acquire_single_file_exclusive_lock(
+    lock_path: impl AsRef<Path>,
+) -> Result<SingleFileExclusiveLockHandle, LpmError> {
+    let file = open_lock_file(lock_path.as_ref())?;
+    let mut data = fd_lock::RwLock::new(file);
+    poll_until_acquired(
+        &mut data,
+        LockMode::Exclusive,
+        Some(Box::new(default_wait_hint)),
+        None,
+    )?;
+    Ok(SingleFileExclusiveLockHandle { _data: data })
 }
 
 /// Try to acquire an exclusive advisory lock without waiting.

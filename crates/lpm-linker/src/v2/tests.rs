@@ -816,6 +816,102 @@ fn store_cached_compat_island_is_reused_across_node_modules_removal() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn store_cached_compat_island_recovers_when_completion_sentinel_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let sri = synthetic_sri(b"store_cached_compat_island_recovers_missing_sentinel");
+    write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"}}"#,
+            ),
+            ("cli.js", b"#!/usr/bin/env node\n"),
+        ],
+    );
+    let link = || {
+        link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![target("tool", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+    };
+    link().unwrap();
+    let island = std::fs::read_dir(store.paths().compat_root())
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.ok()?.path();
+            path.is_dir().then_some(path)
+        })
+        .unwrap();
+    std::fs::remove_file(island.join(COMPAT_ISLAND_COMPLETE_FILENAME)).unwrap();
+    std::fs::remove_dir_all(project.join("node_modules")).unwrap();
+
+    link().unwrap();
+
+    assert!(
+        island.join(COMPAT_ISLAND_COMPLETE_FILENAME).is_file(),
+        "an incomplete cached island must be rebuilt atomically"
+    );
+    assert!(project.join("node_modules/tool/cli.js").is_file());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn store_cached_compat_island_recovers_when_cached_package_content_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let sri = synthetic_sri(b"store_cached_compat_island_recovers_missing_package_content");
+    write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                br#"{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"}}"#,
+            ),
+            ("cli.js", b"#!/usr/bin/env node\n"),
+        ],
+    );
+    let link = || {
+        link_packages_v2_with_compatibility_bin_names(
+            &project,
+            vec![target("tool", "1.0.0", &sri, true)],
+            &store,
+            LinkerMode::Isolated,
+            None,
+            &["tool".to_string()],
+        )
+    };
+    link().unwrap();
+    let island = std::fs::read_dir(store.paths().compat_root())
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.ok()?.path();
+            path.is_dir().then_some(path)
+        })
+        .unwrap();
+    let cached_cli = find_file_named(&island, "cli.js").expect("cached cli.js");
+    std::fs::remove_file(cached_cli).unwrap();
+    std::fs::remove_dir_all(project.join("node_modules")).unwrap();
+
+    link().unwrap();
+
+    assert!(
+        project.join("node_modules/tool/cli.js").is_file(),
+        "a cached island with missing package content must be rebuilt"
+    );
+}
+
 /// Recursively find the first symlink whose file name matches `name`.
 #[cfg(target_os = "macos")]
 fn find_symlink_named(root: &Path, name: &str) -> Option<PathBuf> {
@@ -829,6 +925,24 @@ fn find_symlink_named(root: &Path, name: &str) -> Option<PathBuf> {
             }
         } else if ft.is_dir()
             && let Some(found) = find_symlink_named(&path, name)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = entry.file_type().ok()?;
+        if file_type.is_file() && entry.file_name().to_str() == Some(name) {
+            return Some(path);
+        }
+        if file_type.is_dir()
+            && let Some(found) = find_file_named(&path, name)
         {
             return Some(found);
         }
@@ -1438,6 +1552,181 @@ fn link_packages_v2_wipes_legacy_v1_wrappers() {
     assert!(
         !project.join(".lpm").join("wrappers").exists(),
         "virtual-store linker must wipe legacy v1 wrapper tree"
+    );
+}
+
+#[test]
+fn link_packages_v2_empty_graph_removes_stale_project_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+
+    let sri = synthetic_sri(b"link_packages_v2/empty-graph-reconcile");
+    write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"stale-tool\",\"version\":\"1.0.0\",\"bin\":{\"stale-tool\":\"cli.js\"}}",
+            ),
+            ("cli.js", b"#!/usr/bin/env node\n"),
+        ],
+    );
+    link_packages_v2(
+        &project,
+        vec![target("stale-tool", "1.0.0", &sri, true)],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+    assert!(project.join("node_modules").join("stale-tool").exists());
+    assert!(bin_shim_path(&project, "stale-tool").exists());
+
+    link_packages_v2(&project, Vec::new(), &store, LinkerMode::Isolated, None).unwrap();
+
+    assert!(
+        !project.join("node_modules").join("stale-tool").exists(),
+        "an empty desired graph must remove the last stale root link"
+    );
+    assert!(
+        !bin_shim_path(&project, "stale-tool").exists(),
+        "an empty desired graph must remove stale package bin shims"
+    );
+}
+
+#[test]
+fn link_packages_v2_removes_compatibility_island_when_no_bins_request_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+
+    let sri = synthetic_sri(b"link_packages_v2/remove-unrequested-compatibility-island");
+    write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"tool\",\"version\":\"1.0.0\",\"bin\":{\"tool\":\"cli.js\"}}",
+            ),
+            ("cli.js", b"#!/usr/bin/env node\n"),
+        ],
+    );
+    link_packages_v2_with_compatibility_bin_names(
+        &project,
+        vec![target("tool", "1.0.0", &sri, true)],
+        &store,
+        LinkerMode::Isolated,
+        None,
+        &["tool".to_string()],
+    )
+    .unwrap();
+    let compatibility_root = project.join("node_modules").join(".lpm").join("compat");
+    assert!(compatibility_root.is_dir());
+
+    link_packages_v2(
+        &project,
+        vec![target("tool", "1.0.0", &sri, true)],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        !compatibility_root.exists(),
+        "an install with no requested compatibility bins must remove the stale island"
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn compatibility_island_files_do_not_share_writable_store_inodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let sri = synthetic_sri(b"compatibility_island_files_do_not_share_store_inodes");
+    write_object(
+        &store,
+        &sri,
+        &[
+            (
+                "package.json",
+                b"{\"name\":\"tool\",\"version\":\"1.0.0\",\"bin\":{\"tool\":\"cli.js\"}}",
+            ),
+            ("cli.js", b"original bytes"),
+        ],
+    );
+    let target = target("tool", "1.0.0", &sri, true);
+    let plan = link_v2_prepare_with_compatibility_bin_names(
+        &project,
+        vec![target.clone()],
+        &store,
+        LinkerMode::Isolated,
+        &["tool".to_string()],
+    )
+    .unwrap();
+    let (materialized, _) = link_v2_one(&plan, &target, &store).unwrap();
+    link_v2_finalize(&project, &plan, &store, None).unwrap();
+    let store_file = materialized.destination.join("cli.js");
+    let project_file = project.join("node_modules").join("tool").join("cli.js");
+
+    std::fs::write(&project_file, b"project mutation").unwrap();
+
+    assert_eq!(
+        std::fs::read(&store_file).unwrap(),
+        b"original bytes",
+        "project-local compatibility writes must not mutate the shared link entry"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let store_metadata = std::fs::metadata(&store_file).unwrap();
+        let project_metadata = std::fs::metadata(&project_file).unwrap();
+        assert_ne!(
+            (store_metadata.dev(), store_metadata.ino()),
+            (project_metadata.dev(), project_metadata.ino()),
+            "compatibility files must not be hardlinks to shared link-entry files"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn link_packages_v2_refuses_legacy_cleanup_through_symlinked_lpm_dir() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let outside_lpm = tmp.path().join("outside-lpm");
+    let outside_wrappers = outside_lpm.join("wrappers");
+    std::fs::create_dir_all(&outside_wrappers).unwrap();
+    std::fs::write(outside_wrappers.join("keep"), b"outside project").unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    symlink(&outside_lpm, project.join(".lpm")).unwrap();
+
+    let sri = synthetic_sri(b"link_packages_v2/symlinked-legacy-state");
+    write_object(
+        &store,
+        &sri,
+        &[("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}")],
+    );
+
+    let error = link_packages_v2(
+        &project,
+        vec![target("x", "1.0.0", &sri, true)],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        outside_wrappers.join("keep").is_file(),
+        "legacy cleanup must not delete through a symlinked project .lpm directory; error: {error}"
     );
 }
 

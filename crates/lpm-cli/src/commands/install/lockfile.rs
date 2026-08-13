@@ -530,6 +530,8 @@ fn fast_path_lockfile_rewrite_notice(reasons: FastPathLockfileRewriteReasons) ->
 
 pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) project_dir: &'a Path,
+    pub(super) lpm_root: &'a lpm_common::LpmRoot,
+    pub(super) store_version: lpm_store::StoreVersion,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) cleanup_catalogs_in_pipeline: bool,
     pub(super) json_output: bool,
@@ -554,6 +556,8 @@ pub(super) async fn run_empty_dependency_install_phase(
 ) -> Result<(), LpmError> {
     let EmptyDependencyInstallInput {
         project_dir,
+        lpm_root,
+        store_version,
         policy_extension_configs,
         cleanup_catalogs_in_pipeline,
         json_output,
@@ -578,6 +582,25 @@ pub(super) async fn run_empty_dependency_install_phase(
     }
     let policy_extension_stats =
         run_policy_extensions(policy_extension_configs, project_dir, &[], json_output).await?;
+    let link_start = Instant::now();
+    if store_version.uses_virtual_store() {
+        let store = lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
+            lpm_root,
+            store_version,
+            object_integrity_policy,
+        );
+        lpm_linker::v2::link_packages_v2(project_dir, Vec::new(), &store, linker_mode, None)?;
+    } else {
+        match linker_mode {
+            lpm_linker::LinkerMode::Isolated => {
+                lpm_linker::link_packages(project_dir, &[], false, None)?;
+            }
+            lpm_linker::LinkerMode::Hoisted => {
+                lpm_linker::link_packages_hoisted(project_dir, &[], false, None)?;
+            }
+        }
+    }
+    let link_ms = link_start.elapsed().as_millis();
     let elapsed = start.elapsed();
     let total_ms = elapsed.as_millis();
     if emit_install_report && json_output {
@@ -590,7 +613,7 @@ pub(super) async fn run_empty_dependency_install_phase(
             "timing": {
                 "resolve_ms": 0u128,
                 "fetch_ms": 0u128,
-                "link_ms": 0u128,
+                "link_ms": link_ms,
                 "total_ms": total_ms,
                 "waterfall": {
                     "setup_ms": total_ms,
@@ -601,9 +624,9 @@ pub(super) async fn run_empty_dependency_install_phase(
                     "pre_fetch_ms": 0u128,
                     "fetch_ms": 0u128,
                     "pre_link_ms": 0u128,
-                    "link_ms": 0u128,
+                    "link_ms": link_ms,
                     "link_await_ms": 0u128,
-                    "link_finalize_ms": 0u128,
+                    "link_finalize_ms": link_ms,
                     "tail_ms": 0u128,
                     "total_ms": total_ms,
                 },

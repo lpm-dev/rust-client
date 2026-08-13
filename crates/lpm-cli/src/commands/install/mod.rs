@@ -792,6 +792,8 @@ async fn run_with_options_under_store_lock(
         }
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
+            lpm_root,
+            store_version,
             policy_extension_configs: &policy_extension_configs,
             cleanup_catalogs_in_pipeline,
             json_output,

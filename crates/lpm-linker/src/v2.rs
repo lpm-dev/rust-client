@@ -238,17 +238,6 @@ pub fn link_packages_v2_with_compatibility_bin_names(
     self_package_name: Option<&str>,
     compatibility_bin_names: &[String],
 ) -> Result<LinkResult, LpmError> {
-    if targets.is_empty() {
-        return Ok(LinkResult {
-            linked: 0,
-            symlinked: 0,
-            bin_linked: 0,
-            skipped: 0,
-            self_referenced: false,
-            materialized: Vec::new(),
-        });
-    }
-
     let plan = link_v2_prepare_with_compatibility_bin_names(
         project_dir,
         targets,
@@ -261,11 +250,9 @@ pub fn link_packages_v2_with_compatibility_bin_names(
     // Materialize link entries in parallel for installs above the
     // threshold.
     //
-    // **Atomicity invariant.** `populate_link_entry` already serializes
-    // concurrent writers via atomic-rename — two threads racing on the
-    // same graph_key both write into a tmp sibling and one's `rename`
-    // wins; the loser observes the completed final dir on its second
-    // probe and short-circuits. No external lock needed.
+    // **Atomicity invariant.** `populate_link_entry` serializes writers
+    // for each graph key, stages into a private sibling, and publishes
+    // the complete entry with an atomic rename.
     //
     // **Threshold.** Rayon's global thread pool spin-up cost is
     // measurable (~3-5 ms first call); for small installs the
@@ -332,17 +319,6 @@ pub fn finalize_existing_link_entries_with_compatibility_bin_names(
     self_package_name: Option<&str>,
     compatibility_bin_names: &[String],
 ) -> Result<LinkResult, LpmError> {
-    if targets.is_empty() {
-        return Ok(LinkResult {
-            linked: 0,
-            symlinked: 0,
-            bin_linked: 0,
-            skipped: 0,
-            self_referenced: false,
-            materialized: Vec::new(),
-        });
-    }
-
     let plan = link_v2_prepare_with_compatibility_bin_names(
         project_dir,
         targets,

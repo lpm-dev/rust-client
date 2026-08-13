@@ -1087,6 +1087,100 @@ fn populate_is_idempotent_and_touches_last_referenced_at() {
 }
 
 #[test]
+fn populate_link_entry_waits_for_graph_entry_mutation_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"populate_link_entry_waits_for_graph_entry_mutation_lock");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[(
+            "package.json",
+            b"{\"name\":\"locked\",\"version\":\"1.0.0\"}",
+        )],
+    );
+    let key = arc_key("locked", "1.0.0");
+    let request = LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri,
+        object_dir,
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+    let held_lock = store.acquire_build_entry_lock(&key.digest_hex()).unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        finished_tx
+            .send(store.populate_link_entry(request))
+            .unwrap();
+    });
+
+    assert!(matches!(
+        finished_rx.recv_timeout(std::time::Duration::from_millis(150)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(held_lock);
+    finished_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn reusable_link_entry_waits_for_graph_entry_mutation_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"reusable_link_entry_waits_for_graph_entry_mutation_lock");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[(
+            "package.json",
+            b"{\"name\":\"locked-reuse\",\"version\":\"1.0.0\"}",
+        )],
+    );
+    let key = arc_key("locked-reuse", "1.0.0");
+    store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: object_dir.clone(),
+            deps: vec![],
+            platform: Arc::new(sample_meta_platform()),
+        })
+        .unwrap();
+    let request = LinkEntryRequest {
+        graph_key: Arc::clone(&key),
+        source_sri: sri,
+        object_dir,
+        deps: vec![],
+        platform: Arc::new(sample_meta_platform()),
+    };
+    let held_lock = store.acquire_build_entry_lock(&key.digest_hex()).unwrap();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        finished_tx
+            .send(store.populate_link_entry(request))
+            .unwrap();
+    });
+
+    assert!(matches!(
+        finished_rx.recv_timeout(std::time::Duration::from_millis(150)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(held_lock);
+    let reused = finished_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap();
+    assert!(!reused.freshly_populated);
+    worker.join().unwrap();
+}
+
+#[test]
 fn populate_link_entry_copies_bytes_without_sharing_object_inode() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
@@ -3099,6 +3193,44 @@ fn reusable_object_source_policy_trusts_source_integrity_sidecar() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn reusable_object_rejects_symlinked_object_directory_without_touching_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_object_integrity_policy(
+        dir.path().join("store"),
+        ObjectIntegrityPolicy::Source,
+    );
+    let sri = synthetic_sri(b"reusable_object_rejects_symlinked_object_directory");
+    let outside = dir.path().join("outside-object");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        outside.join("package.json"),
+        b"{\"name\":\"outside\",\"version\":\"1.0.0\"}",
+    )
+    .unwrap();
+    std::fs::write(outside.join("payload.js"), b"outside bytes").unwrap();
+    std::fs::write(outside.join(".integrity"), &sri).unwrap();
+    write_source_object_integrity(&outside, &sri).unwrap();
+
+    let object_dir = store.paths().object_dir(&sri).unwrap();
+    std::fs::create_dir_all(object_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &object_dir).unwrap();
+
+    let reusable = store.reusable_object(&sri).unwrap();
+
+    assert!(reusable.is_none());
+    assert!(
+        object_dir.symlink_metadata().is_err(),
+        "the unusable store entry symlink should be removed"
+    );
+    assert_eq!(
+        std::fs::read(outside.join("payload.js")).unwrap(),
+        b"outside bytes",
+        "rejecting a store entry must not remove or alter its symlink target"
+    );
+}
+
 #[test]
 fn reusable_object_source_policy_migrates_legacy_tree_integrity_sidecar() {
     let dir = tempfile::tempdir().unwrap();
@@ -4257,6 +4389,67 @@ fn ensure_store_tier_dir_locked_tightens_existing_world_readable_dir() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn ensure_store_tier_dir_locked_rejects_symlink_without_chmodding_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().unwrap();
+    let outside = parent.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = parent.path().join("objects");
+    std::os::unix::fs::symlink(&outside, &target).unwrap();
+
+    let error = ensure_store_tier_dir_locked(&target).unwrap_err();
+
+    assert_eq!(
+        std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "refusing a symlinked store tier must not chmod its target; error: {error}"
+    );
+}
+
+#[test]
+fn compat_island_metadata_integrity_rejects_parent_traversal_outside_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path().join("store"));
+    let compat_root = store.paths().compat_root();
+    std::fs::create_dir_all(compat_root.join("staging")).unwrap();
+    let outside = store.paths().root().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("payload"), b"outside bytes").unwrap();
+    let escaping_path = compat_root.join("staging/../../outside");
+
+    assert!(
+        store
+            .compat_island_entry_metadata_integrity(&escaping_path)
+            .is_err(),
+        "a lexical compat-root prefix must not authorize parent traversal outside the cache"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn compat_island_metadata_integrity_rejects_symlink_escape_outside_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path().join("store"));
+    let compat_root = store.paths().compat_root();
+    std::fs::create_dir_all(compat_root).unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("payload"), b"outside bytes").unwrap();
+    let escaping_path = compat_root.join("entry");
+    std::os::unix::fs::symlink(&outside, &escaping_path).unwrap();
+
+    assert!(
+        store
+            .compat_island_entry_metadata_integrity(&escaping_path)
+            .is_err(),
+        "a symlinked cache entry must not authorize metadata reads outside the cache"
+    );
+}
+
 /// A stray symlink in a v1 store entry must NOT propagate
 /// into the v2 object dir via the v1→v2 migration copy. A
 /// regression or local-attacker plant would otherwise reproduce
@@ -4522,6 +4715,22 @@ fn concurrent_local_source_populates_never_break_tree_validation() {
             });
         }
     });
+}
+
+#[test]
+fn local_source_lock_registry_has_bounded_memory() {
+    const EXPECTED_LOCK_SHARDS: usize = 256;
+    let dir = tempfile::tempdir().unwrap();
+    let locks: Vec<_> = (0..=EXPECTED_LOCK_SHARDS)
+        .map(|index| local_source_populate_lock(&dir.path().join(index.to_string())))
+        .collect();
+    let distinct_locks: std::collections::HashSet<_> =
+        locks.iter().map(|lock| std::ptr::from_ref(*lock)).collect();
+
+    assert!(
+        distinct_locks.len() <= EXPECTED_LOCK_SHARDS,
+        "the local-source lock registry must not grow with every distinct source path",
+    );
 }
 
 #[cfg(target_os = "macos")]

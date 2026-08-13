@@ -1156,11 +1156,7 @@ async fn run_under_store_lock(
         let virtual_store =
             lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, package_store_version);
         let _build_entry_lock = if let Some(graph_key_digest) = pkg.graph_key_digest.as_deref() {
-            match virtual_store
-                .paths()
-                .build_entry_lock_path(graph_key_digest)
-                .and_then(lpm_common::acquire_exclusive_lock)
-            {
+            match virtual_store.acquire_build_entry_lock(graph_key_digest) {
                 Ok(lock) => Some(lock),
                 Err(error) => {
                     if !json_output {
