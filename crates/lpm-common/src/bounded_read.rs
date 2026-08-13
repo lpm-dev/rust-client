@@ -76,7 +76,7 @@ fn read_file_capped_with_metadata(
     path: &Path,
     limit: u64,
 ) -> Result<(Vec<u8>, Metadata), BoundedReadError> {
-    let mut file = match File::open(path) {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             return Err(BoundedReadError::NotFound {
@@ -91,6 +91,18 @@ fn read_file_capped_with_metadata(
         }
     };
 
+    read_file_capped_from_open_file(file, path, limit)
+}
+
+/// Read at most `limit + 1` bytes from an already-open file.
+///
+/// Use this when path-opening policy is security-sensitive. The returned
+/// metadata and bytes always come from the supplied descriptor.
+pub fn read_file_capped_from_open_file(
+    mut file: File,
+    path: &Path,
+    limit: u64,
+) -> Result<(Vec<u8>, Metadata), BoundedReadError> {
     let metadata = file.metadata().map_err(|source| BoundedReadError::Io {
         path: path.to_path_buf(),
         source,
@@ -104,6 +116,21 @@ fn read_file_capped_with_metadata(
 
     let bytes = read_opened_file_capped(&mut file, path, limit)?;
     Ok((bytes, metadata))
+}
+
+/// Read bounded UTF-8 text from an already-open file.
+pub fn read_text_file_capped_from_open_file(
+    file: File,
+    path: &Path,
+    limit: u64,
+) -> Result<(String, Metadata), BoundedReadError> {
+    let (bytes, metadata) = read_file_capped_from_open_file(file, path, limit)?;
+    String::from_utf8(bytes)
+        .map_err(|source| BoundedReadError::InvalidUtf8 {
+            path: path.to_path_buf(),
+            source: source.utf8_error(),
+        })
+        .map(|content| (content, metadata))
 }
 
 /// Read a bounded local file and validate it as UTF-8 text.

@@ -40,14 +40,18 @@ pub enum EnvDefinition {
     /// Simple: just a file path (e.g., `"base": ".env"`)
     File(String),
     /// Structured: with optional extends and file
-    Structured {
-        /// Parent environment to inherit from.
-        #[serde(default)]
-        extends: Option<String>,
-        /// The .env file for this environment (optional — may inherit everything).
-        #[serde(default)]
-        file: Option<String>,
-    },
+    Structured(StructuredEnvDefinition),
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct StructuredEnvDefinition {
+    /// Parent environment to inherit from.
+    #[serde(default)]
+    extends: Option<String>,
+    /// The .env file for this environment (optional — may inherit everything).
+    #[serde(default)]
+    file: Option<String>,
 }
 
 impl EnvDefinition {
@@ -55,7 +59,7 @@ impl EnvDefinition {
     pub fn file(&self) -> Option<&str> {
         match self {
             EnvDefinition::File(f) => Some(f.as_str()),
-            EnvDefinition::Structured { file, .. } => file.as_deref(),
+            EnvDefinition::Structured(definition) => definition.file.as_deref(),
         }
     }
 
@@ -63,7 +67,7 @@ impl EnvDefinition {
     pub fn extends(&self) -> Option<&str> {
         match self {
             EnvDefinition::File(_) => None,
-            EnvDefinition::Structured { extends, .. } => extends.as_deref(),
+            EnvDefinition::Structured(definition) => definition.extends.as_deref(),
         }
     }
 }
@@ -310,10 +314,6 @@ mod tests {
         assert_eq!(names, vec!["base", "production", "staging"]);
     }
 
-    /// M51: env file paths that escape the project root are refused
-    /// at chain resolution time. Closes the malicious-lpm.json shape
-    /// where a `"file": "../.env"` would let `lpm run --env` /
-    /// `lpm env print` read a dotenv outside the repo.
     #[test]
     fn rejects_parent_dir_escape_in_env_file_path() {
         let config = config_from_json(r#"{"prod": {"file": "../.env"}}"#);

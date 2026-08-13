@@ -12,6 +12,7 @@ use std::collections::HashMap;
 /// { "env": { "schema": { "DATABASE_URL": { "required": true, "format": "url" } } } }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct EnvSchema {
     #[serde(default)]
     pub vars: HashMap<String, EnvVarRule>,
@@ -19,6 +20,7 @@ pub struct EnvSchema {
 
 /// Validation rules for a single environment variable.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct EnvVarRule {
     /// Whether the variable must be set and non-empty.
     #[serde(default)]

@@ -829,6 +829,12 @@ pub fn acquire_single_file_exclusive_lock(
     lock_path: impl AsRef<Path>,
 ) -> Result<SingleFileExclusiveLockHandle, LpmError> {
     let file = open_lock_file(lock_path.as_ref())?;
+    acquire_single_file_exclusive_lock_from_file(file)
+}
+
+pub(crate) fn acquire_single_file_exclusive_lock_from_file(
+    file: std::fs::File,
+) -> Result<SingleFileExclusiveLockHandle, LpmError> {
     let mut data = fd_lock::RwLock::new(file);
     poll_until_acquired(
         &mut data,

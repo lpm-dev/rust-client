@@ -43,7 +43,15 @@ fn doctor_accepts_every_supported_top_level_lpm_json_field() {
             "publish": {},
             "envSchema": {},
             "environments": {},
-            "cert": {}
+            "cert": {},
+            "$schema": "https://cli.lpm.dev/schemas/lpm.json",
+            "vault": "vault-123",
+            "vaultSync": {
+                "personalVersion": 7,
+                "personalSyncedAt": "2026-08-13T09:00:00Z",
+                "orgVersions": {"acme": 4},
+                "orgSyncedAt": {"acme": "2026-08-13T09:01:00Z"}
+            }
         }"#,
     );
 
@@ -62,7 +70,7 @@ fn doctor_accepts_every_supported_top_level_lpm_json_field() {
 #[test]
 fn doctor_continues_to_warn_for_unknown_top_level_lpm_json_fields() {
     let project = TempProject::empty(r#"{"name":"doctor-config","version":"1.0.0"}"#);
-    project.write_file("lpm.json", r#"{"vault": {}}"#);
+    project.write_file("lpm.json", r#"{"notAnLpmField": {}}"#);
 
     let config_check = doctor_lpm_json_check(&project);
 
@@ -75,7 +83,7 @@ fn doctor_continues_to_warn_for_unknown_top_level_lpm_json_fields() {
         (
             Some("lpm_json_schema_warnings"),
             Some("warn"),
-            Some("unknown field \"vault\"")
+            Some("unknown field \"notAnLpmField\"")
         ),
         "doctor must preserve its warning contract for unknown fields: {config_check}"
     );

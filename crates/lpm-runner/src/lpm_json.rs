@@ -13,11 +13,27 @@ use lpm_env::{EnvSchema, EnvironmentsConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
+
+const LPM_JSON_SCHEMA_URL: &str = "https://cli.lpm.dev/schemas/lpm.json";
 
 /// Configuration from `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct LpmJsonConfig {
+    /// Optional JSON Schema URI used by editors.
+    #[serde(default, rename = "$schema")]
+    #[schemars(extend("format" = "uri"))]
+    pub schema: Option<String>,
+
+    /// Stable project identifier for encrypted environment storage.
+    #[serde(default)]
+    pub vault: Option<String>,
+
+    /// Project-local cloud sync metadata maintained by `lpm env`.
+    #[serde(default, rename = "vaultSync")]
+    pub vault_sync: Option<VaultSyncConfig>,
+
     /// Pinned runtime versions.
     /// e.g., `{"node": ">=22.0.0", "deno": ">=2.0.0"}`
     #[serde(default)]
@@ -85,9 +101,28 @@ pub struct LpmJsonConfig {
     pub cert: Option<CertBlock>,
 }
 
+/// Cloud sync metadata maintained by `lpm env`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
+pub struct VaultSyncConfig {
+    #[serde(default)]
+    pub personal_version: Option<i32>,
+
+    #[serde(default)]
+    pub personal_synced_at: Option<String>,
+
+    #[serde(default)]
+    pub org_versions: HashMap<String, i32>,
+
+    #[serde(default)]
+    pub org_synced_at: HashMap<String, String>,
+}
+
 /// Hosted cache configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct RemoteCacheConfig {
     /// Enable hosted task cache reads and writes for cache-enabled tasks.
     #[serde(default)]
@@ -117,6 +152,7 @@ pub struct RemoteCacheConfig {
 /// Env safety controls for hosted task cache uploads.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct RemoteCacheEnvConfig {
     /// Variable-name patterns explicitly allowed for remote uploads.
     #[serde(default)]
@@ -134,6 +170,7 @@ pub struct RemoteCacheEnvConfig {
 /// `cert` configuration block in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct CertBlock {
     /// Additional DNS subtrees the project-scoped intermediate may permit.
     /// Each entry must be a bare multi-label hostname. Wildcards, leading dots,
@@ -150,6 +187,7 @@ pub struct CertBlock {
 
 /// Tunnel configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct TunnelConfig {
     /// Full tunnel domain (e.g., "acme-api.lpm.llc").
     /// Pro/Org only — free users get ephemeral random domains.
@@ -160,6 +198,7 @@ pub struct TunnelConfig {
 /// Dev reverse-proxy configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Top-level host routed by the local dev proxy.
     #[serde(default)]
@@ -178,11 +217,12 @@ pub struct ProxyConfig {
 ///
 /// Controls which registries `lpm publish` targets and per-registry settings.
 /// CLI flags (`--npm`, `--lpm`) override these values.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct PublishConfig {
     /// Target registries. e.g., `["lpm", "npm"]`.
     /// If absent, defaults to `["lpm"]` (backward compatible).
-    #[serde(default)]
+    #[serde(default = "default_publish_registries")]
     pub registries: Vec<String>,
 
     /// LPM registry publish settings.
@@ -202,8 +242,25 @@ pub struct PublishConfig {
     pub gitlab: Option<GitlabPublishConfig>,
 }
 
+fn default_publish_registries() -> Vec<String> {
+    vec!["lpm".to_string()]
+}
+
+impl Default for PublishConfig {
+    fn default() -> Self {
+        Self {
+            registries: default_publish_registries(),
+            lpm: None,
+            npm: None,
+            github: None,
+            gitlab: None,
+        }
+    }
+}
+
 /// LPM registry publish configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct LpmPublishConfig {
     /// Override package name for LPM (must be `@lpm.dev/owner.pkg` format).
     #[serde(default)]
@@ -213,6 +270,7 @@ pub struct LpmPublishConfig {
 /// npm-specific publish configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct NpmPublishConfig {
     /// Override package name for npm (e.g., `"@scope/pkg"`).
     /// Required if the package.json name starts with `@lpm.dev/`.
@@ -240,6 +298,7 @@ pub struct NpmPublishConfig {
 /// GitHub Packages publish configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct GithubPublishConfig {
     /// Override package name for GitHub Packages (must be scoped: `@owner/pkg`).
     #[serde(default)]
@@ -253,6 +312,7 @@ pub struct GithubPublishConfig {
 /// GitLab Packages publish configuration in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
 pub struct GitlabPublishConfig {
     /// Override package name for GitLab Packages.
     #[serde(default)]
@@ -272,6 +332,7 @@ pub struct GitlabPublishConfig {
 
 /// Configuration for a dev service in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ServiceConfig {
     /// Shell command to run.
     pub command: String,
@@ -331,6 +392,7 @@ impl ServiceConfig {
 
 /// Configuration for a single task in `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct TaskConfig {
     /// Command to run (overrides package.json scripts).
     #[serde(default)]
@@ -422,7 +484,7 @@ pub fn generate_schema() -> serde_json::Value {
     let obj = schema.as_object_mut().expect("schema root is an object");
     obj.insert(
         "$id".to_string(),
-        serde_json::Value::String("https://cli.lpm.dev/schemas/lpm.json".to_string()),
+        serde_json::Value::String(LPM_JSON_SCHEMA_URL.to_string()),
     );
     obj.insert(
         "title".to_string(),
@@ -434,39 +496,145 @@ pub fn generate_schema() -> serde_json::Value {
             "Project-level LPM configuration. Sits alongside package.json and \
              provides runtime pinning, env file mapping, task runner config, \
              hosted task cache settings, dev services, local-domain proxy \
-             settings, publish targets, and tunnel/HTTPS settings."
+             settings, env vault metadata, publish targets, and tunnel/HTTPS settings."
                 .to_string(),
         ),
     );
     serde_json::to_value(&schema).expect("schema serializes to JSON")
 }
 
-/// Returns whether `field` is a top-level property in the canonical
-/// generated schema for `lpm.json`.
-pub fn is_supported_top_level_field(field: &str) -> bool {
-    static FIELDS: OnceLock<Box<[String]>> = OnceLock::new();
+/// Return unknown object fields using the same generated contract served to editors.
+/// Parsing remains forward-compatible; callers such as Doctor can surface these as warnings.
+pub fn unknown_field_paths(document: &serde_json::Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_unknown_field_paths(
+        document,
+        &UNKNOWN_FIELD_SCHEMA,
+        &UNKNOWN_FIELD_SCHEMA,
+        "",
+        &mut paths,
+    );
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
 
-    let fields = FIELDS.get_or_init(|| {
-        let schema = derived_schema();
+fn collect_unknown_field_paths(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    root_schema: &serde_json::Value,
+    path: &str,
+    paths: &mut Vec<String>,
+) {
+    let schema = resolve_schema(schema, root_schema);
+    let schema = select_shape_schema(value, schema, root_schema);
+
+    if let Some(object) = value.as_object() {
         let properties = schema
-            .as_object()
-            .and_then(|root| root.get("properties"))
-            .and_then(serde_json::Value::as_object)
-            .expect("lpm.json schema root has properties");
-        let mut fields = Vec::with_capacity(properties.len());
-        fields.extend(properties.keys().cloned());
-        fields.sort_unstable();
-        fields.into_boxed_slice()
-    });
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let additional = schema.get("additionalProperties");
+        for (key, nested_value) in object {
+            let nested_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            if let Some(nested_schema) = properties.and_then(|known| known.get(key)) {
+                collect_unknown_field_paths(
+                    nested_value,
+                    nested_schema,
+                    root_schema,
+                    &nested_path,
+                    paths,
+                );
+            } else if additional == Some(&serde_json::Value::Bool(false)) {
+                paths.push(nested_path);
+            } else if let Some(nested_schema) = additional.filter(|value| value.is_object()) {
+                collect_unknown_field_paths(
+                    nested_value,
+                    nested_schema,
+                    root_schema,
+                    &nested_path,
+                    paths,
+                );
+            }
+        }
+    } else if let Some(array) = value.as_array()
+        && let Some(item_schema) = schema.get("items")
+    {
+        for (index, nested_value) in array.iter().enumerate() {
+            let nested_path = format!("{path}[{index}]");
+            collect_unknown_field_paths(
+                nested_value,
+                item_schema,
+                root_schema,
+                &nested_path,
+                paths,
+            );
+        }
+    }
+}
 
-    fields
-        .binary_search_by(|known| known.as_str().cmp(field))
-        .is_ok()
+fn resolve_schema<'a>(
+    schema: &'a serde_json::Value,
+    root_schema: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str) else {
+        return schema;
+    };
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return schema;
+    };
+    root_schema.pointer(pointer).unwrap_or(schema)
+}
+
+fn select_shape_schema<'a>(
+    value: &serde_json::Value,
+    schema: &'a serde_json::Value,
+    root_schema: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    for variants_key in ["anyOf", "oneOf"] {
+        if let Some(variants) = schema
+            .get(variants_key)
+            .and_then(serde_json::Value::as_array)
+            && let Some(selected) = variants.iter().find(|candidate| {
+                schema_accepts_value_shape(value, resolve_schema(candidate, root_schema))
+            })
+        {
+            return resolve_schema(selected, root_schema);
+        }
+    }
+    schema
+}
+
+fn schema_accepts_value_shape(value: &serde_json::Value, schema: &serde_json::Value) -> bool {
+    let accepts = |kind: &str| match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => false,
+    };
+    match schema.get("type") {
+        Some(serde_json::Value::String(kind)) => accepts(kind),
+        Some(serde_json::Value::Array(kinds)) => kinds
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(accepts),
+        _ => schema.get("properties").is_some() && value.is_object(),
+    }
 }
 
 fn derived_schema() -> schemars::Schema {
     schemars::schema_for!(LpmJsonConfig)
 }
+
+static UNKNOWN_FIELD_SCHEMA: LazyLock<serde_json::Value> =
+    LazyLock::new(|| serde_json::to_value(derived_schema()).expect("schema serializes to JSON"));
 
 /// Read `lpm.json` from a project directory.
 ///
@@ -492,6 +660,14 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
                 format!("failed to read lpm.json: {error}")
             }
         })?;
+
+    if let Some(vault_id) = config.vault.as_deref()
+        && !lpm_vault::vault_id::is_safe_vault_id(vault_id)
+    {
+        return Err(format!(
+            "invalid lpm.json data: vault id {vault_id:?} contains path-traversal or non-portable characters"
+        ));
+    }
 
     validated_cert_extra_permitted_dns(&config)?;
 
@@ -612,24 +788,40 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn supported_top_level_field_lookup_accepts_serde_names() {
-        assert_eq!(
-            (
-                is_supported_top_level_field("remoteCache"),
-                is_supported_top_level_field("envSchema")
-            ),
-            (true, true)
-        );
+    fn generated_schema_contains_documented_env_metadata_fields() {
+        let schema = generate_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("lpm.json schema must have root properties");
+
+        assert!(properties["$schema"]["type"].is_array());
+        assert_eq!(properties["$schema"]["format"], "uri");
+        assert!(properties["vault"]["type"].is_array());
+        assert!(properties["vaultSync"]["anyOf"].is_array());
     }
 
     #[test]
-    fn supported_top_level_field_lookup_rejects_rust_member_names() {
+    fn generated_schema_publish_default_matches_effective_default() {
+        let schema = generate_schema();
+
         assert_eq!(
-            (
-                is_supported_top_level_field("remote_cache"),
-                is_supported_top_level_field("env_schema")
-            ),
-            (false, false)
+            schema["$defs"]["PublishConfig"]["properties"]["registries"]["default"],
+            serde_json::json!(["lpm"])
+        );
+        assert_eq!(PublishConfig::default().registries, vec!["lpm"]);
+    }
+
+    #[test]
+    fn unknown_field_paths_reports_nested_typos_consistently_across_calls() {
+        let document = serde_json::json!({"proxy": {"httpRediect": true}});
+
+        assert_eq!(
+            unknown_field_paths(&document),
+            vec!["proxy.httpRediect".to_string()]
+        );
+        assert_eq!(
+            unknown_field_paths(&document),
+            vec!["proxy.httpRediect".to_string()]
         );
     }
 
@@ -648,6 +840,17 @@ mod tests {
         let config = read_lpm_json(dir.path()).unwrap().unwrap();
         assert!(config.runtime.is_empty());
         assert!(config.env.is_empty());
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_unsafe_vault_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.json"), r#"{"vault":"../escape"}"#).unwrap();
+
+        let error = read_lpm_json(dir.path()).expect_err("unsafe vault id must be rejected");
+
+        assert!(error.contains("vault id"), "{error}");
+        assert!(error.contains("path-traversal"), "{error}");
     }
 
     #[test]
@@ -746,19 +949,8 @@ mod tests {
     #[test]
     fn resolve_env_mode_found() {
         let config = LpmJsonConfig {
-            runtime: HashMap::new(),
             env: [("dev".into(), ".env.development".into())].into(),
-            tasks: HashMap::new(),
-            tools: HashMap::new(),
-            services: HashMap::new(),
-            proxy: None,
-            remote_cache: None,
-            https: None,
-            tunnel: None,
-            publish: None,
-            env_schema: None,
-            environments: None,
-            cert: None,
+            ..Default::default()
         };
         assert_eq!(
             resolve_env_mode(&config, "dev"),
