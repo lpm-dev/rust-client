@@ -18,6 +18,8 @@ use std::path::Path;
 pub fn compute_cache_key(
     project_dir: &Path,
     command: &str,
+    extra_args: &[String],
+    runtime_identities: &[(String, String)],
     input_globs: &[String],
     env_vars: &HashMap<String, String>,
     deps_json: &str,
@@ -25,12 +27,28 @@ pub fn compute_cache_key(
     let mut hasher = Sha256::new();
 
     // 0. Cache format version — bump this when changing hash inputs
-    hasher.update(b"cache-v2\n");
+    hasher.update(b"cache-v3\n");
 
     // 1. Command string
     hasher.update(b"cmd:");
     hasher.update(command.as_bytes());
     hasher.update(b"\n");
+
+    for argument in extra_args {
+        hasher.update(b"arg:");
+        hasher.update(argument.len().to_le_bytes());
+        hasher.update(b":");
+        hasher.update(argument.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    for (runtime, identity) in runtime_identities {
+        hasher.update(b"runtime:");
+        hasher.update(runtime.as_bytes());
+        hasher.update(b"=");
+        hasher.update(identity.as_bytes());
+        hasher.update(b"\n");
+    }
 
     // 2. Dependencies JSON — canonicalize for determinism
     //    serde_json doesn't guarantee key ordering, so we parse and re-serialize
@@ -241,8 +259,24 @@ mod tests {
         fs::write(dir.path().join("package.json"), "{}").unwrap();
 
         let env = HashMap::new();
-        let key1 = compute_cache_key(dir.path(), "echo build", &["src/**".into()], &env, "{}");
-        let key2 = compute_cache_key(dir.path(), "echo build", &["src/**".into()], &env, "{}");
+        let key1 = compute_cache_key(
+            dir.path(),
+            "echo build",
+            &[],
+            &[],
+            &["src/**".into()],
+            &env,
+            "{}",
+        );
+        let key2 = compute_cache_key(
+            dir.path(),
+            "echo build",
+            &[],
+            &[],
+            &["src/**".into()],
+            &env,
+            "{}",
+        );
         assert_eq!(key1, key2);
         assert_eq!(key1.len(), 64); // SHA-256 hex = 64 chars
     }
@@ -253,8 +287,8 @@ mod tests {
         fs::write(dir.path().join("package.json"), "{}").unwrap();
         let env = HashMap::new();
 
-        let key1 = compute_cache_key(dir.path(), "echo a", &[], &env, "{}");
-        let key2 = compute_cache_key(dir.path(), "echo b", &[], &env, "{}");
+        let key1 = compute_cache_key(dir.path(), "echo a", &[], &[], &[], &env, "{}");
+        let key2 = compute_cache_key(dir.path(), "echo b", &[], &[], &[], &env, "{}");
         assert_ne!(key1, key2);
     }
 
@@ -267,8 +301,8 @@ mod tests {
         let mut env2 = HashMap::new();
         env2.insert("NODE_ENV".into(), "production".into());
 
-        let key1 = compute_cache_key(dir.path(), "echo", &[], &env1, "{}");
-        let key2 = compute_cache_key(dir.path(), "echo", &[], &env2, "{}");
+        let key1 = compute_cache_key(dir.path(), "echo", &[], &[], &[], &env1, "{}");
+        let key2 = compute_cache_key(dir.path(), "echo", &[], &[], &[], &env2, "{}");
         assert_ne!(key1, key2);
     }
 
@@ -279,11 +313,27 @@ mod tests {
         fs::write(dir.path().join("src/index.js"), "v1").unwrap();
         let env = HashMap::new();
 
-        let key1 = compute_cache_key(dir.path(), "build", &["src/**".into()], &env, "{}");
+        let key1 = compute_cache_key(
+            dir.path(),
+            "build",
+            &[],
+            &[],
+            &["src/**".into()],
+            &env,
+            "{}",
+        );
 
         fs::write(dir.path().join("src/index.js"), "v2").unwrap();
 
-        let key2 = compute_cache_key(dir.path(), "build", &["src/**".into()], &env, "{}");
+        let key2 = compute_cache_key(
+            dir.path(),
+            "build",
+            &[],
+            &[],
+            &["src/**".into()],
+            &env,
+            "{}",
+        );
         assert_ne!(key1, key2);
     }
 
@@ -297,12 +347,16 @@ mod tests {
             dir.path(),
             "build",
             &[],
+            &[],
+            &[],
             &env,
             r#"{"react":"^19","lodash":"^4"}"#,
         );
         let key2 = compute_cache_key(
             dir.path(),
             "build",
+            &[],
+            &[],
             &[],
             &env,
             r#"{"lodash":"^4","react":"^19"}"#,
@@ -331,8 +385,78 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env = HashMap::new();
 
-        let key1 = compute_cache_key(dir.path(), "build", &[], &env, r#"{"react":"^18"}"#);
-        let key2 = compute_cache_key(dir.path(), "build", &[], &env, r#"{"react":"^19"}"#);
+        let key1 = compute_cache_key(
+            dir.path(),
+            "build",
+            &[],
+            &[],
+            &[],
+            &env,
+            r#"{"react":"^18"}"#,
+        );
+        let key2 = compute_cache_key(
+            dir.path(),
+            "build",
+            &[],
+            &[],
+            &[],
+            &env,
+            r#"{"react":"^19"}"#,
+        );
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn different_cli_arguments_produce_different_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let key1 = compute_cache_key(
+            dir.path(),
+            "build",
+            &["--target".into(), "node".into()],
+            &[],
+            &[],
+            &env,
+            "{}",
+        );
+        let key2 = compute_cache_key(
+            dir.path(),
+            "build",
+            &["--target".into(), "browser".into()],
+            &[],
+            &[],
+            &env,
+            "{}",
+        );
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn different_runtime_identities_produce_different_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let key1 = compute_cache_key(
+            dir.path(),
+            "build",
+            &[],
+            &[("node".into(), "fingerprint-a".into())],
+            &[],
+            &env,
+            "{}",
+        );
+        let key2 = compute_cache_key(
+            dir.path(),
+            "build",
+            &[],
+            &[("node".into(), "fingerprint-b".into())],
+            &[],
+            &env,
+            "{}",
+        );
+
         assert_ne!(key1, key2);
     }
 

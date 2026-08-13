@@ -217,11 +217,9 @@ pub struct TunnelOptions {
     pub tunnel_auth: Option<String>,
     /// Channel for sending captured webhooks to observers (inspector, logger, dashboard).
     ///
-    /// Uses an unbounded channel by design: webhook capture is best-effort and must
-    /// never block the proxy hot path. The receiver (logger/inspector) drains quickly
-    /// since it only writes to disk. If back-pressure is ever needed, the caller can
-    /// switch to a bounded channel — the tunnel uses `send()` which works with both.
-    pub webhook_tx: Option<tokio::sync::mpsc::UnboundedSender<CapturedWebhook>>,
+    /// Bounded best-effort channel. A full observer queue drops capture events
+    /// without blocking the proxy hot path or retaining unbounded request bodies.
+    pub webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhook>>,
     /// Disable TLS certificate pinning (for development/testing).
     /// When false (default), the relay's TLS certificate public key is pinned
     /// using TOFU (Trust On First Use) to prevent MITM attacks.
@@ -234,8 +232,8 @@ pub struct TunnelOptions {
     /// for later replay.
     pub auto_ack: bool,
     /// Channel for sending captured WebSocket events to the inspector.
-    /// Uses the same unbounded best-effort pattern as `webhook_tx`.
-    pub ws_tx: Option<tokio::sync::mpsc::UnboundedSender<WsEvent>>,
+    /// Uses the same bounded best-effort pattern as `webhook_tx`.
+    pub ws_tx: Option<tokio::sync::mpsc::Sender<WsEvent>>,
 }
 
 impl TunnelOptions {
@@ -300,6 +298,25 @@ pub async fn connect(
 pub async fn connect_with_usage(
     options: &TunnelOptions,
     on_connected: impl Fn(&TunnelSession),
+    on_disconnected: impl Fn(&str),
+    on_usage: impl Fn(&TunnelUsageMetadata, bool),
+) -> Result<(), LpmError> {
+    connect_with_usage_fallible(
+        options,
+        |session| {
+            on_connected(session);
+            Ok(())
+        },
+        on_disconnected,
+        on_usage,
+    )
+    .await
+}
+
+/// Connect to the relay with a callback that can reject session startup.
+pub async fn connect_with_usage_fallible(
+    options: &TunnelOptions,
+    on_connected: impl Fn(&TunnelSession) -> Result<(), LpmError>,
     on_disconnected: impl Fn(&str),
     on_usage: impl Fn(&TunnelUsageMetadata, bool),
 ) -> Result<(), LpmError> {
@@ -787,7 +804,7 @@ fn is_localhost_relay(url: &str) -> bool {
 /// Single connection attempt to the relay.
 async fn try_connect(
     options: &TunnelOptions,
-    on_connected: &impl Fn(&TunnelSession),
+    on_connected: &impl Fn(&TunnelSession) -> Result<(), LpmError>,
     on_usage: &impl Fn(&TunnelUsageMetadata, bool),
 ) -> Result<(), TunnelConnectError> {
     let connection_target = options.current_local_target();
@@ -957,7 +974,10 @@ async fn try_connect(
     if let Some(ref usage) = initial_usage {
         on_usage(usage, true);
     }
-    on_connected(&session);
+    on_connected(&session).map_err(|error| TunnelConnectError {
+        error,
+        retry_class: RetryClass::Permanent,
+    })?;
 
     // Create HTTP client for local proxying. `Policy::none()` disables
     // redirect-following entirely — the local dev server should never
@@ -979,14 +999,14 @@ async fn try_connect(
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
     ping_interval.tick().await; // Skip first immediate tick
 
-    // Track last pong time for dead relay detection (#3)
+    // Track last pong time for dead relay detection.
     let mut last_pong = std::time::Instant::now();
 
     // Channel for spawned WebSocket tasks to send frames back to the relay.
     // The main loop owns `write` exclusively; spawned tasks send through this channel.
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<String>(64);
 
-    // Track spawned task handles for graceful shutdown (#2)
+    // Track spawned task handles for graceful shutdown.
     let mut task_handles = tokio::task::JoinSet::new();
 
     // Active local WebSocket connections keyed by connection ID.
@@ -1130,7 +1150,7 @@ async fn try_connect(
                                                 );
                                         }
 
-                                        let _ = tx.send(captured);
+                                        let _ = tx.try_send(captured);
                                     }
 
                                 let json = match serde_json::to_string(&response) {
@@ -1249,18 +1269,36 @@ async fn try_connect(
                                         let ws_tx_clone = options.ws_tx.clone();
                                         task_handles.spawn(async move {
                                             while let Some(Ok(msg)) = local_read.next().await {
-                                                let (data, is_binary) = match msg {
+                                                let (data, is_binary, capture) = match msg {
                                                     tokio_tungstenite::tungstenite::Message::Text(t) => {
+                                                        let capture = ws_tx_clone.as_ref().map(|_| {
+                                                            WsEvent::captured_frame(
+                                                                id_clone.clone(),
+                                                                FrameDirection::Outbound,
+                                                                t.as_bytes(),
+                                                                false,
+                                                                chrono::Utc::now().to_rfc3339(),
+                                                            )
+                                                        });
                                                         (base64::Engine::encode(
                                                             &base64::engine::general_purpose::STANDARD,
                                                             t.as_bytes(),
-                                                        ), false)
+                                                        ), false, capture)
                                                     }
                                                     tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                                                        let capture = ws_tx_clone.as_ref().map(|_| {
+                                                            WsEvent::captured_frame(
+                                                                id_clone.clone(),
+                                                                FrameDirection::Outbound,
+                                                                &b,
+                                                                true,
+                                                                chrono::Utc::now().to_rfc3339(),
+                                                            )
+                                                        });
                                                         (base64::Engine::encode(
                                                             &base64::engine::general_purpose::STANDARD,
                                                             &b,
-                                                        ), true)
+                                                        ), true, capture)
                                                     }
                                                     tokio_tungstenite::tungstenite::Message::Close(reason) => {
                                                         tracing::debug!("local WS closed for {}", id_clone);
@@ -1271,7 +1309,7 @@ async fn try_connect(
                                                             .as_ref()
                                                             .map(|frame| u16::from(frame.code));
                                                         if let Some(ref ws_tx) = ws_tx_clone {
-                                                            let _ = ws_tx.send(WsEvent::Closed {
+                                                            let _ = ws_tx.try_send(WsEvent::Closed {
                                                                 connection_id: id_clone.clone(),
                                                                 reason: close_reason.clone(),
                                                                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -1290,32 +1328,10 @@ async fn try_connect(
                                                     _ => continue,
                                                 };
                                                 // Capture outbound frame for inspector
-                                                if let Some(ref ws_tx) = ws_tx_clone {
-                                                    let display_data = if is_binary {
-                                                        data.clone() // Already base64
-                                                    } else {
-                                                        // Decode base64 back to text for display
-                                                        base64::Engine::decode(
-                                                            &base64::engine::general_purpose::STANDARD,
-                                                            &data,
-                                                        )
-                                                        .ok()
-                                                        .and_then(|b| String::from_utf8(b).ok())
-                                                        .unwrap_or_else(|| data.clone())
-                                                    };
-                                                    let size = base64::Engine::decode(
-                                                        &base64::engine::general_purpose::STANDARD,
-                                                        &data,
-                                                    )
-                                                    .map_or(0, |b| b.len());
-                                                    let _ = ws_tx.send(WsEvent::Frame {
-                                                        connection_id: id_clone.clone(),
-                                                        direction: FrameDirection::Outbound,
-                                                        data: display_data,
-                                                        is_binary,
-                                                        size,
-                                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                                    });
+                                                if let (Some(ws_tx), Some(capture)) =
+                                                    (ws_tx_clone.as_ref(), capture)
+                                                {
+                                                    let _ = ws_tx.try_send(capture);
                                                 }
 
                                                 let frame = ClientMessage::WebSocketFrame {
@@ -1362,7 +1378,7 @@ async fn try_connect(
 
                                         // Capture WS connection event for inspector
                                         if let Some(ref ws_tx) = options.ws_tx {
-                                            let _ = ws_tx.send(WsEvent::Connected {
+                                            let _ = ws_tx.try_send(WsEvent::Connected {
                                                 connection_id: id.clone(),
                                                 url: url.clone(),
                                                 headers: headers.clone(),
@@ -1412,22 +1428,13 @@ async fn try_connect(
                                     };
                                     // Capture inbound frame for inspector
                                     if let Some(ref ws_tx) = options.ws_tx {
-                                        let frame_data = if is_binary {
-                                            base64::Engine::encode(
-                                                &base64::engine::general_purpose::STANDARD,
-                                                &decoded,
-                                            )
-                                        } else {
-                                            String::from_utf8_lossy(&decoded).into_owned()
-                                        };
-                                        let _ = ws_tx.send(WsEvent::Frame {
-                                            connection_id: id.clone(),
-                                            direction: FrameDirection::Inbound,
-                                            data: frame_data,
+                                        let _ = ws_tx.try_send(WsEvent::captured_frame(
+                                            id.clone(),
+                                            FrameDirection::Inbound,
+                                            &decoded,
                                             is_binary,
-                                            size: decoded.len(),
-                                            timestamp: chrono::Utc::now().to_rfc3339(),
-                                        });
+                                            chrono::Utc::now().to_rfc3339(),
+                                        ));
                                     }
 
                                     if tx.send(LocalWebSocketCommand::Frame { data: decoded, is_binary }).await.is_err() {
@@ -1519,7 +1526,7 @@ async fn try_connect(
     // Clean up: drop all WS connection senders to signal spawned tasks to exit
     ws_connections.clear();
 
-    // Gracefully await in-flight tasks with a timeout (#2)
+    // Gracefully await in-flight tasks with a timeout.
     let shutdown_deadline = tokio::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
     let _ = tokio::time::timeout(shutdown_deadline, async {
         while task_handles.join_next().await.is_some() {}

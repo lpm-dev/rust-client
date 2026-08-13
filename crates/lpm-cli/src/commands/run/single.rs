@@ -1,5 +1,6 @@
 use super::cache::{
-    is_task_cached_with_config, try_cache_hit_with_config, try_cache_store_with_output_and_config,
+    CacheStoreRequest, is_task_cached_with_config, try_cache_hit_with_config,
+    try_cache_store_with_output_and_config,
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::ensure_runtime;
@@ -74,8 +75,14 @@ pub async fn run(
 
     // Check if caching is enabled for this task
     if !no_cache
-        && let Some(hit) =
-            try_cache_hit_with_config(project_dir, script_name, env_mode, lpm_config.as_ref())?
+        && let Some(hit) = try_cache_hit_with_config(
+            project_dir,
+            script_name,
+            env_mode,
+            extra_args,
+            bin_hint,
+            lpm_config.as_ref(),
+        )?
     {
         // Cache hit — replay output
         if !hit.stdout.is_empty() {
@@ -120,15 +127,17 @@ pub async fn run(
             bin_hint,
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        let _ = try_cache_store_with_output_and_config(
+        let _ = try_cache_store_with_output_and_config(CacheStoreRequest {
             project_dir,
             script_name,
             env_mode,
+            extra_args,
+            bin_hint,
             duration_ms,
-            &output.stdout,
-            &output.stderr,
-            lpm_config.as_ref(),
-        );
+            stdout: &output.stdout,
+            stderr: &output.stderr,
+            lpm_config: lpm_config.as_ref(),
+        });
     } else {
         // Run normally (inherited stdio, no capture)
         lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;

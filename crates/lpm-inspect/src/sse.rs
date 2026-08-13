@@ -6,7 +6,7 @@
 //!
 //! # Backpressure
 //!
-//! The broadcast channel has a bounded capacity (128 events). If a browser
+//! The broadcast channel has a bounded capacity (512 events). If a browser
 //! falls behind (e.g., tab in background), it receives a `lagged` event
 //! with the count of missed events, and should re-fetch via the REST API.
 
@@ -19,7 +19,8 @@ use std::convert::Infallible;
 /// SSE stream handler.
 ///
 /// Each connected browser gets an independent receiver from the broadcast channel.
-/// Events are JSON-serialized `CapturedWebhook` objects.
+/// Events are JSON-serialized request summaries. Full bodies remain available
+/// through the authenticated request-detail endpoint.
 pub async fn stream(
     State(state): State<InspectorState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -41,11 +42,7 @@ pub async fn stream(
             tokio::select! {
                 received = rx.recv() => match received {
                     Ok(capture) => {
-                        let summary = crate::api::RequestSummary::from_live(
-                            &capture.webhook,
-                            capture.session_id.clone(),
-                        );
-                        match serde_json::to_string(&summary) {
+                        match serde_json::to_string(capture.as_ref()) {
                             Ok(json) => {
                                 yield Ok(Event::default().event("request").data(json));
                             }

@@ -218,7 +218,15 @@ fn sequential_excludes_skipped() {
 fn build_cache_context_returns_none_without_lpm_json() {
     let dir = tempfile::tempdir().unwrap();
     // No lpm.json → caching not configured
-    let ctx = build_cache_context(dir.path(), "build", None, None).unwrap();
+    let ctx = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        None,
+    )
+    .unwrap();
     assert!(ctx.is_none(), "should return None without lpm.json");
 }
 
@@ -245,7 +253,15 @@ fn build_cache_context_returns_none_when_cache_false() {
         },
         ..Default::default()
     };
-    let ctx = build_cache_context(dir.path(), "build", None, Some(&config)).unwrap();
+    let ctx = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        Some(&config),
+    )
+    .unwrap();
     assert!(ctx.is_none(), "should return None when cache is false");
 }
 
@@ -272,7 +288,15 @@ fn build_cache_context_returns_none_when_outputs_empty() {
         },
         ..Default::default()
     };
-    let ctx = build_cache_context(dir.path(), "build", None, Some(&config)).unwrap();
+    let ctx = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        Some(&config),
+    )
+    .unwrap();
     assert!(ctx.is_none(), "should return None when outputs are empty");
 }
 
@@ -299,11 +323,88 @@ fn build_cache_context_returns_some_when_properly_configured() {
         },
         ..Default::default()
     };
-    let ctx = build_cache_context(dir.path(), "build", None, Some(&config)).unwrap();
+    let ctx = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        Some(&config),
+    )
+    .unwrap();
     assert!(ctx.is_some(), "should return Some for valid cache config");
     let ctx = ctx.unwrap();
     assert_eq!(ctx.command, "echo hi");
     assert_eq!(ctx.cache_key.len(), 64, "cache key should be SHA-256 hex");
+}
+
+#[test]
+fn build_cache_context_changes_with_arguments_and_managed_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"build":"echo hi"}}"#,
+    )
+    .unwrap();
+    let config = lpm_runner::lpm_json::LpmJsonConfig {
+        tasks: std::collections::HashMap::from([(
+            "build".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                cache: true,
+                outputs: vec!["dist/**".into()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let node_20 = lpm_runner::bin_path::ManagedRuntimeHint::Resolved(vec![
+        lpm_runner::bin_path::ManagedRuntimeBin {
+            runtime: lpm_runtime::detect::RuntimeKind::Node,
+            version: "20.19.0".into(),
+            bin_dir: dir.path().join("node-20/bin"),
+        },
+    ]);
+    let node_22 = lpm_runner::bin_path::ManagedRuntimeHint::Resolved(vec![
+        lpm_runner::bin_path::ManagedRuntimeBin {
+            runtime: lpm_runtime::detect::RuntimeKind::Node,
+            version: "22.14.0".into(),
+            bin_dir: dir.path().join("node-22/bin"),
+        },
+    ]);
+
+    let node_20_browser = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &["--target=browser".into()],
+        &node_20,
+        Some(&config),
+    )
+    .unwrap()
+    .unwrap();
+    let node_20_server = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &["--target=server".into()],
+        &node_20,
+        Some(&config),
+    )
+    .unwrap()
+    .unwrap();
+    let node_22_browser = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &["--target=browser".into()],
+        &node_22,
+        Some(&config),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_ne!(node_20_browser.cache_key, node_20_server.cache_key);
+    assert_ne!(node_20_browser.cache_key, node_22_browser.cache_key);
 }
 
 // --- Format helpers ---

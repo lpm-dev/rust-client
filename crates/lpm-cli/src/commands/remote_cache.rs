@@ -89,12 +89,15 @@ pub fn try_store(
     stderr: &str,
     duration_ms: u64,
     env_vars: &HashMap<String, String>,
+    inherited_env: &HashMap<String, String>,
 ) {
     if client.read_only {
         return;
     }
 
-    if let Some(reason) = upload_block_reason(&client.env_policy, env_vars, stdout, stderr) {
+    if let Some(reason) =
+        upload_block_reason(&client.env_policy, env_vars, inherited_env, stdout, stderr)
+    {
         warn_once(&reason);
         return;
     }
@@ -846,10 +849,11 @@ fn decode_hmac_tag(tag: &str) -> Result<Vec<u8>, String> {
 fn upload_block_reason(
     policy: &lpm_runner::lpm_json::RemoteCacheEnvConfig,
     env_vars: &HashMap<String, String>,
+    inherited_env: &HashMap<String, String>,
     stdout: &str,
     stderr: &str,
 ) -> Option<String> {
-    for (name, value) in env_vars {
+    for (name, value) in env_vars.iter().chain(inherited_env) {
         if !env_name_blocks_upload(policy, name) {
             continue;
         }
@@ -989,6 +993,7 @@ mod tests {
         let reason = upload_block_reason(
             &lpm_runner::lpm_json::RemoteCacheEnvConfig::default(),
             &env,
+            &HashMap::new(),
             "",
             "",
         )
@@ -1005,6 +1010,7 @@ mod tests {
         let reason = upload_block_reason(
             &lpm_runner::lpm_json::RemoteCacheEnvConfig::default(),
             &env,
+            &HashMap::new(),
             "token=super-secret-token",
             "",
         )
@@ -1022,7 +1028,23 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(upload_block_reason(&policy, &env, "", "").is_none());
+        assert!(upload_block_reason(&policy, &env, &HashMap::new(), "", "").is_none());
+    }
+
+    #[test]
+    fn inherited_secret_like_env_blocks_remote_upload() {
+        let inherited = HashMap::from([("CI_DEPLOY_PASSWORD".into(), "secret-value".into())]);
+
+        let reason = upload_block_reason(
+            &lpm_runner::lpm_json::RemoteCacheEnvConfig::default(),
+            &HashMap::new(),
+            &inherited,
+            "",
+            "",
+        )
+        .expect("secret-like inherited env must block upload");
+
+        assert!(reason.contains("CI_DEPLOY_PASSWORD"));
     }
 
     #[test]

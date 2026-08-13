@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const WS_CAPTURE_PREVIEW_BYTES: usize = 64 * 1024;
+
 /// A captured WebSocket event — either a connection lifecycle event or a frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,6 +36,9 @@ pub enum WsEvent {
         is_binary: bool,
         /// Size of the frame data in bytes (before base64 encoding).
         size: usize,
+        /// Whether `data` is a bounded preview of a larger frame.
+        #[serde(default)]
+        truncated: bool,
         /// Timestamp (ISO 8601).
         timestamp: String,
     },
@@ -59,6 +64,67 @@ pub enum FrameDirection {
 }
 
 impl WsEvent {
+    /// Build a frame event without retaining an unbounded frame payload.
+    pub fn captured_frame(
+        connection_id: String,
+        direction: FrameDirection,
+        bytes: &[u8],
+        is_binary: bool,
+        timestamp: String,
+    ) -> Self {
+        let preview_len = bytes.len().min(WS_CAPTURE_PREVIEW_BYTES);
+        let preview = &bytes[..preview_len];
+        let data = if is_binary {
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, preview)
+        } else {
+            String::from_utf8_lossy(preview).into_owned()
+        };
+        Self::Frame {
+            connection_id,
+            direction,
+            data,
+            is_binary,
+            size: bytes.len(),
+            truncated: preview_len < bytes.len(),
+            timestamp,
+        }
+    }
+
+    /// Estimated heap bytes retained by this event.
+    pub fn retained_size_bytes(&self) -> usize {
+        match self {
+            Self::Connected {
+                connection_id,
+                url,
+                headers,
+                timestamp,
+            } => {
+                connection_id.capacity()
+                    + url.capacity()
+                    + timestamp.capacity()
+                    + headers
+                        .iter()
+                        .map(|(name, value)| name.capacity() + value.capacity())
+                        .sum::<usize>()
+            }
+            Self::Frame {
+                connection_id,
+                data,
+                timestamp,
+                ..
+            } => connection_id.capacity() + data.capacity() + timestamp.capacity(),
+            Self::Closed {
+                connection_id,
+                reason,
+                timestamp,
+            } => {
+                connection_id.capacity()
+                    + reason.as_ref().map_or(0, String::capacity)
+                    + timestamp.capacity()
+            }
+        }
+    }
+
     /// Get the connection ID regardless of event type.
     pub fn connection_id(&self) -> &str {
         match self {
@@ -104,6 +170,7 @@ mod tests {
             data: "{\"type\":\"ping\"}".to_string(),
             is_binary: false,
             size: 15,
+            truncated: false,
             timestamp: "2026-04-06T12:00:01Z".to_string(),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -140,8 +207,61 @@ mod tests {
             data: String::new(),
             is_binary: false,
             size: 0,
+            truncated: false,
             timestamp: String::new(),
         };
         assert_eq!(frame.connection_id(), "c2");
+    }
+
+    #[test]
+    fn captured_frame_bounds_preview_and_preserves_original_size() {
+        let payload = vec![b'x'; 1024 * 1024];
+
+        let event = WsEvent::captured_frame(
+            "c1".to_string(),
+            FrameDirection::Inbound,
+            &payload,
+            false,
+            String::new(),
+        );
+
+        let WsEvent::Frame {
+            data,
+            size,
+            truncated,
+            ..
+        } = event
+        else {
+            panic!("expected frame event");
+        };
+        assert_eq!(size, payload.len());
+        assert!(truncated);
+        assert!(data.len() <= WS_CAPTURE_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn captured_binary_frame_encodes_only_the_bounded_preview() {
+        let payload = vec![0xff; 1024 * 1024];
+
+        let event = WsEvent::captured_frame(
+            "c1".to_string(),
+            FrameDirection::Outbound,
+            &payload,
+            true,
+            String::new(),
+        );
+
+        let WsEvent::Frame {
+            data,
+            size,
+            truncated,
+            ..
+        } = event
+        else {
+            panic!("expected frame event");
+        };
+        assert_eq!(size, payload.len());
+        assert!(truncated);
+        assert!(data.len() <= WS_CAPTURE_PREVIEW_BYTES.div_ceil(3) * 4);
     }
 }

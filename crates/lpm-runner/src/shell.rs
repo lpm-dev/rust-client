@@ -5,10 +5,9 @@
 //!
 //! ## Signal handling
 //!
-//! On Unix, `sh -c` creates a process group. When the user presses Ctrl+C,
-//! the terminal sends SIGINT to the entire foreground process group, so both
-//! the shell and the child process receive the signal. We don't need to
-//! manually forward signals.
+//! On Unix, terminal Ctrl+C reaches the foreground process group. A targeted
+//! signal to the LPM PID does not, so endpoint-aware dev execution also maps
+//! SIGINT and SIGTERM to its scoped process-tree shutdown flag.
 //!
 //! However, if the child process is killed by a signal (e.g., SIGINT),
 //! `ExitStatus::code()` returns `None` on Unix. We handle this by extracting
@@ -24,11 +23,9 @@ use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
 /// Inherited-env names that MUST be stripped from any `lpm run` /
 /// `lpm exec` child before spawn.
 ///
-/// H21: the script runner spawns `sh -c <cmd>` (Unix) or
-/// `cmd /C <cmd>` (Windows) with no `env_clear()` and no scrub of
-/// the inherited process env. Pre-fix, every parent env variable
-/// (credential bearers, dynamic-linker hijack hooks) flowed
-/// verbatim into the user's `package.json > scripts` body.
+/// The script runner spawns a platform shell without clearing the inherited
+/// process environment, so credentials and runtime-injection hooks must be
+/// removed explicitly before project env values are added.
 ///
 /// We can't `env_clear` outright — legitimate scripts depend on
 /// `HOME`, `USER`, `LANG`, `PATH`, etc. Instead we mirror the
@@ -37,7 +34,7 @@ use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
 /// each entry — same posture, applied at the script-runner boundary.
 ///
 /// Credential carriers + dynamic-linker hijacks live in one list;
-/// suffix-shaped patterns (`*_SECRET`, `*_PASSWORD`, etc.) get
+/// suffix-shaped patterns (`*_SECRET`, `*_TOKEN`, etc.) get
 /// stripped programmatically via `STRIPPED_INHERITED_ENV_SUFFIXES`.
 const STRIPPED_INHERITED_ENV_PATTERNS: &[&str] = &[
     // Credential carriers
@@ -72,7 +69,32 @@ const STRIPPED_INHERITED_ENV_PATTERNS: &[&str] = &[
     "RUBYLIB",
 ];
 
-const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &["_SECRET", "_PASSWORD", "_KEY", "_PRIVATE_KEY"];
+const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &[
+    "_SECRET",
+    "_PASSWORD",
+    "_KEY",
+    "_PRIVATE_KEY",
+    "_KEY_ID",
+    "_TOKEN",
+];
+
+fn inherited_env_is_stripped(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    STRIPPED_INHERITED_ENV_PATTERNS.contains(&upper.as_str())
+        || STRIPPED_INHERITED_ENV_SUFFIXES
+            .iter()
+            .any(|suffix| upper.ends_with(suffix))
+}
+
+/// Return inherited environment variables that a script child can observe.
+///
+/// Explicit project env values are handled separately because they override
+/// inherited values after the scrub.
+pub fn inherited_child_env() -> HashMap<String, String> {
+    std::env::vars()
+        .filter(|(key, _)| !inherited_env_is_stripped(key))
+        .collect()
+}
 
 /// Strip credential + runtime-hijack inherited env vars from `cmd`
 /// before spawn. Must run before any `command.envs(...)` that adds
@@ -92,11 +114,7 @@ pub(crate) fn strip_inherited_env_hooks(cmd: &mut Command) {
         cmd.env_remove(pattern);
     }
     for (key, _value) in std::env::vars() {
-        let upper = key.to_ascii_uppercase();
-        if STRIPPED_INHERITED_ENV_SUFFIXES
-            .iter()
-            .any(|suffix| upper.ends_with(suffix))
-        {
+        if inherited_env_is_stripped(&key) {
             cmd.env_remove(&key);
         }
     }
@@ -105,13 +123,13 @@ pub(crate) fn strip_inherited_env_hooks(cmd: &mut Command) {
 /// Max bytes accumulated per captured stream (stdout OR stderr).
 ///
 /// Mirrors the post-execution truncation cap in `commands::run` so the
-/// in-memory buffer never grows past it. Pre-fix, a chatty task could
-/// produce gigabytes of stdout, fill up `String`, and only get
-/// truncated AFTER the buffer was already in RAM (or written to a
-/// `stdout.log` cache file). With this cap, accumulation halts at
+/// in-memory buffer never grows past it. Without this cap, a chatty task can
+/// fill the process with output before later truncation. Accumulation halts at
 /// 10 MiB while the reader keeps draining the pipe so the child
 /// doesn't block — the truncation marker is appended once.
 const MAX_CAPTURED_STREAM_BYTES: usize = 10 * 1024 * 1024;
+const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
+const MAX_ENDPOINT_OUTPUT_LINE_BYTES: usize = 64 * 1024;
 
 /// Append `line` (plus a newline) to `buf` unless that would push
 /// `buf.len()` past the cap; when the cap is first crossed, push a
@@ -146,6 +164,76 @@ fn push_capped_line(buf: &mut String, line: &str) {
     ));
 }
 
+fn drain_captured_stream<R: std::io::Read>(mut reader: R, mut render: impl FnMut(&str)) -> String {
+    let mut captured = String::with_capacity(OUTPUT_READ_CHUNK_BYTES);
+    let mut pending = Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES);
+    let mut chunk = [0u8; OUTPUT_READ_CHUNK_BYTES];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let mut remaining = &chunk[..read];
+        while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+            pending.extend_from_slice(&remaining[..newline]);
+            let line = String::from_utf8_lossy(&pending);
+            render(&line);
+            push_capped_line(&mut captured, &line);
+            pending.clear();
+            remaining = &remaining[newline + 1..];
+        }
+        if !remaining.is_empty() && pending.len() < MAX_CAPTURED_STREAM_BYTES {
+            let keep = remaining
+                .len()
+                .min(MAX_CAPTURED_STREAM_BYTES - pending.len());
+            pending.extend_from_slice(&remaining[..keep]);
+        }
+    }
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending);
+        render(&line);
+        push_capped_line(&mut captured, &line);
+    }
+    captured
+}
+
+fn drain_bounded_lines<R: std::io::Read>(
+    mut reader: R,
+    max_line_bytes: usize,
+    mut on_line: impl FnMut(&str),
+) {
+    let mut line = Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES.min(max_line_bytes));
+    let mut chunk = [0u8; OUTPUT_READ_CHUNK_BYTES];
+    let mut truncated = false;
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let mut remaining = &chunk[..read];
+        while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+            if !truncated {
+                let keep = newline.min(max_line_bytes.saturating_sub(line.len()));
+                line.extend_from_slice(&remaining[..keep]);
+            }
+            on_line(&String::from_utf8_lossy(&line));
+            line.clear();
+            truncated = false;
+            remaining = &remaining[newline + 1..];
+        }
+        if !remaining.is_empty() && !truncated {
+            let keep = remaining
+                .len()
+                .min(max_line_bytes.saturating_sub(line.len()));
+            line.extend_from_slice(&remaining[..keep]);
+            truncated = keep < remaining.len() || line.len() == max_line_bytes;
+        }
+    }
+    if !line.is_empty() {
+        on_line(&String::from_utf8_lossy(&line));
+    }
+}
+
 /// Configuration for spawning a shell command.
 pub struct ShellCommand<'a> {
     /// The command string to execute (passed to `sh -c` / `cmd /C`).
@@ -162,25 +250,50 @@ pub struct ShellCommand<'a> {
 pub type EndpointResultCallback =
     Box<dyn FnOnce(Result<Option<DevEndpoint>, String>) + Send + 'static>;
 
+#[cfg(unix)]
+struct StopSignalRegistrations(Vec<signal_hook::SigId>);
+
+#[cfg(unix)]
+impl Drop for StopSignalRegistrations {
+    fn drop(&mut self) {
+        for registration in self.0.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn register_stop_signals(
+    stop_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<StopSignalRegistrations, LpmError> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+
+    let mut registrations = StopSignalRegistrations(Vec::with_capacity(2));
+    for signal in [SIGINT, SIGTERM] {
+        let registration =
+            signal_hook::flag::register(signal, std::sync::Arc::clone(stop_requested)).map_err(
+                |error| LpmError::Script(format!("failed to install dev signal handlers: {error}")),
+            )?;
+        registrations.0.push(registration);
+    }
+    Ok(registrations)
+}
+
 /// Spawn a shell command and wait for it to complete.
 ///
 /// Returns the exit status. Stdio is inherited so the child process
 /// can interact with the terminal directly. This deliberately gives the child
 /// ownership of the terminal; LPM cannot sanitize output on this raw path.
 pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
-    let (shell, flag) = shell_and_flag();
-
-    let mut command = Command::new(shell);
+    let mut command = shell_process(cmd.command)?;
     command
-        .arg(flag)
-        .arg(cmd.command)
         .current_dir(cmd.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
     // Scrub credential + runtime-hijack env hooks the parent process
-    // inherited (H21). Runs BEFORE project envs so a legitimate
+    // inherited. Runs BEFORE project envs so a legitimate
     // project-level override in `.env` can still take effect.
     strip_inherited_env_hooks(&mut command);
 
@@ -201,12 +314,11 @@ pub fn spawn_shell_with_endpoint(
     stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_endpoint: EndpointResultCallback,
 ) -> Result<ExitStatus, LpmError> {
-    let (shell, flag) = shell_and_flag();
+    #[cfg(unix)]
+    let _stop_signal_registrations = register_stop_signals(&stop_requested)?;
     let baseline = ListenerSnapshot::capture();
-    let mut command = Command::new(shell);
+    let mut command = shell_process(cmd.command)?;
     command
-        .arg(flag)
-        .arg(cmd.command)
         .current_dir(cmd.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -298,19 +410,17 @@ where
         let Some(stream) = stream else {
             return;
         };
-        let reader = std::io::BufReader::new(stream);
-        use std::io::BufRead;
-        for line in reader.lines().map_while(Result::ok) {
-            for target in crate::dev_endpoint::parse_local_targets(&line) {
+        drain_bounded_lines(stream, MAX_ENDPOINT_OUTPUT_LINE_BYTES, |line| {
+            for target in crate::dev_endpoint::parse_local_targets(line) {
                 let _ = candidate_tx.send(target);
             }
-            let safe = sanitize_terminal_inline(&line);
+            let safe = sanitize_terminal_inline(line);
             if is_stderr {
                 eprintln!("{safe}");
             } else {
                 println!("{safe}");
             }
-        }
+        });
     })
 }
 
@@ -352,19 +462,15 @@ pub struct CapturedOutput {
 /// into strings so stored data keeps its original semantics. Cache replay must
 /// sanitize the captured strings again at its terminal boundary.
 pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
-    let (shell, flag) = shell_and_flag();
-
-    let mut command = Command::new(shell);
+    let mut command = shell_process(cmd.command)?;
     command
-        .arg(flag)
-        .arg(cmd.command)
         .current_dir(cmd.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     // Scrub credential + runtime-hijack env hooks the parent process
-    // inherited (H21). Runs BEFORE project envs so a legitimate
+    // inherited. Runs BEFORE project envs so a legitimate
     // project-level override in `.env` can still take effect.
     strip_inherited_env_hooks(&mut command);
 
@@ -384,30 +490,20 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
 
     // Tee stdout: read from pipe, write to terminal + capped buffer
     let stdout_handle = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        if let Some(stdout) = child_stdout {
-            let reader = std::io::BufReader::new(stdout);
-            use std::io::BufRead;
-            for line in reader.lines().map_while(Result::ok) {
-                println!("{}", sanitize_terminal_inline(&line));
-                push_capped_line(&mut buf, &line);
-            }
-        }
-        buf
+        child_stdout.map_or_else(String::new, |stdout| {
+            drain_captured_stream(stdout, |line| {
+                println!("{}", sanitize_terminal_inline(line));
+            })
+        })
     });
 
     // Tee stderr: read from pipe, write to terminal + capped buffer
     let stderr_handle = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        if let Some(stderr) = child_stderr {
-            let reader = std::io::BufReader::new(stderr);
-            use std::io::BufRead;
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("{}", sanitize_terminal_inline(&line));
-                push_capped_line(&mut buf, &line);
-            }
-        }
-        buf
+        child_stderr.map_or_else(String::new, |stderr| {
+            drain_captured_stream(stderr, |line| {
+                eprintln!("{}", sanitize_terminal_inline(line));
+            })
+        })
     });
 
     let status = child
@@ -436,12 +532,8 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
 /// Used by buffered parallel mode where output should only appear after
 /// the task completes.
 pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
-    let (shell, flag) = shell_and_flag();
-
-    let mut command = Command::new(shell);
+    let mut command = shell_process(cmd.command)?;
     command
-        .arg(flag)
-        .arg(cmd.command)
         .current_dir(cmd.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -466,27 +558,11 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
     let child_stderr = child.stderr.take();
 
     let stdout_handle = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        if let Some(stdout) = child_stdout {
-            let reader = std::io::BufReader::new(stdout);
-            use std::io::BufRead;
-            for line in reader.lines().map_while(Result::ok) {
-                push_capped_line(&mut buf, &line);
-            }
-        }
-        buf
+        child_stdout.map_or_else(String::new, |stdout| drain_captured_stream(stdout, |_| {}))
     });
 
     let stderr_handle = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        if let Some(stderr) = child_stderr {
-            let reader = std::io::BufReader::new(stderr);
-            use std::io::BufRead;
-            for line in reader.lines().map_while(Result::ok) {
-                push_capped_line(&mut buf, &line);
-            }
-        }
-        buf
+        child_stderr.map_or_else(String::new, |stderr| drain_captured_stream(stderr, |_| {}))
     });
 
     let status = child
@@ -512,12 +588,8 @@ pub fn spawn_shell_prefixed(
     prefix: &str,
     color: &str,
 ) -> Result<CapturedOutput, LpmError> {
-    let (shell, flag) = shell_and_flag();
-
-    let mut command = Command::new(shell);
+    let mut command = shell_process(cmd.command)?;
     command
-        .arg(flag)
-        .arg(cmd.command)
         .current_dir(cmd.cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
@@ -544,32 +616,22 @@ pub fn spawn_shell_prefixed(
 
     // Prefixed stdout reader
     let stdout_handle = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        if let Some(stdout) = child_stdout {
-            let reader = std::io::BufReader::new(stdout);
-            use std::io::BufRead;
-            for line in reader.lines().map_while(Result::ok) {
-                let safe_line = sanitize_terminal_inline(&line);
+        child_stdout.map_or_else(String::new, |stdout| {
+            drain_captured_stream(stdout, |line| {
+                let safe_line = sanitize_terminal_inline(line);
                 eprintln!("\x1b[{}m{}\x1b[0m {}", color_out, prefix_out, safe_line);
-                push_capped_line(&mut buf, &line);
-            }
-        }
-        buf
+            })
+        })
     });
 
     // Prefixed stderr reader
     let stderr_handle = std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        if let Some(stderr) = child_stderr {
-            let reader = std::io::BufReader::new(stderr);
-            use std::io::BufRead;
-            for line in reader.lines().map_while(Result::ok) {
-                let safe_line = sanitize_terminal_inline(&line);
+        child_stderr.map_or_else(String::new, |stderr| {
+            drain_captured_stream(stderr, |line| {
+                let safe_line = sanitize_terminal_inline(line);
                 eprintln!("\x1b[{}m{}\x1b[0m {}", color_err, prefix_err, safe_line);
-                push_capped_line(&mut buf, &line);
-            }
-        }
-        buf
+            })
+        })
     });
 
     let status = child
@@ -586,12 +648,57 @@ pub fn spawn_shell_prefixed(
     })
 }
 
-/// Returns the shell binary and flag for the current platform.
-fn shell_and_flag() -> (&'static str, &'static str) {
-    if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
+#[cfg(not(windows))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Windows implementation can fail while resolving the system shell"
+)]
+pub(crate) fn shell_process(command: &str) -> Result<Command, LpmError> {
+    let mut process = Command::new("sh");
+    process.arg("-c").arg(command);
+    Ok(process)
+}
+
+#[cfg(windows)]
+pub(crate) fn shell_process(command: &str) -> Result<Command, LpmError> {
+    use std::os::windows::process::CommandExt;
+
+    let mut process = Command::new(windows_system_directory()?.join("cmd.exe"));
+    process
+        .arg("/D")
+        .arg("/V:OFF")
+        .arg("/S")
+        .arg("/C")
+        .raw_arg(format!("\"{command}\""));
+    Ok(process)
+}
+
+#[cfg(windows)]
+fn windows_system_directory() -> Result<std::path::PathBuf, LpmError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let buffer_len = u32::try_from(buffer.len())
+            .map_err(|_| LpmError::Script("Windows system directory path is too long".into()))?;
+        // SAFETY: `buffer` is writable for `buffer_len` UTF-16 units, and the
+        // pointer remains valid for the duration of this synchronous call.
+        let written = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_len) };
+        if written == 0 {
+            return Err(LpmError::Script(format!(
+                "failed to resolve Windows system directory: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let written = written as usize;
+        if written < buffer.len() {
+            buffer.truncate(written);
+            return Ok(std::path::PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        buffer.resize(written.saturating_add(1), 0);
     }
 }
 
@@ -872,7 +979,7 @@ mod tests {
         assert!(status.success(), "all env vars should be visible");
     }
 
-    /// M52: per-line accumulation halts at the cap. Subsequent lines
+    /// Per-line accumulation halts at the cap. Subsequent lines
     /// are silently dropped. The marker is emitted exactly once.
     #[test]
     fn push_capped_line_truncates_at_cap_with_marker() {
@@ -912,7 +1019,7 @@ mod tests {
         assert_eq!(buf, "line one\nline two\n");
     }
 
-    /// M52: when the last buffer byte lands inside a multibyte
+    /// When the last buffer byte lands inside a multibyte
     /// codepoint, the truncator must walk back to a `char_boundary`
     /// rather than panic on `&str` slicing.
     #[test]
@@ -929,9 +1036,31 @@ mod tests {
         assert!(buf.contains("[output truncated"));
     }
 
-    /// H21: each `spawn_shell` invocation must NOT inherit a parent
+    #[test]
+    fn drain_captured_stream_bounds_newline_free_input() {
+        let input = vec![b'x'; MAX_CAPTURED_STREAM_BYTES * 3];
+
+        let captured = drain_captured_stream(input.as_slice(), |_| {});
+
+        assert!(captured.contains("[output truncated at 10 MiB]"));
+        assert!(captured.len() <= MAX_CAPTURED_STREAM_BYTES + 64);
+    }
+
+    #[test]
+    fn drain_bounded_lines_caps_newline_free_endpoint_output() {
+        let input = vec![b'x'; MAX_ENDPOINT_OUTPUT_LINE_BYTES * 4];
+        let mut observed = Vec::new();
+
+        drain_bounded_lines(input.as_slice(), MAX_ENDPOINT_OUTPUT_LINE_BYTES, |line| {
+            observed.push(line.len());
+        });
+
+        assert_eq!(observed, vec![MAX_ENDPOINT_OUTPUT_LINE_BYTES]);
+    }
+
+    /// Each `spawn_shell` invocation must NOT inherit a parent
     /// `LD_PRELOAD` / `NODE_OPTIONS` / `LPM_TOKEN` value into the
-    /// `sh -c` child. Pre-fix the parent env flowed verbatim.
+    /// `sh -c` child.
     ///
     /// Cross-platform shape: we set the env vars on the calling
     /// process, spawn a shell that prints them, and assert the
@@ -951,6 +1080,7 @@ mod tests {
             std::env::set_var("LD_PRELOAD", "/dev/null/evil.so");
             std::env::set_var("NODE_OPTIONS", "--require=/dev/null/evil");
             std::env::set_var("LPM_TOKEN", "secret-token-value");
+            std::env::set_var("CI_JOB_TOKEN", "ci-secret-token-value");
             std::env::set_var(&suffix_secret_name, "exfil-secret");
             // Non-stripped sentinel: a generic var that should pass
             // through so we know the scrub is targeted, not blanket.
@@ -958,7 +1088,7 @@ mod tests {
         }
 
         let cmd = format!(
-            r#"echo "LP=${{LD_PRELOAD-unset}} NO=${{NODE_OPTIONS-unset}} TK=${{LPM_TOKEN-unset}} SE=${{{suffix_secret_name}-unset}} S=${{LPM_NONSCRUB_SENTINEL-unset}}""#
+            r#"echo "LP=${{LD_PRELOAD-unset}} NO=${{NODE_OPTIONS-unset}} TK=${{LPM_TOKEN-unset}} CI=${{CI_JOB_TOKEN-unset}} SE=${{{suffix_secret_name}-unset}} S=${{LPM_NONSCRUB_SENTINEL-unset}}""#
         );
         let result = spawn_shell_capture(&ShellCommand {
             command: &cmd,
@@ -972,6 +1102,7 @@ mod tests {
             std::env::remove_var("LD_PRELOAD");
             std::env::remove_var("NODE_OPTIONS");
             std::env::remove_var("LPM_TOKEN");
+            std::env::remove_var("CI_JOB_TOKEN");
             std::env::remove_var(&suffix_secret_name);
             std::env::remove_var("LPM_NONSCRUB_SENTINEL");
         }
@@ -994,6 +1125,11 @@ mod tests {
             result.stdout
         );
         assert!(
+            result.stdout.contains("CI=unset"),
+            "*_TOKEN suffix must NOT reach the child: {}",
+            result.stdout
+        );
+        assert!(
             result.stdout.contains("SE=unset"),
             "*_SECRET suffix must NOT reach the child: {}",
             result.stdout
@@ -1005,7 +1141,7 @@ mod tests {
         );
     }
 
-    /// H21: a value passed via the explicit `envs` map MUST still
+    /// A value passed via the explicit `envs` map MUST still
     /// reach the child even if its name overlaps with a stripped
     /// pattern — the strip targets *inherited* env, not project-
     /// supplied values.

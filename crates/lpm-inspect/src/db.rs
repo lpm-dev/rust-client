@@ -17,6 +17,7 @@ use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, mpsc};
 
 /// Batch flush interval — writes are buffered and flushed together.
@@ -24,6 +25,8 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 
 /// Maximum number of buffered writes before forcing a flush.
 const FLUSH_BATCH_SIZE: usize = 50;
+const WRITE_QUEUE_CAPACITY: usize = 256;
+const WRITE_QUEUE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Handle to the inspector database.
 ///
@@ -33,23 +36,21 @@ const FLUSH_BATCH_SIZE: usize = 50;
 pub struct InspectorDb {
     /// Read-only connection (shared across API handlers via Arc<Mutex>).
     read_conn: Arc<Mutex<Connection>>,
+    /// Session lifecycle writes bypass the lossy capture queue.
+    control_conn: Arc<std::sync::Mutex<Connection>>,
     /// Channel for sending writes to the background flush task.
-    write_tx: mpsc::UnboundedSender<DbWrite>,
+    write_tx: mpsc::Sender<DbWrite>,
+    queued_capture_bytes: Arc<AtomicUsize>,
     /// Database file path (for display/diagnostics).
     pub db_path: PathBuf,
 }
 
 /// A write operation to be batched.
 enum DbWrite {
-    InsertRequest(Box<CapturedWebhook>, Option<String>),
-    StartSession {
-        id: String,
-        name: Option<String>,
-        domain: Option<String>,
-        local_port: u16,
-    },
-    EndSession {
-        id: String,
+    InsertRequest {
+        webhook: Arc<CapturedWebhook>,
+        session_id: Option<String>,
+        retained_bytes: usize,
     },
     Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
@@ -81,16 +82,24 @@ impl InspectorDb {
              PRAGMA foreign_keys=ON;
              PRAGMA busy_timeout=5000;",
         )?;
+        let control_conn = open_control_connection(&db_path)?;
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
+        let queued_capture_bytes = Arc::new(AtomicUsize::new(0));
 
         // Spawn background flush task
         let write_conn = Arc::new(Mutex::new(write_conn));
-        tokio::spawn(flush_task(write_conn, write_rx));
+        tokio::spawn(flush_task(
+            write_conn,
+            write_rx,
+            Arc::clone(&queued_capture_bytes),
+        ));
 
         Ok(Self {
             read_conn: Arc::new(Mutex::new(read_conn)),
+            control_conn: Arc::new(std::sync::Mutex::new(control_conn)),
             write_tx,
+            queued_capture_bytes,
             db_path,
         })
     }
@@ -122,28 +131,80 @@ impl InspectorDb {
              PRAGMA foreign_keys=ON;
              PRAGMA busy_timeout=5000;",
         )?;
+        let control_conn = open_control_connection(&tmp)?;
 
-        let (write_tx, write_rx) = mpsc::unbounded_channel();
+        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
+        let queued_capture_bytes = Arc::new(AtomicUsize::new(0));
         let write_conn = Arc::new(Mutex::new(write_conn));
-        tokio::spawn(flush_task(write_conn, write_rx));
+        tokio::spawn(flush_task(
+            write_conn,
+            write_rx,
+            Arc::clone(&queued_capture_bytes),
+        ));
 
         Ok(Self {
             read_conn: Arc::new(Mutex::new(read_conn)),
+            control_conn: Arc::new(std::sync::Mutex::new(control_conn)),
             write_tx,
+            queued_capture_bytes,
             db_path: tmp,
         })
     }
 
     /// Insert a captured request (non-blocking — queued for batch write).
     pub fn insert_request(&self, webhook: CapturedWebhook, session_id: Option<String>) {
-        let _ = self
+        self.insert_shared_request(Arc::new(webhook), session_id);
+    }
+
+    pub(crate) fn insert_shared_request(
+        &self,
+        webhook: Arc<CapturedWebhook>,
+        session_id: Option<String>,
+    ) {
+        if self.write_tx.capacity() == 0 {
+            tracing::warn!("inspector database capture queue full; dropping capture");
+            return;
+        }
+        let retained_bytes = webhook.retained_size_bytes();
+        if self
+            .queued_capture_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                queued
+                    .checked_add(retained_bytes)
+                    .filter(|next| *next <= WRITE_QUEUE_BYTE_BUDGET)
+            })
+            .is_err()
+        {
+            tracing::warn!("inspector database capture byte budget full; dropping capture");
+            return;
+        }
+        if self
             .write_tx
-            .send(DbWrite::InsertRequest(Box::new(webhook), session_id));
+            .try_send(DbWrite::InsertRequest {
+                webhook,
+                session_id,
+                retained_bytes,
+            })
+            .is_err()
+        {
+            self.queued_capture_bytes
+                .fetch_sub(retained_bytes, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn queued_capture_bytes(&self) -> usize {
+        self.queued_capture_bytes.load(Ordering::Relaxed)
     }
 
     /// Record a new tunnel session start.
-    pub fn start_session(&self, id: String, domain: Option<String>, local_port: u16) {
-        self.start_session_named(id, domain, local_port, None);
+    pub fn start_session(
+        &self,
+        id: String,
+        domain: Option<String>,
+        local_port: u16,
+    ) -> Result<(), rusqlite::Error> {
+        self.start_session_named(id, domain, local_port, None)
     }
 
     /// Record a new tunnel session start with an optional display name.
@@ -153,18 +214,30 @@ impl InspectorDb {
         domain: Option<String>,
         local_port: u16,
         name: Option<String>,
-    ) {
-        let _ = self.write_tx.send(DbWrite::StartSession {
-            id,
-            name,
-            domain,
-            local_port,
-        });
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .control_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, name, domain, local_port)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, domain, local_port],
+        )?;
+        Ok(())
     }
 
     /// Record a tunnel session end.
-    pub fn end_session(&self, id: String) {
-        let _ = self.write_tx.send(DbWrite::EndSession { id });
+    pub fn end_session(&self, id: String) -> Result<(), rusqlite::Error> {
+        let conn = self
+            .control_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     /// Wait until all writes queued before this call have committed.
@@ -172,6 +245,7 @@ impl InspectorDb {
         let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
         self.write_tx
             .send(DbWrite::Flush(flushed_tx))
+            .await
             .map_err(|_| "inspector database writer stopped unexpectedly".to_string())?;
         tokio::time::timeout(std::time::Duration::from_secs(5), flushed_rx)
             .await
@@ -553,6 +627,17 @@ fn restrict_database_permissions(_path: &Path) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn open_control_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let connection = Connection::open(path)?;
+    connection.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA foreign_keys=ON;
+         PRAGMA busy_timeout=5000;",
+    )?;
+    Ok(connection)
+}
+
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
@@ -606,7 +691,11 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 // ── Background flush task ─────────────────────────────────────────────
 
-async fn flush_task(conn: Arc<Mutex<Connection>>, mut rx: mpsc::UnboundedReceiver<DbWrite>) {
+async fn flush_task(
+    conn: Arc<Mutex<Connection>>,
+    mut rx: mpsc::Receiver<DbWrite>,
+    queued_capture_bytes: Arc<AtomicUsize>,
+) {
     let mut batch: Vec<DbWrite> = Vec::with_capacity(FLUSH_BATCH_SIZE);
     let mut pending_error: Option<String> = None;
 
@@ -636,20 +725,21 @@ async fn flush_task(conn: Arc<Mutex<Connection>>, mut rx: mpsc::UnboundedReceive
             }
         }
 
-        flush_pending_batch(&conn, &mut batch, &mut pending_error).await;
+        flush_pending_batch(&conn, &mut batch, &mut pending_error, &queued_capture_bytes).await;
     }
 
     // Drain remaining writes on shutdown
     while let Ok(write) = rx.try_recv() {
         batch.push(write);
     }
-    flush_pending_batch(&conn, &mut batch, &mut pending_error).await;
+    flush_pending_batch(&conn, &mut batch, &mut pending_error, &queued_capture_bytes).await;
 }
 
 async fn flush_pending_batch(
     conn: &Arc<Mutex<Connection>>,
     batch: &mut Vec<DbWrite>,
     pending_error: &mut Option<String>,
+    queued_capture_bytes: &AtomicUsize,
 ) {
     if batch.is_empty() {
         return;
@@ -673,16 +763,25 @@ async fn flush_pending_batch(
 
     let has_flush_marker = batch.iter().any(|write| matches!(write, DbWrite::Flush(_)));
     let reported_result = pending_error.clone().map_or(Ok(()), Err);
-    finish_batch(batch, reported_result);
+    finish_batch(batch, reported_result, queued_capture_bytes);
     if has_flush_marker {
         *pending_error = None;
     }
 }
 
-fn finish_batch(batch: &mut Vec<DbWrite>, flush_result: Result<(), String>) {
+fn finish_batch(
+    batch: &mut Vec<DbWrite>,
+    flush_result: Result<(), String>,
+    queued_capture_bytes: &AtomicUsize,
+) {
     for write in batch.drain(..) {
-        if let DbWrite::Flush(flushed_tx) = write {
-            let _ = flushed_tx.send(flush_result.clone());
+        match write {
+            DbWrite::InsertRequest { retained_bytes, .. } => {
+                queued_capture_bytes.fetch_sub(retained_bytes, Ordering::Relaxed);
+            }
+            DbWrite::Flush(flushed_tx) => {
+                let _ = flushed_tx.send(flush_result.clone());
+            }
         }
     }
 }
@@ -692,26 +791,12 @@ fn flush_batch(conn: &Connection, batch: &[DbWrite]) -> Result<(), rusqlite::Err
 
     for write in batch {
         match write {
-            DbWrite::InsertRequest(webhook, session_id) => {
-                insert_request_row(&tx, webhook, session_id.as_deref())?;
-            }
-            DbWrite::StartSession {
-                id,
-                name,
-                domain,
-                local_port,
+            DbWrite::InsertRequest {
+                webhook,
+                session_id,
+                ..
             } => {
-                tx.execute(
-                    "INSERT OR IGNORE INTO sessions (id, name, domain, local_port)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![id, name, domain, local_port],
-                )?;
-            }
-            DbWrite::EndSession { id } => {
-                tx.execute(
-                    "UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1",
-                    params![id],
-                )?;
+                insert_request_row(&tx, webhook, session_id.as_deref())?;
             }
             DbWrite::Flush(_) => {}
         }
@@ -1118,10 +1203,11 @@ mod tests {
     async fn session_lifecycle() {
         let db = InspectorDb::open_temp().unwrap();
 
-        db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000);
+        db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000)
+            .unwrap();
         db.insert_request(make_webhook("w1", 200), Some("s1".to_string()));
         db.insert_request(make_webhook("w2", 200), Some("s1".to_string()));
-        db.end_session("s1".to_string());
+        db.end_session("s1".to_string()).unwrap();
         db.flush_pending_writes().await.unwrap();
 
         let sessions = db.list_sessions(10).await.unwrap();
@@ -1133,16 +1219,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_lifecycle_persists_while_the_capture_writer_is_saturated() {
+        let project = tempfile::tempdir().unwrap();
+        let db_path = project.path().join("inspector.db");
+        let write_conn = Connection::open(&db_path).unwrap();
+        init_schema(&write_conn).unwrap();
+        let read_conn = Connection::open(&db_path).unwrap();
+        read_conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA busy_timeout=5000;",
+            )
+            .unwrap();
+        let control_conn = open_control_connection(&db_path).unwrap();
+        let (write_tx, write_rx) = mpsc::channel(1);
+        let queued_capture_bytes = Arc::new(AtomicUsize::new(0));
+        let db = InspectorDb {
+            read_conn: Arc::new(Mutex::new(read_conn)),
+            control_conn: Arc::new(std::sync::Mutex::new(control_conn)),
+            write_tx,
+            queued_capture_bytes: Arc::clone(&queued_capture_bytes),
+            db_path,
+        };
+
+        db.start_session("saturated-session".to_string(), None, 3000)
+            .unwrap();
+        db.insert_request(
+            make_webhook("queued-while-paused", 200),
+            Some("saturated-session".to_string()),
+        );
+        assert_eq!(db.write_tx.capacity(), 0);
+        db.end_session("saturated-session".to_string()).unwrap();
+
+        let writer = tokio::spawn(flush_task(
+            Arc::new(Mutex::new(write_conn)),
+            write_rx,
+            queued_capture_bytes,
+        ));
+        db.flush_pending_writes().await.unwrap();
+
+        let session = db.get_session("saturated-session").await.unwrap().unwrap();
+        assert_eq!(session.request_count, 1);
+        assert!(session.ended_at.is_some());
+        assert!(
+            db.get_webhook("queued-while-paused")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
     async fn clear_history_preserves_an_open_session_for_future_captures() {
         let project = tempfile::tempdir().unwrap();
         let writer = InspectorDb::open(project.path()).unwrap();
         let clearer = InspectorDb::open(project.path()).unwrap();
 
-        writer.start_session(
-            "active-session".to_string(),
-            Some("active.lpm.fyi".to_string()),
-            3000,
-        );
+        writer
+            .start_session(
+                "active-session".to_string(),
+                Some("active.lpm.fyi".to_string()),
+                3000,
+            )
+            .unwrap();
         writer.insert_request(
             make_webhook("before-clear", 200),
             Some("active-session".to_string()),
@@ -1171,12 +1315,23 @@ mod tests {
         init_schema(&conn).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let mut pending_error = None;
-        let mut failed_batch = vec![DbWrite::InsertRequest(
-            Box::new(make_webhook("orphaned-request", 200)),
-            Some("missing-session".to_string()),
-        )];
+        let queued_capture_bytes = AtomicUsize::new(0);
+        let webhook = Arc::new(make_webhook("orphaned-request", 200));
+        let retained_bytes = webhook.retained_size_bytes();
+        queued_capture_bytes.store(retained_bytes, Ordering::Relaxed);
+        let mut failed_batch = vec![DbWrite::InsertRequest {
+            webhook,
+            session_id: Some("missing-session".to_string()),
+            retained_bytes,
+        }];
 
-        flush_pending_batch(&conn, &mut failed_batch, &mut pending_error).await;
+        flush_pending_batch(
+            &conn,
+            &mut failed_batch,
+            &mut pending_error,
+            &queued_capture_bytes,
+        )
+        .await;
 
         assert!(
             pending_error
@@ -1187,11 +1342,44 @@ mod tests {
 
         let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
         let mut marker_batch = vec![DbWrite::Flush(flushed_tx)];
-        flush_pending_batch(&conn, &mut marker_batch, &mut pending_error).await;
+        flush_pending_batch(
+            &conn,
+            &mut marker_batch,
+            &mut pending_error,
+            &queued_capture_bytes,
+        )
+        .await;
 
         let error = flushed_rx.await.unwrap().unwrap_err();
         assert!(error.contains("FOREIGN KEY"));
         assert!(pending_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_queue_byte_budget_rejects_oversized_requests_without_accounting_leaks() {
+        let db = InspectorDb::open_temp().unwrap();
+        let mut webhook = make_webhook("oversized-queue-entry", 200);
+        webhook.request_body = Vec::with_capacity(WRITE_QUEUE_BYTE_BUDGET + 1);
+
+        db.insert_request(webhook, None);
+        db.flush_pending_writes().await.unwrap();
+
+        assert_eq!(db.queued_capture_bytes(), 0);
+        assert_eq!(db.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn capture_queue_releases_byte_budget_after_committing_shared_requests() {
+        let db = InspectorDb::open_temp().unwrap();
+        let mut webhook = make_webhook("shared-queue-entry", 200);
+        webhook.request_body = vec![0; 1024 * 1024];
+        let webhook = Arc::new(webhook);
+
+        db.insert_shared_request(Arc::clone(&webhook), None);
+        db.flush_pending_writes().await.unwrap();
+
+        assert_eq!(db.queued_capture_bytes(), 0);
+        assert_eq!(db.count().await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -1335,7 +1523,8 @@ mod tests {
     #[tokio::test]
     async fn rename_session() {
         let db = InspectorDb::open_temp().unwrap();
-        db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000);
+        db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000)
+            .unwrap();
         db.flush_pending_writes().await.unwrap();
 
         let updated = db
@@ -1358,11 +1547,12 @@ mod tests {
     #[tokio::test]
     async fn get_session_detail() {
         let db = InspectorDb::open_temp().unwrap();
-        db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000);
+        db.start_session("s1".to_string(), Some("acme.lpm.fyi".to_string()), 3000)
+            .unwrap();
         db.insert_request(make_webhook("w1", 200), Some("s1".to_string()));
         db.insert_request(make_webhook("w2", 500), Some("s1".to_string()));
         db.insert_request(make_webhook("w3", 200), Some("s1".to_string()));
-        db.end_session("s1".to_string());
+        db.end_session("s1".to_string()).unwrap();
         db.flush_pending_writes().await.unwrap();
 
         let detail = db.get_session("s1").await.unwrap().unwrap();
@@ -1382,7 +1572,7 @@ mod tests {
     #[tokio::test]
     async fn list_session_requests() {
         let db = InspectorDb::open_temp().unwrap();
-        db.start_session("s1".to_string(), None, 3000);
+        db.start_session("s1".to_string(), None, 3000).unwrap();
         db.insert_request(make_webhook("w1", 200), Some("s1".to_string()));
         db.insert_request(make_webhook("w2", 200), Some("s1".to_string()));
         // This one belongs to a different session

@@ -55,6 +55,7 @@ pub struct EffectiveNodeResolution {
 pub struct PathNodeResolution {
     version: Option<String>,
     runtime_fingerprint: Option<String>,
+    executable: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -103,6 +104,11 @@ impl PathNodeResolution {
     pub fn runtime_fingerprint(&self) -> Option<&str> {
         self.runtime_fingerprint.as_deref()
     }
+
+    /// Executable selected by the script `PATH`, when identifiable.
+    pub fn executable(&self) -> Option<&Path> {
+        self.executable.as_deref()
+    }
 }
 
 impl PathNodeVersionCache {
@@ -138,6 +144,7 @@ impl PathNodeVersionCache {
             runtime_fingerprint: stable_identity
                 .as_ref()
                 .map(|identity| identity.runtime_fingerprint.clone()),
+            executable: executable_before,
         };
         if let Some(identity) = stable_identity {
             self.resolutions.insert(identity, resolution.clone());
@@ -228,8 +235,18 @@ pub fn resolve_node_on_path_with_fingerprint(cwd: &Path, path: &OsStr) -> PathNo
 
 /// Fingerprint the Node executable selected by a script's cwd and `PATH`.
 pub fn probe_node_fingerprint_on_path(cwd: &Path, path: &OsStr) -> Option<String> {
-    let executable = node_executable_in_path(cwd, path)?;
+    let executable = runtime_executable_in_path(cwd, path, detect::RuntimeKind::Node)?;
     executable_fingerprint(b"script-path\0", &executable)
+}
+
+/// Fingerprint a Node or Bun executable selected by a script's cwd and `PATH`.
+pub fn probe_runtime_fingerprint_on_path(
+    cwd: &Path,
+    path: &OsStr,
+    runtime: detect::RuntimeKind,
+) -> Option<String> {
+    let executable = runtime_executable_in_path(cwd, path, runtime)?;
+    executable_fingerprint(runtime.as_str().as_bytes(), &executable)
 }
 
 /// Fingerprint the Node executable LPM would select without executing it.
@@ -392,8 +409,16 @@ fn system_node_executable() -> Option<PathBuf> {
 }
 
 fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
+    runtime_executable_in_path(cwd, path, detect::RuntimeKind::Node)
+}
+
+fn runtime_executable_in_path(
+    cwd: &Path,
+    path: &OsStr,
+    runtime: detect::RuntimeKind,
+) -> Option<PathBuf> {
     #[cfg(windows)]
-    let executable_names = windows_node_executable_names();
+    let executable_names = windows_runtime_executable_names(runtime);
 
     #[cfg(windows)]
     for executable_name in &executable_names {
@@ -417,7 +442,7 @@ fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
             }
         }
         #[cfg(not(windows))]
-        let candidate = dir.join("node");
+        let candidate = dir.join(runtime.binary_name());
 
         #[cfg(not(windows))]
         if executable_file(&candidate) {
@@ -428,7 +453,7 @@ fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn windows_node_executable_names() -> Vec<std::ffi::OsString> {
+fn windows_runtime_executable_names(runtime: detect::RuntimeKind) -> Vec<std::ffi::OsString> {
     let path_extensions =
         std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     let mut names = Vec::with_capacity(4);
@@ -436,7 +461,9 @@ fn windows_node_executable_names() -> Vec<std::ffi::OsString> {
         path_extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
-            .map(|extension| std::ffi::OsString::from(format!("node{extension}"))),
+            .map(|extension| {
+                std::ffi::OsString::from(format!("{}{extension}", runtime.binary_name()))
+            }),
     );
     names
 }

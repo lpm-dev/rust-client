@@ -1,5 +1,6 @@
 use super::cache::{
-    is_task_cached_with_config, try_cache_hit_with_config, try_cache_store_with_output_and_config,
+    CacheStoreRequest, is_task_cached_with_config, try_cache_hit_with_config,
+    try_cache_store_with_output_and_config,
 };
 use super::format::{
     TaskResult, format_failed_task_output_footer, format_failed_task_output_header,
@@ -132,8 +133,14 @@ pub(super) async fn run_tasks_parallel(
 
             // Check cache
             if !no_cache
-                && let Ok(Some(hit)) =
-                    try_cache_hit_with_config(project_dir, task_name, env_mode, lpm_config)
+                && let Ok(Some(hit)) = try_cache_hit_with_config(
+                    project_dir,
+                    task_name,
+                    env_mode,
+                    extra_args,
+                    bin_hint,
+                    lpm_config,
+                )
             {
                 if !hit.stdout.is_empty() {
                     print_captured_stdout(&hit.stdout);
@@ -171,15 +178,17 @@ pub(super) async fn run_tasks_parallel(
                 ) {
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        let _ = try_cache_store_with_output_and_config(
+                        let _ = try_cache_store_with_output_and_config(CacheStoreRequest {
                             project_dir,
-                            task_name,
+                            script_name: task_name,
                             env_mode,
+                            extra_args,
+                            bin_hint,
                             duration_ms,
-                            &output.stdout,
-                            &output.stderr,
+                            stdout: &output.stdout,
+                            stderr: &output.stderr,
                             lpm_config,
-                        );
+                        });
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: true,
@@ -289,6 +298,8 @@ pub(super) async fn run_tasks_parallel(
                                     &dir,
                                     &name,
                                     mode.as_deref(),
+                                    &args,
+                                    &hint_clone,
                                     config_clone.as_deref(),
                                 )
                             {
@@ -312,8 +323,9 @@ pub(super) async fn run_tasks_parallel(
                             let result = if is_stream {
                                 // Streaming: prefixed live output, no double-print
                                 if let Some(cmd) = &command_override {
-                                    lpm_runner::script::run_command_prefixed(
+                                    lpm_runner::script::run_task_command_prefixed(
                                         &dir,
+                                        &name,
                                         cmd,
                                         &args,
                                         mode.as_deref(),
@@ -335,8 +347,9 @@ pub(super) async fn run_tasks_parallel(
                             } else {
                                 // Buffered: capture silently, print after completion
                                 if let Some(cmd) = &command_override {
-                                    lpm_runner::script::run_command_buffered(
+                                    lpm_runner::script::run_task_command_buffered(
                                         &dir,
+                                        &name,
                                         cmd,
                                         &args,
                                         mode.as_deref(),
@@ -359,13 +372,17 @@ pub(super) async fn run_tasks_parallel(
                                     if !no_cache {
                                         let duration_ms = start.elapsed().as_millis() as u64;
                                         let _ = try_cache_store_with_output_and_config(
-                                            &dir,
-                                            &name,
-                                            mode.as_deref(),
-                                            duration_ms,
-                                            &output.stdout,
-                                            &output.stderr,
-                                            config_clone.as_deref(),
+                                            CacheStoreRequest {
+                                                project_dir: &dir,
+                                                script_name: &name,
+                                                env_mode: mode.as_deref(),
+                                                extra_args: &args,
+                                                bin_hint: &hint_clone,
+                                                duration_ms,
+                                                stdout: &output.stdout,
+                                                stderr: &output.stderr,
+                                                lpm_config: config_clone.as_deref(),
+                                            },
                                         );
                                     }
                                     (

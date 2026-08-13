@@ -2,6 +2,7 @@ use super::dev_ui;
 use crate::install_ui;
 use lpm_common::color::Painted;
 use lpm_common::{LocalScheme, LocalTarget, LpmError};
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -24,6 +25,57 @@ fn show_tunnel_notice(message: &str) {
     } else if message.contains("concurrent") {
         dev_ui::hint_line("Close other tunnels first, or upgrade your plan");
     }
+}
+
+async fn prepare_service_runtime_hints(
+    project_dir: &Path,
+    services: &HashMap<String, lpm_runner::lpm_json::ServiceConfig>,
+    filters: &[String],
+    root_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+) -> Result<HashMap<String, lpm_runner::bin_path::ManagedRuntimeHint>, LpmError> {
+    let active_names: HashSet<String> = if filters.is_empty() {
+        services.keys().cloned().collect()
+    } else {
+        let mut active = HashSet::new();
+        for name in filters {
+            if !services.contains_key(name) {
+                return Err(LpmError::Script(format!(
+                    "service '{name}' not found. Available: {}",
+                    services.keys().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            active.extend(lpm_runner::service_graph::transitive_deps(name, services));
+        }
+        active
+    };
+
+    let mut hints = HashMap::with_capacity(active_names.len());
+    let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
+    let mut ordered_names: Vec<_> = active_names.into_iter().collect();
+    ordered_names.sort_unstable();
+    for name in ordered_names {
+        let config = &services[&name];
+        let service_dir = config
+            .cwd
+            .as_deref()
+            .map(|cwd| lpm_runner::orchestrator::safe_resolve_cwd(project_dir, cwd))
+            .transpose()
+            .map_err(|error| LpmError::Script(format!("service '{name}': {error}")))?
+            .unwrap_or_else(|| project_dir.to_path_buf());
+        let selectors = lpm_runtime::detect::detect_runtime_versions(&service_dir)?;
+        let hint = if service_dir == project_dir || selectors.is_empty() {
+            root_hint.clone()
+        } else {
+            let selected_runtimes: Vec<_> =
+                selectors.iter().map(|selector| selector.runtime).collect();
+            super::run::ensure_detected_runtimes(selectors)
+                .await
+                .inherit_unselected_from(root_hint, &selected_runtimes)
+        };
+        super::run::validate_runtime_with_cache(&service_dir, &hint, false, &mut node_versions)?;
+        hints.insert(name, hint);
+    }
+    Ok(hints)
 }
 
 struct DevCertSetup {
@@ -203,6 +255,7 @@ pub async fn run(
         tunnel_source: None,
         network_addr: None,
         node_version: None,
+        node_source: None,
         inspector_url: None,
         proxy_lines: startup_proxy_lines,
     };
@@ -235,23 +288,13 @@ pub async fn run(
     let local_domain_hostnames_for_cert = local_domain_hostnames.clone();
     let cert_extra_permitted_dns_for_cert = cert_extra_permitted_dns.clone();
 
-    let node_version_handle = tokio::task::spawn_blocking(|| {
-        std::process::Command::new("node")
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout).ok()
-                } else {
-                    None
-                }
-            })
-            .map(|v| v.trim().to_string())
-    });
+    let selected_node_source = detected_runtimes
+        .iter()
+        .find(|detected| detected.runtime == lpm_runtime::detect::RuntimeKind::Node)
+        .map(lpm_runtime::detect::DetectedRuntimeVersion::source_label);
     let dev_entrypoint_compatibility_bins = dev_entrypoint_compatibility_bins(project_dir);
 
-    let (install_result, env_result, https_result, runtime_hint, node_version_result) = tokio::join!(
+    let (install_result, env_result, https_result, runtime_hint) = tokio::join!(
         async {
             if !no_install {
                 auto_install_if_stale(client, &install_dir, &dev_entrypoint_compatibility_bins)
@@ -305,13 +348,35 @@ pub async fn run(
             }
         },
         async { super::run::ensure_detected_runtimes(detected_runtimes).await },
-        async { node_version_handle.await.unwrap_or(None) },
     );
 
     // Process parallel results
     startup.deps_status = install_result?;
     startup.env_status = env_result;
-    startup.node_version = node_version_result;
+    let script_path =
+        lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, &runtime_hint)?;
+    let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
+        project_dir,
+        std::ffi::OsStr::new(&script_path),
+    );
+    if let Some(requirement) =
+        crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
+    {
+        crate::engine_check::enforce_resolved_node_for_run(
+            requirement,
+            effective_node.clone(),
+            false,
+        )?;
+    }
+    if let Some(version) = effective_node.version() {
+        startup.node_version = Some(format!("v{version}"));
+        startup.node_source = Some(node_source_for_resolution(
+            project_dir,
+            &runtime_hint,
+            &effective_node,
+            selected_node_source.as_deref(),
+        ));
+    }
 
     let https_setup: Option<DevCertSetup> = https_result?;
     if let Some(cert_setup) = https_setup {
@@ -342,7 +407,7 @@ pub async fn run(
     // When --dashboard is active, orchestrator events and webhook events
     // are forwarded through this channel to the TUI.
     let (dashboard_event_tx, dashboard_event_rx) = if dashboard {
-        let (tx, rx) = std::sync::mpsc::channel::<lpm_dashboard::DashboardEvent>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<lpm_dashboard::DashboardEvent>(256);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -415,7 +480,7 @@ pub async fn run(
 
         // Create webhook capture channel.
         let (webhook_tx, mut webhook_rx) =
-            tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
+            tokio::sync::mpsc::channel::<lpm_tunnel::webhook::CapturedWebhook>(64);
 
         tracing::warn!(
             target: "lpm_cli::dev",
@@ -433,8 +498,9 @@ pub async fn run(
 
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.
-        let dashboard_webhook_tx: Option<std::sync::mpsc::Sender<lpm_dashboard::DashboardEvent>> =
-            dashboard_event_tx.clone();
+        let dashboard_webhook_tx: Option<
+            std::sync::mpsc::SyncSender<lpm_dashboard::DashboardEvent>,
+        > = dashboard_event_tx.clone();
 
         // Generate tunnel auth token if requested (random 32-byte hex, one per session)
         let tunnel_auth_token = if tunnel_auth {
@@ -463,13 +529,16 @@ pub async fn run(
         let inspector_state_for_consumer = inspector_state.clone();
         capture_consumer_handle = Some(tokio::spawn(async move {
             while let Some(webhook) = webhook_rx.recv().await {
-                inspector_state_for_consumer.push(webhook.clone()).await;
+                let webhook = Arc::new(webhook);
+                inspector_state_for_consumer
+                    .push_shared(Arc::clone(&webhook))
+                    .await;
 
                 // Forward to dashboard if active
                 if let Some(ref tx) = dashboard_webhook_tx {
-                    let _ = tx.send(lpm_dashboard::DashboardEvent::WebhookCaptured(Box::new(
-                        webhook.clone(),
-                    )));
+                    let _ = tx.try_send(lpm_dashboard::DashboardEvent::WebhookCaptured(
+                        Arc::clone(&webhook),
+                    ));
                 }
 
                 // Inline display: skip when dashboard is active (dashboard shows its own view),
@@ -529,7 +598,7 @@ pub async fn run(
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = local_target;
             options_clone.live_local_target = Some(live_local_target);
-            let result = lpm_tunnel::client::connect_with_usage(
+            let result = lpm_tunnel::client::connect_with_usage_fallible(
                 &options_clone,
                 move |session| {
                     let url = session.tunnel_url.clone();
@@ -537,7 +606,13 @@ pub async fn run(
                     let domain = Some(session.domain.clone());
                     let local = session.local_port;
                     let state = inspector_state_for_connect.clone();
-                    state.start_session_immediate(session_id, domain, local, None);
+                    state
+                        .start_session_immediate(session_id, domain, local, None)
+                        .map_err(|error| {
+                            LpmError::Tunnel(format!(
+                                "failed to persist inspector session start: {error}"
+                            ))
+                        })?;
                     tokio::spawn(async move {
                         state.set_tunnel_url(url).await;
                     });
@@ -578,6 +653,7 @@ pub async fn run(
                             session.tunnel_url
                         ));
                     }
+                    Ok(())
                 },
                 show_tunnel_notice,
                 move |usage, initial| {
@@ -601,11 +677,13 @@ pub async fn run(
 
     // ── Check for multi-service orchestration ──────────────────────────
     if has_services {
-        print_startup_banner(&startup, project_dir);
         let config = lpm_config.as_ref().ok_or_else(|| {
             LpmError::Script("multi-service configuration disappeared before startup".to_string())
         })?;
         let services = &config.services;
+        let service_runtime_hints =
+            prepare_service_runtime_hints(project_dir, services, extra_args, &runtime_hint).await?;
+        print_startup_banner(&startup, project_dir);
         let primary_service = primary_proxy_service_for_display(config).map(str::to_string);
         if primary_service.is_none() && (requested_port.is_some() || https || network || tunnel) {
             return Err(LpmError::Script(
@@ -626,7 +704,7 @@ pub async fn run(
         // The orchestrator sends OrchestratorEvent, the dashboard receives DashboardEvent.
         let orchestrator_event_tx = dashboard_event_tx.as_ref().map(|dash_tx| {
             let (orch_tx, orch_rx) =
-                std::sync::mpsc::channel::<lpm_runner::orchestrator::OrchestratorEvent>();
+                std::sync::mpsc::sync_channel::<lpm_runner::orchestrator::OrchestratorEvent>(256);
             let dash_tx = dash_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(event) = orch_rx.recv() {
@@ -647,8 +725,20 @@ pub async fn run(
                             status: convert_service_status(&status),
                         },
                     };
-                    if dash_tx.send(dash_event).is_err() {
-                        break;
+                    match dash_event {
+                        event @ lpm_dashboard::DashboardEvent::ServiceLog { .. } => {
+                            if matches!(
+                                dash_tx.try_send(event),
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_))
+                            ) {
+                                break;
+                            }
+                        }
+                        event => {
+                            if dash_tx.send(event).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             });
@@ -878,6 +968,8 @@ pub async fn run(
             https: false,
             filter: extra_args.to_vec(), // lpm dev web api → filter to web + api
             extra_envs: extra_env.clone(),
+            env_mode: env_mode.map(str::to_string),
+            service_runtime_hints,
             event_tx: orchestrator_event_tx,
             command_rx: orch_cmd_rx,
             on_ports_assigned,
@@ -954,7 +1046,7 @@ pub async fn run(
                         port: svc.port,
                         hosts: dashboard_service_hosts(config, name),
                         status: lpm_dashboard::ServiceStatus::Starting,
-                        logs: lpm_dashboard::LogBuffer::new(5000),
+                        logs: lpm_dashboard::LogBuffer::with_limits(5000, 16 * 1024 * 1024),
                     }
                 })
                 .collect();
@@ -1595,7 +1687,9 @@ async fn shutdown_multi_service_tunnel_after(
         None => Ok(()),
     };
     let persistence_result = if let Some(state) = inspector_state {
-        state.end_session().await;
+        state.end_session().await.map_err(|error| {
+            LpmError::Tunnel(format!("failed to persist inspector session end: {error}"))
+        })?;
         state.flush().await.map_err(|error| {
             LpmError::Tunnel(format!(
                 "failed to commit captures to .lpm/inspector.db: {error}"
@@ -1741,6 +1835,8 @@ struct StartupInfo {
     network_addr: Option<String>,
     /// Node.js version string (e.g. "v20.11.0"), pre-fetched in parallel
     node_version: Option<String>,
+    /// Source of the executable reported by `node_version`.
+    node_source: Option<String>,
     /// Live browser-inspector URL (e.g. `http://127.0.0.1:53412`) when
     /// `--tunnel` started one. Printed in the banner so the user can
     /// copy-paste it; the dashboard's `o` key opens the same URL.
@@ -1762,14 +1858,28 @@ struct StartupBannerLine {
     hint: Option<String>,
 }
 
-fn node_source_hint(project_dir: &Path) -> &'static str {
-    if project_dir.join(".nvmrc").exists() {
-        "from .nvmrc"
-    } else if project_dir.join(".node-version").exists() {
-        "from .node-version"
-    } else {
-        "system"
+fn node_source_for_resolution(
+    project_dir: &Path,
+    runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    resolution: &lpm_runtime::effective::PathNodeResolution,
+    selected_source: Option<&str>,
+) -> String {
+    let Some(executable) = resolution.executable() else {
+        return "system PATH".to_string();
+    };
+    if runtime_hint
+        .bin_dir(lpm_runtime::detect::RuntimeKind::Node)
+        .is_some_and(|bin_dir| executable.starts_with(bin_dir))
+    {
+        return selected_source.unwrap_or("managed runtime").to_string();
     }
+    if lpm_runner::bin_path::find_bin_dirs(project_dir)
+        .iter()
+        .any(|bin_dir| executable.starts_with(bin_dir))
+    {
+        return "project PATH".to_string();
+    }
+    "system PATH".to_string()
 }
 
 fn normalize_env_banner_status(status: &str) -> (String, Option<String>) {
@@ -1793,14 +1903,17 @@ fn split_trailing_parenthetical(status: &str) -> (String, Option<String>) {
     )
 }
 
-fn startup_banner_lines(info: &StartupInfo, project_dir: &Path) -> Vec<StartupBannerLine> {
+fn startup_banner_lines(info: &StartupInfo, _project_dir: &Path) -> Vec<StartupBannerLine> {
     let mut lines = Vec::new();
 
     if let Some(ref version) = info.node_version {
         lines.push(StartupBannerLine {
             label: "Node",
             value: version.clone(),
-            hint: Some(format!("({})", node_source_hint(project_dir))),
+            hint: info
+                .node_source
+                .as_ref()
+                .map(|source| format!("({source})")),
         });
     }
 
@@ -1934,7 +2047,7 @@ async fn auto_install_if_stale(
     }
 
     // Single-writer ownership: `run_with_options` is the only writer
-    // of `.lpm/install-hash`. Pre-fix this branch wrote a stale,
+    // of `.lpm/install-hash`. This branch must not write a stale,
     // pre-install single-line hash AFTER the install returned,
     // clobbering the v6 mtime / linker metadata the install pipeline
     // had just written and (worse) using the pre-install hash even
@@ -1942,10 +2055,8 @@ async fn auto_install_if_stale(
     // The install pipeline now writes the correct v6 hash on every
     // successful exit path; this branch just propagates success.
     //
-    // Step 6 fix: use the injected client. Pre-fix this
-    // built a fresh `RegistryClient::new()` with no token, so any
-    // `@lpm.dev` package required by the dev project would have been
-    // unauthenticated.
+    // Use the injected client so nested installs preserve the caller's
+    // registry, authentication, and test configuration.
     let nested_install_result = {
         let _stdout_suppressed = crate::output::suppress_stdout(true).map_err(LpmError::Script)?;
         let _stderr_suppressed = crate::output::suppress_stderr(true).map_err(LpmError::Script)?;
@@ -2818,6 +2929,7 @@ mod tests {
             tunnel_source: Some("lpm.json".to_string()),
             network_addr: Some("192.168.1.42:3000".to_string()),
             node_version: Some("v22.22.1".to_string()),
+            node_source: Some("from .nvmrc".to_string()),
             inspector_url: Some("http://127.0.0.1:53412".to_string()),
             proxy_lines: vec![StartupProxyLine {
                 host: "web.localhost".to_string(),
@@ -2885,6 +2997,7 @@ mod tests {
             tunnel_source: Some("--domain".to_string()),
             network_addr: None,
             node_version: Some("v20.11.0".to_string()),
+            node_source: Some("system PATH".to_string()),
             inspector_url: None,
             proxy_lines: Vec::new(),
         };
@@ -2895,7 +3008,7 @@ mod tests {
                 StartupBannerLine {
                     label: "Node",
                     value: "v20.11.0".to_string(),
-                    hint: Some("(system)".to_string()),
+                    hint: Some("(system PATH)".to_string()),
                 },
                 StartupBannerLine {
                     label: "Deps",
@@ -3559,7 +3672,7 @@ mod tests {
 
         // Send webhook event (same pattern as dev.rs consumer)
         dash_tx
-            .send(lpm_dashboard::DashboardEvent::WebhookCaptured(Box::new(
+            .send(lpm_dashboard::DashboardEvent::WebhookCaptured(Arc::new(
                 webhook,
             )))
             .unwrap();

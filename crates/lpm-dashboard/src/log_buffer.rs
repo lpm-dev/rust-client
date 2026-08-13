@@ -6,21 +6,45 @@ use std::collections::VecDeque;
 pub struct LogBuffer {
     lines: VecDeque<String>,
     capacity: usize,
+    max_bytes: usize,
+    retained_bytes: usize,
+    dropped_lines: u64,
 }
 
 impl LogBuffer {
     pub fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, usize::MAX)
+    }
+
+    pub fn with_limits(capacity: usize, max_bytes: usize) -> Self {
+        assert!(capacity > 0, "LogBuffer capacity must be > 0");
+        assert!(max_bytes > 0, "LogBuffer byte limit must be > 0");
         Self {
             lines: VecDeque::with_capacity(capacity.min(1024)),
             capacity,
+            max_bytes,
+            retained_bytes: 0,
+            dropped_lines: 0,
         }
     }
 
     pub fn push(&mut self, line: String) {
         let clean = lpm_common::sanitize_terminal_inline(&line).into_owned();
-        if self.lines.len() >= self.capacity {
-            self.lines.pop_front();
+        let line_bytes = clean.capacity();
+        if line_bytes > self.max_bytes {
+            self.dropped_lines = self.dropped_lines.saturating_add(1);
+            return;
         }
+        while self.lines.len() >= self.capacity
+            || self.retained_bytes.saturating_add(line_bytes) > self.max_bytes
+        {
+            let Some(evicted) = self.lines.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.capacity());
+            self.dropped_lines = self.dropped_lines.saturating_add(1);
+        }
+        self.retained_bytes += line_bytes;
         self.lines.push_back(clean);
     }
 
@@ -34,6 +58,14 @@ impl LogBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub fn dropped_lines(&self) -> u64 {
+        self.dropped_lines
     }
 
     /// Get lines starting from `offset` (for scrolling).
@@ -91,6 +123,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "LogBuffer capacity must be > 0")]
+    fn zero_capacity_is_rejected() {
+        LogBuffer::with_limits(0, 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "LogBuffer byte limit must be > 0")]
+    fn zero_byte_limit_is_rejected() {
+        LogBuffer::with_limits(10, 0);
+    }
+
+    #[test]
     fn shared_policy_removes_csi_sequences() {
         assert_eq!(
             lpm_common::sanitize_terminal_inline("\x1b[31mred\x1b[0m"),
@@ -145,5 +189,32 @@ mod tests {
 
         let lines: Vec<&str> = buf.lines().collect();
         assert_eq!(lines, vec!["safe tail end"]);
+    }
+
+    #[test]
+    fn byte_limit_evicts_oldest_lines() {
+        let mut buf = LogBuffer::with_limits(10, 6);
+        buf.push("abc".into());
+        buf.push("def".into());
+        buf.push("ghi".into());
+
+        assert_eq!(buf.lines().collect::<Vec<_>>(), vec!["def", "ghi"]);
+        assert!(buf.retained_bytes() <= 6);
+        assert_eq!(buf.dropped_lines(), 1);
+    }
+
+    #[test]
+    fn noisy_service_output_stays_within_the_byte_budget() {
+        let line = "x".repeat(8 * 1024);
+        let byte_limit = 64 * 1024;
+        let mut buf = LogBuffer::with_limits(1_000, byte_limit);
+
+        for _ in 0..1_000 {
+            buf.push(line.clone());
+        }
+
+        assert!(buf.retained_bytes() <= byte_limit);
+        assert_eq!(buf.len(), byte_limit / line.len());
+        assert_eq!(buf.dropped_lines(), 1_000 - buf.len() as u64);
     }
 }

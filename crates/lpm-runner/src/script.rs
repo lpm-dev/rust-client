@@ -51,32 +51,185 @@ fn mark_script_child_env(env_vars: &mut HashMap<String, String>) {
     env_vars.insert(LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
 }
 
-/// Escape a string for safe interpolation inside a single-quoted POSIX
-/// shell word. `'foo'\''bar'` is the canonical POSIX way to embed a
-/// literal `'`: close the quoted run, emit `\'`, reopen the quoted run.
-fn shell_single_quote(arg: &str) -> String {
+/// Escape a runtime argument so the platform shell treats it as data.
+#[cfg(not(windows))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Windows implementation can reject unsafe cmd.exe arguments"
+)]
+fn shell_quote_arg(
+    arg: &str,
+    _script_cmd: &str,
+    _project_dir: &Path,
+    _path: &str,
+) -> Result<String, LpmError> {
     let escaped = arg.replace('\'', "'\\''");
-    format!("'{escaped}'")
+    Ok(format!("'{escaped}'"))
 }
 
-/// Build the shell command for a script invocation by single-quoting
-/// every runtime arg before concatenation. The script body is owned by
+#[cfg(windows)]
+fn shell_quote_arg(
+    arg: &str,
+    script_cmd: &str,
+    project_dir: &Path,
+    path: &str,
+) -> Result<String, LpmError> {
+    windows_shell_quote_arg(
+        arg,
+        windows_command_uses_batch_shim(script_cmd, project_dir, path),
+    )
+}
+
+#[cfg(any(test, windows))]
+fn windows_shell_quote_arg(arg: &str, double_escape: bool) -> Result<String, LpmError> {
+    if arg
+        .bytes()
+        .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+    {
+        return Err(LpmError::Script(
+            "runtime arguments containing line breaks cannot be passed safely through cmd.exe"
+                .to_string(),
+        ));
+    }
+
+    let mut quoted = String::with_capacity(arg.len().saturating_mul(2).saturating_add(2));
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for character in arg.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            for _ in 0..backslashes.saturating_mul(2).saturating_add(1) {
+                quoted.push('\\');
+            }
+            quoted.push('"');
+        } else {
+            for _ in 0..backslashes {
+                quoted.push('\\');
+            }
+            quoted.push(character);
+        }
+        backslashes = 0;
+    }
+    for _ in 0..backslashes.saturating_mul(2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+
+    let escaped = windows_escape_cmd_metacharacters(&quoted);
+    if double_escape {
+        Ok(windows_escape_cmd_metacharacters(&escaped))
+    } else {
+        Ok(escaped)
+    }
+}
+
+#[cfg(any(test, windows))]
+fn windows_escape_cmd_metacharacters(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len().saturating_mul(2));
+    for character in value.chars() {
+        if matches!(
+            character,
+            '(' | ')'
+                | '['
+                | ']'
+                | '%'
+                | '!'
+                | '^'
+                | '"'
+                | '`'
+                | '<'
+                | '>'
+                | '&'
+                | '|'
+                | ';'
+                | ','
+                | ' '
+                | '*'
+                | '?'
+        ) {
+            escaped.push('^');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+#[cfg(windows)]
+fn windows_command_uses_batch_shim(script_cmd: &str, project_dir: &Path, path: &str) -> bool {
+    let Some(command_name) = windows_first_command_word(script_cmd) else {
+        return false;
+    };
+    let command_path = Path::new(command_name);
+    if command_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+    {
+        return true;
+    }
+    if command_path.extension().is_some() {
+        return false;
+    }
+
+    let mut search_dirs = Vec::new();
+    if command_path.components().count() > 1 {
+        search_dirs.push(project_dir.to_path_buf());
+    } else {
+        search_dirs.extend(std::env::split_paths(path));
+    }
+    for directory in search_dirs {
+        let candidate = directory.join(command_path);
+        for extension in ["com", "exe", "bat", "cmd"] {
+            let candidate = candidate.with_extension(extension);
+            if candidate.is_file() {
+                return matches!(extension, "bat" | "cmd");
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn windows_first_command_word(script_cmd: &str) -> Option<&str> {
+    let trimmed = script_cmd.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        return rest.split_once('"').map(|(command, _)| command);
+    }
+    let end = trimmed
+        .find(|character: char| character.is_whitespace() || "&|<>()".contains(character))
+        .unwrap_or(trimmed.len());
+    (end > 0).then(|| &trimmed[..end])
+}
+
+/// Build the shell command for a script invocation by quoting every runtime
+/// argument for the platform shell. The script body is owned by
 /// `package.json` (developer-authored) and legitimately contains shell
 /// metacharacters (pipes, redirects, `$VAR`), so it is concatenated
 /// verbatim. Extra args, however, come from the CLI tail (already
 /// split into argv by the user's shell) and must not re-introduce
 /// metacharacter semantics — otherwise `lpm run x -- "; rm -rf ~"`
 /// detonates inside `sh -c`.
-fn assemble_shell_command(script_cmd: &str, extra_args: &[String]) -> String {
+fn assemble_shell_command(
+    script_cmd: &str,
+    extra_args: &[String],
+    project_dir: &Path,
+    path: &str,
+) -> Result<String, LpmError> {
     if extra_args.is_empty() {
-        return script_cmd.to_string();
+        return Ok(script_cmd.to_string());
     }
-    let quoted = extra_args
-        .iter()
-        .map(|a| shell_single_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{script_cmd} {quoted}")
+    let mut full_command = String::with_capacity(
+        script_cmd.len() + extra_args.iter().map(|arg| arg.len() + 3).sum::<usize>(),
+    );
+    full_command.push_str(script_cmd);
+    for arg in extra_args {
+        full_command.push(' ');
+        full_command.push_str(&shell_quote_arg(arg, script_cmd, project_dir, path)?);
+    }
+    Ok(full_command)
 }
 
 /// Run a package.json script by name, with PATH injection, .env loading, and hooks.
@@ -151,7 +304,7 @@ pub fn run_script_with_envs(
         }
     }
 
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     // Run the main script
     let status = shell::spawn_shell(&ShellCommand {
@@ -227,7 +380,7 @@ pub fn run_dev_script_with_envs(
         }
     }
 
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
     let status = shell::spawn_shell_with_endpoint(
         &ShellCommand {
             command: &full_cmd,
@@ -236,9 +389,15 @@ pub fn run_dev_script_with_envs(
             envs: &env_vars,
         },
         endpoint_options.requested_port,
-        endpoint_options.stop_requested,
+        Arc::clone(&endpoint_options.stop_requested),
         endpoint_options.on_endpoint,
     )?;
+    if endpoint_options
+        .stop_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
     if !status.success() {
         return Err(LpmError::ExitCode(shell::exit_code(&status)));
     }
@@ -307,7 +466,7 @@ pub fn run_script_captured(
         }
     }
 
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     // Run the main script with tee capture
     let captured = shell::spawn_shell_tee(&ShellCommand {
@@ -381,7 +540,7 @@ pub fn run_script_buffered(
         }
     }
 
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     // Capture without terminal echo
     let captured = shell::spawn_shell_capture(&ShellCommand {
@@ -430,7 +589,34 @@ pub fn run_command_buffered(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    run_command_buffered_with_envs(project_dir, command, extra_args, env_mode, &[], bin_hint)
+    run_command_buffered_named(
+        project_dir,
+        "",
+        command,
+        extra_args,
+        env_mode,
+        &[],
+        bin_hint,
+    )
+}
+
+pub fn run_task_command_buffered(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_buffered_named(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        &[],
+        bin_hint,
+    )
 }
 
 /// Run an explicit command with fully captured output and additional env vars.
@@ -442,14 +628,34 @@ pub fn run_command_buffered_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    run_command_buffered_named(
+        project_dir,
+        "",
+        command,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+    )
+}
+
+fn run_command_buffered_named(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
 
-    let full_cmd = assemble_shell_command(command, extra_args);
+    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
     let captured = shell::spawn_shell_capture(&ShellCommand {
         command: &full_cmd,
@@ -488,7 +694,7 @@ pub fn run_script_prefixed(
     let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args);
+    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     let captured = shell::spawn_shell_prefixed(
         &ShellCommand {
@@ -525,11 +731,63 @@ pub fn run_command_prefixed(
     color: &str,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    run_command_prefixed_named(
+        project_dir,
+        "",
+        command,
+        extra_args,
+        env_mode,
+        prefix,
+        color,
+        bin_hint,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner boundary keeps the task, shell, environment, output, and runtime inputs explicit"
+)]
+pub fn run_task_command_prefixed(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_prefixed_named(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        prefix,
+        color,
+        bin_hint,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the runner boundary keeps the task, shell, environment, output, and runtime inputs explicit"
+)]
+fn run_command_prefixed_named(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 
-    let full_cmd = assemble_shell_command(command, extra_args);
+    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
     let captured = shell::spawn_shell_prefixed(
         &ShellCommand {
@@ -569,7 +827,34 @@ pub fn run_command(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    run_command_with_envs(project_dir, command, extra_args, env_mode, &[], bin_hint)
+    run_command_named_with_envs(
+        project_dir,
+        "",
+        command,
+        extra_args,
+        env_mode,
+        &[],
+        bin_hint,
+    )
+}
+
+pub fn run_task_command(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<(), LpmError> {
+    run_command_named_with_envs(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        &[],
+        bin_hint,
+    )
 }
 
 /// Run an explicit command string with additional environment variables.
@@ -581,14 +866,34 @@ pub fn run_command_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
+    run_command_named_with_envs(
+        project_dir,
+        "",
+        command,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+    )
+}
+
+fn run_command_named_with_envs(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<(), LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     for (key, value) in extra_envs {
         env_vars.insert(key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
 
-    let full_cmd = assemble_shell_command(command, extra_args);
+    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
     let status = shell::spawn_shell(&ShellCommand {
         command: &full_cmd,
@@ -767,11 +1072,40 @@ pub fn run_command_captured(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    run_command_captured_named(project_dir, "", command, extra_args, env_mode, bin_hint)
+}
+
+pub fn run_task_command_captured(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_captured_named(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        bin_hint,
+    )
+}
+
+fn run_command_captured_named(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, "", env_mode)?.vars;
+    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     mark_script_child_env(&mut env_vars);
 
-    let full_cmd = assemble_shell_command(command, extra_args);
+    let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
     let captured = shell::spawn_shell_tee(&ShellCommand {
         command: &full_cmd,
@@ -799,6 +1133,7 @@ fn print_env_context(loaded: &LoadedEnv) {
 
     let via = match (loaded.source, &loaded.alias) {
         ("--env flag", _) => format!("via {}", "--env".dimmed()),
+        ("lpm.json task", _) => "via lpm.json task".to_string(),
         ("lpm.json", Some(alias)) => {
             format!(
                 "via lpm.json \"{}\"",
@@ -880,6 +1215,16 @@ fn resolve_and_load_env(
         };
         let alias = resolved.alias.clone();
         (Some(resolved.canonical), alias, "--env flag")
+    } else if let Some(task_mode) = config
+        .as_ref()
+        .and_then(|config| config.tasks.get(script_name))
+        .and_then(|task| task.env.as_deref())
+    {
+        let config = config.as_ref().expect("task mode requires lpm.json");
+        let resolved =
+            lpm_env::resolver::resolve(task_mode, &config.env, config.environments.as_ref());
+        let alias = resolved.alias.clone();
+        (Some(resolved.canonical), alias, "lpm.json task")
     } else {
         match config.as_ref().and_then(|c| {
             lpm_env::resolver::resolve_from_script(script_name, &c.env, c.environments.as_ref())
@@ -912,6 +1257,19 @@ fn resolve_and_load_env(
         source,
         vault_count,
     })
+}
+
+/// Load the exact environment that a named script or task receives.
+///
+/// This applies the same precedence as script execution: an explicit mode,
+/// then `tasks.<name>.env`, then the `lpm.json` script mapping, then the
+/// default environment.
+pub fn load_script_env(
+    project_dir: &Path,
+    script_name: &str,
+    explicit_mode: Option<&str>,
+) -> Result<HashMap<String, String>, LpmError> {
+    Ok(resolve_and_load_env(project_dir, script_name, explicit_mode)?.vars)
 }
 
 /// Resolve only a script command from package.json or lpm.json tasks.
@@ -1593,31 +1951,75 @@ mod tests {
         assert!(output.stdout.contains("prefixed-test"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn assemble_shell_command_quotes_extra_args_against_injection() {
+        let project = Path::new(".");
+        let path = "";
         // Each runtime arg becomes a single-quoted POSIX shell word so
         // a malicious tail like `; rm -rf ~` lands as one literal token.
-        let cmd = assemble_shell_command("echo hello", &["; rm -rf ~".into()]);
+        let cmd =
+            assemble_shell_command("echo hello", &["; rm -rf ~".into()], project, path).unwrap();
         assert_eq!(cmd, "echo hello '; rm -rf ~'");
 
         // Embedded single quotes are escaped via the close-escape-reopen
         // dance — the resulting word reaches the script as the literal
         // string `it's fine`.
-        let cmd = assemble_shell_command("echo", &["it's fine".into()]);
+        let cmd = assemble_shell_command("echo", &["it's fine".into()], project, path).unwrap();
         assert_eq!(cmd, r#"echo 'it'\''s fine'"#);
 
         // Shell metacharacters in extra args are inert.
         let cmd = assemble_shell_command(
             "echo",
             &["$HOME".into(), "`pwd`".into(), "&& whoami".into()],
-        );
+            project,
+            path,
+        )
+        .unwrap();
         assert_eq!(cmd, "echo '$HOME' '`pwd`' '&& whoami'");
 
         // Empty extra-args list returns the script body verbatim — the
         // body itself is package.json-authored and may contain pipes,
         // redirects, env expansion that must work as written.
-        let cmd = assemble_shell_command("cat file | grep foo", &[]);
+        let cmd = assemble_shell_command("cat file | grep foo", &[], project, path).unwrap();
         assert_eq!(cmd, "cat file | grep foo");
+    }
+
+    #[test]
+    fn windows_shell_argument_escaping_preserves_words_and_metacharacters() {
+        let cases = [
+            ("", "^\"^\""),
+            ("two words", "^\"two^ words^\""),
+            ("a&b", "^\"a^&b^\""),
+            ("c|d", "^\"c^|d^\""),
+            ("e<f", "^\"e^<f^\""),
+            ("g>h", "^\"g^>h^\""),
+            ("%PATH%", "^\"^%PATH^%^\""),
+            ("!delayed!", "^\"^!delayed^!^\""),
+            ("quoted\"value", "^\"quoted\\^\"value^\""),
+            ("trail\\", "^\"trail\\\\^\""),
+            ("x^(y)", "^\"x^^^(y^)^\""),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(windows_shell_quote_arg(input, false).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn windows_shell_argument_escaping_rejects_line_breaks() {
+        for input in ["one\ntwo", "one\rtwo", "one\0two"] {
+            assert!(windows_shell_quote_arg(input, false).is_err());
+        }
+    }
+
+    #[test]
+    fn windows_batch_shim_argument_escaping_adds_a_second_cmd_layer() {
+        let once = windows_shell_quote_arg("a&b", false).unwrap();
+        let twice = windows_shell_quote_arg("a&b", true).unwrap();
+
+        assert_eq!(once, "^\"a^&b^\"");
+        assert_eq!(twice, "^^^\"a^^^&b^^^\"");
     }
 
     #[test]

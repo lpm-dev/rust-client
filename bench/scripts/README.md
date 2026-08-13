@@ -305,6 +305,65 @@ deprecation note. Unknown warning lines remain visible in `rows.json`,
 `metrics.json`, per-run `warnings.json`, `warning-summary.json`,
 `warning-summary.md`, and the summary's `Warnings exp/unknown` column.
 
+## Runtime-readiness harness
+
+`run-runtime-readiness.mjs` compares prebuilt `main` and candidate binaries
+across `lpm run` and `lpm dev`. It does not build either binary. This keeps the
+required disk-space check outside the harness and prevents an implicit Cargo
+build from modifying the benchmark environment.
+
+The fixed PR profile covers:
+
+- package scripts without `lpm.json`
+- `.node-version` and `lpm.json` managed-runtime selectors
+- explicit env mapping
+- root Node plus workspace-member Bun
+- single-service and dependency-ordered multi-service dev
+- simultaneous projects with different runtimes and env values
+- a concurrent first install into one shared runtime home
+- descendant cleanup after signalling only the LPM process
+- 4 MiB of newline-free service output
+
+The full profile adds a local tunnel burst with the dashboard under a PTY.
+Runtime downloads and tunnel traffic are local and deterministic. The harness
+continuously drains output, retains only a bounded prefix and tail, and records
+the complete byte count and SHA-256 digest. It samples the whole process tree
+for RSS and process count. FD and thread counts are maximum-observed diagnostic
+values, not kernel-level peaks.
+
+Every measured baseline/candidate pair is adjacent. Pair order alternates AB/BA,
+and scenario order rotates by sample. JSON, Markdown, bounded logs, resource
+samples, runtime request counts, and survivor evidence are written to a unique
+temporary artifact directory by default.
+
+Validate the harness:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs --self-test
+```
+
+Run the PR profile after explicitly building both binaries:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary main=/tmp/lpm-main/release/lpm-rs \
+  --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
+  --compare main,candidate \
+  --profile pr \
+  --samples 3
+```
+
+Run the landing profile, including the PTY tunnel/dashboard cell:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary main=/tmp/lpm-main/release/lpm-rs \
+  --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
+  --compare main,candidate \
+  --profile full \
+  --samples 10
+```
+
 ## Run/bin wrapper benchmark
 
 `run-bin-benchmark.mjs` measures local script-runner and local-bin runner

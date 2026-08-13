@@ -345,9 +345,10 @@ mod integration_tests {
                 3000,
                 Some("stripe retries".to_string()),
             )
-            .await;
+            .await
+            .unwrap();
         state.push(make_webhook("session-request", 202)).await;
-        state.end_session().await;
+        state.end_session().await.unwrap();
         state.flush().await.unwrap();
 
         let sessions = db.list_sessions(10).await.unwrap();
@@ -399,11 +400,12 @@ mod integration_tests {
                 3000,
                 None,
             )
-            .await;
+            .await
+            .unwrap();
         writer.flush().await.unwrap();
         let after_start = observer.database_revision().await.unwrap();
 
-        writer.end_session().await;
+        writer.end_session().await.unwrap();
         writer.flush().await.unwrap();
         let after_end = observer.database_revision().await.unwrap();
 

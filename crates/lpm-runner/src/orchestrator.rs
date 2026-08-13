@@ -10,7 +10,6 @@ use crate::lpm_json::ServiceConfig;
 use crate::{ports, ready, service_graph};
 use lpm_common::{LocalTarget, LpmError, sanitize_terminal_inline};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -97,9 +96,14 @@ pub struct OrchestratorOptions {
     /// Extra environment variables to inject into all services (e.g., HTTPS cert paths).
     /// Passed via `Command::envs()` — no unsafe `set_var` needed.
     pub extra_envs: Vec<(String, String)>,
+    /// Environment selected by `lpm dev --env`. When absent, the `dev`
+    /// mapping in `lpm.json` is used before falling back to the default files.
+    pub env_mode: Option<String>,
+    /// Managed runtimes prepared for each service working directory.
+    pub service_runtime_hints: HashMap<String, crate::bin_path::ManagedRuntimeHint>,
     /// Optional channel for sending events to a dashboard or observer.
     /// When set, events are sent in addition to (not instead of) terminal output.
-    pub event_tx: Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    pub event_tx: Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     /// Optional channel for receiving commands from a dashboard or controller.
     /// The orchestrator checks this non-blockingly in its main loop.
     pub command_rx: Option<std::sync::mpsc::Receiver<OrchestratorCommand>>,
@@ -124,6 +128,7 @@ const MAX_RESTART_ATTEMPTS: u32 = 10;
 /// Brief grace period for services without explicit readiness checks.
 /// Prevents immediately failing processes from being marked Ready before the first exit poll.
 const NO_READINESS_GRACE: Duration = Duration::from_millis(100);
+const MAX_SERVICE_LOG_LINE_BYTES: usize = 64 * 1024;
 
 /// Colors for service output prefixes.
 const COLORS: &[&str] = &[
@@ -187,7 +192,7 @@ fn ui_readiness_timing(duration: Option<Duration>) -> String {
 }
 
 fn send_status(
-    event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    event_tx: &Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     service_names: &[String],
     name: &str,
     status: ServiceStatus,
@@ -660,11 +665,8 @@ pub fn run_services(
     // Build cross-service env
     let cross_env = ports::build_cross_service_env(&port_map, options.https);
 
-    // Build PATH
-    let path = crate::bin_path::build_path_with_bins(project_dir)?;
-
     // Load .env files + vault + validate schema (unified loader)
-    let dotenv = crate::dotenv::load_project_env(project_dir, None)?;
+    let dotenv = crate::script::load_script_env(project_dir, "dev", options.env_mode.as_deref())?;
 
     // Assign colors
     let service_names: Vec<String> = groups.iter().flatten().cloned().collect();
@@ -779,24 +781,23 @@ pub fn run_services(
             };
             let service_command =
                 command_with_managed_port(&config.command, &cwd, port_map.get(name).copied());
+            let service_runtime_hint = options
+                .service_runtime_hints
+                .get(name)
+                .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
+            let service_path =
+                crate::bin_path::build_path_with_bins_pre_resolved(&cwd, service_runtime_hint)?;
             let assigned_port = port_map.get(name).copied();
             let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
 
             // Spawn the service process
-            let (shell, flag) = if cfg!(windows) {
-                ("cmd", "/C")
-            } else {
-                ("sh", "-c")
-            };
-
-            let mut cmd = Command::new(shell);
-            cmd.arg(flag)
-                .arg(&service_command)
-                .current_dir(&cwd)
-                .env("PATH", &path)
-                .envs(&env)
+            let mut cmd = crate::shell::shell_process(&service_command)?;
+            cmd.current_dir(&cwd)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            isolate_service_process_tree(&mut cmd);
+            crate::shell::strip_inherited_env_hooks(&mut cmd);
+            cmd.envs(&env).env("PATH", &service_path);
 
             // Inject extra envs from HTTPS/tunnel/network setup (safe, no global mutation)
             for (key, value) in &options.extra_envs {
@@ -933,7 +934,7 @@ pub fn run_services(
         project_dir,
         active_services: &active_services,
         groups: &groups,
-        path: &path,
+        service_runtime_hints: &options.service_runtime_hints,
         dotenv: &dotenv,
         cross_env: &cross_env,
         port_map: &port_map,
@@ -970,7 +971,7 @@ fn spawn_output_readers(
     service_index: usize,
     children: &Arc<Mutex<Vec<(String, Child)>>>,
     shutdown_state: &Arc<AtomicU8>,
-    event_tx: &Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    event_tx: &Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     endpoint_tx: Option<std::sync::mpsc::Sender<LocalTarget>>,
 ) {
     let stderr_endpoint_tx = endpoint_tx.clone();
@@ -993,29 +994,23 @@ fn spawn_output_readers(
             };
 
             if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    if shutdown_ref.load(Ordering::Relaxed) > 0 {
-                        break;
-                    }
-                    if let Ok(line) = line {
-                        if let Some(ref tx) = endpoint_tx {
-                            for target in crate::dev_endpoint::parse_local_targets(&line) {
-                                let _ = tx.send(target);
-                            }
-                        }
-                        let safe_name = sanitize_terminal_inline(&name);
-                        let safe_line = sanitize_terminal_inline(&line);
-                        println!("  {color}[{safe_name}]{RESET} {safe_line}");
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(OrchestratorEvent::ServiceLog {
-                                service_index,
-                                line: line.clone(),
-                                is_stderr: false,
-                            });
+                drain_service_output(stdout, &shutdown_ref, |line| {
+                    if let Some(ref tx) = endpoint_tx {
+                        for target in crate::dev_endpoint::parse_local_targets(line) {
+                            let _ = tx.send(target);
                         }
                     }
-                }
+                    let safe_name = sanitize_terminal_inline(&name);
+                    let safe_line = sanitize_terminal_inline(line);
+                    println!("  {color}[{safe_name}]{RESET} {safe_line}");
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.try_send(OrchestratorEvent::ServiceLog {
+                            service_index,
+                            line: line.to_string(),
+                            is_stderr: false,
+                        });
+                    }
+                });
             }
         });
     }
@@ -1039,31 +1034,67 @@ fn spawn_output_readers(
             };
 
             if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if shutdown_ref.load(Ordering::Relaxed) > 0 {
-                        break;
-                    }
-                    if let Ok(line) = line {
-                        if let Some(ref tx) = stderr_endpoint_tx {
-                            for target in crate::dev_endpoint::parse_local_targets(&line) {
-                                let _ = tx.send(target);
-                            }
-                        }
-                        let safe_name = sanitize_terminal_inline(&name);
-                        let safe_line = sanitize_terminal_inline(&line);
-                        eprintln!("  {color}[{safe_name}]{RESET} {safe_line}");
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(OrchestratorEvent::ServiceLog {
-                                service_index,
-                                line: line.clone(),
-                                is_stderr: true,
-                            });
+                drain_service_output(stderr, &shutdown_ref, |line| {
+                    if let Some(ref tx) = stderr_endpoint_tx {
+                        for target in crate::dev_endpoint::parse_local_targets(line) {
+                            let _ = tx.send(target);
                         }
                     }
-                }
+                    let safe_name = sanitize_terminal_inline(&name);
+                    let safe_line = sanitize_terminal_inline(line);
+                    eprintln!("  {color}[{safe_name}]{RESET} {safe_line}");
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.try_send(OrchestratorEvent::ServiceLog {
+                            service_index,
+                            line: line.to_string(),
+                            is_stderr: true,
+                        });
+                    }
+                });
             }
         });
+    }
+}
+
+fn drain_service_output<R: std::io::Read>(
+    mut stream: R,
+    shutdown_state: &AtomicU8,
+    mut on_line: impl FnMut(&str),
+) {
+    let mut line = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let mut remaining = &chunk[..read];
+        while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
+            if !truncated {
+                let keep = newline.min(MAX_SERVICE_LOG_LINE_BYTES.saturating_sub(line.len()));
+                line.extend_from_slice(&remaining[..keep]);
+            }
+            let rendered = String::from_utf8_lossy(&line);
+            on_line(&rendered);
+            line.clear();
+            truncated = false;
+            remaining = &remaining[newline + 1..];
+        }
+        if !remaining.is_empty() && !truncated {
+            let keep = remaining
+                .len()
+                .min(MAX_SERVICE_LOG_LINE_BYTES.saturating_sub(line.len()));
+            line.extend_from_slice(&remaining[..keep]);
+            truncated = keep < remaining.len() || line.len() == MAX_SERVICE_LOG_LINE_BYTES;
+        }
+        if shutdown_state.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+    }
+    if !line.is_empty() {
+        let rendered = String::from_utf8_lossy(&line);
+        on_line(&rendered);
     }
 }
 
@@ -1123,16 +1154,15 @@ fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
         match child.try_wait() {
-            Ok(Some(_)) => {} // Already exited
+            Ok(Some(_)) => {
+                #[cfg(unix)]
+                signal_service_process_group(child.id(), libc::SIGKILL);
+            }
             _ => {
-                let _ = child.kill();
+                force_kill_service_tree(child);
                 ui_service_status(RESET, name, RED, "✗", "force-killed");
             }
         }
-    }
-    // Reap zombies
-    for (_, child) in locked.iter_mut() {
-        let _ = child.wait();
     }
 }
 
@@ -1171,11 +1201,8 @@ fn shutdown_children_ordered(
         eprintln!();
         ui_warn(&format!("Force-killing {count} services..."));
         for (name, child) in locked.iter_mut() {
-            let _ = child.kill();
+            force_kill_service_tree(child);
             ui_service_status(RESET, name, RED, "✗", "force-killed");
-        }
-        for (_, child) in locked.iter_mut() {
-            let _ = child.wait();
         }
         return;
     }
@@ -1202,8 +1229,8 @@ fn shutdown_children_ordered(
                     }
                     #[cfg(unix)]
                     {
-                        let pid = child.id() as i32;
-                        unsafe { libc::kill(pid, libc::SIGTERM) };
+                        let pid = child.id();
+                        signal_service_process_group(pid, libc::SIGTERM);
                         tracing::debug!("sent SIGTERM to service '{name}' (pid {pid})");
                     }
                     #[cfg(not(unix))]
@@ -1222,23 +1249,54 @@ fn shutdown_children_ordered(
     // Final pass: force-kill any stragglers and reap zombies
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                ui_service_note(
-                    RESET,
-                    name,
-                    &format!("stopped (exit {})", status.code().unwrap_or(-1)),
-                );
-            }
-            _ => {
-                tracing::debug!("force-killing service '{name}'");
-                let _ = child.kill();
-                ui_service_status(RESET, name, RED, "✗", "force-killed");
-            }
+        let status = child.try_wait().ok().flatten();
+        #[cfg(unix)]
+        signal_service_process_group(child.id(), libc::SIGKILL);
+        if let Some(status) = status {
+            ui_service_note(
+                RESET,
+                name,
+                &format!("stopped (exit {})", status.code().unwrap_or(-1)),
+            );
+        } else {
+            tracing::debug!("force-killing service '{name}'");
+            force_kill_service_tree(child);
+            ui_service_status(RESET, name, RED, "✗", "force-killed");
         }
     }
-    for (_, child) in locked.iter_mut() {
+}
+
+fn isolate_service_process_tree(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+#[cfg(unix)]
+fn signal_service_process_group(root_pid: u32, signal: libc::c_int) {
+    let Ok(process_group) = libc::pid_t::try_from(root_pid) else {
+        return;
+    };
+    // SAFETY: a negative PID targets the child-owned process group created at
+    // spawn. The group ID is derived from the tracked child's positive PID.
+    unsafe {
+        libc::kill(-process_group, signal);
+    }
+}
+
+fn force_kill_service_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        signal_service_process_group(child.id(), libc::SIGKILL);
         let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ports::terminate_child_process_tree(child);
     }
 }
 
@@ -1587,7 +1645,7 @@ mod tests {
         children.lock().push((name.clone(), child));
 
         let shutdown = Arc::new(AtomicU8::new(0));
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
 
         spawn_output_readers(
             &name,
@@ -1634,6 +1692,19 @@ mod tests {
             stderr_lines.iter().any(|l| l.contains("STDERR_LINE")),
             "should capture stderr, got: {stderr_lines:?}"
         );
+    }
+
+    #[test]
+    fn service_output_reader_bounds_a_newline_free_line() {
+        let shutdown = AtomicU8::new(0);
+        let input = vec![b'x'; MAX_SERVICE_LOG_LINE_BYTES * 4];
+        let mut observed_len = None;
+
+        drain_service_output(input.as_slice(), &shutdown, |line| {
+            observed_len = Some(line.len());
+        });
+
+        assert_eq!(observed_len, Some(MAX_SERVICE_LOG_LINE_BYTES));
     }
 
     #[test]
@@ -1815,7 +1886,7 @@ mod tests {
         let mut services = HashMap::new();
         services.insert("fast".to_string(), simple_service("true"));
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             event_tx: Some(tx),
             ..Default::default()
@@ -1844,7 +1915,7 @@ mod tests {
         let mut services = HashMap::new();
         services.insert("crasher".to_string(), simple_service("exit 1"));
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             event_tx: Some(tx),
             ..Default::default()
@@ -1872,7 +1943,7 @@ mod tests {
         let mut services = HashMap::new();
         services.insert("crasher".to_string(), simple_service("exit 1"));
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             event_tx: Some(tx),
             ..Default::default()
@@ -1976,7 +2047,7 @@ mod tests {
         services.insert("b".to_string(), simple_service("sleep 60"));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             command_rx: Some(cmd_rx),
             event_tx: Some(event_tx),
@@ -2015,7 +2086,7 @@ mod tests {
         services.insert("worker".to_string(), simple_service("sleep 60"));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             command_rx: Some(cmd_rx),
             event_tx: Some(event_tx),
@@ -2062,7 +2133,7 @@ mod tests {
         services.insert("worker".to_string(), simple_service("sleep 60"));
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             command_rx: Some(cmd_rx),
             event_tx: Some(event_tx),
@@ -2179,7 +2250,7 @@ setInterval(() => {{}}, 1000);
         );
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             command_rx: Some(cmd_rx),
             event_tx: Some(event_tx),
@@ -2278,7 +2349,7 @@ setInterval(() => {{}}, 1000);
             },
         );
 
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
         let options = OrchestratorOptions {
             event_tx: Some(event_tx),
             ..Default::default()

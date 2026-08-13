@@ -14,17 +14,85 @@ use tokio::sync::{RwLock, broadcast};
 
 /// Maximum number of requests held in the in-memory ring buffer.
 const DEFAULT_BUFFER_CAPACITY: usize = 1000;
+const DEFAULT_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum number of WebSocket events held in memory.
 const WS_EVENT_CAPACITY: usize = 5000;
+const WS_EVENT_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+
+struct WsEventBuffer {
+    events: VecDeque<Arc<WsEvent>>,
+    retained_bytes: usize,
+    dropped_events: u64,
+}
+
+impl WsEventBuffer {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(WS_EVENT_CAPACITY),
+            retained_bytes: 0,
+            dropped_events: 0,
+        }
+    }
+
+    fn push(&mut self, event: Arc<WsEvent>) -> bool {
+        let event_bytes = event.retained_size_bytes();
+        if event_bytes > WS_EVENT_BYTE_BUDGET {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+            return false;
+        }
+        while self.events.len() >= WS_EVENT_CAPACITY
+            || self.retained_bytes.saturating_add(event_bytes) > WS_EVENT_BYTE_BUDGET
+        {
+            let Some(evicted) = self.events.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(evicted.retained_size_bytes());
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
+        self.retained_bytes += event_bytes;
+        self.events.push_back(event);
+        true
+    }
+}
+
+#[cfg(test)]
+mod ws_event_buffer_tests {
+    use super::*;
+    use lpm_tunnel::ws_capture::FrameDirection;
+
+    #[test]
+    fn repeated_large_frames_stay_within_the_byte_budget() {
+        let payload = vec![b'x'; 1024 * 1024];
+        let event = WsEvent::captured_frame(
+            "connection".to_string(),
+            FrameDirection::Inbound,
+            &payload,
+            false,
+            String::new(),
+        );
+        let event_bytes = event.retained_size_bytes();
+        let mut buffer = WsEventBuffer::new();
+
+        for _ in 0..WS_EVENT_CAPACITY * 2 {
+            assert!(buffer.push(Arc::new(event.clone())));
+        }
+
+        assert!(buffer.retained_bytes <= WS_EVENT_BYTE_BUDGET);
+        assert!(buffer.events.len() <= WS_EVENT_BYTE_BUDGET / event_bytes);
+        assert!(buffer.dropped_events > 0);
+    }
+}
 
 /// Capacity of the SSE broadcast channel.
 /// Slow consumers that fall behind this many events will receive a lagged error
 /// and must re-fetch via the REST API.
 ///
 /// Set to 512 to handle burst scenarios (e.g., Stripe batch actions sending
-/// 150+ webhooks/sec). Since events use `Arc<CapturedWebhook>`, each slot
-/// costs only a pointer — the memory overhead of a larger buffer is negligible.
+/// 150+ webhooks/sec). Events contain compact request summaries instead of
+/// request and response bodies.
 const SSE_BROADCAST_CAPACITY: usize = 512;
 
 /// Shared inspector state, cheaply cloneable via `Arc`.
@@ -33,33 +101,19 @@ pub struct InspectorState {
     inner: Arc<Inner>,
 }
 
-/// A captured request plus the session assigned at capture time.
-pub struct CapturedRequestEvent {
-    pub webhook: Arc<CapturedWebhook>,
-    pub session_id: Option<String>,
-}
-
-impl std::ops::Deref for CapturedRequestEvent {
-    type Target = CapturedWebhook;
-
-    fn deref(&self) -> &Self::Target {
-        &self.webhook
-    }
-}
-
 struct Inner {
     /// In-memory ring buffer of recent requests. Bounded to prevent OOM.
     buffer: RwLock<WebhookBuffer>,
     /// Broadcast channel for real-time SSE streaming to browser clients.
     /// Uses `broadcast` so multiple browser tabs can subscribe independently.
-    sse_tx: broadcast::Sender<Arc<CapturedRequestEvent>>,
+    sse_tx: broadcast::Sender<Arc<crate::api::RequestSummary>>,
     /// SQLite database for persistent storage and full-text search.
     /// `None` only for explicitly in-memory state.
     db: Option<InspectorDb>,
     /// Whether SSE should watch SQLite for captures written by another process.
     observe_database: bool,
     /// WebSocket events ring buffer (bounded, FIFO eviction).
-    ws_events: RwLock<VecDeque<WsEvent>>,
+    ws_events: RwLock<WsEventBuffer>,
     /// Broadcast channel for real-time WS event streaming to browser.
     ws_sse_tx: broadcast::Sender<Arc<WsEvent>>,
     /// Active session ID for tagging requests.
@@ -105,11 +159,14 @@ impl InspectorState {
         let (ws_sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(Inner {
-                buffer: RwLock::new(WebhookBuffer::new(DEFAULT_BUFFER_CAPACITY)),
+                buffer: RwLock::new(WebhookBuffer::with_limits(
+                    DEFAULT_BUFFER_CAPACITY,
+                    DEFAULT_BUFFER_BYTES,
+                )),
                 sse_tx,
                 db: None,
                 observe_database: false,
-                ws_events: RwLock::new(VecDeque::with_capacity(WS_EVENT_CAPACITY)),
+                ws_events: RwLock::new(WsEventBuffer::new()),
                 ws_sse_tx,
                 session_id: SyncRwLock::new(None),
                 local_target: SyncRwLock::new(local_target),
@@ -162,11 +219,14 @@ impl InspectorState {
         let (ws_sse_tx, _) = broadcast::channel(SSE_BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(Inner {
-                buffer: RwLock::new(WebhookBuffer::new(DEFAULT_BUFFER_CAPACITY)),
+                buffer: RwLock::new(WebhookBuffer::with_limits(
+                    DEFAULT_BUFFER_CAPACITY,
+                    DEFAULT_BUFFER_BYTES,
+                )),
                 sse_tx,
                 db: Some(db),
                 observe_database,
-                ws_events: RwLock::new(VecDeque::with_capacity(WS_EVENT_CAPACITY)),
+                ws_events: RwLock::new(WsEventBuffer::new()),
                 ws_sse_tx,
                 session_id: SyncRwLock::new(None),
                 local_target: SyncRwLock::new(local_target),
@@ -183,7 +243,11 @@ impl InspectorState {
 
     /// Push a captured request into the buffer, broadcast to SSE, and persist to SQLite.
     pub async fn push(&self, webhook: CapturedWebhook) {
-        let webhook = Arc::new(webhook);
+        self.push_shared(Arc::new(webhook)).await;
+    }
+
+    /// Push an already shared request without copying its headers and bodies.
+    pub async fn push_shared(&self, webhook: Arc<CapturedWebhook>) {
         let session_id = self
             .inner
             .session_id
@@ -193,19 +257,21 @@ impl InspectorState {
 
         // Persist to SQLite (non-blocking — queued for batch write).
         if let Some(ref db) = self.inner.db {
-            db.insert_request(CapturedWebhook::clone(&webhook), session_id.clone());
+            db.insert_shared_request(Arc::clone(&webhook), session_id.clone());
         }
 
         // Broadcast to SSE subscribers (best-effort — if no subscribers, this is a no-op).
         // If the channel is full, lagged subscribers will get an error on next recv.
-        let _ = self.inner.sse_tx.send(Arc::new(CapturedRequestEvent {
-            webhook: Arc::clone(&webhook),
-            session_id,
-        }));
+        let _ = self
+            .inner
+            .sse_tx
+            .send(Arc::new(crate::api::RequestSummary::from_live(
+                &webhook, session_id,
+            )));
 
         // Store in ring buffer (evicts oldest if at capacity).
         let mut buf = self.inner.buffer.write().await;
-        buf.push(CapturedWebhook::clone(&webhook));
+        buf.push_shared(webhook);
     }
 
     /// Get all requests currently in the buffer (oldest first).
@@ -250,7 +316,7 @@ impl InspectorState {
     }
 
     /// Subscribe to the SSE broadcast channel.
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<CapturedRequestEvent>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<crate::api::RequestSummary>> {
         self.inner.sse_tx.subscribe()
     }
 
@@ -300,27 +366,25 @@ impl InspectorState {
     /// Push a WebSocket event into the buffer and broadcast to SSE subscribers.
     pub async fn push_ws_event(&self, event: WsEvent) {
         let event = Arc::new(event);
-        let _ = self.inner.ws_sse_tx.send(Arc::clone(&event));
-
         let mut buf = self.inner.ws_events.write().await;
-        if buf.len() >= WS_EVENT_CAPACITY {
-            buf.pop_front();
+        if buf.push(Arc::clone(&event)) {
+            let _ = self.inner.ws_sse_tx.send(event);
         }
-        buf.push_back(WsEvent::clone(&event));
     }
 
     /// Get all WS events (oldest first).
     pub async fn get_ws_events(&self) -> Vec<WsEvent> {
         let buf = self.inner.ws_events.read().await;
-        buf.iter().cloned().collect()
+        buf.events.iter().map(|event| (**event).clone()).collect()
     }
 
     /// Get WS events for a specific connection.
     pub async fn get_ws_connection_events(&self, connection_id: &str) -> Vec<WsEvent> {
         let buf = self.inner.ws_events.read().await;
-        buf.iter()
+        buf.events
+            .iter()
             .filter(|e| e.connection_id() == connection_id)
-            .cloned()
+            .map(|event| (**event).clone())
             .collect()
     }
 
@@ -362,8 +426,8 @@ impl InspectorState {
         domain: Option<String>,
         local_port: u16,
         name: Option<String>,
-    ) {
-        self.start_session_immediate(id, domain, local_port, name);
+    ) -> Result<(), rusqlite::Error> {
+        self.start_session_immediate(id, domain, local_port, name)
     }
 
     /// Start a session synchronously before the relay can deliver its first request.
@@ -373,9 +437,9 @@ impl InspectorState {
         domain: Option<String>,
         local_port: u16,
         name: Option<String>,
-    ) {
+    ) -> Result<(), rusqlite::Error> {
         if let Some(ref db) = self.inner.db {
-            db.start_session_named(id.clone(), domain, local_port, name);
+            db.start_session_named(id.clone(), domain, local_port, name)?;
         }
         let mut session_id = self
             .inner
@@ -383,10 +447,11 @@ impl InspectorState {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *session_id = Some(id);
+        Ok(())
     }
 
     /// End the current tunnel session.
-    pub async fn end_session(&self) {
+    pub async fn end_session(&self) -> Result<(), rusqlite::Error> {
         let mut session_id = self
             .inner
             .session_id
@@ -395,7 +460,8 @@ impl InspectorState {
         if let Some(id) = session_id.take()
             && let Some(ref db) = self.inner.db
         {
-            db.end_session(id);
+            db.end_session(id)?;
         }
+        Ok(())
     }
 }

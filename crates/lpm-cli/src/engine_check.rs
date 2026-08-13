@@ -52,6 +52,12 @@ pub(crate) struct RootNodeEngineRequirement {
     pub(crate) engine_strict: bool,
 }
 
+pub(crate) struct NodeEngineRequirement {
+    pub(crate) required: String,
+    pub(crate) engine_strict: bool,
+    pub(crate) source: String,
+}
+
 pub(crate) struct DependencyEnginePolicy {
     engine_strict: bool,
     json_output: bool,
@@ -271,17 +277,27 @@ pub(crate) fn enforce_resolved_node_for_run(
     effective_node: PathNodeResolution,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let policy = DependencyEnginePolicy::with_resolved_node(
-        effective_node,
+    enforce_resolved_node_requirement_for_run(
+        requirement.required,
         requirement.engine_strict,
-        json_output,
-    );
-    let result = policy.check_node_requirement(
-        &requirement.required,
         "package.json > engines.node".to_string(),
-    );
+        effective_node,
+        json_output,
+    )
+}
 
-    if !requirement.engine_strict {
+pub(crate) fn enforce_resolved_node_requirement_for_run(
+    required: String,
+    engine_strict: bool,
+    source: String,
+    effective_node: PathNodeResolution,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let policy =
+        DependencyEnginePolicy::with_resolved_node(effective_node, engine_strict, json_output);
+    let result = policy.check_node_requirement(&required, source);
+
+    if !engine_strict {
         if let Err(mismatch) = result
             && !json_output
         {
@@ -306,6 +322,67 @@ pub(crate) fn resolve_root_node_engine_requirement(
         required: required.clone(),
         engine_strict: engine_strict_config::resolve_for_root(false, &root_pkg),
     }))
+}
+
+pub(crate) fn resolve_execution_node_engine_requirements(
+    start_dir: &Path,
+) -> Result<Vec<NodeEngineRequirement>, LpmError> {
+    let workspace = crate::workspace_discovery_cache::discover_workspace(start_dir)
+        .map_err(|error| LpmError::Workspace(format!("could not discover workspace: {error}")))?;
+    let (root_dir, root_pkg) = match workspace.as_ref() {
+        Some(workspace) => (workspace.root.as_path(), &workspace.root_package),
+        None => {
+            let package_path = start_dir.join("package.json");
+            if !package_path.exists() {
+                return Ok(Vec::new());
+            }
+            let package = read_package_json(&package_path).map_err(|error| {
+                LpmError::Workspace(format!("could not read package.json: {error}"))
+            })?;
+            let engine_strict = engine_strict_config::resolve_for_root(false, &package);
+            return Ok(package
+                .engines
+                .get("node")
+                .map(|required| {
+                    vec![NodeEngineRequirement {
+                        required: required.clone(),
+                        engine_strict,
+                        source: "package.json > engines.node".to_string(),
+                    }]
+                })
+                .unwrap_or_default());
+        }
+    };
+    let engine_strict = engine_strict_config::resolve_for_root(false, root_pkg);
+    let mut requirements = Vec::with_capacity(2);
+    if let Some(required) = root_pkg.engines.get("node") {
+        requirements.push(NodeEngineRequirement {
+            required: required.clone(),
+            engine_strict,
+            source: "workspace root package.json > engines.node".to_string(),
+        });
+    }
+
+    if start_dir != root_dir {
+        let package_path = start_dir.join("package.json");
+        if package_path.exists() {
+            let package = read_package_json(&package_path).map_err(|error| {
+                LpmError::Workspace(format!("could not read package.json: {error}"))
+            })?;
+            if let Some(required) = package.engines.get("node")
+                && !requirements
+                    .iter()
+                    .any(|requirement| requirement.required == *required)
+            {
+                requirements.push(NodeEngineRequirement {
+                    required: required.clone(),
+                    engine_strict,
+                    source: "service package.json > engines.node".to_string(),
+                });
+            }
+        }
+    }
+    Ok(requirements)
 }
 
 /// Variant that takes the already-resolved root + manifest. Use this

@@ -2,8 +2,28 @@
 
 mod support;
 
-use support::{TempProject, configure_fake_node, lpm};
-use wiremock::MockServer;
+use support::{TempProject, configure_fake_node, lpm, lpm_spawnable};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[cfg(unix)]
+fn fake_node_archive(platform: &lpm_runtime::platform::Platform, version: &str) -> Vec<u8> {
+    use std::io::Write;
+
+    let top = format!("node-v{version}-{}", platform.node_suffix());
+    let mut builder = tar::Builder::new(Vec::new());
+    let contents = format!("#!/bin/sh\necho v{version}\n");
+    let mut header = tar::Header::new_gnu();
+    header.set_path(format!("{top}/bin/node")).unwrap();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder.append(&header, contents.as_bytes()).unwrap();
+    let tar = builder.into_inner().unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&tar).unwrap();
+    encoder.finish().unwrap()
+}
 
 fn node_version_project(engines: &str) -> TempProject {
     TempProject::empty(&format!(
@@ -30,6 +50,22 @@ fn install_fake_managed_node(project: &TempProject, version: &str) {
         .expect("write managed Node binary");
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
         .expect("mark managed Node executable");
+}
+
+#[cfg(unix)]
+fn install_fake_managed_bun(project: &TempProject, version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = project
+        .home()
+        .join(".lpm/runtimes/bun")
+        .join(version)
+        .join("bin/bun");
+    std::fs::create_dir_all(binary.parent().unwrap()).expect("create managed Bun bin directory");
+    std::fs::write(&binary, format!("#!/bin/sh\necho bun-v{version}\n"))
+        .expect("write managed Bun binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("mark managed Bun executable");
 }
 
 #[cfg(unix)]
@@ -136,6 +172,167 @@ fn command_output_text(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn run_cache_invalidates_when_the_managed_node_selector_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"runtime-cache-selector",
+            "scripts":{"build":"node build.js"}
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        "require('fs').mkdirSync('dist', {recursive:true}); require('fs').writeFileSync('dist/version.txt', process.env.FAKE_NODE_VERSION);\n",
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "runtime":{"node":"20.19.0"},
+            "tasks":{"build":{"cache":true,"outputs":["dist/**"]}}
+        }"#,
+    );
+    let system_node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node"))
+        .find(|binary| binary.is_file())
+        .expect("workflow host must provide Node");
+
+    for version in ["20.19.0", "22.14.0"] {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = project
+            .home()
+            .join(".lpm/runtimes/node")
+            .join(version)
+            .join("bin/node");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo v{version}; exit 0; fi\nFAKE_NODE_VERSION={version} exec {} \"$@\"\n",
+                system_node.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "runtime":{"node":"22.14.0"},
+            "tasks":{"build":{"cache":true,"outputs":["dist/**"]}}
+        }"#,
+    );
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run cached task after changing managed Node selector");
+    let combined = command_output_text(&output);
+
+    assert!(output.status.success(), "second build failed:\n{combined}");
+    assert_eq!(project.read_file("dist/version.txt"), "22.14.0");
+    assert!(
+        !combined.contains("restored from cache"),
+        "changed Node selector restored stale output:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_projects_share_one_managed_node_install() {
+    use sha2::{Digest, Sha256};
+
+    let server = MockServer::start().await;
+    let project = TempProject::empty(r#"{"name":"runtime-install-root","private":true}"#);
+    let first_dir = project.path().join("first");
+    let second_dir = project.path().join("second");
+    std::fs::create_dir_all(&first_dir).unwrap();
+    std::fs::create_dir_all(&second_dir).unwrap();
+    for dir in [&first_dir, &second_dir] {
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"runtime-install-project","scripts":{"version":"node --version"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("lpm.json"), r#"{"runtime":{"node":"99.0.0"}}"#).unwrap();
+    }
+
+    let platform = lpm_runtime::platform::Platform::current().unwrap();
+    let archive = fake_node_archive(&platform, "99.0.0");
+    let digest = format!("{:x}", Sha256::digest(&archive));
+    let archive_name = format!("node-v99.0.0-{}.tar.gz", platform.node_suffix());
+    let runtimes_dir = project.home().join(".lpm/runtimes");
+    std::fs::create_dir_all(runtimes_dir.join("node/.99.0.0-installing-stale")).unwrap();
+    std::fs::write(
+        runtimes_dir.join("index-cache.json"),
+        serde_json::json!([{
+            "version": "v99.0.0",
+            "date": "2099-01-01",
+            "lts": false,
+            "dist_base_url": server.uri(),
+        }])
+        .to_string(),
+    )
+    .unwrap();
+
+    Mock::given(method("GET"))
+        .and(path(format!("/v99.0.0/{archive_name}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_bytes(archive.clone()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v99.0.0/SHASUMS256.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{digest}  {archive_name}\n")),
+        )
+        .mount(&server)
+        .await;
+
+    let mut first = lpm_spawnable(&project);
+    first.current_dir(&first_dir).args(["run", "version"]);
+    let mut second = lpm_spawnable(&project);
+    second.current_dir(&second_dir).args(["run", "version"]);
+    let first_child = first.spawn().expect("start first runtime install");
+    let second_child = second.spawn().expect("start second runtime install");
+    let first_output = first_child.wait_with_output().expect("wait for first run");
+    let second_output = second_child
+        .wait_with_output()
+        .expect("wait for second run");
+
+    assert!(
+        first_output.status.success(),
+        "first run failed:\n{}",
+        command_output_text(&first_output)
+    );
+    assert!(
+        second_output.status.success(),
+        "second run failed:\n{}",
+        command_output_text(&second_output)
+    );
+    let requests = server.received_requests().await.unwrap();
+    let archive_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with(&archive_name))
+        .count();
+    assert_eq!(archive_requests, 1, "runtime archive was downloaded twice");
+    assert!(
+        runtimes_dir.join("node/99.0.0/bin/node").is_file(),
+        "the shared managed runtime was not published completely"
+    );
+    assert!(
+        std::fs::read_dir(runtimes_dir.join("node"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("installing")),
+        "runtime staging directory was left behind"
+    );
 }
 
 #[tokio::test]
@@ -727,6 +924,43 @@ fn workspace_runtime_preflight_follows_topological_order() {
             "workspace preflight did not fail on the dependency first on attempt {attempt}:\n{combined}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_member_inherits_root_node_and_adds_its_bun_selector() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "mixed-runtime-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    project.write_file("lpm.json", r#"{"runtime":{"node":"22.0.0"}}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "mixed-runtime-app",
+            "version": "1.0.0",
+            "scripts": {"runtime-versions": "node --version && bun --version"}
+        }"#,
+    );
+    project.write_file("packages/app/lpm.json", r#"{"runtime":{"bun":"1.3.14"}}"#);
+    install_fake_managed_node(&project, "22.0.0");
+    install_fake_managed_bun(&project, "1.3.14");
+
+    let output = lpm(&project)
+        .args(["run", "runtime-versions", "--all"])
+        .output()
+        .expect("run workspace member with composed runtime selectors");
+    let combined = command_output_text(&output);
+
+    assert!(output.status.success(), "workspace run failed:\n{combined}");
+    assert!(
+        combined.contains("v22.0.0") && combined.contains("bun-v1.3.14"),
+        "workspace member did not receive both managed runtimes:\n{combined}"
+    );
 }
 
 #[test]

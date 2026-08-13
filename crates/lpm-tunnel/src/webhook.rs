@@ -61,6 +61,36 @@ impl CapturedWebhook {
         self.request_body.len()
     }
 
+    /// Estimated heap bytes owned by this capture.
+    pub fn retained_size_bytes(&self) -> usize {
+        let header_bytes = self
+            .request_headers
+            .iter()
+            .chain(&self.response_headers)
+            .map(|(name, value)| name.capacity().saturating_add(value.capacity()))
+            .sum::<usize>()
+            .saturating_add(
+                self.request_headers
+                    .capacity()
+                    .saturating_add(self.response_headers.capacity())
+                    .saturating_mul(std::mem::size_of::<(String, String)>()),
+            );
+        self.id
+            .capacity()
+            .saturating_add(self.timestamp.capacity())
+            .saturating_add(self.method.capacity())
+            .saturating_add(self.path.capacity())
+            .saturating_add(self.request_body.capacity())
+            .saturating_add(self.response_body.capacity())
+            .saturating_add(self.summary.capacity())
+            .saturating_add(
+                self.signature_diagnostic
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+            .saturating_add(header_bytes)
+    }
+
     /// Whether the response indicates an error (status >= 400).
     pub fn is_error(&self) -> bool {
         self.response_status >= 400

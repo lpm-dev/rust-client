@@ -1,5 +1,6 @@
 use super::cache::{
-    is_task_cached_with_config, try_cache_hit_with_config, try_cache_store_with_output_and_config,
+    CacheStoreRequest, is_task_cached_with_config, try_cache_hit_with_config,
+    try_cache_store_with_output_and_config,
 };
 use super::format::{
     TaskResult, print_captured_stderr, print_captured_stdout, print_json_summary,
@@ -75,8 +76,14 @@ pub(super) async fn run_tasks_sequential(
 
         // Check cache
         if !no_cache
-            && let Ok(Some(hit)) =
-                try_cache_hit_with_config(project_dir, script, env_mode, lpm_config)
+            && let Ok(Some(hit)) = try_cache_hit_with_config(
+                project_dir,
+                script,
+                env_mode,
+                extra_args,
+                bin_hint,
+                lpm_config,
+            )
         {
             if !hit.stdout.is_empty() {
                 print_captured_stdout(&hit.stdout);
@@ -108,15 +115,17 @@ pub(super) async fn run_tasks_sequential(
             match run_task_captured(project_dir, script, extra_args, env_mode, tasks, bin_hint) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
-                    let _ = try_cache_store_with_output_and_config(
+                    let _ = try_cache_store_with_output_and_config(CacheStoreRequest {
                         project_dir,
-                        script,
+                        script_name: script,
                         env_mode,
+                        extra_args,
+                        bin_hint,
                         duration_ms,
-                        &captured.stdout,
-                        &captured.stderr,
+                        stdout: &captured.stdout,
+                        stderr: &captured.stderr,
                         lpm_config,
-                    );
+                    });
                     Ok(())
                 }
                 Err(e) => Err(e),

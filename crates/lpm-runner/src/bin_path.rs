@@ -66,8 +66,7 @@ fn is_workspace_root(dir: &Path) -> bool {
 ///
 /// Three states are required to honestly avoid redundant detection:
 ///
-/// - `Bin(path)` — caller already resolved one managed runtime bin dir.
-/// - `Bins(paths)` — caller already resolved multiple managed runtime bin dirs.
+/// - `Resolved(bins)` — caller resolved zero or more typed runtime bin dirs.
 /// - `Absent` — caller called `ensure_runtime` and confirmed there is no
 ///   managed runtime to use (no spec detected, or spec detected but no
 ///   matching install). The PATH builder skips the silent detect entirely.
@@ -76,10 +75,88 @@ fn is_workspace_root(dir: &Path) -> bool {
 ///   first (rebuild, dlx, hooks, `lpm test/bench/check`, doctor, orchestrator).
 #[derive(Debug, Clone)]
 pub enum ManagedRuntimeHint {
-    Bin(std::path::PathBuf),
-    Bins(Vec<std::path::PathBuf>),
+    Resolved(Vec<ManagedRuntimeBin>),
     Absent,
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRuntimeBin {
+    pub runtime: lpm_runtime::detect::RuntimeKind,
+    pub version: String,
+    pub bin_dir: std::path::PathBuf,
+}
+
+impl ManagedRuntimeHint {
+    pub fn bin_dir(&self, runtime: lpm_runtime::detect::RuntimeKind) -> Option<&std::path::Path> {
+        let Self::Resolved(bins) = self else {
+            return None;
+        };
+        bins.iter()
+            .find(|bin| bin.runtime == runtime)
+            .map(|bin| bin.bin_dir.as_path())
+    }
+
+    pub fn inherit_unselected_from(
+        &self,
+        parent: &Self,
+        locally_selected: &[lpm_runtime::detect::RuntimeKind],
+    ) -> Self {
+        let local = match self {
+            Self::Resolved(bins) => bins.as_slice(),
+            Self::Absent | Self::Unknown => &[],
+        };
+        let parent = match parent {
+            Self::Resolved(bins) => bins.as_slice(),
+            Self::Absent | Self::Unknown => &[],
+        };
+        let mut bins = Vec::with_capacity(2);
+        for runtime in [
+            lpm_runtime::detect::RuntimeKind::Node,
+            lpm_runtime::detect::RuntimeKind::Bun,
+        ] {
+            let bin = if locally_selected.contains(&runtime) {
+                local.iter().find(|bin| bin.runtime == runtime)
+            } else {
+                parent.iter().find(|bin| bin.runtime == runtime)
+            };
+            if let Some(bin) = bin {
+                bins.push(bin.clone());
+            }
+        }
+        if bins.is_empty() {
+            Self::Absent
+        } else {
+            Self::Resolved(bins)
+        }
+    }
+
+    pub fn cache_identities(&self) -> Vec<(String, String)> {
+        let Self::Resolved(bins) = self else {
+            return Vec::new();
+        };
+        bins.iter()
+            .map(|bin| (bin.runtime.as_str().to_string(), bin.version.clone()))
+            .collect()
+    }
+
+    pub fn append_executable_cache_identities(
+        &self,
+        cwd: &Path,
+        path: &std::ffi::OsStr,
+        identities: &mut Vec<(String, String)>,
+    ) {
+        for runtime in [
+            lpm_runtime::detect::RuntimeKind::Node,
+            lpm_runtime::detect::RuntimeKind::Bun,
+        ] {
+            if let Some(fingerprint) =
+                lpm_runtime::effective::probe_runtime_fingerprint_on_path(cwd, path, runtime)
+            {
+                identities.push((format!("{}-executable", runtime.as_str()), fingerprint));
+            }
+        }
+    }
 }
 
 impl Default for ManagedRuntimeHint {
@@ -121,11 +198,11 @@ pub fn build_path_with_bins_pre_resolved(
         .collect();
 
     match hint {
-        ManagedRuntimeHint::Bin(path) => {
-            parts.push(path.to_string_lossy().to_string());
-        }
-        ManagedRuntimeHint::Bins(paths) => {
-            parts.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
+        ManagedRuntimeHint::Resolved(bins) => {
+            parts.extend(
+                bins.iter()
+                    .map(|bin| bin.bin_dir.to_string_lossy().to_string()),
+            );
         }
         ManagedRuntimeHint::Absent => {
             // Caller confirmed no managed runtime — skip the silent detect.
@@ -314,7 +391,11 @@ mod tests {
 
         let path = build_path_with_bins_pre_resolved(
             dir.path(),
-            &ManagedRuntimeHint::Bin(fake_runtime_bin.clone()),
+            &ManagedRuntimeHint::Resolved(vec![ManagedRuntimeBin {
+                runtime: lpm_runtime::detect::RuntimeKind::Node,
+                version: "22.5.0".to_string(),
+                bin_dir: fake_runtime_bin.clone(),
+            }]),
         )
         .unwrap();
 
@@ -346,7 +427,18 @@ mod tests {
 
         let path = build_path_with_bins_pre_resolved(
             dir.path(),
-            &ManagedRuntimeHint::Bins(vec![node_bin.clone(), bun_bin.clone()]),
+            &ManagedRuntimeHint::Resolved(vec![
+                ManagedRuntimeBin {
+                    runtime: lpm_runtime::detect::RuntimeKind::Node,
+                    version: "22.5.0".to_string(),
+                    bin_dir: node_bin.clone(),
+                },
+                ManagedRuntimeBin {
+                    runtime: lpm_runtime::detect::RuntimeKind::Bun,
+                    version: "1.3.14".to_string(),
+                    bin_dir: bun_bin.clone(),
+                },
+            ]),
         )
         .unwrap();
 
