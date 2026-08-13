@@ -11,7 +11,7 @@ use lpm_common::{LpmError, sanitize_terminal_inline};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
@@ -82,7 +82,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) active_services: &'a HashMap<String, ServiceConfig>,
     pub(super) groups: &'a [Vec<String>],
-    pub(super) path: &'a str,
+    pub(super) service_runtime_hints: &'a HashMap<String, crate::bin_path::ManagedRuntimeHint>,
     pub(super) dotenv: &'a HashMap<String, String>,
     pub(super) cross_env: &'a HashMap<String, HashMap<String, String>>,
     pub(super) port_map: &'a ServicePortMap,
@@ -91,7 +91,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) initial_ready: &'a HashSet<String>,
     pub(super) children: &'a Arc<Mutex<Vec<(String, Child)>>>,
     pub(super) shutdown_state: &'a Arc<AtomicU8>,
-    pub(super) event_tx: &'a Option<std::sync::mpsc::Sender<OrchestratorEvent>>,
+    pub(super) event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     pub(super) command_rx: Option<&'a Receiver<OrchestratorCommand>>,
     pub(super) on_endpoint_changed: Option<&'a EndpointChangedCallback>,
     pub(super) extra_envs: &'a [(String, String)],
@@ -542,22 +542,34 @@ fn restart_service(
 
     let service_command =
         command_with_managed_port(&config.command, &cwd, context.port_map.get(name).copied());
+    let service_runtime_hint = context
+        .service_runtime_hints
+        .get(name)
+        .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
+    let service_path =
+        match crate::bin_path::build_path_with_bins_pre_resolved(&cwd, service_runtime_hint) {
+            Ok(path) => path,
+            Err(error) => {
+                report_restart_failure(context, states, name, &error.to_string(), false);
+                return Ok(());
+            }
+        };
     let assigned_port = context.port_map.get(name).copied();
     let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
-    let (shell, flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
+    let mut command = match crate::shell::shell_process(&service_command) {
+        Ok(command) => command,
+        Err(error) => {
+            report_restart_failure(context, states, name, &error.to_string(), false);
+            return Ok(());
+        }
     };
-    let mut command = Command::new(shell);
     command
-        .arg(flag)
-        .arg(&service_command)
         .current_dir(&cwd)
-        .env("PATH", context.path)
-        .envs(&env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    super::isolate_service_process_tree(&mut command);
+    crate::shell::strip_inherited_env_hooks(&mut command);
+    command.envs(&env).env("PATH", service_path);
     for (key, value) in context.extra_envs {
         command.env(key, value);
     }

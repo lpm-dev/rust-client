@@ -14,6 +14,7 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 use std::io;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ pub enum DashboardEvent {
     /// Final managed port assigned to a named service.
     PortAssigned { service: String, port: u16 },
     /// A webhook was captured by the tunnel.
-    WebhookCaptured(Box<lpm_tunnel::webhook::CapturedWebhook>),
+    WebhookCaptured(Arc<lpm_tunnel::webhook::CapturedWebhook>),
     /// A fatal background error that must close the dashboard.
     FatalError(String),
 }
@@ -174,7 +175,7 @@ pub fn run_dashboard(
                     app.set_service_port(&service, port);
                 }
                 DashboardEvent::WebhookCaptured(webhook) => {
-                    app.push_webhook(*webhook);
+                    app.push_shared_webhook(webhook);
                 }
                 DashboardEvent::FatalError(error) => return Err(io::Error::other(error)),
             }

@@ -24,7 +24,7 @@ fn initial_readiness_failure_emits_failure_without_ready_or_all_ready_callback()
             ..Default::default()
         },
     )]);
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
     let callback_called = Arc::new(AtomicBool::new(false));
     let callback_flag = Arc::clone(&callback_called);
     let options = OrchestratorOptions {

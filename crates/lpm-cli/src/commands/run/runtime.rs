@@ -1,6 +1,6 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_runner::bin_path::ManagedRuntimeHint;
+use lpm_runner::bin_path::{ManagedRuntimeBin, ManagedRuntimeHint};
 use lpm_runtime::effective::PathNodeVersionCache;
 use std::path::Path;
 
@@ -39,16 +39,26 @@ pub fn validate_runtime(
     hint: &ManagedRuntimeHint,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let Some(requirement) = crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
-    else {
+    let requirements =
+        crate::engine_check::resolve_execution_node_engine_requirements(project_dir)?;
+    if requirements.is_empty() {
         return Ok(());
-    };
+    }
     let script_path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, hint)?;
     let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
         project_dir,
         std::ffi::OsStr::new(&script_path),
     );
-    crate::engine_check::enforce_resolved_node_for_run(requirement, effective_node, json_output)
+    for requirement in requirements {
+        crate::engine_check::enforce_resolved_node_requirement_for_run(
+            requirement.required,
+            requirement.engine_strict,
+            requirement.source,
+            effective_node.clone(),
+            json_output,
+        )?;
+    }
+    Ok(())
 }
 
 /// Validate a workspace member while reusing probes for shared Node executables.
@@ -58,13 +68,23 @@ pub fn validate_runtime_with_cache(
     json_output: bool,
     node_versions: &mut PathNodeVersionCache,
 ) -> Result<(), LpmError> {
-    let Some(requirement) = crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
-    else {
+    let requirements =
+        crate::engine_check::resolve_execution_node_engine_requirements(project_dir)?;
+    if requirements.is_empty() {
         return Ok(());
-    };
+    }
     let script_path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, hint)?;
     let effective_node = node_versions.resolve(project_dir, std::ffi::OsStr::new(&script_path));
-    crate::engine_check::enforce_resolved_node_for_run(requirement, effective_node, json_output)
+    for requirement in requirements {
+        crate::engine_check::enforce_resolved_node_requirement_for_run(
+            requirement.required,
+            requirement.engine_strict,
+            requirement.source,
+            effective_node.clone(),
+            json_output,
+        )?;
+    }
+    Ok(())
 }
 
 /// Ensure already-detected managed runtimes are available before running scripts.
@@ -94,7 +114,11 @@ pub async fn ensure_detected_runtimes(
                     install_ui::status_ok(&version),
                     install_ui::dim(&format!("from {source}"))
                 ));
-                bin_dirs.push(bin_dir);
+                bin_dirs.push(ManagedRuntimeBin {
+                    runtime,
+                    version,
+                    bin_dir,
+                });
             }
             lpm_runtime::RuntimeStatus::Installed {
                 runtime,
@@ -108,7 +132,11 @@ pub async fn ensure_detected_runtimes(
                     install_ui::status_ok(&version),
                     source,
                 ));
-                bin_dirs.push(bin_dir);
+                bin_dirs.push(ManagedRuntimeBin {
+                    runtime,
+                    version,
+                    bin_dir,
+                });
             }
             lpm_runtime::RuntimeStatus::NotInstalled {
                 runtime,
@@ -133,7 +161,6 @@ pub async fn ensure_detected_runtimes(
 
     match bin_dirs.len() {
         0 => ManagedRuntimeHint::Absent,
-        1 => ManagedRuntimeHint::Bin(bin_dirs.remove(0)),
-        _ => ManagedRuntimeHint::Bins(bin_dirs),
+        _ => ManagedRuntimeHint::Resolved(bin_dirs),
     }
 }

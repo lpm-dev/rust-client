@@ -13,6 +13,7 @@ use std::path::Path;
 
 use crate::install_ui;
 
+pub(crate) use runtime::validate_runtime_with_cache;
 pub use runtime::{ensure_detected_runtimes, ensure_runtime, prepare_runtime};
 pub use single::{DlxOptions, dlx, exec, managed_dlx, run, run_file, run_file_watch, run_watch};
 pub use workspace::run_workspace;

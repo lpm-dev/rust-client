@@ -407,11 +407,10 @@ pub(crate) async fn run_start(
 
     // Create webhook capture channel.
     let (webhook_tx, mut webhook_rx) =
-        tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::webhook::CapturedWebhook>();
+        tokio::sync::mpsc::channel::<lpm_tunnel::webhook::CapturedWebhook>(8);
 
     // Create WebSocket capture channel
-    let (ws_tx, mut ws_rx) =
-        tokio::sync::mpsc::unbounded_channel::<lpm_tunnel::ws_capture::WsEvent>();
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<lpm_tunnel::ws_capture::WsEvent>(256);
 
     // Spawn webhook consumer: pushes to inspector state for real-time SSE streaming
     let inspector_state_consumer = inspector_state.clone();
@@ -463,7 +462,7 @@ pub(crate) async fn run_start(
     let usage_for_connect = latest_usage.clone();
     let usage_for_notices = latest_usage.clone();
 
-    let connect = lpm_tunnel::client::connect_with_usage(
+    let connect = lpm_tunnel::client::connect_with_usage_fallible(
         &options,
         move |session| {
             // Update inspector state with the tunnel URL and start a session
@@ -473,7 +472,13 @@ pub(crate) async fn run_start(
             let local = session.local_port;
             let state = inspector_state_for_connect.clone();
             let name = session_name_owned.clone();
-            state.start_session_immediate(session_id, domain, local, name);
+            state
+                .start_session_immediate(session_id, domain, local, name)
+                .map_err(|error| {
+                    LpmError::Tunnel(format!(
+                        "failed to persist inspector session start: {error}"
+                    ))
+                })?;
             tokio::spawn(async move {
                 state.set_tunnel_url(url).await;
             });
@@ -535,6 +540,7 @@ pub(crate) async fn run_start(
                     install_ui::detail_line(format_tunnel_footer(false));
                 }
             }
+            Ok(())
         },
         |msg| {
             if !json_output {
@@ -579,7 +585,9 @@ pub(crate) async fn run_start(
     let websocket_result = ws_consumer
         .await
         .map_err(|error| LpmError::Tunnel(format!("WebSocket capture task failed: {error}")));
-    inspector_state.end_session().await;
+    let session_result = inspector_state.end_session().await.map_err(|error| {
+        LpmError::Tunnel(format!("failed to persist inspector session end: {error}"))
+    });
     let flush_result = inspector_state.flush().await.map_err(|error| {
         LpmError::Tunnel(format!(
             "failed to commit captures to .lpm/inspector.db: {error}"
@@ -589,7 +597,10 @@ pub(crate) async fn run_start(
         handle.shutdown();
     }
 
-    let cleanup_result = webhook_result.and(websocket_result).and(flush_result);
+    let cleanup_result = webhook_result
+        .and(websocket_result)
+        .and(session_result)
+        .and(flush_result);
     match (connect_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),

@@ -13,7 +13,7 @@
 use crate::lpm_json;
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DENIED_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
@@ -282,15 +282,24 @@ pub fn load_env_files(
     let mut merged = HashMap::new();
 
     // 1. .env
-    merge_env_file(&mut merged, &project_dir.join(".env"))?;
+    merge_env_file(&mut merged, &contained_env_file_path(project_dir, ".env")?)?;
 
     // 2. .env.local
-    merge_env_file(&mut merged, &project_dir.join(".env.local"))?;
+    merge_env_file(
+        &mut merged,
+        &contained_env_file_path(project_dir, ".env.local")?,
+    )?;
 
     // 3 & 4. Mode-specific files
     if let Some(mode) = mode {
-        merge_env_file(&mut merged, &project_dir.join(format!(".env.{mode}")))?;
-        merge_env_file(&mut merged, &project_dir.join(format!(".env.{mode}.local")))?;
+        merge_env_file(
+            &mut merged,
+            &contained_env_file_path(project_dir, &format!(".env.{mode}"))?,
+        )?;
+        merge_env_file(
+            &mut merged,
+            &contained_env_file_path(project_dir, &format!(".env.{mode}.local"))?,
+        )?;
     }
 
     // Filter out vars that already exist in process environment
@@ -317,12 +326,12 @@ pub fn load_env_from_chain(
     let mut merged = HashMap::new();
 
     for file_path in file_chain {
-        let full_path = project_dir.join(file_path);
+        let full_path = contained_env_file_path(project_dir, file_path)?;
         merge_env_file(&mut merged, &full_path)?;
 
         // Also load the .local variant for each file in the chain
         // e.g., .env.staging → .env.staging.local
-        let local_path = project_dir.join(format!("{file_path}.local"));
+        let local_path = contained_env_file_path(project_dir, &format!("{file_path}.local"))?;
         merge_env_file(&mut merged, &local_path)?;
     }
 
@@ -332,6 +341,32 @@ pub fn load_env_from_chain(
     remove_dangerous_env_vars(&mut merged, ".env file");
 
     Ok(merged)
+}
+
+fn contained_env_file_path(project_dir: &Path, file_path: &str) -> Result<PathBuf, LpmError> {
+    let path = project_dir.join(file_path);
+    if !path.exists() {
+        return Ok(path);
+    }
+    let project_root = project_dir.canonicalize().map_err(|error| {
+        LpmError::EnvValidation(format!(
+            "could not resolve project directory '{}': {error}",
+            project_dir.display()
+        ))
+    })?;
+    let canonical_path = path.canonicalize().map_err(|error| {
+        LpmError::EnvValidation(format!(
+            "could not resolve environment file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical_path.starts_with(&project_root) {
+        return Err(LpmError::EnvValidation(format!(
+            "environment file '{}' resolves outside the project directory",
+            path.display()
+        )));
+    }
+    Ok(canonical_path)
 }
 
 fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {

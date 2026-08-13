@@ -49,7 +49,7 @@ fn start_orchestrator(
     services: HashMap<String, ServiceConfig>,
 ) -> (OrchestratorGuard, Receiver<OrchestratorEvent>) {
     let (command_tx, command_rx) = std::sync::mpsc::channel();
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
     let options = OrchestratorOptions {
         command_rx: Some(command_rx),
         event_tx: Some(event_tx),
@@ -191,7 +191,7 @@ fn dependency_exit_stops_running_dependents() {
         ),
         ("api".to_string(), long_running_service(&["db"])),
     ]);
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
     let result = run_services(
         project.path(),
         &services,

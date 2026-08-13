@@ -2,10 +2,49 @@ mod support;
 
 use std::net::{TcpListener, TcpStream};
 
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 does not modify the target process. The PID comes from
+    // the child fixture and is used only while this test owns that fixture.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
 use support::mock_registry::MockRegistry;
 use support::{
     TempProject, configure_fake_node, lpm, lpm_spawnable, lpm_with_registry, write_repeated_file,
 };
+
+#[cfg(unix)]
+fn install_fake_managed_node(project: &TempProject, version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = project
+        .home()
+        .join(".lpm/runtimes/node")
+        .join(version)
+        .join("bin/node");
+    std::fs::create_dir_all(binary.parent().unwrap()).expect("create managed Node bin directory");
+    std::fs::write(&binary, format!("#!/bin/sh\necho v{version}\n"))
+        .expect("write managed Node binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("mark managed Node executable");
+}
+
+#[cfg(unix)]
+fn install_fake_managed_bun(project: &TempProject, version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let binary = project
+        .home()
+        .join(".lpm/runtimes/bun")
+        .join(version)
+        .join("bin/bun");
+    std::fs::create_dir_all(binary.parent().unwrap()).expect("create managed Bun bin directory");
+    std::fs::write(&binary, format!("#!/bin/sh\necho bun-v{version}\n"))
+        .expect("write managed Bun binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("mark managed Bun executable");
+}
 
 struct FrameworkBinCase {
     label: &'static str,
@@ -368,6 +407,120 @@ server.listen(port, '127.0.0.1', () => {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dev_sigterm_stops_single_service_child_and_listener() {
+    use std::io::Read;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve child server port");
+    let port = listener
+        .local_addr()
+        .expect("read child server port")
+        .port();
+    drop(listener);
+
+    let project = TempProject::empty(
+        r#"{"name":"dev-sigterm","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const fs = require('fs');
+const http = require('http');
+const port = Number(process.env.PORT);
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(port, '127.0.0.1', () => {
+  fs.writeFileSync('child.pid', String(process.pid));
+  console.log(`Local: http://localhost:${port}/`);
+});
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+"#,
+    );
+
+    let mut command = lpm_spawnable(&project);
+    command.args([
+        "dev",
+        "--no-install",
+        "--no-open",
+        "--no-dashboard",
+        "--port",
+        &port.to_string(),
+    ]);
+    let mut lpm_child = command.spawn().expect("start single-service lpm dev");
+    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let child_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(project.path().join("child.pid"))
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            break pid.trim().parse::<u32>().expect("parse child PID");
+        }
+        if let Some(status) = lpm_child.try_wait().expect("inspect lpm dev") {
+            panic!("lpm dev exited with {status} before its child became ready");
+        }
+        assert!(
+            std::time::Instant::now() < readiness_deadline,
+            "single-service child did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+
+    // SAFETY: the PID belongs to the live LPM child spawned by this test.
+    let signal_result = unsafe { libc::kill(lpm_child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(signal_result, 0, "send SIGTERM to lpm dev");
+
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let lpm_status = loop {
+        if let Some(status) = lpm_child.try_wait().expect("wait for lpm dev shutdown") {
+            break status;
+        }
+        if std::time::Instant::now() >= exit_deadline {
+            let _ = lpm_child.kill();
+            let _ = lpm_child.wait();
+            panic!("lpm dev did not exit after SIGTERM");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    lpm_child
+        .stdout
+        .take()
+        .expect("capture lpm stdout")
+        .read_to_string(&mut stdout)
+        .expect("read lpm stdout");
+    lpm_child
+        .stderr
+        .take()
+        .expect("capture lpm stderr")
+        .read_to_string(&mut stderr)
+        .expect("read lpm stderr");
+
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < cleanup_deadline
+        && (process_is_alive(child_pid) || TcpStream::connect(("127.0.0.1", port)).is_ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let child_survived = process_is_alive(child_pid);
+    let listener_survived = TcpStream::connect(("127.0.0.1", port)).is_ok();
+    if child_survived {
+        // SAFETY: this PID was recorded by the fixture owned by this test.
+        unsafe {
+            libc::kill(child_pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    assert!(
+        lpm_status.success(),
+        "lpm dev should shut down cleanly after SIGTERM (status {lpm_status})\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !child_survived && !listener_survived,
+        "SIGTERM to lpm dev must stop child PID {child_pid} and listener {port}; child survived: {child_survived}, listener survived: {listener_survived}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn concurrent_vite_like_projects_report_their_own_child_endpoints() {
     let first_listener = TcpListener::bind("127.0.0.1:0").expect("reserve first Vite port");
@@ -426,6 +579,285 @@ server.listen(port, '127.0.0.1', () => {
     assert!(!first_stderr.contains(&format!("  Local http://localhost:{second_port}/")));
     assert!(second_stderr.contains(&format!("  Local http://localhost:{second_port}/")));
     assert!(!second_stderr.contains(&format!("  Local http://localhost:{first_port}/")));
+}
+
+#[test]
+fn multi_service_dev_loads_the_explicit_environment_mode() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"multi-service-env-mode",
+            "version":"1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "worker": {
+                    "command": "node record-env.js"
+                }
+            }
+        }"#,
+    );
+    project.write_file(".env", "SELECTED_MODE=default\n");
+    project.write_file(".env.staging", "SELECTED_MODE=staging\n");
+    project.write_file(
+        "record-env.js",
+        r#"const fs = require('fs');
+const http = require('http');
+fs.writeFileSync('selected-mode.txt', process.env.SELECTED_MODE || '<unset>');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1', () => setTimeout(() => server.close(), 2000));"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "dev",
+            "--env",
+            "staging",
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+        ])
+        .output()
+        .expect("run multi-service dev with an explicit env mode");
+
+    assert!(
+        output.status.success(),
+        "multi-service dev failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(project.read_file("selected-mode.txt"), "staging");
+}
+
+#[test]
+fn multi_service_dev_scrubs_inherited_credentials() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"multi-service-env-scrub",
+            "version":"1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "worker": {
+                    "command": "node record-env.js"
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "record-env.js",
+        r#"const fs = require('fs');
+const http = require('http');
+fs.writeFileSync('child-env.json', JSON.stringify({
+  token: process.env.LPM_TOKEN || null,
+  ordinary: process.env.LPM_ORDINARY_VALUE || null
+}));
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1', () => setTimeout(() => server.close(), 2000));"#,
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "must-not-leak")
+        .env("LPM_ORDINARY_VALUE", "preserved")
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run multi-service dev with inherited credentials");
+
+    assert!(
+        output.status.success(),
+        "multi-service dev failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let child_env: serde_json::Value =
+        serde_json::from_str(&project.read_file("child-env.json")).expect("parse child env");
+    assert_eq!(child_env["token"], serde_json::Value::Null);
+    assert_eq!(child_env["ordinary"], "preserved");
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_service_dev_composes_root_and_service_local_runtimes() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"multi-service-local-runtimes",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["services/*"]
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+        "runtime":{"node":"22.0.0"},
+        "services":{
+            "api":{"command":"node --version && bun --version && service-tool","cwd":"services/api"},
+            "worker":{"command":"true"}
+        }
+    }"#,
+    );
+    project.write_file(
+        "services/api/package.json",
+        r#"{"name":"multi-service-api","version":"1.0.0","engines":{"node":">=22"}}"#,
+    );
+    project.write_file("services/api/lpm.json", r#"{"runtime":{"bun":"1.3.14"}}"#);
+    install_fake_managed_node(&project, "22.0.0");
+    install_fake_managed_bun(&project, "1.3.14");
+    project.write_file(
+        "services/api/node_modules/.bin/service-tool",
+        "#!/bin/sh\necho service-local-bin\n",
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = project
+            .path()
+            .join("services/api/node_modules/.bin/service-tool");
+        std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755))
+            .expect("mark service-local tool executable");
+    }
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run multi-service dev with service-local runtime selectors");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output.status.success(),
+        "multi-service dev failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("v22.0.0")
+            && combined.contains("bun-v1.3.14")
+            && combined.contains("service-local-bin"),
+        "service did not receive root runtime, local runtime, and local bin:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_service_dev_rejects_service_node_that_violates_its_engine() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"multi-service-engine-gate",
+            "version":"1.0.0",
+            "private":true,
+            "workspaces":["services/*"]
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+        "services":{
+            "api":{"command":"touch service-started","cwd":"services/api"},
+            "worker":{"command":"true"}
+        }
+    }"#,
+    );
+    project.write_file(
+        "services/api/package.json",
+        r#"{"name":"engine-gated-api","version":"1.0.0","engines":{"node":">=22"}}"#,
+    );
+    project.write_file("services/api/lpm.json", r#"{"runtime":{"node":"20.0.0"}}"#);
+    install_fake_managed_node(&project, "20.0.0");
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run multi-service dev with an incompatible service runtime");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "engine mismatch did not fail:\n{combined}"
+    );
+    assert!(
+        combined.contains(">=22") && combined.contains("20.0.0"),
+        "engine mismatch did not identify the requirement and runtime:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("services/api/service-started"),
+        "service spawned before its engine requirement was validated"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn single_service_dev_banner_reports_the_selected_managed_node() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"single-service-runtime-banner",
+            "version":"1.0.0",
+            "scripts":{"dev":"node server.js"}
+        }"#,
+    );
+    project.write_file("lpm.json", r#"{"runtime":{"node":"22.0.0"}}"#);
+    install_fake_managed_node(&project, "22.0.0");
+    let system_node = std::process::Command::new("sh")
+        .args(["-c", "command -v node"])
+        .output()
+        .expect("locate system Node");
+    assert!(system_node.status.success(), "system Node is required");
+    let system_node = String::from_utf8(system_node.stdout)
+        .expect("system Node path is UTF-8")
+        .trim()
+        .to_string();
+    let managed_node = project.home().join(".lpm/runtimes/node/22.0.0/bin/node");
+    std::fs::write(
+        &managed_node,
+        format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = --version ]; then echo v22.0.0; else exec '{system_node}' \"$@\"; fi\n"
+        ),
+    )
+    .expect("write managed Node proxy");
+    project.write_file(
+        "server.js",
+        r#"const http = require('http');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(0, '127.0.0.1', () => {
+  const port = server.address().port;
+  console.log(`Local: http://localhost:${port}/`);
+  setTimeout(() => server.close(), 750);
+});"#,
+    );
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "20.0.0");
+
+    let output = command
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run single-service dev with a managed Node selector");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        output.status.success(),
+        "single-service dev failed:\n{combined}"
+    );
+    let node_line = combined
+        .lines()
+        .find(|line| line.contains("● Node"))
+        .unwrap_or_else(|| panic!("startup banner omitted Node:\n{combined}"));
+    assert!(
+        node_line.contains("v22.0.0") && node_line.contains("lpm.json"),
+        "startup banner did not report the selected managed Node:\n{node_line}"
+    );
 }
 
 #[test]
@@ -554,6 +986,59 @@ fn dev_readiness_timeout_stops_before_starting_dependents() {
         stderr.contains("service 'db' failed readiness")
             && stderr.contains("timed out waiting for http://127.0.0.1:0/health (1s)"),
         "error must identify the service and readiness target\nstderr:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_service_readiness_failure_stops_descendant_processes() {
+    let descendant_listener = TcpListener::bind("127.0.0.1:0").expect("reserve descendant port");
+    let descendant_port = descendant_listener
+        .local_addr()
+        .expect("read descendant port")
+        .port();
+    drop(descendant_listener);
+    let project = TempProject::empty(r#"{"name":"descendant-cleanup","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+                "services":{{
+                    "api":{{
+                        "command":"node descendant.js {descendant_port} & sleep 30",
+                        "readyUrl":"http://127.0.0.1:0/health",
+                        "readyTimeout":1
+                    }},
+                    "worker":{{"command":"sleep 30"}}
+                }}
+            }}"#
+        ),
+    );
+    project.write_file(
+        "descendant.js",
+        r#"const fs = require('fs');
+const net = require('net');
+const server = net.createServer(() => {});
+server.listen(Number(process.argv[2]), '127.0.0.1', () => {
+  fs.writeFileSync('descendant-ready', String(process.pid));
+});"#,
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run multi-service dev with a descendant process");
+    assert!(!output.status.success(), "readiness failure must fail dev");
+
+    let survived = TcpStream::connect(("127.0.0.1", descendant_port)).is_ok();
+    if survived && let Ok(pid) = project.read_file("descendant-ready").trim().parse::<u32>() {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    assert!(
+        !survived,
+        "readiness failure left a descendant listening on port {descendant_port}"
     );
 }
 

@@ -3,6 +3,7 @@
 use crate::log_buffer::LogBuffer;
 use lpm_tunnel::webhook::CapturedWebhook;
 use lpm_tunnel::webhook_buffer::WebhookBuffer;
+use std::sync::Arc;
 
 /// Status of a service in the dashboard.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,7 +91,7 @@ impl DashboardApp {
             network_ip: None,
             https: false,
             active_tab: Tab::Services,
-            webhooks: WebhookBuffer::new(100),
+            webhooks: WebhookBuffer::with_limits(100, 8 * 1024 * 1024),
             webhook_scroll: 0,
             webhook_detail: None,
             inspector_url: None,
@@ -164,8 +165,12 @@ impl DashboardApp {
 
     /// Push a captured webhook into the in-memory buffer.
     pub fn push_webhook(&mut self, webhook: CapturedWebhook) {
+        self.push_shared_webhook(Arc::new(webhook));
+    }
+
+    pub fn push_shared_webhook(&mut self, webhook: Arc<CapturedWebhook>) {
         let was_at_bottom = self.webhook_scroll == 0;
-        self.webhooks.push(webhook);
+        self.webhooks.push_shared(webhook);
         if !was_at_bottom {
             let max = self.webhooks.len().saturating_sub(1);
             self.webhook_scroll = self.webhook_scroll.min(max);

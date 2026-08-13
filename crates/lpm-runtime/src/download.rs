@@ -4,7 +4,73 @@ use crate::bun::{self, BunAsset, BunRelease};
 use crate::node::{self, NodeRelease};
 use crate::platform::Platform;
 use lpm_common::LpmError;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+struct RuntimeStagingDir {
+    path: PathBuf,
+}
+
+impl RuntimeStagingDir {
+    fn create(parent: &Path, version: &str) -> Result<Self, LpmError> {
+        let path = parent.join(format!(".{version}-installing-{}", std::process::id()));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        create_restricted_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RuntimeStagingDir {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                "failed to remove runtime staging directory: {error}"
+            );
+        }
+    }
+}
+
+fn remove_stale_runtime_staging_dirs(parent: &Path, version: &str) -> Result<(), LpmError> {
+    create_restricted_dir(parent)?;
+    let prefix = format!(".{version}-installing-");
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        } else {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn runtime_install_lock_path(target_dir: &Path) -> Result<std::path::PathBuf, LpmError> {
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
+    let version = target_dir
+        .file_name()
+        .ok_or_else(|| LpmError::Script("invalid runtime version path".into()))?;
+    Ok(parent
+        .join(".install-locks")
+        .join(format!("{}.lock", version.to_string_lossy())))
+}
+
+fn runtime_is_complete(target_dir: &Path, executable_relative_path: &Path) -> bool {
+    target_dir.join(executable_relative_path).is_file()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeInstallReport {
@@ -53,14 +119,36 @@ pub async fn install_node_with_report(
 ) -> Result<RuntimeInstallReport, LpmError> {
     let version = release.version_bare();
     let target_dir = node::node_version_dir(version)?;
+    let executable_relative_path = Path::new(if cfg!(windows) {
+        "node.exe"
+    } else {
+        "bin/node"
+    });
 
-    if target_dir.exists() {
+    if runtime_is_complete(&target_dir, executable_relative_path) {
         tracing::debug!(
             "node {version} already installed at {}",
             target_dir.display()
         );
         return Ok(RuntimeInstallReport::already_installed(version));
     }
+
+    let lock_path = runtime_install_lock_path(&target_dir)?;
+    let _install_lock = tokio::task::spawn_blocking(move || {
+        lpm_common::acquire_single_file_exclusive_lock(lock_path)
+    })
+    .await
+    .map_err(|error| LpmError::Script(format!("runtime install lock task failed: {error}")))??;
+    if runtime_is_complete(&target_dir, executable_relative_path) {
+        return Ok(RuntimeInstallReport::already_installed(version));
+    }
+    if target_dir.exists() {
+        std::fs::remove_dir_all(&target_dir)?;
+    }
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
+    remove_stale_runtime_staging_dirs(parent, version)?;
 
     let url = release.download_url(platform);
     tracing::debug!("downloading node {version} from {url}");
@@ -92,37 +180,24 @@ pub async fn install_node_with_report(
     let sha256 = verify_checksum(client, release, platform, &bytes).await?;
 
     // Extract tarball
-    let parent = target_dir
-        .parent()
-        .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
-
-    // Create parent directory with restricted permissions
-    create_restricted_dir(parent)?;
-
-    // Extract to a temp dir first, then rename (atomic)
-    let temp_dir = parent.join(format!(".{version}-installing"));
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir)?;
-    }
-    create_restricted_dir(&temp_dir)?;
+    let staging = RuntimeStagingDir::create(parent, version)?;
+    let temp_dir = staging.path();
 
     // Windows uses .zip, others use .tar.gz
     if platform.os == "win" {
-        extract_zip(&bytes, &temp_dir)?;
+        extract_zip(&bytes, temp_dir)?;
     } else {
-        extract_tarball(&bytes, &temp_dir)?;
+        extract_tarball(&bytes, temp_dir)?;
     }
 
     // The tarball contains a single top-level directory like "node-v22.5.0-darwin-arm64/"
     // We need to move its contents to the final location.
-    let inner_dir = find_single_subdir(&temp_dir)?;
+    let inner_dir = find_single_subdir(temp_dir)?;
 
     // Rename with TOCTOU race recovery
     rename_with_fallback(&inner_dir, &target_dir)?;
 
     // Clean up temp dir
-    let _ = std::fs::remove_dir_all(&temp_dir);
-
     tracing::debug!("installed node {version} to {}", target_dir.display());
     Ok(RuntimeInstallReport {
         version: version.to_string(),
@@ -155,14 +230,37 @@ pub async fn install_bun_with_report(
 ) -> Result<RuntimeInstallReport, LpmError> {
     let version = release.version_bare();
     let target_dir = bun::bun_version_dir(version)?;
+    let binary_name = if cfg!(windows) { "bun.exe" } else { "bun" };
+    let executable_relative_path = Path::new(if cfg!(windows) {
+        "bin/bun.exe"
+    } else {
+        "bin/bun"
+    });
 
-    if target_dir.exists() {
+    if runtime_is_complete(&target_dir, executable_relative_path) {
         tracing::debug!(
             "bun {version} already installed at {}",
             target_dir.display()
         );
         return Ok(RuntimeInstallReport::already_installed(version));
     }
+
+    let lock_path = runtime_install_lock_path(&target_dir)?;
+    let _install_lock = tokio::task::spawn_blocking(move || {
+        lpm_common::acquire_single_file_exclusive_lock(lock_path)
+    })
+    .await
+    .map_err(|error| LpmError::Script(format!("runtime install lock task failed: {error}")))??;
+    if runtime_is_complete(&target_dir, executable_relative_path) {
+        return Ok(RuntimeInstallReport::already_installed(version));
+    }
+    if target_dir.exists() {
+        std::fs::remove_dir_all(&target_dir)?;
+    }
+    let parent = target_dir
+        .parent()
+        .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
+    remove_stale_runtime_staging_dirs(parent, version)?;
 
     tracing::debug!(
         "downloading bun {version} from {}",
@@ -194,16 +292,8 @@ pub async fn install_bun_with_report(
 
     let sha256 = verify_bun_checksum(client, release, asset, &bytes).await?;
 
-    let parent = target_dir
-        .parent()
-        .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
-    create_restricted_dir(parent)?;
-
-    let temp_dir = parent.join(format!(".{version}-installing"));
-    if temp_dir.exists() {
-        std::fs::remove_dir_all(&temp_dir)?;
-    }
-    create_restricted_dir(&temp_dir)?;
+    let staging = RuntimeStagingDir::create(parent, version)?;
+    let temp_dir = staging.path();
 
     let extract_dir = temp_dir.join("extract");
     create_restricted_dir(&extract_dir)?;
@@ -214,7 +304,6 @@ pub async fn install_bun_with_report(
     let bin_dir = stage_dir.join("bin");
     create_restricted_dir(&bin_dir)?;
 
-    let binary_name = if cfg!(windows) { "bun.exe" } else { "bun" };
     let source_binary = inner_dir.join(binary_name);
     if !source_binary.exists() {
         return Err(LpmError::Script(format!(
@@ -236,8 +325,6 @@ pub async fn install_bun_with_report(
     }
 
     rename_with_fallback(&stage_dir, &target_dir)?;
-    let _ = std::fs::remove_dir_all(&temp_dir);
-
     tracing::debug!("installed bun {version} to {}", target_dir.display());
     Ok(RuntimeInstallReport {
         version: version.to_string(),
@@ -614,7 +701,6 @@ async fn verify_checksum(
     compare_checksum(expected_hash, data)?;
     let expected_hash = expected_hash.to_ascii_lowercase();
 
-    // M20: surface the trust posture on every successful verify.
     // SHASUMS256.txt is fetched over HTTPS from nodejs.org but the
     // detached `.sig` GPG signature is NOT verified, so a CA-trusted
     // MITM (corporate proxy, mis-issued cert) or a mirror operator
@@ -626,7 +712,7 @@ async fn verify_checksum(
     tracing::warn!(
         target: "lpm_runtime::download",
         url = %shasums_url,
-        "Node runtime SHASUMS256 verified via upstream HTTPS only — no GPG signature check (M20). Trust is anchored on nodejs.org TLS; a CA-trusted MITM or mirror operator can substitute the asset + checksum together.",
+        "Node runtime SHASUMS256 verified via upstream HTTPS only — no GPG signature check. Trust is anchored on nodejs.org TLS; a CA-trusted MITM or mirror operator can substitute the asset + checksum together.",
     );
 
     Ok(expected_hash)

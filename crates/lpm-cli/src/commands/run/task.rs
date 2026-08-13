@@ -52,8 +52,9 @@ pub(super) fn run_task(
 ) -> Result<(), LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_command(
+        return lpm_runner::script::run_task_command(
             project_dir,
+            task_name,
             command,
             extra_args,
             env_mode,
@@ -75,8 +76,9 @@ pub(super) fn run_task_captured(
 ) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_command_captured(
+        return lpm_runner::script::run_task_command_captured(
             project_dir,
+            task_name,
             command,
             extra_args,
             env_mode,

@@ -19,7 +19,20 @@ pub(super) struct CacheContext {
     pub(super) cache_key: String,
     pub(super) command: String,
     pub(super) env_vars: HashMap<String, String>,
+    pub(super) inherited_env: HashMap<String, String>,
     pub(super) remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
+}
+
+pub(super) struct CacheStoreRequest<'a> {
+    pub(super) project_dir: &'a Path,
+    pub(super) script_name: &'a str,
+    pub(super) env_mode: Option<&'a str>,
+    pub(super) extra_args: &'a [String],
+    pub(super) bin_hint: &'a lpm_runner::bin_path::ManagedRuntimeHint,
+    pub(super) duration_ms: u64,
+    pub(super) stdout: &'a str,
+    pub(super) stderr: &'a str,
+    pub(super) lpm_config: Option<&'a lpm_runner::lpm_json::LpmJsonConfig>,
 }
 
 /// Build the cache context for a task: reads lpm.json (or uses provided config),
@@ -30,6 +43,8 @@ pub(super) fn build_cache_context(
     project_dir: &Path,
     script_name: &str,
     env_mode: Option<&str>,
+    extra_args: &[String],
+    bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<Option<CacheContext>, LpmError> {
     // Use provided config or read from disk
@@ -49,7 +64,27 @@ pub(super) fn build_cache_context(
         _ => return Ok(None),
     };
 
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, env_mode)?;
+    let env_vars = lpm_runner::script::load_script_env(project_dir, script_name, env_mode)?;
+    let inherited_env = lpm_runner::shell::inherited_child_env();
+    let mut child_env = HashMap::with_capacity(inherited_env.len() + env_vars.len());
+    child_env.extend(
+        inherited_env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    child_env.extend(
+        env_vars
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    let mut runtime_identities = bin_hint.cache_identities();
+    let child_path =
+        lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
+    bin_hint.append_executable_cache_identities(
+        project_dir,
+        std::ffi::OsStr::new(&child_path),
+        &mut runtime_identities,
+    );
 
     let pkg_json_path = project_dir.join("package.json");
     let deps_json = if pkg_json_path.exists() {
@@ -73,8 +108,10 @@ pub(super) fn build_cache_context(
     let cache_key = lpm_task::hasher::compute_cache_key(
         project_dir,
         &command,
+        extra_args,
+        &runtime_identities,
         &task_config.effective_inputs(),
-        &env_vars,
+        &child_env,
         &deps_json,
     );
 
@@ -83,6 +120,7 @@ pub(super) fn build_cache_context(
         cache_key,
         command,
         env_vars,
+        inherited_env,
         remote_cache: crate::commands::remote_cache::client_from_config(config_ref),
     }))
 }
@@ -95,9 +133,18 @@ pub(super) fn try_cache_hit_with_config(
     project_dir: &Path,
     script_name: &str,
     env_mode: Option<&str>,
+    extra_args: &[String],
+    bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<Option<lpm_task::cache::CacheHit>, LpmError> {
-    let ctx = match build_cache_context(project_dir, script_name, env_mode, lpm_config)? {
+    let ctx = match build_cache_context(
+        project_dir,
+        script_name,
+        env_mode,
+        extra_args,
+        bin_hint,
+        lpm_config,
+    )? {
         Some(ctx) => ctx,
         None => return Ok(None),
     };
@@ -131,47 +178,50 @@ pub(super) fn try_cache_hit_with_config(
 /// Store cache with captured stdout/stderr. Callers thread a pre-read
 /// `lpm.json` through to avoid re-reading per task in parallel execution.
 pub(super) fn try_cache_store_with_output_and_config(
-    project_dir: &Path,
-    script_name: &str,
-    env_mode: Option<&str>,
-    duration_ms: u64,
-    stdout: &str,
-    stderr: &str,
-    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    request: CacheStoreRequest<'_>,
 ) -> Result<(), LpmError> {
-    let ctx = match build_cache_context(project_dir, script_name, env_mode, lpm_config)? {
+    let ctx = match build_cache_context(
+        request.project_dir,
+        request.script_name,
+        request.env_mode,
+        request.extra_args,
+        request.bin_hint,
+        request.lpm_config,
+    )? {
         Some(ctx) => ctx,
         None => return Ok(()),
     };
 
     lpm_task::cache::store_cache(
         &ctx.cache_key,
-        project_dir,
+        request.project_dir,
         &ctx.command,
         &ctx.task_config.outputs,
-        stdout,
-        stderr,
-        duration_ms,
+        request.stdout,
+        request.stderr,
+        request.duration_ms,
     )?;
 
     if let Some(remote_cache) = &ctx.remote_cache {
         crate::commands::remote_cache::try_store(
             remote_cache,
             &ctx.cache_key,
-            project_dir,
+            request.project_dir,
             &ctx.command,
             &ctx.task_config.outputs,
-            stdout,
-            stderr,
-            duration_ms,
+            request.stdout,
+            request.stderr,
+            request.duration_ms,
             &ctx.env_vars,
+            &ctx.inherited_env,
         );
     }
 
     tracing::debug!(
-        "stored cache for task '{script_name}' (key: {}, stdout: {} bytes)",
+        "stored cache for task '{}' (key: {}, stdout: {} bytes)",
+        request.script_name,
         ctx.cache_key,
-        stdout.len()
+        request.stdout.len()
     );
     Ok(())
 }

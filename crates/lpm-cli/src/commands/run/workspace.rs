@@ -133,8 +133,16 @@ pub async fn run_workspace(
         .filter(|idx| runnable_members[*idx])
     {
         let member_dir = &ws_graph.members[idx].path;
-        if lpm_runtime::detect::detect_node_version(member_dir)?.is_some() {
-            member_runtime_hints[idx] = Arc::new(ensure_runtime(member_dir).await?);
+        let member_selectors = lpm_runtime::detect::detect_runtime_versions(member_dir)?;
+        if !member_selectors.is_empty() {
+            let member_hint = ensure_runtime(member_dir).await?;
+            let selected_runtimes: Vec<_> = member_selectors
+                .iter()
+                .map(|selector| selector.runtime)
+                .collect();
+            member_runtime_hints[idx] = Arc::new(
+                member_hint.inherit_unselected_from(root_hint.as_ref(), &selected_runtimes),
+            );
             validate_runtime_with_cache(
                 member_dir,
                 member_runtime_hints[idx].as_ref(),

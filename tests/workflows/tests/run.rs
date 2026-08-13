@@ -10,6 +10,166 @@ use support::{TempProject, lpm, write_repeated_file};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[cfg(unix)]
+#[test]
+fn run_rejects_an_environment_file_symlink_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"env-symlink-containment",
+            "version":"1.0.0",
+            "scripts":{"read-secret":"node -e \"require('fs').writeFileSync('leaked', process.env.EXTERNAL_SECRET || '<unset>')\""}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"environments":{"staging":{"file":"config/.env.staging"}}}"#,
+    );
+    let external = project.home().join("outside-secret.env");
+    std::fs::write(&external, "EXTERNAL_SECRET=must-not-load\n")
+        .expect("write external secret file");
+    let configured = project.path().join("config/.env.staging");
+    std::fs::create_dir_all(configured.parent().unwrap()).expect("create env directory");
+    symlink(&external, &configured).expect("create external env symlink");
+
+    let output = lpm(&project)
+        .args(["run", "read-secret", "--env", "staging"])
+        .output()
+        .expect("run with an environment file symlink");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "external environment symlink was accepted:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("leaked"),
+        "script ran after the environment containment failure"
+    );
+    assert!(
+        combined.contains("outside the project"),
+        "containment error was not actionable:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_without_lpm_json_rejects_a_standard_env_symlink_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(
+        r#"{
+            "name":"standard-env-symlink-containment",
+            "version":"1.0.0",
+            "scripts":{"read-secret":"node -e \"require('fs').writeFileSync('leaked', process.env.EXTERNAL_SECRET || '<unset>')\""}
+        }"#,
+    );
+    let external = project.home().join("outside-standard.env");
+    std::fs::write(&external, "EXTERNAL_SECRET=must-not-load\n")
+        .expect("write external secret file");
+    symlink(&external, project.path().join(".env")).expect("create external .env symlink");
+
+    let output = lpm(&project)
+        .args(["run", "read-secret"])
+        .output()
+        .expect("run without lpm.json through an external .env symlink");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "external standard environment symlink was accepted:\n{combined}"
+    );
+    assert!(
+        !project.file_exists("leaked"),
+        "script ran after the standard environment containment failure"
+    );
+    assert!(
+        combined.contains("outside the project"),
+        "containment error was not actionable:\n{combined}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_passes_cmd_metacharacters_as_literal_arguments() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"windows-literal-args",
+            "version":"1.0.0",
+            "scripts":{"capture":"capture"}
+        }"#,
+    );
+    project.write_file(
+        "capture.js",
+        "require('fs').writeFileSync('args.json', JSON.stringify(process.argv.slice(2)));\n",
+    );
+    std::fs::create_dir_all(project.path().join("node_modules/.bin"))
+        .expect("create local bin directory");
+    project.write_file(
+        "node_modules/.bin/capture.cmd",
+        "@ECHO OFF\r\nnode \"%~dp0\\..\\..\\capture.js\" %*\r\n",
+    );
+
+    let output = lpm(&project)
+        .args([
+            "run",
+            "capture",
+            "--",
+            "",
+            "two words",
+            "tab\tvalue",
+            "snowman-☃",
+            "a&b",
+            "c|d",
+            "e<f",
+            "g>h",
+            "%PATH%",
+            "!delayed!",
+            "quoted\"value",
+            "trail\\",
+            "& echo PWNED > injected-marker",
+        ])
+        .output()
+        .expect("run script with cmd.exe metacharacters");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "script failed:\n{combined}");
+    let args: serde_json::Value =
+        serde_json::from_str(&project.read_file("args.json")).expect("parse captured arguments");
+    assert_eq!(
+        args,
+        serde_json::json!([
+            "",
+            "two words",
+            "tab\tvalue",
+            "snowman-☃",
+            "a&b",
+            "c|d",
+            "e<f",
+            "g>h",
+            "%PATH%",
+            "!delayed!",
+            "quoted\"value",
+            "trail\\",
+            "& echo PWNED > injected-marker"
+        ])
+    );
+    assert!(!project.file_exists("injected-marker"));
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -842,6 +1002,74 @@ fn run_loads_env_mode_file() {
 }
 
 #[test]
+fn run_uses_task_environment_when_cli_mode_is_absent() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "task-env-mode",
+        "version": "1.0.0"
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "show-env": {
+                    "command": "node show.js",
+                    "env": "staging"
+                }
+            }
+        }"#,
+    );
+    project.write_file(".env.staging", "STAGE_VAR=task-staging\n");
+    project.write_file("show.js", "console.log(process.env.STAGE_VAR || '<unset>')");
+
+    let output = lpm(&project)
+        .args(["run", "show-env"])
+        .output()
+        .expect("run task with its configured environment");
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("task-staging"),
+        "task environment was not loaded; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn run_cli_environment_overrides_task_environment() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "task-env-override",
+        "version": "1.0.0"
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "show-env": {
+                    "command": "node show.js",
+                    "env": "staging"
+                }
+            }
+        }"#,
+    );
+    project.write_file(".env.staging", "STAGE_VAR=task-staging\n");
+    project.write_file(".env.production", "STAGE_VAR=cli-production\n");
+    project.write_file("show.js", "console.log(process.env.STAGE_VAR || '<unset>')");
+
+    let output = lpm(&project)
+        .args(["run", "show-env", "--env", "production"])
+        .output()
+        .expect("run task with a CLI environment override");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("cli-production"));
+}
+
+#[test]
 fn run_rejects_oversized_lpm_json_before_spawning_script() {
     let project = TempProject::empty(
         r#"{
@@ -1067,6 +1295,115 @@ fn run_cache_hit_replays_output() {
     assert!(
         combined2.contains("cache") || combined2.contains("restored"),
         "cache hit should mention cache, got:\n{combined2}"
+    );
+}
+
+#[test]
+fn run_cache_invalidates_when_mapped_environment_changes() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "cache-mapped-env",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "node build.js"
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "env": {"build": ".env.development"},
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/value.txt', process.env.BUILD_VALUE || '<unset>');
+console.log(process.env.BUILD_VALUE || '<unset>');"#,
+    );
+    project.write_file(".env.development", "BUILD_VALUE=first\n");
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    project.write_file(".env.development", "BUILD_VALUE=second\n");
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run cached task after mapped env changed");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(output.status.success(), "second build failed:\n{combined}");
+    assert_eq!(project.read_file("dist/value.txt"), "second");
+    assert!(
+        !combined.contains("restored from cache"),
+        "changed mapped env restored stale output:\n{combined}"
+    );
+}
+
+#[test]
+fn run_cache_invalidates_when_cli_arguments_change() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "cache-cli-arguments",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "node build.js"
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/value.txt', process.argv.slice(2).join('|'));
+console.log(process.argv.slice(2).join('|'));"#,
+    );
+
+    lpm(&project)
+        .args(["run", "build", "--", "--target", "node"])
+        .assert()
+        .success();
+    let output = lpm(&project)
+        .args(["run", "build", "--", "--target", "browser"])
+        .output()
+        .expect("run cached task with different arguments");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    assert!(output.status.success(), "second build failed:\n{combined}");
+    assert_eq!(
+        project.read_file("dist/value.txt"),
+        "--target|browser",
+        "second run output:\n{combined}"
+    );
+    assert!(
+        !combined.contains("restored from cache"),
+        "different arguments restored stale output:\n{combined}"
     );
 }
 
