@@ -57,13 +57,13 @@ const BUILTIN_FIXTURES = new Map([
 ]);
 
 const DEFAULT_FIXTURES = ['dogfood', 'nest', 'vitepress'];
-const TAIL_METRICS = ['wall_ms', 'resolve_ms', 'fetch_ms', 'link_ms'];
+const TAIL_METRICS = ['wall_ms', 'max_rss_bytes', 'resolve_ms', 'fetch_ms', 'link_ms'];
 const DEFAULT_MANAGERS = ['lpm'];
 const DEFAULT_MODES = ['cold'];
 const DEFAULT_LPM_ROUTES = ['direct'];
 const DEFAULT_LPM_FIREWALL_MODES = ['off'];
 const INSTALL_DIRS = new Set(['node_modules', '.lpm']);
-const COMPARISON_GATE_METRICS = new Set(['wall_ms']);
+const COMPARISON_GATE_METRICS = new Set(['wall_ms', 'max_rss_bytes']);
 const LOCKFILES = new Set([
   'lpm.lock',
   'lpm.lockb',
@@ -127,8 +127,30 @@ const defaultLpmBin = path.resolve(args.lpmBin ?? path.join(repoRoot, 'target/re
 const lpmBinaries = parseLpmBinaries(args.lpmBinaries, defaultLpmBin);
 const lpmComparison = parseLpmComparison(args.lpmCompare, lpmBinaries);
 const comparisonThresholds = {
-  median_pct: nonNegativeNumber(args.medianRegressionPct, 5, '--median-regression-pct'),
-  p95_pct: nonNegativeNumber(args.p95RegressionPct, 10, '--p95-regression-pct'),
+  wall_ms: {
+    median_pct: nonNegativeNumber(args.medianRegressionPct, 5, '--median-regression-pct'),
+    p95_pct: nonNegativeNumber(args.p95RegressionPct, 10, '--p95-regression-pct'),
+    median_abs: nonNegativeNumber(args.medianRegressionMs, 20, '--median-regression-ms'),
+    p95_abs: nonNegativeNumber(args.p95RegressionMs, 50, '--p95-regression-ms'),
+  },
+  max_rss_bytes: {
+    median_pct: nonNegativeNumber(
+      args.rssMedianRegressionPct,
+      5,
+      '--rss-median-regression-pct',
+    ),
+    p95_pct: nonNegativeNumber(
+      args.rssP95RegressionPct,
+      10,
+      '--rss-p95-regression-pct',
+    ),
+    median_abs: mebibytesToBytes(
+      nonNegativeNumber(args.rssMedianRegressionMb, 16, '--rss-median-regression-mb'),
+    ),
+    p95_abs: mebibytesToBytes(
+      nonNegativeNumber(args.rssP95RegressionMb, 32, '--rss-p95-regression-mb'),
+    ),
+  },
 };
 const lpmTyposquatGuard = args.lpmTyposquatGuard ?? (topNpmFile ? 'off' : 'default');
 const scriptPolicy = args.scriptPolicy ?? 'ignore';
@@ -200,10 +222,23 @@ fs.mkdirSync(outputDir, { recursive: true });
 fs.writeFileSync(path.join(outputDir, 'plan.json'), `${JSON.stringify(plan, null, 2)}\n`);
 
 const rows = [];
+let executionSequence = 0;
 
 for (let sample = 1; sample <= samples; sample += 1) {
   for (const fixture of fixtures) {
-    for (const spec of rotated(runSpecs, sample - 1)) {
+    const pairedSpecIds = new Set();
+    if (lpmComparison) {
+      const pairs = buildLpmComparisonPairs(runSpecs, lpmComparison);
+      for (const [pairIndex, pair] of pairs.entries()) {
+        pairedSpecIds.add(pair.baseline.id);
+        pairedSpecIds.add(pair.candidate.id);
+        rows.push(
+          ...runPairedLpmSpecs({ sample, fixture, pair, pairIndex, modes }),
+        );
+      }
+    }
+    const referenceSpecs = runSpecs.filter((spec) => !pairedSpecIds.has(spec.id));
+    for (const spec of rotated(referenceSpecs, sample - 1)) {
       const rowSet = runInstallSpec({ sample, fixture, spec, modes });
       rows.push(...rowSet);
     }
@@ -291,7 +326,7 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
         phase: 'cold',
       });
       rowsForSpec.push(row);
-      installedOk = row.exit_code === 0 && !row.parse_error;
+      installedOk = !runFailed(row);
     } else if (shouldMeasureWarm || shouldMeasureUpToDate) {
       const row = measureInstall({
         sample,
@@ -305,7 +340,7 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
         counted: false,
       });
       rowsForSpec.push(row);
-      installedOk = row.exit_code === 0 && !row.parse_error;
+      installedOk = !runFailed(row);
     }
 
     if (shouldMeasureWarm) {
@@ -322,7 +357,7 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
           phase: 'warm',
         });
         rowsForSpec.push(row);
-        installedOk = row.exit_code === 0 && !row.parse_error;
+        installedOk = !runFailed(row);
       } else {
         rowsForSpec.push(
           recordSkippedInstall({
@@ -375,6 +410,114 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
   return rowsForSpec;
 }
 
+function buildLpmComparisonPairs(specs, comparison) {
+  const baselines = specs.filter(
+    (spec) => spec.manager === 'lpm' && spec.binaryName === comparison.baseline,
+  );
+  const candidates = specs.filter(
+    (spec) => spec.manager === 'lpm' && spec.binaryName === comparison.candidate,
+  );
+  const identity = (spec) => [spec.cellName, spec.route, spec.firewallMode].join('\0');
+  const candidateByIdentity = new Map(candidates.map((spec) => [identity(spec), spec]));
+  const pairs = baselines.map((baseline) => {
+    const candidate = candidateByIdentity.get(identity(baseline));
+    if (!candidate) {
+      throw new Error(`missing candidate lpm run spec for ${baseline.id}`);
+    }
+    candidateByIdentity.delete(identity(baseline));
+    return { baseline, candidate };
+  });
+  if (candidateByIdentity.size > 0) {
+    throw new Error(
+      `missing baseline lpm run spec for ${[...candidateByIdentity.values()][0].id}`,
+    );
+  }
+  return pairs;
+}
+
+function runPairedLpmSpecs({ sample, fixture, pair, pairIndex, modes }) {
+  const contexts = [pair.baseline, pair.candidate].map((spec) => {
+    const tmpRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), `lpm-readiness-${fixture.name}-${spec.id}-${sample}-`),
+    );
+    const projectDir = path.join(tmpRoot, 'project');
+    const homeDir = path.join(tmpRoot, 'home');
+    const lpmHome = path.join(tmpRoot, 'lpm-home');
+    const runDir = path.join(outputDir, fixture.name, spec.id, `sample-${sample}`);
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.mkdirSync(homeDir, { recursive: true });
+    materializeFixture(fixture, projectDir);
+    cleanProjectForCold(projectDir);
+    const env = buildEnv({ homeDir, lpmHome, spec });
+    fs.writeFileSync(path.join(runDir, 'env.json'), `${JSON.stringify(redactedEnv(env), null, 2)}\n`);
+    fs.writeFileSync(path.join(runDir, 'project-dir.txt'), `${projectDir}\n`);
+    return { spec, tmpRoot, projectDir, env, runDir, installedOk: true, rows: [] };
+  });
+  const pairId = [
+    fixture.name,
+    contexts[0].spec.cellName,
+    contexts[0].spec.route,
+    contexts[0].spec.firewallMode,
+    `sample-${sample}`,
+  ].join(':');
+  const baselineFirst = (sample + pairIndex) % 2 === 1;
+  const ordered = baselineFirst ? contexts : contexts.slice().reverse();
+  const pairOrder = baselineFirst ? 'baseline-candidate' : 'candidate-baseline';
+
+  try {
+    if (!modes.includes('cold') && modes.some((mode) => mode !== 'cold')) {
+      for (const context of ordered) {
+        const row = measureInstall({
+          sample,
+          fixture,
+          ...context,
+          mode: 'seed',
+          phase: 'warm-seed',
+          counted: false,
+        });
+        context.rows.push(row);
+        context.installedOk = !runFailed(row);
+      }
+    }
+
+    for (const mode of modes) {
+      for (const context of ordered) {
+        if (mode === 'warm' && context.installedOk) {
+          cleanProjectForWarm(context.projectDir);
+        }
+        const pairMeta = { pairId: `${pairId}:${mode}`, pairOrder };
+        const row = context.installedOk
+          ? measureInstall({
+              sample,
+              fixture,
+              ...context,
+              mode,
+              phase: mode,
+              pairMeta,
+            })
+          : recordSkippedInstall({
+              sample,
+              fixture,
+              ...context,
+              mode,
+              phase: mode,
+              reason: 'previous install failed',
+              pairMeta,
+            });
+        context.rows.push(row);
+        context.installedOk = !runFailed(row);
+      }
+    }
+  } finally {
+    for (const context of contexts) {
+      if (!keepProjects && !(keepFailedProjects && context.rows.some(runFailed))) {
+        removeTree(context.tmpRoot);
+      }
+    }
+  }
+  return contexts.flatMap((context) => context.rows);
+}
+
 function measureInstall({
   sample,
   fixture,
@@ -385,13 +528,17 @@ function measureInstall({
   runDir,
   phase,
   counted = true,
+  pairMeta,
 }) {
   const phaseDir = path.join(runDir, phase);
   fs.mkdirSync(phaseDir, { recursive: true });
 
   const command = installCommand(spec, scriptPolicy);
+  const timeOutputPath = path.join(phaseDir, 'time.txt');
+  const timed = timedCommand(command, timeOutputPath);
   const started = process.hrtime.bigint();
-  const result = spawnSync(command[0], command.slice(1), {
+  const startedAt = new Date().toISOString();
+  const result = spawnSync(timed.command[0], timed.command.slice(1), {
     cwd: projectDir,
     env,
     encoding: 'utf8',
@@ -399,6 +546,13 @@ function measureInstall({
     timeout: timeoutMs,
   });
   const wallMs = Number((process.hrtime.bigint() - started) / 1_000_000n);
+  const timeOutput = timed.enabled && fs.existsSync(timeOutputPath)
+    ? fs.readFileSync(timeOutputPath, 'utf8')
+    : '';
+  const maxRssBytes = timed.enabled ? parseMaxRssBytes(timeOutput, process.platform) : undefined;
+  const rssParseError = timed.enabled && maxRssBytes === undefined
+    ? `could not parse peak RSS from ${timeOutputPath}`
+    : null;
 
   fs.writeFileSync(path.join(phaseDir, 'stdout.log'), result.stdout || '');
   fs.writeFileSync(path.join(phaseDir, 'stderr.log'), result.stderr || '');
@@ -439,10 +593,16 @@ function measureInstall({
     spec: spec.id,
     mode,
     counted,
+    pair_id: pairMeta?.pairId,
+    pair_order: pairMeta?.pairOrder,
+    execution_sequence: ++executionSequence,
+    started_at: startedAt,
     exit_code: result.status ?? 1,
     signal: result.signal,
     spawn_error: result.error ? String(result.error) : undefined,
     wall_ms: wallMs,
+    max_rss_bytes: maxRssBytes,
+    rss_parse_error: rssParseError,
     parse_error: parseError,
     stdout_tail: tail(result.stdout || ''),
     stderr_tail: tail(result.stderr || ''),
@@ -452,19 +612,21 @@ function measureInstall({
 
   fs.writeFileSync(path.join(phaseDir, 'metrics.json'), `${JSON.stringify(row, null, 2)}\n`);
 
-  const status = row.exit_code === 0 && !row.parse_error ? 'ok' : `exit=${row.exit_code}`;
+  const status = row.exit_code === 0 && !row.parse_error && !row.rss_parse_error
+    ? 'ok'
+    : `exit=${row.exit_code}`;
   const detail =
     spec.manager === 'lpm'
       ? ` duration=${formatMs(row.duration_ms)} resolve=${formatMs(row.resolve_ms)} fetch=${formatMs(row.fetch_ms)} link=${formatMs(row.link_ms)}`
       : '';
   console.log(
-    `[${fixture.name} ${spec.id} ${mode}] sample ${sample}/${samples}: ${status} wall=${wallMs}ms${detail}`,
+    `[${fixture.name} ${spec.id} ${mode}] sample ${sample}/${samples}: ${status} wall=${wallMs}ms rss=${formatBytes(maxRssBytes)}${detail}`,
   );
 
   return row;
 }
 
-function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reason }) {
+function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reason, pairMeta }) {
   const phaseDir = path.join(runDir, phase);
   fs.mkdirSync(phaseDir, { recursive: true });
   const row = {
@@ -479,6 +641,10 @@ function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reas
     spec: spec.id,
     mode,
     counted: true,
+    pair_id: pairMeta?.pairId,
+    pair_order: pairMeta?.pairOrder,
+    execution_sequence: ++executionSequence,
+    started_at: new Date().toISOString(),
     skipped: true,
     skip_reason: reason,
     exit_code: 1,
@@ -488,6 +654,31 @@ function recordSkippedInstall({ sample, fixture, spec, mode, runDir, phase, reas
     `[${fixture.name} ${spec.id} ${mode}] sample ${sample}/${samples}: skipped (${reason})`,
   );
   return row;
+}
+
+function timedCommand(command, outputPath) {
+  if (!fs.existsSync('/usr/bin/time')) {
+    return { command, enabled: false };
+  }
+  if (process.platform === 'darwin') {
+    return { command: ['/usr/bin/time', '-l', '-o', outputPath, ...command], enabled: true };
+  }
+  if (process.platform === 'linux') {
+    return { command: ['/usr/bin/time', '-v', '-o', outputPath, ...command], enabled: true };
+  }
+  return { command, enabled: false };
+}
+
+function parseMaxRssBytes(output, platform) {
+  if (platform === 'darwin') {
+    const match = output.match(/^\s*(\d+)\s+maximum resident set size\s*$/im);
+    return match ? Number(match[1]) : undefined;
+  }
+  if (platform === 'linux') {
+    const match = output.match(/^\s*Maximum resident set size \(kbytes\):\s*(\d+)\s*$/im);
+    return match ? Number(match[1]) * 1024 : undefined;
+  }
+  return undefined;
 }
 
 function installCommand(spec, policy) {
@@ -991,7 +1182,7 @@ function summarize(rows) {
   const out = [];
   for (const [key, groupRows] of groups) {
     const [fixture, spec, mode] = key.split('\0');
-    const successful = groupRows.filter((row) => row.exit_code === 0 && !row.parse_error);
+    const successful = groupRows.filter((row) => !runFailed(row));
     const first = groupRows[0];
     const metrics = summarizeMetrics(successful);
     out.push({
@@ -1055,6 +1246,17 @@ function summarizeLpmComparison(rows, comparison, thresholds, expectedSamples) {
         });
         continue;
       }
+      if (
+        baseline.pair_id !== candidate.pair_id ||
+        Math.abs(baseline.execution_sequence - candidate.execution_sequence) !== 1
+      ) {
+        failedSamples.push({
+          sample,
+          baseline: 'not adjacent',
+          candidate: 'not adjacent',
+        });
+        continue;
+      }
       pairs.push({ sample, baseline, candidate });
     }
 
@@ -1073,7 +1275,8 @@ function summarizeLpmComparison(rows, comparison, thresholds, expectedSamples) {
       if (metricPairs.length === 0) {
         continue;
       }
-      metrics[metric] = comparePairedMetric(metricPairs, thresholds);
+      const metricThresholds = thresholds[metric] ?? thresholds.wall_ms;
+      metrics[metric] = comparePairedMetric(metricPairs, metricThresholds);
       if (COMPARISON_GATE_METRICS.has(metric) && metrics[metric].verdict === 'regression') {
         hasRegression = true;
       } else if (
@@ -1087,6 +1290,22 @@ function summarizeLpmComparison(rows, comparison, thresholds, expectedSamples) {
     if (failedSamples.length > 0) {
       hasExecutionFailure = true;
     }
+    const orderCounts = {
+      'baseline-candidate': pairs.filter(
+        (pair) => pair.baseline.pair_order === 'baseline-candidate',
+      ).length,
+      'candidate-baseline': pairs.filter(
+        (pair) => pair.baseline.pair_order === 'candidate-baseline',
+      ).length,
+    };
+    if (Math.abs(orderCounts['baseline-candidate'] - orderCounts['candidate-baseline']) > 1) {
+      hasExecutionFailure = true;
+      failedSamples.push({
+        sample: 'schedule',
+        baseline: 'imbalanced AB/BA order',
+        candidate: 'imbalanced AB/BA order',
+      });
+    }
     groups.push({
       fixture,
       mode,
@@ -1095,6 +1314,7 @@ function summarizeLpmComparison(rows, comparison, thresholds, expectedSamples) {
       firewall_mode: firewallMode,
       expected_pairs: expectedSamples,
       successful_pairs: pairs.length,
+      pair_orders: orderCounts,
       failed_samples: failedSamples,
       metrics,
     });
@@ -1133,22 +1353,33 @@ function comparePairedMetric(pairs, thresholds) {
     delta_pct: relativeDeltaPct(pair.baseline, pair.candidate),
   }));
   const pairedDeltaPct = metricDistribution(pairedDeltas, 'delta_pct');
+  const pairedDelta = metricDistribution(pairedDeltas, 'delta');
   const medianDeltaPct = relativeDeltaPct(baseline.median, candidate.median);
   const p95DeltaPct = relativeDeltaPct(baseline.p95, candidate.p95);
+  const medianDelta = candidate.median - baseline.median;
+  const p95Delta = candidate.p95 - baseline.p95;
   const medianClearlyRegressed =
     medianDeltaPct > thresholds.median_pct &&
-    pairedDeltaPct.median - pairedDeltaPct.mad > thresholds.median_pct;
+    medianDelta > thresholds.median_abs &&
+    pairedDeltaPct.median - pairedDeltaPct.mad > thresholds.median_pct &&
+    pairedDelta.median - pairedDelta.mad > thresholds.median_abs;
   const p95ClearlyRegressed =
     p95DeltaPct > thresholds.p95_pct &&
-    pairedDeltaPct.p95 - pairedDeltaPct.iqr > thresholds.p95_pct;
+    p95Delta > thresholds.p95_abs &&
+    pairedDeltaPct.p95 - pairedDeltaPct.iqr > thresholds.p95_pct &&
+    pairedDelta.p95 - pairedDelta.iqr > thresholds.p95_abs;
   const withinThresholds =
-    medianDeltaPct <= thresholds.median_pct && p95DeltaPct <= thresholds.p95_pct;
+    (medianDeltaPct <= thresholds.median_pct || medianDelta <= thresholds.median_abs) &&
+    (p95DeltaPct <= thresholds.p95_pct || p95Delta <= thresholds.p95_abs);
   return {
     baseline,
     candidate,
     median_delta_pct: medianDeltaPct,
     p95_delta_pct: p95DeltaPct,
+    median_delta: medianDelta,
+    p95_delta: p95Delta,
     paired_delta_pct: pairedDeltaPct,
+    paired_delta: pairedDelta,
     pairs: pairedDeltas,
     verdict: medianClearlyRegressed || p95ClearlyRegressed
       ? 'regression'
@@ -1184,7 +1415,8 @@ function renderLpmComparisonMarkdown(comparison) {
     '',
     `Baseline: \`${comparison.baseline}\`. Candidate: \`${comparison.candidate}\`.`,
     '',
-    `Limits: median ${comparison.thresholds.median_pct}%; p95 ${comparison.thresholds.p95_pct}%.`,
+    `Wall limits: median ${comparison.thresholds.wall_ms.median_pct}% and ${comparison.thresholds.wall_ms.median_abs} ms; p95 ${comparison.thresholds.wall_ms.p95_pct}% and ${comparison.thresholds.wall_ms.p95_abs} ms.`,
+    `RSS limits: median ${comparison.thresholds.max_rss_bytes.median_pct}% and ${formatBytes(comparison.thresholds.max_rss_bytes.median_abs)}; p95 ${comparison.thresholds.max_rss_bytes.p95_pct}% and ${formatBytes(comparison.thresholds.max_rss_bytes.p95_abs)}.`,
     '',
     '| Fixture | Mode | Pairs | Metric | Base med/p95 | Candidate med/p95 | Delta med/p95 | Paired delta med/p95 | Result |',
     '| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | --- |',
@@ -1213,6 +1445,7 @@ function renderLpmComparisonMarkdown(comparison) {
 function summarizeMetrics(rows) {
   const keys = [
     'wall_ms',
+    'max_rss_bytes',
     'duration_ms',
     'resolve_ms',
     'firewall_batch_ms',
@@ -1393,8 +1626,8 @@ function summarizeTailWarnings(metrics) {
 
 function renderSummaryMarkdown(summary) {
   const lines = [
-    '| Fixture | Spec | Mode | OK | Wall med/p95/max | Resolve med/p95/max | Firewall med/min | FW chunks | FW chunk sum | FW chunk max | Fetch med/p95/max | Link med/p95/max | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
-    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| Fixture | Spec | Mode | OK | Wall med/p95/max | RSS MiB med/p95/max | Resolve med/p95/max | Firewall med/min | FW chunks | FW chunk sum | FW chunk max | Fetch med/p95/max | Link med/p95/max | Pkgs | FW checked | FW warn/block/unknown | Metadata MB | Version docs | Parity mismatches | Warnings exp/unknown |',
+    '| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   ];
   for (const row of summary) {
     const m = row.metrics;
@@ -1415,7 +1648,7 @@ function renderSummaryMarkdown(summary) {
       ? `${one(m.firewall_warn_count)}/${one(m.firewall_block_count)}/${one(m.firewall_unknown_count)}`
       : 'n/a';
     lines.push(
-      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${tailStat(m.wall_ms)} | ${tailStat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${one(m.firewall_chunk_count)} | ${stat(m.firewall_chunk_sum_ms)} | ${stat(m.firewall_chunk_max_ms)} | ${tailStat(m.fetch_ms)} | ${tailStat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
+      `| ${row.fixture} | ${row.spec} | ${row.mode} | ${row.successful_samples}/${row.samples} | ${tailStat(m.wall_ms)} | ${tailBytesMiB(m.max_rss_bytes)} | ${tailStat(m.resolve_ms)} | ${stat(m.firewall_batch_ms)} | ${one(m.firewall_chunk_count)} | ${stat(m.firewall_chunk_sum_ms)} | ${stat(m.firewall_chunk_max_ms)} | ${tailStat(m.fetch_ms)} | ${tailStat(m.link_ms)} | ${one(m.package_count)} | ${one(m.firewall_checked_count)} | ${firewallVerdicts} | ${stat(m.metadata_body_mb_sum)} | ${versionDocs} | ${mismatches} | ${warnings} |`,
     );
   }
   const tailWarnings = summary.flatMap((row) =>
@@ -1488,6 +1721,12 @@ function parseArgs(argv) {
       ['--lpm-compare', 'lpmCompare'],
       ['--median-regression-pct', 'medianRegressionPct'],
       ['--p95-regression-pct', 'p95RegressionPct'],
+      ['--median-regression-ms', 'medianRegressionMs'],
+      ['--p95-regression-ms', 'p95RegressionMs'],
+      ['--rss-median-regression-pct', 'rssMedianRegressionPct'],
+      ['--rss-p95-regression-pct', 'rssP95RegressionPct'],
+      ['--rss-median-regression-mb', 'rssMedianRegressionMb'],
+      ['--rss-p95-regression-mb', 'rssP95RegressionMb'],
       ['--script-policy', 'scriptPolicy'],
       ['--timeout-ms', 'timeoutMs'],
       ['--lpm-cell', 'lpmCell'],
@@ -1822,6 +2061,10 @@ function nonNegativeNumber(raw, fallback, flag) {
   return value;
 }
 
+function mebibytesToBytes(value) {
+  return Math.round(value * 1024 * 1024);
+}
+
 function splitOnce(value, delimiter) {
   const index = value.indexOf(delimiter);
   if (index === -1) {
@@ -2083,6 +2326,23 @@ function runSelfTests() {
     () => parseLpmComparison('main:missing', binarySpecs),
     /must match two --lpm-binary names/,
   );
+  assert.equal(
+    parseMaxRssBytes('       12345678  maximum resident set size\n', 'darwin'),
+    12_345_678,
+  );
+  assert.equal(
+    parseMaxRssBytes('Maximum resident set size (kbytes): 12345\n', 'linux'),
+    12_641_280,
+  );
+  assert.equal(parseMaxRssBytes('no rss here', 'linux'), undefined);
+  const wallMaterialityArgs = parseArgs([
+    '--median-regression-ms',
+    '20',
+    '--p95-regression-ms',
+    '50',
+  ]);
+  assert.equal(wallMaterialityArgs.medianRegressionMs, '20');
+  assert.equal(wallMaterialityArgs.p95RegressionMs, '50');
   const pairedRows = (candidateValues, failedCandidateSample = null) =>
     candidateValues.flatMap((candidateWallMs, index) => {
       const sample = index + 1;
@@ -2096,22 +2356,63 @@ function runSelfTests() {
         firewall_mode: 'off',
         exit_code: 0,
       };
+      const baselineFirst = sample % 2 === 1;
       return [
-        { ...common, binary: 'main', wall_ms: 100 },
+        {
+          ...common,
+          binary: 'main',
+          wall_ms: 100,
+          pair_id: `paired:cold:${sample}`,
+          pair_order: baselineFirst ? 'baseline-candidate' : 'candidate-baseline',
+          execution_sequence: baselineFirst ? sample * 2 - 1 : sample * 2,
+        },
         {
           ...common,
           binary: 'candidate',
           wall_ms: candidateWallMs,
+          pair_id: `paired:cold:${sample}`,
+          pair_order: baselineFirst ? 'baseline-candidate' : 'candidate-baseline',
+          execution_sequence: baselineFirst ? sample * 2 : sample * 2 - 1,
           exit_code: failedCandidateSample === sample ? 1 : 0,
         },
       ];
     });
   const comparison = { baseline: 'main', candidate: 'candidate' };
-  const thresholds = { median_pct: 5, p95_pct: 10 };
+  const thresholds = {
+    wall_ms: { median_pct: 5, p95_pct: 10, median_abs: 0, p95_abs: 0 },
+    max_rss_bytes: {
+      median_pct: 5,
+      p95_pct: 10,
+      median_abs: 16 * 1024 * 1024,
+      p95_abs: 32 * 1024 * 1024,
+    },
+  };
   assert.equal(
     summarizeLpmComparison(pairedRows([104, 104, 104, 104, 104]), comparison, thresholds, 5)
       .verdict,
     'pass',
+  );
+  const materialWallThresholds = {
+    ...thresholds,
+    wall_ms: { median_pct: 5, p95_pct: 10, median_abs: 20, p95_abs: 50 },
+  };
+  assert.equal(
+    summarizeLpmComparison(
+      pairedRows([106, 106, 106, 106, 106]),
+      comparison,
+      materialWallThresholds,
+      5,
+    ).verdict,
+    'pass',
+  );
+  assert.equal(
+    summarizeLpmComparison(
+      pairedRows([125, 125, 125, 125, 125]),
+      comparison,
+      materialWallThresholds,
+      5,
+    ).verdict,
+    'regression',
   );
   assert.equal(
     summarizeLpmComparison(pairedRows([120, 120, 120, 120, 120]), comparison, thresholds, 5)
@@ -2132,6 +2433,29 @@ function runSelfTests() {
     ).verdict,
     'execution-failure',
   );
+  const rssRows = pairedRows([100, 100, 100, 100, 100]).map((row) => ({
+    ...row,
+    max_rss_bytes: row.binary === 'candidate' ? 160 * 1024 * 1024 : 100 * 1024 * 1024,
+  }));
+  assert.equal(
+    summarizeLpmComparison(rssRows, comparison, thresholds, 5).verdict,
+    'regression',
+  );
+  const rssNoiseRows = pairedRows([100, 100, 100, 100, 100]).map((row) => ({
+    ...row,
+    max_rss_bytes: row.binary === 'candidate' ? 110 * 1024 * 1024 : 100 * 1024 * 1024,
+  }));
+  assert.equal(
+    summarizeLpmComparison(rssNoiseRows, comparison, thresholds, 5).verdict,
+    'pass',
+  );
+  const pairedSpecs = buildLpmComparisonPairs(
+    buildRunSpecs(['lpm', 'bun', 'pnpm'], binarySpecs, [{ name: 'current', env: {} }], ['direct'], ['off']),
+    comparison,
+  );
+  assert.equal(pairedSpecs.length, 1);
+  assert.equal(pairedSpecs[0].baseline.binaryName, 'main');
+  assert.equal(pairedSpecs[0].candidate.binaryName, 'candidate');
   const tailSummary = summarize([
     { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 100 },
     { fixture: 'tail', spec: 'current', mode: 'cold', manager: 'lpm', exit_code: 0, wall_ms: 110 },
@@ -2630,7 +2954,12 @@ function roundDistributionValue(value) {
 }
 
 function runFailed(row) {
-  return row.exit_code !== 0 || Boolean(row.parse_error) || Boolean(row.skipped);
+  return (
+    row.exit_code !== 0 ||
+    Boolean(row.parse_error) ||
+    Boolean(row.rss_parse_error) ||
+    Boolean(row.skipped)
+  );
 }
 
 function stat(value) {
@@ -2641,8 +2970,22 @@ function tailStat(value) {
   return value ? `${value.median}/${value.p95}/${value.max}` : 'n/a';
 }
 
+function tailBytesMiB(value) {
+  return value
+    ? [value.median, value.p95, value.max]
+        .map((bytes) => roundDistributionValue(bytes / 1024 / 1024))
+        .join('/')
+    : 'n/a';
+}
+
 function formatMs(value) {
   return typeof value === 'number' && Number.isFinite(value) ? `${value}ms` : 'n/a';
+}
+
+function formatBytes(value) {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${roundDistributionValue(value / 1024 / 1024)} MiB`
+    : 'n/a';
 }
 
 function one(value) {
@@ -2715,6 +3058,16 @@ Options:
       --median-regression-pct N
                                Median wall-time limit (default: 5).
       --p95-regression-pct N   p95 wall-time limit (default: 10).
+      --median-regression-ms N Median wall-time absolute limit (default: 20).
+      --p95-regression-ms N    p95 wall-time absolute limit (default: 50).
+      --rss-median-regression-pct N
+                               Median peak-RSS percentage limit (default: 5).
+      --rss-p95-regression-pct N
+                               p95 peak-RSS percentage limit (default: 10).
+      --rss-median-regression-mb N
+                               Median peak-RSS absolute limit in MiB (default: 16).
+      --rss-p95-regression-mb N
+                               p95 peak-RSS absolute limit in MiB (default: 32).
       --lpm-typosquat-guard MODE
                                default or off. Defaults to off for --top-npm-file.
       --script-policy MODE     ignore or default for bun/pnpm/npm scripts (default: ignore)
