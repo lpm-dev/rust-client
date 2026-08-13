@@ -532,7 +532,6 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) lpm_root: &'a lpm_common::LpmRoot,
     pub(super) store_version: lpm_store::StoreVersion,
-    pub(super) self_package_name: Option<&'a str>,
     pub(super) policy_extension_configs: &'a [policy_extensions::PolicyExtensionConfig],
     pub(super) cleanup_catalogs_in_pipeline: bool,
     pub(super) json_output: bool,
@@ -559,7 +558,6 @@ pub(super) async fn run_empty_dependency_install_phase(
         project_dir,
         lpm_root,
         store_version,
-        self_package_name,
         policy_extension_configs,
         cleanup_catalogs_in_pipeline,
         json_output,
@@ -591,20 +589,14 @@ pub(super) async fn run_empty_dependency_install_phase(
             store_version,
             object_integrity_policy,
         );
-        lpm_linker::v2::link_packages_v2(
-            project_dir,
-            Vec::new(),
-            &store,
-            linker_mode,
-            self_package_name,
-        )?;
+        lpm_linker::v2::link_packages_v2(project_dir, Vec::new(), &store, linker_mode, None)?;
     } else {
         match linker_mode {
             lpm_linker::LinkerMode::Isolated => {
-                lpm_linker::link_packages(project_dir, &[], false, self_package_name)?;
+                lpm_linker::link_packages(project_dir, &[], false, None)?;
             }
             lpm_linker::LinkerMode::Hoisted => {
-                lpm_linker::link_packages_hoisted(project_dir, &[], false, self_package_name)?;
+                lpm_linker::link_packages_hoisted(project_dir, &[], false, None)?;
             }
         }
     }
