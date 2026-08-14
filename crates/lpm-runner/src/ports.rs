@@ -1428,11 +1428,22 @@ struct ProjectInfo {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn list_listening_ports_lsof() -> Vec<ListeningPort> {
-    list_listening_ports_lsof_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+    list_listening_ports_lsof_until_inner(
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+        true,
+    )
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn list_listening_ports_lsof_until(deadline: std::time::Instant) -> Vec<ListeningPort> {
+    list_listening_ports_lsof_until_inner(deadline, false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn list_listening_ports_lsof_until_inner(
+    deadline: std::time::Instant,
+    complete_macos_cwd_enrichment: bool,
+) -> Vec<ListeningPort> {
     let mut command = Command::new("lsof");
     command.args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcPtn"]);
     let Some(output) = command_stdout_capped_until(&mut command, deadline) else {
@@ -1452,7 +1463,7 @@ fn list_listening_ports_lsof_until(deadline: std::time::Instant) -> Vec<Listenin
     pids.sort_unstable();
     pids.dedup();
 
-    let cwd_by_pid = collect_cwds_until(&pids, deadline);
+    let cwd_by_pid = collect_cwds_until(&pids, deadline, complete_macos_cwd_enrichment);
     let ps_by_pid = collect_ps_info_until(&pids, deadline);
 
     for row in &mut rows {
@@ -1833,8 +1844,68 @@ fn parse_lsof_tcp_name(value: &str) -> Option<(Option<String>, u16)> {
     Some((address, port))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn collect_cwds_until(pids: &[u32], deadline: std::time::Instant) -> HashMap<u32, PathBuf> {
+#[cfg(target_os = "macos")]
+fn collect_cwds_until(
+    pids: &[u32],
+    deadline: std::time::Instant,
+    complete_after_deadline: bool,
+) -> HashMap<u32, PathBuf> {
+    let mut result = HashMap::with_capacity(pids.len());
+    for &pid in pids {
+        if !complete_after_deadline && std::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Some(cwd) = macos_process_cwd(pid) {
+            result.insert(pid, cwd);
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let expected = libc::c_int::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+    // SAFETY: `info` points to an allocation of exactly `expected` bytes and
+    // `proc_pidinfo` initializes it only when it reports that full size.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    if written != expected {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let info = unsafe { info.assume_init() };
+    // SAFETY: the byte slice is bounded by the fixed-size kernel structure and
+    // has the same lifetime as `info`; it is scanned for NUL before use.
+    let path = unsafe {
+        std::slice::from_raw_parts(
+            info.pvi_cdir.vip_path.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(&info.pvi_cdir.vip_path),
+        )
+    };
+    let path = path.get(..path.iter().position(|byte| *byte == 0)?)?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn collect_cwds_until(
+    pids: &[u32],
+    deadline: std::time::Instant,
+    _complete_after_deadline: bool,
+) -> HashMap<u32, PathBuf> {
     let mut result = HashMap::with_capacity(pids.len());
     for chunk in pids.chunks(100) {
         let pid_list = join_pids(chunk);
@@ -3445,6 +3516,21 @@ nTCP 127.0.0.1:6379 (LISTEN)
         assert_eq!(info.process.as_deref(), Some("node"));
         assert_eq!(info.uptime.as_deref(), Some("01:02:03"));
         assert_eq!(info.command.as_deref(), Some("node server.js --port 3000"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cwd_collection_does_not_drop_listener_metadata_after_lsof_deadline() {
+        let cwd_by_pid = collect_cwds_until(
+            &[std::process::id()],
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+            true,
+        );
+
+        assert_eq!(
+            cwd_by_pid.get(&std::process::id()),
+            std::env::current_dir().ok().as_ref()
+        );
     }
 
     #[cfg(target_os = "linux")]

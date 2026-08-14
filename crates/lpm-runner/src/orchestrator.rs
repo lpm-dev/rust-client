@@ -3798,9 +3798,7 @@ setInterval(() => {{}}, 1000);
         let children = Arc::new(Mutex::new(Vec::new()));
 
         let mut web_command = Command::new("sh");
-        web_command
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 0.05; done");
+        web_command.arg("-c").arg("trap '' TERM; exec sleep 60");
         isolate_service_process_tree(&mut web_command);
         let web = web_command.spawn().unwrap();
         let web_pid = web.id();
