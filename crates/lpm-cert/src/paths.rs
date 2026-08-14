@@ -1020,10 +1020,29 @@ fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
         ));
     }
     #[cfg(target_os = "linux")]
-    let sync_handle = Dir::reopen_dir(dir)?;
+    let sync_handle = {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        // SAFETY: `dir` stays open for the call, the relative path is NUL-terminated, and the
+        // returned descriptor is checked before ownership is transferred to `File` exactly once.
+        // A fresh read descriptor is required because cap-std intentionally retains Linux
+        // directories as O_PATH handles, which cannot be passed to fsync.
+        let descriptor = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c".".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `descriptor` is a newly owned descriptor returned by `openat` above.
+        unsafe { std::fs::File::from_raw_fd(descriptor) }
+    };
     #[cfg(not(target_os = "linux"))]
-    let sync_handle = dir.try_clone()?;
-    sync_handle.into_std_file().sync_all()
+    let sync_handle = dir.try_clone()?.into_std_file();
+    sync_handle.sync_all()
 }
 
 #[cfg(test)]
@@ -1399,10 +1418,13 @@ fn replace_relative_file(
         use std::mem::{offset_of, size_of};
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
         };
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
         let _ = source;
         let destination: Vec<u16> = Path::new(destination).as_os_str().encode_wide().collect();
@@ -1410,12 +1432,12 @@ fn replace_relative_file(
             .len()
             .checked_mul(size_of::<u16>())
             .ok_or_else(|| std::io::Error::other("certificate filename is too long"))?;
-        let info_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+        let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
             .checked_add(file_name_bytes)
             .ok_or_else(|| std::io::Error::other("certificate rename data is too large"))?;
         let info_words = info_bytes.div_ceil(size_of::<usize>());
         let mut storage = vec![0usize; info_words];
-        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         let info_bytes = u32::try_from(info_bytes)
             .map_err(|_| std::io::Error::other("certificate rename data is too large"))?;
         let file_name_bytes = u32::try_from(file_name_bytes)
@@ -1437,20 +1459,24 @@ fn replace_relative_file(
             if delay_ms != 0 {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             }
-            let renamed = unsafe {
-                // SAFETY: info points to the initialized buffer described above,
-                // and the exact temporary file handle remains valid for the call.
-                SetFileInformationByHandle(
+            let mut io_status = IO_STATUS_BLOCK::default();
+            let status = unsafe {
+                // SAFETY: `info` points to the initialized variable-sized buffer described above.
+                // Both retained handles remain valid for this synchronous native rename call.
+                NtSetInformationFile(
                     temporary.as_raw_handle(),
-                    FileRenameInfo,
+                    &mut io_status,
                     info.cast(),
                     info_bytes,
+                    FileRenameInformation,
                 )
             };
-            if renamed != 0 {
+            if status >= 0 {
                 return Ok(());
             }
-            let error = std::io::Error::last_os_error();
+            // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
+            let error =
+                std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
             let raw = error.raw_os_error().map(|code| code as u32);
             if !matches!(
                 raw,
@@ -1569,6 +1595,33 @@ mod tests {
         let project = Path::new("/tmp/my-project");
         let dir = project_cert_dir(project).unwrap();
         assert_eq!(dir, PathBuf::from("/tmp/my-project/.lpm/certs"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn syncing_linux_capability_directory_uses_an_fsync_capable_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+
+        sync_directory_io(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_write_replaces_an_existing_certificate_file() {
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+
+        cert_dir
+            .write_atomic("cert.pem", b"original", 0o644)
+            .unwrap();
+        cert_dir
+            .write_atomic("cert.pem", b"replacement", 0o644)
+            .unwrap();
+
+        assert_eq!(cert_dir.read("cert.pem").unwrap(), b"replacement");
     }
 
     #[cfg(unix)]
