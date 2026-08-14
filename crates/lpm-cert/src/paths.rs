@@ -1015,44 +1015,56 @@ fn sync_directory(dir: &Dir) -> Result<(), LpmError> {
 
 fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_DIRECTORY_SYNC.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::other(
             "injected certificate directory sync failure",
         ));
     }
-    #[cfg(target_os = "linux")]
-    let sync_handle = {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        // Windows FlushFileBuffers rejects ordinary directory handles. Staged files are flushed
+        // before replacement, and the renamed file handle is flushed again after the atomic rename.
+        // Flushing the containing volume would require administrator privileges.
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "linux")]
+        let sync_handle = {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-        // SAFETY: `dir` stays open for the call, the relative path is NUL-terminated, and the
-        // returned descriptor is checked before ownership is transferred to `File` exactly once.
-        // A fresh read descriptor is required because cap-std intentionally retains Linux
-        // directories as O_PATH handles, which cannot be passed to fsync.
-        let descriptor = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
+            // SAFETY: `dir` stays open for the call, the relative path is NUL-terminated, and the
+            // returned descriptor is checked before ownership is transferred to `File` exactly once.
+            // A fresh read descriptor is required because cap-std intentionally retains Linux
+            // directories as O_PATH handles, which cannot be passed to fsync.
+            let descriptor = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    c".".as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `descriptor` is a newly owned descriptor returned by `openat` above.
+            unsafe { std::fs::File::from_raw_fd(descriptor) }
         };
-        if descriptor < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: `descriptor` is a newly owned descriptor returned by `openat` above.
-        unsafe { std::fs::File::from_raw_fd(descriptor) }
-    };
-    #[cfg(not(target_os = "linux"))]
-    let sync_handle = dir.try_clone()?.into_std_file();
-    sync_handle.sync_all()
+        #[cfg(not(target_os = "linux"))]
+        let sync_handle = dir.try_clone()?.into_std_file();
+        sync_handle.sync_all()
+    }
 }
 
 #[cfg(test)]
-static FAIL_NEXT_DIRECTORY_SYNC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+std::thread_local! {
+    static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 pub(crate) fn fail_next_directory_sync() {
-    FAIL_NEXT_DIRECTORY_SYNC.store(true, std::sync::atomic::Ordering::SeqCst);
+    FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
 }
 
 fn relative_file_exists(dir: &Dir, name: &str) -> Result<bool, LpmError> {
@@ -1473,7 +1485,7 @@ fn replace_relative_file(
                 )
             };
             if status >= 0 {
-                return Ok(());
+                return temporary.sync_all();
             }
             // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
             let error =
@@ -1601,6 +1613,39 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn syncing_linux_capability_directory_uses_an_fsync_capable_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+
+        sync_directory_io(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_sync_failure_injection_is_confined_to_the_requesting_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+        fail_next_directory_sync();
+        let other_path = root.path().to_owned();
+
+        let other_result = std::thread::spawn(move || {
+            let other = Dir::open_ambient_dir(&other_path, cap_std::ambient_authority()).unwrap();
+            sync_directory_io(&other)
+        })
+        .join()
+        .unwrap();
+
+        assert!(
+            other_result.is_ok(),
+            "failure injection escaped to another thread: {other_result:?}"
+        );
+        assert_eq!(
+            sync_directory_io(&dir).unwrap_err().to_string(),
+            "injected certificate directory sync failure"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn syncing_windows_capability_directory_avoids_unsupported_file_flush() {
         let root = tempfile::tempdir().unwrap();
         let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
 
