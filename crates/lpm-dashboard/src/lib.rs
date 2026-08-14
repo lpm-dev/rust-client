@@ -33,6 +33,8 @@ pub enum DashboardEvent {
     WebhookCaptured(Arc<lpm_tunnel::webhook::CapturedWebhook>),
     /// A fatal background error that must close the dashboard.
     FatalError(String),
+    /// The service orchestrator stopped and the dashboard must close.
+    Shutdown,
 }
 
 /// Command from the dashboard back to the orchestrator.
@@ -40,6 +42,40 @@ pub enum DashboardCommand {
     RestartService(usize),
     StopService(usize),
     StopAll,
+}
+
+/// Non-blocking sink for dashboard service-control commands.
+pub type DashboardCommandSink = Arc<dyn Fn(DashboardCommand) + Send + Sync>;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DashboardFlow {
+    Continue,
+    Stop,
+}
+
+fn apply_dashboard_event(
+    app: &mut DashboardApp,
+    event: DashboardEvent,
+) -> io::Result<DashboardFlow> {
+    match event {
+        DashboardEvent::ServiceLog { index, line } => {
+            app.push_log(index, &line);
+        }
+        DashboardEvent::StatusChange { index, status } => {
+            if index < app.services.len() {
+                app.services[index].status = status;
+            }
+        }
+        DashboardEvent::PortAssigned { service, port } => {
+            app.set_service_port(&service, port);
+        }
+        DashboardEvent::WebhookCaptured(webhook) => {
+            app.push_shared_webhook(webhook);
+        }
+        DashboardEvent::FatalError(error) => return Err(io::Error::other(error)),
+        DashboardEvent::Shutdown => return Ok(DashboardFlow::Stop),
+    }
+    Ok(DashboardFlow::Continue)
 }
 
 /// RAII guard that restores the terminal to normal state on drop.
@@ -64,7 +100,7 @@ impl Drop for TerminalGuard {
 /// Returns `DashboardCommand::StopAll` when the user exits.
 ///
 /// Service control commands (restart, stop) are sent directly to the orchestrator
-/// via `command_tx` without exiting the TUI — the dashboard continues running.
+/// via `command_sink` without exiting the TUI — the dashboard continues running.
 ///
 /// `inspector_url` is the live browser-inspector URL when `lpm dev --tunnel`
 /// started one. When set, the `o` key opens it in the user's default browser
@@ -74,7 +110,7 @@ impl Drop for TerminalGuard {
 pub fn run_dashboard(
     services: Vec<ServiceState>,
     event_rx: mpsc::Receiver<DashboardEvent>,
-    command_tx: Option<mpsc::Sender<DashboardCommand>>,
+    command_sink: Option<DashboardCommandSink>,
     inspector_url: Option<String>,
 ) -> io::Result<DashboardCommand> {
     // Setup terminal — TerminalGuard ensures cleanup on any exit path
@@ -133,14 +169,14 @@ pub fn run_dashboard(
                 }
                 KeyCode::Char('r') if app.active_tab == app::Tab::Services => {
                     // Send restart command to orchestrator without leaving the TUI
-                    if let Some(ref tx) = command_tx {
-                        let _ = tx.send(DashboardCommand::RestartService(app.selected_service));
+                    if let Some(ref sink) = command_sink {
+                        sink(DashboardCommand::RestartService(app.selected_service));
                     }
                 }
                 KeyCode::Char('x') if app.active_tab == app::Tab::Services => {
                     // Send stop command for selected service without leaving the TUI
-                    if let Some(ref tx) = command_tx {
-                        let _ = tx.send(DashboardCommand::StopService(app.selected_service));
+                    if let Some(ref sink) = command_sink {
+                        sink(DashboardCommand::StopService(app.selected_service));
                     }
                 }
                 // `o` opens the live browser inspector in the user's default
@@ -162,23 +198,23 @@ pub fn run_dashboard(
 
         // Drain service events
         while let Ok(event) = event_rx.try_recv() {
-            match event {
-                DashboardEvent::ServiceLog { index, line } => {
-                    app.push_log(index, &line);
-                }
-                DashboardEvent::StatusChange { index, status } => {
-                    if index < app.services.len() {
-                        app.services[index].status = status;
-                    }
-                }
-                DashboardEvent::PortAssigned { service, port } => {
-                    app.set_service_port(&service, port);
-                }
-                DashboardEvent::WebhookCaptured(webhook) => {
-                    app.push_shared_webhook(webhook);
-                }
-                DashboardEvent::FatalError(error) => return Err(io::Error::other(error)),
+            if apply_dashboard_event(&mut app, event)? == DashboardFlow::Stop {
+                return Ok(DashboardCommand::StopAll);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_event_stops_dashboard_without_keyboard_input() {
+        let mut app = DashboardApp::new(Vec::new());
+
+        let flow = apply_dashboard_event(&mut app, DashboardEvent::Shutdown).unwrap();
+
+        assert_eq!(flow, DashboardFlow::Stop);
     }
 }

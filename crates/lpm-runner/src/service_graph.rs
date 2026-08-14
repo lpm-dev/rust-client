@@ -48,6 +48,57 @@ pub fn transitive_deps(name: &str, services: &HashMap<String, ServiceConfig>) ->
     crate::dag::transitive_deps(name, &to_dag(services))
 }
 
+/// Select the requested services and their transitive dependencies.
+pub fn select_active_services(
+    services: &HashMap<String, ServiceConfig>,
+    filters: &[String],
+) -> Result<HashMap<String, ServiceConfig>, String> {
+    if filters.is_empty() {
+        return Ok(services.clone());
+    }
+
+    let mut active = HashMap::new();
+    for name in filters {
+        if !services.contains_key(name) {
+            let mut available: Vec<&str> = services.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            return Err(format!(
+                "service '{name}' not found. Available: {}",
+                available.join(", ")
+            ));
+        }
+        for dependency in transitive_deps(name, services) {
+            if let Some(config) = services.get(&dependency) {
+                active.insert(dependency, config.clone());
+            }
+        }
+    }
+    Ok(active)
+}
+
+/// Return the explicit primary service, or the only service when it is implicit.
+pub fn primary_service_name(
+    services: &HashMap<String, ServiceConfig>,
+) -> Result<Option<&str>, String> {
+    let mut primary_services = services
+        .iter()
+        .filter(|(_, service)| service.primary)
+        .map(|(name, _)| name.as_str());
+    if let Some(primary) = primary_services.next() {
+        if primary_services.next().is_some() {
+            return Err(
+                "multiple services are marked `primary`; exactly one primary service is allowed"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(primary));
+    }
+    if services.len() == 1 {
+        return Ok(services.keys().next().map(String::as_str));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +194,47 @@ mod tests {
         assert!(deps.contains("api"));
         assert!(deps.contains("db"));
         assert_eq!(deps.len(), 3);
+    }
+
+    #[test]
+    fn filtered_services_include_only_requested_services_and_dependencies() {
+        let services = HashMap::from([
+            ("db".to_string(), svc("postgres", &[])),
+            ("api".to_string(), svc("node api.js", &["db"])),
+            ("web".to_string(), svc("next dev", &["api"])),
+            ("worker".to_string(), svc("node worker.js", &["db"])),
+        ]);
+
+        let active = select_active_services(&services, &["web".to_string()]).unwrap();
+
+        let mut names: Vec<_> = active.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["api", "db", "web"]);
+    }
+
+    #[test]
+    fn filtered_services_report_unknown_names_with_sorted_choices() {
+        let services = HashMap::from([
+            ("web".to_string(), svc("next dev", &[])),
+            ("api".to_string(), svc("node api.js", &[])),
+        ]);
+
+        let error = select_active_services(&services, &["missing".to_string()]).unwrap_err();
+
+        assert_eq!(error, "service 'missing' not found. Available: api, web");
+    }
+
+    #[test]
+    fn duplicate_primary_services_are_rejected() {
+        let mut services = HashMap::from([
+            ("api".to_string(), svc("node api.js", &[])),
+            ("web".to_string(), svc("next dev", &[])),
+        ]);
+        services.get_mut("api").unwrap().primary = true;
+        services.get_mut("web").unwrap().primary = true;
+
+        let error = primary_service_name(&services).unwrap_err();
+
+        assert!(error.contains("multiple services are marked `primary`"));
     }
 }

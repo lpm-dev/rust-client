@@ -158,6 +158,13 @@ pub enum ServerMessage {
         /// Error code (e.g., "auth_failed", "rate_limited", "plan_required").
         code: Option<String>,
     },
+
+    /// Updated relay allowance and usage counters for the active session.
+    #[serde(rename = "usage_notice")]
+    UsageNotice {
+        /// Current request and bandwidth usage reported by the relay.
+        usage: crate::TunnelUsageMetadata,
+    },
 }
 
 #[cfg(test)]
@@ -263,6 +270,27 @@ mod tests {
             }
             _ => panic!("expected Hello"),
         }
+    }
+
+    #[test]
+    fn server_message_deserializes_usage_notices_without_a_second_protocol_parse() {
+        let json = r#"{
+            "type": "usage_notice",
+            "usage": {
+                "accepted_requests": 12,
+                "included_requests": 100
+            }
+        }"#;
+
+        let message: ServerMessage = serde_json::from_str(json).unwrap();
+
+        let ServerMessage::UsageNotice { usage } = message else {
+            panic!("expected usage notice");
+        };
+        assert_eq!(
+            (usage.accepted_requests, usage.included_requests),
+            (Some(12), Some(100))
+        );
     }
 
     #[test]

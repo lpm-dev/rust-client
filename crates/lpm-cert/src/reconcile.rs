@@ -27,7 +27,6 @@ use crate::{audit, cert, paths, rotate, trust};
 use lpm_common::LpmError;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -52,14 +51,23 @@ pub struct ReconcileOptions {
 }
 
 pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
+    let operation = paths::CertificateOperation::begin()?;
+    let _recovery_guard = rotate::acquire_pending_recovery_generation(&operation)?;
+    rotate::recover_pending_rotation(&operation.ca)?;
+    reconcile_locked(&operation, opts)
+}
+
+fn reconcile_locked(
+    operation: &paths::CertificateOperation,
+    opts: ReconcileOptions,
+) -> Result<ReconcileResult, LpmError> {
+    let ca_dir = &operation.ca;
     let mut out = ReconcileResult {
         success: true,
         ..Default::default()
     };
     let now = OffsetDateTime::now_utc();
-    let ca_dir = paths::ca_dir()?;
-    let prev_cert = ca_dir.join("rootCA.pem.previous");
-    let prev_key = ca_dir.join("rootCA-key.pem.previous");
+    let prev_cert = ca_dir.path("rootCA.pem.previous");
 
     let mut unresolved_old_fps = scan_unresolved_reconcile_required()?;
 
@@ -70,13 +78,16 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
     // the trust store and record a false `resolved` event for the original
     // marker. This can happen on developer machines that produced the
     // pre-guard mixed state from an earlier build of this branch.
-    let prev_cert_fp_hex: Option<String> = if prev_cert.exists() {
-        cert::fingerprint_sha256(&prev_cert)
-            .ok()
-            .map(|fp| cert::fingerprint_hex(&fp))
+    let prev_exists = ca_dir.exists("rootCA.pem.previous")?;
+    let previous_cert_bytes = if prev_exists {
+        Some(ca_dir.read("rootCA.pem.previous")?)
     } else {
         None
     };
+    let prev_cert_fp_hex: Option<String> = previous_cert_bytes
+        .as_deref()
+        .and_then(|pem| cert::fingerprint_sha256_bytes(pem).ok())
+        .map(|fp| cert::fingerprint_hex(&fp));
 
     // Job 1: grace-window expiry.
     for entry in rotate::read_grace_entries()? {
@@ -94,7 +105,7 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             out.grace_removed.push(entry.fingerprint.clone());
             continue;
         }
-        if !prev_cert.exists() {
+        if !prev_exists {
             tracing::warn!(
                 "grace-expiry: cannot find rootCA.pem.previous; the old CA fingerprint {} must be removed manually (re-install the old root, then `lpm cert uninstall`)",
                 entry.fingerprint
@@ -111,7 +122,20 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             out.grace_pending.push(entry.clone());
             continue;
         }
-        match trust::uninstall_ca(&prev_cert) {
+        let previous_cert_bytes = previous_cert_bytes.as_deref().ok_or_else(|| {
+            LpmError::Cert("previous CA bytes disappeared during reconciliation".into())
+        })?;
+        let Some(_generation_guard) =
+            operation.try_acquire_destructive_generation(previous_cert_bytes)?
+        else {
+            tracing::warn!(
+                "grace-expiry: old CA {} is still served by an active TLS runtime",
+                entry.fingerprint
+            );
+            out.grace_pending.push(entry);
+            continue;
+        };
+        match trust::uninstall_ca_bytes(previous_cert_bytes, &prev_cert) {
             Ok(()) => {
                 audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
                     fingerprint: entry.fingerprint.clone(),
@@ -152,7 +176,7 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             out.pending_old_fingerprints.push(old_fp);
             continue;
         }
-        if !prev_cert.exists() {
+        if !prev_exists {
             tracing::warn!(
                 "reconcile_required is unresolved for old CA {}, but rootCA.pem.previous is missing — re-install the old root and run `lpm cert uninstall`, then re-run `lpm cert reconcile`",
                 old_fp
@@ -169,7 +193,19 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             out.pending_old_fingerprints.push(old_fp);
             continue;
         }
-        match trust::uninstall_ca(&prev_cert) {
+        let previous_cert_bytes = previous_cert_bytes.as_deref().ok_or_else(|| {
+            LpmError::Cert("previous CA bytes disappeared during reconciliation".into())
+        })?;
+        let Some(_generation_guard) =
+            operation.try_acquire_destructive_generation(previous_cert_bytes)?
+        else {
+            tracing::warn!(
+                "reconcile_required old CA {old_fp} is still served by an active TLS runtime"
+            );
+            out.pending_old_fingerprints.push(old_fp);
+            continue;
+        };
+        match trust::uninstall_ca_bytes(previous_cert_bytes, &prev_cert) {
             Ok(()) => {
                 audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
                     fingerprint: old_fp.clone(),
@@ -199,11 +235,8 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
 
     // Once every reconcile_required is resolved AND every grace entry that pointed
     // at the previous-root is gone, the .previous files are safe to delete in this run.
-    let prev_safe_to_remove = unresolved_old_fps.is_empty()
-        && !rotate::read_grace_entries()?.iter().any(|e| {
-            paths::ca_dir().is_ok_and(|d| d.join("rootCA.pem.previous").exists())
-                && grace_entry_points_at_previous(e)
-        });
+    let prev_safe_to_remove =
+        unresolved_old_fps.is_empty() && !rotate::read_grace_entries()?.iter().any(|_| prev_exists);
 
     // Job 3: stale staging-file cleanup.
     let stale_targets = [
@@ -213,8 +246,8 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
         "rootCA-key.pem.previous",
     ];
     for name in stale_targets {
-        let p = ca_dir.join(name);
-        if !p.exists() {
+        let p = ca_dir.path(name);
+        if !ca_dir.exists(name)? {
             continue;
         }
         let is_previous = name.ends_with(".previous");
@@ -225,8 +258,8 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             );
             continue;
         }
-        let mtime = match std::fs::metadata(&p).and_then(|m| m.modified()) {
-            Ok(t) => t,
+        let mtime = match ca_dir.modified(name) {
+            Ok(time) => time,
             Err(_) => continue,
         };
         let age = std::time::SystemTime::now()
@@ -240,7 +273,7 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
             out.stale_removed.push(p.to_string_lossy().into_owned());
             continue;
         }
-        let _ = std::fs::remove_file(&p);
+        ca_dir.remove(name)?;
         audit::append_best_effort(audit::AuditAction::CaReconcileMtimeFallback {
             path: p.to_string_lossy().into_owned(),
         });
@@ -254,8 +287,8 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
     // If reconcile fully cleared every required marker and there are no pending
     // grace entries pointing at the previous root, we can also delete .previous
     // key file alongside the cert. (cert side already handled in Job 3 above.)
-    if out.reconcile_required_cleared && !prev_cert.exists() {
-        let _ = std::fs::remove_file(&prev_key);
+    if out.reconcile_required_cleared && !ca_dir.exists("rootCA.pem.previous")? {
+        let _ = ca_dir.remove("rootCA-key.pem.previous");
     }
 
     Ok(out)
@@ -265,12 +298,9 @@ pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
 /// `ca.reconcile_required` that has not been resolved by a subsequent
 /// `ca.reconcile.resolved` or a successful `ca.trust_uninstall`.
 pub fn scan_unresolved_reconcile_required() -> Result<BTreeSet<String>, LpmError> {
-    let log = audit::audit_log_path()?;
-    if !log.exists() {
+    let Some(s) = audit::read_log()? else {
         return Ok(BTreeSet::new());
-    }
-    let s = std::fs::read_to_string(&log)
-        .map_err(|e| LpmError::Cert(format!("failed to read audit log: {e}")))?;
+    };
     let mut pending: BTreeSet<String> = BTreeSet::new();
     for line in s.lines() {
         let Ok(v): Result<serde_json::Value, _> = serde_json::from_str(line) else {
@@ -301,20 +331,13 @@ pub fn scan_unresolved_reconcile_required() -> Result<BTreeSet<String>, LpmError
     Ok(pending)
 }
 
-fn grace_entry_points_at_previous(_e: &rotate::GraceEntry) -> bool {
-    paths::ca_dir().is_ok_and(|d| d.join("rootCA.pem.previous").exists())
-}
-
 pub fn audit_log_lines() -> Result<Vec<String>, LpmError> {
-    let path = audit::audit_log_path()?;
-    if !path.exists() {
+    let Some(s) = audit::read_log()? else {
         return Ok(Vec::new());
-    }
-    let s = std::fs::read_to_string(&path)
-        .map_err(|e| LpmError::Cert(format!("failed to read audit log: {e}")))?;
+    };
     Ok(s.lines().map(|l| l.to_string()).collect())
 }
 
-pub fn audit_log_path() -> Result<PathBuf, LpmError> {
+pub fn audit_log_path() -> Result<std::path::PathBuf, LpmError> {
     audit::audit_log_path()
 }

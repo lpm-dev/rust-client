@@ -407,7 +407,7 @@ pub(crate) async fn run_start(
 
     // Create webhook capture channel.
     let (webhook_tx, mut webhook_rx) =
-        tokio::sync::mpsc::channel::<lpm_tunnel::webhook::CapturedWebhook>(8);
+        tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(8);
 
     // Create WebSocket capture channel
     let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<lpm_tunnel::ws_capture::WsEvent>(256);
@@ -416,11 +416,12 @@ pub(crate) async fn run_start(
     let inspector_state_consumer = inspector_state.clone();
     let print_request_stream = !json_output;
     let webhook_consumer = tokio::spawn(async move {
-        while let Some(webhook) = webhook_rx.recv().await {
+        while let Some(captured) = webhook_rx.recv().await {
+            let webhook = Arc::clone(&captured.webhook);
             if print_request_stream {
                 print_tunnel_request(&webhook);
             }
-            inspector_state_consumer.push(webhook).await;
+            inspector_state_consumer.push_shared(webhook).await;
         }
     });
 
@@ -432,6 +433,7 @@ pub(crate) async fn run_start(
         }
     });
 
+    let tunnel_cancel = tokio_util::sync::CancellationToken::new();
     let options = lpm_tunnel::client::TunnelOptions {
         relay_url: relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
         token: token.to_string(),
@@ -443,6 +445,8 @@ pub(crate) async fn run_start(
         no_pin: false,
         auto_ack,
         ws_tx: Some(ws_tx),
+        forwarding_admission: None,
+        shutdown: Some(tunnel_cancel.clone()),
     };
 
     if !json_output {
@@ -525,10 +529,9 @@ pub(crate) async fn run_start(
                     tunnel_detail("auto-ack", "on (200 OK returned when server is down)");
                 }
                 if let Some(ref auth) = tunnel_auth_display {
-                    tunnel_detail("auth", format!("X-Tunnel-Auth: {auth}"));
                     tunnel_detail(
-                        "browser",
-                        format!("{}?__tunnel_auth={auth}", session.tunnel_url),
+                        "auth",
+                        tunnel_auth_header_summary(auth, std::io::stderr().is_terminal()),
                     );
                 }
                 tunnel_detail("domain", &session.domain);
@@ -561,19 +564,39 @@ pub(crate) async fn run_start(
     );
 
     let connect_result = if json_output {
-        connect.await
+        tokio::pin!(connect);
+        if let Some(mut shutdown) = shutdown {
+            tokio::select! {
+                result = &mut connect => result,
+                _ = &mut shutdown => {
+                    tunnel_cancel.cancel();
+                    connect.await
+                }
+            }
+        } else {
+            connect.await
+        }
     } else {
         tokio::pin!(connect);
         if let Some(mut shutdown) = shutdown {
             tokio::select! {
                 result = &mut connect => result,
-                result = wait_for_tunnel_controls(control_inspector_url) => result,
-                _ = &mut shutdown => Ok(())
+                control_result = wait_for_tunnel_controls(control_inspector_url) => {
+                    tunnel_cancel.cancel();
+                    compose_tunnel_control_and_connect(control_result, connect.await)
+                },
+                _ = &mut shutdown => {
+                    tunnel_cancel.cancel();
+                    connect.await
+                }
             }
         } else {
             tokio::select! {
                 result = &mut connect => result,
-                result = wait_for_tunnel_controls(control_inspector_url) => result,
+                control_result = wait_for_tunnel_controls(control_inspector_url) => {
+                    tunnel_cancel.cancel();
+                    compose_tunnel_control_and_connect(control_result, connect.await)
+                },
             }
         }
     };
@@ -593,14 +616,16 @@ pub(crate) async fn run_start(
             "failed to commit captures to .lpm/inspector.db: {error}"
         ))
     });
-    if let Some(handle) = inspector_handle {
-        handle.shutdown();
-    }
+    let inspector_result = match inspector_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
 
     let cleanup_result = webhook_result
         .and(websocket_result)
         .and(session_result)
-        .and(flush_result);
+        .and(flush_result)
+        .and(inspector_result);
     match (connect_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
@@ -609,6 +634,27 @@ pub(crate) async fn run_start(
             tracing::warn!("tunnel capture cleanup failed: {cleanup_error}");
             Err(primary)
         }
+    }
+}
+
+fn compose_tunnel_control_and_connect(
+    control_result: Result<(), LpmError>,
+    connect_result: Result<(), LpmError>,
+) -> Result<(), LpmError> {
+    match (control_result, connect_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(control_error), Err(connect_error)) => Err(LpmError::Tunnel(format!(
+            "{control_error}; tunnel shutdown also failed: {connect_error}"
+        ))),
+    }
+}
+
+pub(crate) fn tunnel_auth_header_summary(auth: &str, reveal: bool) -> String {
+    if reveal {
+        format!("X-Tunnel-Auth: {auth}")
+    } else {
+        "X-Tunnel-Auth: <hidden in non-interactive output>".to_string()
     }
 }
 
@@ -798,8 +844,7 @@ async fn run_inspect_ui(project_dir: &Path, inspect_port: Option<u16>) -> Result
         .await
         .map_err(|e| LpmError::Tunnel(format!("signal error: {e}")))?;
 
-    handle.shutdown();
-    Ok(())
+    handle.shutdown().await
 }
 
 fn project_inspector_state(
@@ -1709,6 +1754,15 @@ fn is_valid_tunnel_domain(domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_interactive_tunnel_auth_output_never_contains_the_secret() {
+        let output = tunnel_auth_header_summary("super-secret", false);
+
+        assert!(!output.contains("super-secret"));
+        assert!(!output.contains("http://"));
+        assert!(!output.contains("https://"));
+    }
 
     // ── Tunnel domain validation ──
 

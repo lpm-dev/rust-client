@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cap-primitives = "4.0.2"
+cap-fs-ext = { workspace = true }
+cap-std = "4.0.2"
 lpm-common = { workspace = true }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 x509-parser = { version = "0.16", features = ["verify"] }
@@ -14,6 +17,8 @@ pem = "3"
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 regex = "1"
+rand = { workspace = true }
+same-file = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,9 +26,24 @@ dirs = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 shlex = { workspace = true }
-
-[dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [lints]
 workspace = true

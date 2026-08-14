@@ -4,14 +4,19 @@
 //! and builds cross-service environment variables ({SERVICE}_URL, {SERVICE}_PORT).
 
 use lpm_common::{ExclusiveLockHandle, LpmError, LpmRoot};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-#[cfg(unix)]
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
 use std::process::Command;
+
+#[cfg(target_os = "linux")]
+const PROC_STAT_FILE_SIZE_CAP_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const LINUX_BOOT_ID_FILE_SIZE_CAP_BYTES: u64 = 128;
 
 pub(crate) struct PortAllocation {
     root: LpmRoot,
@@ -158,6 +163,8 @@ pub enum PortStatus {
 pub struct ListeningPort {
     pub port: u16,
     pub address: Option<String>,
+    #[serde(skip)]
+    pub address_family: Option<ListeningAddressFamily>,
     pub pid: Option<u32>,
     pub process: Option<String>,
     pub command: Option<String>,
@@ -166,6 +173,73 @@ pub struct ListeningPort {
     pub project: Option<String>,
     pub framework: Option<String>,
     pub uptime: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListeningAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ListeningSocketIdentity {
+    port: u16,
+    pid: Option<u32>,
+    address_family: Option<ListeningAddressFamily>,
+    address: Option<String>,
+}
+
+impl ListeningSocketIdentity {
+    fn new(
+        port: u16,
+        pid: Option<u32>,
+        address_family: Option<ListeningAddressFamily>,
+        address: Option<String>,
+    ) -> Self {
+        Self {
+            port,
+            pid,
+            address_family,
+            address,
+        }
+    }
+}
+
+impl ListeningPort {
+    pub(crate) fn socket_identity(&self) -> ListeningSocketIdentity {
+        ListeningSocketIdentity::new(
+            self.port,
+            self.pid,
+            self.address_family,
+            self.address.clone(),
+        )
+    }
+
+    /// Return whether this socket accepts the exact IP family and address.
+    pub fn listens_on(&self, address: std::net::IpAddr, port: u16) -> bool {
+        if self.port != port {
+            return false;
+        }
+        let target_family = match address {
+            std::net::IpAddr::V4(_) => ListeningAddressFamily::Ipv4,
+            std::net::IpAddr::V6(_) => ListeningAddressFamily::Ipv6,
+        };
+        let listener_family = self.address_family.or_else(|| {
+            self.address
+                .as_deref()
+                .and_then(listening_address_family_from_str)
+        });
+        if listener_family != Some(target_family) {
+            return false;
+        }
+        self.address.as_deref().is_none_or(|listener_address| {
+            listener_address
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|listener_address| {
+                    listener_address.is_unspecified() || listener_address == address
+                })
+        })
+    }
 }
 
 /// Check if a port is available.
@@ -181,7 +255,7 @@ pub fn check_port(port: u16) -> PortStatus {
     }
 }
 
-fn loopback_port_available(port: u16) -> bool {
+pub(crate) fn loopback_port_available(port: u16) -> bool {
     loopback_addr_available("127.0.0.1", port) && loopback_addr_available("::1", port)
 }
 
@@ -226,16 +300,22 @@ pub fn kill_port_owner(port: u16) -> Result<(), String> {
         let (pid, name) = find_port_owner(port);
         match pid {
             Some(pid) => {
-                // Mitigate PID reuse TOCTOU by re-querying which PID owns the
-                // *specific port* (not just checking if the PID exists).
-                // The platform backend verifies the PID is still bound to this
-                // exact port, not merely alive.
+                let expected_identity = process_identity_for_pid(pid).ok_or_else(|| {
+                    format!(
+                        "cannot verify the identity of PID {pid} on port {port} — aborting kill for safety"
+                    )
+                })?;
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 let (pid_recheck, _) = find_port_owner(port);
                 if pid_recheck != Some(pid) {
                     return Err(format!(
                         "port {port} owner changed (was PID {pid}, now {:?}) — aborting kill for safety",
                         pid_recheck
+                    ));
+                }
+                if process_identity_for_pid(pid).as_ref() != Some(&expected_identity) {
+                    return Err(format!(
+                        "port {port} owner PID {pid} was reused — aborting kill for safety"
                     ));
                 }
                 if protected_pid(pid) {
@@ -254,16 +334,9 @@ pub fn kill_port_owner(port: u16) -> Result<(), String> {
 
                 #[cfg(unix)]
                 {
-                    let output = Command::new("kill")
-                        .arg(pid.to_string())
-                        .output()
-                        .map_err(|e| format!("failed to kill PID {pid} ({proc_name}): {e}"))?;
-                    if !output.status.success() {
-                        return Err(format!(
-                            "failed to kill PID {pid} ({proc_name}): {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        ));
-                    }
+                    signal_unix_pid(pid).map_err(|error| {
+                        format!("failed to kill PID {pid} ({proc_name}): {error}")
+                    })?;
                 }
                 Ok(())
             }
@@ -283,16 +356,7 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
 
     #[cfg(unix)]
     {
-        let output = Command::new("kill")
-            .arg(pid.to_string())
-            .output()
-            .map_err(|e| format!("failed to kill PID {pid}: {e}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "failed to kill PID {pid}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
+        signal_unix_pid(pid).map_err(|error| format!("failed to kill PID {pid}: {error}"))?;
     }
     #[cfg(windows)]
     {
@@ -303,10 +367,63 @@ pub fn kill_pid(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn signal_unix_pid(pid: u32) -> Result<(), String> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| "PID is outside the platform range")?;
+    if pid <= 0 {
+        return Err("PID must be positive".to_string());
+    }
+    // SAFETY: the PID is a positive platform PID and SIGTERM does not
+    // dereference memory. Callers verify ownership and process identity.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
 /// Kill `pid` only if it still owns at least one of the requested ports.
 ///
 /// Returns the subset of requested ports that were still owned at the moment
 /// of the safety re-check. An empty vector means nothing was killed.
+#[cfg(not(windows))]
+pub fn kill_pid_if_owns_ports(pid: u32, ports: &[u16]) -> Result<Vec<u16>, String> {
+    let Some(expected_identity) = process_identity_for_pid(pid) else {
+        return Ok(Vec::new());
+    };
+    kill_pid_if_owns_ports_unix_with(
+        pid,
+        ports,
+        &expected_identity,
+        |port| match check_port(port) {
+            PortStatus::InUse { pid, .. } => pid,
+            PortStatus::Free => None,
+        },
+        process_identity_for_pid,
+        kill_pid,
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn kill_pid_if_identity_owns_ports(
+    pid: u32,
+    expected_identity: &ProcessIdentity,
+    ports: &[u16],
+) -> Result<Vec<u16>, String> {
+    kill_pid_if_owns_ports_unix_with(
+        pid,
+        ports,
+        expected_identity,
+        |port| match check_port(port) {
+            PortStatus::InUse { pid, .. } => pid,
+            PortStatus::Free => None,
+        },
+        process_identity_for_pid,
+        kill_pid,
+    )
+}
+
+#[cfg(windows)]
 pub fn kill_pid_if_owns_ports(pid: u32, ports: &[u16]) -> Result<Vec<u16>, String> {
     let mut still_owned_ports: Vec<u16> = ports
         .iter()
@@ -325,27 +442,49 @@ pub fn kill_pid_if_owns_ports(pid: u32, ports: &[u16]) -> Result<Vec<u16>, Strin
         return Ok(Vec::new());
     }
 
-    #[cfg(windows)]
-    {
-        let expected_identity = windows_process_identity_for_pid(pid);
-        still_owned_ports.retain(|port| {
-            find_windows_port_owner(*port).is_some_and(|owner| {
-                expected_identity
-                    .is_none_or(|expected| windows_same_process(owner.identity, expected))
-            })
-        });
-        if still_owned_ports.is_empty() {
-            return Ok(Vec::new());
-        }
-        terminate_windows_pid(pid, expected_identity)
-            .map_err(|err| format!("failed to kill PID {pid}: {err}"))?;
+    let expected_identity = windows_process_identity_for_pid(pid);
+    still_owned_ports.retain(|port| {
+        find_windows_port_owner(*port).is_some_and(|owner| {
+            expected_identity.is_none_or(|expected| windows_same_process(owner.identity, expected))
+        })
+    });
+    if still_owned_ports.is_empty() {
+        return Ok(Vec::new());
+    }
+    terminate_windows_pid(pid, expected_identity)
+        .map_err(|err| format!("failed to kill PID {pid}: {err}"))?;
+
+    Ok(still_owned_ports)
+}
+
+#[cfg(not(windows))]
+fn kill_pid_if_owns_ports_unix_with(
+    pid: u32,
+    ports: &[u16],
+    expected_identity: &ProcessIdentity,
+    mut port_owner: impl FnMut(u16) -> Option<u32>,
+    mut process_identity: impl FnMut(u32) -> Option<ProcessIdentity>,
+    mut signal: impl FnMut(u32) -> Result<(), String>,
+) -> Result<Vec<u16>, String> {
+    if process_identity(pid).as_ref() != Some(expected_identity) {
+        return Ok(Vec::new());
+    }
+    let mut still_owned_ports: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|port| port_owner(*port) == Some(pid))
+        .collect();
+    still_owned_ports.sort_unstable();
+    still_owned_ports.dedup();
+
+    if still_owned_ports.is_empty() {
+        return Ok(Vec::new());
+    }
+    if process_identity(pid).as_ref() != Some(expected_identity) {
+        return Ok(Vec::new());
     }
 
-    #[cfg(not(windows))]
-    {
-        kill_pid(pid)?;
-    }
-
+    signal(pid)?;
     Ok(still_owned_ports)
 }
 
@@ -368,18 +507,149 @@ pub fn list_listening_ports() -> Vec<ListeningPort> {
     rows
 }
 
-pub(crate) fn descendant_process_ids(root_pid: u32) -> HashSet<u32> {
+pub(crate) fn list_listening_ports_until(
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<Vec<ListeningPort>> {
+    if should_cancel() || std::time::Instant::now() >= deadline {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let rows = list_listening_ports_unix_until(deadline, should_cancel)?;
+    #[cfg(not(unix))]
+    let rows = list_listening_ports();
+
+    if should_cancel() || std::time::Instant::now() >= deadline {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn list_listening_ports_for_pids(pids: &HashSet<u32>) -> Vec<ListeningPort> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    #[cfg(unix)]
+    let mut rows = list_listening_ports_unix_for_pids(pids);
+    #[cfg(not(unix))]
+    let mut rows: Vec<ListeningPort> = list_listening_ports_platform()
+        .into_iter()
+        .filter(|row| row.pid.is_some_and(|pid| pids.contains(&pid)))
+        .collect();
+
+    sort_listening_ports(&mut rows);
+    rows
+}
+
+pub(crate) fn list_listening_ports_for_pids_until(
+    pids: &HashSet<u32>,
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<Vec<ListeningPort>> {
+    if pids.is_empty() {
+        return Some(Vec::new());
+    }
+    if should_cancel() || std::time::Instant::now() >= deadline {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let mut rows = list_listening_ports_unix_for_pids_until(pids, deadline, should_cancel)?;
+    #[cfg(not(unix))]
+    let mut rows: Vec<ListeningPort> = list_listening_ports_platform()
+        .into_iter()
+        .filter(|row| row.pid.is_some_and(|pid| pids.contains(&pid)))
+        .collect();
+
+    if should_cancel() || std::time::Instant::now() >= deadline {
+        return None;
+    }
+    sort_listening_ports(&mut rows);
+    Some(rows)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProcessIdentity(String);
+
+#[derive(Debug, Clone)]
+pub(crate) struct DescendantProcessSnapshot {
+    identities: HashMap<u32, Option<ProcessIdentity>>,
+}
+
+impl DescendantProcessSnapshot {
+    #[cfg(windows)]
+    fn from_pairs(root_pid: u32, pairs: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        let identities = descendant_process_ids_from_pairs(root_pid, pairs)
+            .into_iter()
+            .map(|pid| (pid, None))
+            .collect();
+        Self { identities }
+    }
+
+    pub(crate) fn process_ids(&self) -> HashSet<u32> {
+        self.identities.keys().copied().collect()
+    }
+
+    pub(crate) fn contains(&self, pid: u32) -> bool {
+        self.identities.contains_key(&pid)
+    }
+
+    pub(crate) fn contains_same_process(
+        &self,
+        pid: u32,
+        other: &DescendantProcessSnapshot,
+    ) -> bool {
+        matches!(
+            (self.identities.get(&pid), other.identities.get(&pid)),
+            (Some(Some(first)), Some(Some(second))) if first == second
+        )
+    }
+}
+
+pub(crate) fn descendant_process_snapshot(root_pid: u32) -> DescendantProcessSnapshot {
     #[cfg(unix)]
     {
-        descendant_process_ids_unix(root_pid)
+        descendant_process_snapshot_unix(root_pid)
     }
     #[cfg(windows)]
     {
-        descendant_process_ids_windows(root_pid)
+        descendant_process_snapshot_windows(root_pid)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        HashSet::from([root_pid])
+        DescendantProcessSnapshot {
+            identities: HashMap::from([(root_pid, None)]),
+        }
+    }
+}
+
+pub(crate) fn descendant_process_snapshot_until(
+    root_pid: u32,
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<DescendantProcessSnapshot> {
+    if should_cancel() || std::time::Instant::now() >= deadline {
+        return None;
+    }
+
+    #[cfg(unix)]
+    let snapshot = descendant_process_snapshot_unix_until(root_pid, deadline, should_cancel)?;
+    #[cfg(windows)]
+    let snapshot = descendant_process_snapshot_windows(root_pid);
+    #[cfg(not(any(unix, windows)))]
+    let snapshot = DescendantProcessSnapshot {
+        identities: HashMap::from([(root_pid, None)]),
+    };
+
+    if should_cancel() || std::time::Instant::now() >= deadline {
+        None
+    } else {
+        Some(snapshot)
     }
 }
 
@@ -387,7 +657,12 @@ pub(crate) fn terminate_child_process_tree(
     child: &mut Child,
 ) -> std::io::Result<std::process::ExitStatus> {
     let root_pid = child.id();
-    for pid in descendant_process_ids(root_pid)
+    let snapshot = descendant_process_snapshot(root_pid);
+    #[cfg(unix)]
+    kill_snapshot_descendants_unix_with(&snapshot, root_pid, process_identity_for_pid, kill_pid);
+    #[cfg(not(unix))]
+    for pid in snapshot
+        .process_ids()
         .into_iter()
         .filter(|pid| *pid != root_pid)
     {
@@ -395,6 +670,28 @@ pub(crate) fn terminate_child_process_tree(
     }
     let _ = child.kill();
     child.wait()
+}
+
+#[cfg(unix)]
+fn kill_snapshot_descendants_unix_with(
+    snapshot: &DescendantProcessSnapshot,
+    root_pid: u32,
+    mut process_identity: impl FnMut(u32) -> Option<ProcessIdentity>,
+    mut signal: impl FnMut(u32) -> Result<(), String>,
+) {
+    for (&pid, expected_identity) in snapshot
+        .identities
+        .iter()
+        .filter(|(pid, _)| **pid != root_pid)
+    {
+        let Some(expected_identity) = expected_identity else {
+            continue;
+        };
+        if process_identity(pid).as_ref() != Some(expected_identity) {
+            continue;
+        }
+        let _ = signal(pid);
+    }
 }
 
 #[cfg(windows)]
@@ -448,25 +745,461 @@ pub(crate) fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn descendant_process_ids_unix(root_pid: u32) -> HashSet<u32> {
-    let output = match Command::new("ps").args(["-axo", "pid=,ppid="]).output() {
-        Ok(output) if output.status.success() => output,
-        _ => return HashSet::from([root_pid]),
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    descendant_process_ids_from_pairs(
+fn descendant_process_snapshot_unix(root_pid: u32) -> DescendantProcessSnapshot {
+    let mut never_cancel = || false;
+    descendant_process_snapshot_unix_until(
         root_pid,
-        stdout.lines().filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse::<u32>().ok()?;
-            let parent = fields.next()?.parse::<u32>().ok()?;
-            Some((pid, parent))
-        }),
+        std::time::Instant::now() + std::time::Duration::from_millis(2_100),
+        &mut never_cancel,
+    )
+    .unwrap_or_else(|| failed_process_tree_snapshot(root_pid))
+}
+
+#[cfg(unix)]
+fn descendant_process_snapshot_unix_until(
+    root_pid: u32,
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<DescendantProcessSnapshot> {
+    static SENDER: std::sync::OnceLock<
+        Option<std::sync::mpsc::SyncSender<ProcessTreeSnapshotRequest>>,
+    > = std::sync::OnceLock::new();
+    let sender = SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(DISCOVERY_WORKER_QUEUE_CAPACITY);
+            std::thread::Builder::new()
+                .name("lpm-process-trees".to_string())
+                .spawn(move || run_process_tree_snapshot_batches(receiver))
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()?;
+    let (response, snapshot) = std::sync::mpsc::sync_channel(1);
+    if sender
+        .try_send(ProcessTreeSnapshotRequest {
+            root_pid,
+            deadline,
+            response,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    receive_worker_response_until(&snapshot, deadline, should_cancel)
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct UnixProcessRecord {
+    pid: u32,
+    parent: u32,
+    identity: Option<ProcessIdentity>,
+}
+
+#[cfg(unix)]
+struct UnixProcessTable {
+    children_by_parent: HashMap<u32, Vec<u32>>,
+    identities: HashMap<u32, Option<ProcessIdentity>>,
+}
+
+#[cfg(unix)]
+impl UnixProcessTable {
+    fn from_records(records: Vec<UnixProcessRecord>) -> Self {
+        let mut children_by_parent = HashMap::with_capacity(records.len());
+        let mut identities = HashMap::with_capacity(records.len());
+        for record in records {
+            children_by_parent
+                .entry(record.parent)
+                .or_insert_with(Vec::new)
+                .push(record.pid);
+            identities.insert(record.pid, record.identity);
+        }
+        Self {
+            children_by_parent,
+            identities,
+        }
+    }
+
+    fn descendants(&self, root_pid: u32) -> DescendantProcessSnapshot {
+        const MAX_DESCENDANTS: usize = 16_384;
+        let mut identities = HashMap::with_capacity(16);
+        let mut pending = Vec::with_capacity(16);
+        pending.push(root_pid);
+        while let Some(pid) = pending.pop() {
+            if identities.contains_key(&pid) {
+                continue;
+            }
+            if identities.len() >= MAX_DESCENDANTS {
+                return failed_process_tree_snapshot(root_pid);
+            }
+            let identity = self
+                .identities
+                .get(&pid)
+                .cloned()
+                .flatten()
+                .or_else(|| process_identity_for_pid(pid));
+            identities.insert(pid, identity);
+            if let Some(children) = self.children_by_parent.get(&pid) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        DescendantProcessSnapshot { identities }
+    }
+}
+
+#[cfg(unix)]
+struct ProcessTreeSnapshotRequest {
+    root_pid: u32,
+    deadline: std::time::Instant,
+    response: std::sync::mpsc::SyncSender<DescendantProcessSnapshot>,
+}
+
+#[cfg(unix)]
+fn receive_worker_response_until<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<T> {
+    const CANCELLATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    loop {
+        if should_cancel() {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match receiver.recv_timeout(remaining.min(CANCELLATION_POLL_INTERVAL)) {
+            Ok(response) => return Some(response),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_process_tree_snapshot_batches(
+    receiver: std::sync::mpsc::Receiver<ProcessTreeSnapshotRequest>,
+) {
+    while let Ok(first) = receiver.recv() {
+        process_tree_snapshot_batch(first, &receiver, query_unix_process_table);
+    }
+}
+
+#[cfg(unix)]
+fn process_tree_snapshot_batch(
+    first: ProcessTreeSnapshotRequest,
+    receiver: &std::sync::mpsc::Receiver<ProcessTreeSnapshotRequest>,
+    query: impl FnOnce(std::time::Instant) -> Option<UnixProcessTable>,
+) {
+    let mut requests = Vec::with_capacity(8);
+    requests.push(first);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(request) => requests.push(request),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    requests.retain(|request| std::time::Instant::now() < request.deadline);
+    if requests.is_empty() {
+        return;
+    }
+
+    let query_deadline = requests
+        .iter()
+        .map(|request| request.deadline)
+        .min()
+        .unwrap_or_else(std::time::Instant::now);
+    let table = query(query_deadline);
+    for request in requests {
+        if std::time::Instant::now() >= request.deadline {
+            continue;
+        }
+        let snapshot = table.as_ref().map_or_else(
+            || failed_process_tree_snapshot(request.root_pid),
+            |table| table.descendants(request.root_pid),
+        );
+        let _ = request.response.send(snapshot);
+    }
+}
+
+fn failed_process_tree_snapshot(root_pid: u32) -> DescendantProcessSnapshot {
+    DescendantProcessSnapshot {
+        identities: HashMap::from([(root_pid, None)]),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_unix_process_table(deadline: std::time::Instant) -> Option<UnixProcessTable> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let boot_id = linux_boot_id();
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let mut stat_path = entry.path();
+        stat_path.push("stat");
+        let Ok(stat) = lpm_common::read_text_file_capped(&stat_path, PROC_STAT_FILE_SIZE_CAP_BYTES)
+        else {
+            continue;
+        };
+        let Some((parent, start_ticks)) = parse_proc_stat_parent_and_start_ticks(&stat) else {
+            continue;
+        };
+        let identity = boot_id
+            .as_deref()
+            .map(|boot_id| ProcessIdentity(format!("linux:{boot_id}:{start_ticks}")));
+        records.push(UnixProcessRecord {
+            pid,
+            parent,
+            identity,
+        });
+    }
+    Some(UnixProcessTable::from_records(records))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn query_unix_process_table(deadline: std::time::Instant) -> Option<UnixProcessTable> {
+    let mut command = Command::new("ps");
+    command.args(["-axo", "pid=,ppid="]);
+    let output = command_stdout_capped_until(&mut command, deadline)?;
+    let stdout = std::str::from_utf8(&output).ok()?;
+    Some(UnixProcessTable::from_records(
+        stdout
+            .lines()
+            .filter_map(parse_unix_process_record)
+            .collect(),
+    ))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn command_stdout_capped(command: &mut Command) -> Option<Vec<u8>> {
+    command_stdout_capped_until(
+        command,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
     )
 }
 
+#[cfg(all(unix, test))]
+fn command_stdout_capped_with_timeout(
+    command: &mut Command,
+    command_timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    command_stdout_capped_until(command, std::time::Instant::now() + command_timeout)
+}
+
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn command_stdout_capped_until(
+    command: &mut Command,
+    deadline: std::time::Instant,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    const OUTPUT_CAP: u64 = 8 * 1024 * 1024;
+
+    command.process_group(0);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let process_group = child.id();
+    let (output_sender, output_receiver) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let mut output = Vec::with_capacity(64 * 1024);
+        let output = std::io::copy(&mut stdout.take(OUTPUT_CAP + 1), &mut output).map(|_| output);
+        let _ = output_sender.send(output);
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => {
+                kill_unix_process_group(process_group);
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let output = match output_receiver.recv_timeout(remaining) {
+        Ok(output) => {
+            let _ = reader.join();
+            output.ok()?
+        }
+        Err(_) => {
+            kill_unix_process_group(process_group);
+            let _ = child.kill();
+            let _ = child.wait();
+            if output_receiver
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_ok()
+            {
+                let _ = reader.join();
+            }
+            return None;
+        }
+    };
+    if !status.is_some_and(|status| status.success()) || output.len() as u64 > OUTPUT_CAP {
+        return None;
+    }
+    Some(output)
+}
+
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn kill_unix_process_group(process_group: u32) {
+    let Ok(process_group) = libc::pid_t::try_from(process_group) else {
+        return;
+    };
+    if process_group <= 1 {
+        return;
+    }
+    // SAFETY: the negative PID addresses only the dedicated process group
+    // created for this probe; SIGKILL does not dereference memory.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn parse_unix_process_record(line: &str) -> Option<UnixProcessRecord> {
+    let (pid, rest) = take_token(line.trim_start())?;
+    let (parent, _) = take_token(rest.trim_start())?;
+    let pid = pid.parse::<u32>().ok()?;
+    Some(UnixProcessRecord {
+        pid,
+        parent: parent.parse::<u32>().ok()?,
+        identity: None,
+    })
+}
+
+pub(crate) fn process_identity_for_pid(pid: u32) -> Option<ProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat_path = format!("/proc/{pid}/stat");
+        let stat =
+            lpm_common::read_text_file_capped(Path::new(&stat_path), PROC_STAT_FILE_SIZE_CAP_BYTES)
+                .ok()?;
+        let (_, start_ticks) = parse_proc_stat_parent_and_start_ticks(&stat)?;
+        linux_boot_id().map(|boot_id| ProcessIdentity(format!("linux:{boot_id}:{start_ticks}")))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_process_identity(pid)
+    }
+    #[cfg(windows)]
+    {
+        windows_process_identity_for_pid(pid)
+            .and_then(|identity| identity.creation_ticks)
+            .map(|ticks| ProcessIdentity(format!("windows:{ticks}")))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+pub(crate) fn process_identities_for_pids(pids: &HashSet<u32>) -> HashMap<u32, ProcessIdentity> {
+    let mut identities = HashMap::with_capacity(pids.len());
+    for &pid in pids {
+        if let Some(identity) = process_identity_for_pid(pid) {
+            identities.insert(pid, identity);
+        }
+    }
+    identities
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id() -> Option<String> {
+    static BOOT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            lpm_common::read_text_file_capped(
+                Path::new("/proc/sys/kernel/random/boot_id"),
+                LINUX_BOOT_ID_FILE_SIZE_CAP_BYTES,
+            )
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        })
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    #[repr(C)]
+    struct ProcUniqueIdentifierInfo {
+        uuid: [u8; 16],
+        unique_id: u64,
+        parent_unique_id: u64,
+        id_version: i32,
+        reserved_2: u32,
+        reserved_3: u64,
+        reserved_4: u64,
+    }
+
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffer_size: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    const PROC_PID_UNIQUE_IDENTIFIER_INFO: libc::c_int = 17;
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info = std::mem::MaybeUninit::<ProcUniqueIdentifierInfo>::uninit();
+    let expected = libc::c_int::try_from(std::mem::size_of::<ProcUniqueIdentifierInfo>()).ok()?;
+    // SAFETY: `info` points to an allocation of exactly `expected` bytes and
+    // `proc_pidinfo` initializes it only when it reports that full size.
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PID_UNIQUE_IDENTIFIER_INFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected,
+        )
+    };
+    if written != expected {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let info = unsafe { info.assume_init() };
+    Some(ProcessIdentity(format!(
+        "macos:{}:{}",
+        info.unique_id, info.id_version
+    )))
+}
+
 #[cfg(windows)]
-fn descendant_process_ids_windows(root_pid: u32) -> HashSet<u32> {
+fn descendant_process_snapshot_windows(root_pid: u32) -> DescendantProcessSnapshot {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -477,7 +1210,9 @@ fn descendant_process_ids_windows(root_pid: u32) -> HashSet<u32> {
     // successful handle path below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
-        return HashSet::from([root_pid]);
+        return DescendantProcessSnapshot {
+            identities: HashMap::from([(root_pid, None)]),
+        };
     }
 
     let mut entry = PROCESSENTRY32W {
@@ -498,9 +1233,17 @@ fn descendant_process_ids_windows(root_pid: u32) -> HashSet<u32> {
         CloseHandle(snapshot);
     }
 
-    descendant_process_ids_from_pairs(root_pid, pairs)
+    let mut process_snapshot = DescendantProcessSnapshot::from_pairs(root_pid, pairs);
+    for pid in process_snapshot.process_ids() {
+        let identity = windows_process_identity_for_pid(pid)
+            .and_then(|identity| identity.creation_ticks)
+            .map(|ticks| ProcessIdentity(format!("windows:{ticks}")));
+        process_snapshot.identities.insert(pid, identity);
+    }
+    process_snapshot
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn descendant_process_ids_from_pairs(
     root_pid: u32,
     pairs: impl IntoIterator<Item = (u32, u32)>,
@@ -616,8 +1359,20 @@ fn sort_listening_ports(rows: &mut [ListeningPort]) {
         left.port
             .cmp(&right.port)
             .then_with(|| left.pid.cmp(&right.pid))
+            .then_with(|| {
+                listening_address_family_rank(left.address_family)
+                    .cmp(&listening_address_family_rank(right.address_family))
+            })
             .then_with(|| left.address.cmp(&right.address))
     });
+}
+
+fn listening_address_family_rank(family: Option<ListeningAddressFamily>) -> u8 {
+    match family {
+        Some(ListeningAddressFamily::Ipv4) => 0,
+        Some(ListeningAddressFamily::Ipv6) => 1,
+        None => 2,
+    }
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -636,28 +1391,18 @@ fn format_elapsed_secs(total_secs: u64) -> String {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn find_port_owner_lsof(port: u16) -> (Option<u32>, Option<String>) {
-    let output = Command::new("lsof")
-        .args(["-ti", &format!(":{port}")])
-        .output()
-        .ok();
-
-    if let Some(output) = output
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    let port_arg = format!(":{port}");
+    let mut lsof = Command::new("lsof");
+    lsof.args(["-ti", &port_arg]);
+    if let Some(output) = command_stdout_capped(&mut lsof) {
+        let stdout = String::from_utf8_lossy(&output);
         let pid_str = stdout.trim().lines().next().unwrap_or("").trim();
         if let Ok(pid) = pid_str.parse::<u32>() {
-            let name = Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "comm="])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    } else {
-                        None
-                    }
-                });
+            let pid_arg = pid.to_string();
+            let mut ps = Command::new("ps");
+            ps.args(["-p", &pid_arg, "-o", "comm="]);
+            let name = command_stdout_capped(&mut ps)
+                .map(|output| String::from_utf8_lossy(&output).trim().to_string());
             return (Some(pid), name);
         }
     }
@@ -683,19 +1428,21 @@ struct ProjectInfo {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn list_listening_ports_lsof() -> Vec<ListeningPort> {
-    let output = match Command::new("lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcPn"])
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return Vec::new(),
-    };
+    list_listening_ports_lsof_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+}
 
-    if output.stdout.is_empty() {
+#[cfg(all(unix, not(target_os = "linux")))]
+fn list_listening_ports_lsof_until(deadline: std::time::Instant) -> Vec<ListeningPort> {
+    let mut command = Command::new("lsof");
+    command.args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcPtn"]);
+    let Some(output) = command_stdout_capped_until(&mut command, deadline) else {
+        return Vec::new();
+    };
+    if output.is_empty() {
         return Vec::new();
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output);
     let mut rows = parse_lsof_listen_output(&stdout);
     if rows.is_empty() {
         return rows;
@@ -705,8 +1452,8 @@ fn list_listening_ports_lsof() -> Vec<ListeningPort> {
     pids.sort_unstable();
     pids.dedup();
 
-    let cwd_by_pid = collect_cwds(&pids);
-    let ps_by_pid = collect_ps_info(&pids);
+    let cwd_by_pid = collect_cwds_until(&pids, deadline);
+    let ps_by_pid = collect_ps_info_until(&pids, deadline);
 
     for row in &mut rows {
         if let Some(pid) = row.pid {
@@ -724,12 +1471,276 @@ fn list_listening_ports_lsof() -> Vec<ListeningPort> {
     rows
 }
 
+#[cfg(unix)]
+struct PidListenerRequest {
+    pids: HashSet<u32>,
+    deadline: std::time::Instant,
+    response: std::sync::mpsc::SyncSender<Vec<ListeningPort>>,
+}
+
+#[cfg(unix)]
+struct FullListenerRequest {
+    deadline: std::time::Instant,
+    response: std::sync::mpsc::SyncSender<Vec<ListeningPort>>,
+}
+
+#[cfg(unix)]
+const DISCOVERY_WORKER_QUEUE_CAPACITY: usize = 64;
+
+#[cfg(unix)]
+fn list_listening_ports_unix_until(
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<Vec<ListeningPort>> {
+    static SENDER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<FullListenerRequest>>> =
+        std::sync::OnceLock::new();
+    let sender = SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(DISCOVERY_WORKER_QUEUE_CAPACITY);
+            std::thread::Builder::new()
+                .name("lpm-all-listeners".to_string())
+                .spawn(move || run_full_listener_batches(receiver))
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()?;
+    let (response, rows) = std::sync::mpsc::sync_channel(1);
+    sender
+        .try_send(FullListenerRequest { deadline, response })
+        .ok()?;
+    receive_worker_response_until(&rows, deadline, should_cancel)
+}
+
+#[cfg(unix)]
+fn run_full_listener_batches(receiver: std::sync::mpsc::Receiver<FullListenerRequest>) {
+    while let Ok(first) = receiver.recv() {
+        process_full_listener_batch(first, &receiver, list_listening_ports_unix_query_until);
+    }
+}
+
+#[cfg(unix)]
+fn list_listening_ports_unix_query_until(deadline: std::time::Instant) -> Vec<ListeningPort> {
+    #[cfg(target_os = "linux")]
+    let mut rows = list_listening_ports_linux();
+    #[cfg(not(target_os = "linux"))]
+    let mut rows = list_listening_ports_lsof_until(deadline);
+
+    if std::time::Instant::now() >= deadline {
+        return Vec::new();
+    }
+    enrich_listening_port_projects(&mut rows);
+    sort_listening_ports(&mut rows);
+    rows
+}
+
+#[cfg(unix)]
+fn process_full_listener_batch(
+    first: FullListenerRequest,
+    receiver: &std::sync::mpsc::Receiver<FullListenerRequest>,
+    query: impl FnOnce(std::time::Instant) -> Vec<ListeningPort>,
+) {
+    let mut requests = Vec::with_capacity(8);
+    requests.push(first);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(request) => requests.push(request),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    requests.retain(|request| std::time::Instant::now() < request.deadline);
+    if requests.is_empty() {
+        return;
+    }
+
+    let query_deadline = requests
+        .iter()
+        .map(|request| request.deadline)
+        .min()
+        .unwrap_or_else(std::time::Instant::now);
+    let rows = query(query_deadline);
+    for request in requests {
+        if std::time::Instant::now() >= request.deadline {
+            continue;
+        }
+        let _ = request.response.send(rows.clone());
+    }
+}
+
+#[cfg(all(unix, test))]
+fn list_listening_ports_unix_for_pids(pids: &HashSet<u32>) -> Vec<ListeningPort> {
+    let mut never_cancel = || false;
+    list_listening_ports_unix_for_pids_until(
+        pids,
+        std::time::Instant::now() + std::time::Duration::from_millis(2_100),
+        &mut never_cancel,
+    )
+    .unwrap_or_else(|| {
+        query_listening_ports_unix_for_pids(
+            pids,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn list_listening_ports_unix_for_pids_until(
+    pids: &HashSet<u32>,
+    deadline: std::time::Instant,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Option<Vec<ListeningPort>> {
+    static SENDER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<PidListenerRequest>>> =
+        std::sync::OnceLock::new();
+    let sender = SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(DISCOVERY_WORKER_QUEUE_CAPACITY);
+            std::thread::Builder::new()
+                .name("lpm-pid-listeners".to_string())
+                .spawn(move || run_pid_listener_batches(receiver))
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()?;
+    let (response, rows) = std::sync::mpsc::sync_channel(1);
+    if sender
+        .try_send(PidListenerRequest {
+            pids: pids.clone(),
+            deadline,
+            response,
+        })
+        .is_err()
+    {
+        return None;
+    }
+    receive_worker_response_until(&rows, deadline, should_cancel)
+}
+
+#[cfg(unix)]
+fn run_pid_listener_batches(receiver: std::sync::mpsc::Receiver<PidListenerRequest>) {
+    while let Ok(first) = receiver.recv() {
+        process_pid_listener_batch(first, &receiver, query_listening_ports_unix_for_pids);
+    }
+}
+
+#[cfg(unix)]
+fn process_pid_listener_batch(
+    first: PidListenerRequest,
+    receiver: &std::sync::mpsc::Receiver<PidListenerRequest>,
+    query: impl FnOnce(&HashSet<u32>, std::time::Instant) -> Vec<ListeningPort>,
+) {
+    let mut requests = Vec::with_capacity(8);
+    requests.push(first);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(request) => requests.push(request),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    requests.retain(|request| std::time::Instant::now() < request.deadline);
+    if requests.is_empty() {
+        return;
+    }
+
+    let expected_pids = requests.iter().map(|request| request.pids.len()).sum();
+    let mut pids = HashSet::with_capacity(expected_pids);
+    for request in &requests {
+        pids.extend(request.pids.iter().copied());
+    }
+    let query_deadline = requests
+        .iter()
+        .map(|request| request.deadline)
+        .min()
+        .unwrap_or_else(std::time::Instant::now);
+    let rows = query(&pids, query_deadline);
+    for request in requests {
+        if std::time::Instant::now() >= request.deadline {
+            continue;
+        }
+        let matching = rows
+            .iter()
+            .filter(|row| row.pid.is_some_and(|pid| request.pids.contains(&pid)))
+            .cloned()
+            .collect();
+        let _ = request.response.send(matching);
+    }
+}
+
+#[cfg(unix)]
+fn query_listening_ports_unix_for_pids(
+    pids: &HashSet<u32>,
+    deadline: std::time::Instant,
+) -> Vec<ListeningPort> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = deadline;
+        list_listening_ports_linux_for_pids(pids)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        query_listening_ports_lsof_for_pids(pids, deadline)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn query_listening_ports_lsof_for_pids(
+    pids: &HashSet<u32>,
+    deadline: std::time::Instant,
+) -> Vec<ListeningPort> {
+    let mut pids: Vec<u32> = pids.iter().copied().collect();
+    pids.sort_unstable();
+
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for chunk in pids.chunks(100) {
+        let pid_list = join_pids(chunk);
+        let mut command = Command::new("lsof");
+        command.args([
+            "-nP",
+            "-a",
+            "-p",
+            &pid_list,
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-F",
+            "pcPtn",
+        ]);
+        let Some(output) = command_stdout_capped_until(&mut command, deadline) else {
+            continue;
+        };
+        if output.is_empty() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output);
+        for row in parse_lsof_listen_output(&stdout) {
+            if seen.insert(row.socket_identity()) {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
 #[cfg(all(unix, not(target_os = "linux")))]
 fn parse_lsof_listen_output(output: &str) -> Vec<ListeningPort> {
     let mut rows = Vec::new();
-    let mut seen: HashSet<(u16, Option<u32>)> = HashSet::new();
+    let mut seen = HashSet::<ListeningSocketIdentity>::new();
     let mut current_pid = None;
     let mut current_process = None::<String>;
+    let mut current_address_family = None;
 
     for line in output.lines() {
         let Some((tag, value)) = line.split_at_checked(1) else {
@@ -739,22 +1750,41 @@ fn parse_lsof_listen_output(output: &str) -> Vec<ListeningPort> {
             "p" => {
                 current_pid = value.parse::<u32>().ok();
                 current_process = None;
+                current_address_family = None;
             }
             "c" => {
                 if !value.is_empty() {
                     current_process = Some(value.to_string());
                 }
             }
+            "t" => {
+                current_address_family = match value {
+                    "IPv4" => Some(ListeningAddressFamily::Ipv4),
+                    "IPv6" => Some(ListeningAddressFamily::Ipv6),
+                    _ => None,
+                };
+            }
             "n" => {
                 let Some((address, port)) = parse_lsof_tcp_name(value) else {
                     continue;
                 };
-                if !seen.insert((port, current_pid)) {
+                let address_family = current_address_family.or_else(|| {
+                    address
+                        .as_deref()
+                        .and_then(listening_address_family_from_str)
+                });
+                if !seen.insert(ListeningSocketIdentity::new(
+                    port,
+                    current_pid,
+                    address_family,
+                    address.clone(),
+                )) {
                     continue;
                 }
                 rows.push(ListeningPort {
                     port,
                     address,
+                    address_family,
                     pid: current_pid,
                     process: current_process.clone(),
                     command: None,
@@ -770,6 +1800,13 @@ fn parse_lsof_listen_output(output: &str) -> Vec<ListeningPort> {
     }
 
     rows
+}
+
+fn listening_address_family_from_str(address: &str) -> Option<ListeningAddressFamily> {
+    match address.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(_) => Some(ListeningAddressFamily::Ipv4),
+        std::net::IpAddr::V6(_) => Some(ListeningAddressFamily::Ipv6),
+    }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -797,21 +1834,20 @@ fn parse_lsof_tcp_name(value: &str) -> Option<(Option<String>, u16)> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn collect_cwds(pids: &[u32]) -> HashMap<u32, PathBuf> {
+fn collect_cwds_until(pids: &[u32], deadline: std::time::Instant) -> HashMap<u32, PathBuf> {
     let mut result = HashMap::with_capacity(pids.len());
     for chunk in pids.chunks(100) {
         let pid_list = join_pids(chunk);
-        let Ok(output) = Command::new("lsof")
-            .args(["-a", "-d", "cwd", "-F", "pn", "-p", &pid_list])
-            .output()
-        else {
+        let mut command = Command::new("lsof");
+        command.args(["-a", "-d", "cwd", "-F", "pn", "-p", &pid_list]);
+        let Some(output) = command_stdout_capped_until(&mut command, deadline) else {
             continue;
         };
-        if output.stdout.is_empty() {
+        if output.is_empty() {
             continue;
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output);
         let mut current_pid = None;
         for line in stdout.lines() {
             let Some((tag, value)) = line.split_at_checked(1) else {
@@ -834,23 +1870,22 @@ fn collect_cwds(pids: &[u32]) -> HashMap<u32, PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn collect_ps_info(pids: &[u32]) -> HashMap<u32, PsInfo> {
+fn collect_ps_info_until(pids: &[u32], deadline: std::time::Instant) -> HashMap<u32, PsInfo> {
     let mut result = HashMap::with_capacity(pids.len());
     for chunk in pids.chunks(200) {
         let pid_list = join_pids(chunk);
-        let Ok(output) = Command::new("ps")
-            .args([
-                "-p", &pid_list, "-o", "pid=", "-o", "comm=", "-o", "etime=", "-o", "command=",
-            ])
-            .output()
-        else {
+        let mut command = Command::new("ps");
+        command.args([
+            "-p", &pid_list, "-o", "pid=", "-o", "comm=", "-o", "etime=", "-o", "command=",
+        ]);
+        let Some(output) = command_stdout_capped_until(&mut command, deadline) else {
             continue;
         };
-        if output.stdout.is_empty() {
+        if output.is_empty() {
             continue;
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output);
         for line in stdout.lines() {
             if let Some((pid, info)) = parse_ps_line(line) {
                 result.insert(pid, info);
@@ -906,6 +1941,7 @@ fn take_token(input: &str) -> Option<(&str, &str)> {
 struct ProcTcpEntry {
     port: u16,
     address: Option<String>,
+    address_family: ListeningAddressFamily,
     inode: u64,
 }
 
@@ -918,15 +1954,9 @@ struct LinuxTimebase {
 
 #[cfg(target_os = "linux")]
 fn list_listening_ports_linux() -> Vec<ListeningPort> {
-    let mut sockets = parse_proc_net_tcp_file("/proc/net/tcp", false);
-    sockets.extend(parse_proc_net_tcp_file("/proc/net/tcp6", true));
-    if sockets.is_empty() {
+    let by_inode = linux_listening_socket_index();
+    if by_inode.is_empty() {
         return Vec::new();
-    }
-
-    let mut by_inode: HashMap<u64, Vec<ProcTcpEntry>> = HashMap::with_capacity(sockets.len());
-    for socket in sockets {
-        by_inode.entry(socket.inode).or_default().push(socket);
     }
 
     let Ok(proc_entries) = std::fs::read_dir("/proc") else {
@@ -940,7 +1970,7 @@ fn list_listening_ports_linux() -> Vec<ListeningPort> {
         ticks_per_second: linux_ticks_per_second(),
     };
     let mut rows = Vec::with_capacity(by_inode.len());
-    let mut seen: HashSet<(u16, Option<u32>)> = HashSet::with_capacity(by_inode.len());
+    let mut seen = HashSet::<ListeningSocketIdentity>::with_capacity(by_inode.len());
     let mut matched_inodes: HashSet<u64> = HashSet::with_capacity(by_inode.len());
 
     for entry in proc_entries.flatten() {
@@ -949,29 +1979,15 @@ fn list_listening_ports_linux() -> Vec<ListeningPort> {
             continue;
         };
 
-        let matches = linux_socket_matches_for_pid(&entry.path(), &by_inode, &mut matched_inodes);
-        if matches.is_empty() {
-            continue;
-        }
-
-        let info = read_linux_process_info(pid, timebase);
-        for socket in matches {
-            if !seen.insert((socket.port, Some(pid))) {
-                continue;
-            }
-            rows.push(ListeningPort {
-                port: socket.port,
-                address: socket.address,
-                pid: Some(pid),
-                process: info.process.clone(),
-                command: info.command.clone(),
-                cwd: info.cwd.clone(),
-                project_dir: None,
-                project: None,
-                framework: None,
-                uptime: info.uptime.clone(),
-            });
-        }
+        append_linux_listeners_for_pid(
+            pid,
+            &entry.path(),
+            &by_inode,
+            &mut matched_inodes,
+            &mut seen,
+            &mut rows,
+            timebase,
+        );
     }
 
     rows.extend(unmatched_linux_sockets(
@@ -983,10 +1999,92 @@ fn list_listening_ports_linux() -> Vec<ListeningPort> {
 }
 
 #[cfg(target_os = "linux")]
+fn list_listening_ports_linux_for_pids(pids: &HashSet<u32>) -> Vec<ListeningPort> {
+    let by_inode = linux_listening_socket_index();
+    if by_inode.is_empty() {
+        return Vec::new();
+    }
+    let timebase = LinuxTimebase {
+        uptime_secs: linux_system_uptime_secs(),
+        ticks_per_second: linux_ticks_per_second(),
+    };
+    let mut rows = Vec::with_capacity(pids.len());
+    let mut seen = HashSet::<ListeningSocketIdentity>::with_capacity(pids.len());
+    let mut matched_inodes = HashSet::with_capacity(pids.len());
+    for &pid in pids {
+        let pid_raw = pid.to_string();
+        let mut proc_dir = PathBuf::with_capacity(6 + pid_raw.len());
+        proc_dir.push("/proc");
+        proc_dir.push(pid_raw);
+        append_linux_listeners_for_pid(
+            pid,
+            &proc_dir,
+            &by_inode,
+            &mut matched_inodes,
+            &mut seen,
+            &mut rows,
+            timebase,
+        );
+    }
+    rows
+}
+
+#[cfg(target_os = "linux")]
+fn linux_listening_socket_index() -> HashMap<u64, Vec<ProcTcpEntry>> {
+    let mut sockets = parse_proc_net_tcp_file("/proc/net/tcp", false);
+    sockets.extend(parse_proc_net_tcp_file("/proc/net/tcp6", true));
+    let mut by_inode: HashMap<u64, Vec<ProcTcpEntry>> = HashMap::with_capacity(sockets.len());
+    for socket in sockets {
+        by_inode.entry(socket.inode).or_default().push(socket);
+    }
+    by_inode
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_listeners_for_pid(
+    pid: u32,
+    proc_dir: &Path,
+    by_inode: &HashMap<u64, Vec<ProcTcpEntry>>,
+    matched_inodes: &mut HashSet<u64>,
+    seen: &mut HashSet<ListeningSocketIdentity>,
+    rows: &mut Vec<ListeningPort>,
+    timebase: LinuxTimebase,
+) {
+    let matches = linux_socket_matches_for_pid(proc_dir, by_inode, matched_inodes);
+    if matches.is_empty() {
+        return;
+    }
+    let info = read_linux_process_info(pid, timebase);
+    for socket in matches {
+        if !seen.insert(ListeningSocketIdentity::new(
+            socket.port,
+            Some(pid),
+            Some(socket.address_family),
+            socket.address.clone(),
+        )) {
+            continue;
+        }
+        rows.push(ListeningPort {
+            port: socket.port,
+            address: socket.address,
+            address_family: Some(socket.address_family),
+            pid: Some(pid),
+            process: info.process.clone(),
+            command: info.command.clone(),
+            cwd: info.cwd.clone(),
+            project_dir: None,
+            project: None,
+            framework: None,
+            uptime: info.uptime.clone(),
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn unmatched_linux_sockets(
     by_inode: &HashMap<u64, Vec<ProcTcpEntry>>,
     matched_inodes: &HashSet<u64>,
-    seen: &mut HashSet<(u16, Option<u32>)>,
+    seen: &mut HashSet<ListeningSocketIdentity>,
 ) -> Vec<ListeningPort> {
     let mut rows = Vec::new();
     for (inode, sockets) in by_inode {
@@ -994,12 +2092,18 @@ fn unmatched_linux_sockets(
             continue;
         }
         for socket in sockets {
-            if !seen.insert((socket.port, None)) {
+            if !seen.insert(ListeningSocketIdentity::new(
+                socket.port,
+                None,
+                Some(socket.address_family),
+                socket.address.clone(),
+            )) {
                 continue;
             }
             rows.push(ListeningPort {
                 port: socket.port,
                 address: socket.address.clone(),
+                address_family: Some(socket.address_family),
                 pid: None,
                 process: None,
                 command: None,
@@ -1062,6 +2166,11 @@ fn parse_proc_net_tcp_line(line: &str, ipv6: bool) -> Option<ProcTcpEntry> {
     Some(ProcTcpEntry {
         port,
         address,
+        address_family: if ipv6 {
+            ListeningAddressFamily::Ipv6
+        } else {
+            ListeningAddressFamily::Ipv4
+        },
         inode,
     })
 }
@@ -1187,12 +2296,16 @@ fn read_linux_process_uptime(proc_dir: &Path, timebase: LinuxTimebase) -> Option
 
 #[cfg(target_os = "linux")]
 fn parse_proc_stat_start_ticks(stat: &str) -> Option<u64> {
-    stat.rsplit_once(") ")?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse::<u64>()
-        .ok()
+    parse_proc_stat_parent_and_start_ticks(stat).map(|(_, start_ticks)| start_ticks)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_parent_and_start_ticks(stat: &str) -> Option<(u32, u64)> {
+    let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+    let _state = fields.next()?;
+    let parent = fields.next()?.parse::<u32>().ok()?;
+    let start_ticks = fields.nth(17)?.parse::<u64>().ok()?;
+    Some((parent, start_ticks))
 }
 
 #[cfg(target_os = "linux")]
@@ -1223,6 +2336,7 @@ struct WindowsProcessInfo {
 struct WindowsTcpEntry {
     port: u16,
     address: Option<String>,
+    address_family: ListeningAddressFamily,
     pid: u32,
 }
 
@@ -1250,11 +2364,16 @@ fn list_listening_ports_windows() -> Vec<ListeningPort> {
     }
 
     let mut rows = Vec::with_capacity(sockets.len());
-    let mut seen: HashSet<(u16, Option<u32>)> = HashSet::with_capacity(sockets.len());
+    let mut seen = HashSet::<ListeningSocketIdentity>::with_capacity(sockets.len());
     let mut process_cache: HashMap<u32, WindowsProcessInfo> = HashMap::new();
 
     for socket in sockets {
-        if !seen.insert((socket.port, Some(socket.pid))) {
+        if !seen.insert(ListeningSocketIdentity::new(
+            socket.port,
+            Some(socket.pid),
+            Some(socket.address_family),
+            socket.address.clone(),
+        )) {
             continue;
         }
         let info = process_cache
@@ -1263,6 +2382,7 @@ fn list_listening_ports_windows() -> Vec<ListeningPort> {
         rows.push(ListeningPort {
             port: socket.port,
             address: socket.address,
+            address_family: Some(socket.address_family),
             pid: Some(socket.pid),
             process: info.process.clone(),
             command: info.command.clone(),
@@ -1293,6 +2413,7 @@ fn windows_tcp4_listeners() -> Vec<WindowsTcpEntry> {
         rows.push(WindowsTcpEntry {
             port: windows_port_from_mib(row.dwLocalPort),
             address: windows_ipv4_address_from_mib(row.dwLocalAddr),
+            address_family: ListeningAddressFamily::Ipv4,
             pid: row.dwOwningPid,
         });
     }
@@ -1315,6 +2436,7 @@ fn windows_tcp6_listeners() -> Vec<WindowsTcpEntry> {
         rows.push(WindowsTcpEntry {
             port: windows_port_from_mib(row.dwLocalPort),
             address: windows_ipv6_address_from_mib(row.ucLocalAddr),
+            address_family: ListeningAddressFamily::Ipv6,
             pid: row.dwOwningPid,
         });
     }
@@ -1925,6 +3047,27 @@ mod tests {
         assert!(!process_is_running(0));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn process_probe_timeout_is_not_held_open_by_a_background_descendant() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2 & exit 0"]);
+        let started = std::time::Instant::now();
+
+        let output =
+            command_stdout_capped_with_timeout(&mut command, std::time::Duration::from_millis(50));
+        let elapsed = started.elapsed();
+
+        assert!(
+            output.is_none(),
+            "incomplete process-probe output was accepted"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "background descendant retained the process-probe worker for {elapsed:?}"
+        );
+    }
+
     #[test]
     fn check_port_reports_ipv6_loopback_listener_as_in_use() {
         let Ok(listener) = TcpListener::bind("[::1]:0") else {
@@ -1935,30 +3078,335 @@ mod tests {
         assert!(matches!(check_port(port), PortStatus::InUse { .. }));
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn pid_scoped_listener_discovery_includes_only_requested_processes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let rows = list_listening_ports_for_pids(&HashSet::from([std::process::id()]));
+
+        assert!(
+            rows.iter()
+                .any(|row| row.port == port && row.pid == Some(std::process::id())),
+            "PID-scoped listener discovery omitted the current process listener: {rows:?}"
+        );
+        assert!(rows.iter().all(|row| row.pid == Some(std::process::id())));
+    }
+
     #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
-    fn parse_lsof_listen_output_dedupes_dual_stack_same_pid_port() {
+    fn concurrent_pid_listener_requests_share_one_scoped_query() {
+        fn row(pid: u32, port: u16) -> ListeningPort {
+            ListeningPort {
+                port,
+                address: None,
+                address_family: None,
+                pid: Some(pid),
+                process: None,
+                command: None,
+                cwd: None,
+                project_dir: None,
+                project: None,
+                framework: None,
+                uptime: None,
+            }
+        }
+
+        let (requests, receiver) = std::sync::mpsc::channel();
+        let (first_response, first_rows) = std::sync::mpsc::sync_channel(1);
+        let (second_response, second_rows) = std::sync::mpsc::sync_channel(1);
+        requests
+            .send(PidListenerRequest {
+                pids: HashSet::from([20, 30]),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                response: second_response,
+            })
+            .unwrap();
+        process_pid_listener_batch(
+            PidListenerRequest {
+                pids: HashSet::from([10, 20]),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                response: first_response,
+            },
+            &receiver,
+            |pids, _deadline| {
+                assert_eq!(pids, &HashSet::from([10, 20, 30]));
+                vec![row(10, 3010), row(20, 3020), row(30, 3030)]
+            },
+        );
+
+        assert_eq!(
+            first_rows
+                .recv()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.pid.unwrap())
+                .collect::<HashSet<_>>(),
+            HashSet::from([10, 20])
+        );
+        assert_eq!(
+            second_rows
+                .recv()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.pid.unwrap())
+                .collect::<HashSet<_>>(),
+            HashSet::from([20, 30])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_pid_listener_requests_do_not_invoke_a_process_query() {
+        let (_requests, receiver) = std::sync::mpsc::channel();
+        let (response, rows) = std::sync::mpsc::sync_channel(1);
+
+        process_pid_listener_batch(
+            PidListenerRequest {
+                pids: HashSet::from([10]),
+                deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+                response,
+            },
+            &receiver,
+            |_, _| panic!("expired request invoked listener discovery"),
+        );
+
+        assert!(matches!(
+            rows.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_full_listener_requests_do_not_invoke_a_process_query() {
+        let (_requests, receiver) = std::sync::mpsc::channel();
+        let (response, rows) = std::sync::mpsc::sync_channel(1);
+
+        process_full_listener_batch(
+            FullListenerRequest {
+                deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+                response,
+            },
+            &receiver,
+            |_| panic!("expired request invoked full listener discovery"),
+        );
+
+        assert!(matches!(
+            rows.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn process_snapshot_rejects_a_reused_pid_identity() {
+        let first = DescendantProcessSnapshot {
+            identities: HashMap::from([(20, Some(ProcessIdentity("first".to_string())))]),
+        };
+        let second = DescendantProcessSnapshot {
+            identities: HashMap::from([(20, Some(ProcessIdentity("second".to_string())))]),
+        };
+
+        assert!(!first.contains_same_process(20, &second));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn port_owner_cleanup_skips_a_pid_reused_before_the_signal() {
+        let identity_calls = std::cell::Cell::new(0);
+        let signalled = std::cell::Cell::new(false);
+
+        let killed_ports = kill_pid_if_owns_ports_unix_with(
+            20,
+            &[3_000],
+            &ProcessIdentity("original".to_string()),
+            |_| Some(20),
+            |_| {
+                let call = identity_calls.get();
+                identity_calls.set(call + 1);
+                Some(ProcessIdentity(if call == 0 {
+                    "original".to_string()
+                } else {
+                    "reused".to_string()
+                }))
+            },
+            |_| {
+                signalled.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(killed_ports.is_empty());
+        assert!(!signalled.get());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_tree_cleanup_skips_a_descendant_with_a_reused_pid() {
+        let snapshot = DescendantProcessSnapshot {
+            identities: HashMap::from([
+                (10, Some(ProcessIdentity("root".to_string()))),
+                (20, Some(ProcessIdentity("original".to_string()))),
+            ]),
+        };
+        let signalled = std::cell::Cell::new(false);
+
+        kill_snapshot_descendants_unix_with(
+            &snapshot,
+            10,
+            |_| Some(ProcessIdentity("reused".to_string())),
+            |_| {
+                signalled.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(!signalled.get());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_process_tree_requests_share_one_process_table() {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        let (first_response, first_snapshot) = std::sync::mpsc::sync_channel(1);
+        let (second_response, second_snapshot) = std::sync::mpsc::sync_channel(1);
+        requests
+            .send(ProcessTreeSnapshotRequest {
+                root_pid: 20,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                response: second_response,
+            })
+            .unwrap();
+        process_tree_snapshot_batch(
+            ProcessTreeSnapshotRequest {
+                root_pid: 10,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                response: first_response,
+            },
+            &receiver,
+            |_| {
+                Some(UnixProcessTable::from_records(vec![
+                    UnixProcessRecord {
+                        pid: 10,
+                        parent: 1,
+                        identity: Some(ProcessIdentity("root-10".to_string())),
+                    },
+                    UnixProcessRecord {
+                        pid: 11,
+                        parent: 10,
+                        identity: Some(ProcessIdentity("child-11".to_string())),
+                    },
+                    UnixProcessRecord {
+                        pid: 20,
+                        parent: 1,
+                        identity: Some(ProcessIdentity("root-20".to_string())),
+                    },
+                    UnixProcessRecord {
+                        pid: 21,
+                        parent: 20,
+                        identity: Some(ProcessIdentity("child-21".to_string())),
+                    },
+                ]))
+            },
+        );
+
+        assert_eq!(
+            first_snapshot.recv().unwrap().process_ids(),
+            HashSet::from([10, 11])
+        );
+        assert_eq!(
+            second_snapshot.recv().unwrap().process_ids(),
+            HashSet::from([20, 21])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_process_tree_requests_do_not_invoke_a_process_query() {
+        let (_requests, receiver) = std::sync::mpsc::channel();
+        let (response, snapshot) = std::sync::mpsc::sync_channel(1);
+
+        process_tree_snapshot_batch(
+            ProcessTreeSnapshotRequest {
+                root_pid: 10,
+                deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
+                response,
+            },
+            &receiver,
+            |_| panic!("expired request invoked process-tree discovery"),
+        );
+
+        assert!(matches!(
+            snapshot.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_response_wait_returns_when_the_deadline_expires() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = sender.send(42_u8);
+        });
+        let started = std::time::Instant::now();
+        let response = receive_worker_response_until(
+            &receiver,
+            started + std::time::Duration::from_millis(20),
+            &mut || false,
+        );
+        let elapsed = started.elapsed();
+        worker.join().unwrap();
+
+        assert!(response.is_none(), "late worker response was accepted");
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "deadline wait returned after {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_process_identity_is_stable_across_snapshots() {
+        let pid = std::process::id();
+        let first = descendant_process_snapshot(pid);
+        let second = descendant_process_snapshot(pid);
+
+        assert!(first.contains_same_process(pid, &second));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn parse_lsof_listen_output_preserves_dual_stack_same_pid_port() {
         let rows = parse_lsof_listen_output(
             "\
 p101
 cnode
 PTCP
+tIPv4
 nTCP *:3000 (LISTEN)
+tIPv6
 nTCP [::1]:3000 (LISTEN)
 p202
 credis-server
 PTCP
+tIPv4
 nTCP 127.0.0.1:6379 (LISTEN)
 ",
         );
 
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].pid, Some(101));
         assert_eq!(rows[0].process.as_deref(), Some("node"));
         assert_eq!(rows[0].port, 3000);
-        assert_eq!(rows[1].pid, Some(202));
-        assert_eq!(rows[1].address.as_deref(), Some("127.0.0.1"));
-        assert_eq!(rows[1].port, 6379);
+        assert_eq!(rows[1].pid, Some(101));
+        assert_eq!(rows[1].address.as_deref(), Some("::1"));
+        assert_eq!(rows[1].port, 3000);
+        assert_eq!(rows[2].pid, Some(202));
+        assert_eq!(rows[2].address.as_deref(), Some("127.0.0.1"));
+        assert_eq!(rows[2].port, 6379);
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]

@@ -15,12 +15,11 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 const IPC_LINE_CAP_BYTES: usize = 1024 * 1024;
+const CONTROL_CONNECTION_LIMIT: usize = 64;
 const HTTP_HEAD_CAP_BYTES: usize = 64 * 1024;
 const EMPTY_CONTROL_FRAME_MESSAGE: &str = "empty control frame";
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_CONNECTION_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
-type HttpHeaderPair = (axum::http::HeaderName, axum::http::HeaderValue);
-type ParsedHttpResponseHead = (axum::http::StatusCode, Vec<HttpHeaderPair>);
 
 mod client;
 mod control;
@@ -46,7 +45,7 @@ mod windows_pipes;
 pub use client::send_request_to_path;
 #[cfg(windows)]
 pub use client::send_request_to_pipe;
-pub use client::{RouteLease, register, send_request, status};
+pub use client::{RouteLease, register, register_staged, send_request, status};
 #[cfg(unix)]
 pub use control::{serve_control_at_path, serve_control_at_path_with_options};
 #[cfg(windows)]
@@ -55,8 +54,8 @@ pub use control::{serve_control_default, serve_control_default_with_options};
 pub use error::ProxyError;
 pub use host::{canonical_host, canonical_host_from_header};
 pub use http::{
-    HttpProxyHandle, HttpProxyState, start_http_frontend_on_listener, start_http_proxy,
-    start_http_proxy_on_listener,
+    FrontendUpstream, HttpProxyHandle, HttpProxyState, start_http_frontend_on_listener,
+    start_http_frontend_on_listener_with_upstream, start_http_proxy, start_http_proxy_on_listener,
 };
 #[cfg(windows)]
 pub use paths::proxy_pipe_name_from_env;
@@ -71,7 +70,10 @@ pub use tcp_forward::{
 };
 #[cfg(unix)]
 pub use tcp_forward::{UnixForwarderGuard, start_guarded_tcp_forwarder};
-pub use tls::start_tls_frontend_on_listener;
+pub use tls::{
+    start_tls_frontend_on_listener, start_tls_frontend_on_listener_with_pem,
+    start_tls_frontend_on_listener_with_pem_and_upstream,
+};
 pub use types::{
     ProxyDaemonOptions, ProxyDaemonState, ProxyRequest, ProxyResponse, ProxyStatus,
     RegisteredRoute, Route, RouteLeaseId, RouteStatus,
@@ -92,8 +94,11 @@ pub(crate) use platform::{
     process_owner_uid, read_forwarder_daemon_state, validate_forwarder_daemon_state,
     validate_unix_control_peer,
 };
+#[cfg(test)]
+pub(crate) use protocol::read_proxy_request;
 pub(crate) use protocol::{
-    read_proxy_request, send_request_on_stream, send_request_on_stream_ref, write_response,
+    read_proxy_request_after_activity, read_proxy_request_with_timeout, send_request_on_stream,
+    send_request_on_stream_ref, write_response,
 };
 pub(crate) use state_file::write_state_file;
 #[cfg(all(test, unix))]

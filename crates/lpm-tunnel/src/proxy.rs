@@ -7,10 +7,16 @@
 use crate::protocol::{ClientMessage, ServerMessage};
 use lpm_common::LpmError;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Maximum local response body size before returning 502 (50 MB).
 const MAX_RESPONSE_BODY_SIZE: usize = 50 * 1024 * 1024;
+
+pub(crate) struct ForwardedResponse {
+    pub(crate) message: ClientMessage,
+    pub(crate) memory_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 
 /// Allowed request headers (whitelist). Only these headers are forwarded from
 /// the relay to the local dev server. Any header starting with `x-` is also
@@ -64,6 +70,42 @@ pub async fn forward_request(
     local_target: &lpm_common::LocalTarget,
     request: &ServerMessage,
 ) -> Result<ClientMessage, LpmError> {
+    Ok(
+        forward_request_inner(http_client, local_target, request, None)
+            .await?
+            .message,
+    )
+}
+
+pub(crate) async fn forward_request_with_memory_budget(
+    http_client: &reqwest::Client,
+    local_target: &lpm_common::LocalTarget,
+    request: &ServerMessage,
+    memory_budget: Arc<tokio::sync::Semaphore>,
+    memory_budget_permits: usize,
+    memory_unit_bytes: usize,
+    memory_multiplier: usize,
+) -> Result<ForwardedResponse, LpmError> {
+    forward_request_inner(
+        http_client,
+        local_target,
+        request,
+        Some((
+            memory_budget,
+            memory_budget_permits,
+            memory_unit_bytes,
+            memory_multiplier,
+        )),
+    )
+    .await
+}
+
+async fn forward_request_inner(
+    http_client: &reqwest::Client,
+    local_target: &lpm_common::LocalTarget,
+    request: &ServerMessage,
+    memory_budget: Option<(Arc<tokio::sync::Semaphore>, usize, usize, usize)>,
+) -> Result<ForwardedResponse, LpmError> {
     crate::validate_forward_target(local_target)?;
     let (id, method, url, headers, body) = match request {
         ServerMessage::HttpRequest {
@@ -145,26 +187,65 @@ pub async fn forward_request(
     if let Some(cl) = response.content_length()
         && cl > MAX_RESPONSE_BODY_SIZE as u64
     {
-        return Ok(response_too_large(id, cl));
+        return Ok(ForwardedResponse {
+            message: response_too_large(id, cl),
+            memory_permit: None,
+        });
     }
 
-    // Read response body
-    let body_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Tunnel(format!("failed to read response body: {e}")))?;
+    let memory_permit =
+        if let Some((budget, budget_permits, unit_bytes, multiplier)) = memory_budget {
+            let raw_bytes = response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or(MAX_RESPONSE_BODY_SIZE)
+                .min(MAX_RESPONSE_BODY_SIZE);
+            let estimated_bytes = raw_bytes.saturating_mul(multiplier);
+            let permits = estimated_bytes.div_ceil(unit_bytes).max(1);
+            let permits = u32::try_from(permits.min(budget_permits).max(1))
+                .map_err(|_| LpmError::Tunnel("response memory budget is too large".into()))?;
+            Some(
+                budget
+                    .acquire_many_owned(permits)
+                    .await
+                    .map_err(|_| LpmError::Tunnel("response memory budget was closed".into()))?,
+            )
+        } else {
+            None
+        };
 
-    if body_bytes.len() > MAX_RESPONSE_BODY_SIZE {
-        return Ok(response_too_large(id, body_bytes.len() as u64));
+    let mut body_bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .map_or(0, |length| length as usize)
+            .min(MAX_RESPONSE_BODY_SIZE),
+    );
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| LpmError::Tunnel(format!("failed to read response body: {e}")))?
+    {
+        let next_len = body_bytes.len().saturating_add(chunk.len());
+        if next_len > MAX_RESPONSE_BODY_SIZE {
+            return Ok(ForwardedResponse {
+                message: response_too_large(id, next_len as u64),
+                memory_permit,
+            });
+        }
+        body_bytes.extend_from_slice(&chunk);
     }
 
     let body_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &body_bytes);
 
-    Ok(ClientMessage::HttpResponse {
-        id: id.clone(),
-        status,
-        headers: resp_headers,
-        body: body_b64,
+    Ok(ForwardedResponse {
+        message: ClientMessage::HttpResponse {
+            id: id.clone(),
+            status,
+            headers: resp_headers,
+            body: body_b64,
+        },
+        memory_permit,
     })
 }
 
@@ -180,6 +261,23 @@ pub fn bad_gateway_response(request_id: &str) -> ClientMessage {
         body: base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             b"502 Bad Gateway: local dev server is not running",
+        ),
+    }
+}
+
+/// Create an HTTP response when the bounded local-forwarding pool is busy.
+pub fn service_unavailable_response(request_id: &str) -> ClientMessage {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert("retry-after".to_string(), "1".to_string());
+
+    ClientMessage::HttpResponse {
+        id: request_id.to_string(),
+        status: 503,
+        headers,
+        body: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"Tunnel local forwarding is busy; retry shortly",
         ),
     }
 }
@@ -252,7 +350,14 @@ pub async fn connect_local_websocket(
     crate::validate_forward_target(local_target)?;
     let request = build_local_websocket_request(local_target, url, headers)?;
 
-    let (stream, _) = tokio_tungstenite::connect_async(request)
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        write_buffer_size: 128 * 1024,
+        max_write_buffer_size: 4 * 1024 * 1024,
+        max_message_size: Some(crate::client::MAX_WS_MESSAGE_SIZE),
+        max_frame_size: Some(crate::client::MAX_WS_FRAME_SIZE),
+        ..Default::default()
+    };
+    let (stream, _) = tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
         .await
         .map_err(|e| LpmError::Tunnel(format!("failed to connect local WebSocket: {e}")))?;
 
@@ -386,6 +491,121 @@ mod tests {
     #[test]
     fn max_response_body_size_is_reasonable() {
         assert_eq!(MAX_RESPONSE_BODY_SIZE, 50 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn chunked_response_stops_at_the_body_limit_without_waiting_for_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..=MAX_RESPONSE_BODY_SIZE / chunk.len() {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let target =
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port());
+        let request = ServerMessage::HttpRequest {
+            id: "chunked-large".to_string(),
+            method: "GET".to_string(),
+            url: "/large".to_string(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            forward_request(&client, &target, &request),
+        )
+        .await
+        .expect("oversized response waited for EOF")
+        .unwrap();
+        server.abort();
+
+        assert!(matches!(
+            response,
+            ClientMessage::HttpResponse { status: 502, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn near_limit_response_reserves_the_full_memory_budget_before_body_buffering() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let release_body = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_release = Arc::clone(&release_body);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        49 * 1024 * 1024
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            server_release.notified().await;
+        });
+        let budget = Arc::new(tokio::sync::Semaphore::new(64));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let target =
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port());
+        let request = ServerMessage::HttpRequest {
+            id: "near-limit".to_string(),
+            method: "GET".to_string(),
+            url: "/large".to_string(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        let forward_budget = Arc::clone(&budget);
+        let forward = tokio::spawn(async move {
+            forward_request_with_memory_budget(
+                &client,
+                &target,
+                &request,
+                forward_budget,
+                64,
+                1024 * 1024,
+                4,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while budget.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("near-limit response did not reserve the memory budget");
+
+        forward.abort();
+        release_body.notify_waiters();
+        server.await.unwrap();
+        assert_eq!(budget.available_permits(), 64);
     }
 
     #[test]

@@ -77,10 +77,14 @@ pub fn cert_has_name_constraints(path: &Path) -> Result<bool, LpmError> {
             .map_err(|e| {
                 LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
             })?;
-    let pem = pem::parse(&pem_str)
-        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    cert_has_name_constraints_bytes(pem_str.as_bytes())
+}
+
+pub(crate) fn cert_has_name_constraints_bytes(cert_pem: &[u8]) -> Result<bool, LpmError> {
+    let pem = pem::parse(cert_pem)
+        .map_err(|e| LpmError::Cert(format!("invalid CA certificate PEM: {e}")))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
-        .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+        .map_err(|e| LpmError::Cert(format!("invalid CA X.509: {e}")))?;
 
     Ok(cert
         .name_constraints()
@@ -96,10 +100,14 @@ pub fn cert_allows_project_intermediates(path: &Path) -> Result<bool, LpmError> 
             .map_err(|e| {
                 LpmError::Cert(format!("failed to read CA cert at {}: {e}", path.display()))
             })?;
-    let pem = pem::parse(&pem_str)
-        .map_err(|e| LpmError::Cert(format!("invalid PEM at {}: {e}", path.display())))?;
+    cert_allows_project_intermediates_bytes(pem_str.as_bytes())
+}
+
+pub(crate) fn cert_allows_project_intermediates_bytes(cert_pem: &[u8]) -> Result<bool, LpmError> {
+    let pem = pem::parse(cert_pem)
+        .map_err(|e| LpmError::Cert(format!("invalid CA certificate PEM: {e}")))?;
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
-        .map_err(|e| LpmError::Cert(format!("invalid X.509 at {}: {e}", path.display())))?;
+        .map_err(|e| LpmError::Cert(format!("invalid CA X.509: {e}")))?;
 
     let Some(basic_constraints) = cert
         .basic_constraints()
@@ -180,9 +188,9 @@ mod tests {
         let (cert_pem, key_pem) = generate_ca_with_options(CaOptions::default()).unwrap();
 
         assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
-        assert!(cert_pem.ends_with("-----END CERTIFICATE-----\n"));
+        assert_eq!(cert_pem.lines().last(), Some("-----END CERTIFICATE-----"));
         assert!(key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
-        assert!(key_pem.ends_with("-----END PRIVATE KEY-----\n"));
+        assert_eq!(key_pem.lines().last(), Some("-----END PRIVATE KEY-----"));
     }
 
     #[test]

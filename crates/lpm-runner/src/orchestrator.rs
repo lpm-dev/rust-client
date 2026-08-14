@@ -5,7 +5,7 @@
 
 mod recovery;
 
-use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
+use crate::dev_endpoint::DevEndpoint;
 use crate::lpm_json::ServiceConfig;
 use crate::{ports, ready, service_graph};
 use lpm_common::{LocalTarget, LpmError, sanitize_terminal_inline};
@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -62,7 +62,7 @@ pub type ServicePortMap = HashMap<String, u16>;
 pub type ServiceEndpointMap = HashMap<String, DevEndpoint>;
 pub type PortsAssignedCallback = Box<dyn Fn(&ServicePortMap) -> Result<(), LpmError> + Send>;
 pub type AllReadyCallback = Box<dyn FnOnce(ServiceEndpointMap) -> Result<(), LpmError> + Send>;
-pub type EndpointChangedCallback = Box<dyn Fn(DevEndpoint) -> Result<(), LpmError> + Send>;
+pub type EndpointChangedCallback = Box<dyn Fn(DevEndpoint) -> Result<(), LpmError> + Send + Sync>;
 
 type PortReassignments = HashMap<String, PortReassignment>;
 
@@ -76,7 +76,7 @@ struct AssignedServicePorts {
 }
 
 /// Command sent from the dashboard (or external controller) to the orchestrator.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrchestratorCommand {
     /// Restart the service at the given index.
     RestartService(usize),
@@ -84,6 +84,92 @@ pub enum OrchestratorCommand {
     StopService(usize),
     /// Stop all services and shut down.
     StopAll,
+}
+
+#[derive(Debug)]
+struct OrchestratorCommandMailbox {
+    stop_all: AtomicBool,
+    service_intents: Mutex<Vec<Option<OrchestratorCommand>>>,
+}
+
+/// Cloneable, bounded command sink for an active service orchestrator.
+#[derive(Debug, Clone)]
+pub struct OrchestratorCommandController {
+    mailbox: Arc<OrchestratorCommandMailbox>,
+}
+
+impl OrchestratorCommandController {
+    /// Create a controller with one coalesced command slot per service.
+    pub fn new(service_count: usize) -> Self {
+        Self {
+            mailbox: Arc::new(OrchestratorCommandMailbox {
+                stop_all: AtomicBool::new(false),
+                service_intents: Mutex::new(vec![None; service_count]),
+            }),
+        }
+    }
+
+    /// Submit a command without blocking. The last command for each service wins.
+    pub fn send(&self, command: OrchestratorCommand) {
+        match command {
+            OrchestratorCommand::StopAll => {
+                self.mailbox.stop_all.store(true, Ordering::Release);
+                self.mailbox.service_intents.lock().fill(None);
+            }
+            command @ (OrchestratorCommand::RestartService(index)
+            | OrchestratorCommand::StopService(index)) => {
+                if self.mailbox.stop_all.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(slot) = self.mailbox.service_intents.lock().get_mut(index) {
+                    *slot = Some(command);
+                }
+            }
+        }
+    }
+
+    fn stop_all_requested(&self) -> bool {
+        self.mailbox.stop_all.load(Ordering::Acquire)
+    }
+
+    fn has_pending_service(&self, service_index: usize) -> bool {
+        self.stop_all_requested()
+            || self
+                .mailbox
+                .service_intents
+                .lock()
+                .get(service_index)
+                .is_some_and(Option::is_some)
+    }
+
+    fn has_pending_command(&self) -> bool {
+        self.stop_all_requested()
+            || self
+                .mailbox
+                .service_intents
+                .lock()
+                .iter()
+                .any(Option::is_some)
+    }
+
+    pub(super) fn drain(&self) -> Vec<OrchestratorCommand> {
+        let mut intents = self.mailbox.service_intents.lock();
+        if self.stop_all_requested() {
+            intents.fill(None);
+            return vec![OrchestratorCommand::StopAll];
+        }
+        intents.iter_mut().filter_map(Option::take).collect()
+    }
+
+    #[cfg(test)]
+    fn pending_service_count(&self) -> usize {
+        self.mailbox
+            .service_intents
+            .lock()
+            .iter()
+            .filter(|intent| intent.is_some())
+            .count()
+    }
 }
 
 /// Options for the orchestrator.
@@ -107,6 +193,8 @@ pub struct OrchestratorOptions {
     /// Optional channel for receiving commands from a dashboard or controller.
     /// The orchestrator checks this non-blockingly in its main loop.
     pub command_rx: Option<std::sync::mpsc::Receiver<OrchestratorCommand>>,
+    /// Bounded command controller used by interactive callers.
+    pub command_controller: Option<OrchestratorCommandController>,
     /// Called once after ALL initial services pass readiness checks.
     /// Used by dev.rs to open the browser at the right time.
     pub on_all_ready: Option<AllReadyCallback>,
@@ -114,6 +202,8 @@ pub struct OrchestratorOptions {
     pub on_endpoint_changed: Option<EndpointChangedCallback>,
     /// Called once after declared ports are checked and final service ports are assigned.
     pub on_ports_assigned: Option<PortsAssignedCallback>,
+    /// Called before orderly child-tree termination begins.
+    pub on_shutdown_started: Option<crate::ShutdownStartedCallback>,
     /// CLI port override for the primary service.
     pub primary_port: Option<u16>,
     /// Allocate and verify an endpoint for the configured or implicit primary service.
@@ -129,6 +219,76 @@ const MAX_RESTART_ATTEMPTS: u32 = 10;
 /// Prevents immediately failing processes from being marked Ready before the first exit poll.
 const NO_READINESS_GRACE: Duration = Duration::from_millis(100);
 const MAX_SERVICE_LOG_LINE_BYTES: usize = 64 * 1024;
+struct CommandBridge {
+    controller: OrchestratorCommandController,
+    stop: Arc<AtomicU8>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CommandBridge {
+    fn start(
+        receiver: Option<Receiver<OrchestratorCommand>>,
+        controller: Option<OrchestratorCommandController>,
+        shutdown_state: Arc<AtomicU8>,
+        service_count: usize,
+    ) -> Self {
+        let stop = Arc::new(AtomicU8::new(0));
+        let controller =
+            controller.unwrap_or_else(|| OrchestratorCommandController::new(service_count));
+        let Some(receiver) = receiver else {
+            return Self {
+                controller,
+                stop,
+                thread: None,
+            };
+        };
+        let bridge_stop = Arc::clone(&stop);
+        let bridge_controller = controller.clone();
+        let thread = std::thread::spawn(move || {
+            while bridge_stop.load(Ordering::Relaxed) == 0 {
+                match receiver.recv_timeout(Duration::from_millis(25)) {
+                    Ok(command) => {
+                        if matches!(command, OrchestratorCommand::StopAll) {
+                            shutdown_state.store(1, Ordering::Release);
+                        }
+                        bridge_controller.send(command);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        shutdown_state.store(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            controller,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn controller(&self) -> &OrchestratorCommandController {
+        &self.controller
+    }
+
+    fn startup_interrupted(&self, service_index: usize) -> bool {
+        self.controller.has_pending_service(service_index)
+    }
+
+    fn has_startup_command(&self) -> bool {
+        self.controller.has_pending_command()
+    }
+}
+
+impl Drop for CommandBridge {
+    fn drop(&mut self) {
+        self.stop.store(1, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// Colors for service output prefixes.
 const COLORS: &[&str] = &[
@@ -325,6 +485,13 @@ fn service_exit_status(
     child.try_wait().ok().flatten()
 }
 
+fn group_has_exited_service(children: &Arc<Mutex<Vec<(String, Child)>>>, names: &[String]) -> bool {
+    let mut locked = children.lock();
+    locked
+        .iter_mut()
+        .any(|(name, child)| names.contains(name) && matches!(child.try_wait(), Ok(Some(_))))
+}
+
 struct InitialServiceReadiness {
     duration: Option<Duration>,
     endpoint: Option<DevEndpoint>,
@@ -333,7 +500,6 @@ struct InitialServiceReadiness {
 struct InitialReadinessOptions<'a> {
     service_dir: &'a Path,
     root_pid: u32,
-    baseline: Option<&'a ListenerSnapshot>,
     assigned_port: Option<u16>,
     candidates: &'a Receiver<LocalTarget>,
     ready_url: Option<String>,
@@ -343,36 +509,55 @@ struct InitialReadinessOptions<'a> {
 
 fn wait_for_initial_service_readiness(
     options: InitialReadinessOptions<'_>,
+    mut should_cancel: impl FnMut() -> bool,
 ) -> Result<InitialServiceReadiness, String> {
     let started = std::time::Instant::now();
-    let endpoint = if let (Some(port), Some(baseline)) = (options.assigned_port, options.baseline) {
-        let child_exited = Arc::new(AtomicBool::new(false));
-        crate::dev_endpoint::resolve_spawned_endpoint(
+    let deadline = started + Duration::from_secs(options.timeout_secs);
+    let endpoint = if let Some(port) = options.assigned_port {
+        crate::dev_endpoint::resolve_spawned_endpoint_until(
             options.service_dir,
             options.root_pid,
-            baseline,
+            None,
             Some(port),
             options.candidates,
-            &child_exited,
-            Duration::from_secs(options.timeout_secs),
+            deadline,
+            &mut should_cancel,
         )?
     } else {
         None
     };
 
     let explicit_readiness = if let Some(url) = options.ready_url {
-        Some(ready::wait_for_url(&url, options.timeout_secs)?)
+        Some(ready::wait_for_url_until_deadline(
+            &url,
+            started,
+            deadline,
+            options.timeout_secs,
+            &mut should_cancel,
+        )?)
     } else if let Some(port) = options
         .ready_port
         .filter(|port| Some(*port) != options.assigned_port)
     {
-        Some(ready::wait_for_port(port, options.timeout_secs)?)
+        Some(ready::wait_for_port_until_deadline(
+            port,
+            started,
+            deadline,
+            options.timeout_secs,
+            &mut should_cancel,
+        )?)
     } else {
         None
     };
 
     if endpoint.is_none() && explicit_readiness.is_none() {
-        std::thread::sleep(NO_READINESS_GRACE);
+        let grace_deadline = std::time::Instant::now() + NO_READINESS_GRACE;
+        while std::time::Instant::now() < grace_deadline {
+            if should_cancel() {
+                return Err("readiness cancelled".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         return Ok(InitialServiceReadiness {
             duration: None,
             endpoint: None,
@@ -417,13 +602,10 @@ fn port_conflict_reason(port: u16, reserved_ports: &HashMap<u16, String>) -> Opt
         return Some(format!("service '{service_name}'"));
     }
 
-    match ports::check_port(port) {
-        ports::PortStatus::Free => None,
-        ports::PortStatus::InUse { pid, process_name } => match (&pid, &process_name) {
-            (Some(p), Some(n)) => Some(format!("{n} (PID {p})")),
-            (Some(p), None) => Some(format!("PID {p}")),
-            _ => Some("unknown process".to_string()),
-        },
+    if ports::loopback_port_available(port) {
+        None
+    } else {
+        Some("another process".to_string())
     }
 }
 
@@ -470,23 +652,7 @@ fn find_available_service_port(
 fn primary_service_name(
     services: &HashMap<String, ServiceConfig>,
 ) -> Result<Option<&str>, LpmError> {
-    let mut primary_services = services
-        .iter()
-        .filter(|(_, service)| service.primary)
-        .map(|(name, _)| name.as_str());
-    if let Some(primary) = primary_services.next() {
-        if primary_services.next().is_some() {
-            return Err(LpmError::Script(
-                "multiple services are marked `primary`; exactly one primary service is allowed"
-                    .to_string(),
-            ));
-        }
-        return Ok(Some(primary));
-    }
-    if services.len() == 1 {
-        return Ok(services.keys().next().map(String::as_str));
-    }
-    Ok(None)
+    service_graph::primary_service_name(services).map_err(LpmError::Script)
 }
 
 fn assign_service_ports(
@@ -498,8 +664,9 @@ fn assign_service_ports(
     reserved_frontend_port: Option<u16>,
 ) -> Result<AssignedServicePorts, LpmError> {
     let port_overrides = port_allocation.read_overrides(project_dir);
+    let configured_primary = primary_service_name(active_services)?;
     let primary_service = if manage_primary_endpoint {
-        primary_service_name(active_services)?
+        configured_primary
     } else {
         None
     };
@@ -584,34 +751,21 @@ fn assign_service_ports(
 pub fn run_services(
     project_dir: &Path,
     services: &HashMap<String, ServiceConfig>,
-    options: OrchestratorOptions,
+    mut options: OrchestratorOptions,
 ) -> Result<(), LpmError> {
     if services.is_empty() {
         return Ok(());
     }
 
-    // Filter services if specific ones were requested
-    let active_services = if options.filter.is_empty() {
-        services.clone()
-    } else {
-        let mut active = HashMap::new();
-        for name in &options.filter {
-            if !services.contains_key(name) {
-                return Err(LpmError::Script(format!(
-                    "service '{name}' not found. Available: {}",
-                    services.keys().cloned().collect::<Vec<_>>().join(", ")
-                )));
-            }
-            // Include transitive deps
-            let deps = service_graph::transitive_deps(name, services);
-            for dep_name in deps {
-                if let Some(config) = services.get(&dep_name) {
-                    active.insert(dep_name, config.clone());
-                }
-            }
-        }
-        active
-    };
+    let active_services = service_graph::select_active_services(services, &options.filter)
+        .map_err(LpmError::Script)?;
+    let primary_service = primary_service_name(&active_services)?;
+    if options.manage_primary_endpoint && primary_service.is_none() {
+        return Err(LpmError::Script(
+            "multi-service dev features require exactly one active service marked `primary`"
+                .to_string(),
+        ));
+    }
 
     // Validate dependsOn references before sorting
     for (name, config) in &active_services {
@@ -720,279 +874,415 @@ pub fn run_services(
 
     // Shutdown state: 0 = running, 1 = graceful shutdown (SIGTERM), 2+ = force kill (SIGKILL)
     let shutdown_state = Arc::new(AtomicU8::new(0));
+    let command_bridge = CommandBridge::start(
+        options.command_rx.take(),
+        options.command_controller.take(),
+        Arc::clone(&shutdown_state),
+        service_names.len(),
+    );
     // Vec<(String, Child)> with linear scan is fine for typical dev setups
     // (<20 services). HashMap would be cleaner but Child doesn't implement Debug and
     // the vec allows ordered iteration useful for shutdown. O(n) cost negligible at this scale.
     let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
 
     // RAII guard: ensures children are cleaned up even on panic
-    let children_guard = ChildrenGuard(children.clone());
+    let mut children_guard = ChildrenGuard {
+        children: children.clone(),
+        on_shutdown_started: options.on_shutdown_started.take(),
+    };
 
     // Set up Ctrl+C handler with double-press escalation
     let shutdown_state_clone = shutdown_state.clone();
     let children_clone = children.clone();
-    ctrlc_handler(shutdown_state_clone, children_clone);
+    let _signal_handler = ctrlc_handler(shutdown_state_clone, children_clone);
 
-    // Start services in dependency order
-    let mut startup_interrupted = false;
-    let mut service_endpoints = ServiceEndpointMap::with_capacity(port_map.len());
-    let mut initial_ready = HashSet::with_capacity(active_services.len());
+    let runtime_result = (|| -> Result<(), LpmError> {
+        // Start services in dependency order
+        let mut startup_interrupted = false;
+        let mut service_endpoints = ServiceEndpointMap::with_capacity(port_map.len());
+        let mut initial_ready = HashSet::with_capacity(active_services.len());
 
-    for group in &groups {
-        if shutdown_state.load(Ordering::Relaxed) > 0 {
-            break;
-        }
-
-        let mut handles = Vec::new();
-
-        for name in group {
+        for group in &groups {
             if shutdown_state.load(Ordering::Relaxed) > 0 {
                 break;
             }
 
-            let config = &active_services[name];
-            let color = color_map[name];
+            let mut handles = Vec::new();
+            let group_names = Arc::new(group.clone());
+            let group_failed = Arc::new(AtomicBool::new(false));
 
-            // Emit Starting status
-            send_status(
-                &options.event_tx,
-                &service_names,
-                name,
-                ServiceStatus::Starting,
-            );
-
-            // Build env for this service
-            let mut env = dotenv.clone();
-            env.extend(config.env.clone());
-            if let Some(svc_cross_env) = cross_env.get(name) {
-                env.extend(svc_cross_env.clone());
-            }
-            // Override PORT if we reassigned it
-            if let Some(&port) = port_map.get(name) {
-                env.insert("PORT".to_string(), port.to_string());
-            }
-
-            // Resolve working directory with path traversal protection
-            let cwd = if let Some(ref sub) = config.cwd {
-                safe_resolve_cwd(project_dir, sub)
-                    .map_err(|e| LpmError::Script(format!("service '{name}': {e}")))?
-            } else {
-                project_dir.to_path_buf()
-            };
-            let service_command =
-                command_with_managed_port(&config.command, &cwd, port_map.get(name).copied());
-            let service_runtime_hint = options
-                .service_runtime_hints
-                .get(name)
-                .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
-            let service_path =
-                crate::bin_path::build_path_with_bins_pre_resolved(&cwd, service_runtime_hint)?;
-            let assigned_port = port_map.get(name).copied();
-            let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
-
-            // Spawn the service process
-            let mut cmd = crate::shell::shell_process(&service_command)?;
-            cmd.current_dir(&cwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            isolate_service_process_tree(&mut cmd);
-            crate::shell::strip_inherited_env_hooks(&mut cmd);
-            cmd.envs(&env).env("PATH", &service_path);
-
-            // Inject extra envs from HTTPS/tunnel/network setup (safe, no global mutation)
-            for (key, value) in &options.extra_envs {
-                cmd.env(key, value);
-            }
-
-            let child = cmd
-                .spawn()
-                .map_err(|e| LpmError::Script(format!("failed to start service '{name}': {e}")))?;
-            let child_pid = child.id();
-
-            children.lock().push((name.clone(), child));
-
-            // Compute service index for event sending
-            let service_index = service_names.iter().position(|n| n == name).unwrap_or(0);
-
-            // Spawn output readers in background threads
-            let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
-            spawn_output_readers(
-                name,
-                color,
-                service_index,
-                &children,
-                &shutdown_state,
-                &options.event_tx,
-                Some(endpoint_tx),
-            );
-
-            // Wait for readiness (in a background thread)
-            let ready_port = service_ready_port(config, port_map.get(name).copied());
-            let ready_url = config.ready_url.clone();
-            let timeout = config.ready_timeout;
-            let service_dir = cwd;
-
-            let handle = std::thread::spawn(move || {
-                wait_for_initial_service_readiness(InitialReadinessOptions {
-                    service_dir: &service_dir,
-                    root_pid: child_pid,
-                    baseline: listener_baseline.as_ref(),
-                    assigned_port,
-                    candidates: &endpoint_rx,
-                    ready_url,
-                    ready_port,
-                    timeout_secs: timeout,
-                })
-            });
-
-            handles.push((name.clone(), handle));
-        }
-
-        // Wait for all services in this group to be ready
-        let mut readiness_failure = None;
-        for (name, handle) in handles {
-            match handle.join() {
-                Ok(Ok(readiness)) => {
-                    if service_exit_status(&children, &name).is_some() {
-                        startup_interrupted = true;
-                        continue;
-                    }
-
-                    if let Some(mut endpoint) = readiness.endpoint {
-                        endpoint.service = Some(name.clone());
-                        service_endpoints.insert(name.clone(), endpoint);
-                    }
-                    let color = color_map[&name];
-                    let timing = ui_readiness_timing(readiness.duration);
-                    ui_service_status(color, &name, GREEN, "✓", &format!("ready{timing}"));
-                    send_status(
-                        &options.event_tx,
-                        &service_names,
-                        &name,
-                        ServiceStatus::Ready,
-                    );
-                    initial_ready.insert(name);
+            for name in group {
+                if shutdown_state.load(Ordering::Relaxed) > 0 {
+                    break;
                 }
-                Ok(Err(error)) => {
-                    let display_error = sanitize_terminal_inline(&error).into_owned();
-                    ui_service_status(
-                        RESET,
-                        &name,
-                        RED,
-                        "✗",
-                        &format!("readiness failed - {display_error}"),
-                    );
-                    send_status(
-                        &options.event_tx,
-                        &service_names,
-                        &name,
-                        ServiceStatus::ReadinessFailed(display_error),
-                    );
-                    readiness_failure.get_or_insert((name, error));
+
+                let config = &active_services[name];
+                let color = color_map[name];
+
+                // Emit Starting status
+                send_status(
+                    &options.event_tx,
+                    &service_names,
+                    name,
+                    ServiceStatus::Starting,
+                );
+
+                // Build env for this service
+                let mut env = dotenv.clone();
+                env.extend(config.env.clone());
+                if let Some(svc_cross_env) = cross_env.get(name) {
+                    env.extend(svc_cross_env.clone());
                 }
-                Err(_) => {
-                    ui_service_status(RESET, &name, RED, "✗", "readiness check panicked");
-                    if shutdown_state.load(Ordering::Relaxed) == 0 {
-                        shutdown_state.store(1, Ordering::Relaxed);
-                        shutdown_children(&children, false);
-                        return Err(LpmError::Script(format!(
-                            "service '{name}' readiness check panicked"
-                        )));
+                // Override PORT if we reassigned it
+                if let Some(&port) = port_map.get(name) {
+                    env.insert("PORT".to_string(), port.to_string());
+                }
+
+                // Resolve working directory with path traversal protection
+                let cwd = if let Some(ref sub) = config.cwd {
+                    safe_resolve_cwd(project_dir, sub)
+                        .map_err(|e| LpmError::Script(format!("service '{name}': {e}")))?
+                } else {
+                    project_dir.to_path_buf()
+                };
+                let service_command =
+                    command_with_managed_port(&config.command, &cwd, port_map.get(name).copied());
+                let service_runtime_hint = options
+                    .service_runtime_hints
+                    .get(name)
+                    .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
+                let service_path =
+                    crate::bin_path::build_path_with_bins_pre_resolved(&cwd, service_runtime_hint)?;
+                let assigned_port = port_map.get(name).copied();
+                // Spawn the service process
+                let mut cmd = crate::shell::shell_process(&service_command)?;
+                cmd.current_dir(&cwd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                isolate_service_process_tree(&mut cmd);
+                crate::shell::strip_inherited_env_hooks(&mut cmd);
+                cmd.envs(&env).env("PATH", &service_path);
+
+                // Inject extra envs from HTTPS/tunnel/network setup (safe, no global mutation)
+                for (key, value) in &options.extra_envs {
+                    cmd.env(key, value);
+                }
+
+                let mut child = cmd.spawn().map_err(|e| {
+                    LpmError::Script(format!("failed to start service '{name}': {e}"))
+                })?;
+                let child_pid = child.id();
+                let child_stdout = child.stdout.take();
+                let child_stderr = child.stderr.take();
+
+                children.lock().push((name.clone(), child));
+
+                // Compute service index for event sending
+                let service_index = service_names.iter().position(|n| n == name).unwrap_or(0);
+
+                // Spawn output readers in background threads
+                let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
+                spawn_output_readers(
+                    child_stdout,
+                    child_stderr,
+                    OutputReaderOptions {
+                        name,
+                        color,
+                        service_index,
+                        shutdown_state: &shutdown_state,
+                        event_tx: &options.event_tx,
+                        endpoint_tx: Some(endpoint_tx),
+                    },
+                );
+
+                // Wait for readiness (in a background thread)
+                let ready_port = service_ready_port(config, port_map.get(name).copied());
+                let ready_url = config.ready_url.clone();
+                let timeout = config.ready_timeout;
+                let readiness_requires_running_process =
+                    assigned_port.is_some() || ready_url.is_some() || ready_port.is_some();
+                let service_dir = cwd;
+                let readiness_children = Arc::clone(&children);
+                let readiness_shutdown = Arc::clone(&shutdown_state);
+                let readiness_name = name.clone();
+                let readiness_group = Arc::clone(&group_names);
+                let readiness_group_failed = Arc::clone(&group_failed);
+                let readiness_command_controller = command_bridge.controller().clone();
+
+                let handle = std::thread::spawn(move || {
+                    wait_for_initial_service_readiness(
+                        InitialReadinessOptions {
+                            service_dir: &service_dir,
+                            root_pid: child_pid,
+                            assigned_port,
+                            candidates: &endpoint_rx,
+                            ready_url,
+                            ready_port,
+                            timeout_secs: timeout,
+                        },
+                        || {
+                            if readiness_shutdown.load(Ordering::Relaxed) > 0 {
+                                return true;
+                            }
+                            if readiness_command_controller.has_pending_service(service_index) {
+                                terminate_named_service(&readiness_children, &readiness_name);
+                                return true;
+                            }
+                            if readiness_requires_running_process
+                                && group_has_exited_service(&readiness_children, &readiness_group)
+                            {
+                                readiness_group_failed.store(true, Ordering::Relaxed);
+                                return true;
+                            }
+                            readiness_requires_running_process
+                                && service_exit_status(&readiness_children, &readiness_name)
+                                    .is_some()
+                        },
+                    )
+                });
+
+                handles.push((name.clone(), handle));
+            }
+
+            // Wait for all services in this group to be ready
+            let mut readiness_failure = None;
+            for (name, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(readiness)) => {
+                        if let Some(status) = service_exit_status(&children, &name) {
+                            if status.success() {
+                                startup_interrupted = true;
+                                continue;
+                            }
+                            let code = status.code().unwrap_or(-1);
+                            ui_service_status(
+                                RESET,
+                                &name,
+                                RED,
+                                "✗",
+                                &format!("crashed (exit {code})"),
+                            );
+                            send_status(
+                                &options.event_tx,
+                                &service_names,
+                                &name,
+                                ServiceStatus::Crashed(code),
+                            );
+                            readiness_failure.get_or_insert((
+                                name,
+                                format!("service exited with status {code} before becoming ready"),
+                            ));
+                            continue;
+                        }
+
+                        if let Some(mut endpoint) = readiness.endpoint {
+                            endpoint.service = Some(name.clone());
+                            service_endpoints.insert(name.clone(), endpoint);
+                        }
+                        let color = color_map[&name];
+                        let timing = ui_readiness_timing(readiness.duration);
+                        ui_service_status(color, &name, GREEN, "✓", &format!("ready{timing}"));
+                        send_status(
+                            &options.event_tx,
+                            &service_names,
+                            &name,
+                            ServiceStatus::Ready,
+                        );
+                        initial_ready.insert(name);
+                    }
+                    Ok(Err(error)) => {
+                        if shutdown_state.load(Ordering::Relaxed) > 0 {
+                            startup_interrupted = true;
+                            continue;
+                        }
+                        let service_index = service_names
+                            .iter()
+                            .position(|service_name| service_name == &name)
+                            .unwrap_or(usize::MAX);
+                        if command_bridge.startup_interrupted(service_index) {
+                            startup_interrupted = true;
+                            continue;
+                        }
+                        if let Some(status) = service_exit_status(&children, &name) {
+                            let code = status.code().unwrap_or(-1);
+                            ui_service_status(
+                                RESET,
+                                &name,
+                                RED,
+                                "✗",
+                                &format!("crashed (exit {code})"),
+                            );
+                            send_status(
+                                &options.event_tx,
+                                &service_names,
+                                &name,
+                                ServiceStatus::Crashed(code),
+                            );
+                            readiness_failure.get_or_insert((
+                                name,
+                                format!("service exited with status {code} before becoming ready"),
+                            ));
+                            continue;
+                        }
+                        if group_failed.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let display_error = sanitize_terminal_inline(&error).into_owned();
+                        ui_service_status(
+                            RESET,
+                            &name,
+                            RED,
+                            "✗",
+                            &format!("readiness failed - {display_error}"),
+                        );
+                        send_status(
+                            &options.event_tx,
+                            &service_names,
+                            &name,
+                            ServiceStatus::ReadinessFailed(display_error),
+                        );
+                        readiness_failure.get_or_insert((name, error));
+                    }
+                    Err(_) => {
+                        ui_service_status(RESET, &name, RED, "✗", "readiness check panicked");
+                        if shutdown_state.load(Ordering::Relaxed) == 0 {
+                            shutdown_state.store(1, Ordering::Relaxed);
+                            return Err(LpmError::Script(format!(
+                                "service '{name}' readiness check panicked"
+                            )));
+                        }
                     }
                 }
             }
-        }
 
-        if let Some((name, error)) = readiness_failure {
-            shutdown_state.store(1, Ordering::Relaxed);
-            shutdown_children_ordered(&children, false, Some(&groups));
-            std::mem::forget(children_guard);
-            return Err(LpmError::Script(format!(
-                "service '{name}' failed readiness: {error}"
-            )));
-        }
+            if command_bridge.has_startup_command() {
+                startup_interrupted = true;
+            }
 
-        if startup_interrupted {
-            break;
-        }
-    }
+            if let Some((name, error)) = readiness_failure {
+                if !active_services
+                    .get(&name)
+                    .is_some_and(|config| config.restart)
+                {
+                    shutdown_state.store(1, Ordering::Relaxed);
+                    return Err(LpmError::Script(format!(
+                        "service '{name}' failed readiness: {error}"
+                    )));
+                }
+                startup_interrupted = true;
+            }
 
-    // All initial services are ready — fire callback (e.g., open browser)
-    if !startup_interrupted && let Some(callback) = options.on_all_ready {
-        let callback = std::thread::spawn(move || callback(service_endpoints));
-        match callback.join() {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(LpmError::Script(
-                    "all-services-ready callback panicked".to_string(),
-                ));
+            if startup_interrupted {
+                break;
             }
         }
-    }
 
-    recovery::supervise_services(recovery::RecoveryContext {
-        project_dir,
-        active_services: &active_services,
-        groups: &groups,
-        service_runtime_hints: &options.service_runtime_hints,
-        dotenv: &dotenv,
-        cross_env: &cross_env,
-        port_map: &port_map,
-        color_map: &color_map,
-        service_names: &service_names,
-        initial_ready: &initial_ready,
-        children: &children,
-        shutdown_state: &shutdown_state,
-        event_tx: &options.event_tx,
-        command_rx: options.command_rx.as_ref(),
-        on_endpoint_changed: options.on_endpoint_changed.as_ref(),
-        extra_envs: &options.extra_envs,
-    })?;
+        if startup_interrupted && shutdown_state.load(Ordering::Relaxed) == 0 {
+            terminate_unready_initial_services(&children, &initial_ready);
+        }
 
-    // Normal cleanup (guard will also cleanup on panic/early exit via Drop)
+        let initial_publication_complete = !startup_interrupted;
+        if initial_publication_complete && let Some(callback) = options.on_all_ready.take() {
+            invoke_all_ready_callback(callback, std::mem::take(&mut service_endpoints))?;
+        }
+
+        recovery::supervise_services(recovery::RecoveryContext {
+            project_dir,
+            active_services: &active_services,
+            groups: &groups,
+            service_runtime_hints: &options.service_runtime_hints,
+            dotenv: &dotenv,
+            cross_env: &cross_env,
+            port_map: &port_map,
+            color_map: &color_map,
+            service_names: &service_names,
+            initial_ready: &initial_ready,
+            children: &children,
+            shutdown_state: &shutdown_state,
+            event_tx: &options.event_tx,
+            command_controller: Some(command_bridge.controller()),
+            initial_publication_complete,
+            initial_endpoints: service_endpoints,
+            on_all_ready: options.on_all_ready.take(),
+            on_endpoint_changed: options.on_endpoint_changed.as_ref(),
+            extra_envs: &options.extra_envs,
+        })?;
+
+        Ok(())
+    })();
+
     let force = shutdown_state.load(Ordering::Relaxed) >= 2;
+    let shutdown_result = children_guard.begin_shutdown();
     shutdown_children_ordered(&children, force, Some(&groups));
-    std::mem::forget(children_guard); // Don't double-cleanup
+    std::mem::forget(children_guard);
+    match runtime_result {
+        Ok(()) => shutdown_result,
+        Err(primary) => Err(compose_runtime_and_shutdown_error(primary, shutdown_result)),
+    }
+}
 
-    Ok(())
+fn compose_runtime_and_shutdown_error(
+    primary: LpmError,
+    shutdown_result: Result<(), LpmError>,
+) -> LpmError {
+    match shutdown_result {
+        Ok(()) => primary,
+        Err(shutdown) => LpmError::Script(format!(
+            "{primary}; shutdown boundary also failed: {shutdown}"
+        )),
+    }
+}
+
+fn invoke_all_ready_callback(
+    callback: AllReadyCallback,
+    endpoints: ServiceEndpointMap,
+) -> Result<(), LpmError> {
+    match std::thread::spawn(move || callback(endpoints)).join() {
+        Ok(result) => result,
+        Err(_) => Err(LpmError::Script(
+            "all-services-ready callback panicked".to_string(),
+        )),
+    }
 }
 
 /// Spawn background threads to read stdout and stderr from a child process.
 ///
-/// Finds the child by name in the shared `children` vec, takes its stdout/stderr
-/// handles, and spawns reader threads that print output with colored service prefixes
-/// and optionally send events to the dashboard.
+/// Takes the spawned child's stdout/stderr handles and starts reader threads that
+/// print output with colored service prefixes and optionally send dashboard events.
 ///
 /// Must be called after every `spawn()` — both initial start and restart — otherwise
 /// the new process's output is silently lost.
-fn spawn_output_readers(
-    name: &str,
-    color: &str,
+struct OutputReaderOptions<'a> {
+    name: &'a str,
+    color: &'a str,
     service_index: usize,
-    children: &Arc<Mutex<Vec<(String, Child)>>>,
-    shutdown_state: &Arc<AtomicU8>,
-    event_tx: &Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
+    shutdown_state: &'a Arc<AtomicU8>,
+    event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
     endpoint_tx: Option<std::sync::mpsc::Sender<LocalTarget>>,
+}
+
+fn spawn_output_readers(
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+    options: OutputReaderOptions<'_>,
 ) {
+    let OutputReaderOptions {
+        name,
+        color,
+        service_index,
+        shutdown_state,
+        event_tx,
+        endpoint_tx,
+    } = options;
     let stderr_endpoint_tx = endpoint_tx.clone();
     // stdout reader
     {
         let name = name.to_string();
         let color = color.to_string();
-        let children_ref = children.clone();
         let shutdown_ref = shutdown_state.clone();
         let event_tx = event_tx.clone();
 
         std::thread::spawn(move || {
-            let stdout = {
-                let mut locked = children_ref.lock();
-                let entry = locked.iter_mut().find(|(n, _)| *n == name);
-                match entry {
-                    Some((_, child)) => child.stdout.take(),
-                    None => return,
-                }
-            };
-
             if let Some(stdout) = stdout {
                 drain_service_output(stdout, &shutdown_ref, |line| {
                     if let Some(ref tx) = endpoint_tx {
@@ -1019,20 +1309,10 @@ fn spawn_output_readers(
     {
         let name = name.to_string();
         let color = color.to_string();
-        let children_ref = children.clone();
         let shutdown_ref = shutdown_state.clone();
         let event_tx = event_tx.clone();
 
         std::thread::spawn(move || {
-            let stderr = {
-                let mut locked = children_ref.lock();
-                let entry = locked.iter_mut().find(|(n, _)| *n == name);
-                match entry {
-                    Some((_, child)) => child.stderr.take(),
-                    None => return,
-                }
-            };
-
             if let Some(stderr) = stderr {
                 drain_service_output(stderr, &shutdown_ref, |line| {
                     if let Some(ref tx) = stderr_endpoint_tx {
@@ -1099,11 +1379,23 @@ fn drain_service_output<R: std::io::Read>(
 }
 
 /// RAII guard that kills child processes on drop (panic safety).
-struct ChildrenGuard(Arc<Mutex<Vec<(String, Child)>>>);
+struct ChildrenGuard {
+    children: Arc<Mutex<Vec<(String, Child)>>>,
+    on_shutdown_started: Option<crate::ShutdownStartedCallback>,
+}
+
+impl ChildrenGuard {
+    fn begin_shutdown(&mut self) -> Result<(), LpmError> {
+        crate::invoke_shutdown_started(&mut self.on_shutdown_started)
+    }
+}
 
 impl Drop for ChildrenGuard {
     fn drop(&mut self) {
-        shutdown_children(&self.0, false);
+        if let Err(error) = self.begin_shutdown() {
+            tracing::error!(%error, "shutdown boundary failed during child cleanup");
+        }
+        shutdown_children(&self.children, false);
     }
 }
 
@@ -1115,37 +1407,71 @@ impl Drop for ChildrenGuard {
 /// Uses `signal-hook` on Unix for safe, non-`unsafe` signal handling.
 /// Falls back to a no-op on non-Unix (Windows child process cleanup
 /// is handled by the `ChildrenGuard` RAII guard on drop).
-fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String, Child)>>>) {
-    #[cfg(unix)]
-    {
-        use signal_hook::consts::{SIGINT, SIGTERM};
-        use signal_hook::iterator::Signals;
+#[cfg(unix)]
+struct SignalHandler {
+    handle: signal_hook::iterator::Handle,
+    thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    running: Arc<AtomicBool>,
+}
 
-        let state = shutdown_state;
-        let kids = children;
-        if let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) {
-            std::thread::spawn(move || {
-                for _ in signals.forever() {
-                    let prev = state.fetch_add(1, Ordering::Relaxed);
-                    if prev == 0 {
-                        // First signal: graceful shutdown
-                        eprintln!();
-                        ui_warn("Stopping services...");
-                    } else {
-                        // Second+ signal: force kill
-                        eprintln!();
-                        ui_warn("Force-killing services...");
-                        force_kill_children(&kids);
-                        break;
-                    }
-                }
-            });
+#[cfg(unix)]
+impl Drop for SignalHandler {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (shutdown_state, children);
-    }
+}
+
+#[cfg(unix)]
+fn ctrlc_handler(
+    shutdown_state: Arc<AtomicU8>,
+    children: Arc<Mutex<Vec<(String, Child)>>>,
+) -> Option<SignalHandler> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let state = shutdown_state;
+    let kids = children;
+    let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) else {
+        return None;
+    };
+    let handle = signals.handle();
+    #[cfg(test)]
+    let running = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let thread_running = Arc::clone(&running);
+    let thread = std::thread::spawn(move || {
+        #[cfg(test)]
+        thread_running.store(true, Ordering::Release);
+        for _ in signals.forever() {
+            let prev = state.fetch_add(1, Ordering::Relaxed);
+            if prev == 0 {
+                eprintln!();
+                ui_warn("Stopping services...");
+            } else {
+                eprintln!();
+                ui_warn("Force-killing services...");
+                force_kill_children(&kids);
+                break;
+            }
+        }
+        #[cfg(test)]
+        thread_running.store(false, Ordering::Release);
+    });
+    Some(SignalHandler {
+        handle,
+        thread: Some(thread),
+        #[cfg(test)]
+        running,
+    })
+}
+
+#[cfg(not(unix))]
+fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String, Child)>>>) {
+    let _ = (shutdown_state, children);
 }
 
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).
@@ -1153,16 +1479,8 @@ fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String,
 fn force_kill_children(children: &Arc<Mutex<Vec<(String, Child)>>>) {
     let mut locked = children.lock();
     for (name, child) in locked.iter_mut() {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                #[cfg(unix)]
-                signal_service_process_group(child.id(), libc::SIGKILL);
-            }
-            _ => {
-                force_kill_service_tree(child);
-                ui_service_status(RESET, name, RED, "✗", "force-killed");
-            }
-        }
+        force_kill_service_tree(child);
+        ui_service_status(RESET, name, RED, "✗", "force-killed");
     }
 }
 
@@ -1181,7 +1499,7 @@ fn shutdown_children(children: &Arc<Mutex<Vec<(String, Child)>>>, force: bool) {
 /// Shutdown with optional reverse topological ordering.
 ///
 /// When `groups` is provided, services are stopped in reverse topological order
-/// (dependents first, then their dependencies). Each group gets a 2s grace period.
+/// (dependents first, then their dependencies). All groups share a 2s grace budget.
 /// When `groups` is None, all services are stopped simultaneously (legacy behavior).
 fn shutdown_children_ordered(
     children: &Arc<Mutex<Vec<(String, Child)>>>,
@@ -1219,7 +1537,8 @@ fn shutdown_children_ordered(
         vec![locked.iter().map(|(n, _)| n.clone()).collect()]
     };
 
-    for group in &shutdown_order {
+    let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    for (group_index, group) in shutdown_order.iter().enumerate() {
         {
             let mut locked = children.lock();
             for name in group {
@@ -1242,8 +1561,53 @@ fn shutdown_children_ordered(
             }
         }
 
-        // Grace period between groups to allow orderly shutdown
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let groups_remaining = u32::try_from(shutdown_order.len() - group_index).unwrap_or(1);
+        let group_deadline = std::time::Instant::now()
+            + shutdown_deadline.saturating_duration_since(std::time::Instant::now())
+                / groups_remaining;
+        loop {
+            let group_still_running = {
+                let mut locked = children.lock();
+                group.iter().any(|name| {
+                    locked
+                        .iter_mut()
+                        .find(|(child_name, _)| child_name == name)
+                        .is_some_and(|(_, child)| {
+                            let root_running = !matches!(child.try_wait(), Ok(Some(_)));
+                            #[cfg(unix)]
+                            {
+                                root_running || service_process_group_exists(child.id())
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                root_running
+                            }
+                        })
+                })
+            };
+            if !group_still_running || std::time::Instant::now() >= group_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        let mut locked = children.lock();
+        for name in group {
+            let Some((_, child)) = locked.iter_mut().find(|(child_name, _)| child_name == name)
+            else {
+                continue;
+            };
+            let root_running = !matches!(child.try_wait(), Ok(Some(_)));
+            #[cfg(unix)]
+            let tree_running = root_running || service_process_group_exists(child.id());
+            #[cfg(not(unix))]
+            let tree_running = root_running;
+            if tree_running {
+                tracing::debug!("force-killing service '{name}' before the next dependency level");
+                force_kill_service_tree(child);
+                ui_service_status(RESET, name, RED, "✗", "force-killed");
+            }
+        }
     }
 
     // Final pass: force-kill any stragglers and reap zombies
@@ -1251,8 +1615,12 @@ fn shutdown_children_ordered(
     for (name, child) in locked.iter_mut() {
         let status = child.try_wait().ok().flatten();
         #[cfg(unix)]
-        signal_service_process_group(child.id(), libc::SIGKILL);
-        if let Some(status) = status {
+        let descendants_remain = service_process_group_exists(child.id());
+        #[cfg(not(unix))]
+        let descendants_remain = false;
+        if let Some(status) = status
+            && !descendants_remain
+        {
             ui_service_note(
                 RESET,
                 name,
@@ -1287,6 +1655,84 @@ fn signal_service_process_group(root_pid: u32, signal: libc::c_int) {
         libc::kill(-process_group, signal);
     }
 }
+
+#[cfg(unix)]
+fn service_process_group_exists(root_pid: u32) -> bool {
+    let Ok(process_group) = libc::pid_t::try_from(root_pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 checks whether the child-owned process group still has
+    // members without delivering a signal.
+    let result = unsafe { libc::kill(-process_group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn terminate_service_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let root_pid = child.id();
+        signal_service_process_group(root_pid, libc::SIGTERM);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
+            let _ = child.try_wait();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if service_process_group_exists(root_pid) {
+            signal_service_process_group(root_pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ports::terminate_child_process_tree(child);
+    }
+}
+
+fn terminate_named_service(children: &Arc<Mutex<Vec<(String, Child)>>>, name: &str) {
+    let child = {
+        let mut locked = children.lock();
+        locked
+            .iter()
+            .position(|(child_name, _)| child_name == name)
+            .map(|index| locked.remove(index).1)
+    };
+    if let Some(mut child) = child {
+        terminate_service_tree(&mut child);
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_exited_service_tree(root_pid: u32) {
+    if service_process_group_exists(root_pid) {
+        signal_service_process_group(root_pid, libc::SIGKILL);
+    }
+}
+
+fn terminate_unready_initial_services(
+    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    initial_ready: &HashSet<String>,
+) {
+    let mut unready = {
+        let mut locked = children.lock();
+        let mut retained = Vec::with_capacity(locked.len());
+        let mut unready = Vec::new();
+        for mut child in locked.drain(..) {
+            if initial_ready.contains(&child.0) || matches!(child.1.try_wait(), Ok(Some(_))) {
+                retained.push(child);
+            } else {
+                unready.push(child.1);
+            }
+        }
+        *locked = retained;
+        unready
+    };
+    for child in &mut unready {
+        terminate_service_tree(child);
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_exited_service_tree(_root_pid: u32) {}
 
 fn force_kill_service_tree(child: &mut Child) {
     #[cfg(unix)]
@@ -1632,13 +2078,15 @@ mod tests {
     #[test]
     fn spawn_output_readers_captures_stdout_and_stderr() {
         // Spawn a real process that writes to both stdout and stderr
-        let child = Command::new("sh")
+        let mut child = Command::new("sh")
             .arg("-c")
             .arg("echo STDOUT_LINE; echo STDERR_LINE >&2")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
 
         let name = "test-svc".to_string();
         let children: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1648,13 +2096,16 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
 
         spawn_output_readers(
-            &name,
-            "\x1b[36m", // cyan
-            0,
-            &children,
-            &shutdown,
-            &Some(tx),
-            None,
+            child_stdout,
+            child_stderr,
+            OutputReaderOptions {
+                name: &name,
+                color: "\x1b[36m",
+                service_index: 0,
+                shutdown_state: &shutdown,
+                event_tx: &Some(tx),
+                endpoint_tx: None,
+            },
         );
 
         // Wait for the child to finish and readers to flush
@@ -1964,7 +2415,263 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crashed_service_does_not_wait_for_the_full_readiness_timeout() {
+        let unavailable_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unavailable_port = unavailable_listener.local_addr().unwrap().port();
+        drop(unavailable_listener);
+        let services = HashMap::from([(
+            "crasher".to_string(),
+            ServiceConfig {
+                command: "exit 1".to_string(),
+                ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
+                ready_timeout: 30,
+                ..Default::default()
+            },
+        )]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_services(dir.path(), &services, OrchestratorOptions::default());
+
+        assert!(result.is_err(), "crashed service unexpectedly succeeded");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "crashed service waited for readiness timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn crashing_service_cancels_sibling_readiness_in_the_same_startup_level() {
+        let unavailable_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unavailable_port = unavailable_listener.local_addr().unwrap().port();
+        drop(unavailable_listener);
+        let services = HashMap::from([
+            (
+                "a-slow".to_string(),
+                ServiceConfig {
+                    command: "sleep 60".to_string(),
+                    ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
+                    ready_timeout: 4,
+                    ..Default::default()
+                },
+            ),
+            ("z-crash".to_string(), simple_service("exit 1")),
+        ]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_services(dir.path(), &services, OrchestratorOptions::default());
+
+        assert!(
+            result.is_err(),
+            "crashing startup level unexpectedly succeeded"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sibling crash waited for the unrelated readiness timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn restart_policy_recovers_a_service_that_crashes_before_initial_readiness() {
+        let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
+        drop(ready_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("crash-once.js"),
+            format!(
+                r#"
+const fs = require('fs');
+if (!fs.existsSync('crashed')) {{
+  fs.writeFileSync('crashed', 'yes');
+  process.exit(23);
+}}
+require('http').createServer((_request, response) => response.end('ok'))
+  .listen({ready_port}, '127.0.0.1');
+"#
+            ),
+        )
+        .unwrap();
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "node crash-once.js".to_string(),
+                restart: true,
+                ready_url: Some(format!("http://127.0.0.1:{ready_port}")),
+                ready_timeout: 3,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let project_dir = dir.path().to_path_buf();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(run_services(&project_dir, &services, options));
+        });
+
+        let mut statuses = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(OrchestratorEvent::StatusChange { status, .. }) => {
+                    let recovered = matches!(status, ServiceStatus::Ready);
+                    statuses.push(status);
+                    if recovered {
+                        break;
+                    }
+                }
+                Ok(OrchestratorEvent::ServiceLog { .. }) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("orchestrator event channel disconnected: {error}"),
+            }
+        }
+        command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        assert!(result.is_ok(), "restart policy failed startup: {result:?}");
+        assert!(
+            statuses
+                .iter()
+                .any(|status| matches!(status, ServiceStatus::Crashed(23))),
+            "initial crash was not reported: {statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .filter(|status| matches!(status, ServiceStatus::Starting))
+                .count()
+                >= 2,
+            "service was not restarted: {statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .any(|status| matches!(status, ServiceStatus::Ready)),
+            "restarted service did not become ready: {statuses:?}"
+        );
+    }
+
     // ── OrchestratorCommand tests ──────────────────────────────────
+
+    #[test]
+    fn stop_all_dominates_queued_service_commands() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        command_tx
+            .send(OrchestratorCommand::RestartService(0))
+            .unwrap();
+        command_tx
+            .send(OrchestratorCommand::StopService(0))
+            .unwrap();
+        command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let bridge = CommandBridge::start(Some(command_rx), None, Arc::clone(&shutdown_state), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while shutdown_state.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let command = bridge.controller().drain().into_iter().next().unwrap();
+
+        assert!(matches!(command, OrchestratorCommand::StopAll));
+    }
+
+    #[test]
+    fn service_command_storm_keeps_only_the_last_valid_intent() {
+        let controller = OrchestratorCommandController::new(1);
+        for index in 0..100_000 {
+            let command = if index % 2 == 0 {
+                OrchestratorCommand::RestartService(0)
+            } else {
+                OrchestratorCommand::StopService(0)
+            };
+            controller.send(command);
+            controller.send(OrchestratorCommand::RestartService(usize::MAX));
+        }
+
+        assert_eq!(controller.pending_service_count(), 1);
+        assert_eq!(
+            controller.drain(),
+            vec![OrchestratorCommand::StopService(0)]
+        );
+    }
+
+    #[test]
+    fn recovered_service_publishes_initial_readiness_before_endpoint_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("crash-once.js"),
+            r#"
+const fs = require('fs');
+if (!fs.existsSync('crashed')) {
+  fs.writeFileSync('crashed', 'yes');
+  process.exit(23);
+}
+require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
+"#,
+        )
+        .unwrap();
+        let services = HashMap::from([(
+            "web".to_string(),
+            ServiceConfig {
+                command: "node crash-once.js".to_string(),
+                restart: true,
+                ready_timeout: 3,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (publication_tx, publication_rx) = std::sync::mpsc::channel();
+        let changed_tx = publication_tx.clone();
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            manage_primary_endpoint: true,
+            on_all_ready: Some(Box::new(move |mut endpoints| {
+                publication_tx
+                    .send((true, endpoints.remove("web").unwrap()))
+                    .unwrap();
+                Ok(())
+            })),
+            on_endpoint_changed: Some(Box::new(move |endpoint| {
+                changed_tx.send((false, endpoint)).unwrap();
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
+
+        let initial = publication_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        command_tx
+            .send(OrchestratorCommand::RestartService(0))
+            .unwrap();
+        let changed = publication_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = handle.join().unwrap();
+
+        assert!(result.is_ok(), "restart policy failed startup: {result:?}");
+        assert!(
+            initial.0,
+            "recovery published an endpoint change before initial readiness"
+        );
+        assert_eq!(initial.1.service.as_deref(), Some("web"));
+        assert!(!changed.0, "later restart repeated initial readiness");
+        assert_eq!(changed.1.service.as_deref(), Some("web"));
+        assert_ne!(changed.1.owner_pid, initial.1.owner_pid);
+        assert!(
+            publication_rx.try_recv().is_err(),
+            "initial readiness was published more than once"
+        );
+    }
 
     #[test]
     fn stop_all_command_terminates_orchestrator() {
@@ -2041,6 +2748,288 @@ mod tests {
     }
 
     #[test]
+    fn channel_disconnect_interrupts_initial_readiness() {
+        let unavailable_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unavailable_port = unavailable_listener.local_addr().unwrap().port();
+        drop(unavailable_listener);
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "sleep 60".to_string(),
+                ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
+                ready_timeout: 4,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel::<OrchestratorCommand>();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let controller = std::thread::spawn(move || {
+            while !matches!(
+                event_rx.recv_timeout(Duration::from_secs(2)),
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Starting,
+                    ..
+                })
+            ) {}
+            drop(command_tx);
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_services(dir.path(), &services, options);
+        controller.join().unwrap();
+
+        assert!(result.is_ok(), "channel disconnect failed: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "channel disconnect remained blocked behind initial readiness: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_service_interrupts_its_initial_readiness() {
+        let unavailable_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unavailable_port = unavailable_listener.local_addr().unwrap().port();
+        drop(unavailable_listener);
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "sleep 60".to_string(),
+                ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
+                ready_timeout: 4,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let controller = std::thread::spawn(move || {
+            while !matches!(
+                event_rx.recv_timeout(Duration::from_secs(2)),
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Starting,
+                    ..
+                })
+            ) {}
+            command_tx
+                .send(OrchestratorCommand::StopService(0))
+                .unwrap();
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let started = std::time::Instant::now();
+
+        let result = run_services(dir.path(), &services, options);
+        controller.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "StopService failed during startup: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "StopService remained blocked behind initial readiness: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn stop_service_terminates_its_starting_process_without_waiting_for_a_sibling() {
+        let first_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let first_port = first_listener.local_addr().unwrap().port();
+        drop(first_listener);
+        let second_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let second_port = second_listener.local_addr().unwrap().port();
+        drop(second_listener);
+        let services = HashMap::from([
+            (
+                "a".to_string(),
+                ServiceConfig {
+                    command: "echo $$ > a.pid; sleep 60".to_string(),
+                    ready_url: Some(format!("http://127.0.0.1:{first_port}/health")),
+                    ready_timeout: 10,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                ServiceConfig {
+                    command: "sleep 60".to_string(),
+                    ready_url: Some(format!("http://127.0.0.1:{second_port}/health")),
+                    ready_timeout: 10,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::sync_channel(1);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("a.pid");
+        let controller = std::thread::spawn(move || {
+            let mut starting = 0;
+            while starting < 2 {
+                if matches!(
+                    event_rx.recv_timeout(Duration::from_secs(2)),
+                    Ok(OrchestratorEvent::StatusChange {
+                        status: ServiceStatus::Starting,
+                        ..
+                    })
+                ) {
+                    starting += 1;
+                }
+            }
+            let pid_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !pid_path.exists() && std::time::Instant::now() < pid_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pid = std::fs::read_to_string(&pid_path)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            command_tx
+                .send(OrchestratorCommand::StopService(0))
+                .unwrap();
+            let stop_deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while ports::process_is_running(pid) && std::time::Instant::now() < stop_deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            stopped_tx.send(!ports::process_is_running(pid)).unwrap();
+            command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        });
+
+        let result = run_services(dir.path(), &services, options);
+        controller.join().unwrap();
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert!(
+            stopped_rx.recv().unwrap(),
+            "target service remained alive behind sibling readiness"
+        );
+    }
+
+    #[test]
+    fn restarting_one_starting_service_does_not_restart_an_unrelated_starting_service() {
+        let first_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let first_port = first_listener.local_addr().unwrap().port();
+        drop(first_listener);
+        let second_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let second_port = second_listener.local_addr().unwrap().port();
+        drop(second_listener);
+        let services = HashMap::from([
+            (
+                "a".to_string(),
+                ServiceConfig {
+                    command: format!(
+                        "node -e \"setTimeout(() => require('http').createServer((_, response) => response.end('ok')).listen({first_port}, '127.0.0.1'), 500); setInterval(() => {{}}, 1000)\""
+                    ),
+                    ready_url: Some(format!("http://127.0.0.1:{first_port}")),
+                    ready_timeout: 5,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                ServiceConfig {
+                    command: format!(
+                        "node -e \"setTimeout(() => require('http').createServer((_, response) => response.end('ok')).listen({second_port}, '127.0.0.1'), 500); setInterval(() => {{}}, 1000)\""
+                    ),
+                    ready_url: Some(format!("http://127.0.0.1:{second_port}")),
+                    ready_timeout: 5,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(run_services(&project_dir, &services, options));
+        });
+
+        let mut starting_counts = [0usize; 2];
+        let mut ready = [false; 2];
+        while starting_counts.iter().sum::<usize>() < 2 {
+            match event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    service_index,
+                    status: ServiceStatus::Starting,
+                }) => starting_counts[service_index] += 1,
+                Ok(_) => {}
+                Err(error) => panic!("services did not begin initial startup: {error}"),
+            }
+        }
+        command_tx
+            .send(OrchestratorCommand::RestartService(0))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while !ready.iter().all(|is_ready| *is_ready) && std::time::Instant::now() < deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
+                service_index,
+                status,
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                match status {
+                    ServiceStatus::Starting => starting_counts[service_index] += 1,
+                    ServiceStatus::Ready => ready[service_index] = true,
+                    _ => {}
+                }
+            }
+        }
+        command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert_eq!(starting_counts[0], 2, "target service should restart once");
+        assert_eq!(
+            starting_counts[1], 1,
+            "unrelated service should keep its initial process"
+        );
+        assert!(ready.iter().all(|is_ready| *is_ready));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_signal_handler_releases_its_background_thread() {
+        let shutdown_state = Arc::new(AtomicU8::new(0));
+        let children = Arc::new(Mutex::new(Vec::new()));
+
+        let handler = ctrlc_handler(shutdown_state, children);
+        let running = Arc::clone(&handler.as_ref().unwrap().running);
+        let start_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !running.load(Ordering::Acquire) && std::time::Instant::now() < start_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(running.load(Ordering::Acquire));
+        drop(handler);
+
+        assert!(!running.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn stop_service_command_stops_single_service() {
         let mut services = HashMap::new();
         services.insert("a".to_string(), simple_service("sleep 60"));
@@ -2054,30 +3043,110 @@ mod tests {
             ..Default::default()
         };
         let dir = tempfile::TempDir::new().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
 
-        // Stop service at index 0 after startup, then StopAll
-        let cmd_tx_clone = cmd_tx.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = cmd_tx_clone.send(OrchestratorCommand::StopService(0));
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = cmd_tx.send(OrchestratorCommand::StopAll);
-        });
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut ready_count = 0;
+        while ready_count < 2 && std::time::Instant::now() < ready_deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
+                status: ServiceStatus::Ready,
+                ..
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
+            {
+                ready_count += 1;
+            }
+        }
+        cmd_tx.send(OrchestratorCommand::StopService(0)).unwrap();
 
-        let _ = run_services(dir.path(), &services, options);
-
-        // Verify we got a Stopped status for the killed service
         let mut saw_stopped = false;
-        while let Ok(event) = event_rx.try_recv() {
-            if let OrchestratorEvent::StatusChange {
+        let stop_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !saw_stopped && std::time::Instant::now() < stop_deadline {
+            if let Ok(OrchestratorEvent::StatusChange {
                 status: ServiceStatus::Stopped,
                 ..
-            } = event
+            }) = event_rx.recv_timeout(Duration::from_millis(100))
             {
                 saw_stopped = true;
             }
         }
+        cmd_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = handle.join().unwrap();
+
+        assert_eq!(ready_count, 2, "services did not reach initial readiness");
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
         assert!(saw_stopped, "should emit Stopped status for killed service");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_all_invokes_the_shutdown_boundary_before_multi_service_cleanup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let started_path = dir.path().join("started");
+        let services = HashMap::from([(
+            "web".to_string(),
+            simple_service(&format!(
+                "touch '{}'; while :; do sleep 1; done",
+                started_path.display()
+            )),
+        )]);
+        let controller = OrchestratorCommandController::new(services.len());
+        let shutdown_boundary_ran = Arc::new(AtomicBool::new(false));
+        let callback_state = Arc::clone(&shutdown_boundary_ran);
+        let options = OrchestratorOptions {
+            command_controller: Some(controller.clone()),
+            on_shutdown_started: Some(Box::new(move || {
+                callback_state.store(true, Ordering::Release);
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let project_dir = dir.path().to_path_buf();
+        let handle = std::thread::spawn(move || run_services(&project_dir, &services, options));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !started_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started_path.exists(), "service did not start");
+        controller.send(OrchestratorCommand::StopAll);
+
+        let result = handle.join().unwrap();
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert!(
+            shutdown_boundary_ran.load(Ordering::Acquire),
+            "child cleanup started without acknowledging the shutdown boundary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_failure_preserves_the_shutdown_boundary_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let services = HashMap::from([(
+            "web".to_string(),
+            simple_service("while :; do sleep 1; done"),
+        )]);
+        let options = OrchestratorOptions {
+            on_all_ready: Some(Box::new(|_| {
+                Err(LpmError::Script(
+                    "injected endpoint publication failure".to_string(),
+                ))
+            })),
+            on_shutdown_started: Some(Box::new(|| {
+                Err(LpmError::Tunnel(
+                    "injected shutdown boundary failure".to_string(),
+                ))
+            })),
+            ..Default::default()
+        };
+
+        let error = run_services(dir.path(), &services, options)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("injected endpoint publication failure"));
+        assert!(error.contains("injected shutdown boundary failure"));
     }
 
     #[test]
@@ -2334,6 +3403,253 @@ setInterval(() => {{}}, 1000);
     }
 
     #[test]
+    fn stop_all_interrupts_restart_readiness_without_waiting_for_its_timeout() {
+        let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
+        drop(ready_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ready-only-once.js"),
+            format!(
+                r#"
+const fs = require('fs');
+if (!fs.existsSync('ready-once')) {{
+  fs.writeFileSync('ready-once', 'ready');
+  require('http').createServer((_request, response) => response.end('ok'))
+    .listen({ready_port}, '127.0.0.1');
+}}
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        )
+        .unwrap();
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "node ready-only-once.js".to_string(),
+                port: Some(ready_port),
+                ready_url: Some(format!("http://127.0.0.1:{ready_port}")),
+                ready_timeout: 30,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let project_dir = dir.path().to_path_buf();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(run_services(&project_dir, &services, options));
+        });
+
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                }) => break,
+                Ok(_) => {}
+                Err(error) => panic!("initial service did not become ready: {error}"),
+            }
+        }
+        command_tx
+            .send(OrchestratorCommand::RestartService(0))
+            .unwrap();
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Starting,
+                    ..
+                }) => break,
+                Ok(_) => {}
+                Err(error) => panic!("service restart did not begin: {error}"),
+            }
+        }
+
+        let stop_started = std::time::Instant::now();
+        command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("StopAll remained blocked behind restart readiness");
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert!(stop_started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn stop_all_interrupts_initial_readiness_without_waiting_for_its_timeout() {
+        let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
+        drop(ready_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("never-ready.js"),
+            "setInterval(() => {}, 1000);\n",
+        )
+        .unwrap();
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "node never-ready.js".to_string(),
+                port: Some(ready_port),
+                ready_timeout: 3,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let controller = std::thread::spawn(move || {
+            loop {
+                match event_rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(OrchestratorEvent::StatusChange {
+                        status: ServiceStatus::Starting,
+                        ..
+                    }) => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("initial service did not start: {error}"),
+                }
+            }
+            let sent_at = std::time::Instant::now();
+            command_tx.send(OrchestratorCommand::StopAll).unwrap();
+            (sent_at, event_rx)
+        });
+
+        let result = run_services(dir.path(), &services, options);
+        let (stop_sent_at, event_rx) = controller.join().unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+        assert!(
+            stop_sent_at.elapsed() < Duration::from_secs(2),
+            "StopAll remained blocked behind initial readiness"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::ReadinessFailed(_),
+                    ..
+                }
+            )),
+            "StopAll was reported as a readiness failure: {events:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_restart_during_readiness_does_not_report_failure_or_back_off() {
+        let ready_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
+        drop(ready_listener);
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ready-except-second.js"),
+            format!(
+                r#"
+const fs = require('fs');
+const count = fs.existsSync('starts') ? Number(fs.readFileSync('starts', 'utf8')) + 1 : 1;
+fs.writeFileSync('starts', String(count));
+if (count !== 2) {{
+  require('http').createServer((_request, response) => response.end('ok'))
+    .listen({ready_port}, '127.0.0.1');
+}}
+setInterval(() => {{}}, 1000);
+"#
+            ),
+        )
+        .unwrap();
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "node ready-except-second.js".to_string(),
+                ready_url: Some(format!("http://127.0.0.1:{ready_port}")),
+                ready_timeout: 30,
+                ..Default::default()
+            },
+        )]);
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel(256);
+        let options = OrchestratorOptions {
+            command_rx: Some(command_rx),
+            event_tx: Some(event_tx),
+            ..Default::default()
+        };
+        let project_dir = dir.path().to_path_buf();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = result_tx.send(run_services(&project_dir, &services, options));
+        });
+
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                }) => break,
+                Ok(_) => {}
+                Err(error) => panic!("initial service did not become ready: {error}"),
+            }
+        }
+        command_tx
+            .send(OrchestratorCommand::RestartService(0))
+            .unwrap();
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Starting,
+                    ..
+                }) => break,
+                Ok(_) => {}
+                Err(error) => panic!("first restart did not begin: {error}"),
+            }
+        }
+        let restart_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::fs::read_to_string(dir.path().join("starts"))
+            .ok()
+            .as_deref()
+            != Some("2")
+        {
+            assert!(
+                std::time::Instant::now() < restart_deadline,
+                "first restart process did not enter readiness"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        command_tx
+            .send(OrchestratorCommand::RestartService(0))
+            .unwrap();
+        let restart_started = std::time::Instant::now();
+        loop {
+            match event_rx.recv_timeout(Duration::from_secs(6)) {
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::ReadinessFailed(error),
+                    ..
+                }) => panic!("user-requested restart was reported as a failure: {error}"),
+                Ok(OrchestratorEvent::StatusChange {
+                    status: ServiceStatus::Ready,
+                    ..
+                }) => break,
+                Ok(_) => {}
+                Err(error) => panic!("second restart did not become ready promptly: {error}"),
+            }
+        }
+
+        assert!(restart_started.elapsed() < Duration::from_secs(6));
+        command_tx.send(OrchestratorCommand::StopAll).unwrap();
+        let result = result_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(result.is_ok(), "orchestrator failed: {result:?}");
+    }
+
+    #[test]
     fn reassigned_service_fails_readiness_instead_of_using_stale_occupied_port() {
         let occupied_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let occupied_port = occupied_listener.local_addr().unwrap().port();
@@ -2377,5 +3693,137 @@ setInterval(() => {{}}, 1000);
                 .any(|status| matches!(status, ServiceStatus::Ready)),
             "service must not be Ready from an unrelated occupied original port: {statuses:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordered_shutdown_does_not_wait_for_levels_that_exit_promptly() {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut groups = Vec::new();
+        for name in ["db", "api", "web"] {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("trap 'exit 0' TERM; while :; do sleep 0.05; done");
+            isolate_service_process_tree(&mut command);
+            children
+                .lock()
+                .push((name.to_string(), command.spawn().unwrap()));
+            groups.push(vec![name.to_string()]);
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        shutdown_children_ordered(&children, false, Some(&groups));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "promptly exiting dependency levels waited for fixed grace periods: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crashed_service_cleanup_removes_surviving_process_group_members() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("trap '' TERM; sleep 60 & exit 1");
+        isolate_service_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let root_pid = child.id();
+        let status = child.wait().unwrap();
+        assert!(!status.success());
+        assert!(service_process_group_exists(root_pid));
+
+        cleanup_exited_service_tree(root_pid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(!service_process_group_exists(root_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_cleanup_removes_descendants_after_the_root_exits() {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("trap '' TERM; sleep 60 & exit 0");
+        isolate_service_process_tree(&mut command);
+        let mut child = command.spawn().unwrap();
+        let root_pid = child.id();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert!(service_process_group_exists(root_pid));
+        children.lock().push(("worker".to_string(), child));
+
+        force_kill_children(&children);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(!service_process_group_exists(root_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordered_shutdown_removes_signal_resistant_descendants_after_the_root_exits() {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "trap 'exit 0' TERM; sh -c \"trap '' TERM; sleep 60\" & while :; do sleep 0.05; done",
+        );
+        isolate_service_process_tree(&mut command);
+        let child = command.spawn().unwrap();
+        let root_pid = child.id();
+        children.lock().push(("web".to_string(), child));
+        std::thread::sleep(Duration::from_millis(100));
+
+        shutdown_children_ordered(&children, false, Some(&[vec!["web".to_string()]]));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while service_process_group_exists(root_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!service_process_group_exists(root_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordered_shutdown_force_kills_resistant_dependents_before_dependencies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let observation = dir.path().join("dependency-observation");
+        let children = Arc::new(Mutex::new(Vec::new()));
+
+        let mut web_command = Command::new("sh");
+        web_command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 0.05; done");
+        isolate_service_process_tree(&mut web_command);
+        let web = web_command.spawn().unwrap();
+        let web_pid = web.id();
+        children.lock().push(("web".to_string(), web));
+
+        let mut db_command = Command::new("sh");
+        db_command.arg("-c").arg(format!(
+            "trap 'if kill -0 -{web_pid} 2>/dev/null; then echo alive > \"{}\"; else echo gone > \"{}\"; fi; exit 0' TERM; while :; do sleep 0.05; done",
+            observation.display(),
+            observation.display()
+        ));
+        isolate_service_process_tree(&mut db_command);
+        children
+            .lock()
+            .push(("db".to_string(), db_command.spawn().unwrap()));
+        std::thread::sleep(Duration::from_millis(100));
+
+        shutdown_children_ordered(
+            &children,
+            false,
+            Some(&[vec!["db".to_string()], vec!["web".to_string()]]),
+        );
+
+        assert_eq!(std::fs::read_to_string(observation).unwrap().trim(), "gone");
     }
 }

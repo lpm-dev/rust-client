@@ -2,7 +2,7 @@ use super::dev_ui;
 use crate::install_ui;
 use lpm_common::color::Painted;
 use lpm_common::{LocalScheme, LocalTarget, LpmError};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -12,9 +12,912 @@ use std::sync::{Arc, Mutex, RwLock};
 struct LocalProxyRuntime {
     lease: lpm_proxy::RouteLease,
     bridges: Vec<lpm_proxy::HttpProxyHandle>,
+    routes: Vec<lpm_proxy::Route>,
 }
 
-type ProxyLeaseSlot = Arc<Mutex<Option<LocalProxyRuntime>>>;
+struct TunnelReadyPublication {
+    session: lpm_tunnel::TunnelSession,
+    local_target_url: String,
+    tunnel_auth: Option<String>,
+    usage: Option<lpm_tunnel::TunnelUsageMetadata>,
+}
+
+#[derive(Clone)]
+struct TunnelShutdownBoundary {
+    state: Arc<Mutex<TunnelShutdownState>>,
+}
+
+struct TunnelShutdownState {
+    request: Option<tokio::sync::oneshot::Sender<()>>,
+    completion: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+struct TunnelTaskCompletion(Option<std::sync::mpsc::Sender<()>>);
+
+impl TunnelShutdownBoundary {
+    fn new() -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        TunnelTaskCompletion,
+    ) {
+        let (request, request_rx) = tokio::sync::oneshot::channel();
+        let (completion, completion_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                state: Arc::new(Mutex::new(TunnelShutdownState {
+                    request: Some(request),
+                    completion: Some(completion_rx),
+                })),
+            },
+            request_rx,
+            TunnelTaskCompletion(Some(completion)),
+        )
+    }
+
+    fn request(&self) -> Result<(), LpmError> {
+        let request = self
+            .state
+            .lock()
+            .map_err(|_| LpmError::Tunnel("tunnel shutdown state is poisoned".into()))?
+            .request
+            .take();
+        if let Some(request) = request {
+            let _ = request.send(());
+        }
+        Ok(())
+    }
+
+    fn request_and_wait(&self) -> Result<(), LpmError> {
+        let completion = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| LpmError::Tunnel("tunnel shutdown state is poisoned".into()))?;
+            if let Some(request) = state.request.take() {
+                let _ = request.send(());
+            }
+            state.completion.take()
+        };
+        let Some(completion) = completion else {
+            return Ok(());
+        };
+        completion
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    LpmError::Tunnel("tunnel did not acknowledge shutdown within 5 seconds".into())
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    LpmError::Tunnel("tunnel shutdown acknowledgement channel closed".into())
+                }
+            })
+    }
+}
+
+impl Drop for TunnelTaskCompletion {
+    fn drop(&mut self) {
+        if let Some(completion) = self.0.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+struct ProxyRoutePublisher {
+    command_tx: tokio::sync::mpsc::UnboundedSender<ProxyPublisherCommand>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+enum ProxyPublisherCommand {
+    Prepare {
+        routes: Vec<lpm_proxy::Route>,
+        bridges: Vec<lpm_proxy::HttpProxyHandle>,
+        reply: tokio::sync::oneshot::Sender<Result<u64, LpmError>>,
+    },
+    Finalize {
+        publication_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), LpmError>>,
+    },
+    Accept {
+        publication_id: u64,
+    },
+    Restore {
+        publication_id: u64,
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), LpmError>>>,
+    },
+    Rollback {
+        publication_id: u64,
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), LpmError>>>,
+    },
+    Release {
+        reply: tokio::sync::oneshot::Sender<Result<(), LpmError>>,
+    },
+    #[cfg(test)]
+    Snapshot {
+        reply: tokio::sync::oneshot::Sender<Vec<lpm_proxy::Route>>,
+    },
+}
+
+struct PendingProxyPublication {
+    publication_id: u64,
+    routes: Vec<lpm_proxy::Route>,
+    bridges: Vec<lpm_proxy::HttpProxyHandle>,
+}
+
+struct CommittedProxyPublication {
+    publication_id: u64,
+    previous_routes: Vec<lpm_proxy::Route>,
+    previous_bridges: Vec<lpm_proxy::HttpProxyHandle>,
+}
+
+impl ProxyRoutePublisher {
+    fn start(runtime: LocalProxyRuntime) -> Self {
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_proxy_route_publisher(runtime, command_rx));
+        Self { command_tx, worker }
+    }
+
+    async fn release(self) -> Result<(), LpmError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let send_result = self
+            .command_tx
+            .send(ProxyPublisherCommand::Release { reply });
+        drop(self.command_tx);
+        let release_result = if send_result.is_ok() {
+            response.await.map_err(|_| {
+                LpmError::Script("local proxy route publisher stopped during release".into())
+            })?
+        } else {
+            Err(LpmError::Script(
+                "local proxy route publisher stopped before release".into(),
+            ))
+        };
+        self.worker.await.map_err(|error| {
+            LpmError::Script(format!("local proxy route publisher task failed: {error}"))
+        })?;
+        release_result
+    }
+}
+
+type ProxyLeaseSlot = Arc<tokio::sync::Mutex<Option<ProxyRoutePublisher>>>;
+
+struct PreparedProxyRoutePlan {
+    command_tx: tokio::sync::mpsc::UnboundedSender<ProxyPublisherCommand>,
+    publication_id: u64,
+    finalized: bool,
+}
+
+struct PublishedProxyRoutePlan {
+    command_tx: tokio::sync::mpsc::UnboundedSender<ProxyPublisherCommand>,
+    publication_id: u64,
+    finalized: bool,
+}
+
+impl PreparedProxyRoutePlan {
+    async fn finalize(self) -> Result<(), LpmError> {
+        self.commit_reversible().await?.finalize();
+        Ok(())
+    }
+
+    async fn commit_reversible(mut self) -> Result<PublishedProxyRoutePlan, LpmError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(ProxyPublisherCommand::Finalize {
+                publication_id: self.publication_id,
+                reply,
+            })
+            .map_err(|_| {
+                LpmError::Script("local proxy route publisher stopped before finalization".into())
+            })?;
+        let result = response.await.map_err(|_| {
+            LpmError::Script("local proxy route publisher stopped during finalization".into())
+        })?;
+        self.finalized = true;
+        result?;
+        Ok(PublishedProxyRoutePlan {
+            command_tx: self.command_tx.clone(),
+            publication_id: self.publication_id,
+            finalized: false,
+        })
+    }
+
+    async fn rollback(mut self) -> Result<(), LpmError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(ProxyPublisherCommand::Rollback {
+                publication_id: self.publication_id,
+                reply: Some(reply),
+            })
+            .map_err(|_| {
+                LpmError::Script("local proxy route publisher stopped before rollback".into())
+            })?;
+        let result = response.await.map_err(|_| {
+            LpmError::Script("local proxy route publisher stopped during rollback".into())
+        })?;
+        if result.is_ok() {
+            self.finalized = true;
+        }
+        result
+    }
+}
+
+impl PublishedProxyRoutePlan {
+    fn finalize(mut self) {
+        if self
+            .command_tx
+            .send(ProxyPublisherCommand::Accept {
+                publication_id: self.publication_id,
+            })
+            .is_err()
+        {
+            tracing::error!("local proxy route publisher stopped before acceptance");
+        }
+        self.finalized = true;
+    }
+
+    async fn rollback(mut self) -> Result<(), LpmError> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.command_tx
+            .send(ProxyPublisherCommand::Restore {
+                publication_id: self.publication_id,
+                reply: Some(reply),
+            })
+            .map_err(|_| {
+                LpmError::Script("local proxy route publisher stopped before restoration".into())
+            })?;
+        let result = response.await.map_err(|_| {
+            LpmError::Script("local proxy route publisher stopped during restoration".into())
+        })?;
+        if result.is_ok() {
+            self.finalized = true;
+        }
+        result
+    }
+}
+
+impl Drop for PreparedProxyRoutePlan {
+    fn drop(&mut self) {
+        if !self.finalized
+            && self
+                .command_tx
+                .send(ProxyPublisherCommand::Rollback {
+                    publication_id: self.publication_id,
+                    reply: None,
+                })
+                .is_err()
+        {
+            tracing::error!("local proxy route publisher stopped before automatic rollback");
+        }
+    }
+}
+
+impl Drop for PublishedProxyRoutePlan {
+    fn drop(&mut self) {
+        if !self.finalized
+            && self
+                .command_tx
+                .send(ProxyPublisherCommand::Restore {
+                    publication_id: self.publication_id,
+                    reply: None,
+                })
+                .is_err()
+        {
+            tracing::error!("local proxy route publisher stopped before automatic restoration");
+        }
+    }
+}
+
+async fn run_proxy_route_publisher(
+    mut runtime: LocalProxyRuntime,
+    mut command_rx: tokio::sync::mpsc::UnboundedReceiver<ProxyPublisherCommand>,
+) {
+    let mut pending = None::<PendingProxyPublication>;
+    let mut committed = None::<CommittedProxyPublication>;
+    let mut next_publication_id = 1u64;
+    let mut failed_closed = None::<String>;
+
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            ProxyPublisherCommand::Prepare {
+                routes,
+                bridges,
+                reply,
+            } => {
+                if let Some(error) = failed_closed.as_ref() {
+                    let _ = reply.send(Err(LpmError::Script(error.clone())));
+                    continue;
+                }
+                if pending.is_some() || committed.is_some() {
+                    let _ = reply.send(Err(LpmError::Script(
+                        "local proxy route publication is already pending acceptance".into(),
+                    )));
+                    continue;
+                }
+                let publication_id = next_publication_id;
+                next_publication_id = next_publication_id.wrapping_add(1).max(1);
+                match runtime
+                    .lease
+                    .stage_routes(publication_id, routes.clone())
+                    .await
+                {
+                    Ok(()) => {
+                        pending = Some(PendingProxyPublication {
+                            publication_id,
+                            routes,
+                            bridges,
+                        });
+                        if reply.send(Ok(publication_id)).is_err()
+                            && let Err(error) = rollback_proxy_publication(
+                                &mut runtime,
+                                &mut pending,
+                                &mut failed_closed,
+                                publication_id,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                "cancelled local proxy route publication could not roll back: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let error = map_proxy_register_error(error);
+                        if runtime.lease.lease_id().is_none() {
+                            fail_proxy_publisher_closed(
+                                &mut runtime,
+                                &mut pending,
+                                &mut failed_closed,
+                                &error,
+                            );
+                        }
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            ProxyPublisherCommand::Finalize {
+                publication_id,
+                reply,
+            } => {
+                let result = commit_proxy_publication(
+                    &mut runtime,
+                    &mut pending,
+                    &mut failed_closed,
+                    publication_id,
+                )
+                .await;
+                match result {
+                    Ok(publication) => {
+                        committed = Some(publication);
+                        if reply.send(Ok(())).is_err()
+                            && let Err(error) = restore_proxy_publication(
+                                &mut runtime,
+                                &mut committed,
+                                publication_id,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                "cancelled local proxy route finalization could not restore the previous generation: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            ProxyPublisherCommand::Accept { publication_id } => {
+                if let Err(error) = accept_proxy_publication(&mut committed, publication_id) {
+                    tracing::error!("local proxy route acceptance failed: {error}");
+                }
+            }
+            ProxyPublisherCommand::Restore {
+                publication_id,
+                reply,
+            } => {
+                let result =
+                    restore_proxy_publication(&mut runtime, &mut committed, publication_id).await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
+                    tracing::error!("automatic local proxy route restoration failed: {error}");
+                }
+            }
+            ProxyPublisherCommand::Rollback {
+                publication_id,
+                reply,
+            } => {
+                let result = if let Some(error) = failed_closed.as_ref() {
+                    Err(LpmError::Script(error.clone()))
+                } else {
+                    rollback_proxy_publication(
+                        &mut runtime,
+                        &mut pending,
+                        &mut failed_closed,
+                        publication_id,
+                    )
+                    .await
+                };
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
+                    tracing::error!("automatic local proxy route rollback failed: {error}");
+                }
+            }
+            ProxyPublisherCommand::Release { reply } => {
+                let result = runtime.lease.release().await.map(|_| ()).map_err(|error| {
+                    LpmError::Script(format!("local proxy route release failed: {error}"))
+                });
+                let _ = reply.send(result);
+                return;
+            }
+            #[cfg(test)]
+            ProxyPublisherCommand::Snapshot { reply } => {
+                let _ = reply.send(runtime.routes.clone());
+            }
+        }
+    }
+
+    if let Err(error) = runtime.lease.release().await {
+        tracing::error!("local proxy route publisher shutdown failed: {error}");
+    }
+}
+
+async fn rollback_proxy_publication(
+    runtime: &mut LocalProxyRuntime,
+    pending: &mut Option<PendingProxyPublication>,
+    failed_closed: &mut Option<String>,
+    publication_id: u64,
+) -> Result<(), LpmError> {
+    let candidate = pending.as_ref().ok_or_else(|| {
+        LpmError::Script(format!(
+            "local proxy route publication {publication_id} is not pending"
+        ))
+    })?;
+    if candidate.publication_id != publication_id {
+        return Err(LpmError::Script(format!(
+            "local proxy route publication {publication_id} cannot roll back pending publication {}",
+            candidate.publication_id,
+        )));
+    }
+    match runtime.lease.rollback_routes(publication_id).await {
+        Ok(()) => {
+            pending.take();
+            Ok(())
+        }
+        Err(error) => {
+            let error = map_proxy_register_error(error);
+            if runtime.lease.lease_id().is_none() {
+                fail_proxy_publisher_closed(runtime, pending, failed_closed, &error);
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn commit_proxy_publication(
+    runtime: &mut LocalProxyRuntime,
+    pending: &mut Option<PendingProxyPublication>,
+    failed_closed: &mut Option<String>,
+    publication_id: u64,
+) -> Result<CommittedProxyPublication, LpmError> {
+    if let Some(error) = failed_closed.as_ref() {
+        return Err(LpmError::Script(error.clone()));
+    }
+    let candidate = pending.as_ref().ok_or_else(|| {
+        LpmError::Script(format!(
+            "local proxy route publication {publication_id} is not pending"
+        ))
+    })?;
+    if candidate.publication_id != publication_id {
+        return Err(LpmError::Script(format!(
+            "local proxy route publication {publication_id} cannot commit pending publication {}",
+            candidate.publication_id,
+        )));
+    }
+
+    match runtime.lease.commit_routes(publication_id).await {
+        Ok(()) => {
+            let candidate = pending
+                .take()
+                .expect("validated proxy publication must remain pending");
+            Ok(CommittedProxyPublication {
+                publication_id,
+                previous_routes: std::mem::replace(&mut runtime.routes, candidate.routes),
+                previous_bridges: std::mem::replace(&mut runtime.bridges, candidate.bridges),
+            })
+        }
+        Err(commit_error) => {
+            let commit_error = map_proxy_register_error(commit_error);
+            if runtime.lease.lease_id().is_none() {
+                fail_proxy_publisher_closed(runtime, pending, failed_closed, &commit_error);
+                return Err(commit_error);
+            }
+            match runtime.lease.rollback_routes(publication_id).await {
+                Ok(()) => {
+                    pending.take();
+                    Err(commit_error)
+                }
+                Err(rollback_error) => {
+                    let rollback_error = map_proxy_register_error(rollback_error);
+                    if runtime.lease.lease_id().is_none() {
+                        fail_proxy_publisher_closed(
+                            runtime,
+                            pending,
+                            failed_closed,
+                            &rollback_error,
+                        );
+                    }
+                    Err(LpmError::Script(format!(
+                        "{commit_error}; discarding the staged proxy routes also failed: {rollback_error}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+fn accept_proxy_publication(
+    committed: &mut Option<CommittedProxyPublication>,
+    publication_id: u64,
+) -> Result<(), LpmError> {
+    let publication = committed.as_ref().ok_or_else(|| {
+        LpmError::Script(format!(
+            "local proxy route publication {publication_id} is not awaiting acceptance"
+        ))
+    })?;
+    if publication.publication_id != publication_id {
+        return Err(LpmError::Script(format!(
+            "local proxy route publication {publication_id} cannot accept publication {}",
+            publication.publication_id,
+        )));
+    }
+    committed.take();
+    Ok(())
+}
+
+async fn restore_proxy_publication(
+    runtime: &mut LocalProxyRuntime,
+    committed: &mut Option<CommittedProxyPublication>,
+    publication_id: u64,
+) -> Result<(), LpmError> {
+    let publication = committed.as_ref().ok_or_else(|| {
+        LpmError::Script(format!(
+            "local proxy route publication {publication_id} is not awaiting restoration"
+        ))
+    })?;
+    if publication.publication_id != publication_id {
+        return Err(LpmError::Script(format!(
+            "local proxy route publication {publication_id} cannot restore publication {}",
+            publication.publication_id,
+        )));
+    }
+    let previous_routes = publication.previous_routes.clone();
+    if let Err(error) = runtime.lease.replace_routes(previous_routes).await {
+        let error = map_proxy_register_error(error);
+        if runtime.lease.lease_id().is_none() {
+            runtime.routes.clear();
+            runtime.bridges.clear();
+            committed.take();
+        }
+        return Err(error);
+    }
+    let publication = committed
+        .take()
+        .expect("validated proxy publication must remain reversible");
+    runtime.routes = publication.previous_routes;
+    runtime.bridges = publication.previous_bridges;
+    Ok(())
+}
+
+fn fail_proxy_publisher_closed(
+    runtime: &mut LocalProxyRuntime,
+    pending: &mut Option<PendingProxyPublication>,
+    failed_closed: &mut Option<String>,
+    error: &LpmError,
+) {
+    pending.take();
+    runtime.routes.clear();
+    runtime.bridges.clear();
+    *failed_closed = Some(format!(
+        "local proxy route publisher failed closed after an ambiguous control operation: {error}"
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_initial_runtime(
+    runtime_handle: &tokio::runtime::Handle,
+    endpoint: &lpm_runner::dev_endpoint::DevEndpoint,
+    endpoints: lpm_runner::orchestrator::ServiceEndpointMap,
+    active_frontends: DevFrontends,
+    prepared_session: lpm_runner::dev_session::PreparedDevSession,
+    frontend_slot: &Arc<Mutex<Option<DevFrontends>>>,
+    dev_session_slot: &Arc<Mutex<Option<lpm_runner::dev_session::DevSessionLease>>>,
+    service_endpoint_slot: &Arc<Mutex<lpm_runner::orchestrator::ServiceEndpointMap>>,
+    inspector_state: Option<&lpm_inspect::state::InspectorState>,
+    tunnel_live_target: Option<&Arc<RwLock<LocalTarget>>>,
+    tunnel_publication: Option<&TunnelReadyPublication>,
+    tunnel_published: Option<&Arc<AtomicBool>>,
+    prepared_proxy_plan: Option<PreparedProxyRoutePlan>,
+    before_visible_commit: impl FnOnce() -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
+    before_visible_commit()?;
+    let mut frontends = frontend_slot
+        .lock()
+        .map_err(|_| LpmError::Script("dev frontend state is poisoned".into()))?;
+    let mut session = dev_session_slot
+        .lock()
+        .map_err(|_| LpmError::Script("dev session state is poisoned".into()))?;
+    let mut published_endpoints = service_endpoint_slot
+        .lock()
+        .map_err(|_| LpmError::Script("service endpoint state is poisoned".into()))?;
+    let mut tunnel_target = tunnel_live_target
+        .map(|target| {
+            target
+                .write()
+                .map_err(|_| LpmError::Tunnel("tunnel endpoint state is poisoned".into()))
+        })
+        .transpose()?;
+    let published_proxy = match prepared_proxy_plan {
+        Some(proxy_plan) => Some(runtime_handle.block_on(proxy_plan.commit_reversible())?),
+        None => None,
+    };
+    let mut published_inspector_session = if let Some(publication) = tunnel_publication {
+        let inspector_state = inspector_state
+            .ok_or_else(|| LpmError::Tunnel("tunnel inspector state is not initialized".into()));
+        let inspector_state = match inspector_state {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(rollback_published_proxy_after(
+                    runtime_handle,
+                    error,
+                    published_proxy,
+                ));
+            }
+        };
+        let publication = match prepare_tunnel_connection(inspector_state, publication) {
+            Ok(publication) => publication,
+            Err(error) => {
+                return Err(rollback_published_proxy_after(
+                    runtime_handle,
+                    error,
+                    published_proxy,
+                ));
+            }
+        };
+        Some(publication)
+    } else {
+        None
+    };
+
+    let published_session = match prepared_session.commit() {
+        Ok(session) => session,
+        Err(error) => {
+            let error = rollback_inspector_session_after(error, published_inspector_session);
+            return Err(rollback_published_proxy_after(
+                runtime_handle,
+                error,
+                published_proxy,
+            ));
+        }
+    };
+    if let Some(publication) = published_inspector_session.as_mut()
+        && let Err(finalize_error) = publication.finalize()
+    {
+        let error = rollback_inspector_session_after(
+            LpmError::Tunnel(format!(
+                "failed to publish the inspector session: {finalize_error}"
+            )),
+            published_inspector_session,
+        );
+        return Err(rollback_published_proxy_after(
+            runtime_handle,
+            error,
+            published_proxy,
+        ));
+    }
+    if let Some(state) = inspector_state {
+        state.set_local_target(endpoint.target.clone());
+    }
+    if let Some(target) = tunnel_target.as_mut() {
+        **target = endpoint.target.clone();
+    }
+    if let Some(proxy) = published_proxy {
+        proxy.finalize();
+    }
+    *frontends = Some(active_frontends);
+    *session = Some(published_session);
+    *published_endpoints = endpoints;
+    if let Some(published) = tunnel_published {
+        published.store(true, Ordering::Release);
+    }
+    if let Some(publication) = tunnel_publication {
+        render_tunnel_connection(publication);
+    }
+    Ok(())
+}
+
+fn rollback_inspector_session_after(
+    error: LpmError,
+    publication: Option<lpm_inspect::state::PublishedInspectorSession>,
+) -> LpmError {
+    let Some(publication) = publication else {
+        return error;
+    };
+    match publication.rollback() {
+        Ok(()) => error,
+        Err(rollback_error) => LpmError::Tunnel(format!(
+            "{error}; restoring the inspector session also failed: {rollback_error}"
+        )),
+    }
+}
+
+fn rollback_published_proxy_after(
+    runtime_handle: &tokio::runtime::Handle,
+    error: LpmError,
+    published_proxy: Option<PublishedProxyRoutePlan>,
+) -> LpmError {
+    let Some(published_proxy) = published_proxy else {
+        return error;
+    };
+    match runtime_handle.block_on(published_proxy.rollback()) {
+        Ok(()) => error,
+        Err(rollback_error) => LpmError::Script(format!(
+            "{error}; restoring local proxy routes also failed: {rollback_error}"
+        )),
+    }
+}
+
+fn rollback_prepared_proxy_after(
+    runtime_handle: &tokio::runtime::Handle,
+    error: LpmError,
+    prepared_proxy: Option<PreparedProxyRoutePlan>,
+) -> LpmError {
+    let Some(prepared_proxy) = prepared_proxy else {
+        return error;
+    };
+    match runtime_handle.block_on(prepared_proxy.rollback()) {
+        Ok(()) => error,
+        Err(rollback_error) => LpmError::Script(format!(
+            "{error}; restoring local proxy routes also failed: {rollback_error}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_primary_endpoint(
+    runtime_handle: &tokio::runtime::Handle,
+    service: String,
+    endpoint: lpm_runner::dev_endpoint::DevEndpoint,
+    frontend_slot: &Arc<Mutex<Option<DevFrontends>>>,
+    dev_session_slot: &Arc<Mutex<Option<lpm_runner::dev_session::DevSessionLease>>>,
+    service_endpoint_slot: &Arc<Mutex<lpm_runner::orchestrator::ServiceEndpointMap>>,
+    inspector_state: Option<&lpm_inspect::state::InspectorState>,
+    tunnel_live_target: Option<&Arc<RwLock<LocalTarget>>>,
+    prepared_session: lpm_runner::dev_session::PreparedDevSession,
+    prepared_proxy_plan: Option<PreparedProxyRoutePlan>,
+    before_visible_commit: impl FnOnce() -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
+    if let Err(error) = before_visible_commit() {
+        return Err(rollback_prepared_proxy_after(
+            runtime_handle,
+            error,
+            prepared_proxy_plan,
+        ));
+    }
+
+    let mut frontends = match frontend_slot.lock() {
+        Ok(frontends) => frontends,
+        Err(_) => {
+            return Err(rollback_prepared_proxy_after(
+                runtime_handle,
+                LpmError::Script("dev frontend state is poisoned".to_string()),
+                prepared_proxy_plan,
+            ));
+        }
+    };
+    let frontends = match frontends.as_mut() {
+        Some(frontends) => frontends,
+        None => {
+            return Err(rollback_prepared_proxy_after(
+                runtime_handle,
+                LpmError::Script("dev frontend state is not initialized".to_string()),
+                prepared_proxy_plan,
+            ));
+        }
+    };
+    let mut session_slot = match dev_session_slot.lock() {
+        Ok(session) => session,
+        Err(_) => {
+            return Err(rollback_prepared_proxy_after(
+                runtime_handle,
+                LpmError::Script("dev session state is poisoned".to_string()),
+                prepared_proxy_plan,
+            ));
+        }
+    };
+    let mut endpoints = match service_endpoint_slot.lock() {
+        Ok(endpoints) => endpoints,
+        Err(_) => {
+            return Err(rollback_prepared_proxy_after(
+                runtime_handle,
+                LpmError::Script("service endpoint state is poisoned".to_string()),
+                prepared_proxy_plan,
+            ));
+        }
+    };
+    let mut tunnel_target = match tunnel_live_target {
+        Some(target) => match target.write() {
+            Ok(target) => Some(target),
+            Err(_) => {
+                return Err(rollback_prepared_proxy_after(
+                    runtime_handle,
+                    LpmError::Tunnel("tunnel endpoint state is poisoned".to_string()),
+                    prepared_proxy_plan,
+                ));
+            }
+        },
+        None => None,
+    };
+    let previous_target = frontends.child_target.clone();
+    if let Err(error) = frontends.update_child_target(endpoint.target.clone()) {
+        return Err(rollback_prepared_proxy_after(
+            runtime_handle,
+            error,
+            prepared_proxy_plan,
+        ));
+    }
+
+    let published_proxy = match prepared_proxy_plan {
+        Some(proxy_plan) => match runtime_handle.block_on(proxy_plan.commit_reversible()) {
+            Ok(proxy) => Some(proxy),
+            Err(error) => {
+                let restore_error = frontends.update_child_target(previous_target).err();
+                return match restore_error {
+                    None => Err(error),
+                    Some(restore_error) => Err(LpmError::Script(format!(
+                        "{error}; restoring the local frontend also failed: {restore_error}"
+                    ))),
+                };
+            }
+        },
+        None => None,
+    };
+
+    let session_lease = match prepared_session.commit() {
+        Ok(session) => session,
+        Err(error) => {
+            let mut rollback_errors = Vec::new();
+            if let Err(restore_error) = frontends.update_child_target(previous_target) {
+                rollback_errors.push(format!("restore local frontend: {restore_error}"));
+            }
+            let error = if rollback_errors.is_empty() {
+                error
+            } else {
+                LpmError::Script(format!(
+                    "{error}; endpoint publication rollback also failed: {}",
+                    rollback_errors.join("; ")
+                ))
+            };
+            return Err(rollback_published_proxy_after(
+                runtime_handle,
+                error,
+                published_proxy,
+            ));
+        }
+    };
+    if let Some(state) = inspector_state {
+        state.set_local_target(endpoint.target.clone());
+    }
+    if let Some(target) = tunnel_target.as_mut() {
+        **target = endpoint.target.clone();
+    }
+    endpoints.insert(service, endpoint);
+    *session_slot = Some(session_lease);
+    if let Some(proxy) = published_proxy {
+        proxy.finalize();
+    }
+    Ok(())
+}
 
 fn show_tunnel_notice(message: &str) {
     dev_ui::warn(message);
@@ -27,31 +930,79 @@ fn show_tunnel_notice(message: &str) {
     }
 }
 
+fn publish_tunnel_connection(
+    inspector_state: &lpm_inspect::state::InspectorState,
+    publication: &TunnelReadyPublication,
+) -> Result<(), LpmError> {
+    prepare_tunnel_connection(inspector_state, publication)?
+        .finalize()
+        .map_err(|error| {
+            LpmError::Tunnel(format!("failed to publish the inspector session: {error}"))
+        })?;
+    render_tunnel_connection(publication);
+    Ok(())
+}
+
+fn prepare_tunnel_connection(
+    inspector_state: &lpm_inspect::state::InspectorState,
+    publication: &TunnelReadyPublication,
+) -> Result<lpm_inspect::state::PublishedInspectorSession, LpmError> {
+    inspector_state
+        .start_session_reversible(
+            publication.session.session_id.clone(),
+            Some(publication.session.domain.clone()),
+            publication.session.local_port,
+            None,
+            publication.session.tunnel_url.clone(),
+        )
+        .map_err(|error| {
+            LpmError::Tunnel(format!(
+                "failed to persist inspector session start: {error}"
+            ))
+        })
+}
+
+fn render_tunnel_connection(publication: &TunnelReadyPublication) {
+    dev_ui::trusted_detail_line(
+        "Tunnel",
+        install_ui::terminal_line!(
+            "{} → {}",
+            install_ui::url(&publication.session.tunnel_url),
+            publication.local_target_url,
+        ),
+    );
+    if let Some(expiry) =
+        crate::commands::tunnel::tunnel_session_expiry_summary(&publication.session)
+    {
+        dev_ui::hint_line(&format!("Tunnel expires {expiry}"));
+    }
+    if let Some(limits) =
+        crate::commands::tunnel::tunnel_limit_summary(publication.session.limits.as_ref())
+    {
+        dev_ui::hint_line(&format!("Tunnel limits: {limits}"));
+    }
+    if let Some(usage) = crate::commands::tunnel::tunnel_usage_summary(publication.usage.as_ref()) {
+        dev_ui::hint_line(&format!("Tunnel usage: {usage}"));
+    }
+    if let Some(auth) = publication.tunnel_auth.as_deref() {
+        dev_ui::hint_line(&format!(
+            "Auth required: {}",
+            crate::commands::tunnel::tunnel_auth_header_summary(
+                auth,
+                std::io::stderr().is_terminal(),
+            )
+        ));
+    }
+}
+
 async fn prepare_service_runtime_hints(
     project_dir: &Path,
     services: &HashMap<String, lpm_runner::lpm_json::ServiceConfig>,
-    filters: &[String],
     root_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
 ) -> Result<HashMap<String, lpm_runner::bin_path::ManagedRuntimeHint>, LpmError> {
-    let active_names: HashSet<String> = if filters.is_empty() {
-        services.keys().cloned().collect()
-    } else {
-        let mut active = HashSet::new();
-        for name in filters {
-            if !services.contains_key(name) {
-                return Err(LpmError::Script(format!(
-                    "service '{name}' not found. Available: {}",
-                    services.keys().cloned().collect::<Vec<_>>().join(", ")
-                )));
-            }
-            active.extend(lpm_runner::service_graph::transitive_deps(name, services));
-        }
-        active
-    };
-
-    let mut hints = HashMap::with_capacity(active_names.len());
+    let mut hints = HashMap::with_capacity(services.len());
     let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
-    let mut ordered_names: Vec<_> = active_names.into_iter().collect();
+    let mut ordered_names: Vec<_> = services.keys().cloned().collect();
     ordered_names.sort_unstable();
     for name in ordered_names {
         let config = &services[&name];
@@ -83,26 +1034,46 @@ struct DevCertSetup {
     inject_env: bool,
 }
 
+#[derive(Clone)]
+struct DevTlsMaterial {
+    cert_pem: Arc<[u8]>,
+    key_pem: Arc<[u8]>,
+    _runtime_lease: lpm_cert::RuntimeCertificateLease,
+}
+
 struct DevFrontends {
+    child_target: LocalTarget,
     local_target: LocalTarget,
     network_port: Option<u16>,
+    upstream: Option<lpm_proxy::FrontendUpstream>,
     handles: Vec<lpm_proxy::HttpProxyHandle>,
 }
 
 impl DevFrontends {
-    fn update_child_target(&mut self, child_target: LocalTarget) -> Result<(), LpmError> {
+    fn validate_child_target(&self, child_target: &LocalTarget) -> Result<(), LpmError> {
         for handle in &self.handles {
             handle
-                .update_upstream(child_target.clone())
+                .validate_upstream_update(child_target)
                 .map_err(|error| {
                     LpmError::Script(format!("update LPM dev frontend upstream: {error}"))
                 })?;
         }
-        if self.handles.is_empty() {
-            self.local_target = child_target;
-        } else {
-            self.local_target.base_path = child_target.base_path;
+        Ok(())
+    }
+
+    fn update_child_target(&mut self, child_target: LocalTarget) -> Result<(), LpmError> {
+        self.validate_child_target(&child_target)?;
+        if let Some(upstream) = &self.upstream {
+            upstream.update(child_target.clone()).map_err(|error| {
+                LpmError::Script(format!("update LPM dev frontend upstream: {error}"))
+            })?;
         }
+        if self.handles.is_empty() {
+            self.local_target = child_target.clone();
+        } else {
+            self.local_target.base_path = child_target.base_path.clone();
+        }
+        self.child_target = child_target;
         Ok(())
     }
 }
@@ -215,6 +1186,46 @@ pub async fn run(
     } else {
         lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?
     };
+    let lpm_config = lpm_config
+        .map(|mut config| {
+            if config.services.is_empty() {
+                return Ok(config);
+            }
+            let configured_primary =
+                lpm_runner::service_graph::primary_service_name(&config.services)
+                    .map_err(LpmError::Script)?
+                    .map(str::to_string);
+            let active_services =
+                lpm_runner::service_graph::select_active_services(&config.services, extra_args)
+                    .map_err(LpmError::Script)?;
+            let active_primary = lpm_runner::service_graph::primary_service_name(&active_services)
+                .map_err(LpmError::Script)?
+                .map(str::to_string);
+            let primary_endpoint_requested = port.is_some()
+                || https
+                || network
+                || tunnel
+                || config
+                    .proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.host.as_ref())
+                    .is_some();
+            if primary_endpoint_requested && active_primary != configured_primary {
+                let configured_primary = configured_primary.as_deref().unwrap_or("<none>");
+                return Err(LpmError::Script(format!(
+                    "filtered services exclude the configured primary service `{configured_primary}`; include it when using a primary port, HTTPS, network access, a tunnel, or a proxy host"
+                )));
+            }
+            if primary_endpoint_requested && active_primary.is_none() {
+                return Err(LpmError::Script(
+                    "multi-service dev features require exactly one active service marked `primary`"
+                        .to_string(),
+                ));
+            }
+            config.services = active_services;
+            Ok(config)
+        })
+        .transpose()?;
     let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
     let requested_port = port;
     let port = resolve_dev_port(port, has_services);
@@ -379,7 +1390,7 @@ pub async fn run(
     }
 
     let https_setup: Option<DevCertSetup> = https_result?;
-    if let Some(cert_setup) = https_setup {
+    let tls_material = if let Some(cert_setup) = https_setup {
         let setup = cert_setup.setup;
         if setup.ca_freshly_installed {
             dev_ui::done("root CA generated and installed to trust store");
@@ -388,9 +1399,16 @@ pub async fn run(
             dev_ui::done("project certificate generated");
         }
         if cert_setup.inject_env {
-            extra_env.extend(setup.env_vars);
+            extra_env.extend(setup.env_vars.clone());
         }
-    }
+        Some(DevTlsMaterial {
+            cert_pem: setup.cert_pem.into(),
+            key_pem: setup.key_pem.into(),
+            _runtime_lease: setup.runtime_lease,
+        })
+    } else {
+        None
+    };
     startup.https_active = https;
 
     // The public HMR hostname can differ from the loopback child endpoint.
@@ -415,19 +1433,24 @@ pub async fn run(
 
     // ── Tunnel setup ───────────────────────────────────────────────────
     let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut tunnel_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>> = None;
+    let mut tunnel_shutdown_boundary: Option<TunnelShutdownBoundary> = None;
+    let single_tunnel_shutdown_slot = Arc::new(Mutex::new(None::<TunnelShutdownBoundary>));
     let mut capture_consumer_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut inspector_handle: Option<lpm_inspect::InspectorHandle> = None;
     let mut multi_inspector_state = None;
-    let (mut multi_tunnel_target_tx, mut multi_tunnel_target_rx) = if tunnel && has_services {
-        let (tx, rx) = tokio::sync::oneshot::channel::<LocalTarget>();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let multi_tunnel_live_target = (tunnel && has_services)
-        .then(|| Arc::new(RwLock::new(LocalTarget::loopback(LocalScheme::Http, port))));
+    let mut multi_tunnel_ready_rx = None;
+    let mut multi_tunnel_target_tx = None;
+    let mut multi_tunnel_live_target = None;
+    let mut multi_tunnel_published = None;
+    let mut multi_tunnel_forwarding_controller = None;
     if tunnel && has_services {
+        let (tunnel_target_tx, target_rx) = tokio::sync::oneshot::channel::<LocalTarget>();
+        multi_tunnel_target_tx = Some(tunnel_target_tx);
+        let live_local_target =
+            Arc::new(RwLock::new(LocalTarget::loopback(LocalScheme::Http, port)));
+        multi_tunnel_live_target = Some(Arc::clone(&live_local_target));
+        let published_for_connect = Arc::new(AtomicBool::new(false));
+        multi_tunnel_published = Some(Arc::clone(&published_for_connect));
         let token = token.ok_or_else(|| {
             LpmError::Tunnel("authentication required for tunnel. Run `lpm login` first.".into())
         })?;
@@ -480,7 +1503,7 @@ pub async fn run(
 
         // Create webhook capture channel.
         let (webhook_tx, mut webhook_rx) =
-            tokio::sync::mpsc::channel::<lpm_tunnel::webhook::CapturedWebhook>(64);
+            tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(64);
 
         tracing::warn!(
             target: "lpm_cli::dev",
@@ -513,6 +1536,9 @@ pub async fn run(
             None
         };
 
+        let (forwarding_controller, forwarding_admission) =
+            lpm_tunnel::client::forwarding_admission_barrier();
+        multi_tunnel_forwarding_controller = Some(forwarding_controller);
         let options = lpm_tunnel::client::TunnelOptions {
             relay_url: tunnel_relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
             token: token.to_string(),
@@ -524,12 +1550,14 @@ pub async fn run(
             no_pin: false,
             auto_ack: false,
             ws_tx: None,
+            forwarding_admission: Some(forwarding_admission),
+            shutdown: None,
         };
 
         let inspector_state_for_consumer = inspector_state.clone();
         capture_consumer_handle = Some(tokio::spawn(async move {
-            while let Some(webhook) = webhook_rx.recv().await {
-                let webhook = Arc::new(webhook);
+            while let Some(captured) = webhook_rx.recv().await {
+                let webhook = Arc::clone(&captured.webhook);
                 inspector_state_for_consumer
                     .push_shared(Arc::clone(&webhook))
                     .await;
@@ -572,25 +1600,29 @@ pub async fn run(
 
         // Start tunnel in background task, storing the handle for clean shutdown
         let mut options_clone = options;
-        let live_local_target = multi_tunnel_live_target.clone().ok_or_else(|| {
-            LpmError::Tunnel("multi-service tunnel live endpoint was not initialized".to_string())
-        })?;
-        let target_rx = multi_tunnel_target_rx.take().ok_or_else(|| {
-            LpmError::Tunnel(
-                "multi-service tunnel endpoint channel was not initialized".to_string(),
-            )
-        })?;
+        let tunnel_cancel = tokio_util::sync::CancellationToken::new();
+        options_clone.shutdown = Some(tunnel_cancel.clone());
         let tunnel_auth_display = tunnel_auth_token;
-        // Mirror commands/tunnel.rs: hand the connect callback a clone of the
-        // inspector state so the live tunnel URL + session id are pushed to
-        // the inspector UI as soon as the relay returns ServerHello.
+        let (tunnel_ready_tx, tunnel_ready_rx) = tokio::sync::oneshot::channel();
+        multi_tunnel_ready_rx = Some(tunnel_ready_rx);
+        let tunnel_ready_tx = Arc::new(Mutex::new(Some(tunnel_ready_tx)));
+        let ready_for_connect = Arc::clone(&tunnel_ready_tx);
         let inspector_state_for_connect = inspector_state.clone();
         let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
         let usage_for_connect = latest_usage.clone();
         let usage_for_notices = latest_usage;
+        let (shutdown_boundary, mut shutdown_rx, tunnel_completion) = TunnelShutdownBoundary::new();
+        tunnel_shutdown_boundary = Some(shutdown_boundary);
         tunnel_handle = Some(tokio::spawn(async move {
-            let Ok(local_target) = target_rx.await else {
-                return;
+            let _tunnel_completion = tunnel_completion;
+            let local_target = tokio::select! {
+                target = target_rx => {
+                    let Ok(target) = target else {
+                        return;
+                    };
+                    target
+                }
+                _ = &mut shutdown_rx => return,
             };
             let local_target_url = local_target.url();
             options_clone.local_target = local_target.clone();
@@ -598,60 +1630,31 @@ pub async fn run(
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = local_target;
             options_clone.live_local_target = Some(live_local_target);
-            let result = lpm_tunnel::client::connect_with_usage_fallible(
+            let connect = lpm_tunnel::client::connect_with_usage_fallible(
                 &options_clone,
                 move |session| {
-                    let url = session.tunnel_url.clone();
-                    let session_id = session.session_id.clone();
-                    let domain = Some(session.domain.clone());
-                    let local = session.local_port;
-                    let state = inspector_state_for_connect.clone();
-                    state
-                        .start_session_immediate(session_id, domain, local, None)
-                        .map_err(|error| {
-                            LpmError::Tunnel(format!(
-                                "failed to persist inspector session start: {error}"
-                            ))
-                        })?;
-                    tokio::spawn(async move {
-                        state.set_tunnel_url(url).await;
-                    });
-
-                    dev_ui::trusted_detail_line(
-                        "Tunnel",
-                        install_ui::terminal_line!(
-                            "{} → {}",
-                            install_ui::url(&session.tunnel_url),
-                            local_target_url,
-                        ),
-                    );
-                    if let Some(expiry) =
-                        crate::commands::tunnel::tunnel_session_expiry_summary(session)
-                    {
-                        dev_ui::hint_line(&format!("Tunnel expires {expiry}"));
-                    }
-                    if let Some(limits) =
-                        crate::commands::tunnel::tunnel_limit_summary(session.limits.as_ref())
-                    {
-                        dev_ui::hint_line(&format!("Tunnel limits: {limits}"));
-                    }
                     let usage = usage_for_connect
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    if let Some(usage) =
-                        crate::commands::tunnel::tunnel_usage_summary(usage.as_ref())
+                    let publication = TunnelReadyPublication {
+                        session: session.clone(),
+                        local_target_url: local_target_url.clone(),
+                        tunnel_auth: tunnel_auth_display.clone(),
+                        usage,
+                    };
+                    if let Some(sender) = ready_for_connect
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
                     {
-                        dev_ui::hint_line(&format!("Tunnel usage: {usage}"));
-                    }
-                    if let Some(ref auth) = tunnel_auth_display {
-                        dev_ui::hint_line(&format!(
-                            "Auth required: add header X-Tunnel-Auth: {auth}"
-                        ));
-                        dev_ui::hint_line(&format!(
-                            "Browser: {}?__tunnel_auth={auth}",
-                            session.tunnel_url
-                        ));
+                        sender.send(Ok(publication)).map_err(|_| {
+                            LpmError::Tunnel(
+                                "runtime stopped before tunnel publication completed".into(),
+                            )
+                        })?;
+                    } else if published_for_connect.load(Ordering::Acquire) {
+                        publish_tunnel_connection(&inspector_state_for_connect, &publication)?;
                     }
                     Ok(())
                 },
@@ -667,30 +1670,76 @@ pub async fn run(
                         show_tunnel_notice(&format!("Tunnel usage: {summary}"));
                     }
                 },
-            )
-            .await;
+            );
+            tokio::pin!(connect);
+            let result = tokio::select! {
+                result = &mut connect => result,
+                _ = &mut shutdown_rx => {
+                    tunnel_cancel.cancel();
+                    connect.await
+                },
+            };
             if let Err(error) = result {
+                if let Some(sender) = tunnel_ready_tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = sender.send(Err::<TunnelReadyPublication, String>(error.to_string()));
+                }
                 show_tunnel_notice(&format!("Tunnel failed: {error}"));
             }
         }));
     }
 
+    let multi_tunnel_abort_handle = tunnel_handle.as_ref().map(|handle| handle.abort_handle());
+
     // ── Check for multi-service orchestration ──────────────────────────
     if has_services {
-        let config = lpm_config.as_ref().ok_or_else(|| {
-            LpmError::Script("multi-service configuration disappeared before startup".to_string())
-        })?;
-        let services = &config.services;
-        let service_runtime_hints =
-            prepare_service_runtime_hints(project_dir, services, extra_args, &runtime_hint).await?;
-        print_startup_banner(&startup, project_dir);
-        let primary_service = primary_proxy_service_for_display(config).map(str::to_string);
-        if primary_service.is_none() && (requested_port.is_some() || https || network || tunnel) {
-            return Err(LpmError::Script(
-                "multi-service dev features require exactly one service marked `primary`"
-                    .to_string(),
-            ));
+        let preparation = async {
+            let config = lpm_config.as_ref().ok_or_else(|| {
+                LpmError::Script(
+                    "multi-service configuration disappeared before startup".to_string(),
+                )
+            })?;
+            let primary_service = lpm_runner::service_graph::primary_service_name(&config.services)
+                .map_err(LpmError::Script)?
+                .map(str::to_string);
+            let service_runtime_hints =
+                prepare_service_runtime_hints(project_dir, &config.services, &runtime_hint).await?;
+            let dashboard_services = if dashboard {
+                build_dashboard_services(config)?
+            } else {
+                Vec::new()
+            };
+            let hosts_file_lease =
+                prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
+            Ok::<_, LpmError>((
+                config,
+                primary_service,
+                service_runtime_hints,
+                dashboard_services,
+                hosts_file_lease,
+            ))
         }
+        .await;
+        let (config, primary_service, service_runtime_hints, dashboard_services, hosts_file_lease) =
+            match preparation {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    return cleanup_failed_multi_service_preparation(
+                        error,
+                        tunnel_handle,
+                        tunnel_shutdown_boundary.as_ref(),
+                        capture_consumer_handle,
+                        multi_inspector_state,
+                        inspector_handle,
+                    )
+                    .await;
+                }
+            };
+        let services = &config.services;
+        print_startup_banner(&startup, project_dir);
         let open_browser = primary_service.is_some() && should_open_browser(true, no_open, is_ci());
         let frontend_slot = Arc::new(Mutex::new(None::<DevFrontends>));
         let dev_session_slot =
@@ -745,16 +1794,10 @@ pub async fn run(
             orch_tx
         });
 
-        // Create command channel for dashboard → orchestrator communication
-        let (orch_cmd_tx, orch_cmd_rx) = if dashboard {
-            let (tx, rx) =
-                std::sync::mpsc::channel::<lpm_runner::orchestrator::OrchestratorCommand>();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+        let orchestrator_command_controller = dashboard
+            .then(|| lpm_runner::orchestrator::OrchestratorCommandController::new(services.len()));
 
-        let proxy_lease = Arc::new(Mutex::new(None));
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
         let dashboard_ports_tx = dashboard_event_tx.clone();
         let on_ports_assigned = dashboard_ports_tx.map(|tx| {
             Box::new(move |ports: &lpm_runner::orchestrator::ServicePortMap| {
@@ -780,15 +1823,18 @@ pub async fn run(
             let dev_session_slot = Arc::clone(&dev_session_slot);
             let inspector_state = multi_inspector_state.clone();
             let tunnel_target_tx = multi_tunnel_target_tx.take();
+            let tunnel_ready_rx = multi_tunnel_ready_rx.take();
             let tunnel_live_target = multi_tunnel_live_target.clone();
+            let tunnel_published = multi_tunnel_published.clone();
+            let tunnel_forwarding_controller = multi_tunnel_forwarding_controller.clone();
+            let tunnel_abort_handle = multi_tunnel_abort_handle.clone();
             let local_display_host = local_display_host.clone();
             let service_endpoint_slot = Arc::clone(&service_endpoint_slot);
+            let tls_material = tls_material.clone();
             Box::new(
-                move |mut endpoints: lpm_runner::orchestrator::ServiceEndpointMap| {
-                    *service_endpoint_slot.lock().map_err(|_| {
-                        LpmError::Script("service endpoint state is poisoned".to_string())
-                    })? = endpoints.clone();
-                    if register_local_proxy {
+                move |endpoints: lpm_runner::orchestrator::ServiceEndpointMap| {
+                    let publication_result = (|| -> Result<(), LpmError> {
+                    let (prepared_proxy_plan, registered_proxy_routes) = if register_local_proxy {
                         let final_targets = endpoints
                             .iter()
                             .map(|(service, endpoint)| {
@@ -800,22 +1846,37 @@ pub async fn run(
                             &final_targets,
                         )
                         .map_err(LpmError::Script)?;
-                        runtime_handle.block_on(register_proxy_route_plan(
+                        let routes = plan.routes;
+                        let prepared = runtime_handle.block_on(prepare_initial_proxy_route_plan(
                             &project_dir,
-                            plan.routes,
+                            routes.clone(),
                             Arc::clone(&proxy_lease),
                         ))?;
-                    }
+                        (Some(prepared), Some(routes))
+                    } else {
+                        (None, None)
+                    };
 
                     let Some(primary_service) = primary_service else {
+                        if let Some(proxy_plan) = prepared_proxy_plan {
+                            runtime_handle.block_on(proxy_plan.finalize())?;
+                        }
+                        *service_endpoint_slot
+                            .lock()
+                            .map_err(|_| {
+                                LpmError::Script("service endpoint state is poisoned".into())
+                            })? = endpoints;
+                        if let Some(routes) = registered_proxy_routes.as_deref() {
+                            print_registered_proxy_routes(routes);
+                        }
                         return Ok(());
                     };
-                    let endpoint = endpoints.remove(&primary_service).ok_or_else(|| {
+                    let endpoint = endpoints.get(&primary_service).cloned().ok_or_else(|| {
                         LpmError::Script(format!(
                             "primary service `{primary_service}` did not open its assigned local endpoint"
                         ))
                     })?;
-                    let child_target = endpoint.target;
+                    let child_target = endpoint.target.clone();
                     let active_frontends = runtime_handle.block_on(
                         start_single_service_frontends(
                             &project_dir,
@@ -824,6 +1885,7 @@ pub async fn run(
                             https,
                             network,
                             requested_port,
+                            tls_material.as_ref(),
                         ),
                     )?;
                     let local_target = active_frontends.local_target.clone();
@@ -847,41 +1909,76 @@ pub async fn run(
                         local_target.port,
                         local_target.base_path
                     );
-                    dev_ui::trusted_detail("Local", &install_ui::url(&local_url));
-                    dev_ui::blank_line();
-                    dev_ui::done_ready("Local server", multi_started.elapsed());
-
-                    if let Some(ref state) = inspector_state {
-                        state.set_local_target(child_target.clone());
-                    }
-                    if let Some(ref target) = tunnel_live_target {
-                        *target
-                            .write()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            child_target.clone();
-                    }
-                    let session_lease = lpm_runner::dev_session::DevSessionLease::register(
+                    let prepared_session = lpm_runner::dev_session::PreparedDevSession::prepare(
                         &project_dir,
                         child_target.clone(),
                         endpoint.owner_pid,
-                        Some(primary_service.clone()),
+                        endpoint.owner_identity.clone(),
+                        Some(primary_service),
+                        https,
                     )?;
-                    *dev_session_slot.lock().map_err(|_| {
-                        LpmError::Script("dev session state is poisoned".to_string())
-                    })? = Some(session_lease);
-                    *frontend_slot.lock().map_err(|_| {
-                        LpmError::Script("dev frontend state is poisoned".to_string())
-                    })? = Some(active_frontends);
 
-                    if let Some(sender) = tunnel_target_tx {
-                        sender.send(child_target).map_err(|_| {
-                            LpmError::Tunnel(
+                    if let Some(sender) = tunnel_target_tx
+                        && let Err(_target) = sender.send(child_target)
+                    {
+                        return Err(LpmError::Tunnel(
                                 "tunnel stopped before the primary service became ready".to_string(),
-                            )
-                        })?;
+                            ));
                     }
+                    let tunnel_publication = tunnel_ready_rx
+                        .map(|receiver| {
+                            runtime_handle.block_on(wait_for_tunnel_readiness(
+                                receiver,
+                                std::time::Duration::from_secs(20),
+                            ))
+                        })
+                        .transpose()?;
+                    publish_initial_runtime(
+                        &runtime_handle,
+                        &endpoint,
+                        endpoints,
+                        active_frontends,
+                        prepared_session,
+                        &frontend_slot,
+                        &dev_session_slot,
+                        &service_endpoint_slot,
+                        inspector_state.as_ref(),
+                        tunnel_live_target.as_ref(),
+                        tunnel_publication.as_ref(),
+                        tunnel_published.as_ref(),
+                        prepared_proxy_plan,
+                        || Ok(()),
+                    )?;
+                    if let Some(routes) = registered_proxy_routes.as_deref() {
+                        print_registered_proxy_routes(routes);
+                    }
+                    if let Some(controller) = tunnel_forwarding_controller.as_ref() {
+                        controller.open();
+                    }
+                    dev_ui::trusted_detail("Local", &install_ui::url(&local_url));
+                    dev_ui::blank_line();
+                    dev_ui::done_ready("Local server", multi_started.elapsed());
                     if open_browser {
                         let _ = open::that(local_url);
+                    }
+                    Ok(())
+                    })();
+                    if let Err(error) = publication_result {
+                        if let Some(controller) = tunnel_forwarding_controller.as_ref() {
+                            controller.reject();
+                        }
+                        if let Some(handle) = tunnel_abort_handle.as_ref() {
+                            handle.abort();
+                        }
+                        if register_local_proxy
+                            && let Err(cleanup_error) =
+                                runtime_handle.block_on(release_proxy_lease(&proxy_lease))
+                        {
+                            return Err(LpmError::Script(format!(
+                                "{error}; local proxy route cleanup also failed: {cleanup_error}"
+                            )));
+                        }
+                        return Err(error);
                     }
                     Ok(())
                 },
@@ -906,73 +2003,103 @@ pub async fn run(
                     )
                 })?;
                 let final_targets = {
-                    let mut endpoints = service_endpoint_slot.lock().map_err(|_| {
+                    let endpoints = service_endpoint_slot.lock().map_err(|_| {
                         LpmError::Script("service endpoint state is poisoned".to_string())
                     })?;
-                    endpoints.insert(service.clone(), endpoint.clone());
-                    endpoints
+                    let mut candidate = endpoints.clone();
+                    candidate.insert(service.clone(), endpoint.clone());
+                    candidate
                         .iter()
                         .map(|(name, endpoint)| (name.clone(), endpoint.target.clone()))
                         .collect()
                 };
 
-                if register_local_proxy {
+                let primary_changed = primary_service.as_deref() == Some(service.as_str());
+                if primary_changed {
+                    frontend_slot
+                        .lock()
+                        .map_err(|_| {
+                            LpmError::Script("dev frontend state is poisoned".to_string())
+                        })?
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LpmError::Script("dev frontend state is not initialized".to_string())
+                        })?
+                        .validate_child_target(&endpoint.target)?;
+                }
+                let prepared_session = primary_changed
+                    .then(|| {
+                        lpm_runner::dev_session::PreparedDevSession::prepare(
+                            &project_dir,
+                            endpoint.target.clone(),
+                            endpoint.owner_pid,
+                            endpoint.owner_identity.clone(),
+                            Some(service.clone()),
+                            https,
+                        )
+                    })
+                    .transpose()?;
+
+                let prepared_proxy_plan = if register_local_proxy {
                     let plan = lpm_runner::local_domains::plan_multi_service_routes(
                         &proxy_config,
                         &final_targets,
                     )
                     .map_err(LpmError::Script)?;
-                    runtime_handle.block_on(replace_proxy_route_plan(
+                    Some(runtime_handle.block_on(prepare_proxy_route_plan(
                         &project_dir,
                         plan.routes,
                         Arc::clone(&proxy_lease),
-                    ))?;
-                }
+                    ))?)
+                } else {
+                    None
+                };
 
-                if primary_service.as_deref() != Some(service.as_str()) {
+                if !primary_changed {
+                    let mut published_endpoints = service_endpoint_slot.lock().map_err(|_| {
+                        LpmError::Script("service endpoint state is poisoned".to_string())
+                    })?;
+                    if let Some(proxy_plan) = prepared_proxy_plan {
+                        runtime_handle.block_on(proxy_plan.finalize())?;
+                    }
+                    published_endpoints.insert(service, endpoint);
                     return Ok(());
                 }
 
-                frontend_slot
-                    .lock()
-                    .map_err(|_| LpmError::Script("dev frontend state is poisoned".to_string()))?
-                    .as_mut()
-                    .ok_or_else(|| {
-                        LpmError::Script("dev frontend state is not initialized".to_string())
-                    })?
-                    .update_child_target(endpoint.target.clone())?;
-                if let Some(ref state) = inspector_state {
-                    state.set_local_target(endpoint.target.clone());
-                }
-                if let Some(ref target) = tunnel_live_target {
-                    *target
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = endpoint.target.clone();
-                }
+                let prepared_session = prepared_session.ok_or_else(|| {
+                    LpmError::Script("primary endpoint publication is missing its session".into())
+                })?;
 
-                let session_lease = lpm_runner::dev_session::DevSessionLease::register(
-                    &project_dir,
-                    endpoint.target,
-                    endpoint.owner_pid,
-                    Some(service),
-                )?;
-                *dev_session_slot
-                    .lock()
-                    .map_err(|_| LpmError::Script("dev session state is poisoned".to_string()))? =
-                    Some(session_lease);
-                Ok(())
+                publish_primary_endpoint(
+                    &runtime_handle,
+                    service,
+                    endpoint,
+                    &frontend_slot,
+                    &dev_session_slot,
+                    &service_endpoint_slot,
+                    inspector_state.as_ref(),
+                    tunnel_live_target.as_ref(),
+                    prepared_session,
+                    prepared_proxy_plan,
+                    || Ok(()),
+                )
             }) as lpm_runner::orchestrator::EndpointChangedCallback
         });
 
+        let on_shutdown_started = tunnel_shutdown_boundary.clone().map(|boundary| {
+            Box::new(move || boundary.request_and_wait()) as lpm_runner::ShutdownStartedCallback
+        });
         let options = lpm_runner::orchestrator::OrchestratorOptions {
             https: false,
-            filter: extra_args.to_vec(), // lpm dev web api → filter to web + api
+            filter: Vec::new(),
             extra_envs: extra_env.clone(),
             env_mode: env_mode.map(str::to_string),
             service_runtime_hints,
             event_tx: orchestrator_event_tx,
-            command_rx: orch_cmd_rx,
+            command_rx: None,
+            command_controller: orchestrator_command_controller.clone(),
             on_ports_assigned,
+            on_shutdown_started,
             on_all_ready,
             on_endpoint_changed,
             primary_port: requested_port.filter(|_| !https),
@@ -980,88 +2107,34 @@ pub async fn run(
             reserved_frontend_port: requested_port.filter(|_| https),
         };
 
-        let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
-
         if dashboard {
             // Dashboard mode: run orchestrator in a background thread,
             // launch the TUI dashboard on the current thread (it blocks until quit).
             //
-            // The dashboard sends DashboardCommand via command_tx when the user
-            // presses [r]estart or [x] stop. A bridge thread converts these to
-            // OrchestratorCommand and forwards them. The dashboard stays in the TUI
-            // the entire time — no exit/re-enter cycle.
+            // The dashboard sends service intents directly to the bounded
+            // orchestrator controller and stays in the TUI until shutdown.
+            let command_controller = orchestrator_command_controller.ok_or_else(|| {
+                LpmError::Script("dashboard command controller was not initialized".to_string())
+            })?;
             let project_dir_owned = project_dir.to_path_buf();
             let services_owned = services.clone();
-            let dashboard_failure_tx = dashboard_event_tx.clone();
+            let dashboard_terminal_tx = dashboard_event_tx.clone();
             let orch_handle = std::thread::spawn(move || {
-                let result = lpm_runner::orchestrator::run_services(
-                    &project_dir_owned,
-                    &services_owned,
-                    options,
-                );
-                if let Err(error) = &result
-                    && let Some(tx) = dashboard_failure_tx
-                {
-                    let _ = tx.send(lpm_dashboard::DashboardEvent::FatalError(error.to_string()));
-                }
-                result
+                run_dashboard_orchestrator(dashboard_terminal_tx, || {
+                    lpm_runner::orchestrator::run_services(
+                        &project_dir_owned,
+                        &services_owned,
+                        options,
+                    )
+                })
             });
 
-            // Dashboard → orchestrator command bridge
-            let orch_cmd_tx = orch_cmd_tx.ok_or_else(|| {
-                LpmError::Script("dashboard command channel was not initialized".to_string())
-            })?;
-            // Keep a clone so we can send StopAll when the dashboard exits
-            let orch_cmd_tx_for_shutdown = orch_cmd_tx.clone();
-            let (dash_cmd_tx, dash_cmd_rx) =
-                std::sync::mpsc::channel::<lpm_dashboard::DashboardCommand>();
-            std::thread::spawn(move || {
-                while let Ok(cmd) = dash_cmd_rx.recv() {
-                    let orch_cmd = match cmd {
-                        lpm_dashboard::DashboardCommand::RestartService(idx) => {
-                            lpm_runner::orchestrator::OrchestratorCommand::RestartService(idx)
-                        }
-                        lpm_dashboard::DashboardCommand::StopService(idx) => {
-                            lpm_runner::orchestrator::OrchestratorCommand::StopService(idx)
-                        }
-                        lpm_dashboard::DashboardCommand::StopAll => {
-                            lpm_runner::orchestrator::OrchestratorCommand::StopAll
-                        }
-                    };
-                    if orch_cmd_tx.send(orch_cmd).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Build dashboard service state from config (sorted by name for stable ordering)
-            let mut service_names: Vec<&String> = services.keys().collect();
-            service_names.sort();
-            let dashboard_services: Vec<lpm_dashboard::ServiceState> = service_names
-                .iter()
-                .map(|name| {
-                    let svc = &services[*name];
-                    lpm_dashboard::ServiceState {
-                        name: (*name).clone(),
-                        port: svc.port,
-                        hosts: dashboard_service_hosts(config, name),
-                        status: lpm_dashboard::ServiceStatus::Starting,
-                        logs: lpm_dashboard::LogBuffer::with_limits(5000, 16 * 1024 * 1024),
-                    }
-                })
-                .collect();
-
-            // Signal the orchestrator to shut down and preserve its result after
-            // the dashboard exits.
-            let graceful_shutdown = move || {
-                let _ = orch_cmd_tx_for_shutdown
-                    .send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
-                orch_handle.join().unwrap_or_else(|_| {
-                    Err(LpmError::Script(
-                        "service orchestrator panicked".to_string(),
-                    ))
-                })
-            };
+            let shutdown_controller = command_controller.clone();
+            let dashboard_controller = command_controller.clone();
+            let dashboard_command_sink: lpm_dashboard::DashboardCommandSink =
+                Arc::new(move |command| {
+                    dashboard_controller.send(dashboard_orchestrator_command(command));
+                });
 
             let inspector_url_for_dashboard = inspector_handle.as_ref().map(|h| h.url.clone());
 
@@ -1069,7 +2142,7 @@ pub async fn run(
                 lpm_dashboard::run_dashboard(
                     dashboard_services,
                     rx,
-                    Some(dash_cmd_tx),
+                    Some(dashboard_command_sink),
                     inspector_url_for_dashboard,
                 )
                 .map(|_| ())
@@ -1077,15 +2150,23 @@ pub async fn run(
             } else {
                 Ok(())
             };
-            let result = graceful_shutdown().and(dashboard_result);
+            let tunnel_shutdown_result =
+                stop_multi_service_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
+            shutdown_controller.send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
+            let orchestrator_result = orch_handle.join().unwrap_or_else(|_| {
+                Err(LpmError::Script(
+                    "service orchestrator panicked".to_string(),
+                ))
+            });
+            let result = orchestrator_result.and(dashboard_result);
+            let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
 
             let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
             let result = release_proxy_lease_after(result, &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
 
-            return shutdown_multi_service_tunnel_after(
+            return finalize_multi_service_tunnel_after(
                 result,
-                tunnel_handle,
                 capture_consumer_handle,
                 multi_inspector_state,
                 inspector_handle,
@@ -1094,12 +2175,14 @@ pub async fn run(
         }
 
         let result = lpm_runner::orchestrator::run_services(project_dir, services, options);
+        let tunnel_shutdown_result =
+            stop_multi_service_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
+        let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
         let result = release_multi_service_runtime(result, &frontend_slot, &dev_session_slot);
         let result = release_proxy_lease_after(result, &proxy_lease).await;
         let result = release_hosts_file_after(result, hosts_file_lease);
-        return shutdown_multi_service_tunnel_after(
+        return finalize_multi_service_tunnel_after(
             result,
-            tunnel_handle,
             capture_consumer_handle,
             multi_inspector_state,
             inspector_handle,
@@ -1108,7 +2191,7 @@ pub async fn run(
     }
 
     // ── Single service: start dev server ────────────────────────────
-    let proxy_lease = Arc::new(Mutex::new(None));
+    let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
     let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
     let mut script_env = extra_env.clone();
     let child_requested_port = requested_port.filter(|_| !https);
@@ -1135,6 +2218,7 @@ pub async fn run(
     let startup_started = std::time::Instant::now();
     let script_stop_requested = Arc::new(AtomicBool::new(false));
     let script_stop_for_runner = Arc::clone(&script_stop_requested);
+    let script_tunnel_shutdown_slot = Arc::clone(&single_tunnel_shutdown_slot);
     let mut script_handle = tokio::task::spawn_blocking(move || {
         lpm_runner::script::run_dev_script_with_envs(
             &script_project_dir,
@@ -1148,6 +2232,17 @@ pub async fn run(
                 on_endpoint: Box::new(move |result| {
                     let _ = endpoint_tx.send(result);
                 }),
+                on_shutdown_started: Some(Box::new(move || {
+                    let boundary = script_tunnel_shutdown_slot
+                        .lock()
+                        .map_err(|_| {
+                            LpmError::Tunnel(
+                                "single-service tunnel shutdown state is poisoned".into(),
+                            )
+                        })?
+                        .clone();
+                    boundary.map_or(Ok(()), |boundary| boundary.request_and_wait())
+                })),
             },
         )
     });
@@ -1178,6 +2273,7 @@ pub async fn run(
         let mut dev_session_lease = None;
         if let Some(endpoint) = endpoint {
             let endpoint_owner_pid = endpoint.owner_pid;
+            let endpoint_owner_identity = endpoint.owner_identity;
             let child_target = endpoint.target;
             let active_frontends = start_single_service_frontends(
                 project_dir,
@@ -1186,6 +2282,7 @@ pub async fn run(
                 https,
                 network,
                 requested_port,
+                tls_material.as_ref(),
             )
             .await?;
             let target = active_frontends.local_target.clone();
@@ -1201,8 +2298,12 @@ pub async fn run(
                 let tunnel_domain = tunnel_domain.map(str::to_string);
                 let tunnel_relay_url = tunnel_relay_url.map(str::to_string);
                 let tunnel_target = child_target.clone();
-                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                tunnel_shutdown_tx = Some(shutdown_tx);
+                let (shutdown_boundary, shutdown_rx, tunnel_completion) =
+                    TunnelShutdownBoundary::new();
+                *single_tunnel_shutdown_slot.lock().map_err(|_| {
+                    LpmError::Tunnel("single-service tunnel shutdown state is poisoned".into())
+                })? = Some(shutdown_boundary.clone());
+                tunnel_shutdown_boundary = Some(shutdown_boundary);
                 startup.tunnel_source = tunnel_source.map(str::to_string);
                 if let Some(domain) = tunnel_domain.as_deref()
                     && !quiet
@@ -1210,6 +2311,7 @@ pub async fn run(
                     dev_ui::trusted_detail("Tunnel domain", &install_ui::cyan(domain));
                 }
                 tunnel_handle = Some(tokio::spawn(async move {
+                    let _tunnel_completion = tunnel_completion;
                     let result = crate::commands::tunnel::run_start(
                         Some(&tunnel_token),
                         tunnel_target,
@@ -1264,7 +2366,9 @@ pub async fn run(
                 project_dir,
                 child_target,
                 endpoint_owner_pid,
+                endpoint_owner_identity,
                 None,
+                https,
             )?);
             if should_open_browser(true, no_open, is_ci()) {
                 let _ = open::that(&url);
@@ -1280,34 +2384,37 @@ pub async fn run(
     let (frontends, dev_session_lease) = match setup_result {
         Ok(runtime) => runtime,
         Err(error) => {
+            let tunnel_shutdown_result =
+                shutdown_spawned_tunnel(tunnel_handle.take(), tunnel_shutdown_boundary.as_ref())
+                    .await;
             script_stop_requested.store(true, Ordering::Release);
             let _ = script_handle.await;
             let result = release_proxy_lease_after(Err(error), &proxy_lease).await;
             let result = release_hosts_file_after(result, hosts_file_lease);
-            shutdown_spawned_tunnel(tunnel_handle.take(), tunnel_shutdown_tx.take()).await;
-            if let Some(handle) = inspector_handle.take() {
-                handle.shutdown();
-            }
-            return result;
+            let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
+            let inspector_result = match inspector_handle.take() {
+                Some(handle) => handle.shutdown().await,
+                None => Ok(()),
+            };
+            return combine_tunnel_cleanup_results(result, inspector_result);
         }
     };
 
     let script_result = script_handle
         .await
         .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
+    let tunnel_shutdown_result =
+        shutdown_spawned_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
     drop(frontends);
     drop(dev_session_lease);
     let result = release_proxy_lease_after(script_result, &proxy_lease).await;
     let result = release_hosts_file_after(result, hosts_file_lease);
-
-    // Clean shutdown: tunnel first, then inspector (lets in-flight webhook
-    // pushes drain into the inspector state before the server closes).
-    shutdown_spawned_tunnel(tunnel_handle, tunnel_shutdown_tx).await;
-    if let Some(handle) = inspector_handle {
-        handle.shutdown();
-    }
-
-    result
+    let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
+    let inspector_result = match inspector_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
+    combine_tunnel_cleanup_results(result, inspector_result)
 }
 
 fn startup_proxy_lines_from_config(
@@ -1349,6 +2456,41 @@ fn startup_proxy_lines_from_config(
     lines
 }
 
+fn run_dashboard_orchestrator(
+    terminal_tx: Option<std::sync::mpsc::SyncSender<lpm_dashboard::DashboardEvent>>,
+    run: impl FnOnce() -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| {
+        Err(LpmError::Script(
+            "service orchestrator panicked while the dashboard was active".to_string(),
+        ))
+    });
+    if let Some(tx) = terminal_tx {
+        let event = match &result {
+            Ok(()) => lpm_dashboard::DashboardEvent::Shutdown,
+            Err(error) => lpm_dashboard::DashboardEvent::FatalError(error.to_string()),
+        };
+        let _ = tx.send(event);
+    }
+    result
+}
+
+fn dashboard_orchestrator_command(
+    command: lpm_dashboard::DashboardCommand,
+) -> lpm_runner::orchestrator::OrchestratorCommand {
+    match command {
+        lpm_dashboard::DashboardCommand::RestartService(index) => {
+            lpm_runner::orchestrator::OrchestratorCommand::RestartService(index)
+        }
+        lpm_dashboard::DashboardCommand::StopService(index) => {
+            lpm_runner::orchestrator::OrchestratorCommand::StopService(index)
+        }
+        lpm_dashboard::DashboardCommand::StopAll => {
+            lpm_runner::orchestrator::OrchestratorCommand::StopAll
+        }
+    }
+}
+
 fn dashboard_service_hosts(
     config: &lpm_runner::lpm_json::LpmJsonConfig,
     service_name: &str,
@@ -1365,6 +2507,34 @@ fn dashboard_service_hosts(
         push_unique_hostname(&mut hosts, proxy_host.clone());
     }
     hosts
+}
+
+fn dashboard_service_names(
+    services: &HashMap<String, lpm_runner::lpm_json::ServiceConfig>,
+) -> Result<Vec<String>, LpmError> {
+    lpm_runner::service_graph::topological_sort(services)
+        .map(|groups| groups.into_iter().flatten().collect())
+        .map_err(LpmError::Script)
+}
+
+fn build_dashboard_services(
+    config: &lpm_runner::lpm_json::LpmJsonConfig,
+) -> Result<Vec<lpm_dashboard::ServiceState>, LpmError> {
+    dashboard_service_names(&config.services).map(|service_names| {
+        service_names
+            .into_iter()
+            .map(|name| {
+                let service = &config.services[&name];
+                lpm_dashboard::ServiceState {
+                    hosts: dashboard_service_hosts(config, &name),
+                    name,
+                    port: service.port,
+                    status: lpm_dashboard::ServiceStatus::Starting,
+                    logs: lpm_dashboard::LogBuffer::with_limits(5000, 16 * 1024 * 1024),
+                }
+            })
+            .collect()
+    })
 }
 
 fn primary_proxy_service_for_display(config: &lpm_runner::lpm_json::LpmJsonConfig) -> Option<&str> {
@@ -1506,41 +2676,91 @@ async fn register_proxy_route_plan(
         return Ok(());
     }
 
-    let (proxy_routes, bridges) = prepare_proxy_routes(project_dir, &routes).await?;
-    let lease = register_proxy_routes(proxy_routes.clone()).await?;
-    store_proxy_lease(proxy_lease, LocalProxyRuntime { lease, bridges })?;
+    let prepared =
+        prepare_initial_proxy_route_plan(project_dir, routes.clone(), proxy_lease).await?;
+    prepared.finalize().await?;
     print_registered_proxy_routes(&routes);
     Ok(())
 }
 
-async fn replace_proxy_route_plan(
+async fn prepare_initial_proxy_route_plan(
     project_dir: &Path,
     routes: Vec<lpm_runner::local_domains::LocalDomainRoute>,
     proxy_lease: ProxyLeaseSlot,
-) -> Result<(), LpmError> {
+) -> Result<PreparedProxyRoutePlan, LpmError> {
     if routes.is_empty() {
-        return Ok(());
+        return Err(LpmError::Script(
+            "cannot initialize a local proxy route lease with no routes".into(),
+        ));
     }
 
     let (proxy_routes, bridges) = prepare_proxy_routes(project_dir, &routes).await?;
-    let mut runtime = proxy_lease
-        .lock()
-        .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?
-        .take()
-        .ok_or_else(|| LpmError::Script("local proxy route lease is not initialized".into()))?;
-    let replace_result = runtime
-        .lease
-        .replace_routes(proxy_routes)
-        .await
-        .map_err(map_proxy_register_error);
-    if replace_result.is_ok() {
-        runtime.bridges = bridges;
+    let lease = register_staged_proxy_routes().await?;
+    store_proxy_lease(
+        Arc::clone(&proxy_lease),
+        LocalProxyRuntime {
+            lease,
+            bridges: Vec::new(),
+            routes: Vec::new(),
+        },
+    )
+    .await?;
+    match stage_proxy_route_plan(proxy_routes, bridges, Arc::clone(&proxy_lease)).await {
+        Ok(plan) => Ok(plan),
+        Err(error) => {
+            let cleanup = release_proxy_lease(&proxy_lease).await;
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(LpmError::Script(format!(
+                    "{error}; releasing the uninitialized local proxy lease also failed: {cleanup_error}"
+                ))),
+            }
+        }
     }
-    *proxy_lease
+}
+
+async fn prepare_proxy_route_plan(
+    project_dir: &Path,
+    routes: Vec<lpm_runner::local_domains::LocalDomainRoute>,
+    proxy_lease: ProxyLeaseSlot,
+) -> Result<PreparedProxyRoutePlan, LpmError> {
+    if routes.is_empty() {
+        return Err(LpmError::Script(
+            "cannot replace a local proxy route lease with no routes".into(),
+        ));
+    }
+
+    let (proxy_routes, bridges) = prepare_proxy_routes(project_dir, &routes).await?;
+    stage_proxy_route_plan(proxy_routes, bridges, proxy_lease).await
+}
+
+async fn stage_proxy_route_plan(
+    proxy_routes: Vec<lpm_proxy::Route>,
+    bridges: Vec<lpm_proxy::HttpProxyHandle>,
+    proxy_lease: ProxyLeaseSlot,
+) -> Result<PreparedProxyRoutePlan, LpmError> {
+    let command_tx = proxy_lease
         .lock()
-        .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))? =
-        Some(runtime);
-    replace_result
+        .await
+        .as_ref()
+        .map(|publisher| publisher.command_tx.clone())
+        .ok_or_else(|| LpmError::Script("local proxy route lease is not initialized".into()))?;
+    let (reply, response) = tokio::sync::oneshot::channel();
+    command_tx
+        .send(ProxyPublisherCommand::Prepare {
+            routes: proxy_routes,
+            bridges,
+            reply,
+        })
+        .map_err(|_| LpmError::Script("local proxy route publisher stopped".into()))?;
+    let publication_id = response.await.map_err(|_| {
+        LpmError::Script("local proxy route publisher stopped during replacement".into())
+    })??;
+    Ok(PreparedProxyRoutePlan {
+        command_tx,
+        publication_id,
+        finalized: false,
+    })
 }
 
 async fn prepare_proxy_routes(
@@ -1597,21 +2817,22 @@ fn proxy_can_reach_target_directly(target: &LocalTarget) -> bool {
         && target.base_path == "/"
 }
 
-fn store_proxy_lease(
+async fn store_proxy_lease(
     proxy_lease: ProxyLeaseSlot,
     runtime: LocalProxyRuntime,
 ) -> Result<(), LpmError> {
-    let mut guard = proxy_lease
-        .lock()
-        .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?;
-    *guard = Some(runtime);
+    let mut guard = proxy_lease.lock().await;
+    if guard.is_some() {
+        return Err(LpmError::Script(
+            "local proxy route lease is already initialized".into(),
+        ));
+    }
+    *guard = Some(ProxyRoutePublisher::start(runtime));
     Ok(())
 }
 
-async fn register_proxy_routes(
-    routes: Vec<lpm_proxy::Route>,
-) -> Result<lpm_proxy::RouteLease, LpmError> {
-    lpm_proxy::register(routes)
+async fn register_staged_proxy_routes() -> Result<lpm_proxy::RouteLease, LpmError> {
+    lpm_proxy::register_staged()
         .await
         .map_err(map_proxy_register_error)
 }
@@ -1650,36 +2871,90 @@ async fn release_proxy_lease_after(
 
 async fn shutdown_spawned_tunnel(
     tunnel_handle: Option<tokio::task::JoinHandle<()>>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) {
-    if let Some(shutdown_tx) = shutdown_tx {
-        let _ = shutdown_tx.send(());
-    }
-    let Some(mut handle) = tunnel_handle else {
-        return;
-    };
+    shutdown_boundary: Option<&TunnelShutdownBoundary>,
+) -> Result<(), LpmError> {
+    stop_multi_service_tunnel(tunnel_handle, shutdown_boundary).await
+}
 
-    tokio::select! {
-        _ = &mut handle => {}
-        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
-            handle.abort();
-            let _ = handle.await;
-        }
+async fn wait_for_tunnel_readiness<T>(
+    receiver: tokio::sync::oneshot::Receiver<Result<T, String>>,
+    timeout: std::time::Duration,
+) -> Result<T, LpmError> {
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(Ok(publication))) => Ok(publication),
+        Ok(Ok(Err(error))) => Err(LpmError::Tunnel(format!(
+            "tunnel failed before runtime publication: {error}"
+        ))),
+        Ok(Err(_)) => Err(LpmError::Tunnel(
+            "tunnel stopped before confirming readiness".to_string(),
+        )),
+        Err(_) => Err(LpmError::Tunnel(
+            "timed out waiting for the tunnel to become ready".to_string(),
+        )),
     }
 }
 
-async fn shutdown_multi_service_tunnel_after(
-    result: Result<(), LpmError>,
+async fn stop_multi_service_tunnel(
     tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_boundary: Option<&TunnelShutdownBoundary>,
+) -> Result<(), LpmError> {
+    let request_result = match shutdown_boundary {
+        Some(boundary) => boundary.request(),
+        None => Ok(()),
+    };
+    let task_result = match tunnel_handle {
+        Some(mut handle) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) if error.is_cancelled() => Ok(()),
+                Ok(Err(error)) => Err(LpmError::Tunnel(format!(
+                    "tunnel task failed during shutdown: {error}"
+                ))),
+                Err(_) => {
+                    handle.abort();
+                    let join_result = handle.await;
+                    let timeout_error =
+                        LpmError::Tunnel("tunnel did not stop within 5 seconds".to_string());
+                    match join_result {
+                        Ok(()) => Err(timeout_error),
+                        Err(error) if error.is_cancelled() => Err(timeout_error),
+                        Err(error) => Err(LpmError::Tunnel(format!(
+                            "{timeout_error}; aborting the tunnel task also failed: {error}"
+                        ))),
+                    }
+                }
+            }
+        }
+        None => Ok(()),
+    };
+    combine_tunnel_cleanup_results(request_result, task_result)
+}
+
+async fn cleanup_failed_multi_service_preparation(
+    error: LpmError,
+    tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_boundary: Option<&TunnelShutdownBoundary>,
     capture_consumer_handle: Option<tokio::task::JoinHandle<()>>,
     inspector_state: Option<lpm_inspect::state::InspectorState>,
     inspector_handle: Option<lpm_inspect::InspectorHandle>,
 ) -> Result<(), LpmError> {
-    if let Some(handle) = tunnel_handle {
-        handle.abort();
-        let _ = handle.await;
-    }
+    let tunnel_result = stop_multi_service_tunnel(tunnel_handle, shutdown_boundary).await;
+    let result = combine_tunnel_cleanup_results(Err(error), tunnel_result);
+    finalize_multi_service_tunnel_after(
+        result,
+        capture_consumer_handle,
+        inspector_state,
+        inspector_handle,
+    )
+    .await
+}
 
+async fn finalize_multi_service_tunnel_after(
+    result: Result<(), LpmError>,
+    capture_consumer_handle: Option<tokio::task::JoinHandle<()>>,
+    inspector_state: Option<lpm_inspect::state::InspectorState>,
+    inspector_handle: Option<lpm_inspect::InspectorHandle>,
+) -> Result<(), LpmError> {
     let capture_result = match capture_consumer_handle {
         Some(handle) => handle
             .await
@@ -1687,29 +2962,52 @@ async fn shutdown_multi_service_tunnel_after(
         None => Ok(()),
     };
     let persistence_result = if let Some(state) = inspector_state {
-        state.end_session().await.map_err(|error| {
+        let end_result = state.end_session().await.map_err(|error| {
             LpmError::Tunnel(format!("failed to persist inspector session end: {error}"))
-        })?;
-        state.flush().await.map_err(|error| {
+        });
+        let flush_result = state.flush().await.map_err(|error| {
             LpmError::Tunnel(format!(
                 "failed to commit captures to .lpm/inspector.db: {error}"
             ))
-        })
+        });
+        combine_tunnel_cleanup_results(end_result, flush_result)
     } else {
         Ok(())
     };
-    if let Some(handle) = inspector_handle {
-        handle.shutdown();
-    }
+    let inspector_result = match inspector_handle {
+        Some(handle) => handle.shutdown().await,
+        None => Ok(()),
+    };
 
-    let cleanup_result = capture_result.and(persistence_result);
+    let cleanup_result = combine_tunnel_cleanup_results(capture_result, persistence_result);
+    let cleanup_result = combine_tunnel_cleanup_results(cleanup_result, inspector_result);
+    compose_tunnel_runtime_and_cleanup(result, cleanup_result)
+}
+
+fn combine_tunnel_cleanup_results(
+    first: Result<(), LpmError>,
+    second: Result<(), LpmError>,
+) -> Result<(), LpmError> {
+    match (first, second) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(first), Err(second)) => Err(LpmError::Tunnel(format!("{first}; {second}"))),
+    }
+}
+
+fn compose_tunnel_runtime_and_cleanup(
+    result: Result<(), LpmError>,
+    cleanup_result: Result<(), LpmError>,
+) -> Result<(), LpmError> {
     match (result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
         (Err(primary), Ok(())) => Err(primary),
         (Err(primary), Err(cleanup_error)) => {
             dev_ui::warn(&format!("tunnel capture cleanup failed: {cleanup_error}"));
-            Err(primary)
+            Err(LpmError::Tunnel(format!(
+                "{primary}; tunnel capture cleanup also failed: {cleanup_error}"
+            )))
         }
     }
 }
@@ -1770,20 +3068,30 @@ fn release_hosts_file(
 }
 
 async fn release_proxy_lease(proxy_lease: &ProxyLeaseSlot) -> Result<(), LpmError> {
-    let mut runtime = {
-        let mut guard = proxy_lease
-            .lock()
-            .map_err(|_| LpmError::Script("local proxy lease state is poisoned".into()))?;
+    let publisher = {
+        let mut guard = proxy_lease.lock().await;
         guard.take()
     };
-    if let Some(ref mut runtime) = runtime {
-        runtime
-            .lease
-            .release()
-            .await
-            .map_err(|err| LpmError::Script(format!("local proxy route release failed: {err}")))?;
+    if let Some(publisher) = publisher {
+        publisher.release().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+async fn proxy_route_snapshot(proxy_lease: &ProxyLeaseSlot) -> Vec<lpm_proxy::Route> {
+    let command_tx = proxy_lease
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .command_tx
+        .clone();
+    let (reply, response) = tokio::sync::oneshot::channel();
+    command_tx
+        .send(ProxyPublisherCommand::Snapshot { reply })
+        .unwrap();
+    response.await.unwrap()
 }
 
 fn print_registered_proxy_routes(routes: &[lpm_runner::local_domains::LocalDomainRoute]) {
@@ -2333,12 +3641,13 @@ fn find_internal_dev_port(public_port: u16) -> Result<u16, LpmError> {
 }
 
 async fn start_single_service_frontends(
-    project_dir: &Path,
+    _project_dir: &Path,
     child_target: LocalTarget,
     child_owner_pid: Option<u32>,
     https: bool,
     network: bool,
     requested_port: Option<u16>,
+    tls_material: Option<&DevTlsMaterial>,
 ) -> Result<DevFrontends, LpmError> {
     if child_target.scheme == LocalScheme::Https {
         if https {
@@ -2359,13 +3668,18 @@ async fn start_single_service_frontends(
             ));
         }
         return Ok(DevFrontends {
+            child_target: child_target.clone(),
             local_target: child_target.clone(),
             network_port: network.then_some(child_target.port),
+            upstream: None,
             handles: Vec::new(),
         });
     }
 
     if https {
+        let tls_material = tls_material.ok_or_else(|| {
+            LpmError::Script("HTTPS certificate material was not retained after setup".to_string())
+        })?;
         let public_port = requested_port.unwrap_or(0);
         let bind_address = if network {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -2379,23 +3693,30 @@ async fn start_single_service_frontends(
                     "bind LPM HTTPS frontend on {bind_address}:{public_port}: {error}"
                 ))
             })?;
-        let cert_dir = project_dir.join(".lpm").join("certs");
-        let handle = lpm_proxy::start_tls_frontend_on_listener(
+        let upstream = lpm_proxy::FrontendUpstream::new(child_target.clone())
+            .map_err(|error| LpmError::Script(format!("prepare LPM HTTPS frontend: {error}")))?;
+        let handle = lpm_proxy::start_tls_frontend_on_listener_with_pem_and_upstream(
             listener,
-            &cert_dir.join("cert.pem"),
-            &cert_dir.join("key.pem"),
-            child_target.clone(),
+            &tls_material.cert_pem,
+            &tls_material.key_pem,
+            upstream.clone(),
         )
         .await
         .map_err(|error| LpmError::Script(format!("start LPM HTTPS frontend: {error}")))?;
         return Ok(DevFrontends {
+            child_target: child_target.clone(),
             local_target: LocalTarget::loopback(LocalScheme::Https, handle.port())
-                .with_base_path(child_target.base_path),
+                .with_base_path(child_target.base_path.clone()),
             network_port: network.then_some(handle.port()),
+            upstream: Some(upstream),
             handles: vec![handle],
         });
     }
 
+    let upstream = network
+        .then(|| lpm_proxy::FrontendUpstream::new(child_target.clone()))
+        .transpose()
+        .map_err(|error| LpmError::Network(format!("prepare LPM network frontend: {error}")))?;
     let mut handles = Vec::new();
     if network {
         let network_info = lpm_network::get_network_info(child_target.port, false)?;
@@ -2409,14 +3730,19 @@ async fn start_single_service_frontends(
             };
             match tokio::net::TcpListener::bind((ip, child_target.port)).await {
                 Ok(listener) => {
-                    let handle =
-                        lpm_proxy::start_http_frontend_on_listener(listener, child_target.clone())
-                            .map_err(|error| {
-                                LpmError::Network(format!(
-                                    "start LPM network frontend on {ip}:{}: {error}",
-                                    child_target.port
-                                ))
-                            })?;
+                    let handle = lpm_proxy::start_http_frontend_on_listener_with_upstream(
+                        listener,
+                        upstream
+                            .as_ref()
+                            .expect("network frontends must share an upstream")
+                            .clone(),
+                    )
+                    .map_err(|error| {
+                        LpmError::Network(format!(
+                            "start LPM network frontend on {ip}:{}: {error}",
+                            child_target.port
+                        ))
+                    })?;
                     handles.push(handle);
                 }
                 Err(error) => {
@@ -2446,7 +3772,9 @@ async fn start_single_service_frontends(
 
     Ok(DevFrontends {
         network_port: network.then_some(child_target.port),
-        local_target: child_target,
+        local_target: child_target.clone(),
+        child_target,
+        upstream,
         handles,
     })
 }
@@ -2460,15 +3788,9 @@ fn lan_listener_is_owned_by_child(
     let Some(child_owner_pid) = child_owner_pid else {
         return false;
     };
-    listeners.iter().any(|listener| {
-        listener.port == port
-            && listener.pid == Some(child_owner_pid)
-            && listener.address.as_deref().is_none_or(|listener_address| {
-                listener_address
-                    .parse::<IpAddr>()
-                    .is_ok_and(|listener_address| listener_address == address)
-            })
-    })
+    listeners
+        .iter()
+        .any(|listener| listener.pid == Some(child_owner_pid) && listener.listens_on(address, port))
 }
 
 async fn display_network_access(
@@ -2678,6 +4000,463 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    async fn start_proxy_test_upstream(response: &'static str) -> u16 {
+        use axum::Router;
+        use axum::routing::get;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(get(move || async move { response })),
+            )
+            .await
+            .unwrap();
+        });
+        port
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_test_proxy(socket_path: &Path) {
+        for _ in 0..100 {
+            if lpm_proxy::send_request_to_path(socket_path, lpm_proxy::ProxyRequest::Status)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("proxy control socket did not become ready");
+    }
+
+    #[cfg(unix)]
+    async fn stop_test_proxy(
+        socket_path: &Path,
+        server: tokio::task::JoinHandle<Result<(), lpm_proxy::ProxyError>>,
+    ) {
+        let stopped = lpm_proxy::send_request_to_path(socket_path, lpm_proxy::ProxyRequest::Stop)
+            .await
+            .unwrap();
+        assert_eq!(stopped, lpm_proxy::ProxyResponse::Stopped);
+        server.await.unwrap().unwrap();
+    }
+
+    fn remove_staged_dev_session(root: &lpm_common::LpmRoot) {
+        let staged = fs::read_dir(root.dev_sessions_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".next"))
+            })
+            .expect("prepared dev session did not create a staged record");
+        fs::remove_file(staged).unwrap();
+    }
+
+    #[test]
+    fn selecting_the_primary_endpoint_preserves_it_for_future_route_rebuilds() {
+        let endpoints = lpm_runner::orchestrator::ServiceEndpointMap::from([
+            (
+                "web".to_string(),
+                lpm_runner::dev_endpoint::DevEndpoint {
+                    target: LocalTarget::loopback(LocalScheme::Http, 3000),
+                    owner_pid: Some(1),
+                    owner_identity: None,
+                    service: Some("web".to_string()),
+                },
+            ),
+            (
+                "api".to_string(),
+                lpm_runner::dev_endpoint::DevEndpoint {
+                    target: LocalTarget::loopback(LocalScheme::Http, 4000),
+                    owner_pid: Some(2),
+                    owner_identity: None,
+                    service: Some("api".to_string()),
+                },
+            ),
+        ]);
+
+        let selected = endpoints.get("web").cloned().unwrap();
+
+        assert_eq!(selected.target.port, 3000);
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints["web"].target.port, 3000);
+    }
+
+    #[tokio::test]
+    async fn tunnel_publication_wait_rejects_a_dropped_connection_attempt() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        drop(sender);
+
+        let error = wait_for_tunnel_readiness(receiver, std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("stopped before confirming readiness")
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_publication_wait_reports_the_connection_failure() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        sender
+            .send(Err("relay rejected token".to_string()))
+            .unwrap();
+
+        let error = wait_for_tunnel_readiness(receiver, std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("relay rejected token"));
+    }
+
+    #[tokio::test]
+    async fn tunnel_shutdown_reports_a_panicked_task() {
+        let tunnel_handle = tokio::spawn(async {
+            panic!("injected tunnel task panic");
+        });
+
+        let error = shutdown_spawned_tunnel(Some(tunnel_handle), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("tunnel task failed during shutdown")
+        );
+        assert!(error.to_string().contains("injected tunnel task panic"));
+    }
+
+    #[tokio::test]
+    async fn failed_multi_service_preparation_closes_inspector_and_flushes_captures() {
+        let project = TempDir::new().unwrap();
+        let db = lpm_inspect::db::InspectorDb::open(project.path()).unwrap();
+        let state = lpm_inspect::state::InspectorState::with_db_pending(db.clone());
+        state
+            .start_session_immediate(
+                "setup-session".to_string(),
+                None,
+                3000,
+                Some("web".to_string()),
+            )
+            .unwrap();
+        state
+            .push(lpm_tunnel::webhook::CapturedWebhook {
+                id: "queued-before-setup-failure".to_string(),
+                timestamp: "2026-08-14T12:00:00Z".to_string(),
+                method: "POST".to_string(),
+                path: "/hook".to_string(),
+                request_headers: HashMap::new(),
+                request_body: b"request".to_vec(),
+                response_status: 202,
+                response_headers: HashMap::new(),
+                response_body: b"accepted".to_vec(),
+                duration_ms: 1,
+                provider: None,
+                summary: "queued capture".to_string(),
+                signature_diagnostic: None,
+                auto_acked: false,
+            })
+            .await;
+        let inspector = lpm_inspect::start(state.clone(), 0).await.unwrap();
+        let inspector_port = inspector.port;
+
+        let error = cleanup_failed_multi_service_preparation(
+            LpmError::Script("injected multi-service preparation failure".to_string()),
+            None,
+            None,
+            None,
+            Some(state),
+            Some(inspector),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected multi-service preparation failure")
+        );
+        assert!(
+            db.get_webhook("queued-before-setup-failure")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let rebound = lpm_inspect::start(
+            lpm_inspect::state::InspectorState::pending(),
+            inspector_port,
+        )
+        .await
+        .expect("failed setup cleanup must release the inspector listener");
+        rebound.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn tunnel_finalization_preserves_primary_and_every_cleanup_failure() {
+        let cleanup = combine_tunnel_cleanup_results(
+            Err(LpmError::Tunnel("capture task failed".to_string())),
+            Err(LpmError::Tunnel("inspector session end failed".to_string())),
+        );
+
+        let error = compose_tunnel_runtime_and_cleanup(
+            Err(LpmError::Script("runtime failed".to_string())),
+            cleanup,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("runtime failed"), "{error}");
+        assert!(error.contains("capture task failed"), "{error}");
+        assert!(error.contains("inspector session end failed"), "{error}");
+    }
+
+    #[test]
+    fn tunnel_shutdown_boundary_returns_only_after_task_acknowledgement() {
+        let (boundary, shutdown_rx, completion) = TunnelShutdownBoundary::new();
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let task_acknowledged = Arc::clone(&acknowledged);
+        let task = std::thread::spawn(move || {
+            shutdown_rx.blocking_recv().unwrap();
+            task_acknowledged.store(true, Ordering::Release);
+            drop(completion);
+        });
+
+        boundary.request_and_wait().unwrap();
+        task.join().unwrap();
+
+        assert!(acknowledged.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn failed_initial_publication_keeps_runtime_and_tunnel_surfaces_hidden() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+        let old_target = LocalTarget::loopback(LocalScheme::Http, 3000);
+        let new_target = LocalTarget::loopback(LocalScheme::Http, 4000);
+        let endpoint = lpm_runner::dev_endpoint::DevEndpoint {
+            target: new_target.clone(),
+            owner_pid: Some(42),
+            owner_identity: None,
+            service: Some("web".to_string()),
+        };
+        let endpoints = lpm_runner::orchestrator::ServiceEndpointMap::from([(
+            "web".to_string(),
+            endpoint.clone(),
+        )]);
+        let prepared_session = lpm_runner::dev_session::PreparedDevSession::prepare(
+            project.path(),
+            new_target.clone(),
+            endpoint.owner_pid,
+            endpoint.owner_identity.clone(),
+            endpoint.service.clone(),
+            false,
+        )
+        .unwrap();
+        let frontend_slot = Arc::new(Mutex::new(None));
+        let session_slot = Arc::new(Mutex::new(None));
+        let endpoint_slot = Arc::new(Mutex::new(
+            lpm_runner::orchestrator::ServiceEndpointMap::new(),
+        ));
+        let inspector_db = lpm_inspect::db::InspectorDb::open(project.path()).unwrap();
+        let inspector = lpm_inspect::state::InspectorState::with_db_for_target(
+            old_target.clone(),
+            inspector_db,
+        );
+        let tunnel_target = Arc::new(RwLock::new(old_target.clone()));
+        let tunnel_published = Arc::new(AtomicBool::new(false));
+        let tunnel_publication = TunnelReadyPublication {
+            session: lpm_tunnel::TunnelSession {
+                tunnel_url: "https://example.lpm.fyi".to_string(),
+                domain: "example.lpm.fyi".to_string(),
+                session_id: "session".to_string(),
+                local_port: new_target.port,
+                plan: None,
+                base_domain: None,
+                domain_kind: None,
+                session_expires_at: None,
+                session_max_ms: None,
+                limits: None,
+            },
+            local_target_url: new_target.url(),
+            tunnel_auth: None,
+            usage: None,
+        };
+        let runtime_handle = tokio::runtime::Handle::current();
+
+        let error = publish_initial_runtime(
+            &runtime_handle,
+            &endpoint,
+            endpoints,
+            DevFrontends {
+                child_target: new_target.clone(),
+                local_target: new_target,
+                network_port: None,
+                upstream: None,
+                handles: Vec::new(),
+            },
+            prepared_session,
+            &frontend_slot,
+            &session_slot,
+            &endpoint_slot,
+            Some(&inspector),
+            Some(&tunnel_target),
+            Some(&tunnel_publication),
+            Some(&tunnel_published),
+            None,
+            || Err(LpmError::Script("injected publication failure".into())),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected publication failure"));
+        assert!(frontend_slot.lock().unwrap().is_none());
+        assert!(session_slot.lock().unwrap().is_none());
+        assert!(endpoint_slot.lock().unwrap().is_empty());
+        assert_eq!(inspector.local_target(), old_target);
+        assert_eq!(*tunnel_target.read().unwrap(), old_target);
+        assert!(!tunnel_published.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_initial_session_commit_keeps_tunnel_publication_hidden() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        let socket_path = root.proxy_socket();
+        let state_path = root.proxy_state();
+        let server_socket = socket_path.clone();
+        let server_state = state_path.clone();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+        let server = tokio::spawn(async move {
+            lpm_proxy::serve_control_at_path(&server_socket, &server_state).await
+        });
+        wait_for_test_proxy(&socket_path).await;
+        let old_target = LocalTarget::loopback(LocalScheme::Http, 3000);
+        let new_target = LocalTarget::loopback(LocalScheme::Http, 4000);
+        let endpoint = lpm_runner::dev_endpoint::DevEndpoint {
+            target: new_target.clone(),
+            owner_pid: None,
+            owner_identity: None,
+            service: Some("web".to_string()),
+        };
+        let prepared_session = lpm_runner::dev_session::PreparedDevSession::prepare(
+            project.path(),
+            new_target.clone(),
+            None,
+            None,
+            endpoint.service.clone(),
+            false,
+        )
+        .unwrap();
+        let inspector_db = lpm_inspect::db::InspectorDb::open(project.path()).unwrap();
+        let inspector = lpm_inspect::state::InspectorState::with_db_for_target(
+            old_target.clone(),
+            inspector_db.clone(),
+        );
+        let tunnel_target = Arc::new(RwLock::new(old_target.clone()));
+        let tunnel_published = Arc::new(AtomicBool::new(false));
+        let tunnel_publication = TunnelReadyPublication {
+            session: lpm_tunnel::TunnelSession {
+                tunnel_url: "https://example.lpm.fyi".to_string(),
+                domain: "example.lpm.fyi".to_string(),
+                session_id: "session".to_string(),
+                local_port: new_target.port,
+                plan: None,
+                base_domain: None,
+                domain_kind: None,
+                session_expires_at: None,
+                session_max_ms: None,
+                limits: None,
+            },
+            local_target_url: new_target.url(),
+            tunnel_auth: None,
+            usage: None,
+        };
+        let runtime_handle = tokio::runtime::Handle::current();
+        let frontend_slot = Arc::new(Mutex::new(None));
+        let session_slot = Arc::new(Mutex::new(None));
+        let endpoint_slot = Arc::new(Mutex::new(
+            lpm_runner::orchestrator::ServiceEndpointMap::new(),
+        ));
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+        let proxy_plan = prepare_initial_proxy_route_plan(
+            project.path(),
+            vec![lpm_runner::local_domains::LocalDomainRoute {
+                host: "app.localhost".to_string(),
+                upstream: LocalTarget::loopback(LocalScheme::Http, 4000),
+                service: Some("web".to_string()),
+            }],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        .unwrap();
+
+        let error = tokio::task::block_in_place(|| {
+            publish_initial_runtime(
+                &runtime_handle,
+                &endpoint,
+                lpm_runner::orchestrator::ServiceEndpointMap::from([(
+                    "web".to_string(),
+                    endpoint.clone(),
+                )]),
+                DevFrontends {
+                    child_target: new_target.clone(),
+                    local_target: new_target,
+                    network_port: None,
+                    upstream: None,
+                    handles: Vec::new(),
+                },
+                prepared_session,
+                &frontend_slot,
+                &session_slot,
+                &endpoint_slot,
+                Some(&inspector),
+                Some(&tunnel_target),
+                Some(&tunnel_publication),
+                Some(&tunnel_published),
+                Some(proxy_plan),
+                || {
+                    remove_staged_dev_session(&root);
+                    Ok(())
+                },
+            )
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("No such file or directory"));
+        assert!(inspector.get_tunnel_url().await.is_none());
+        assert!(inspector_db.list_sessions(10).await.unwrap().is_empty());
+        assert_eq!(inspector.local_target(), old_target);
+        assert_eq!(*tunnel_target.read().unwrap(), old_target);
+        assert!(!tunnel_published.load(Ordering::Acquire));
+        assert!(frontend_slot.lock().unwrap().is_none());
+        assert!(session_slot.lock().unwrap().is_none());
+        assert!(endpoint_slot.lock().unwrap().is_empty());
+        let proxy_snapshot = proxy_route_snapshot(&proxy_lease).await;
+        assert!(proxy_snapshot.is_empty(), "{proxy_snapshot:?}");
+
+        release_proxy_lease(&proxy_lease).await.unwrap();
+        stop_test_proxy(&socket_path, server).await;
+    }
+
     #[test]
     fn privileged_port_detection() {
         assert!(is_privileged_port(80));
@@ -2743,6 +4522,7 @@ mod tests {
         let rows = vec![lpm_runner::ports::ListeningPort {
             port: 5173,
             address: Some(ip.to_string()),
+            address_family: Some(lpm_runner::ports::ListeningAddressFamily::Ipv4),
             pid: Some(200),
             process: Some("unrelated".to_string()),
             command: None,
@@ -2758,14 +4538,41 @@ mod tests {
         assert!(!lan_listener_is_owned_by_child(&rows, ip, 5173, None));
     }
 
+    #[test]
+    fn ipv6_wildcard_listener_does_not_authenticate_an_ipv4_lan_target() {
+        let ip = "192.0.2.10".parse::<IpAddr>().unwrap();
+        let rows = vec![lpm_runner::ports::ListeningPort {
+            port: 5173,
+            address: None,
+            address_family: Some(lpm_runner::ports::ListeningAddressFamily::Ipv6),
+            pid: Some(200),
+            process: Some("node".to_string()),
+            command: None,
+            cwd: None,
+            project_dir: None,
+            project: None,
+            framework: None,
+            uptime: None,
+        }];
+
+        assert!(!lan_listener_is_owned_by_child(&rows, ip, 5173, Some(200)));
+    }
+
     #[tokio::test]
     async fn an_https_child_rejects_a_different_requested_public_port() {
         let project = TempDir::new().unwrap();
         let child = LocalTarget::loopback(LocalScheme::Https, 5173);
 
-        let result =
-            start_single_service_frontends(project.path(), child, None, true, false, Some(4000))
-                .await;
+        let result = start_single_service_frontends(
+            project.path(),
+            child,
+            None,
+            true,
+            false,
+            Some(4000),
+            None,
+        )
+        .await;
         let Err(error) = result else {
             panic!("an existing HTTPS child cannot be remapped without a TLS-aware frontend");
         };
@@ -2781,7 +4588,8 @@ mod tests {
         let child = LocalTarget::loopback(LocalScheme::Https, 5173);
 
         let result =
-            start_single_service_frontends(project.path(), child, None, true, false, None).await;
+            start_single_service_frontends(project.path(), child, None, true, false, None, None)
+                .await;
         let Err(error) = result else {
             panic!("LPM TLS termination requires a plain HTTP child");
         };
@@ -2796,7 +4604,8 @@ mod tests {
         let child = LocalTarget::loopback(LocalScheme::Https, 5173);
 
         let result =
-            start_single_service_frontends(project.path(), child, None, false, true, None).await;
+            start_single_service_frontends(project.path(), child, None, false, true, None, None)
+                .await;
         let Err(error) = result else {
             panic!("an HTTPS loopback child cannot be advertised on the LAN without forwarding");
         };
@@ -2820,6 +4629,555 @@ mod tests {
 
         assert!(error.to_string().contains("requires a plain HTTP child"));
         assert!(error.to_string().contains("https://127.0.0.1:5173/"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preparing_proxy_routes_keeps_the_candidate_generation_hidden() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        let socket_path = root.proxy_socket();
+        let state_path = root.proxy_state();
+        let server_socket = socket_path.clone();
+        let server_state = state_path.clone();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+        let server = tokio::spawn(async move {
+            lpm_proxy::serve_control_at_path(&server_socket, &server_state).await
+        });
+        wait_for_test_proxy(&socket_path).await;
+
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+        let route = |port| lpm_runner::local_domains::LocalDomainRoute {
+            host: "app.localhost".to_string(),
+            upstream: LocalTarget::loopback(LocalScheme::Http, port),
+            service: Some("web".to_string()),
+        };
+        register_proxy_route_plan(project.path(), vec![route(3000)], Arc::clone(&proxy_lease))
+            .await
+            .unwrap();
+
+        let candidate =
+            prepare_proxy_route_plan(project.path(), vec![route(4000)], Arc::clone(&proxy_lease))
+                .await
+                .unwrap();
+        let listed = lpm_proxy::send_request_to_path(&socket_path, lpm_proxy::ProxyRequest::List)
+            .await
+            .unwrap();
+        let lpm_proxy::ProxyResponse::Routes { routes } = listed else {
+            panic!("expected proxy route listing");
+        };
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].upstream_port, 3000);
+
+        candidate.rollback().await.unwrap();
+        release_proxy_lease(&proxy_lease).await.unwrap();
+        stop_test_proxy(&socket_path, server).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_proxy_routes_restore_the_previous_generation_before_acceptance() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        let socket_path = root.proxy_socket();
+        let state_path = root.proxy_state();
+        let server_socket = socket_path.clone();
+        let server_state = state_path.clone();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+        let server = tokio::spawn(async move {
+            lpm_proxy::serve_control_at_path(&server_socket, &server_state).await
+        });
+        wait_for_test_proxy(&socket_path).await;
+
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+        let route = |port| lpm_runner::local_domains::LocalDomainRoute {
+            host: "app.localhost".to_string(),
+            upstream: LocalTarget::loopback(LocalScheme::Http, port),
+            service: Some("web".to_string()),
+        };
+        register_proxy_route_plan(project.path(), vec![route(3000)], Arc::clone(&proxy_lease))
+            .await
+            .unwrap();
+        let published =
+            prepare_proxy_route_plan(project.path(), vec![route(4000)], Arc::clone(&proxy_lease))
+                .await
+                .unwrap()
+                .commit_reversible()
+                .await
+                .unwrap();
+
+        assert_eq!(
+            proxy_route_snapshot(&proxy_lease).await[0].upstream_port,
+            4000
+        );
+        published.rollback().await.unwrap();
+        assert_eq!(
+            proxy_route_snapshot(&proxy_lease).await[0].upstream_port,
+            3000
+        );
+
+        release_proxy_lease(&proxy_lease).await.unwrap();
+        stop_test_proxy(&socket_path, server).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rolling_back_proxy_routes_keeps_the_previous_bridge_reachable() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        let socket_path = root.proxy_socket();
+        let state_path = root.proxy_state();
+        let server_socket = socket_path.clone();
+        let server_state = state_path.clone();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+        let server = tokio::spawn(async move {
+            lpm_proxy::serve_control_at_path(&server_socket, &server_state).await
+        });
+        wait_for_test_proxy(&socket_path).await;
+
+        let old_port = start_proxy_test_upstream("old generation").await;
+        let new_port = start_proxy_test_upstream("new generation").await;
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+        register_proxy_route_plan(
+            project.path(),
+            vec![lpm_runner::local_domains::LocalDomainRoute {
+                host: "app.localhost".to_string(),
+                upstream: LocalTarget {
+                    scheme: LocalScheme::Http,
+                    address: std::net::Ipv6Addr::LOCALHOST.into(),
+                    port: old_port,
+                    base_path: "/old".to_string(),
+                },
+                service: Some("web".to_string()),
+            }],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        .unwrap();
+
+        let plan = prepare_proxy_route_plan(
+            project.path(),
+            vec![lpm_runner::local_domains::LocalDomainRoute {
+                host: "app.localhost".to_string(),
+                upstream: LocalTarget {
+                    scheme: LocalScheme::Http,
+                    address: std::net::Ipv6Addr::LOCALHOST.into(),
+                    port: new_port,
+                    base_path: "/new".to_string(),
+                },
+                service: Some("web".to_string()),
+            }],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        .unwrap();
+
+        plan.rollback().await.unwrap();
+        let old_bridge_port = proxy_route_snapshot(&proxy_lease).await[0].upstream_port;
+        let response = reqwest::get(format!("http://127.0.0.1:{old_bridge_port}/health"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(response, "old generation");
+        drop(proxy_lease);
+        for _ in 0..100 {
+            let listed =
+                lpm_proxy::send_request_to_path(&socket_path, lpm_proxy::ProxyRequest::List)
+                    .await
+                    .unwrap();
+            if listed == (lpm_proxy::ProxyResponse::Routes { routes: Vec::new() }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stop_test_proxy(&socket_path, server).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_proxy_replacement_rolls_back_before_the_next_request() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn read_request(
+            lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        ) -> lpm_proxy::ProxyRequest {
+            let line = lines.next_line().await.unwrap().unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn write_response(
+            writer: &mut tokio::net::unix::OwnedWriteHalf,
+            response: &lpm_proxy::ProxyResponse,
+        ) {
+            let mut encoded = serde_json::to_vec(response).unwrap();
+            encoded.push(b'\n');
+            writer.write_all(&encoded).await.unwrap();
+            writer.flush().await.unwrap();
+        }
+
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        let socket_path = root.proxy_socket();
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let (replacement_applied_tx, replacement_applied_rx) = tokio::sync::oneshot::channel();
+        let (allow_response_tx, allow_response_rx) = tokio::sync::oneshot::channel();
+        let (rollback_applied_tx, rollback_applied_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+
+            let lpm_proxy::ProxyRequest::RegisterStagedLease { .. } =
+                read_request(&mut lines).await
+            else {
+                panic!("expected a staged connection-backed lease registration");
+            };
+            let lease_id = lpm_proxy::RouteLeaseId::from_raw(1);
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::Registered { lease_id },
+            )
+            .await;
+
+            let lpm_proxy::ProxyRequest::Stage {
+                lease_id: initial_lease,
+                publication_id: initial_publication,
+                routes: old_routes,
+            } = read_request(&mut lines).await
+            else {
+                panic!("expected the initial staged routes");
+            };
+            assert_eq!(initial_lease, lease_id);
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::Staged {
+                    publication_id: initial_publication,
+                },
+            )
+            .await;
+            let lpm_proxy::ProxyRequest::Commit {
+                lease_id: initial_commit_lease,
+                publication_id: initial_commit,
+            } = read_request(&mut lines).await
+            else {
+                panic!("expected the initial publication commit");
+            };
+            assert_eq!(initial_commit_lease, lease_id);
+            assert_eq!(initial_commit, initial_publication);
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::Committed {
+                    publication_id: initial_publication,
+                },
+            )
+            .await;
+
+            let lpm_proxy::ProxyRequest::Stage {
+                lease_id: candidate_lease,
+                publication_id: candidate_publication,
+                routes: candidate_routes,
+            } = read_request(&mut lines).await
+            else {
+                panic!("expected the candidate stage");
+            };
+            assert_eq!(candidate_lease, lease_id);
+            assert_ne!(candidate_routes, old_routes);
+            replacement_applied_tx.send(()).unwrap();
+            allow_response_rx.await.unwrap();
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::Staged {
+                    publication_id: candidate_publication,
+                },
+            )
+            .await;
+
+            let lpm_proxy::ProxyRequest::Rollback {
+                lease_id: rollback_lease_id,
+                publication_id: rollback_publication,
+            } = read_request(&mut lines).await
+            else {
+                panic!("expected cancellation rollback before another request");
+            };
+            assert_eq!(rollback_lease_id, lease_id);
+            assert_eq!(rollback_publication, candidate_publication);
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::RolledBack {
+                    publication_id: candidate_publication,
+                },
+            )
+            .await;
+            rollback_applied_tx.send(()).unwrap();
+
+            let lpm_proxy::ProxyRequest::Stage { .. } = read_request(&mut lines).await else {
+                panic!("expected the stage after cancellation rollback");
+            };
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::Error {
+                    message: "injected replacement rejection".to_string(),
+                },
+            )
+            .await;
+
+            let lpm_proxy::ProxyRequest::Release {
+                lease_id: released_lease,
+            } = read_request(&mut lines).await
+            else {
+                panic!("expected lease release after the rejected stage");
+            };
+            assert_eq!(released_lease, lease_id);
+            write_response(
+                &mut writer,
+                &lpm_proxy::ProxyResponse::Released { removed: 1 },
+            )
+            .await;
+        });
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+
+        let old_port = start_proxy_test_upstream("old generation").await;
+        let new_port = start_proxy_test_upstream("candidate generation").await;
+        let rejected_port = start_proxy_test_upstream("rejected generation").await;
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+        let route = |port, base_path: &str| lpm_runner::local_domains::LocalDomainRoute {
+            host: "app.localhost".to_string(),
+            upstream: LocalTarget {
+                scheme: LocalScheme::Http,
+                address: std::net::Ipv6Addr::LOCALHOST.into(),
+                port,
+                base_path: base_path.to_string(),
+            },
+            service: Some("web".to_string()),
+        };
+        register_proxy_route_plan(
+            project.path(),
+            vec![route(old_port, "/old")],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        .unwrap();
+
+        let replacement_project = project.path().to_path_buf();
+        let replacement_lease = Arc::clone(&proxy_lease);
+        let replacement = tokio::spawn(async move {
+            prepare_proxy_route_plan(
+                &replacement_project,
+                vec![route(new_port, "/candidate")],
+                replacement_lease,
+            )
+            .await
+        });
+        replacement_applied_rx.await.unwrap();
+        replacement.abort();
+        let _ = replacement.await;
+        allow_response_tx.send(()).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), rollback_applied_rx)
+            .await
+            .expect("cancelled replacement did not roll back the daemon route")
+            .unwrap();
+        let Err(error) = prepare_proxy_route_plan(
+            project.path(),
+            vec![route(rejected_port, "/rejected")],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        else {
+            panic!("the daemon rejection must not consume a stale replacement response");
+        };
+
+        assert!(error.to_string().contains("injected replacement rejection"));
+        release_proxy_lease(&proxy_lease).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_primary_publication_keeps_every_runtime_surface_on_the_old_generation() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(home.path());
+        let socket_path = root.proxy_socket();
+        let state_path = root.proxy_state();
+        let server_socket = socket_path.clone();
+        let server_state = state_path.clone();
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_HOME",
+            std::ffi::OsString::from(home.path().as_os_str()),
+        )]);
+        let server = tokio::spawn(async move {
+            lpm_proxy::serve_control_at_path(&server_socket, &server_state).await
+        });
+        wait_for_test_proxy(&socket_path).await;
+
+        let old_port = start_proxy_test_upstream("old generation").await;
+        let new_port = start_proxy_test_upstream("new generation").await;
+        let old_target = LocalTarget {
+            scheme: LocalScheme::Http,
+            address: std::net::Ipv6Addr::LOCALHOST.into(),
+            port: old_port,
+            base_path: "/old".to_string(),
+        };
+        let new_target = LocalTarget {
+            scheme: LocalScheme::Http,
+            address: std::net::Ipv6Addr::LOCALHOST.into(),
+            port: new_port,
+            base_path: "/new".to_string(),
+        };
+        let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+        register_proxy_route_plan(
+            project.path(),
+            vec![lpm_runner::local_domains::LocalDomainRoute {
+                host: "app.localhost".to_string(),
+                upstream: old_target.clone(),
+                service: Some("web".to_string()),
+            }],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        .unwrap();
+        let proxy_plan = prepare_proxy_route_plan(
+            project.path(),
+            vec![lpm_runner::local_domains::LocalDomainRoute {
+                host: "app.localhost".to_string(),
+                upstream: new_target.clone(),
+                service: Some("web".to_string()),
+            }],
+            Arc::clone(&proxy_lease),
+        )
+        .await
+        .unwrap();
+
+        let old_endpoint = lpm_runner::dev_endpoint::DevEndpoint {
+            target: old_target.clone(),
+            owner_pid: None,
+            owner_identity: None,
+            service: Some("web".to_string()),
+        };
+        let new_endpoint = lpm_runner::dev_endpoint::DevEndpoint {
+            target: new_target.clone(),
+            owner_pid: None,
+            owner_identity: None,
+            service: Some("web".to_string()),
+        };
+        let old_session = lpm_runner::dev_session::DevSessionLease::register(
+            project.path(),
+            old_target.clone(),
+            None,
+            None,
+            Some("web".to_string()),
+            false,
+        )
+        .unwrap();
+        let prepared_session = lpm_runner::dev_session::PreparedDevSession::prepare(
+            project.path(),
+            new_target.clone(),
+            None,
+            None,
+            Some("web".to_string()),
+            false,
+        )
+        .unwrap();
+        let frontend_slot = Arc::new(Mutex::new(Some(DevFrontends {
+            child_target: old_target.clone(),
+            local_target: old_target.clone(),
+            network_port: None,
+            upstream: None,
+            handles: Vec::new(),
+        })));
+        let dev_session_slot = Arc::new(Mutex::new(Some(old_session)));
+        let service_endpoint_slot = Arc::new(Mutex::new(
+            lpm_runner::orchestrator::ServiceEndpointMap::from([("web".to_string(), old_endpoint)]),
+        ));
+        let inspector = lpm_inspect::state::InspectorState::new_for_target(old_target.clone());
+        let tunnel_target = Arc::new(RwLock::new(old_target.clone()));
+        let runtime_handle = tokio::runtime::Handle::current();
+
+        let error = tokio::task::block_in_place(|| {
+            publish_primary_endpoint(
+                &runtime_handle,
+                "web".to_string(),
+                new_endpoint,
+                &frontend_slot,
+                &dev_session_slot,
+                &service_endpoint_slot,
+                Some(&inspector),
+                Some(&tunnel_target),
+                prepared_session,
+                Some(proxy_plan),
+                || {
+                    remove_staged_dev_session(&root);
+                    Ok(())
+                },
+            )
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("No such file or directory"));
+        assert_eq!(
+            frontend_slot.lock().unwrap().as_ref().unwrap().child_target,
+            old_target
+        );
+        assert_eq!(
+            service_endpoint_slot.lock().unwrap()["web"].target,
+            old_target
+        );
+        assert_eq!(inspector.local_target(), old_target);
+        assert_eq!(*tunnel_target.read().unwrap(), old_target);
+        let session_path = fs::read_dir(root.dev_sessions_dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let session: lpm_runner::dev_session::ActiveDevSession =
+            serde_json::from_slice(&fs::read(session_path).unwrap()).unwrap();
+        assert_eq!(session.target, old_target);
+        let old_bridge_port = proxy_route_snapshot(&proxy_lease).await[0].upstream_port;
+        let response = reqwest::get(format!("http://127.0.0.1:{old_bridge_port}/health"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(response, "old generation");
+
+        drop(frontend_slot);
+        drop(dev_session_slot);
+        drop(proxy_lease);
+        for _ in 0..100 {
+            let listed =
+                lpm_proxy::send_request_to_path(&socket_path, lpm_proxy::ProxyRequest::List)
+                    .await
+                    .unwrap();
+            if listed == (lpm_proxy::ProxyResponse::Routes { routes: Vec::new() }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stop_test_proxy(&socket_path, server).await;
     }
 
     #[test]
@@ -3125,6 +5483,95 @@ mod tests {
         assert_eq!(
             dashboard_service_hosts(&config, "web"),
             vec!["web.localhost".to_string(), "app.localhost".to_string()]
+        );
+    }
+
+    #[test]
+    fn dashboard_service_names_match_the_orchestrator_dependency_order() {
+        let services = HashMap::from([
+            (
+                "zdb".to_string(),
+                lpm_runner::lpm_json::ServiceConfig {
+                    command: "postgres".to_string(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "api".to_string(),
+                lpm_runner::lpm_json::ServiceConfig {
+                    command: "node api.js".to_string(),
+                    depends_on: vec!["zdb".to_string()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let names: Vec<_> = dashboard_service_names(&services)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        assert_eq!(names, vec!["zdb", "api"]);
+    }
+
+    #[test]
+    fn dashboard_orchestrator_panic_is_reported_as_a_fatal_event() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_dashboard_orchestrator(Some(tx), || panic!("injected orchestrator panic"))
+        }));
+        let result = unwind.expect("dashboard orchestrator panic must be contained");
+
+        assert!(result.is_err());
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        match event {
+            lpm_dashboard::DashboardEvent::FatalError(error) => {
+                assert!(error.contains("service orchestrator panicked"));
+            }
+            _ => panic!("dashboard did not receive the fatal orchestrator event"),
+        }
+    }
+
+    #[test]
+    fn filtered_config_excludes_inactive_service_hosts_from_runtime_planning() {
+        let mut config = lpm_runner::lpm_json::LpmJsonConfig {
+            services: HashMap::from([
+                (
+                    "api".to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "node api.js".to_string(),
+                        host: Some("api.localhost".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "web".to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "node web.js".to_string(),
+                        host: Some("web.localhost".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        config.services = lpm_runner::service_graph::select_active_services(
+            &config.services,
+            &["web".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            lpm_runner::local_domains::configured_hostnames(&config),
+            vec!["web.localhost"]
+        );
+        assert_eq!(
+            startup_proxy_lines_from_config(&config)
+                .into_iter()
+                .map(|line| line.host)
+                .collect::<Vec<_>>(),
+            vec!["web.localhost"]
         );
     }
 
@@ -3592,60 +6039,23 @@ mod tests {
         }
     }
 
-    // ── Dashboard command bridge test ──────────────────────────────
+    // ── Dashboard command mapping test ─────────────────────────────
 
     #[test]
-    fn dashboard_command_bridge_forwards_restart_and_stop() {
+    fn dashboard_commands_map_to_the_matching_orchestrator_intents() {
         use lpm_runner::orchestrator::OrchestratorCommand;
 
-        let (orch_cmd_tx, orch_cmd_rx) = std::sync::mpsc::channel::<OrchestratorCommand>();
-        let (dash_cmd_tx, dash_cmd_rx) =
-            std::sync::mpsc::channel::<lpm_dashboard::DashboardCommand>();
-
-        // Spawn the bridge thread (same pattern as dev.rs)
-        std::thread::spawn(move || {
-            while let Ok(cmd) = dash_cmd_rx.recv() {
-                let orch_cmd = match cmd {
-                    lpm_dashboard::DashboardCommand::RestartService(idx) => {
-                        OrchestratorCommand::RestartService(idx)
-                    }
-                    lpm_dashboard::DashboardCommand::StopService(idx) => {
-                        OrchestratorCommand::StopService(idx)
-                    }
-                    lpm_dashboard::DashboardCommand::StopAll => OrchestratorCommand::StopAll,
-                };
-                if orch_cmd_tx.send(orch_cmd).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Send commands from dashboard side
-        dash_cmd_tx
-            .send(lpm_dashboard::DashboardCommand::RestartService(2))
-            .unwrap();
-        dash_cmd_tx
-            .send(lpm_dashboard::DashboardCommand::StopService(0))
-            .unwrap();
-        dash_cmd_tx
-            .send(lpm_dashboard::DashboardCommand::StopAll)
-            .unwrap();
-
-        // Verify orchestrator receives them in order
-        let cmd1 = orch_cmd_rx.recv().unwrap();
-        assert!(
-            matches!(cmd1, OrchestratorCommand::RestartService(2)),
-            "first command should be RestartService(2)"
+        assert_eq!(
+            dashboard_orchestrator_command(lpm_dashboard::DashboardCommand::RestartService(2)),
+            OrchestratorCommand::RestartService(2)
         );
-        let cmd2 = orch_cmd_rx.recv().unwrap();
-        assert!(
-            matches!(cmd2, OrchestratorCommand::StopService(0)),
-            "second command should be StopService(0)"
+        assert_eq!(
+            dashboard_orchestrator_command(lpm_dashboard::DashboardCommand::StopService(0)),
+            OrchestratorCommand::StopService(0)
         );
-        let cmd3 = orch_cmd_rx.recv().unwrap();
-        assert!(
-            matches!(cmd3, OrchestratorCommand::StopAll),
-            "third command should be StopAll"
+        assert_eq!(
+            dashboard_orchestrator_command(lpm_dashboard::DashboardCommand::StopAll),
+            OrchestratorCommand::StopAll
         );
     }
 

@@ -1,6 +1,38 @@
 use super::*;
 
-type SharedUpstream = Arc<RwLock<lpm_common::LocalTarget>>;
+const HTTP_CONNECTION_LIMIT: usize = 64;
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone)]
+pub struct FrontendUpstream {
+    target: Arc<RwLock<lpm_common::LocalTarget>>,
+}
+
+impl FrontendUpstream {
+    pub fn new(target: lpm_common::LocalTarget) -> Result<Self, ProxyError> {
+        validate_frontend_upstream(&target)?;
+        Ok(Self {
+            target: Arc::new(RwLock::new(target)),
+        })
+    }
+
+    pub fn update(&self, target: lpm_common::LocalTarget) -> Result<(), ProxyError> {
+        validate_frontend_upstream(&target)?;
+        *self
+            .target
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = target;
+        Ok(())
+    }
+
+    fn current(&self) -> lpm_common::LocalTarget {
+        self.target
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
 
 #[derive(Clone)]
 pub struct HttpProxyState {
@@ -10,7 +42,10 @@ pub struct HttpProxyState {
         axum::body::Body,
     >,
     forwarded_proto: &'static str,
-    fallback_upstream: Option<SharedUpstream>,
+    fallback_upstream: Option<FrontendUpstream>,
+    upstream_header_timeout: Duration,
+    upgrade_capacity: Arc<tokio::sync::Semaphore>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl HttpProxyState {
@@ -22,7 +57,9 @@ impl HttpProxyState {
         registry: Arc<tokio::sync::Mutex<RouteRegistry>>,
         forwarded_proto: &'static str,
     ) -> Self {
-        let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        connector.set_connect_timeout(Some(UPSTREAM_CONNECT_TIMEOUT));
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         Self {
             registry,
             client: hyper_util::client::legacy::Client::builder(
@@ -31,16 +68,35 @@ impl HttpProxyState {
             .build(connector),
             forwarded_proto,
             fallback_upstream: None,
+            upstream_header_timeout: Duration::from_secs(10),
+            upgrade_capacity: Arc::new(tokio::sync::Semaphore::new(64)),
+            shutdown,
         }
     }
 
-    pub(crate) fn for_upstream(upstream: SharedUpstream, forwarded_proto: &'static str) -> Self {
+    pub(crate) fn for_upstream(upstream: FrontendUpstream, forwarded_proto: &'static str) -> Self {
         let mut state = Self::with_forwarded_proto(
             Arc::new(tokio::sync::Mutex::new(RouteRegistry::new())),
             forwarded_proto,
         );
         state.fallback_upstream = Some(upstream);
         state
+    }
+
+    pub(crate) fn with_shutdown(mut self, shutdown: tokio::sync::watch::Sender<bool>) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_limits(
+        mut self,
+        upstream_header_timeout: Duration,
+        upgrades: usize,
+    ) -> Self {
+        self.upstream_header_timeout = upstream_header_timeout;
+        self.upgrade_capacity = Arc::new(tokio::sync::Semaphore::new(upgrades));
+        self
     }
 }
 
@@ -50,10 +106,16 @@ struct HttpRedirectState {
     https_port: u16,
 }
 
+#[derive(Clone)]
+enum HttpFrontendState {
+    Proxy(Arc<HttpProxyState>),
+    Redirect(HttpRedirectState),
+}
+
 pub struct HttpProxyHandle {
     pub(crate) addr: SocketAddr,
-    pub(crate) shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    pub(crate) upstream: Option<SharedUpstream>,
+    pub(crate) shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    pub(crate) upstream: Option<FrontendUpstream>,
 }
 
 impl HttpProxyHandle {
@@ -66,19 +128,27 @@ impl HttpProxyHandle {
     }
 
     pub fn update_upstream(&self, upstream: lpm_common::LocalTarget) -> Result<(), ProxyError> {
-        validate_frontend_upstream(&upstream)?;
+        self.validate_upstream_update(&upstream)?;
         let target = self.upstream.as_ref().ok_or_else(|| {
             ProxyError::Http("proxy handle does not have a direct upstream".to_string())
         })?;
-        *target
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = upstream;
+        target.update(upstream)
+    }
+
+    pub fn validate_upstream_update(
+        &self,
+        upstream: &lpm_common::LocalTarget,
+    ) -> Result<(), ProxyError> {
+        validate_frontend_upstream(upstream)?;
+        self.upstream.as_ref().ok_or_else(|| {
+            ProxyError::Http("proxy handle does not have a direct upstream".to_string())
+        })?;
         Ok(())
     }
 
     pub fn shutdown(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(true);
         }
     }
 }
@@ -86,7 +156,15 @@ impl HttpProxyHandle {
 impl Drop for HttpProxyHandle {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+            let _ = shutdown.send(true);
+        }
+    }
+}
+
+pub(crate) async fn wait_for_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            break;
         }
     }
 }
@@ -105,24 +183,17 @@ pub fn start_http_proxy_on_listener(
     registry: Arc<tokio::sync::Mutex<RouteRegistry>>,
     listener: tokio::net::TcpListener,
 ) -> Result<HttpProxyHandle, ProxyError> {
-    use axum::Router;
-    use axum::routing::any;
-
     let addr = listener
         .local_addr()
         .map_err(|err| ProxyError::Http(format!("read HTTP proxy bind addr: {err}")))?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let app = Router::new()
-        .fallback(any(proxy_http_request))
-        .with_state(HttpProxyState::new(registry));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = HttpProxyState::new(registry).with_shutdown(shutdown_tx.clone());
 
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
+    tokio::spawn(run_http_listener(
+        listener,
+        HttpFrontendState::Proxy(Arc::new(state)),
+        shutdown_rx,
+    ));
 
     Ok(HttpProxyHandle {
         addr,
@@ -136,26 +207,25 @@ pub fn start_http_frontend_on_listener(
     listener: tokio::net::TcpListener,
     upstream: lpm_common::LocalTarget,
 ) -> Result<HttpProxyHandle, ProxyError> {
-    use axum::Router;
-    use axum::routing::any;
+    start_http_frontend_on_listener_with_upstream(listener, FrontendUpstream::new(upstream)?)
+}
 
-    validate_frontend_upstream(&upstream)?;
+pub fn start_http_frontend_on_listener_with_upstream(
+    listener: tokio::net::TcpListener,
+    upstream: FrontendUpstream,
+) -> Result<HttpProxyHandle, ProxyError> {
     let addr = listener
         .local_addr()
         .map_err(|err| ProxyError::Http(format!("read HTTP frontend bind addr: {err}")))?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let upstream = Arc::new(RwLock::new(upstream));
-    let app = Router::new()
-        .fallback(any(proxy_http_request))
-        .with_state(HttpProxyState::for_upstream(Arc::clone(&upstream), "http"));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state =
+        HttpProxyState::for_upstream(upstream.clone(), "http").with_shutdown(shutdown_tx.clone());
 
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
+    tokio::spawn(run_http_listener(
+        listener,
+        HttpFrontendState::Proxy(Arc::new(state)),
+        shutdown_rx,
+    ));
 
     Ok(HttpProxyHandle {
         addr,
@@ -198,33 +268,92 @@ fn start_http_redirect_on_listener(
     listener: tokio::net::TcpListener,
     https_port: u16,
 ) -> Result<HttpProxyHandle, ProxyError> {
-    use axum::Router;
-    use axum::routing::any;
-
     let addr = listener
         .local_addr()
         .map_err(|err| ProxyError::Http(format!("read HTTP redirect bind addr: {err}")))?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let app = Router::new()
-        .fallback(any(redirect_http_request))
-        .with_state(HttpRedirectState {
-            registry,
-            https_port,
-        });
-
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = HttpFrontendState::Redirect(HttpRedirectState {
+        registry,
+        https_port,
     });
+
+    tokio::spawn(run_http_listener(listener, state, shutdown_rx));
 
     Ok(HttpProxyHandle {
         addr,
         shutdown: Some(shutdown_tx),
         upstream: None,
     })
+}
+
+async fn run_http_listener(
+    listener: tokio::net::TcpListener,
+    state: HttpFrontendState,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let capacity = Arc::new(tokio::sync::Semaphore::new(HTTP_CONNECTION_LIMIT));
+    let mut connections = tokio::task::JoinSet::new();
+
+    loop {
+        while connections.try_join_next().is_some() {}
+        let permit = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            permit = Arc::clone(&capacity).acquire_owned() => {
+                let Ok(permit) = permit else {
+                    break;
+                };
+                permit
+            }
+        };
+        let accepted = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, _)) = accepted else {
+            continue;
+        };
+        let state = state.clone();
+        let mut connection_shutdown = shutdown.clone();
+        connections.spawn(async move {
+            let _permit = permit;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut connection_shutdown) => {}
+                _ = serve_http_connection(stream, state) => {}
+            }
+        });
+    }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+}
+
+async fn serve_http_connection(stream: tokio::net::TcpStream, state: HttpFrontendState) {
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let service =
+        hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+            let state = state.clone();
+            async move {
+                let request = request.map(axum::body::Body::new);
+                let response = match state {
+                    HttpFrontendState::Proxy(state) => proxy_http_request_inner(state, request)
+                        .await
+                        .unwrap_or_else(|response| response),
+                    HttpFrontendState::Redirect(state) => {
+                        redirect_http_request_inner(state, request).await
+                    }
+                };
+                Ok::<_, Infallible>(response)
+            }
+        });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HTTP_HEADER_TIMEOUT)
+        .max_buf_size(HTTP_HEAD_CAP_BYTES);
+    let _ = builder.serve_connection(io, service).with_upgrades().await;
 }
 
 pub(crate) fn format_loopback_bind_error(
@@ -241,8 +370,8 @@ pub(crate) fn format_loopback_bind_error(
     message
 }
 
-async fn redirect_http_request(
-    axum::extract::State(state): axum::extract::State<HttpRedirectState>,
+async fn redirect_http_request_inner(
+    state: HttpRedirectState,
     request: axum::extract::Request,
 ) -> axum::response::Response {
     use axum::http::{StatusCode, header};
@@ -280,18 +409,8 @@ async fn redirect_http_request(
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
 }
 
-async fn proxy_http_request(
-    axum::extract::State(state): axum::extract::State<HttpProxyState>,
-    request: axum::extract::Request,
-) -> axum::response::Response {
-    match proxy_http_request_inner(state, request).await {
-        Ok(response) => response,
-        Err(response) => response,
-    }
-}
-
 pub(crate) async fn proxy_http_request_inner(
-    state: HttpProxyState,
+    state: Arc<HttpProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, axum::response::Response> {
     use axum::body::Body;
@@ -315,19 +434,17 @@ pub(crate) async fn proxy_http_request_inner(
             lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, route.upstream_port)
         })
         .or_else(|| {
-            state.fallback_upstream.as_ref().map(|upstream| {
-                upstream
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            })
+            state
+                .fallback_upstream
+                .as_ref()
+                .map(|upstream| upstream.current())
         });
     let Some(upstream) = upstream else {
         return Err((StatusCode::MISDIRECTED_REQUEST, "unknown local proxy host").into_response());
     };
 
     if is_upgrade_request(request.headers()) {
-        return proxy_upgrade_request(request, upstream, host_header, state.forwarded_proto).await;
+        return proxy_upgrade_request(request, upstream, host_header, state).await;
     }
 
     let (parts, body) = request.into_parts();
@@ -344,7 +461,9 @@ pub(crate) async fn proxy_http_request_inner(
         .uri(upstream_url);
 
     for (name, value) in &parts.headers {
-        if is_forwardable_http_header(name.as_str()) {
+        if is_forwardable_http_header(name.as_str())
+            && !connection_header_nominates(&parts.headers, name)
+        {
             builder = builder.header(name.clone(), value.clone());
         }
     }
@@ -356,18 +475,35 @@ pub(crate) async fn proxy_http_request_inner(
     let upstream_request = builder.body(body).map_err(|_| {
         (StatusCode::BAD_GATEWAY, "failed to build upstream request").into_response()
     })?;
-    let upstream = state.client.request(upstream_request).await.map_err(|_| {
-        (
-            StatusCode::BAD_GATEWAY,
-            "upstream dev server request failed",
-        )
-            .into_response()
-    })?;
+    let upstream = match tokio::time::timeout(
+        state.upstream_header_timeout,
+        state.client.request(upstream_request),
+    )
+    .await
+    {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(_)) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "upstream dev server request failed",
+            )
+                .into_response());
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream dev server response headers timed out",
+            )
+                .into_response());
+        }
+    };
 
     let (upstream_parts, upstream_body) = upstream.into_parts();
     let mut response_builder = axum::http::Response::builder().status(upstream_parts.status);
     for (name, value) in &upstream_parts.headers {
-        if is_forwardable_http_header(name.as_str()) {
+        if is_forwardable_http_header(name.as_str())
+            && !connection_header_nominates(&upstream_parts.headers, name)
+        {
             response_builder = response_builder.header(name.clone(), value.clone());
         }
     }
@@ -380,154 +516,155 @@ async fn proxy_upgrade_request(
     mut request: axum::extract::Request,
     upstream: lpm_common::LocalTarget,
     host_header: String,
-    forwarded_proto: &'static str,
+    state: Arc<HttpProxyState>,
 ) -> Result<axum::response::Response, axum::response::Response> {
     use axum::body::Body;
-    use axum::http::StatusCode;
+    use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
-    use tokio::io::AsyncWriteExt;
 
-    let on_upgrade = hyper::upgrade::on(&mut request);
-    let upstream_request =
-        build_upgrade_request_bytes(&request, &upstream, &host_header, forwarded_proto);
-    let mut upstream_stream = tokio::net::TcpStream::connect((upstream.address, upstream.port))
-        .await
+    let permit = Arc::clone(&state.upgrade_capacity)
+        .try_acquire_owned()
         .map_err(|_| {
             (
-                StatusCode::BAD_GATEWAY,
-                "upstream dev server is not reachable",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "proxy upgrade capacity is exhausted",
             )
                 .into_response()
         })?;
-    upstream_stream
-        .write_all(&upstream_request)
-        .await
-        .map_err(|_| {
-            (StatusCode::BAD_GATEWAY, "upstream upgrade request failed").into_response()
-        })?;
+    let downstream_upgrade = hyper::upgrade::on(&mut request);
+    let requested_upgrade = request
+        .headers()
+        .get(header::UPGRADE)
+        .cloned()
+        .ok_or_else(|| bad_gateway_response("upgrade request is missing its protocol"))?;
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str());
+    let mut upstream_builder = axum::http::Request::builder()
+        .method(request.method())
+        .uri(upstream.upstream_path(path));
+    for (name, value) in request.headers() {
+        if is_forwardable_upgrade_request_header(name.as_str())
+            && !connection_header_nominates(request.headers(), name)
+        {
+            upstream_builder = upstream_builder.header(name, value);
+        }
+    }
+    upstream_builder = upstream_builder
+        .header(header::HOST, upstream.authority())
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, requested_upgrade.clone())
+        .header("x-forwarded-host", host_header)
+        .header("x-forwarded-proto", state.forwarded_proto);
+    let upstream_request = upstream_builder.body(Body::empty()).map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "failed to build upstream upgrade request",
+        )
+            .into_response()
+    })?;
+    let upstream_result = tokio::time::timeout(state.upstream_header_timeout, async {
+        let upstream_stream = tokio::net::TcpStream::connect((upstream.address, upstream.port))
+            .await
+            .map_err(|_| "upstream dev server is not reachable")?;
+        let io = hyper_util::rt::TokioIo::new(upstream_stream);
+        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+            .max_buf_size(HTTP_HEAD_CAP_BYTES)
+            .handshake(io)
+            .await
+            .map_err(|_| "upstream upgrade handshake failed")?;
+        tokio::spawn(async move {
+            let _ = connection.with_upgrades().await;
+        });
+        sender
+            .send_request(upstream_request)
+            .await
+            .map_err(|_| "upstream upgrade request failed")
+    })
+    .await;
+    let mut upstream_response = match upstream_result {
+        Ok(Ok(response)) => response,
+        Ok(Err(message)) => return Err(bad_gateway_response(message)),
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream upgrade response headers timed out",
+            )
+                .into_response());
+        }
+    };
 
-    let (head, leftover) = read_http_head(&mut upstream_stream)
-        .await
-        .map_err(bad_gateway_response)?;
-    let (status, headers) = parse_http_response_head(&head).map_err(bad_gateway_response)?;
-    let mut response_builder = axum::http::Response::builder().status(status);
-    for (name, value) in headers {
-        if is_upgrade_response_header_forwardable(&name) {
+    if upstream_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let (parts, body) = upstream_response.into_parts();
+        let mut response_builder = axum::http::Response::builder().status(parts.status);
+        for (name, value) in &parts.headers {
+            if is_forwardable_http_header(name.as_str())
+                && !connection_header_nominates(&parts.headers, name)
+            {
+                response_builder = response_builder.header(name, value);
+            }
+        }
+        return response_builder.body(Body::new(body)).map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "failed to build declined upgrade response",
+            )
+                .into_response()
+        });
+    }
+
+    let Some(response_upgrade) = upstream_response.headers().get(header::UPGRADE).cloned() else {
+        return Err(bad_gateway_response(
+            "upstream upgrade response is missing its protocol",
+        ));
+    };
+    if !same_upgrade_protocol(&requested_upgrade, &response_upgrade) {
+        return Err(bad_gateway_response(
+            "upstream selected a different upgrade protocol",
+        ));
+    }
+    let upstream_upgrade = hyper::upgrade::on(&mut upstream_response);
+    let (parts, _body) = upstream_response.into_parts();
+    let mut response_builder = axum::http::Response::builder().status(parts.status);
+    for (name, value) in &parts.headers {
+        if is_forwardable_upgrade_response_header(name.as_str())
+            && !connection_header_nominates(&parts.headers, name)
+        {
             response_builder = response_builder.header(name, value);
         }
     }
-
+    response_builder = response_builder
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, response_upgrade);
+    let response = response_builder.body(Body::empty()).map_err(|_| {
+        (StatusCode::BAD_GATEWAY, "failed to build upgrade response").into_response()
+    })?;
+    let mut shutdown = state.shutdown.subscribe();
     tokio::spawn(async move {
-        let Ok(upgraded) = on_upgrade.await else {
-            return;
-        };
-        let mut downstream = hyper_util::rt::TokioIo::new(upgraded);
-        if !leftover.is_empty() && downstream.write_all(&leftover).await.is_err() {
-            return;
+        let _permit = permit;
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {}
+            _ = async {
+                let Ok(downstream_upgraded) = downstream_upgrade.await else {
+                    return;
+                };
+                let Ok(upstream_upgraded) = upstream_upgrade.await else {
+                    return;
+                };
+                let mut downstream = hyper_util::rt::TokioIo::new(downstream_upgraded);
+                let mut upstream = hyper_util::rt::TokioIo::new(upstream_upgraded);
+                let _ = tokio::io::copy_bidirectional(
+                    &mut downstream,
+                    &mut upstream,
+                )
+                .await;
+            } => {}
         }
-        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream_stream).await;
     });
 
-    response_builder
-        .body(Body::empty())
-        .map_err(|_| (StatusCode::BAD_GATEWAY, "failed to build upgrade response").into_response())
-}
-
-fn build_upgrade_request_bytes(
-    request: &axum::extract::Request,
-    upstream: &lpm_common::LocalTarget,
-    host_header: &str,
-    forwarded_proto: &str,
-) -> Vec<u8> {
-    use axum::http::header;
-
-    let request_path = request.uri().path_and_query().map_or("/", |p| p.as_str());
-    let path = upstream.upstream_path(request_path);
-    let mut bytes = Vec::with_capacity(1024);
-    bytes.extend_from_slice(request.method().as_str().as_bytes());
-    bytes.extend_from_slice(b" ");
-    bytes.extend_from_slice(path.as_bytes());
-    bytes.extend_from_slice(b" HTTP/1.1\r\n");
-
-    for (name, value) in request.headers() {
-        if is_forwardable_upgrade_request_header(name.as_str()) {
-            bytes.extend_from_slice(name.as_str().as_bytes());
-            bytes.extend_from_slice(b": ");
-            bytes.extend_from_slice(value.as_bytes());
-            bytes.extend_from_slice(b"\r\n");
-        }
-    }
-
-    bytes.extend_from_slice(b"host: ");
-    bytes.extend_from_slice(upstream.authority().as_bytes());
-    bytes.extend_from_slice(b"\r\nx-forwarded-host: ");
-    bytes.extend_from_slice(host_header.as_bytes());
-    bytes.extend_from_slice(b"\r\nx-forwarded-proto: ");
-    bytes.extend_from_slice(forwarded_proto.as_bytes());
-    bytes.extend_from_slice(b"\r\n");
-    if request.headers().get(header::CONNECTION).is_none() {
-        bytes.extend_from_slice(b"connection: upgrade\r\n");
-    }
-    bytes.extend_from_slice(b"\r\n");
-    bytes
-}
-
-async fn read_http_head(
-    stream: &mut tokio::net::TcpStream,
-) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buffer = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    loop {
-        let read = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|_| "upstream upgrade response failed")?;
-        if read == 0 {
-            return Err("upstream closed before upgrade response");
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if let Some(index) = find_header_end(&buffer) {
-            let body_start = index + 4;
-            let leftover = buffer[body_start..].to_vec();
-            buffer.truncate(body_start);
-            return Ok((buffer, leftover));
-        }
-        if buffer.len() > HTTP_HEAD_CAP_BYTES {
-            return Err("upstream upgrade response headers are too large");
-        }
-    }
-}
-
-fn parse_http_response_head(head: &[u8]) -> Result<ParsedHttpResponseHead, &'static str> {
-    use axum::http::{HeaderName, HeaderValue, StatusCode};
-
-    let text =
-        std::str::from_utf8(head).map_err(|_| "upstream upgrade response was not valid HTTP")?;
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().ok_or("missing upstream upgrade status")?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .and_then(|code| StatusCode::from_u16(code).ok())
-        .ok_or("invalid upstream upgrade status")?;
-    let mut headers = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err("invalid upstream upgrade header");
-        };
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|_| "invalid upstream upgrade header name")?;
-        let value = HeaderValue::from_str(value.trim())
-            .map_err(|_| "invalid upstream upgrade header value")?;
-        headers.push((name, value));
-    }
-    Ok((status, headers))
+    Ok(response)
 }
 
 fn bad_gateway_response(message: &'static str) -> axum::response::Response {
@@ -537,40 +674,73 @@ fn bad_gateway_response(message: &'static str) -> axum::response::Response {
     (StatusCode::BAD_GATEWAY, message).into_response()
 }
 
+#[cfg(test)]
 pub(crate) fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 fn is_forwardable_http_header(name: &str) -> bool {
-    !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "host"
-            | "content-length"
-            | "x-forwarded-host"
-            | "x-forwarded-proto"
-    )
+    ![
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
 fn is_forwardable_upgrade_request_header(name: &str) -> bool {
-    !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "host" | "content-length" | "transfer-encoding" | "x-forwarded-host" | "x-forwarded-proto"
-    )
+    ![
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "host",
+        "content-length",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
 }
 
-fn is_upgrade_response_header_forwardable(name: &axum::http::HeaderName) -> bool {
-    !matches!(
-        name.as_str().to_ascii_lowercase().as_str(),
-        "content-length" | "transfer-encoding"
-    )
+fn is_forwardable_upgrade_response_header(name: &str) -> bool {
+    ![
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "content-length",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+fn connection_header_nominates(
+    headers: &axum::http::HeaderMap,
+    candidate: &axum::http::HeaderName,
+) -> bool {
+    headers
+        .get_all(axum::http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(candidate.as_str()))
 }
 
 fn is_upgrade_request(headers: &axum::http::HeaderMap) -> bool {
@@ -587,4 +757,15 @@ fn header_has_upgrade_token(value: &str) -> bool {
     value
         .split(',')
         .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+}
+
+fn same_upgrade_protocol(
+    requested: &axum::http::HeaderValue,
+    selected: &axum::http::HeaderValue,
+) -> bool {
+    requested
+        .to_str()
+        .ok()
+        .zip(selected.to_str().ok())
+        .is_some_and(|(requested, selected)| requested.trim().eq_ignore_ascii_case(selected.trim()))
 }

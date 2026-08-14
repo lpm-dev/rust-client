@@ -167,21 +167,21 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
     );
     tracing::info!(port = bound_port, "inspector listening on loopback");
 
-    // Spawn the server in a background task
-    tokio::spawn(async move {
+    let server_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
                 tracing::debug!("inspector server shutting down");
             })
             .await
-            .ok();
+            .map_err(|error| LpmError::Tunnel(format!("inspector server failed: {error}")))
     });
 
     Ok(InspectorHandle {
         port: bound_port,
         url,
-        shutdown_tx,
+        shutdown_tx: Some(shutdown_tx),
+        server_task,
     })
 }
 
@@ -214,7 +214,7 @@ mod server_tests {
             "url {} should embed the auth token",
             handle.url
         );
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     /// Two simultaneous auto-pick starts must each get a distinct free port —
@@ -224,8 +224,8 @@ mod server_tests {
         let h1 = start(InspectorState::new(0), 0).await.unwrap();
         let h2 = start(InspectorState::new(0), 0).await.unwrap();
         assert_ne!(h1.port, h2.port);
-        h1.shutdown();
-        h2.shutdown();
+        h1.shutdown().await.unwrap();
+        h2.shutdown().await.unwrap();
     }
 
     /// Explicit non-zero port is bound exactly. Re-binding the same explicit
@@ -248,7 +248,7 @@ mod server_tests {
         let err = match start(InspectorState::new(0), chosen).await {
             Err(e) => e,
             Ok(handle) => {
-                handle.shutdown();
+                handle.shutdown().await.unwrap();
                 panic!("second explicit bind on same port must fail");
             }
         };
@@ -262,6 +262,35 @@ mod server_tests {
             "expected remediation hint, got: {msg}"
         );
 
-        h1.shutdown();
+        h1.shutdown().await.unwrap();
+
+        let rebound = start(InspectorState::new(0), chosen)
+            .await
+            .expect("shutdown must release the explicit inspector port before returning");
+        rebound.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspector_shutdown_propagates_the_server_task_failure() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        drop(shutdown_rx);
+        let handle = InspectorHandle {
+            port: 0,
+            url: String::new(),
+            shutdown_tx: Some(shutdown_tx),
+            server_task: tokio::spawn(async {
+                Err(LpmError::Tunnel(
+                    "injected inspector serve failure".to_string(),
+                ))
+            }),
+        };
+
+        let error = handle.shutdown().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected inspector serve failure")
+        );
     }
 }

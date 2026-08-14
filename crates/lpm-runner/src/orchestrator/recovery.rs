@@ -1,12 +1,14 @@
 use super::{
-    EndpointChangedCallback, InitialReadinessOptions, MAX_RESTART_ATTEMPTS, OrchestratorCommand,
-    OrchestratorEvent, RED, RESET, ServicePortMap, ServiceStatus, YELLOW,
-    command_with_managed_port, send_status, service_ready_port, spawn_output_readers,
-    ui_readiness_timing, ui_service_note, ui_service_status, wait_for_initial_service_readiness,
+    AllReadyCallback, EndpointChangedCallback, InitialReadinessOptions, MAX_RESTART_ATTEMPTS,
+    OrchestratorCommand, OrchestratorCommandController, OrchestratorEvent, OutputReaderOptions,
+    RED, RESET, ServiceEndpointMap, ServicePortMap, ServiceStatus, YELLOW,
+    command_with_managed_port, invoke_all_ready_callback, send_status, service_ready_port,
+    spawn_output_readers, terminate_service_tree, ui_readiness_timing, ui_service_note,
+    ui_service_status, wait_for_initial_service_readiness,
 };
-use crate::dev_endpoint::ListenerSnapshot;
+use crate::dev_endpoint::DevEndpoint;
 use crate::lpm_json::ServiceConfig;
-use crate::{ports, service_graph};
+use crate::service_graph;
 use lpm_common::{LpmError, sanitize_terminal_inline};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +16,6 @@ use std::path::Path;
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -43,20 +44,90 @@ struct ServiceRuntimeState {
     last_failure: Option<Instant>,
 }
 
+struct EndpointPublication<'a> {
+    initial_complete: bool,
+    initial_endpoints: ServiceEndpointMap,
+    on_all_ready: Option<AllReadyCallback>,
+    on_endpoint_changed: Option<&'a EndpointChangedCallback>,
+}
+
+impl EndpointPublication<'_> {
+    fn service_ready(
+        &mut self,
+        states: &HashMap<String, ServiceRuntimeState>,
+        name: &str,
+        endpoint: Option<DevEndpoint>,
+    ) -> Result<(), LpmError> {
+        if self.initial_complete {
+            if let (Some(callback), Some(endpoint)) = (self.on_endpoint_changed, endpoint) {
+                invoke_endpoint_changed_callback(callback, endpoint)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(endpoint) = endpoint {
+            self.initial_endpoints.insert(name.to_string(), endpoint);
+        } else {
+            self.initial_endpoints.remove(name);
+        }
+
+        if states
+            .values()
+            .all(|state| state.goal != ServiceGoal::Running || state.is_ready())
+        {
+            self.initial_endpoints.retain(|service, _| {
+                states
+                    .get(service)
+                    .is_some_and(ServiceRuntimeState::is_ready)
+            });
+            self.initial_complete = true;
+            if let Some(callback) = self.on_all_ready.take() {
+                invoke_all_ready_callback(callback, std::mem::take(&mut self.initial_endpoints))?;
+            } else {
+                self.initial_endpoints.clear();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn invoke_endpoint_changed_callback(
+    callback: &EndpointChangedCallback,
+    endpoint: DevEndpoint,
+) -> Result<(), LpmError> {
+    std::thread::scope(
+        |scope| match scope.spawn(move || callback(endpoint)).join() {
+            Ok(result) => result,
+            Err(_) => Err(LpmError::Script(
+                "endpoint-changed callback panicked".to_string(),
+            )),
+        },
+    )
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RestartDecision {
     Scheduled { delay_secs: u64, attempt: u32 },
     Exhausted,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RestartRunOutcome {
+    Settled,
+    Superseded,
+}
+
 impl ServiceRuntimeState {
-    fn initial(ready: bool) -> Self {
+    fn initial(ready: bool, spawned: bool, now: Instant) -> Self {
         Self {
             goal: ServiceGoal::Running,
             phase: if ready {
                 ServicePhase::Ready
-            } else {
+            } else if spawned {
                 ServicePhase::Starting
+            } else {
+                ServicePhase::RestartScheduled(now)
             },
             restart_attempts: 0,
             last_failure: None,
@@ -92,19 +163,39 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) children: &'a Arc<Mutex<Vec<(String, Child)>>>,
     pub(super) shutdown_state: &'a Arc<AtomicU8>,
     pub(super) event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
-    pub(super) command_rx: Option<&'a Receiver<OrchestratorCommand>>,
+    pub(super) command_controller: Option<&'a OrchestratorCommandController>,
+    pub(super) initial_publication_complete: bool,
+    pub(super) initial_endpoints: ServiceEndpointMap,
+    pub(super) on_all_ready: Option<AllReadyCallback>,
     pub(super) on_endpoint_changed: Option<&'a EndpointChangedCallback>,
     pub(super) extra_envs: &'a [(String, String)],
 }
 
-pub(super) fn supervise_services(context: RecoveryContext<'_>) -> Result<(), LpmError> {
+pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(), LpmError> {
+    let mut publication = EndpointPublication {
+        initial_complete: context.initial_publication_complete,
+        initial_endpoints: std::mem::take(&mut context.initial_endpoints),
+        on_all_ready: context.on_all_ready.take(),
+        on_endpoint_changed: context.on_endpoint_changed,
+    };
+    let spawned: HashSet<String> = context
+        .children
+        .lock()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let now = Instant::now();
     let mut states: HashMap<String, ServiceRuntimeState> = context
         .service_names
         .iter()
         .map(|name| {
             (
                 name.clone(),
-                ServiceRuntimeState::initial(context.initial_ready.contains(name)),
+                ServiceRuntimeState::initial(
+                    context.initial_ready.contains(name),
+                    spawned.contains(name),
+                    now,
+                ),
             )
         })
         .collect();
@@ -118,10 +209,9 @@ pub(super) fn supervise_services(context: RecoveryContext<'_>) -> Result<(), Lpm
             handle_service_exit(&context, &mut states, &name, status);
         }
 
-        resume_waiting_services(&context, &mut states);
-        process_due_restarts(&context, &mut states)?;
-        resume_waiting_services(&context, &mut states);
         process_commands(&context, &mut states);
+        resume_waiting_services(&context, &mut states);
+        process_due_restarts(&context, &mut states, &mut publication)?;
         resume_waiting_services(&context, &mut states);
 
         let has_children = !context.children.lock().is_empty();
@@ -145,7 +235,8 @@ fn collect_exited_children(
     while index < locked.len() {
         match locked[index].1.try_wait() {
             Ok(Some(status)) => {
-                let (name, _) = locked.remove(index);
+                let (name, child) = locked.remove(index);
+                super::cleanup_exited_service_tree(child.id());
                 exited.push((name, status));
             }
             Ok(None) | Err(_) => index += 1,
@@ -366,7 +457,7 @@ fn terminate_service(children: &Arc<Mutex<Vec<(String, Child)>>>, name: &str) {
             .map(|position| locked.remove(position).1)
     };
     if let Some(mut child) = child {
-        let _ = ports::terminate_child_process_tree(&mut child);
+        terminate_service_tree(&mut child);
     }
 }
 
@@ -445,6 +536,7 @@ fn first_unready_dependency_for(
 fn process_due_restarts(
     context: &RecoveryContext<'_>,
     states: &mut HashMap<String, ServiceRuntimeState>,
+    publication: &mut EndpointPublication<'_>,
 ) -> Result<(), LpmError> {
     let now = Instant::now();
     let due: Vec<String> = context
@@ -460,15 +552,43 @@ fn process_due_restarts(
         .cloned()
         .collect();
 
+    process_restart_batch(due, states, restart_is_due, |states, name| {
+        loop {
+            if context.shutdown_state.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            if !restart_is_due(states, name) {
+                break;
+            }
+            if let Some(dependency) = first_unready_dependency(context, states, name) {
+                wait_for_dependency(context, states, name, dependency);
+                break;
+            }
+            if restart_service(context, states, publication, name)? == RestartRunOutcome::Settled {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn restart_is_due(states: &HashMap<String, ServiceRuntimeState>, name: &str) -> bool {
+    states.get(name).is_some_and(|state| {
+        state.goal == ServiceGoal::Running
+            && matches!(state.phase, ServicePhase::RestartScheduled(at) if Instant::now() >= at)
+    })
+}
+
+fn process_restart_batch<State, Error>(
+    due: Vec<String>,
+    state: &mut State,
+    is_current: impl Fn(&State, &str) -> bool,
+    mut process: impl FnMut(&mut State, &str) -> Result<(), Error>,
+) -> Result<(), Error> {
     for name in due {
-        if context.shutdown_state.load(Ordering::Relaxed) > 0 {
-            break;
+        if is_current(state, &name) {
+            process(state, &name)?;
         }
-        if let Some(dependency) = first_unready_dependency(context, states, &name) {
-            wait_for_dependency(context, states, &name, dependency);
-            continue;
-        }
-        restart_service(context, states, &name)?;
     }
     Ok(())
 }
@@ -504,10 +624,14 @@ fn waiting_status(dependency: &str) -> ServiceStatus {
 fn restart_service(
     context: &RecoveryContext<'_>,
     states: &mut HashMap<String, ServiceRuntimeState>,
+    publication: &mut EndpointPublication<'_>,
     name: &str,
-) -> Result<(), LpmError> {
+) -> Result<RestartRunOutcome, LpmError> {
+    if !restart_is_due(states, name) {
+        return Ok(RestartRunOutcome::Settled);
+    }
     let Some(config) = context.active_services.get(name) else {
-        return Ok(());
+        return Ok(RestartRunOutcome::Settled);
     };
     if let Some(state) = states.get_mut(name) {
         state.phase = ServicePhase::Starting;
@@ -524,7 +648,7 @@ fn restart_service(
             Ok(path) => path,
             Err(error) => {
                 report_restart_failure(context, states, name, &error.to_string(), false);
-                return Ok(());
+                return Ok(RestartRunOutcome::Settled);
             }
         }
     } else {
@@ -551,16 +675,15 @@ fn restart_service(
             Ok(path) => path,
             Err(error) => {
                 report_restart_failure(context, states, name, &error.to_string(), false);
-                return Ok(());
+                return Ok(RestartRunOutcome::Settled);
             }
         };
     let assigned_port = context.port_map.get(name).copied();
-    let listener_baseline = assigned_port.map(|_| ListenerSnapshot::capture());
     let mut command = match crate::shell::shell_process(&service_command) {
         Ok(command) => command,
         Err(error) => {
             report_restart_failure(context, states, name, &error.to_string(), false);
-            return Ok(());
+            return Ok(RestartRunOutcome::Settled);
         }
     };
     command
@@ -574,14 +697,16 @@ fn restart_service(
         command.env(key, value);
     }
 
-    let new_child = match command.spawn() {
+    let mut new_child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             report_restart_failure(context, states, name, &error.to_string(), false);
-            return Ok(());
+            return Ok(RestartRunOutcome::Settled);
         }
     };
     let child_pid = new_child.id();
+    let child_stdout = new_child.stdout.take();
+    let child_stderr = new_child.stderr.take();
     context.children.lock().push((name.to_string(), new_child));
 
     let service_index = context
@@ -591,39 +716,56 @@ fn restart_service(
         .unwrap_or(0);
     let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
     spawn_output_readers(
-        name,
-        context.color_map.get(name).copied().unwrap_or(RESET),
-        service_index,
-        context.children,
-        context.shutdown_state,
-        context.event_tx,
-        Some(endpoint_tx),
+        child_stdout,
+        child_stderr,
+        OutputReaderOptions {
+            name,
+            color: context.color_map.get(name).copied().unwrap_or(RESET),
+            service_index,
+            shutdown_state: context.shutdown_state,
+            event_tx: context.event_tx,
+            endpoint_tx: Some(endpoint_tx),
+        },
     );
 
-    let readiness = wait_for_initial_service_readiness(InitialReadinessOptions {
-        service_dir: &cwd,
-        root_pid: child_pid,
-        baseline: listener_baseline.as_ref(),
-        assigned_port,
-        candidates: &endpoint_rx,
-        ready_url: config.ready_url.clone(),
-        ready_port: service_ready_port(config, assigned_port),
-        timeout_secs: config.ready_timeout,
-    });
+    let mut restart_superseded = false;
+    let ready_url = config.ready_url.clone();
+    let ready_port = service_ready_port(config, assigned_port);
+    let readiness_requires_running_process =
+        assigned_port.is_some() || ready_url.is_some() || ready_port.is_some();
+    let readiness = wait_for_initial_service_readiness(
+        InitialReadinessOptions {
+            service_dir: &cwd,
+            root_pid: child_pid,
+            assigned_port,
+            candidates: &endpoint_rx,
+            ready_url,
+            ready_port,
+            timeout_secs: config.ready_timeout,
+        },
+        || {
+            process_commands(context, states);
+            restart_superseded = states.get(name).is_some_and(|state| {
+                state.goal == ServiceGoal::Running
+                    && matches!(state.phase, ServicePhase::RestartScheduled(_))
+            });
+            context.shutdown_state.load(Ordering::Relaxed) > 0
+                || (readiness_requires_running_process
+                    && super::service_exit_status(context.children, name).is_some())
+                || !states.get(name).is_some_and(|state| {
+                    state.goal == ServiceGoal::Running && state.phase == ServicePhase::Starting
+                })
+        },
+    );
 
     match readiness {
         Ok(mut readiness) => {
             if let Some(status) = take_exited_service(context.children, name) {
                 handle_service_exit(context, states, name, status);
-                return Ok(());
+                return Ok(RestartRunOutcome::Settled);
             }
             if let Some(endpoint) = &mut readiness.endpoint {
                 endpoint.service = Some(name.to_string());
-            }
-            if let (Some(callback), Some(endpoint)) =
-                (context.on_endpoint_changed, readiness.endpoint)
-            {
-                callback(endpoint)?;
             }
             if let Some(state) = states.get_mut(name) {
                 state.goal = ServiceGoal::Running;
@@ -643,14 +785,26 @@ fn restart_service(
                 name,
                 ServiceStatus::Ready,
             );
+            publication.service_ready(states, name, readiness.endpoint)?;
         }
         Err(error) => {
+            if context.shutdown_state.load(Ordering::Relaxed) > 0
+                || !states.get(name).is_some_and(|state| {
+                    state.goal == ServiceGoal::Running && state.phase == ServicePhase::Starting
+                })
+            {
+                return Ok(if restart_superseded {
+                    RestartRunOutcome::Superseded
+                } else {
+                    RestartRunOutcome::Settled
+                });
+            }
             terminate_service(context.children, name);
             report_restart_failure(context, states, name, &error, true);
         }
     }
 
-    Ok(())
+    Ok(RestartRunOutcome::Settled)
 }
 
 fn take_exited_service(
@@ -662,7 +816,8 @@ fn take_exited_service(
         .iter()
         .position(|(service_name, _)| service_name == name)?;
     let status = locked[position].1.try_wait().ok().flatten()?;
-    locked.remove(position);
+    let (_, child) = locked.remove(position);
+    super::cleanup_exited_service_tree(child.id());
     Some(status)
 }
 
@@ -696,16 +851,16 @@ fn process_commands(
     context: &RecoveryContext<'_>,
     states: &mut HashMap<String, ServiceRuntimeState>,
 ) {
-    let Some(command_rx) = context.command_rx else {
+    let Some(command_controller) = context.command_controller else {
         return;
     };
-    loop {
-        match command_rx.try_recv() {
-            Ok(OrchestratorCommand::StopAll) => {
+    for command in command_controller.drain() {
+        match command {
+            OrchestratorCommand::StopAll => {
                 context.shutdown_state.store(1, Ordering::Relaxed);
                 break;
             }
-            Ok(OrchestratorCommand::StopService(index)) => {
+            OrchestratorCommand::StopService(index) => {
                 if let Some(name) = context.service_names.get(index) {
                     stop_dependents(context, states, name, true, "stopped by user");
                     terminate_service(context.children, name);
@@ -722,7 +877,7 @@ fn process_commands(
                     );
                 }
             }
-            Ok(OrchestratorCommand::RestartService(index)) => {
+            OrchestratorCommand::RestartService(index) => {
                 if let Some(name) = context.service_names.get(index) {
                     reactivate_blocked_dependents(context, states, name);
                     stop_dependents(context, states, name, true, "restarting");
@@ -741,11 +896,6 @@ fn process_commands(
                     }
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                context.shutdown_state.store(1, Ordering::Relaxed);
-                break;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => break,
         }
     }
 }
@@ -770,6 +920,59 @@ fn reactivate_blocked_dependents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restarted_endpoint_callback_runs_outside_the_orchestrator_thread() {
+        let orchestrator_thread = std::thread::current().id();
+        let callback: EndpointChangedCallback = Box::new(move |_| {
+            assert_ne!(std::thread::current().id(), orchestrator_thread);
+            Ok(())
+        });
+        let mut publication = EndpointPublication {
+            initial_complete: true,
+            initial_endpoints: ServiceEndpointMap::new(),
+            on_all_ready: None,
+            on_endpoint_changed: Some(&callback),
+        };
+        let endpoint = DevEndpoint {
+            target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3000),
+            owner_pid: None,
+            owner_identity: None,
+            service: Some("web".to_string()),
+        };
+
+        publication
+            .service_ready(&HashMap::new(), "web", Some(endpoint))
+            .unwrap();
+    }
+
+    #[test]
+    fn restarted_endpoint_callback_panic_is_reported_as_an_error() {
+        let callback: EndpointChangedCallback =
+            Box::new(|_| panic!("injected endpoint callback panic"));
+        let mut publication = EndpointPublication {
+            initial_complete: true,
+            initial_endpoints: ServiceEndpointMap::new(),
+            on_all_ready: None,
+            on_endpoint_changed: Some(&callback),
+        };
+        let endpoint = DevEndpoint {
+            target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3000),
+            owner_pid: None,
+            owner_identity: None,
+            service: Some("web".to_string()),
+        };
+
+        let error = publication
+            .service_ready(&HashMap::new(), "web", Some(endpoint))
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("endpoint-changed callback panicked")
+        );
+    }
 
     #[test]
     fn stable_service_resets_restart_attempts_before_scheduling() {
@@ -823,19 +1026,78 @@ mod tests {
     }
 
     #[test]
+    fn stale_restart_batch_does_not_process_a_service_stopped_by_an_earlier_restart() {
+        let mut running = HashMap::from([("a".to_string(), true), ("b".to_string(), true)]);
+        let mut processed = Vec::new();
+
+        process_restart_batch(
+            vec!["a".to_string(), "b".to_string()],
+            &mut running,
+            |running, name| running.get(name).copied().unwrap_or(false),
+            |running, name| {
+                processed.push(name.to_string());
+                if name == "a" {
+                    running.insert("b".to_string(), false);
+                }
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(processed, vec!["a"]);
+    }
+
+    #[test]
     fn service_waits_until_every_direct_dependency_is_ready() {
         let config = ServiceConfig {
             depends_on: vec!["cache".to_string(), "db".to_string()],
             ..Default::default()
         };
+        let now = Instant::now();
         let states = HashMap::from([
-            ("cache".to_string(), ServiceRuntimeState::initial(true)),
-            ("db".to_string(), ServiceRuntimeState::initial(false)),
+            (
+                "cache".to_string(),
+                ServiceRuntimeState::initial(true, true, now),
+            ),
+            (
+                "db".to_string(),
+                ServiceRuntimeState::initial(false, true, now),
+            ),
         ]);
 
         let dependency = first_unready_dependency_for(&config, &states);
 
         assert_eq!(dependency.as_deref(), Some("db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn taking_an_exited_service_cleans_its_surviving_process_group() {
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("trap '' TERM; sleep 60 & exit 1");
+        super::super::isolate_service_process_tree(&mut command);
+        let child = command.spawn().unwrap();
+        let root_pid = child.id();
+        children.lock().push(("worker".to_string(), child));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = take_exited_service(&children, "worker") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "root process did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(!status.success());
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while super::super::service_process_group_exists(root_pid)
+            && Instant::now() < cleanup_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!super::super::service_process_group_exists(root_pid));
     }
 
     #[test]

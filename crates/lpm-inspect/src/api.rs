@@ -511,8 +511,17 @@ pub async fn list_sessions(
         tracing::warn!("sessions query error: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    let items: Vec<SessionSummary> = sessions.into_iter().map(SessionSummary::from).collect();
+    let mut items: Vec<SessionSummary> = sessions.into_iter().map(SessionSummary::from).collect();
+    if let Some(current_id) = state.current_session_id()
+        && !items.iter().any(|session| session.id == current_id)
+        && let Some(current) = db
+            .get_stored_session_including_pending(&current_id)
+            .await
+            .map_err(database_error)?
+    {
+        items.insert(0, SessionSummary::from(current));
+        items.truncate(50);
+    }
     Ok(Json(items))
 }
 
@@ -523,14 +532,7 @@ pub async fn get_session(
 ) -> Result<Json<SessionDetailResponse>, StatusCode> {
     let db = state.db().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let session = db
-        .get_session(&id)
-        .await
-        .map_err(|e| {
-            tracing::warn!("session query error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let session = visible_session(&state, db, &id).await?;
 
     // Compute duration from timestamps
     let duration_display =
@@ -567,6 +569,7 @@ pub async fn list_session_requests(
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ListRequestsResponse>, StatusCode> {
     let db = state.db().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    visible_session(&state, db, &id).await?;
 
     let limit = params.limit.unwrap_or(50).min(500);
     let offset = params.offset.unwrap_or(0);
@@ -595,6 +598,7 @@ pub async fn rename_session(
     Json(body): Json<RenameSessionBody>,
 ) -> Result<StatusCode, StatusCode> {
     let db = state.db().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    visible_session(&state, db, &id).await?;
 
     if body.name.len() > 200 {
         return Err(StatusCode::BAD_REQUEST);
@@ -922,6 +926,20 @@ async fn load_webhook(
 fn database_error(error: rusqlite::Error) -> StatusCode {
     tracing::warn!("inspector database read failed: {error}");
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+async fn visible_session(
+    state: &InspectorState,
+    db: &crate::db::InspectorDb,
+    id: &str,
+) -> Result<crate::db::SessionDetail, StatusCode> {
+    let session = if state.current_session_id().as_deref() == Some(id) {
+        db.get_session_including_pending(id).await
+    } else {
+        db.get_session(id).await
+    }
+    .map_err(database_error)?;
+    session.ok_or(StatusCode::NOT_FOUND)
 }
 
 impl From<crate::db::StoredSession> for SessionSummary {

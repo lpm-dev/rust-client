@@ -148,10 +148,6 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "the persist method belongs to L4Cache and delegates to the shared secure writer",
     ),
     (
-        "crates/lpm-cert/src/rotate.rs::stage_and_run",
-        "promotes certificate and key staging files that were themselves installed by the shared secure writer",
-    ),
-    (
         "crates/lpm-cli/src/commands/cache_prune.rs::remove_via_prune_tombstone",
         "moves an orphan into a randomized tombstone before recursive deletion",
     ),
@@ -166,6 +162,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
         "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
         "NamedTempFile exclusively creates a randomized sibling before persist",
+    ),
+    (
+        "crates/lpm-runner/src/dev_session.rs::commit_reversible_with_directory_sync",
+        "publishes a randomized same-directory staging file installed by the shared secure writer and retains the prior record for rollback",
     ),
     (
         "crates/lpm-cli/src/commands/run/single.rs::recover_managed_runtime",

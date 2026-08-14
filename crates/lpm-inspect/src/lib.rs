@@ -57,17 +57,23 @@ pub async fn start(
 
 /// Handle to a running inspector server.
 ///
-/// Dropping the handle does NOT stop the server — call [`InspectorHandle::shutdown`]
-/// explicitly for graceful shutdown.
+/// Call [`InspectorHandle::shutdown`] to wait for graceful shutdown and surface
+/// any server failure.
 pub struct InspectorHandle {
     pub port: u16,
     pub url: String,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_task: tokio::task::JoinHandle<Result<(), lpm_common::LpmError>>,
 }
 
 impl InspectorHandle {
-    /// Signal the server to shut down gracefully.
-    pub fn shutdown(self) {
-        let _ = self.shutdown_tx.send(());
+    /// Stop the server gracefully and wait until its listener is closed.
+    pub async fn shutdown(mut self) -> Result<(), lpm_common::LpmError> {
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        self.server_task.await.map_err(|error| {
+            lpm_common::LpmError::Tunnel(format!("inspector server task failed: {error}"))
+        })?
     }
 }
