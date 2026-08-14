@@ -11,6 +11,9 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
+const WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS: [u64; 6] = [0, 50, 150, 450, 1_350, 4_050];
+
+#[cfg(windows)]
 pub(crate) mod windows_security {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use std::os::windows::io::AsRawHandle as _;
@@ -415,9 +418,9 @@ impl GlobalCaDirectory {
 
     pub(crate) fn remove(&self, name: &str) -> Result<(), LpmError> {
         reject_linked_global_entry(&self.dir, name, &self.path)?;
-        match self.dir.remove_file(name) {
-            Ok(()) => sync_directory(&self.dir),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        match remove_relative_file(&self.dir, name) {
+            Ok(true) => sync_directory(&self.dir),
+            Ok(false) => Ok(()),
             Err(error) => Err(LpmError::Cert(format!(
                 "failed to remove global certificate path {}: {error}",
                 self.path(name).display()
@@ -981,9 +984,9 @@ fn read_pair_transaction(
 }
 
 fn remove_pair_transaction(dir: &Dir, journal_name: &str) -> Result<(), LpmError> {
-    match dir.remove_file(journal_name) {
-        Ok(()) => sync_directory(dir),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    match remove_relative_file(dir, journal_name) {
+        Ok(true) => sync_directory(dir),
+        Ok(false) => Ok(()),
         Err(error) => Err(LpmError::Cert(format!(
             "failed to remove certificate pair transaction: {error}"
         ))),
@@ -1109,9 +1112,8 @@ fn restore_relative_file(
                 ))
             })
         }
-        None => match dir.remove_file(destination) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        None => match remove_relative_file(dir, destination) {
+            Ok(_) => Ok(()),
             Err(error) => Err(LpmError::Cert(format!(
                 "failed to remove newly created project certificate path {destination}: {error}"
             ))),
@@ -1426,6 +1428,46 @@ fn create_temporary(dir: &Dir, mode: u32) -> Result<(String, cap_std::fs::File),
     )))
 }
 
+fn remove_relative_file(dir: &Dir, name: &str) -> std::io::Result<bool> {
+    #[cfg(not(windows))]
+    {
+        match dir.remove_file(name) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(windows)]
+    {
+        for (attempt, delay_ms) in WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.iter().enumerate() {
+            if *delay_ms != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+            }
+            match dir.remove_file(name) {
+                Ok(()) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error)
+                    if is_transient_windows_file_operation_error(&error)
+                        && attempt + 1 < WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.len() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "certificate file removal retry loop exhausted",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn is_transient_windows_file_operation_error(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    matches!(
+        error.raw_os_error().map(|code| code as u32),
+        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
+    )
+}
+
 fn replace_relative_file(
     dir: &Dir,
     source: &str,
@@ -1445,9 +1487,7 @@ fn replace_relative_file(
         use windows_sys::Wdk::Storage::FileSystem::{
             FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
         };
-        use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError,
-        };
+        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
         use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
         let _ = source;
@@ -1479,9 +1519,9 @@ fn replace_relative_file(
                 destination.len(),
             );
         }
-        for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
-            if delay_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        for (attempt, delay_ms) in WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.iter().enumerate() {
+            if *delay_ms != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
             }
             let mut io_status = IO_STATUS_BLOCK::default();
             let status = unsafe {
@@ -1501,11 +1541,8 @@ fn replace_relative_file(
             // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
             let error =
                 std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
-            let raw = error.raw_os_error().map(|code| code as u32);
-            if !matches!(
-                raw,
-                Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
-            ) || delay_ms == 4_050
+            if !is_transient_windows_file_operation_error(&error)
+                || attempt + 1 == WINDOWS_FILE_OPERATION_RETRY_DELAYS_MS.len()
             {
                 return Err(error);
             }
@@ -1809,6 +1846,35 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(project.join(".lpm/certs").is_dir());
         assert!(!displaced.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_file_removal_retries_until_windows_delete_sharing_is_released() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("locked.pem");
+        std::fs::write(&path, b"certificate").unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(locked);
+        });
+        started_rx.recv().unwrap();
+        let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
+
+        assert!(remove_relative_file(&dir, "locked.pem").unwrap());
+
+        release.join().unwrap();
+        assert!(!path.exists());
     }
 
     #[cfg(windows)]
