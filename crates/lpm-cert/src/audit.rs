@@ -243,12 +243,21 @@ fn configured_audit_dir() -> Result<AuditDirectoryLocation, LpmError> {
             components,
         });
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Cert("could not determine home directory for audit log".into()))?;
+    let root = lpm_common::LpmRoot::from_env()?;
+    let root = std::path::absolute(root.root()).map_err(LpmError::Io)?;
+    let root_name = root
+        .file_name()
+        .ok_or_else(|| LpmError::Cert("LPM_HOME must name a directory".into()))?;
+    let base = root.parent().ok_or_else(|| {
+        LpmError::Cert(format!(
+            "LPM_HOME has no parent directory: {}",
+            root.display()
+        ))
+    })?;
     Ok(AuditDirectoryLocation {
-        path: home.join(".lpm/audit"),
-        base: home,
-        components: vec![".lpm".into(), "audit".into()],
+        path: root.join("audit"),
+        base: base.to_path_buf(),
+        components: vec![root_name.to_os_string(), "audit".into()],
     })
 }
 
@@ -736,6 +745,19 @@ mod tests {
         });
     }
 
+    #[test]
+    fn audit_log_follows_lpm_home_override() {
+        let _serial = serial_lock();
+        let root = tempfile::tempdir().unwrap();
+        let _audit_override = EnvGuard::remove(AUDIT_DIR_ENV);
+        let _lpm_home = EnvGuard::set("LPM_HOME", root.path());
+
+        assert_eq!(
+            audit_log_path().unwrap(),
+            root.path().join("audit/cert.jsonl")
+        );
+    }
+
     #[cfg(all(debug_assertions, unix))]
     #[test]
     fn append_tightens_an_existing_audit_log_to_owner_only() {
@@ -785,6 +807,12 @@ mod tests {
         fn set<P: AsRef<std::ffi::OsStr>>(key: &'static str, value: P) -> Self {
             let prev = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, prev }
         }
     }

@@ -268,9 +268,8 @@ fn validate_temporary_filename(name: &str) -> Result<&str, LpmError> {
 
 /// Directory for the global root CA: `~/.lpm/certs/`
 pub fn ca_dir() -> Result<PathBuf, LpmError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Cert("could not determine home directory".into()))?;
-    Ok(home.join(".lpm").join("certs"))
+    let root = lpm_common::LpmRoot::from_env()?;
+    Ok(root.root().join("certs"))
 }
 
 /// Path to the root CA certificate: `~/.lpm/certs/rootCA.pem`
@@ -375,27 +374,13 @@ impl GlobalCaDirectory {
         write_pair_transaction(&self.dir, GLOBAL_PAIR_TRANSACTION, &transaction)?;
 
         let result = (|| -> Result<(), LpmError> {
-            replace_relative_file(
-                &self.dir,
-                &staged_cert.name,
-                cert_name,
-                staged_cert.file.try_clone().map_err(|error| {
-                    LpmError::Cert(format!("failed to retain staged CA certificate: {error}"))
-                })?,
-            )
-            .map_err(|error| {
-                LpmError::Cert(format!("failed to replace CA certificate: {error}"))
-            })?;
+            replace_relative_file(&self.dir, &staged_cert.name, cert_name, staged_cert.file)
+                .map_err(|error| {
+                    LpmError::Cert(format!("failed to replace CA certificate: {error}"))
+                })?;
             after_cert_replace()?;
-            replace_relative_file(
-                &self.dir,
-                &staged_key.name,
-                key_name,
-                staged_key.file.try_clone().map_err(|error| {
-                    LpmError::Cert(format!("failed to retain staged CA key: {error}"))
-                })?,
-            )
-            .map_err(|error| LpmError::Cert(format!("failed to replace CA key: {error}")))?;
+            replace_relative_file(&self.dir, &staged_key.name, key_name, staged_key.file)
+                .map_err(|error| LpmError::Cert(format!("failed to replace CA key: {error}")))?;
             sync_directory(&self.dir)?;
             Ok(())
         })();
@@ -683,32 +668,58 @@ fn fingerprint_lock_suffix(fingerprint: &[u8; 32]) -> String {
 }
 
 pub(crate) fn open_global_ca_directory(create: bool) -> Result<GlobalCaDirectory, LpmError> {
-    let home_path = dirs::home_dir()
-        .ok_or_else(|| LpmError::Cert("could not determine home directory".into()))?;
-    open_global_ca_directory_at(home_path, create)
+    let root = lpm_common::LpmRoot::from_env()?;
+    open_global_ca_directory_at_lpm_root(root.root().to_path_buf(), create)
 }
 
+#[cfg(test)]
 fn open_global_ca_directory_at(
     home_path: PathBuf,
     create: bool,
 ) -> Result<GlobalCaDirectory, LpmError> {
-    let home =
-        Dir::open_ambient_dir(&home_path, cap_std::ambient_authority()).map_err(|error| {
+    open_global_ca_directory_at_lpm_root(home_path.join(".lpm"), create)
+}
+
+fn open_global_ca_directory_at_lpm_root(
+    lpm_root_path: PathBuf,
+    create: bool,
+) -> Result<GlobalCaDirectory, LpmError> {
+    let lpm_root_path = std::path::absolute(lpm_root_path).map_err(LpmError::Io)?;
+    let root_name = lpm_root_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| LpmError::Cert("LPM_HOME must name a directory".into()))?;
+    let parent_path = lpm_root_path.parent().ok_or_else(|| {
+        LpmError::Cert(format!(
+            "LPM_HOME has no parent directory: {}",
+            lpm_root_path.display()
+        ))
+    })?;
+    if create {
+        std::fs::create_dir_all(parent_path).map_err(|error| {
             LpmError::Cert(format!(
-                "failed to open home directory {}: {error}",
-                home_path.display()
+                "failed to create LPM_HOME parent directory {}: {error}",
+                parent_path.display()
             ))
         })?;
-    let Some(lpm) = open_or_create_directory(&home, ".lpm", create, "~/.lpm")? else {
+    }
+    let parent =
+        Dir::open_ambient_dir(parent_path, cap_std::ambient_authority()).map_err(|error| {
+            LpmError::Cert(format!(
+                "failed to open LPM_HOME parent directory {}: {error}",
+                parent_path.display()
+            ))
+        })?;
+    let Some(lpm) = open_or_create_directory(&parent, root_name, create, "$LPM_HOME")? else {
         return Err(LpmError::Cert("global LPM directory does not exist".into()));
     };
-    let Some(certs) = open_or_create_directory(&lpm, "certs", create, "~/.lpm/certs")? else {
+    let Some(certs) = open_or_create_directory(&lpm, "certs", create, "$LPM_HOME/certs")? else {
         return Err(LpmError::Cert(
             "global certificate directory does not exist".into(),
         ));
     };
     Ok(GlobalCaDirectory {
-        path: home_path.join(".lpm/certs"),
+        path: lpm_root_path.join("certs"),
         dir: certs,
     })
 }
@@ -1592,15 +1603,51 @@ mod tests {
     }
 
     #[test]
-    fn ca_paths_are_under_home() {
+    fn global_certificate_paths_follow_the_lpm_home_override() {
+        let _serial = crate::test_env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let _restore = EnvGuard::set("LPM_HOME", root.path());
+
+        assert_eq!(ca_dir().unwrap(), root.path().join("certs"));
+    }
+
+    #[test]
+    fn ca_paths_are_under_lpm_root() {
+        let _serial = crate::test_env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let _restore = EnvGuard::set("LPM_HOME", root.path());
         let ca = ca_dir().unwrap();
-        assert!(ca.ends_with(".lpm/certs"));
+        assert_eq!(ca, root.path().join("certs"));
 
         let cert = ca_cert_path().unwrap();
         assert!(cert.ends_with("rootCA.pem"));
 
         let key = ca_key_path().unwrap();
         assert!(key.ends_with("rootCA-key.pem"));
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 
     #[test]

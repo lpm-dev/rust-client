@@ -31,6 +31,7 @@ fn setup_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
     let tmp = tempfile::tempdir().unwrap();
     unsafe {
         std::env::set_var("HOME", tmp.path());
+        std::env::set_var("LPM_HOME", tmp.path().join(".lpm"));
         std::env::set_var(
             "LPM_CERT_TEST_TRUST_STORE_DIR",
             tmp.path().join("trust-store"),
@@ -164,6 +165,7 @@ fn spawn_concurrency_helpers(
             std::process::Command::new(&executable)
                 .args(["--exact", "certificate_concurrency_helper"])
                 .env("HOME", root)
+                .env("LPM_HOME", root.join(".lpm"))
                 .env("LPM_CERT_AUDIT_DIR", root.join("audit"))
                 .env("LPM_CERT_PROJECTS_INDEX", root.join("cert-projects.json"))
                 .env("LPM_CERT_TEST_TRUST_STORE_DIR", root.join("trust-store"))

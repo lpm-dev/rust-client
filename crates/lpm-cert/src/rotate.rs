@@ -1742,9 +1742,8 @@ pub fn grace_file_path() -> Result<PathBuf, LpmError> {
     {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Cert("could not determine home dir for grace file".into()))?;
-    Ok(home.join(".lpm").join("cert-grace.json"))
+    let root = lpm_common::LpmRoot::from_env()?;
+    Ok(root.root().join("cert-grace.json"))
 }
 
 fn schedule_grace(fingerprint: &str, removes_at: &str) -> Result<(), LpmError> {
@@ -1909,6 +1908,19 @@ mod tests {
         assert!(!drop_grace_entry("ZZ:ZZ").unwrap());
     }
 
+    #[test]
+    fn grace_file_follows_lpm_home_override() {
+        let _serial = serial_lock();
+        let root = tempfile::tempdir().unwrap();
+        let _grace_override = EnvGuard::remove(GRACE_FILE_ENV);
+        let _lpm_home = EnvGuard::set("LPM_HOME", root.path());
+
+        assert_eq!(
+            grace_file_path().unwrap(),
+            root.path().join("cert-grace.json")
+        );
+    }
+
     #[cfg(not(debug_assertions))]
     #[test]
     fn grace_file_env_is_ignored_in_release_builds() {
@@ -1932,6 +1944,12 @@ mod tests {
         fn set<P: AsRef<std::ffi::OsStr>>(key: &'static str, value: P) -> Self {
             let prev = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, prev }
         }
     }

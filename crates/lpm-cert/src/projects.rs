@@ -27,9 +27,8 @@ pub fn index_path() -> Result<PathBuf, LpmError> {
     {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Cert("could not determine home dir for projects index".into()))?;
-    Ok(home.join(".lpm").join("cert-projects.json"))
+    let root = lpm_common::LpmRoot::from_env()?;
+    Ok(root.root().join("cert-projects.json"))
 }
 
 fn read_index() -> Result<IndexFile, LpmError> {
@@ -189,6 +188,19 @@ mod tests {
         });
     }
 
+    #[test]
+    fn projects_index_follows_lpm_home_override() {
+        let _serial = serial_lock();
+        let root = tempfile::tempdir().unwrap();
+        let _index_override = EnvGuard::remove(PROJECTS_INDEX_ENV);
+        let _lpm_home = EnvGuard::set("LPM_HOME", root.path());
+
+        assert_eq!(
+            index_path().unwrap(),
+            root.path().join("cert-projects.json")
+        );
+    }
+
     #[cfg(not(debug_assertions))]
     #[test]
     fn projects_index_env_is_ignored_in_release_builds() {
@@ -212,6 +224,12 @@ mod tests {
         fn set<P: AsRef<std::ffi::OsStr>>(key: &'static str, value: P) -> Self {
             let prev = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, prev }
         }
     }
