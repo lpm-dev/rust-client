@@ -18,7 +18,7 @@ pub(crate) mod windows_security {
     use std::ptr::null_mut;
 
     use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree, RtlNtStatusToDosError};
+    use windows_sys::Win32::Foundation::{LocalFree, RtlNtStatusToDosError};
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
@@ -150,6 +150,7 @@ pub(crate) mod windows_security {
 
     #[cfg(test)]
     pub(super) fn descriptor_sddl(file: &std::fs::File) -> std::io::Result<String> {
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
         use windows_sys::Win32::Security::Authorization::{
             ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
         };
@@ -1621,7 +1622,10 @@ mod tests {
             .write_atomic("cert.pem", b"replacement", 0o644)
             .unwrap();
 
-        assert_eq!(cert_dir.read("cert.pem").unwrap(), b"replacement");
+        assert_eq!(
+            read_relative_file(&cert_dir.dir, "cert.pem").unwrap(),
+            b"replacement"
+        );
     }
 
     #[cfg(unix)]
