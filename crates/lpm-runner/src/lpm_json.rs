@@ -10,8 +10,10 @@
 
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_text_file_capped};
 use lpm_env::{EnvSchema, EnvironmentsConfig};
-use serde::Deserialize;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -59,7 +61,7 @@ pub struct LpmJsonConfig {
 
     /// Dev services for multi-process orchestration.
     /// e.g., `{"web": {"command": "next dev", "port": 3000}}`
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_services")]
     pub services: HashMap<String, ServiceConfig>,
 
     /// Dev reverse-proxy configuration for friendly local hostnames.
@@ -99,6 +101,40 @@ pub struct LpmJsonConfig {
     /// consumed by project-scoped certificate-chain generation.
     #[serde(default)]
     pub cert: Option<CertBlock>,
+}
+
+fn deserialize_unique_services<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, ServiceConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct UniqueServicesVisitor;
+
+    impl<'de> Visitor<'de> for UniqueServicesVisitor {
+        type Value = HashMap<String, ServiceConfig>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object with unique service names")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut services = HashMap::with_capacity(access.size_hint().unwrap_or(0));
+            while let Some((name, service)) = access.next_entry::<String, ServiceConfig>()? {
+                if services.insert(name.clone(), service).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate service `{name}`"
+                    )));
+                }
+            }
+            Ok(services)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueServicesVisitor)
 }
 
 /// Cloud sync metadata maintained by `lpm env`.
@@ -1114,6 +1150,28 @@ mod tests {
         assert_eq!(db.ready_port, Some(5432));
         assert_eq!(db.ready_timeout, 60);
         assert_eq!(db.effective_ready_port(), Some(5432));
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_duplicate_service_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "services": {
+                    "web": { "command": "node first.js" },
+                    "web": { "command": "node second.js" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let error = read_lpm_json(dir.path()).unwrap_err();
+
+        assert!(
+            error.contains("duplicate service `web`"),
+            "duplicate service error was not actionable: {error}"
+        );
     }
 
     #[test]

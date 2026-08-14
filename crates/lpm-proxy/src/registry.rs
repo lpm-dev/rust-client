@@ -5,16 +5,26 @@ struct LeaseInfo {
     owner_pid: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct RouteRegistry {
     next_lease_id: u64,
     routes: HashMap<String, RegisteredRoute>,
     leases: HashMap<RouteLeaseId, LeaseInfo>,
 }
 
+impl Default for RouteRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RouteRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            next_lease_id: random_lease_seed(),
+            routes: HashMap::new(),
+            leases: HashMap::new(),
+        }
     }
 
     pub fn register_routes(
@@ -27,12 +37,34 @@ impl RouteRegistry {
         }
 
         let lease_id = self.allocate_lease_id();
-        let prepared = self.prepare_routes(lease_id, owner_pid, routes)?;
+        let prepared = self.prepare_routes(lease_id, owner_pid, &routes)?;
         self.leases.insert(lease_id, LeaseInfo { owner_pid });
         for route in prepared {
             self.routes.insert(route.host.clone(), route);
         }
         Ok(lease_id)
+    }
+
+    pub fn register_lease(&mut self, owner_pid: u32) -> RouteLeaseId {
+        let lease_id = self.allocate_lease_id();
+        self.leases.insert(lease_id, LeaseInfo { owner_pid });
+        lease_id
+    }
+
+    pub fn validate_replacement(
+        &self,
+        lease_id: RouteLeaseId,
+        routes: &[Route],
+    ) -> Result<(), ProxyError> {
+        if routes.is_empty() {
+            return Err(ProxyError::EmptyRouteSet);
+        }
+        let owner_pid = self
+            .leases
+            .get(&lease_id)
+            .ok_or(ProxyError::UnknownLease(lease_id))?
+            .owner_pid;
+        self.prepare_routes(lease_id, owner_pid, routes).map(|_| ())
     }
 
     pub fn replace_routes(
@@ -49,7 +81,7 @@ impl RouteRegistry {
             .get(&lease_id)
             .ok_or(ProxyError::UnknownLease(lease_id))?
             .owner_pid;
-        let prepared = self.prepare_routes(lease_id, owner_pid, routes)?;
+        let prepared = self.prepare_routes(lease_id, owner_pid, &routes)?;
         self.release_routes_for_lease(lease_id);
         for route in prepared {
             self.routes.insert(route.host.clone(), route);
@@ -90,20 +122,59 @@ impl RouteRegistry {
         statuses
     }
 
+    pub(crate) fn routes_for_lease(&self, lease_id: RouteLeaseId) -> Vec<Route> {
+        let mut routes: Vec<Route> = self
+            .routes
+            .values()
+            .filter(|route| route.lease_id == lease_id)
+            .map(|route| Route {
+                host: route.host.clone(),
+                upstream_port: route.upstream_port,
+                project_dir: route.project_dir.clone(),
+                service: route.service.clone(),
+            })
+            .collect();
+        routes.sort_by(|left, right| left.host.cmp(&right.host));
+        routes
+    }
+
+    pub(crate) fn restore_routes_for_lease(
+        &mut self,
+        lease_id: RouteLeaseId,
+        routes: Vec<Route>,
+    ) -> Result<(), ProxyError> {
+        let owner_pid = self
+            .leases
+            .get(&lease_id)
+            .ok_or(ProxyError::UnknownLease(lease_id))?
+            .owner_pid;
+        let prepared = self.prepare_routes(lease_id, owner_pid, &routes)?;
+        self.release_routes_for_lease(lease_id);
+        for route in prepared {
+            self.routes.insert(route.host.clone(), route);
+        }
+        Ok(())
+    }
+
     pub fn prune_dead_leases(&mut self) -> usize {
         self.prune_leases_with(process_is_running)
     }
 
     fn allocate_lease_id(&mut self) -> RouteLeaseId {
-        self.next_lease_id += 1;
-        RouteLeaseId(self.next_lease_id)
+        loop {
+            self.next_lease_id = self.next_lease_id.wrapping_add(1);
+            let lease_id = RouteLeaseId(self.next_lease_id);
+            if lease_id.0 != 0 && !self.leases.contains_key(&lease_id) {
+                return lease_id;
+            }
+        }
     }
 
     fn prepare_routes(
         &self,
         lease_id: RouteLeaseId,
         owner_pid: u32,
-        routes: Vec<Route>,
+        routes: &[Route],
     ) -> Result<Vec<RegisteredRoute>, ProxyError> {
         let mut seen = HashSet::with_capacity(routes.len());
         let mut prepared = Vec::with_capacity(routes.len());
@@ -125,8 +196,8 @@ impl RouteRegistry {
             prepared.push(RegisteredRoute {
                 host,
                 upstream_port: route.upstream_port,
-                project_dir: route.project_dir,
-                service: route.service,
+                project_dir: route.project_dir.clone(),
+                service: route.service.clone(),
                 lease_id,
                 owner_pid,
             });
@@ -157,4 +228,20 @@ impl RouteRegistry {
         }
         removed
     }
+}
+
+fn random_lease_seed() -> u64 {
+    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return u64::from_le_bytes(bytes);
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    created_at ^ u64::from(std::process::id()).rotate_left(32) ^ sequence
 }

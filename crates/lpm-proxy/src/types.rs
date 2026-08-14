@@ -134,6 +134,22 @@ pub enum ProxyRequest {
         owner_pid: u32,
         routes: Vec<Route>,
     },
+    RegisterStagedLease {
+        owner_pid: u32,
+    },
+    Stage {
+        lease_id: RouteLeaseId,
+        publication_id: u64,
+        routes: Vec<Route>,
+    },
+    Commit {
+        lease_id: RouteLeaseId,
+        publication_id: u64,
+    },
+    Rollback {
+        lease_id: RouteLeaseId,
+        publication_id: u64,
+    },
     Replace {
         lease_id: RouteLeaseId,
         routes: Vec<Route>,
@@ -150,6 +166,9 @@ pub enum ProxyResponse {
     Status { status: ProxyStatus },
     Routes { routes: Vec<RouteStatus> },
     Registered { lease_id: RouteLeaseId },
+    Staged { publication_id: u64 },
+    Committed { publication_id: u64 },
+    RolledBack { publication_id: u64 },
     Replaced,
     Released { removed: usize },
     Stopped,

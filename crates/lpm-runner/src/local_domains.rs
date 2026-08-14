@@ -156,23 +156,25 @@ pub fn remove_hosts_file_block_without_backup(path: &Path, block_id: &str) -> Re
 }
 
 pub fn clean_hosts_file_without_backup(path: &Path) -> Result<HostsFileCleanOutcome, String> {
-    let current = read_hosts_file(path)?;
-    let (next, removed_blocks) = remove_all_managed_hosts_blocks(&current)?;
-    if current == next {
-        return Ok(HostsFileCleanOutcome {
+    with_hosts_file_lock(path, || {
+        let current = read_hosts_file(path)?;
+        let (next, removed_blocks) = remove_all_managed_hosts_blocks(&current)?;
+        if current == next {
+            return Ok(HostsFileCleanOutcome {
+                path: path.to_path_buf(),
+                backup_path: PathBuf::new(),
+                removed_blocks,
+                changed: false,
+            });
+        }
+
+        write_hosts_file_atomic(path, &next)?;
+        Ok(HostsFileCleanOutcome {
             path: path.to_path_buf(),
             backup_path: PathBuf::new(),
             removed_blocks,
-            changed: false,
-        });
-    }
-
-    write_hosts_file_atomic(path, &next)?;
-    Ok(HostsFileCleanOutcome {
-        path: path.to_path_buf(),
-        backup_path: PathBuf::new(),
-        removed_blocks,
-        changed: true,
+            changed: true,
+        })
     })
 }
 
@@ -191,24 +193,26 @@ pub fn plan_hosts_file_clean() -> Result<HostsFileCleanPlan, String> {
 pub fn apply_hosts_file_clean_plan(
     plan: &HostsFileCleanPlan,
 ) -> Result<HostsFileCleanOutcome, String> {
-    let current = read_hosts_file(&plan.path)?;
-    let (next, removed_blocks) = remove_all_managed_hosts_blocks(&current)?;
-    if current == next {
-        return Ok(HostsFileCleanOutcome {
+    with_hosts_file_lock(&plan.path, || {
+        let current = read_hosts_file(&plan.path)?;
+        let (next, removed_blocks) = remove_all_managed_hosts_blocks(&current)?;
+        if current == next {
+            return Ok(HostsFileCleanOutcome {
+                path: plan.path.clone(),
+                backup_path: plan.backup_path.clone(),
+                removed_blocks,
+                changed: false,
+            });
+        }
+
+        backup_hosts_file_once(&plan.path, &plan.backup_path)?;
+        write_hosts_file_atomic(&plan.path, &next)?;
+        Ok(HostsFileCleanOutcome {
             path: plan.path.clone(),
             backup_path: plan.backup_path.clone(),
             removed_blocks,
-            changed: false,
-        });
-    }
-
-    backup_hosts_file_once(&plan.path, &plan.backup_path)?;
-    write_hosts_file_atomic(&plan.path, &next)?;
-    Ok(HostsFileCleanOutcome {
-        path: plan.path.clone(),
-        backup_path: plan.backup_path.clone(),
-        removed_blocks,
-        changed: true,
+            changed: true,
+        })
     })
 }
 
@@ -264,9 +268,19 @@ fn windows_system_directory() -> Option<PathBuf> {
 }
 
 fn managed_hosts_block_id(project_dir: &Path) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_LEASE_ID: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let owner = format!("{}:{created_at}:{sequence}", std::process::id());
     format!(
-        "project-{}",
-        crate::dlx::deterministic_hash(&project_dir.to_string_lossy())
+        "project-{}-lease-{}",
+        crate::dlx::deterministic_hash(&project_dir.to_string_lossy()),
+        crate::dlx::deterministic_hash(&owner),
     )
 }
 
@@ -282,14 +296,16 @@ fn upsert_managed_hosts_file_block(
     block_id: &str,
     hosts: &[String],
 ) -> Result<bool, String> {
-    let current = read_hosts_file(path)?;
-    let next = upsert_managed_hosts_block(&current, block_id, hosts);
-    if current == next {
-        return Ok(false);
-    }
-    backup_hosts_file_once(path, backup_path)?;
-    write_hosts_file_atomic(path, &next)?;
-    Ok(true)
+    with_hosts_file_lock(path, || {
+        let current = read_hosts_file(path)?;
+        let next = upsert_managed_hosts_block(&current, block_id, hosts);
+        if current == next {
+            return Ok(false);
+        }
+        backup_hosts_file_once(path, backup_path)?;
+        write_hosts_file_atomic(path, &next)?;
+        Ok(true)
+    })
 }
 
 fn upsert_managed_hosts_file_block_without_backup(
@@ -297,13 +313,15 @@ fn upsert_managed_hosts_file_block_without_backup(
     block_id: &str,
     hosts: &[String],
 ) -> Result<bool, String> {
-    let current = read_hosts_file(path)?;
-    let next = upsert_managed_hosts_block(&current, block_id, hosts);
-    if current == next {
-        return Ok(false);
-    }
-    write_hosts_file_atomic(path, &next)?;
-    Ok(true)
+    with_hosts_file_lock(path, || {
+        let current = read_hosts_file(path)?;
+        let next = upsert_managed_hosts_block(&current, block_id, hosts);
+        if current == next {
+            return Ok(false);
+        }
+        write_hosts_file_atomic(path, &next)?;
+        Ok(true)
+    })
 }
 
 fn remove_managed_hosts_file_block(
@@ -311,27 +329,79 @@ fn remove_managed_hosts_file_block(
     backup_path: &Path,
     block_id: &str,
 ) -> Result<bool, String> {
-    let current = read_hosts_file(path)?;
-    let next = remove_managed_hosts_block(&current, block_id);
-    if current == next {
-        return Ok(false);
-    }
-    backup_hosts_file_once(path, backup_path)?;
-    write_hosts_file_atomic(path, &next)?;
-    Ok(true)
+    with_hosts_file_lock(path, || {
+        let current = read_hosts_file(path)?;
+        let next = remove_managed_hosts_block(&current, block_id);
+        if current == next {
+            return Ok(false);
+        }
+        backup_hosts_file_once(path, backup_path)?;
+        write_hosts_file_atomic(path, &next)?;
+        Ok(true)
+    })
 }
 
 fn remove_managed_hosts_file_block_without_backup(
     path: &Path,
     block_id: &str,
 ) -> Result<bool, String> {
-    let current = read_hosts_file(path)?;
-    let next = remove_managed_hosts_block(&current, block_id);
-    if current == next {
-        return Ok(false);
-    }
-    write_hosts_file_atomic(path, &next)?;
-    Ok(true)
+    with_hosts_file_lock(path, || {
+        let current = read_hosts_file(path)?;
+        let next = remove_managed_hosts_block(&current, block_id);
+        if current == next {
+            return Ok(false);
+        }
+        write_hosts_file_atomic(path, &next)?;
+        Ok(true)
+    })
+}
+
+fn with_hosts_file_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = hosts_file_lock_path(path)?;
+    let _lock = lpm_common::acquire_single_file_exclusive_lock(&lock_path).map_err(|error| {
+        format!(
+            "lock hosts file {} with {}: {error}",
+            path.display(),
+            lock_path.display()
+        )
+    })?;
+    operation()
+}
+
+fn hosts_file_lock_path(path: &Path) -> Result<PathBuf, String> {
+    let stable_path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = parent.canonicalize().map_err(|parent_error| {
+                format!(
+                    "resolve hosts file directory {}: {parent_error}",
+                    parent.display()
+                )
+            })?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| format!("hosts file path {} has no file name", path.display()))?;
+            parent.join(file_name)
+        }
+        Err(error) => {
+            return Err(format!(
+                "resolve hosts file path {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let parent = stable_path.parent().ok_or_else(|| {
+        format!(
+            "resolved hosts file path {} has no parent",
+            stable_path.display()
+        )
+    })?;
+    let key = crate::dlx::deterministic_hash(&stable_path.to_string_lossy());
+    Ok(parent.join(format!(".lpm-hosts-{key}.lock")))
 }
 
 fn read_hosts_file(path: &Path) -> Result<String, String> {
@@ -921,6 +991,82 @@ mod tests {
         assert_eq!(content, "127.0.0.1 localhost\n");
         let backup = std::fs::read_to_string(&backup_path).unwrap();
         assert_eq!(backup, "127.0.0.1 localhost\n");
+    }
+
+    #[test]
+    fn identical_hosts_file_leases_keep_the_block_until_every_owner_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        let plan_for_runtime = || HostsFilePlan {
+            path: hosts_path.clone(),
+            backup_path: dir.path().join("hosts.bak"),
+            block_id: managed_hosts_block_id(dir.path()),
+            hosts: vec!["api.test".to_string()],
+        };
+
+        let first = apply_hosts_file_plan(&plan_for_runtime()).unwrap();
+        let second = apply_hosts_file_plan(&plan_for_runtime()).unwrap();
+        first.release().unwrap();
+
+        assert!(
+            std::fs::read_to_string(&hosts_path)
+                .unwrap()
+                .contains("127.0.0.1 api.test"),
+            "one runtime removed the hosts entry still owned by another runtime"
+        );
+
+        second.release().unwrap();
+        assert!(
+            !std::fs::read_to_string(&hosts_path)
+                .unwrap()
+                .contains("127.0.0.1 api.test")
+        );
+    }
+
+    #[test]
+    fn hosts_file_mutations_wait_for_the_active_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        std::fs::write(&hosts_path, "127.0.0.1 localhost\n").unwrap();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_path = hosts_path.clone();
+        let lock_holder = std::thread::spawn(move || {
+            with_hosts_file_lock(&lock_path, || {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let update_path = hosts_path;
+        let updater = std::thread::spawn(move || {
+            let result = upsert_managed_hosts_file_block_without_backup(
+                &update_path,
+                "project-def",
+                &["web.test".to_string()],
+            );
+            completed_tx.send(result).unwrap();
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a second hosts-file mutation entered before the first transaction released"
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            completed_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+        );
+        lock_holder.join().unwrap();
+        updater.join().unwrap();
     }
 
     #[test]

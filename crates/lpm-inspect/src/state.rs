@@ -101,6 +101,15 @@ pub struct InspectorState {
     inner: Arc<Inner>,
 }
 
+/// Inspector session update that restores the previous state unless accepted.
+pub struct PublishedInspectorSession {
+    state: InspectorState,
+    session_id: String,
+    tunnel_url: String,
+    inserted_session: bool,
+    finalized: bool,
+}
+
 struct Inner {
     /// In-memory ring buffer of recent requests. Bounded to prevent OOM.
     buffer: RwLock<WebhookBuffer>,
@@ -121,7 +130,7 @@ struct Inner {
     /// The local endpoint being tunneled and replayed.
     local_target: SyncRwLock<lpm_common::LocalTarget>,
     /// The tunnel URL (set after connection).
-    pub tunnel_url: RwLock<Option<String>>,
+    pub tunnel_url: SyncRwLock<Option<String>>,
     /// Per-process random auth token gating every `/api/*` route — closes
     /// the same-UID attacker on shared hosts (loopback bind alone is not
     /// enough on CI runners / dev containers).
@@ -170,7 +179,7 @@ impl InspectorState {
                 ws_sse_tx,
                 session_id: SyncRwLock::new(None),
                 local_target: SyncRwLock::new(local_target),
-                tunnel_url: RwLock::new(None),
+                tunnel_url: SyncRwLock::new(None),
                 auth_token: generate_auth_token(),
             }),
         }
@@ -230,7 +239,7 @@ impl InspectorState {
                 ws_sse_tx,
                 session_id: SyncRwLock::new(None),
                 local_target: SyncRwLock::new(local_target),
-                tunnel_url: RwLock::new(None),
+                tunnel_url: SyncRwLock::new(None),
                 auth_token: generate_auth_token(),
             }),
         }
@@ -322,14 +331,25 @@ impl InspectorState {
 
     /// Set the tunnel URL after connection is established.
     pub async fn set_tunnel_url(&self, url: String) {
-        let mut tunnel_url = self.inner.tunnel_url.write().await;
-        *tunnel_url = Some(url);
+        self.set_tunnel_url_immediate(url);
+    }
+
+    /// Set the tunnel URL without yielding to the async scheduler.
+    pub fn set_tunnel_url_immediate(&self, url: String) {
+        *self
+            .inner
+            .tunnel_url
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url);
     }
 
     /// Get the tunnel URL.
     pub async fn get_tunnel_url(&self) -> Option<String> {
-        let tunnel_url = self.inner.tunnel_url.read().await;
-        tunnel_url.clone()
+        self.inner
+            .tunnel_url
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Get the local port being tunneled.
@@ -450,18 +470,315 @@ impl InspectorState {
         Ok(())
     }
 
+    /// Start a tunnel session that is rolled back unless the caller accepts it.
+    pub fn start_session_reversible(
+        &self,
+        id: String,
+        domain: Option<String>,
+        local_port: u16,
+        name: Option<String>,
+        tunnel_url: String,
+    ) -> Result<PublishedInspectorSession, rusqlite::Error> {
+        let inserted_session = self
+            .inner
+            .db
+            .as_ref()
+            .map(|db| db.start_session_named_reversible(id.clone(), domain, local_port, name))
+            .transpose()?
+            .unwrap_or(false);
+        Ok(PublishedInspectorSession {
+            state: self.clone(),
+            session_id: id,
+            tunnel_url,
+            inserted_session,
+            finalized: false,
+        })
+    }
+
     /// End the current tunnel session.
     pub async fn end_session(&self) -> Result<(), rusqlite::Error> {
-        let mut session_id = self
+        let session_id = self
+            .inner
+            .session_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(id) = session_id {
+            if let Some(ref db) = self.inner.db {
+                db.end_session(id.clone())?;
+            }
+            let mut active = self
+                .inner
+                .session_id
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if active.as_ref() == Some(&id) {
+                *active = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn current_session_id(&self) -> Option<String> {
+        self.inner
+            .session_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl PublishedInspectorSession {
+    /// Keep the newly published inspector session.
+    pub fn finalize(&mut self) -> Result<(), rusqlite::Error> {
+        if self.inserted_session {
+            let committed = self
+                .state
+                .inner
+                .db
+                .as_ref()
+                .map(|db| db.commit_session_start(&self.session_id))
+                .transpose()?
+                .unwrap_or(true);
+            if !committed {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            self.inserted_session = false;
+        }
+        *self
+            .state
+            .inner
+            .tunnel_url
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.tunnel_url.clone());
+        *self
+            .state
             .inner
             .session_id
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(id) = session_id.take()
-            && let Some(ref db) = self.inner.db
-        {
-            db.end_session(id)?;
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.session_id.clone());
+        self.finalized = true;
         Ok(())
+    }
+
+    /// Restore the inspector session that preceded this publication.
+    pub fn rollback(mut self) -> Result<(), rusqlite::Error> {
+        let result = self.rollback_inner();
+        if result.is_ok() {
+            self.finalized = true;
+        }
+        result
+    }
+
+    fn rollback_inner(&mut self) -> Result<(), rusqlite::Error> {
+        if self.inserted_session {
+            match self
+                .state
+                .inner
+                .db
+                .as_ref()
+                .map(|db| db.rollback_session_start(&self.session_id))
+                .transpose()
+            {
+                Ok(Some(true)) => {
+                    self.inserted_session = false;
+                    Ok(())
+                }
+                Ok(Some(false)) => Err(rusqlite::Error::QueryReturnedNoRows),
+                Ok(None) => {
+                    self.inserted_session = false;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PublishedInspectorSession {
+    fn drop(&mut self) {
+        if !self.finalized
+            && let Err(error) = self.rollback_inner()
+        {
+            tracing::error!(%error, "failed to roll back an unaccepted inspector session");
+        }
+    }
+}
+
+#[cfg(test)]
+mod inspector_state_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn successive_tunnel_publications_leave_the_newest_url_visible() {
+        let state = InspectorState::new_for_target(lpm_common::LocalTarget::loopback(
+            lpm_common::LocalScheme::Http,
+            3000,
+        ));
+
+        state.set_tunnel_url_immediate("https://old.lpm.fyi".to_string());
+        state.set_tunnel_url_immediate("https://new.lpm.fyi".to_string());
+
+        assert_eq!(
+            state.get_tunnel_url().await.as_deref(),
+            Some("https://new.lpm.fyi")
+        );
+    }
+
+    #[tokio::test]
+    async fn reversible_tunnel_publication_restores_previous_state_and_database_row() {
+        let db = InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        state
+            .start_session_immediate(
+                "old-session".to_string(),
+                Some("old.lpm.fyi".to_string()),
+                3000,
+                None,
+            )
+            .unwrap();
+        state.set_tunnel_url_immediate("https://old.lpm.fyi".to_string());
+        let publication = state
+            .start_session_reversible(
+                "new-session".to_string(),
+                Some("new.lpm.fyi".to_string()),
+                4000,
+                None,
+                "https://new.lpm.fyi".to_string(),
+            )
+            .unwrap();
+
+        publication.rollback().unwrap();
+
+        assert_eq!(
+            state
+                .inner
+                .session_id
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref(),
+            Some("old-session")
+        );
+        assert_eq!(
+            state.get_tunnel_url().await.as_deref(),
+            Some("https://old.lpm.fyi")
+        );
+        assert!(db.get_session("old-session").await.unwrap().is_some());
+        assert!(db.get_session("new-session").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn accepted_tunnel_publication_keeps_the_new_session() {
+        let db = InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        state
+            .start_session_reversible(
+                "new-session".to_string(),
+                Some("new.lpm.fyi".to_string()),
+                4000,
+                None,
+                "https://new.lpm.fyi".to_string(),
+            )
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        assert_eq!(
+            state.get_tunnel_url().await.as_deref(),
+            Some("https://new.lpm.fyi")
+        );
+        assert_eq!(state.current_session_id().as_deref(), Some("new-session"));
+        assert!(db.get_session("new-session").await.unwrap().is_some());
+        assert!(
+            db.list_sessions(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|session| session.id == "new-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_failure_keeps_the_prepared_session_out_of_memory_state() {
+        let db = InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        state
+            .start_session_immediate(
+                "old-session".to_string(),
+                Some("old.lpm.fyi".to_string()),
+                3000,
+                None,
+            )
+            .unwrap();
+        state.set_tunnel_url_immediate("https://old.lpm.fyi".to_string());
+        let mut publication = state
+            .start_session_reversible(
+                "new-session".to_string(),
+                Some("new.lpm.fyi".to_string()),
+                4000,
+                None,
+                "https://new.lpm.fyi".to_string(),
+            )
+            .unwrap();
+        assert!(db.commit_session_start("new-session").unwrap());
+
+        let error = publication.finalize().unwrap_err();
+
+        assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+        assert_eq!(state.current_session_id().as_deref(), Some("old-session"));
+        assert_eq!(
+            state.get_tunnel_url().await.as_deref(),
+            Some("https://old.lpm.fyi")
+        );
+        publication.rollback().unwrap();
+        assert!(db.get_session("new-session").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_tunnel_publication_is_not_visible_before_finalization() {
+        let db = InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        state
+            .start_session_immediate(
+                "old-session".to_string(),
+                Some("old.lpm.fyi".to_string()),
+                3000,
+                None,
+            )
+            .unwrap();
+        state.set_tunnel_url_immediate("https://old.lpm.fyi".to_string());
+
+        let mut publication = state
+            .start_session_reversible(
+                "new-session".to_string(),
+                Some("new.lpm.fyi".to_string()),
+                4000,
+                None,
+                "https://new.lpm.fyi".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(state.current_session_id().as_deref(), Some("old-session"));
+        assert_eq!(
+            state.get_tunnel_url().await.as_deref(),
+            Some("https://old.lpm.fyi")
+        );
+        assert!(db.get_session("new-session").await.unwrap().is_none());
+        assert!(
+            db.list_sessions(10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|session| session.id != "new-session")
+        );
+
+        publication.finalize().unwrap();
+        assert_eq!(state.current_session_id().as_deref(), Some("new-session"));
+        assert_eq!(
+            state.get_tunnel_url().await.as_deref(),
+            Some("https://new.lpm.fyi")
+        );
     }
 }

@@ -227,16 +227,86 @@ impl InspectorDb {
         Ok(())
     }
 
-    /// Record a tunnel session end.
-    pub fn end_session(&self, id: String) -> Result<(), rusqlite::Error> {
-        let conn = self
+    pub(crate) fn start_session_named_reversible(
+        &self,
+        id: String,
+        domain: Option<String>,
+        local_port: u16,
+        name: Option<String>,
+    ) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
             .control_conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        conn.execute(
-            "UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1",
+        let transaction = conn.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO sessions (id, name, domain, local_port)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&id, name, domain, local_port],
+        )?;
+        if inserted != 0 {
+            transaction.execute(
+                "INSERT INTO pending_sessions (session_id) VALUES (?1)",
+                params![id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted != 0)
+    }
+
+    pub(crate) fn rollback_session_start(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .control_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM pending_sessions WHERE session_id = ?1",
             params![id],
         )?;
+        let deleted = transaction.execute(
+            "DELETE FROM sessions
+             WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM requests WHERE session_id = ?1)",
+            params![id],
+        )?;
+        if deleted == 0 {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn commit_session_start(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let mut conn = self
+            .control_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transaction = conn.transaction()?;
+        let committed = transaction.execute(
+            "DELETE FROM pending_sessions WHERE session_id = ?1",
+            params![id],
+        )?;
+        transaction.commit()?;
+        Ok(committed != 0)
+    }
+
+    /// Record a tunnel session end.
+    pub fn end_session(&self, id: String) -> Result<(), rusqlite::Error> {
+        let mut conn = self
+            .control_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "UPDATE sessions SET ended_at = datetime('now') WHERE id = ?1",
+            params![&id],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_sessions WHERE session_id = ?1",
+            params![id],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -442,6 +512,9 @@ impl InspectorDb {
             "SELECT s.id, s.name, s.domain, s.local_port, s.started_at, s.ended_at,
                     (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.id) as request_count
              FROM sessions s
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM pending_sessions pending WHERE pending.session_id = s.id
+             )
              ORDER BY s.started_at DESC
              LIMIT ?1",
         )?;
@@ -461,6 +534,36 @@ impl InspectorDb {
         rows.collect()
     }
 
+    pub(crate) async fn get_stored_session_including_pending(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredSession>, rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let session = conn.query_row(
+            "SELECT s.id, s.name, s.domain, s.local_port, s.started_at, s.ended_at,
+                    (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.id)
+             FROM sessions s
+             WHERE s.id = ?1",
+            params![id],
+            |row| {
+                Ok(StoredSession {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    domain: row.get(2)?,
+                    local_port: row.get(3)?,
+                    started_at: row.get(4)?,
+                    ended_at: row.get(5)?,
+                    request_count: row.get(6)?,
+                })
+            },
+        );
+        match session {
+            Ok(session) => Ok(Some(session)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Rename a session.
     pub async fn rename_session(&self, id: &str, name: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.read_conn.lock().await;
@@ -473,29 +576,47 @@ impl InspectorDb {
 
     /// Get a single session with summary statistics.
     pub async fn get_session(&self, id: &str) -> Result<Option<SessionDetail>, rusqlite::Error> {
-        let conn = self.read_conn.lock().await;
+        self.get_session_with_pending(id, false).await
+    }
 
-        let session = conn.query_row(
+    pub(crate) async fn get_session_including_pending(
+        &self,
+        id: &str,
+    ) -> Result<Option<SessionDetail>, rusqlite::Error> {
+        self.get_session_with_pending(id, true).await
+    }
+
+    async fn get_session_with_pending(
+        &self,
+        id: &str,
+        include_pending: bool,
+    ) -> Result<Option<SessionDetail>, rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let pending_filter = if include_pending {
+            ""
+        } else {
+            "AND NOT EXISTS (SELECT 1 FROM pending_sessions pending WHERE pending.session_id = s.id)"
+        };
+        let query = format!(
             "SELECT s.id, s.name, s.domain, s.local_port, s.started_at, s.ended_at,
                     (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.id),
                     (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.id AND r.status >= 400),
                     (SELECT COUNT(DISTINCT r.provider) FROM requests r WHERE r.session_id = s.id AND r.provider IS NOT NULL)
-             FROM sessions s WHERE s.id = ?1",
-            params![id],
-            |row| {
-                Ok(SessionDetail {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    domain: row.get(2)?,
-                    local_port: row.get(3)?,
-                    started_at: row.get(4)?,
-                    ended_at: row.get(5)?,
-                    request_count: row.get(6)?,
-                    failure_count: row.get(7)?,
-                    provider_count: row.get(8)?,
-                })
-            },
+             FROM sessions s WHERE s.id = ?1 {pending_filter}"
         );
+        let session = conn.query_row(&query, params![id], |row| {
+            Ok(SessionDetail {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                domain: row.get(2)?,
+                local_port: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                request_count: row.get(6)?,
+                failure_count: row.get(7)?,
+                provider_count: row.get(8)?,
+            })
+        });
 
         match session {
             Ok(s) => {
@@ -652,6 +773,11 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              local_port INTEGER,
              started_at TEXT NOT NULL DEFAULT (datetime('now')),
              ended_at TEXT
+         );
+
+         CREATE TABLE IF NOT EXISTS pending_sessions (
+             session_id TEXT PRIMARY KEY,
+             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
          );
 
          CREATE TABLE IF NOT EXISTS requests (
@@ -1216,6 +1342,35 @@ mod tests {
         assert_eq!(sessions[0].domain, Some("acme.lpm.fyi".to_string()));
         assert_eq!(sessions[0].request_count, 2);
         assert!(sessions[0].ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_reversible_session_rollback_keeps_the_session_hidden() {
+        let db = InspectorDb::open_temp().unwrap();
+        assert!(
+            db.start_session_named_reversible(
+                "pending-session".to_string(),
+                Some("pending.lpm.fyi".to_string()),
+                3000,
+                None,
+            )
+            .unwrap()
+        );
+        db.insert_request(
+            make_webhook("captured-before-rollback", 200),
+            Some("pending-session".to_string()),
+        );
+        db.flush_pending_writes().await.unwrap();
+
+        assert!(!db.rollback_session_start("pending-session").unwrap());
+
+        assert!(db.get_session("pending-session").await.unwrap().is_none());
+        assert!(
+            db.get_session_including_pending("pending-session")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

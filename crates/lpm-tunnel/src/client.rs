@@ -20,10 +20,10 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 /// Maximum WebSocket message size from relay (50 MB).
-const MAX_WS_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+pub(crate) const MAX_WS_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 /// Maximum WebSocket frame size from relay (16 MB).
-const MAX_WS_FRAME_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_WS_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Duration after which a successful connection resets the retry counter.
 /// If a connection lasts longer than this, it was "healthy" and the next
@@ -35,6 +35,24 @@ const PONG_TIMEOUT_SECS: u64 = 90;
 
 /// Maximum time to wait for in-flight tasks during graceful shutdown.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+const MAX_CONCURRENT_HTTP_FORWARDS: usize = 4;
+const HTTP_RESPONSE_MEMORY_PERMITS: usize = 64;
+const HTTP_RESPONSE_MEMORY_UNIT_BYTES: usize = 1024 * 1024;
+const HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
+const HTTP_REQUEST_MEMORY_PERMITS: usize = 256;
+const HTTP_REQUEST_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
+const WEBSOCKET_MEMORY_PERMITS: usize = 128;
+const MAX_CONCURRENT_WEBSOCKETS: usize = 64;
+const WEBSOCKET_CONNECT_TIMEOUT_SECS: u64 = 10;
+const WEBSOCKET_LOCAL_ENQUEUE_TIMEOUT_MILLIS: u64 = 100;
+const WEBSOCKET_SEND_TIMEOUT_SECS: u64 = 5;
+const WEBSOCKET_CAPTURE_HEADER_BYTES: usize = 64 * 1024;
+const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 72 * 1024 * 1024;
+const MAX_WEBSOCKET_CONNECTION_ID_BYTES: usize = 256;
+const MAX_WEBSOCKET_LOCAL_URL_BYTES: usize = 8 * 1024;
+const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
@@ -67,15 +85,6 @@ enum RelayHandshakeMessage {
     },
 }
 
-#[derive(serde::Deserialize)]
-#[serde(tag = "type")]
-enum RelayExtensionMessage {
-    #[serde(rename = "usage_notice")]
-    UsageNotice { usage: TunnelUsageMetadata },
-    #[serde(other)]
-    Other,
-}
-
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
 enum ClientExtensionMessage {
@@ -95,6 +104,19 @@ enum RetryClass {
 struct TunnelConnectError {
     error: LpmError,
     retry_class: RetryClass,
+}
+
+/// Captured webhook plus reservations for its queued request and response bodies.
+pub struct CapturedWebhookEvent {
+    pub webhook: Arc<CapturedWebhook>,
+    _response_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _request_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+struct CompletedHttpForward {
+    json: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl TunnelConnectError {
@@ -190,11 +212,451 @@ enum LocalWebSocketCommand {
     Frame {
         data: Vec<u8>,
         is_binary: bool,
+        _memory_permit: tokio::sync::OwnedSemaphorePermit,
     },
     Close {
         code: Option<u16>,
         reason: Option<String>,
     },
+}
+
+fn bounded_websocket_close_reason(reason: Option<String>) -> Option<String> {
+    let mut reason = reason?;
+    if reason.len() > MAX_WEBSOCKET_CLOSE_REASON_BYTES {
+        let mut end = MAX_WEBSOCKET_CLOSE_REASON_BYTES;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    Some(reason)
+}
+
+async fn next_local_websocket_command(
+    commands: &mut tokio::sync::mpsc::Receiver<LocalWebSocketCommand>,
+    priority_commands: &mut tokio::sync::mpsc::Receiver<LocalWebSocketCommand>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Option<LocalWebSocketCommand> {
+    if let Ok(command) = priority_commands.try_recv() {
+        return Some(command);
+    }
+    if let Ok(command) = commands.try_recv() {
+        return Some(command);
+    }
+    tokio::select! {
+        biased;
+        command = priority_commands.recv() => command,
+        command = commands.recv() => command,
+        _ = cancel.cancelled() => commands.try_recv().ok(),
+    }
+}
+
+struct WebSocketConnection {
+    commands: tokio::sync::mpsc::Sender<LocalWebSocketCommand>,
+    priority_commands: tokio::sync::mpsc::Sender<LocalWebSocketCommand>,
+    cancel: tokio_util::sync::CancellationToken,
+    generation: u64,
+}
+
+struct ClosedLocalWebSocket {
+    id: String,
+    generation: u64,
+    half: LocalWebSocketHalf,
+    reason: String,
+    notify_relay: bool,
+    relay_close: Option<(Option<u16>, Option<String>)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalWebSocketHalf {
+    Reader,
+    Writer,
+}
+
+struct ClosingWebSocket {
+    generation: u64,
+    cancel: tokio_util::sync::CancellationToken,
+    completed_halves: u8,
+    relay_notified: bool,
+}
+
+type LocalWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type LocalWebSocketWrite = futures_util::stream::SplitSink<LocalWebSocket, Message>;
+type LocalWebSocketRead = futures_util::stream::SplitStream<LocalWebSocket>;
+
+struct CompletedWebSocketUpgrade {
+    id: String,
+    url: String,
+    headers: HashMap<String, String>,
+    generation: u64,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    result: Result<(LocalWebSocketWrite, LocalWebSocketRead), String>,
+}
+
+struct LocalWebSocketActivation {
+    id: String,
+    generation: u64,
+    local_write: LocalWebSocketWrite,
+    local_read: LocalWebSocketRead,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    relay_tx: tokio::sync::mpsc::Sender<RelayWebSocketMessage>,
+    relay_memory: Arc<tokio::sync::Semaphore>,
+    ws_tx: Option<tokio::sync::mpsc::Sender<WsEvent>>,
+    closed_tx: tokio::sync::mpsc::UnboundedSender<ClosedLocalWebSocket>,
+}
+
+struct PendingWebSocketUpgrade {
+    generation: u64,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+fn discard_pending_websocket_upgrade(
+    pending: &mut HashMap<String, PendingWebSocketUpgrade>,
+    id: &str,
+) -> bool {
+    let Some(pending) = pending.remove(id) else {
+        return false;
+    };
+    pending.cancel.cancel();
+    true
+}
+
+fn cancel_active_websocket(
+    active: &mut HashMap<String, WebSocketConnection>,
+    closing: &mut HashMap<String, ClosingWebSocket>,
+    id: &str,
+    relay_notified: bool,
+) {
+    let Some(connection) = active.remove(id) else {
+        return;
+    };
+    connection.cancel.cancel();
+    closing.insert(
+        id.to_string(),
+        ClosingWebSocket {
+            generation: connection.generation,
+            cancel: connection.cancel,
+            completed_halves: 0,
+            relay_notified,
+        },
+    );
+}
+
+fn websocket_id_is_in_use(
+    active: &HashMap<String, WebSocketConnection>,
+    closing: &HashMap<String, ClosingWebSocket>,
+    pending: &HashMap<String, PendingWebSocketUpgrade>,
+    id: &str,
+) -> bool {
+    active.contains_key(id) || closing.contains_key(id) || pending.contains_key(id)
+}
+
+fn relay_websocket_message_is_current(
+    active: &HashMap<String, WebSocketConnection>,
+    message: &RelayWebSocketMessage,
+) -> bool {
+    active
+        .get(&message.id)
+        .is_some_and(|connection| connection.generation == message.generation)
+}
+
+async fn shutdown_websocket_tasks(
+    ws_connections: HashMap<String, WebSocketConnection>,
+    closing_websockets: HashMap<String, ClosingWebSocket>,
+    pending_websocket_upgrades: HashMap<String, PendingWebSocketUpgrade>,
+    task_handles: &mut tokio::task::JoinSet<()>,
+    shutdown_timeout: std::time::Duration,
+) {
+    for connection in ws_connections.into_values() {
+        connection.cancel.cancel();
+    }
+    for pending in pending_websocket_upgrades.into_values() {
+        pending.cancel.cancel();
+    }
+    for connection in closing_websockets.into_values() {
+        connection.cancel.cancel();
+    }
+
+    if tokio::time::timeout(shutdown_timeout, async {
+        while task_handles.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        task_handles.abort_all();
+        while task_handles.join_next().await.is_some() {}
+    }
+}
+
+struct RelayWebSocketMessage {
+    id: String,
+    generation: u64,
+    json: String,
+    _memory_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+async fn send_websocket_close_to_relay<S>(
+    write: &mut S,
+    id: &str,
+    reason: &str,
+) -> Result<(), TunnelConnectError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    send_websocket_close_frame_to_relay(write, id, Some(1013), Some(reason.to_string())).await
+}
+
+async fn send_websocket_close_frame_to_relay<S>(
+    write: &mut S,
+    id: &str,
+    code: Option<u16>,
+    reason: Option<String>,
+) -> Result<(), TunnelConnectError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let close = ClientMessage::WebSocketClose {
+        id: id.to_string(),
+        code,
+        reason,
+    };
+    let json = serde_json::to_string(&close).map_err(|error| {
+        LpmError::Tunnel(format!("failed to serialize WebSocket close: {error}"))
+    })?;
+    send_to_relay(write, Message::Text(json), "close WebSocket at relay").await
+}
+
+async fn send_to_relay<S>(
+    write: &mut S,
+    message: Message,
+    operation: &str,
+) -> Result<(), TunnelConnectError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(WEBSOCKET_SEND_TIMEOUT_SECS),
+        write.send(message),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(TunnelConnectError::transient(format!(
+            "failed to {operation}: {error}"
+        ))),
+        Err(_) => Err(TunnelConnectError::transient(format!(
+            "timed out while attempting to {operation}"
+        ))),
+    }
+}
+
+fn activate_local_websocket(
+    task_handles: &mut tokio::task::JoinSet<()>,
+    activation: LocalWebSocketActivation,
+) -> WebSocketConnection {
+    let LocalWebSocketActivation {
+        id,
+        generation,
+        local_write,
+        mut local_read,
+        slot,
+        relay_tx,
+        relay_memory,
+        ws_tx,
+        closed_tx,
+    } = activation;
+    let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<LocalWebSocketCommand>(64);
+    let (priority_tx, mut priority_rx) = tokio::sync::mpsc::channel::<LocalWebSocketCommand>(1);
+    let connection_cancel = tokio_util::sync::CancellationToken::new();
+    let local_write = Arc::new(tokio::sync::Mutex::new(local_write));
+    let writer = Arc::clone(&local_write);
+    let writer_id = id.clone();
+    let writer_cancel = connection_cancel.clone();
+    let writer_closed = closed_tx.clone();
+    task_handles.spawn(async move {
+        let mut reason = "local WebSocket writer stopped".to_string();
+        let mut notify_relay = true;
+        loop {
+            let command =
+                next_local_websocket_command(&mut local_rx, &mut priority_rx, &writer_cancel).await;
+            let Some(command) = command else {
+                notify_relay = false;
+                break;
+            };
+            let is_close = matches!(&command, LocalWebSocketCommand::Close { .. });
+            let message = match command {
+                LocalWebSocketCommand::Frame {
+                    data,
+                    is_binary,
+                    _memory_permit,
+                } => match local_websocket_message(data, is_binary) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        reason = error;
+                        break;
+                    }
+                },
+                LocalWebSocketCommand::Close { code, reason } => Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(code.unwrap_or(1000)),
+                    reason: reason.unwrap_or_default().into(),
+                })),
+            };
+            let send = async {
+                let mut sink = writer.lock().await;
+                sink.send(message).await
+            };
+            let result = tokio::select! {
+                biased;
+                _ = writer_cancel.cancelled(), if !is_close => break,
+                result = tokio::time::timeout(
+                    std::time::Duration::from_secs(WEBSOCKET_SEND_TIMEOUT_SECS),
+                    send,
+                ) => result,
+            };
+            match result {
+                Ok(Ok(())) if is_close => {
+                    reason = "relay closed the WebSocket".to_string();
+                    notify_relay = false;
+                    writer_cancel.cancel();
+                    break;
+                }
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    reason = format!("local WebSocket write failed: {error}");
+                    break;
+                }
+                Err(_) => {
+                    reason = "local WebSocket write timed out".to_string();
+                    break;
+                }
+            }
+        }
+        let _ = writer_closed.send(ClosedLocalWebSocket {
+            id: writer_id,
+            generation,
+            half: LocalWebSocketHalf::Writer,
+            reason,
+            notify_relay,
+            relay_close: None,
+        });
+    });
+
+    let reader_id = id;
+    let reader_cancel = connection_cancel.clone();
+    task_handles.spawn(async move {
+        let _slot = slot;
+        let mut close_reason = "local WebSocket connection ended".to_string();
+        let mut notify_relay = true;
+        let mut relay_close = None;
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = reader_cancel.cancelled() => {
+                    notify_relay = false;
+                    break;
+                },
+                message = local_read.next() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    close_reason = format!("local WebSocket read failed: {error}");
+                    break;
+                }
+            };
+            let (bytes, is_binary) = match message {
+                Message::Text(text) => (text.into_bytes(), false),
+                Message::Binary(bytes) => (bytes, true),
+                Message::Close(frame) => {
+                    notify_relay = false;
+                    let reason = frame.as_ref().map(|frame| frame.reason.to_string());
+                    let code = frame.as_ref().map(|frame| u16::from(frame.code));
+                    if let Some(ref ws_tx) = ws_tx {
+                        let _ = ws_tx.try_send(WsEvent::Closed {
+                            connection_id: reader_id.clone(),
+                            reason: reason.clone(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        });
+                    }
+                    relay_close = Some((code, reason.clone()));
+                    close_reason = reason.map_or_else(
+                        || "local WebSocket closed".to_string(),
+                        |reason| format!("local WebSocket closed: {reason}"),
+                    );
+                    break;
+                }
+                _ => continue,
+            };
+            let Some(retained_bytes) =
+                websocket_encoded_message_bytes(bytes.len(), reader_id.len())
+            else {
+                close_reason = "local WebSocket frame size overflowed".to_string();
+                break;
+            };
+            let Some(permits) = websocket_memory_permits(retained_bytes) else {
+                close_reason = "local WebSocket frame exceeded the tunnel byte limit".to_string();
+                break;
+            };
+            let permit = match Arc::clone(&relay_memory).try_acquire_many_owned(permits) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    close_reason =
+                        "relay backpressure exhausted the WebSocket byte budget".to_string();
+                    break;
+                }
+            };
+            if let Some(ref ws_tx) = ws_tx {
+                let _ = ws_tx.try_send(WsEvent::captured_frame(
+                    reader_id.clone(),
+                    FrameDirection::Outbound,
+                    &bytes,
+                    is_binary,
+                    chrono::Utc::now().to_rfc3339(),
+                ));
+            }
+            let json = match serialize_websocket_frame(&reader_id, &bytes, is_binary) {
+                Ok(json) => json,
+                Err(error) => {
+                    close_reason = format!("failed to serialize WebSocket frame: {error}");
+                    break;
+                }
+            };
+            drop(bytes);
+            if relay_tx
+                .send(RelayWebSocketMessage {
+                    id: reader_id.clone(),
+                    generation,
+                    json,
+                    _memory_permit: Some(permit),
+                })
+                .await
+                .is_err()
+            {
+                close_reason = "relay WebSocket writer stopped".to_string();
+                break;
+            }
+        }
+        reader_cancel.cancel();
+        let _ = closed_tx.send(ClosedLocalWebSocket {
+            id: reader_id,
+            generation,
+            half: LocalWebSocketHalf::Reader,
+            reason: close_reason,
+            notify_relay,
+            relay_close,
+        });
+    });
+
+    WebSocketConnection {
+        commands: local_tx,
+        priority_commands: priority_tx,
+        cancel: connection_cancel,
+        generation,
+    }
 }
 
 /// Options for connecting to the tunnel relay.
@@ -219,7 +681,7 @@ pub struct TunnelOptions {
     ///
     /// Bounded best-effort channel. A full observer queue drops capture events
     /// without blocking the proxy hot path or retaining unbounded request bodies.
-    pub webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhook>>,
+    pub webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhookEvent>>,
     /// Disable TLS certificate pinning (for development/testing).
     /// When false (default), the relay's TLS certificate public key is pinned
     /// using TOFU (Trust On First Use) to prevent MITM attacks.
@@ -234,6 +696,69 @@ pub struct TunnelOptions {
     /// Channel for sending captured WebSocket events to the inspector.
     /// Uses the same bounded best-effort pattern as `webhook_tx`.
     pub ws_tx: Option<tokio::sync::mpsc::Sender<WsEvent>>,
+    /// Optional publication barrier for callers that must commit local runtime
+    /// state before the relay can forward requests.
+    pub forwarding_admission: Option<TunnelForwardingAdmission>,
+    /// Cooperative shutdown signal. Connection teardown cancels and joins all
+    /// in-flight forwarding tasks before returning.
+    pub shutdown: Option<tokio_util::sync::CancellationToken>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunnelForwardingState {
+    Pending,
+    Open,
+    Rejected,
+}
+
+#[derive(Clone, Debug)]
+pub struct TunnelForwardingAdmission {
+    state: tokio::sync::watch::Receiver<TunnelForwardingState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TunnelForwardingController {
+    state: tokio::sync::watch::Sender<TunnelForwardingState>,
+}
+
+pub fn forwarding_admission_barrier() -> (TunnelForwardingController, TunnelForwardingAdmission) {
+    let (state, receiver) = tokio::sync::watch::channel(TunnelForwardingState::Pending);
+    (
+        TunnelForwardingController { state },
+        TunnelForwardingAdmission { state: receiver },
+    )
+}
+
+impl TunnelForwardingController {
+    pub fn open(&self) {
+        self.state.send_replace(TunnelForwardingState::Open);
+    }
+
+    pub fn reject(&self) {
+        self.state.send_replace(TunnelForwardingState::Rejected);
+    }
+}
+
+impl TunnelForwardingAdmission {
+    async fn wait(&self) -> Result<(), LpmError> {
+        let mut state = self.state.clone();
+        loop {
+            match *state.borrow() {
+                TunnelForwardingState::Open => return Ok(()),
+                TunnelForwardingState::Rejected => {
+                    return Err(LpmError::Tunnel(
+                        "tunnel forwarding was rejected before runtime publication".into(),
+                    ));
+                }
+                TunnelForwardingState::Pending => {}
+            }
+            state.changed().await.map_err(|_| {
+                LpmError::Tunnel(
+                    "tunnel forwarding admission closed before runtime publication".into(),
+                )
+            })?;
+        }
+    }
 }
 
 impl TunnelOptions {
@@ -252,6 +777,8 @@ impl TunnelOptions {
             no_pin: false,
             auto_ack: false,
             ws_tx: None,
+            forwarding_admission: None,
+            shutdown: None,
         }
     }
 
@@ -325,6 +852,13 @@ pub async fn connect_with_usage_fallible(
     let max_retries = 10;
 
     loop {
+        if options
+            .shutdown
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            return Ok(());
+        }
         let connection_start = std::time::Instant::now();
         match try_connect(options, &on_connected, &on_usage).await {
             Ok(()) => {
@@ -356,9 +890,19 @@ pub async fn connect_with_usage_fallible(
                 on_disconnected(&format!(
                     "disconnected, retrying in {total_delay}s... ({e})"
                 ));
-                tokio::time::sleep(std::time::Duration::from_secs(total_delay)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(total_delay)) => {}
+                    _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+                }
             }
         }
+    }
+}
+
+async fn wait_for_tunnel_shutdown(shutdown: Option<&tokio_util::sync::CancellationToken>) {
+    match shutdown {
+        Some(shutdown) => shutdown.cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -391,6 +935,19 @@ fn is_safe_local_url(url: &str) -> bool {
         return false;
     }
     true
+}
+
+fn websocket_upgrade_metadata_error(id: &str, url: &str) -> Option<&'static str> {
+    if id.len() > MAX_WEBSOCKET_CONNECTION_ID_BYTES {
+        return Some("Local WebSocket connection ID exceeds the byte limit");
+    }
+    if url.len() > MAX_WEBSOCKET_LOCAL_URL_BYTES {
+        return Some("Local WebSocket upgrade URL exceeds the byte limit");
+    }
+    if !is_safe_local_url(url) {
+        return Some("Local WebSocket upgrade URL was rejected");
+    }
+    None
 }
 
 /// Check if enough time has elapsed since last pong to consider the relay dead.
@@ -443,6 +1000,234 @@ fn extract_response_data(response: &ClientMessage) -> (u16, HashMap<String, Stri
         }
         _ => (0, HashMap::new(), Vec::new()),
     }
+}
+
+fn request_memory_permits(wire_message_len: usize) -> Option<u32> {
+    let permits = wire_message_len
+        .saturating_mul(HTTP_REQUEST_ESTIMATED_OVERHEAD_MULTIPLIER)
+        .div_ceil(HTTP_RESPONSE_MEMORY_UNIT_BYTES)
+        .max(1);
+    if permits > HTTP_REQUEST_MEMORY_PERMITS {
+        return None;
+    }
+    u32::try_from(permits).ok()
+}
+
+fn websocket_memory_permits(retained_bytes: usize) -> Option<u32> {
+    let permits = retained_bytes
+        .div_ceil(HTTP_RESPONSE_MEMORY_UNIT_BYTES)
+        .max(1);
+    if permits > WEBSOCKET_MEMORY_PERMITS {
+        return None;
+    }
+    u32::try_from(permits).ok()
+}
+
+fn inbound_websocket_memory_permits(
+    wire_message_bytes: usize,
+    base64_payload_bytes: usize,
+) -> Option<u32> {
+    let decoded_bytes = base64_payload_bytes
+        .checked_div(4)
+        .and_then(|groups| groups.checked_mul(3))
+        .and_then(|bytes| bytes.checked_add(3))?;
+    let retained_bytes = wire_message_bytes
+        .checked_mul(2)?
+        .checked_add(decoded_bytes)?;
+    websocket_memory_permits(retained_bytes)
+        .filter(|permits| *permits as usize <= WEBSOCKET_MEMORY_PERMITS)
+}
+
+fn local_websocket_message(data: Vec<u8>, is_binary: bool) -> Result<Message, String> {
+    if is_binary {
+        Ok(Message::Binary(data))
+    } else {
+        String::from_utf8(data)
+            .map(Message::Text)
+            .map_err(|_| "relay WebSocket text frame is not valid UTF-8".to_string())
+    }
+}
+
+fn websocket_encoded_message_bytes(raw_bytes: usize, connection_id_bytes: usize) -> Option<usize> {
+    let encoded = raw_bytes.checked_add(2)?.checked_div(3)?.checked_mul(4)?;
+    raw_bytes
+        .checked_add(encoded)?
+        .checked_add(connection_id_bytes.checked_mul(6)?)?
+        .checked_add(64)
+}
+
+fn serialize_websocket_frame(id: &str, bytes: &[u8], is_binary: bool) -> Result<String, String> {
+    use base64::Engine as _;
+
+    const PREFIX: &str = "{\"type\":\"ws_frame\",\"id\":";
+    const DATA_PREFIX: &str = ",\"data\":\"";
+    const BINARY_TRUE: &str = "\",\"is_binary\":true}";
+    const BINARY_FALSE: &str = "\",\"is_binary\":false}";
+
+    let encoded = base64::encoded_len(bytes.len(), true)
+        .ok_or_else(|| "WebSocket frame size overflowed during base64 encoding".to_string())?;
+    let escaped_id_capacity = id
+        .len()
+        .checked_mul(6)
+        .and_then(|len| len.checked_add(2))
+        .ok_or_else(|| "WebSocket connection ID size overflowed".to_string())?;
+    let suffix = if is_binary { BINARY_TRUE } else { BINARY_FALSE };
+    let capacity = PREFIX
+        .len()
+        .checked_add(escaped_id_capacity)
+        .and_then(|len| len.checked_add(DATA_PREFIX.len()))
+        .and_then(|len| len.checked_add(encoded))
+        .and_then(|len| len.checked_add(suffix.len()))
+        .ok_or_else(|| "WebSocket frame size overflowed during JSON serialization".to_string())?;
+    let mut json = Vec::with_capacity(capacity);
+    json.extend_from_slice(PREFIX.as_bytes());
+    serde_json::to_writer(&mut json, id).map_err(|error| error.to_string())?;
+    json.extend_from_slice(DATA_PREFIX.as_bytes());
+    let data_offset = json.len();
+    json.resize(
+        data_offset
+            .checked_add(encoded)
+            .ok_or_else(|| "WebSocket frame size overflowed during base64 encoding".to_string())?,
+        0,
+    );
+    let written = base64::engine::general_purpose::STANDARD
+        .encode_slice(bytes, &mut json[data_offset..])
+        .map_err(|error| error.to_string())?;
+    json.truncate(data_offset + written);
+    json.extend_from_slice(suffix.as_bytes());
+    String::from_utf8(json).map_err(|error| error.to_string())
+}
+
+fn captured_websocket_headers(
+    headers: &HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if websocket_upgrade_header_bytes(headers)? > WEBSOCKET_CAPTURE_HEADER_BYTES {
+        return None;
+    }
+    Some(headers.clone())
+}
+
+fn websocket_upgrade_header_bytes(headers: &HashMap<String, String>) -> Option<usize> {
+    headers.iter().try_fold(0usize, |retained, (name, value)| {
+        retained
+            .checked_add(name.len())?
+            .checked_add(value.len())?
+            .checked_add(64)
+    })
+}
+
+fn bounded_websocket_upgrade_headers(
+    headers: HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let retained = websocket_upgrade_header_bytes(&headers)
+        .ok_or_else(|| "WebSocket upgrade headers exceeded the tunnel byte limit".to_string())?;
+    if retained > WEBSOCKET_CAPTURE_HEADER_BYTES {
+        return Err(format!(
+            "WebSocket upgrade headers exceed the {WEBSOCKET_CAPTURE_HEADER_BYTES}-byte limit"
+        ));
+    }
+    Ok(headers)
+}
+
+async fn forward_http_request(
+    http_client: reqwest::Client,
+    local_target: lpm_common::LocalTarget,
+    server_msg: ServerMessage,
+    auto_ack: bool,
+    webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhookEvent>>,
+    memory_budget: Arc<tokio::sync::Semaphore>,
+    request_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+) -> (
+    ClientMessage,
+    Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+) {
+    let forward_start = std::time::Instant::now();
+    let mut was_auto_acked = false;
+    let memory_multiplier = if webhook_tx.is_some() {
+        HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER
+    } else {
+        HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER - 1
+    };
+    let (response, memory_permit) = match proxy::forward_request_with_memory_budget(
+        &http_client,
+        &local_target,
+        &server_msg,
+        memory_budget,
+        HTTP_RESPONSE_MEMORY_PERMITS,
+        HTTP_RESPONSE_MEMORY_UNIT_BYTES,
+        memory_multiplier,
+    )
+    .await
+    {
+        Ok(response) => (response.message, response.memory_permit.map(Arc::new)),
+        Err(error) => {
+            tracing::debug!("local proxy error: {error}");
+            let ServerMessage::HttpRequest { ref id, .. } = server_msg else {
+                return (ClientMessage::Ping, None);
+            };
+            let response = if auto_ack {
+                was_auto_acked = true;
+                tracing::info!("auto-ack: returning 200 OK (server down)");
+                proxy::auto_ack_response(id)
+            } else {
+                proxy::bad_gateway_response(id)
+            };
+            (response, None)
+        }
+    };
+
+    if let Some(ref tx) = webhook_tx
+        && let ServerMessage::HttpRequest {
+            ref id,
+            ref method,
+            ref url,
+            ref headers,
+            ref body,
+        } = server_msg
+    {
+        let request_body = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
+            .unwrap_or_default();
+        let (response_status, response_headers, response_body) = extract_response_data(&response);
+        let mut captured = CapturedWebhook {
+            id: id.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: method.clone(),
+            path: url.clone(),
+            request_headers: headers.clone(),
+            request_body,
+            response_status,
+            response_headers,
+            response_body,
+            duration_ms: forward_start.elapsed().as_millis() as u64,
+            provider: webhook::detect_provider(url, headers),
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: was_auto_acked,
+        };
+        captured.summary = webhook::summarize_webhook(&captured);
+        if captured.response_status >= 400 {
+            const DIAGNOSTIC_ENV_ALLOWLIST: &[&str] = &[
+                "STRIPE_WEBHOOK_SECRET",
+                "STRIPE_SIGNING_SECRET",
+                "GITHUB_WEBHOOK_SECRET",
+            ];
+            let mut env_vars = HashMap::with_capacity(DIAGNOSTIC_ENV_ALLOWLIST.len());
+            for name in DIAGNOSTIC_ENV_ALLOWLIST {
+                if let Ok(value) = std::env::var(name) {
+                    env_vars.insert((*name).to_string(), value);
+                }
+            }
+            captured.signature_diagnostic =
+                webhook_signature::diagnose_signature_failure(&captured, &env_vars);
+        }
+        let _ = tx.try_send(CapturedWebhookEvent {
+            webhook: Arc::new(captured),
+            _response_memory_permit: memory_permit.clone(),
+            _request_memory_permit: request_memory_permit,
+        });
+    }
+
+    (response, memory_permit)
 }
 
 // ── TOFU Certificate Pinning ──────────────────────────────────────
@@ -861,6 +1646,8 @@ async fn try_connect(
     )?;
 
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        write_buffer_size: WEBSOCKET_WRITE_BUFFER_BYTES,
+        max_write_buffer_size: WEBSOCKET_MAX_WRITE_BUFFER_BYTES,
         max_message_size: Some(MAX_WS_MESSAGE_SIZE),
         max_frame_size: Some(MAX_WS_FRAME_SIZE),
         ..Default::default()
@@ -978,6 +1765,17 @@ async fn try_connect(
         error,
         retry_class: RetryClass::Permanent,
     })?;
+    if let Some(admission) = options.forwarding_admission.as_ref() {
+        tokio::select! {
+            result = admission.wait() => {
+                result.map_err(|error| TunnelConnectError {
+                    error,
+                    retry_class: RetryClass::Permanent,
+                })?;
+            }
+            _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+        }
+    }
 
     // Create HTTP client for local proxying. `Policy::none()` disables
     // redirect-following entirely — the local dev server should never
@@ -1004,29 +1802,39 @@ async fn try_connect(
 
     // Channel for spawned WebSocket tasks to send frames back to the relay.
     // The main loop owns `write` exclusively; spawned tasks send through this channel.
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<RelayWebSocketMessage>(64);
+    let relay_websocket_memory = Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS));
+    let local_websocket_memory = Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS));
+    let websocket_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBSOCKETS));
+
+    let http_forward_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HTTP_FORWARDS));
+    let http_request_memory = Arc::new(tokio::sync::Semaphore::new(HTTP_REQUEST_MEMORY_PERMITS));
+    let http_response_memory = Arc::new(tokio::sync::Semaphore::new(HTTP_RESPONSE_MEMORY_PERMITS));
+    let (http_response_tx, mut http_response_rx) =
+        tokio::sync::mpsc::channel::<CompletedHttpForward>(MAX_CONCURRENT_HTTP_FORWARDS);
 
     // Track spawned task handles for graceful shutdown.
     let mut task_handles = tokio::task::JoinSet::new();
 
     // Active local WebSocket connections keyed by connection ID.
     // Senders push frames from relay → local WS.
-    let mut ws_connections: HashMap<String, tokio::sync::mpsc::Sender<LocalWebSocketCommand>> =
-        HashMap::new();
+    let mut ws_connections: HashMap<String, WebSocketConnection> = HashMap::new();
+    let mut closing_websockets: HashMap<String, ClosingWebSocket> = HashMap::new();
+    let mut pending_websocket_upgrades: HashMap<String, PendingWebSocketUpgrade> = HashMap::new();
+    let (closed_local_ws_tx, mut closed_local_ws_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClosedLocalWebSocket>();
+    let (websocket_upgrade_tx, mut websocket_upgrade_rx) =
+        tokio::sync::mpsc::channel::<CompletedWebSocketUpgrade>(MAX_CONCURRENT_WEBSOCKETS);
+    let mut next_websocket_generation = 0u64;
 
     // Message loop
     loop {
         tokio::select! {
+            _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => break,
             // Incoming message from relay
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(RelayExtensionMessage::UsageNotice { usage }) =
-                            serde_json::from_str::<RelayExtensionMessage>(&text)
-                        {
-                            on_usage(&usage, false);
-                            continue;
-                        }
                         let server_msg: ServerMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {
@@ -1051,131 +1859,154 @@ async fn try_connect(
                                             continue;
                                         }
                                     };
-                                    if let Err(e) = write.send(Message::Text(json)).await {
+                                    if let Err(e) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
                                         tracing::warn!("failed to send error response to relay: {e}");
                                         break;
                                     }
                                     continue;
                                 }
 
-                                let forward_start = std::time::Instant::now();
-                                let mut was_auto_acked = false;
-                                let local_target = options.current_local_target();
-                                let response = match proxy::forward_request(
-                                    &http_client,
-                                    &local_target,
-                                    &server_msg,
-                                )
-                                .await
-                                {
-                                    Ok(resp) => resp,
-                                    Err(e) => {
-                                        tracing::debug!("local proxy error: {e}");
-                                        if let ServerMessage::HttpRequest { id, .. } = &server_msg {
-                                            if options.auto_ack {
-                                                // Auto-ack: return 200 OK to prevent provider
-                                                // retries and endpoint deactivation
-                                                was_auto_acked = true;
-                                                tracing::info!(
-                                                    "auto-ack: returning 200 OK (server down)"
-                                                );
-                                                proxy::auto_ack_response(id)
-                                            } else {
-                                                proxy::bad_gateway_response(id)
-                                            }
-                                        } else {
-                                            continue;
+                                let request_permits = request_memory_permits(text.len());
+                                let request_permits = match request_permits {
+                                    Some(permits) => permits,
+                                    None => {
+                                        let response = proxy::service_unavailable_response(id);
+                                        if let Ok(json) = serde_json::to_string(&response)
+                                            && send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err()
+                                        {
+                                            break;
                                         }
-                                    }
-                                };
-                                let forward_duration = forward_start.elapsed();
-
-                                // Capture webhook for inspector/logger/dashboard
-                                if let Some(ref tx) = options.webhook_tx
-                                    && let ServerMessage::HttpRequest {
-                                        ref id,
-                                        ref method,
-                                        ref url,
-                                        ref headers,
-                                        ref body,
-                                    } = server_msg
-                                    {
-                                        let req_body = base64::Engine::decode(
-                                            &base64::engine::general_purpose::STANDARD,
-                                            body,
-                                        )
-                                        .unwrap_or_default();
-
-                                        let (resp_status, resp_headers, resp_body) =
-                                            extract_response_data(&response);
-
-                                        let mut captured = CapturedWebhook {
-                                            id: id.clone(),
-                                            timestamp: chrono::Utc::now().to_rfc3339(),
-                                            method: method.clone(),
-                                            path: url.clone(),
-                                            request_headers: headers.clone(),
-                                            request_body: req_body,
-                                            response_status: resp_status,
-                                            response_headers: resp_headers,
-                                            response_body: resp_body,
-                                            duration_ms: forward_duration.as_millis() as u64,
-                                            provider: webhook::detect_provider(url, headers),
-                                            summary: String::new(),
-                                            signature_diagnostic: None,
-                                            auto_acked: was_auto_acked,
-                                        };
-                                        captured.summary = webhook::summarize_webhook(&captured);
-
-                                        // Signature diagnostics on 4xx/5xx only. Explicit env
-                                        // allowlist — std::env::vars().collect() would silently
-                                        // leak unrelated secrets if the diagnostic ever logged
-                                        // its inputs.
-                                        if captured.response_status >= 400 {
-                                            const DIAGNOSTIC_ENV_ALLOWLIST: &[&str] = &[
-                                                "STRIPE_WEBHOOK_SECRET",
-                                                "STRIPE_SIGNING_SECRET",
-                                                "GITHUB_WEBHOOK_SECRET",
-                                            ];
-                                            let mut env_vars: HashMap<String, String> =
-                                                HashMap::new();
-                                            for name in DIAGNOSTIC_ENV_ALLOWLIST {
-                                                if let Ok(v) = std::env::var(name) {
-                                                    env_vars.insert((*name).to_string(), v);
-                                                }
-                                            }
-                                            captured.signature_diagnostic =
-                                                webhook_signature::diagnose_signature_failure(
-                                                    &captured, &env_vars,
-                                                );
-                                        }
-
-                                        let _ = tx.try_send(captured);
-                                    }
-
-                                let json = match serde_json::to_string(&response) {
-                                    Ok(j) => j,
-                                    Err(e) => {
-                                        tracing::error!("failed to serialize HTTP response: {e}");
                                         continue;
                                     }
                                 };
-                                if let Err(e) = write.send(Message::Text(json)).await {
-                                    tracing::warn!("failed to send response to relay: {e}");
-                                    break;
-                                }
+                                let request_memory_permit = match Arc::clone(&http_request_memory)
+                                    .try_acquire_many_owned(request_permits)
+                                {
+                                    Ok(permit) => Arc::new(permit),
+                                    Err(_) => {
+                                        let response = proxy::service_unavailable_response(id);
+                                        if let Ok(json) = serde_json::to_string(&response)
+                                            && send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                let permit = match Arc::clone(&http_forward_slots)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        let response = if options.auto_ack {
+                                            proxy::auto_ack_response(id)
+                                        } else {
+                                            proxy::service_unavailable_response(id)
+                                        };
+                                        let json = match serde_json::to_string(&response) {
+                                            Ok(json) => json,
+                                            Err(error) => {
+                                                tracing::error!(
+                                                    "failed to serialize busy response: {error}"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        if let Err(error) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
+                                            tracing::warn!(
+                                                "failed to send busy response to relay: {error}"
+                                            );
+                                            break;
+                                        }
+                                        if options.auto_ack
+                                            && let Some(ref webhook_tx) = options.webhook_tx
+                                            && let ServerMessage::HttpRequest {
+                                                id,
+                                                method,
+                                                url,
+                                                headers,
+                                                body,
+                                            } = &server_msg
+                                        {
+                                            let request_body = base64::Engine::decode(
+                                                &base64::engine::general_purpose::STANDARD,
+                                                body,
+                                            )
+                                            .unwrap_or_default();
+                                            let (response_status, response_headers, response_body) =
+                                                extract_response_data(&response);
+                                            let mut captured = CapturedWebhook {
+                                                id: id.clone(),
+                                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                                method: method.clone(),
+                                                path: url.clone(),
+                                                request_headers: headers.clone(),
+                                                request_body,
+                                                response_status,
+                                                response_headers,
+                                                response_body,
+                                                duration_ms: 0,
+                                                provider: webhook::detect_provider(url, headers),
+                                                summary: String::new(),
+                                                signature_diagnostic: None,
+                                                auto_acked: true,
+                                            };
+                                            captured.summary = webhook::summarize_webhook(&captured);
+                                            let _ = webhook_tx.try_send(CapturedWebhookEvent {
+                                                webhook: Arc::new(captured),
+                                                _response_memory_permit: None,
+                                                _request_memory_permit: Some(request_memory_permit),
+                                            });
+                                        }
+                                        continue;
+                                    }
+                                };
+
+                                let http_client = http_client.clone();
+                                let local_target = options.current_local_target();
+                                let auto_ack = options.auto_ack;
+                                let webhook_tx = options.webhook_tx.clone();
+                                let http_response_tx = http_response_tx.clone();
+                                let http_response_memory = Arc::clone(&http_response_memory);
+                                task_handles.spawn(async move {
+                                    let (response, memory_permit) = forward_http_request(
+                                        http_client,
+                                        local_target,
+                                        server_msg,
+                                        auto_ack,
+                                        webhook_tx.clone(),
+                                        http_response_memory,
+                                        Some(request_memory_permit),
+                                    )
+                                    .await;
+                                    let json = match serde_json::to_string(&response) {
+                                        Ok(json) => json,
+                                        Err(error) => {
+                                            tracing::error!(
+                                                "failed to serialize HTTP response: {error}"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    let _ = http_response_tx
+                                        .send(CompletedHttpForward {
+                                            json,
+                                            permit,
+                                            memory_permit,
+                                        })
+                                        .await;
+                                });
                             }
                             ServerMessage::WebSocketUpgrade { id, url, headers } => {
-                                // Validate the URL before forwarding — prevent path traversal
-                                // and header injection via crafted URLs from the relay.
-                                if !is_safe_local_url(&url) {
+                                if let Some(error) = websocket_upgrade_metadata_error(&id, &url) {
                                     tracing::warn!(
                                         "rejected WebSocket upgrade with unsafe URL: {:?}",
                                         url
                                     );
                                     let error_resp = ClientExtensionMessage::WebSocketReject {
                                         id,
-                                        error: "Local WebSocket upgrade URL was rejected".to_string(),
+                                        error: error.to_string(),
                                     };
                                     let json = match serde_json::to_string(&error_resp) {
                                         Ok(j) => j,
@@ -1184,248 +2015,200 @@ async fn try_connect(
                                             continue;
                                         }
                                     };
-                                    if let Err(e) = write.send(Message::Text(json)).await {
+                                    if let Err(e) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
                                         tracing::warn!("failed to send error response to relay: {e}");
                                         break;
                                     }
                                     continue;
                                 }
 
-                                // Establish local WebSocket connection for HMR passthrough
-                                tracing::debug!("WebSocket upgrade request: {url}");
-                                let local_target = options.current_local_target();
-                                match proxy::connect_local_websocket(
-                                    &local_target,
-                                    &url,
-                                    &headers,
-                                ).await {
-                                    Ok((local_write, mut local_read)) => {
-                                        // Create a channel for relay → local WS forwarding
-                                        let (local_tx, mut local_rx) =
-                                            tokio::sync::mpsc::channel::<LocalWebSocketCommand>(64);
-                                        ws_connections.insert(id.clone(), local_tx);
-
-                                        // Spawn: relay → local WS (consumes frames from local_rx)
-                                        let local_write = std::sync::Arc::new(
-                                            tokio::sync::Mutex::new(local_write),
-                                        );
-                                        let local_write_clone = local_write.clone();
-                                        let id_for_writer = id.clone();
-                                        task_handles.spawn(async move {
-                                            while let Some(command) = local_rx.recv().await {
-                                                let is_close = matches!(
-                                                    &command,
-                                                    LocalWebSocketCommand::Close { .. }
-                                                );
-                                                let msg = match command {
-                                                    LocalWebSocketCommand::Frame {
-                                                        data,
-                                                        is_binary,
-                                                    } => {
-                                                        if is_binary {
-                                                            tokio_tungstenite::tungstenite::Message::Binary(data)
-                                                        } else {
-                                                            let text =
-                                                                String::from_utf8_lossy(&data)
-                                                                    .into_owned();
-                                                            tokio_tungstenite::tungstenite::Message::Text(text)
-                                                        }
-                                                    }
-                                                    LocalWebSocketCommand::Close {
-                                                        code,
-                                                        reason,
-                                                    } => {
-                                                        let close_frame = CloseFrame {
-                                                            code: CloseCode::from(
-                                                                code.unwrap_or(1000),
-                                                            ),
-                                                            reason: reason
-                                                                .unwrap_or_default()
-                                                                .into(),
-                                                        };
-                                                        tokio_tungstenite::tungstenite::Message::Close(
-                                                            Some(close_frame),
-                                                        )
-                                                    }
-                                                };
-                                                let mut sink = local_write_clone.lock().await;
-                                                if let Err(e) = sink.send(msg).await {
-                                                    tracing::debug!(
-                                                        "local WS write failed for {}: {e}",
-                                                        id_for_writer
-                                                    );
-                                                    break;
-                                                }
-
-                                                if is_close {
-                                                    break;
-                                                }
-                                            }
-                                        });
-
-                                        // Spawn: local WS → relay (reads from local_read, sends via relay_tx)
-                                        let relay_tx_clone = relay_tx.clone();
-                                        let id_clone = id.clone();
-                                        let ws_tx_clone = options.ws_tx.clone();
-                                        task_handles.spawn(async move {
-                                            while let Some(Ok(msg)) = local_read.next().await {
-                                                let (data, is_binary, capture) = match msg {
-                                                    tokio_tungstenite::tungstenite::Message::Text(t) => {
-                                                        let capture = ws_tx_clone.as_ref().map(|_| {
-                                                            WsEvent::captured_frame(
-                                                                id_clone.clone(),
-                                                                FrameDirection::Outbound,
-                                                                t.as_bytes(),
-                                                                false,
-                                                                chrono::Utc::now().to_rfc3339(),
-                                                            )
-                                                        });
-                                                        (base64::Engine::encode(
-                                                            &base64::engine::general_purpose::STANDARD,
-                                                            t.as_bytes(),
-                                                        ), false, capture)
-                                                    }
-                                                    tokio_tungstenite::tungstenite::Message::Binary(b) => {
-                                                        let capture = ws_tx_clone.as_ref().map(|_| {
-                                                            WsEvent::captured_frame(
-                                                                id_clone.clone(),
-                                                                FrameDirection::Outbound,
-                                                                &b,
-                                                                true,
-                                                                chrono::Utc::now().to_rfc3339(),
-                                                            )
-                                                        });
-                                                        (base64::Engine::encode(
-                                                            &base64::engine::general_purpose::STANDARD,
-                                                            &b,
-                                                        ), true, capture)
-                                                    }
-                                                    tokio_tungstenite::tungstenite::Message::Close(reason) => {
-                                                        tracing::debug!("local WS closed for {}", id_clone);
-                                                        let close_reason = reason
-                                                            .as_ref()
-                                                            .map(|frame| frame.reason.to_string());
-                                                        let close_code = reason
-                                                            .as_ref()
-                                                            .map(|frame| u16::from(frame.code));
-                                                        if let Some(ref ws_tx) = ws_tx_clone {
-                                                            let _ = ws_tx.try_send(WsEvent::Closed {
-                                                                connection_id: id_clone.clone(),
-                                                                reason: close_reason.clone(),
-                                                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                                            });
-                                                        }
-                                                        let close_msg = ClientMessage::WebSocketClose {
-                                                            id: id_clone.clone(),
-                                                            code: close_code,
-                                                            reason: close_reason,
-                                                        };
-                                                        if let Ok(json) = serde_json::to_string(&close_msg) {
-                                                            let _ = relay_tx_clone.send(json).await;
-                                                        }
-                                                        break;
-                                                    }
-                                                    _ => continue,
-                                                };
-                                                // Capture outbound frame for inspector
-                                                if let (Some(ws_tx), Some(capture)) =
-                                                    (ws_tx_clone.as_ref(), capture)
-                                                {
-                                                    let _ = ws_tx.try_send(capture);
-                                                }
-
-                                                let frame = ClientMessage::WebSocketFrame {
-                                                    id: id_clone.clone(),
-                                                    data,
-                                                    is_binary,
-                                                };
-                                                let json = match serde_json::to_string(&frame) {
-                                                    Ok(j) => j,
-                                                    Err(e) => {
-                                                        tracing::error!(
-                                                            "failed to serialize WS frame: {e}"
-                                                        );
-                                                        continue;
-                                                    }
-                                                };
-                                                if relay_tx_clone.send(json).await.is_err() {
-                                                    // Main loop dropped the receiver — tunnel is closing
-                                                    break;
-                                                }
-                                            }
-                                        });
-
-                                        let ready = ClientExtensionMessage::WebSocketReady {
-                                            id: id.clone(),
+                                if websocket_id_is_in_use(
+                                    &ws_connections,
+                                    &closing_websockets,
+                                    &pending_websocket_upgrades,
+                                    &id,
+                                ) {
+                                    let reject = ClientExtensionMessage::WebSocketReject {
+                                        id,
+                                        error: "A WebSocket with this connection ID is already active"
+                                            .to_string(),
+                                    };
+                                    let json = serde_json::to_string(&reject).map_err(|error| {
+                                        LpmError::Tunnel(format!(
+                                            "failed to serialize duplicate WebSocket rejection: {error}"
+                                        ))
+                                    })?;
+                                    if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                let headers = match bounded_websocket_upgrade_headers(headers) {
+                                    Ok(headers) => headers,
+                                    Err(error) => {
+                                        let reject = ClientExtensionMessage::WebSocketReject {
+                                            id,
+                                            error,
                                         };
-                                        let json = match serde_json::to_string(&ready) {
-                                            Ok(json) => json,
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "failed to serialize WebSocket upgrade confirmation: {e}"
-                                                );
-                                                break;
-                                            }
-                                        };
-                                        if let Err(e) = write.send(Message::Text(json)).await {
-                                            tracing::warn!(
-                                                "failed to confirm WebSocket upgrade to relay: {e}"
-                                            );
+                                        let json = serde_json::to_string(&reject).map_err(|error| {
+                                            LpmError::Tunnel(format!(
+                                                "failed to serialize WebSocket header rejection: {error}"
+                                            ))
+                                        })?;
+                                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
                                             break;
                                         }
-
-                                        tracing::debug!("WebSocket upgrade established for {url}");
-
-                                        // Capture WS connection event for inspector
-                                        if let Some(ref ws_tx) = options.ws_tx {
-                                            let _ = ws_tx.try_send(WsEvent::Connected {
-                                                connection_id: id.clone(),
-                                                url: url.clone(),
-                                                headers: headers.clone(),
-                                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                            });
-                                        }
+                                        continue;
                                     }
-                                    Err(e) => {
-                                        tracing::warn!("WebSocket upgrade failed for {}: {e}", id);
-                                        let error_resp = ClientExtensionMessage::WebSocketReject {
+                                };
+                                let websocket_slot = match Arc::clone(&websocket_slots)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(slot) => slot,
+                                    Err(_) => {
+                                        let reject = ClientExtensionMessage::WebSocketReject {
                                             id,
-                                            error: "Local server rejected the WebSocket upgrade"
+                                            error: "The local WebSocket connection limit is reached"
                                                 .to_string(),
                                         };
-                                        let json = match serde_json::to_string(&error_resp) {
-                                            Ok(j) => j,
-                                            Err(ser_e) => {
-                                                tracing::error!(
-                                                    "failed to serialize WS upgrade error: {ser_e}"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        if let Err(e) = write.send(Message::Text(json)).await {
-                                            tracing::warn!(
-                                                "failed to send WS upgrade error to relay: {e}"
-                                            );
+                                        let json = serde_json::to_string(&reject).map_err(|error| {
+                                            LpmError::Tunnel(format!(
+                                                "failed to serialize WebSocket capacity rejection: {error}"
+                                            ))
+                                        })?;
+                                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
                                             break;
                                         }
+                                        continue;
                                     }
-                                }
+                                };
+                                next_websocket_generation = next_websocket_generation.wrapping_add(1);
+                                let websocket_generation = next_websocket_generation;
+                                let upgrade_cancel = tokio_util::sync::CancellationToken::new();
+                                pending_websocket_upgrades.insert(
+                                    id.clone(),
+                                    PendingWebSocketUpgrade {
+                                        generation: websocket_generation,
+                                        cancel: upgrade_cancel.clone(),
+                                    },
+                                );
+
+                                tracing::debug!("WebSocket upgrade request: {url}");
+                                let local_target = options.current_local_target();
+                                let upgrade_tx = websocket_upgrade_tx.clone();
+                                let upgrade_id = id.clone();
+                                let upgrade_url = url.clone();
+                                let upgrade_headers = headers;
+                                task_handles.spawn(async move {
+                                    let result = tokio::select! {
+                                        biased;
+                                        _ = upgrade_cancel.cancelled() => return,
+                                        result = tokio::time::timeout(
+                                            std::time::Duration::from_secs(
+                                                WEBSOCKET_CONNECT_TIMEOUT_SECS,
+                                            ),
+                                            proxy::connect_local_websocket(
+                                                &local_target,
+                                                &upgrade_url,
+                                                &upgrade_headers,
+                                            ),
+                                        ) => result,
+                                    };
+                                    let result = match result {
+                                        Ok(Ok(connection)) => Ok(connection),
+                                        Ok(Err(error)) => Err(format!(
+                                            "Local server rejected the WebSocket upgrade: {error}"
+                                        )),
+                                        Err(_) => {
+                                            Err("Local WebSocket upgrade timed out".to_string())
+                                        }
+                                    };
+                                    let _ = upgrade_tx
+                                        .send(CompletedWebSocketUpgrade {
+                                            id: upgrade_id,
+                                            url: upgrade_url,
+                                            headers: upgrade_headers,
+                                            generation: websocket_generation,
+                                            slot: websocket_slot,
+                                            result,
+                                        })
+                                        .await;
+                                });
                             }
                             ServerMessage::WebSocketFrame { id, data, is_binary } => {
                                 // Forward frame from relay → local WebSocket
-                                if let Some(tx) = ws_connections.get(&id) {
+                                if let Some(connection) = ws_connections.get(&id) {
+                                    let Some(permits) =
+                                        inbound_websocket_memory_permits(text.len(), data.len())
+                                    else {
+                                        tracing::warn!(
+                                            "closing WebSocket {id} after an oversized relay frame"
+                                        );
+                                        cancel_active_websocket(
+                                            &mut ws_connections,
+                                            &mut closing_websockets,
+                                            &id,
+                                            true,
+                                        );
+                                        send_websocket_close_to_relay(
+                                            &mut write,
+                                            &id,
+                                            "relay WebSocket frame exceeded the tunnel byte limit",
+                                        ).await?;
+                                        continue;
+                                    };
+                                    let memory_permit = match Arc::clone(&local_websocket_memory)
+                                        .try_acquire_many_owned(permits)
+                                    {
+                                        Ok(permit) => permit,
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                "closing WebSocket {id} because local backpressure exhausted the byte budget"
+                                            );
+                                            cancel_active_websocket(
+                                                &mut ws_connections,
+                                                &mut closing_websockets,
+                                                &id,
+                                                true,
+                                            );
+                                            send_websocket_close_to_relay(
+                                                &mut write,
+                                                &id,
+                                                "local backpressure exhausted the WebSocket byte budget",
+                                            ).await?;
+                                            continue;
+                                        }
+                                    };
                                     let decoded = match base64::Engine::decode(
                                         &base64::engine::general_purpose::STANDARD,
                                         &data,
                                     ) {
-                                        Ok(d) => d,
-                                        Err(e) => {
+                                        Ok(decoded) => decoded,
+                                        Err(error) => {
                                             tracing::warn!(
-                                                "failed to decode WS frame data for {id}: {e}"
+                                                "failed to decode WS frame data for {id}: {error}"
                                             );
                                             continue;
                                         }
                                     };
+                                    if !is_binary && std::str::from_utf8(&decoded).is_err() {
+                                        tracing::warn!(
+                                            "closing WebSocket {id} after an invalid text frame"
+                                        );
+                                        cancel_active_websocket(
+                                            &mut ws_connections,
+                                            &mut closing_websockets,
+                                            &id,
+                                            true,
+                                        );
+                                        send_websocket_close_to_relay(
+                                            &mut write,
+                                            &id,
+                                            "relay WebSocket text frame is not valid UTF-8",
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
                                     // Capture inbound frame for inspector
                                     if let Some(ref ws_tx) = options.ws_tx {
                                         let _ = ws_tx.try_send(WsEvent::captured_frame(
@@ -1437,12 +2220,35 @@ async fn try_connect(
                                         ));
                                     }
 
-                                    if tx.send(LocalWebSocketCommand::Frame { data: decoded, is_binary }).await.is_err() {
+                                    let command = LocalWebSocketCommand::Frame {
+                                        data: decoded,
+                                        is_binary,
+                                        _memory_permit: memory_permit,
+                                    };
+                                    let enqueue_result = tokio::time::timeout(
+                                        std::time::Duration::from_millis(
+                                            WEBSOCKET_LOCAL_ENQUEUE_TIMEOUT_MILLIS,
+                                        ),
+                                        connection.commands.send(command),
+                                    )
+                                    .await;
+                                    if !matches!(enqueue_result, Ok(Ok(()))) {
                                         // Local WS connection closed, clean up
                                         tracing::debug!(
                                             "local WS connection {id} closed, removing"
                                         );
-                                        ws_connections.remove(&id);
+                                        cancel_active_websocket(
+                                            &mut ws_connections,
+                                            &mut closing_websockets,
+                                            &id,
+                                            true,
+                                        );
+                                        send_websocket_close_to_relay(
+                                            &mut write,
+                                            &id,
+                                            "local WebSocket forwarding queue stalled",
+                                        )
+                                        .await?;
                                     }
                                 } else {
                                     tracing::warn!(
@@ -1451,8 +2257,35 @@ async fn try_connect(
                                 }
                             }
                             ServerMessage::WebSocketClose { id, code, reason } => {
-                                if let Some(tx) = ws_connections.remove(&id) {
-                                    let _ = tx.send(LocalWebSocketCommand::Close { code, reason }).await;
+                                if discard_pending_websocket_upgrade(
+                                    &mut pending_websocket_upgrades,
+                                    &id,
+                                ) {
+                                    tracing::debug!(
+                                        "cancelled pending WS upgrade after relay close for {id}"
+                                    );
+                                } else if let Some(connection) = ws_connections.remove(&id) {
+                                    let generation = connection.generation;
+                                    let cancel = connection.cancel.clone();
+                                    if connection
+                                        .priority_commands
+                                        .try_send(LocalWebSocketCommand::Close {
+                                            code,
+                                            reason: bounded_websocket_close_reason(reason),
+                                        })
+                                        .is_err()
+                                    {
+                                        cancel.cancel();
+                                    }
+                                    closing_websockets.insert(
+                                        id,
+                                        ClosingWebSocket {
+                                            generation,
+                                            cancel,
+                                            completed_halves: 0,
+                                            relay_notified: true,
+                                        },
+                                    );
                                 } else {
                                     tracing::debug!("received WS close for unknown connection {id}");
                                 }
@@ -1460,6 +2293,9 @@ async fn try_connect(
                             ServerMessage::Pong => {
                                 last_pong = std::time::Instant::now();
                                 tracing::debug!("pong received");
+                            }
+                            ServerMessage::UsageNotice { usage } => {
+                                on_usage(&usage, false);
                             }
                             ServerMessage::Error { message, .. } => {
                                 tracing::error!("relay error: {message}");
@@ -1489,11 +2325,153 @@ async fn try_connect(
                 }
             }
 
+            Some(completed) = websocket_upgrade_rx.recv() => {
+                if pending_websocket_upgrades
+                    .get(&completed.id)
+                    .map(|pending| pending.generation)
+                    != Some(completed.generation)
+                {
+                    continue;
+                }
+                pending_websocket_upgrades.remove(&completed.id);
+                match completed.result {
+                    Ok((local_write, local_read)) => {
+                        let connection = activate_local_websocket(
+                            &mut task_handles,
+                            LocalWebSocketActivation {
+                                id: completed.id.clone(),
+                                generation: completed.generation,
+                                local_write,
+                                local_read,
+                                slot: completed.slot,
+                                relay_tx: relay_tx.clone(),
+                                relay_memory: Arc::clone(&relay_websocket_memory),
+                                ws_tx: options.ws_tx.clone(),
+                                closed_tx: closed_local_ws_tx.clone(),
+                            },
+                        );
+                        ws_connections.insert(completed.id.clone(), connection);
+                        let ready = ClientExtensionMessage::WebSocketReady {
+                            id: completed.id.clone(),
+                        };
+                        let json = serde_json::to_string(&ready).map_err(|error| {
+                            LpmError::Tunnel(format!(
+                                "failed to serialize WebSocket upgrade confirmation: {error}"
+                            ))
+                        })?;
+                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                            break;
+                        }
+                        if let (Some(ws_tx), Some(headers)) = (
+                            options.ws_tx.as_ref(),
+                            captured_websocket_headers(&completed.headers),
+                        ) {
+                            let _ = ws_tx.try_send(WsEvent::Connected {
+                                connection_id: completed.id,
+                                url: completed.url,
+                                headers,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "WebSocket upgrade failed for {}: {error}",
+                            completed.id
+                        );
+                        let reject = ClientExtensionMessage::WebSocketReject {
+                            id: completed.id,
+                            error,
+                        };
+                        let json = serde_json::to_string(&reject).map_err(|error| {
+                            LpmError::Tunnel(format!(
+                                "failed to serialize WebSocket rejection: {error}"
+                            ))
+                        })?;
+                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Frames from spawned WS tasks → relay
-            Some(json) = relay_rx.recv() => {
-                if let Err(e) = write.send(Message::Text(json)).await {
+            Some(message) = relay_rx.recv() => {
+                if !relay_websocket_message_is_current(&ws_connections, &message) {
+                    continue;
+                }
+                if let Err(e) = send_to_relay(&mut write, Message::Text(message.json), "send WebSocket frame to relay").await {
                     tracing::warn!("failed to send WS frame to relay: {e}");
                     break;
+                }
+            }
+
+            Some(closed) = closed_local_ws_rx.recv() => {
+                if ws_connections
+                    .get(&closed.id)
+                    .map(|connection| connection.generation)
+                    == Some(closed.generation)
+                    && let Some(connection) = ws_connections.remove(&closed.id)
+                {
+                    connection.cancel.cancel();
+                    closing_websockets.insert(
+                        closed.id.clone(),
+                        ClosingWebSocket {
+                            generation: closed.generation,
+                            cancel: connection.cancel,
+                            completed_halves: 0,
+                            relay_notified: false,
+                        },
+                    );
+                }
+                let Some(closing) = closing_websockets.get_mut(&closed.id)
+                    .filter(|closing| closing.generation == closed.generation)
+                else {
+                    continue;
+                };
+                closing.completed_halves |= match closed.half {
+                    LocalWebSocketHalf::Reader => 0b01,
+                    LocalWebSocketHalf::Writer => 0b10,
+                };
+                let notification = if closing.relay_notified {
+                    None
+                } else if let Some((code, reason)) = closed.relay_close {
+                    closing.relay_notified = true;
+                    Some((code, reason))
+                } else if closed.notify_relay {
+                    closing.relay_notified = true;
+                    Some((Some(1013), Some(closed.reason)))
+                } else {
+                    None
+                };
+                let fully_closed = closing.completed_halves == 0b11;
+                if let Some((code, reason)) = notification {
+                    send_websocket_close_frame_to_relay(
+                        &mut write,
+                        &closed.id,
+                        code,
+                        reason,
+                    )
+                    .await?;
+                }
+                if fully_closed {
+                    closing_websockets.remove(&closed.id);
+                }
+            }
+
+            Some(response) = http_response_rx.recv() => {
+                let CompletedHttpForward { json, permit, memory_permit } = response;
+                if let Err(error) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
+                    tracing::warn!("failed to send HTTP response to relay: {error}");
+                    break;
+                }
+                drop(permit);
+                drop(memory_permit);
+            }
+
+            Some(result) = task_handles.join_next(), if !task_handles.is_empty() => {
+                if let Err(error) = result {
+                    tracing::warn!("tunnel forwarding task failed: {error}");
                 }
             }
 
@@ -1515,7 +2493,7 @@ async fn try_connect(
                         break;
                     }
                 };
-                if let Err(e) = write.send(Message::Text(ping)).await {
+                if let Err(e) = send_to_relay(&mut write, Message::Text(ping), "send tunnel ping").await {
                     tracing::warn!("failed to send ping: {e}");
                     break;
                 }
@@ -1523,14 +2501,13 @@ async fn try_connect(
         }
     }
 
-    // Clean up: drop all WS connection senders to signal spawned tasks to exit
-    ws_connections.clear();
-
-    // Gracefully await in-flight tasks with a timeout.
-    let shutdown_deadline = tokio::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
-    let _ = tokio::time::timeout(shutdown_deadline, async {
-        while task_handles.join_next().await.is_some() {}
-    })
+    shutdown_websocket_tasks(
+        ws_connections,
+        closing_websockets,
+        pending_websocket_upgrades,
+        &mut task_handles,
+        std::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS),
+    )
     .await;
 
     Ok(())
@@ -1584,6 +2561,113 @@ mod tests {
         assert!(opts.webhook_tx.is_none());
         assert!(!opts.no_pin);
         assert!(opts.resolved_domain().is_none());
+    }
+
+    #[tokio::test]
+    async fn forwarding_admission_stays_closed_until_runtime_publication_opens_it() {
+        let (controller, admission) = forwarding_admission_barrier();
+        let waiter = tokio::spawn(async move { admission.wait().await });
+        tokio::task::yield_now().await;
+
+        assert!(!waiter.is_finished());
+        controller.open();
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_publication_rejects_tunnel_forwarding() {
+        let (controller, admission) = forwarding_admission_barrier();
+        controller.reject();
+
+        let error = admission.wait().await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("rejected before runtime publication")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_runtime_publication_never_forwards_a_queued_relay_request() {
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_address = local_listener.local_addr().unwrap();
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let (request_sent_tx, request_sent_rx) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "test.localhost",
+                        "tunnel_url": "http://test.localhost",
+                        "session_id": "session",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "http_request",
+                        "id": "queued-before-publication",
+                        "method": "GET",
+                        "url": "/must-not-forward",
+                        "headers": {},
+                        "body": "",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            request_sent_tx.send(()).unwrap();
+            while websocket.next().await.is_some() {}
+        });
+        let (controller, admission) = forwarding_admission_barrier();
+        let mut options = TunnelOptions::new("test-token".to_string(), local_address.port());
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.forwarding_admission = Some(admission);
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+
+        request_sent_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                local_listener.accept()
+            )
+            .await
+            .is_err(),
+            "the child received a relay request before runtime publication"
+        );
+        controller.reject();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), client)
+            .await
+            .expect("the rejected admission did not stop the tunnel")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .error
+                .to_string()
+                .contains("rejected before runtime publication")
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                local_listener.accept()
+            )
+            .await
+            .is_err(),
+            "the child received a queued relay request after publication rejection"
+        );
+
+        relay.await.unwrap();
     }
 
     #[tokio::test]
@@ -1856,10 +2940,37 @@ mod tests {
     }
 
     #[test]
+    fn websocket_upgrade_rejects_oversized_connection_ids() {
+        let id = "x".repeat(MAX_WEBSOCKET_CONNECTION_ID_BYTES + 1);
+
+        assert_eq!(
+            websocket_upgrade_metadata_error(&id, "/socket"),
+            Some("Local WebSocket connection ID exceeds the byte limit")
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_rejects_oversized_local_urls() {
+        let url = format!("/{}", "x".repeat(MAX_WEBSOCKET_LOCAL_URL_BYTES));
+
+        assert_eq!(
+            websocket_upgrade_metadata_error("connection", &url),
+            Some("Local WebSocket upgrade URL exceeds the byte limit")
+        );
+    }
+
+    #[test]
     fn ws_config_constants_are_reasonable() {
         // Verify WebSocket message size limits are set and sane.
         assert_eq!(MAX_WS_MESSAGE_SIZE, 50 * 1024 * 1024);
         assert_eq!(MAX_WS_FRAME_SIZE, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn websocket_write_buffer_accepts_the_largest_http_response_message() {
+        let maximum_encoded_body = (50 * 1024 * 1024_usize).div_ceil(3) * 4;
+
+        assert!(WEBSOCKET_MAX_WRITE_BUFFER_BYTES >= maximum_encoded_body + 1024 * 1024);
     }
 
     #[test]
@@ -2050,6 +3161,8 @@ mod tests {
             no_pin: false,
             auto_ack: false,
             ws_tx: None,
+            forwarding_admission: None,
+            shutdown: None,
         };
 
         // Reproduce the URL construction from try_connect
@@ -2194,5 +3307,731 @@ mod tests {
             sec_key_count, 1,
             "client must send exactly one Sec-WebSocket-Key header, got request:\n{raw_request}"
         );
+    }
+
+    #[tokio::test]
+    async fn slow_http_forwarding_does_not_block_later_relay_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let release_slow = Arc::new(tokio::sync::Notify::new());
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_address = local_listener.local_addr().unwrap();
+        let local_release = Arc::clone(&release_slow);
+        let local_server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = local_listener.accept().await.unwrap();
+                let release = Arc::clone(&local_release);
+                tokio::spawn(async move {
+                    let mut request = [0; 2048];
+                    let read = socket.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    if request.starts_with("GET /slow ") {
+                        release.notified().await;
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "test.localhost",
+                        "tunnel_url": "http://test.localhost",
+                        "session_id": "session",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            for (id, url) in [("slow", "/slow"), ("fast", "/fast")] {
+                websocket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "http_request",
+                            "id": id,
+                            "method": "GET",
+                            "url": url,
+                            "headers": {},
+                            "body": "",
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            tokio::time::timeout(std::time::Duration::from_millis(750), async {
+                while let Some(message) = websocket.next().await {
+                    let Message::Text(text) = message.unwrap() else {
+                        continue;
+                    };
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value.get("id").and_then(serde_json::Value::as_str) == Some("fast") {
+                        return;
+                    }
+                }
+            })
+            .await
+        });
+
+        let mut options = TunnelOptions::new("test-token".to_string(), local_address.port());
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+
+        let fast_response = relay.await.unwrap();
+        release_slow.notify_waiters();
+        client.abort();
+        local_server.abort();
+
+        assert!(
+            fast_response.is_ok(),
+            "the fast request was blocked behind the slow request"
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_auto_ack_tunnel_returns_success_without_forwarding_the_excess_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let active_requests = Arc::new(AtomicUsize::new(0));
+        let release_requests = Arc::new(tokio::sync::Notify::new());
+        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_address = local_listener.local_addr().unwrap();
+        let local_active = Arc::clone(&active_requests);
+        let local_release = Arc::clone(&release_requests);
+        let local_server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = local_listener.accept().await.unwrap();
+                let active = Arc::clone(&local_active);
+                let release = Arc::clone(&local_release);
+                tokio::spawn(async move {
+                    let mut request = [0; 2048];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    active.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay_active = Arc::clone(&active_requests);
+        let relay = tokio::spawn(async move {
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "test.localhost",
+                        "tunnel_url": "http://test.localhost",
+                        "session_id": "session",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            for index in 0..MAX_CONCURRENT_HTTP_FORWARDS {
+                websocket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "http_request",
+                            "id": format!("held-{index}"),
+                            "method": "GET",
+                            "url": "/held",
+                            "headers": {},
+                            "body": "",
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while relay_active.load(Ordering::SeqCst) != MAX_CONCURRENT_HTTP_FORWARDS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("forwarding slots did not become saturated");
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "http_request",
+                        "id": "excess",
+                        "method": "GET",
+                        "url": "/excess",
+                        "headers": {},
+                        "body": "",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(message) = websocket.next().await {
+                    let Message::Text(text) = message.unwrap() else {
+                        continue;
+                    };
+                    let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if response["id"] == "excess" {
+                        return response["status"].as_u64();
+                    }
+                }
+                None
+            })
+            .await
+            .expect("auto-ack response was not returned promptly")
+        });
+
+        let mut options = TunnelOptions::new("test-token".to_string(), local_address.port());
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.auto_ack = true;
+        let (webhook_tx, mut webhook_rx) = tokio::sync::mpsc::channel(1);
+        options.webhook_tx = Some(webhook_tx);
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+
+        let status = relay.await.unwrap();
+        let captured = tokio::time::timeout(std::time::Duration::from_secs(1), webhook_rx.recv())
+            .await
+            .expect("saturated auto-ack request was not captured")
+            .expect("webhook capture channel closed");
+        release_requests.notify_waiters();
+        client.abort();
+        local_server.abort();
+
+        assert_eq!(status, Some(200));
+        assert_eq!(captured.webhook.id, "excess");
+        assert!(captured.webhook.auto_acked);
+        assert_eq!(
+            active_requests.load(Ordering::SeqCst),
+            MAX_CONCURRENT_HTTP_FORWARDS
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_capture_keeps_response_memory_reserved_until_received() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let response_body = vec![b'x'; 1024 * 1024];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        response_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&response_body).await.unwrap();
+        });
+        let (webhook_tx, mut webhook_rx) = tokio::sync::mpsc::channel(1);
+        let budget = Arc::new(tokio::sync::Semaphore::new(HTTP_RESPONSE_MEMORY_PERMITS));
+        let request = ServerMessage::HttpRequest {
+            id: "budgeted-capture".to_string(),
+            method: "GET".to_string(),
+            url: "/".to_string(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let target =
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port());
+
+        let (_, response_permit) = forward_http_request(
+            client,
+            target,
+            request,
+            false,
+            Some(webhook_tx),
+            Arc::clone(&budget),
+            None,
+        )
+        .await;
+        drop(response_permit);
+        server.await.unwrap();
+
+        assert!(
+            budget.available_permits() < HTTP_RESPONSE_MEMORY_PERMITS,
+            "queued capture released its response-memory reservation"
+        );
+        let capture = webhook_rx.recv().await.unwrap();
+        drop(capture);
+        assert_eq!(budget.available_permits(), HTTP_RESPONSE_MEMORY_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_large_requests_cannot_reserve_more_than_the_byte_budget() {
+        let encoded_len = (20 * 1024 * 1024_usize).div_ceil(3) * 4;
+        let permits = request_memory_permits(encoded_len).unwrap();
+        let budget = Arc::new(tokio::sync::Semaphore::new(HTTP_REQUEST_MEMORY_PERMITS));
+        let mut reservations = Vec::new();
+
+        while let Ok(permit) = Arc::clone(&budget).try_acquire_many_owned(permits) {
+            reservations.push(permit);
+        }
+
+        assert_eq!(
+            reservations.len(),
+            HTTP_REQUEST_MEMORY_PERMITS / permits as usize
+        );
+        assert!(budget.available_permits() < permits as usize);
+    }
+
+    #[test]
+    fn request_admission_accounts_for_headers_and_the_complete_wire_message() {
+        let request = ServerMessage::HttpRequest {
+            id: "request".to_string(),
+            method: "POST".to_string(),
+            url: "/webhook".to_string(),
+            headers: HashMap::from([("x-large".to_string(), "x".repeat(4 * 1024 * 1024))]),
+            body: String::new(),
+        };
+        let wire_bytes = serde_json::to_string(&request).unwrap().len();
+        let permits = request_memory_permits(wire_bytes).unwrap();
+
+        assert!(
+            permits >= 16,
+            "large headers bypassed the request-memory budget: {permits} permits"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_to_local_websocket_queue_is_bounded_by_retained_bytes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let budget = Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS));
+        let permits = websocket_memory_permits(32 * 1024 * 1024).unwrap();
+        for _ in 0..5 {
+            let Ok(memory_permit) = Arc::clone(&budget).try_acquire_many_owned(permits) else {
+                break;
+            };
+            tx.try_send(LocalWebSocketCommand::Frame {
+                data: Vec::with_capacity(32 * 1024 * 1024),
+                is_binary: true,
+                _memory_permit: memory_permit,
+            })
+            .unwrap();
+        }
+
+        let mut retained = 0;
+        while let Ok(LocalWebSocketCommand::Frame { data, .. }) = rx.try_recv() {
+            retained += data.capacity();
+        }
+        assert!(
+            retained <= 128 * 1024 * 1024,
+            "count-only queue retained {retained} bytes"
+        );
+        assert_eq!(budget.available_permits(), WEBSOCKET_MEMORY_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn queued_websocket_close_is_delivered_before_cancellation() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (priority_tx, mut priority_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        priority_tx
+            .try_send(LocalWebSocketCommand::Close {
+                code: Some(1001),
+                reason: Some("relay closed".to_string()),
+            })
+            .unwrap();
+        cancel.cancel();
+
+        let command = next_local_websocket_command(&mut rx, &mut priority_rx, &cancel).await;
+
+        assert!(matches!(
+            command,
+            Some(LocalWebSocketCommand::Close {
+                code: Some(1001),
+                reason: Some(reason),
+            }) if reason == "relay closed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_close_preempts_a_full_frame_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let budget = Arc::new(tokio::sync::Semaphore::new(2));
+        for byte in [b'a', b'b'] {
+            tx.send(LocalWebSocketCommand::Frame {
+                data: vec![byte],
+                is_binary: true,
+                _memory_permit: Arc::clone(&budget).acquire_owned().await.unwrap(),
+            })
+            .await
+            .unwrap();
+        }
+        let (priority_tx, mut priority_rx) = tokio::sync::mpsc::channel(1);
+        priority_tx
+            .try_send(LocalWebSocketCommand::Close {
+                code: Some(1001),
+                reason: Some("relay closed".to_string()),
+            })
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let command = next_local_websocket_command(&mut rx, &mut priority_rx, &cancel).await;
+
+        assert!(matches!(command, Some(LocalWebSocketCommand::Close { .. })));
+    }
+
+    #[test]
+    fn relay_websocket_close_reason_fits_the_control_frame_limit() {
+        let reason = bounded_websocket_close_reason(Some("é".repeat(200))).unwrap();
+
+        assert!(reason.len() <= MAX_WEBSOCKET_CLOSE_REASON_BYTES);
+        assert!(std::str::from_utf8(reason.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn closing_websocket_ids_cannot_be_reused_until_both_halves_finish() {
+        let active = HashMap::new();
+        let pending = HashMap::new();
+        let closing = HashMap::from([(
+            "connection".to_string(),
+            ClosingWebSocket {
+                generation: 1,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                completed_halves: 0b01,
+                relay_notified: true,
+            },
+        )]);
+
+        assert!(websocket_id_is_in_use(
+            &active,
+            &closing,
+            &pending,
+            "connection"
+        ));
+    }
+
+    #[test]
+    fn queued_websocket_frames_from_an_old_generation_are_discarded() {
+        let (commands, _) = tokio::sync::mpsc::channel(1);
+        let (priority_commands, _) = tokio::sync::mpsc::channel(1);
+        let active = HashMap::from([(
+            "connection".to_string(),
+            WebSocketConnection {
+                commands,
+                priority_commands,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                generation: 2,
+            },
+        )]);
+        let queued = RelayWebSocketMessage {
+            id: "connection".to_string(),
+            generation: 1,
+            json: "stale".to_string(),
+            _memory_permit: None,
+        };
+
+        assert!(!relay_websocket_message_is_current(&active, &queued));
+    }
+
+    #[test]
+    fn invalid_text_websocket_frames_are_not_forwarded_lossily() {
+        let error = local_websocket_message(vec![0xff], false).unwrap_err();
+
+        assert_eq!(error, "relay WebSocket text frame is not valid UTF-8");
+    }
+
+    #[test]
+    fn inbound_websocket_admission_accounts_for_wire_and_decoded_buffers() {
+        let wire_bytes = MAX_WS_MESSAGE_SIZE - 1;
+        let base64_bytes = wire_bytes - 128;
+
+        assert!(inbound_websocket_memory_permits(wire_bytes, base64_bytes).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_websocket_close_is_not_followed_by_a_synthetic_close() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            websocket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "finished".into(),
+                })))
+                .await
+                .unwrap();
+        });
+        let (websocket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (local_write, local_read) = websocket.split();
+        let websocket_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = websocket_slots.acquire_owned().await.unwrap();
+        let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel(4);
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        let connection = activate_local_websocket(
+            &mut tasks,
+            LocalWebSocketActivation {
+                id: "connection".to_string(),
+                generation: 1,
+                local_write,
+                local_read,
+                slot,
+                relay_tx,
+                relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
+                ws_tx: None,
+                closed_tx,
+            },
+        );
+
+        let closed = loop {
+            let closed = tokio::time::timeout(std::time::Duration::from_secs(1), closed_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if closed.relay_close.is_some() {
+                break closed;
+            }
+        };
+        assert!(
+            !closed.notify_relay,
+            "local close requested a second synthetic relay close"
+        );
+        assert!(matches!(
+            closed.relay_close,
+            Some((Some(1000), Some(reason))) if reason == "finished"
+        ));
+        assert!(relay_rx.try_recv().is_err());
+
+        connection.cancel.cancel();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn outbound_websocket_admission_accounts_for_base64_and_json_growth() {
+        let raw_bytes = 50 * 1024 * 1024;
+        let connection_id_bytes = 36;
+        let retained = websocket_encoded_message_bytes(raw_bytes, connection_id_bytes).unwrap();
+        let encoded_bytes = raw_bytes.div_ceil(3) * 4;
+
+        assert!(
+            retained >= raw_bytes + encoded_bytes + connection_id_bytes * 6 + 64,
+            "admission reserved {retained} bytes for the raw frame and directly encoded JSON buffer"
+        );
+        assert_eq!(
+            websocket_memory_permits(retained).unwrap() as usize,
+            retained.div_ceil(HTTP_RESPONSE_MEMORY_UNIT_BYTES)
+        );
+    }
+
+    #[test]
+    fn direct_websocket_frame_serialization_matches_the_protocol_contract() {
+        let id = "connection-\"quoted\"-\n-control";
+        let bytes = [0, 1, 2, 127, 128, 255];
+        for is_binary in [false, true] {
+            let expected = serde_json::to_string(&ClientMessage::WebSocketFrame {
+                id: id.to_string(),
+                data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+                is_binary,
+            })
+            .unwrap();
+
+            assert_eq!(
+                serialize_websocket_frame(id, &bytes, is_binary).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_capture_rejects_oversized_upgrade_headers_before_cloning() {
+        let headers = HashMap::from([(
+            "x-large".to_string(),
+            "x".repeat(WEBSOCKET_CAPTURE_HEADER_BYTES + 1),
+        )]);
+
+        assert!(captured_websocket_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn oversized_websocket_upgrade_headers_are_rejected_before_task_spawn() {
+        let headers = HashMap::from([(
+            "x-large".to_string(),
+            "x".repeat(WEBSOCKET_CAPTURE_HEADER_BYTES + 1),
+        )]);
+
+        assert!(bounded_websocket_upgrade_headers(headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_connection_slots_bound_pending_and_active_connections() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WEBSOCKETS));
+        let mut reservations = Vec::with_capacity(MAX_CONCURRENT_WEBSOCKETS);
+        for _ in 0..MAX_CONCURRENT_WEBSOCKETS {
+            reservations.push(Arc::clone(&slots).try_acquire_owned().unwrap());
+        }
+
+        assert!(Arc::clone(&slots).try_acquire_owned().is_err());
+        drop(reservations.pop());
+        assert!(Arc::clone(&slots).try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn relay_close_cancels_the_pending_local_websocket_upgrade() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut pending = HashMap::from([(
+            "connection".to_string(),
+            PendingWebSocketUpgrade {
+                generation: 1,
+                cancel: cancel.clone(),
+            },
+        )]);
+
+        assert!(discard_pending_websocket_upgrade(
+            &mut pending,
+            "connection"
+        ));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn relay_disconnect_cancels_pending_local_websocket_upgrades_before_joining_tasks() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let pending = HashMap::from([(
+            "connection".to_string(),
+            PendingWebSocketUpgrade {
+                generation: 1,
+                cancel,
+            },
+        )]);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            task_cancel.cancelled().await;
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            shutdown_websocket_tasks(
+                HashMap::new(),
+                HashMap::new(),
+                pending,
+                &mut tasks,
+                std::time::Duration::from_millis(250),
+            ),
+        )
+        .await
+        .expect("pending WebSocket upgrade delayed tunnel reconnect");
+    }
+
+    #[tokio::test]
+    async fn tunnel_shutdown_waits_for_in_flight_forwarder_destruction_after_timeout() {
+        struct CompletionGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for CompletionGuard {
+            fn drop(&mut self) {
+                if let Some(completed) = self.0.take() {
+                    let _ = completed.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, mut completed_rx) = tokio::sync::oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let _completion = CompletionGuard(Some(completed_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        shutdown_websocket_tasks(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &mut tasks,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(completed_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn relay_send_deadline_rejects_a_stalled_sink() {
+        use futures_util::Sink;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct StalledSink;
+        impl Sink<Message> for StalledSink {
+            type Error = tokio_tungstenite::tungstenite::Error;
+
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+
+            fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+        }
+
+        let mut sink = StalledSink;
+        let send = send_to_relay(
+            &mut sink,
+            Message::Text("frame".to_string()),
+            "send test frame",
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(6), send)
+            .await
+            .expect("relay send did not enforce its own deadline")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
     }
 }

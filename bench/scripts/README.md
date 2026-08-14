@@ -315,26 +315,50 @@ build from modifying the benchmark environment.
 The fixed PR profile covers:
 
 - package scripts without `lpm.json`
-- `.node-version` and `lpm.json` managed-runtime selectors
+- `.node-version`, `.nvmrc`, and `lpm.json` managed-runtime selector precedence
 - explicit env mapping
 - root Node plus workspace-member Bun
 - single-service and dependency-ordered multi-service dev
+- 10-service deep and wide dependency graphs
 - simultaneous projects with different runtimes and env values
 - a concurrent first install into one shared runtime home
 - descendant cleanup after signalling only the LPM process
+- crash/restart cleanup for signal-resistant descendants
 - 4 MiB of newline-free service output
+- a 1 MiB HTTP readiness body, which must not inflate the CLI process
+- a 1 MiB tunneled response through a local deterministic relay
 
-The full profile adds a local tunnel burst with the dashboard under a PTY.
+The full profile adds 50-service deep and wide graphs, four concurrent
+projects, 10 MiB and 49 MiB readiness and tunnel responses, four concurrent
+49 MiB tunnel responses, slow/fast tunnel fairness, tunneled WebSocket
+text/binary fairness and close/cancellation recovery, and a local tunnel burst
+with the dashboard under a PTY. The PR profile has a 15-second scenario timeout.
+The full profile has a 60-second timeout. `--timeout-ms` overrides either value.
 Runtime downloads and tunnel traffic are local and deterministic. The harness
 continuously drains output, retains only a bounded prefix and tail, and records
 the complete byte count and SHA-256 digest. It samples the whole process tree
-for RSS and process count. FD and thread counts are maximum-observed diagnostic
-values, not kernel-level peaks.
+for resource use. It reports and gates startup, shutdown, root-process and full
+process-tree peak and steady RSS, process count, file-descriptor count, and
+thread count. FD and thread counts are maximum-observed sampled values, not
+kernel-level peaks.
+
+Use `--root-rss-*-regression-*` and
+`--steady-root-rss-*-regression-*` to override the root-process RSS gates.
+Run-to-completion scenarios do not have a steady-state RSS gate. A required
+metric that is missing from either binary makes the comparison inconclusive.
+RSS and process-count gates require at least three samples across 100 ms.
+File-descriptor and thread-count gates require at least two detailed samples.
+If a row does not meet these limits, the harness records
+`advisory-insufficient-sampling` for that metric. This advisory result does not
+make the full comparison inconclusive.
+A correctness improvement from a failing baseline also makes performance
+comparison inconclusive, because those rows do not measure equivalent work.
 
 Every measured baseline/candidate pair is adjacent. Pair order alternates AB/BA,
-and scenario order rotates by sample. JSON, Markdown, bounded logs, resource
-samples, runtime request counts, and survivor evidence are written to a unique
-temporary artifact directory by default.
+and scenario order rotates by sample. The sample count must be even so both
+binaries run first the same number of times. JSON, Markdown, bounded logs,
+resource samples, runtime request counts, and survivor evidence are written to
+a unique temporary artifact directory by default.
 
 Validate the harness:
 
@@ -350,7 +374,7 @@ node bench/scripts/run-runtime-readiness.mjs \
   --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
   --compare main,candidate \
   --profile pr \
-  --samples 3
+  --samples 4
 ```
 
 Run the landing profile, including the PTY tunnel/dashboard cell:

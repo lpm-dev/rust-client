@@ -38,3 +38,12 @@ pub mod service_graph;
 pub mod shell;
 pub mod task_graph;
 pub mod ts_transform;
+
+pub type ShutdownStartedCallback =
+    Box<dyn FnOnce() -> Result<(), lpm_common::LpmError> + Send + 'static>;
+
+pub(crate) fn invoke_shutdown_started(
+    callback: &mut Option<ShutdownStartedCallback>,
+) -> Result<(), lpm_common::LpmError> {
+    callback.take().map_or(Ok(()), |callback| callback())
+}

@@ -345,6 +345,7 @@ pub struct DevScriptEndpointOptions {
     pub requested_port: Option<u16>,
     pub stop_requested: Arc<AtomicBool>,
     pub on_endpoint: shell::EndpointResultCallback,
+    pub on_shutdown_started: Option<crate::ShutdownStartedCallback>,
 }
 
 pub fn run_dev_script_with_envs(
@@ -391,6 +392,7 @@ pub fn run_dev_script_with_envs(
         endpoint_options.requested_port,
         Arc::clone(&endpoint_options.stop_requested),
         endpoint_options.on_endpoint,
+        endpoint_options.on_shutdown_started,
     )?;
     if endpoint_options
         .stop_requested

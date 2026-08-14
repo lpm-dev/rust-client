@@ -25,12 +25,24 @@ pub fn fingerprint_sha256(path: &Path) -> Result<[u8; 32], LpmError> {
     Ok(sha2::Sha256::digest(&der).into())
 }
 
+pub fn fingerprint_sha256_bytes(pem_bytes: &[u8]) -> Result<[u8; 32], LpmError> {
+    let pem = pem::parse(pem_bytes)
+        .map_err(|error| LpmError::Cert(format!("invalid certificate PEM: {error}")))?;
+    Ok(sha2::Sha256::digest(pem.contents()).into())
+}
+
 /// SHA-1 fingerprint (thumbprint) of the DER body of a PEM-encoded cert. SHA-1 is the
 /// identifier Windows `certutil` accepts as a `-store` search key — kept for that
 /// platform's lookup only, not for cryptographic binding.
 pub fn fingerprint_sha1(path: &Path) -> Result<[u8; 20], LpmError> {
     let der = read_cert_der(path)?;
     Ok(sha1::Sha1::digest(&der).into())
+}
+
+pub fn fingerprint_sha1_bytes(pem_bytes: &[u8]) -> Result<[u8; 20], LpmError> {
+    let pem = pem::parse(pem_bytes)
+        .map_err(|error| LpmError::Cert(format!("invalid certificate PEM: {error}")))?;
+    Ok(sha1::Sha1::digest(pem.contents()).into())
 }
 
 /// Format a fingerprint as uppercase colon-separated hex (`AB:CD:EF:…`).
@@ -164,9 +176,303 @@ pub fn leaf_signed_by(leaf_path: &Path, ca_path: &Path) -> Result<bool, LpmError
 pub fn project_cert_chains_to_root(cert_path: &Path, root_path: &Path) -> Result<bool, LpmError> {
     let cert_chain = read_cert_chain_der(cert_path)?;
     let root_der = read_cert_der(root_path)?;
+    project_cert_chain_der_chains_to_root(&cert_chain, &root_der)
+}
+
+pub(crate) fn project_cert_chains_to_root_bytes(
+    cert_pem: &[u8],
+    root_pem: &[u8],
+) -> Result<bool, LpmError> {
+    let cert_chain = pem::parse_many(cert_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid project certificate PEM: {error}")))?;
+    if cert_chain.is_empty() {
+        return Err(LpmError::Cert(
+            "no project certificate PEM blocks found".into(),
+        ));
+    }
+    let cert_chain: Vec<Vec<u8>> = cert_chain
+        .into_iter()
+        .map(pem::Pem::into_contents)
+        .collect();
+    let root_der = pem::parse(root_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid root certificate PEM: {error}")))?
+        .into_contents();
+    project_cert_chain_der_chains_to_root(&cert_chain, &root_der)
+}
+
+pub fn validate_project_server_chain(
+    cert_path: &Path,
+    root_path: &Path,
+    requested_hostnames: &[String],
+) -> Result<(), LpmError> {
+    let cert_pem =
+        lpm_common::read_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| {
+                LpmError::Cert(format!("failed to read project certificate: {error}"))
+            })?;
+    let root_pem =
+        lpm_common::read_file_capped(root_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| {
+                LpmError::Cert(format!("failed to read active root certificate: {error}"))
+            })?;
+    validate_project_server_chain_bytes(&cert_pem, &root_pem, requested_hostnames)
+}
+
+pub(crate) fn validate_project_server_chain_bytes(
+    cert_pem: &[u8],
+    root_pem: &[u8],
+    requested_hostnames: &[String],
+) -> Result<(), LpmError> {
+    let cert_chain = parse_cert_chain_der_bytes(cert_pem)?;
+    let root_pem = pem::parse(root_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid root certificate PEM: {error}")))?;
+    let (_, leaf) = x509_parser::parse_x509_certificate(&cert_chain[0])
+        .map_err(|error| LpmError::Cert(format!("invalid project leaf X.509: {error}")))?;
+    let (_, root) = x509_parser::parse_x509_certificate(root_pem.contents())
+        .map_err(|error| LpmError::Cert(format!("invalid root X.509: {error}")))?;
+
+    validate_certificate_validity(&leaf, "project leaf")?;
+    if leaf.validity().not_after.to_datetime() <= OffsetDateTime::now_utc() + Duration::days(30) {
+        return Err(LpmError::Cert(
+            "project leaf is expired or needs renewal".to_string(),
+        ));
+    }
+    validate_leaf_usage(&leaf)?;
+    if !certificate_covers_requested_hostnames(&leaf, requested_hostnames)? {
+        return Err(LpmError::Cert(
+            "project leaf does not cover every requested hostname".to_string(),
+        ));
+    }
+    validate_certificate_validity(&root, "active root")?;
+    validate_ca_usage(&root, "active root", false)?;
+    if root.issuer() != root.subject() || root.verify_signature(Some(root.public_key())).is_err() {
+        return Err(LpmError::Cert(
+            "active root certificate is not self-signed".to_string(),
+        ));
+    }
+
+    match cert_chain.as_slice() {
+        [_leaf] if requested_hostnames.is_empty() => {
+            if leaf.issuer() != root.subject()
+                || leaf.verify_signature(Some(root.public_key())).is_err()
+            {
+                return Err(LpmError::Cert(
+                    "project leaf does not chain to the active root".to_string(),
+                ));
+            }
+        }
+        [_leaf] => {
+            return Err(LpmError::Cert(
+                "custom-host TLS publication requires a constrained project intermediate"
+                    .to_string(),
+            ));
+        }
+        [_leaf, intermediate_der] => {
+            let (_, intermediate) =
+                x509_parser::parse_x509_certificate(intermediate_der).map_err(|error| {
+                    LpmError::Cert(format!("invalid project intermediate X.509: {error}"))
+                })?;
+            validate_certificate_validity(&intermediate, "project intermediate")?;
+            validate_ca_usage(&intermediate, "project intermediate", true)?;
+            if leaf.issuer() != intermediate.subject()
+                || intermediate.issuer() != root.subject()
+                || leaf
+                    .verify_signature(Some(intermediate.public_key()))
+                    .is_err()
+                || intermediate
+                    .verify_signature(Some(root.public_key()))
+                    .is_err()
+            {
+                return Err(LpmError::Cert(
+                    "project certificate chain signatures are invalid".to_string(),
+                ));
+            }
+            if !intermediate_constraints_cover_leaf(&intermediate, &leaf)? {
+                return Err(LpmError::Cert(
+                    "project intermediate constraints do not permit every leaf hostname"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(LpmError::Cert(
+                "project TLS chain must contain only a leaf and one project intermediate"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_certificate_validity(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+    label: &str,
+) -> Result<(), LpmError> {
+    if certificate.validity().is_valid() {
+        Ok(())
+    } else {
+        Err(LpmError::Cert(format!(
+            "{label} certificate is not currently valid"
+        )))
+    }
+}
+
+fn validate_ca_usage(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+    label: &str,
+    require_path_length_zero: bool,
+) -> Result<(), LpmError> {
+    let constraints = certificate
+        .basic_constraints()
+        .map_err(|error| LpmError::Cert(format!("invalid {label} constraints: {error}")))?
+        .ok_or_else(|| LpmError::Cert(format!("{label} is missing CA constraints")))?;
+    if !constraints.value.ca
+        || (require_path_length_zero && constraints.value.path_len_constraint != Some(0))
+    {
+        return Err(LpmError::Cert(format!(
+            "{label} does not have the required CA constraints"
+        )));
+    }
+    let key_usage = certificate
+        .key_usage()
+        .map_err(|error| LpmError::Cert(format!("invalid {label} key usage: {error}")))?
+        .ok_or_else(|| LpmError::Cert(format!("{label} is missing key usage")))?;
+    if !key_usage.value.key_cert_sign() {
+        return Err(LpmError::Cert(format!(
+            "{label} is not permitted to sign certificates"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_leaf_usage(
+    leaf: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<(), LpmError> {
+    if leaf
+        .basic_constraints()
+        .map_err(|error| LpmError::Cert(format!("invalid project leaf constraints: {error}")))?
+        .is_some_and(|constraints| constraints.value.ca)
+    {
+        return Err(LpmError::Cert(
+            "project leaf must not be a CA certificate".to_string(),
+        ));
+    }
+    let key_usage = leaf
+        .key_usage()
+        .map_err(|error| LpmError::Cert(format!("invalid project leaf key usage: {error}")))?
+        .ok_or_else(|| LpmError::Cert("project leaf is missing key usage".to_string()))?;
+    if !key_usage.value.digital_signature() {
+        return Err(LpmError::Cert(
+            "project leaf is not permitted to sign TLS handshakes".to_string(),
+        ));
+    }
+    let extended_usage = leaf
+        .extended_key_usage()
+        .map_err(|error| {
+            LpmError::Cert(format!("invalid project leaf extended key usage: {error}"))
+        })?
+        .ok_or_else(|| LpmError::Cert("project leaf is missing extended key usage".to_string()))?;
+    if !extended_usage.value.server_auth && !extended_usage.value.any {
+        return Err(LpmError::Cert(
+            "project leaf is not valid for TLS server authentication".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn certificate_covers_requested_hostnames(
+    certificate: &x509_parser::certificate::X509Certificate<'_>,
+    requested_hostnames: &[String],
+) -> Result<bool, LpmError> {
+    if requested_hostnames.is_empty() {
+        return Ok(true);
+    }
+    let names = certificate
+        .subject_alternative_name()
+        .map_err(|error| LpmError::Cert(format!("invalid project leaf SAN extension: {error}")))?
+        .ok_or_else(|| LpmError::Cert("project leaf is missing SAN entries".to_string()))?;
+    Ok(requested_hostnames.iter().all(|hostname| {
+        names
+            .value
+            .general_names
+            .iter()
+            .any(|name| general_name_matches_requested_host(name, hostname))
+    }))
+}
+
+fn intermediate_constraints_cover_leaf(
+    intermediate: &x509_parser::certificate::X509Certificate<'_>,
+    leaf: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<bool, LpmError> {
+    let constraints = intermediate
+        .name_constraints()
+        .map_err(|error| {
+            LpmError::Cert(format!(
+                "invalid project intermediate name constraints: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            LpmError::Cert("project intermediate is missing name constraints".to_string())
+        })?;
+    if !constraints.critical {
+        return Ok(false);
+    }
+    let Some(permitted) = constraints.value.permitted_subtrees.as_ref() else {
+        return Ok(false);
+    };
+    let excluded = constraints
+        .value
+        .excluded_subtrees
+        .as_deref()
+        .unwrap_or_default();
+    let names = leaf
+        .subject_alternative_name()
+        .map_err(|error| LpmError::Cert(format!("invalid project leaf SAN extension: {error}")))?
+        .ok_or_else(|| LpmError::Cert("project leaf is missing SAN entries".to_string()))?;
+    Ok(names.value.general_names.iter().all(|name| {
+        permitted
+            .iter()
+            .any(|subtree| name_constraint_matches(&subtree.base, name))
+            && !excluded
+                .iter()
+                .any(|subtree| name_constraint_matches(&subtree.base, name))
+    }))
+}
+
+fn name_constraint_matches(constraint: &GeneralName<'_>, name: &GeneralName<'_>) -> bool {
+    match (constraint, name) {
+        (GeneralName::DNSName(constraint), GeneralName::DNSName(name)) => {
+            let constraint = constraint.to_ascii_lowercase();
+            let name = name.to_ascii_lowercase();
+            if constraint.starts_with('.') {
+                name.len() > constraint.len() && name.ends_with(&constraint)
+            } else {
+                name == constraint
+                    || name
+                        .strip_suffix(&constraint)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            }
+        }
+        (GeneralName::IPAddress(constraint), GeneralName::IPAddress(name)) => {
+            let address_len = name.len();
+            constraint.len() == address_len.saturating_mul(2)
+                && constraint[..address_len]
+                    .iter()
+                    .zip(&constraint[address_len..])
+                    .zip(name.iter())
+                    .all(|((network, mask), byte)| *byte & *mask == *network & *mask)
+        }
+        _ => false,
+    }
+}
+
+fn project_cert_chain_der_chains_to_root(
+    cert_chain: &[Vec<u8>],
+    root_der: &[u8],
+) -> Result<bool, LpmError> {
     let (_, leaf) = x509_parser::parse_x509_certificate(&cert_chain[0])
         .map_err(|e| LpmError::Cert(format!("invalid leaf X.509: {e}")))?;
-    let (_, root) = x509_parser::parse_x509_certificate(&root_der)
+    let (_, root) = x509_parser::parse_x509_certificate(root_der)
         .map_err(|e| LpmError::Cert(format!("invalid root X.509: {e}")))?;
 
     if leaf.issuer() == root.subject() {
@@ -204,15 +510,71 @@ pub fn project_cert_chains_to_root(cert_path: &Path, root_path: &Path) -> Result
         .is_ok())
 }
 
+/// Verify that the leaf certificate and private key contain the same public key.
+pub fn project_cert_key_matches(cert_path: &Path, key_path: &Path) -> Result<bool, LpmError> {
+    let cert_der = read_cert_der(cert_path)?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(&cert_der)
+        .map_err(|error| LpmError::Cert(format!("invalid project X.509: {error}")))?;
+    let key_pem =
+        lpm_common::read_text_file_capped(key_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| {
+            LpmError::Cert(format!(
+                "failed to read project key at {}: {error}",
+                key_path.display()
+            ))
+        })?;
+    let key_pair = KeyPair::from_pem(&key_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid project private key: {error}")))?;
+    Ok(certificate.public_key().raw == key_pair.public_key_der())
+}
+
+/// Verify that in-memory project certificate and private-key PEM data match.
+pub fn validate_project_key_pair_bytes(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), LpmError> {
+    let cert_pem = pem::parse(cert_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid project certificate PEM: {error}")))?;
+    let (_, certificate) = x509_parser::parse_x509_certificate(cert_pem.contents())
+        .map_err(|error| LpmError::Cert(format!("invalid project X.509: {error}")))?;
+    let key_pem = std::str::from_utf8(key_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid project private key text: {error}")))?;
+    let key_pair = KeyPair::from_pem(key_pem)
+        .map_err(|error| LpmError::Cert(format!("invalid project private key: {error}")))?;
+    if certificate.public_key().raw != key_pair.public_key_der() {
+        return Err(LpmError::Cert(
+            "project certificate and private key do not match".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// True when `cert_path` contains a leaf plus at least one intermediate cert.
 pub fn project_cert_has_intermediate(cert_path: &Path) -> Result<bool, LpmError> {
     Ok(read_cert_chain_der(cert_path)?.len() > 1)
+}
+
+pub(crate) fn project_cert_has_intermediate_bytes(cert_pem: &[u8]) -> Result<bool, LpmError> {
+    let cert_chain = parse_cert_chain_der_bytes(cert_pem)?;
+    Ok(cert_chain.len() > 1)
 }
 
 /// Return DNS permitted-subtree entries from the project intermediate in
 /// `cert_path`. Direct root-signed leaf files return an empty list.
 pub fn read_project_dns_constraints(cert_path: &Path) -> Result<Vec<String>, LpmError> {
     let cert_chain = read_cert_chain_der(cert_path)?;
+    read_project_dns_constraints_der(&cert_chain)
+}
+
+fn parse_cert_chain_der_bytes(cert_pem: &[u8]) -> Result<Vec<Vec<u8>>, LpmError> {
+    let pems = pem::parse_many(cert_pem)
+        .map_err(|e| LpmError::Cert(format!("invalid project certificate PEM: {e}")))?;
+    if pems.is_empty() {
+        return Err(LpmError::Cert(
+            "no project certificate PEM blocks found".into(),
+        ));
+    }
+    Ok(pems.into_iter().map(pem::Pem::into_contents).collect())
+}
+
+fn read_project_dns_constraints_der(cert_chain: &[Vec<u8>]) -> Result<Vec<String>, LpmError> {
     let Some(intermediate_der) = cert_chain.get(1) else {
         return Ok(Vec::new());
     };
@@ -258,14 +620,45 @@ pub fn project_cert_constraints_cover_dns(
         return Ok(true);
     }
 
-    let constraints = read_project_dns_constraints(cert_path)?;
+    Ok(constraints_cover_required_dns(
+        &required,
+        read_project_dns_constraints(cert_path)?,
+    ))
+}
+
+pub(crate) fn project_cert_constraints_cover_dns_bytes(
+    cert_pem: &[u8],
+    requested_hostnames: &[String],
+    extra_permitted_dns_subtrees: &[String],
+) -> Result<bool, LpmError> {
+    let mut required =
+        Vec::with_capacity(requested_hostnames.len() + extra_permitted_dns_subtrees.len());
+    for hostname in requested_hostnames {
+        if hostname.parse::<IpAddr>().is_err() {
+            push_unique_string(&mut required, hostname.to_ascii_lowercase());
+        }
+    }
+    for subtree in extra_permitted_dns_subtrees {
+        push_unique_string(&mut required, subtree.to_ascii_lowercase());
+    }
+    if required.is_empty() {
+        return Ok(true);
+    }
+    let chain = parse_cert_chain_der_bytes(cert_pem)?;
+    Ok(constraints_cover_required_dns(
+        &required,
+        read_project_dns_constraints_der(&chain)?,
+    ))
+}
+
+fn constraints_cover_required_dns(required: &[String], constraints: Vec<String>) -> bool {
     if constraints.is_empty() {
-        return Ok(false);
+        return false;
     }
 
-    Ok(required
+    required
         .iter()
-        .all(|required| constraints.iter().any(|actual| actual == required)))
+        .all(|required| constraints.iter().any(|actual| actual == required))
 }
 
 /// Certificate info extracted from an existing cert file.
@@ -330,9 +723,22 @@ fn issuer_from_ca_pem(
     ca_key_pem: &str,
 ) -> Result<(Certificate, KeyPair), Box<dyn std::error::Error>> {
     let ca_key_pair = KeyPair::from_pem(ca_key_pem)?;
+    let ca_pem = pem::parse(ca_cert_pem)?;
+    let (_, parsed_ca) = x509_parser::parse_x509_certificate(ca_pem.contents())?;
+    if parsed_ca.public_key().raw != ca_key_pair.public_key_der() {
+        return Err("CA certificate and private key do not match".into());
+    }
     let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
     let ca_cert = ca_cert_params.self_signed(&ca_key_pair)?;
     Ok((ca_cert, ca_key_pair))
+}
+
+/// Verify that a root certificate and private key contain the same public key.
+pub fn validate_ca_key_pair(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    issuer_from_ca_pem(ca_cert_pem, ca_key_pem).map(|_| ())
 }
 
 fn project_leaf_params(
@@ -497,16 +903,22 @@ pub fn needs_renewal(cert_path: &Path) -> Result<bool, LpmError> {
         lpm_common::read_text_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
             .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
 
-    let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
+    needs_renewal_bytes(pem_str.as_bytes())
+}
+
+pub(crate) fn needs_renewal_bytes(cert_pem: &[u8]) -> Result<bool, LpmError> {
+    let pem = pem::parse(cert_pem).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
 
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
         .map_err(|e| LpmError::Cert(format!("invalid X.509: {e}")))?;
 
-    let not_after = cert.validity().not_after.to_datetime();
+    let validity = cert.validity();
+    let not_before = validity.not_before.to_datetime();
+    let not_after = validity.not_after.to_datetime();
     let now = time::OffsetDateTime::now_utc();
     let renewal_threshold = now + Duration::days(30);
 
-    Ok(not_after <= renewal_threshold)
+    Ok(not_before > now || not_after <= renewal_threshold)
 }
 
 /// Check whether a certificate already covers the requested extra hostnames.
@@ -522,7 +934,17 @@ pub fn covers_requested_hostnames(
         lpm_common::read_text_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
             .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
 
-    let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
+    covers_requested_hostnames_bytes(pem_str.as_bytes(), requested_hostnames)
+}
+
+pub(crate) fn covers_requested_hostnames_bytes(
+    cert_pem: &[u8],
+    requested_hostnames: &[String],
+) -> Result<bool, LpmError> {
+    if requested_hostnames.is_empty() {
+        return Ok(true);
+    }
+    let pem = pem::parse(cert_pem).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
 
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
         .map_err(|e| LpmError::Cert(format!("invalid X.509: {e}")))?;
@@ -545,7 +967,11 @@ pub fn read_cert_info(cert_path: &Path) -> Result<CertInfo, LpmError> {
         lpm_common::read_text_file_capped(cert_path, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
             .map_err(|e| LpmError::Cert(format!("failed to read cert: {e}")))?;
 
-    let pem = pem::parse(&pem_str).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
+    read_cert_info_bytes(pem_str.as_bytes())
+}
+
+pub(crate) fn read_cert_info_bytes(cert_pem: &[u8]) -> Result<CertInfo, LpmError> {
+    let pem = pem::parse(cert_pem).map_err(|e| LpmError::Cert(format!("invalid PEM: {e}")))?;
 
     let (_, cert) = x509_parser::parse_x509_certificate(pem.contents())
         .map_err(|e| LpmError::Cert(format!("invalid X.509: {e}")))?;
@@ -621,6 +1047,53 @@ mod tests {
     use super::*;
     use crate::ca;
 
+    fn generate_test_ca(not_before: OffsetDateTime, not_after: OffsetDateTime) -> (String, String) {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, "Test LPM Root");
+        params.distinguished_name = name;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    fn generate_custom_project_chain(
+        root_cert_pem: &str,
+        root_key_pem: &str,
+        intermediate_hosts: &[String],
+        leaf_hosts: &[String],
+        intermediate_validity: Option<(OffsetDateTime, OffsetDateTime)>,
+        intermediate_key_usages: Option<Vec<KeyUsagePurpose>>,
+        leaf_extended_key_usages: Option<Vec<rcgen::ExtendedKeyUsagePurpose>>,
+    ) -> String {
+        let (root, root_key) = issuer_from_ca_pem(root_cert_pem, root_key_pem).unwrap();
+        let intermediate_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut intermediate_params = project_intermediate_params(intermediate_hosts, &[]).unwrap();
+        if let Some((not_before, not_after)) = intermediate_validity {
+            intermediate_params.not_before = not_before;
+            intermediate_params.not_after = not_after;
+        }
+        if let Some(key_usages) = intermediate_key_usages {
+            intermediate_params.key_usages = key_usages;
+        }
+        let intermediate = intermediate_params
+            .signed_by(&intermediate_key, &root, &root_key)
+            .unwrap();
+        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = project_leaf_params(leaf_hosts).unwrap();
+        if let Some(key_usages) = leaf_extended_key_usages {
+            leaf_params.extended_key_usages = key_usages;
+        }
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &intermediate, &intermediate_key)
+            .unwrap();
+        format!("{}{}", leaf.pem(), intermediate.pem())
+    }
+
     #[test]
     fn generate_project_cert_signed_by_ca() {
         let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
@@ -645,6 +1118,19 @@ mod tests {
         // Verify it's NOT a CA
         let bc = cert.basic_constraints().ok().flatten();
         assert!(bc.is_none() || !bc.unwrap().value.ca);
+    }
+
+    #[test]
+    fn project_certificate_generation_rejects_a_mismatched_ca_key() {
+        let (ca_cert_pem, _) = ca::generate_ca().unwrap();
+        let (_, different_key_pem) = ca::generate_ca().unwrap();
+
+        let result = generate_project_cert(&ca_cert_pem, &different_key_pem, &[]);
+
+        assert!(
+            result.is_err(),
+            "a CA certificate accepted an unrelated key"
+        );
     }
 
     #[test]
@@ -823,6 +1309,122 @@ mod tests {
     }
 
     #[test]
+    fn server_chain_rejects_an_expired_intermediate() {
+        let (root_cert, root_key) = ca::generate_ca().unwrap();
+        let hosts = vec!["app.localhost".to_string()];
+        let chain = generate_custom_project_chain(
+            &root_cert,
+            &root_key,
+            &hosts,
+            &hosts,
+            Some((
+                rcgen::date_time_ymd(2020, 1, 1),
+                rcgen::date_time_ymd(2021, 1, 1),
+            )),
+            None,
+            None,
+        );
+
+        assert!(
+            validate_project_server_chain_bytes(chain.as_bytes(), root_cert.as_bytes(), &hosts)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_chain_rejects_an_expired_active_root() {
+        let (root_cert, root_key) = generate_test_ca(
+            rcgen::date_time_ymd(2020, 1, 1),
+            rcgen::date_time_ymd(2021, 1, 1),
+        );
+        let hosts = vec!["app.localhost".to_string()];
+        let chain =
+            generate_custom_project_chain(&root_cert, &root_key, &hosts, &hosts, None, None, None);
+
+        assert!(
+            validate_project_server_chain_bytes(chain.as_bytes(), root_cert.as_bytes(), &hosts)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_chain_rejects_a_direct_root_signed_custom_host_leaf() {
+        let (root_cert, root_key) = ca::generate_ca().unwrap();
+        let hosts = vec!["app.localhost".to_string()];
+        let (leaf, _) = generate_project_cert(&root_cert, &root_key, &hosts).unwrap();
+
+        assert!(
+            validate_project_server_chain_bytes(leaf.as_bytes(), root_cert.as_bytes(), &hosts)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_chain_rejects_hosts_outside_the_intermediate_constraints() {
+        let (root_cert, root_key) = ca::generate_ca().unwrap();
+        let constrained_hosts = vec!["other.test".to_string()];
+        let published_hosts = vec!["app.test".to_string()];
+        let chain = generate_custom_project_chain(
+            &root_cert,
+            &root_key,
+            &constrained_hosts,
+            &published_hosts,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            validate_project_server_chain_bytes(
+                chain.as_bytes(),
+                root_cert.as_bytes(),
+                &published_hosts,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn server_chain_rejects_an_intermediate_without_certificate_signing_usage() {
+        let (root_cert, root_key) = ca::generate_ca().unwrap();
+        let hosts = vec!["app.localhost".to_string()];
+        let chain = generate_custom_project_chain(
+            &root_cert,
+            &root_key,
+            &hosts,
+            &hosts,
+            None,
+            Some(vec![KeyUsagePurpose::DigitalSignature]),
+            None,
+        );
+
+        assert!(
+            validate_project_server_chain_bytes(chain.as_bytes(), root_cert.as_bytes(), &hosts)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_chain_rejects_a_leaf_without_server_auth_usage() {
+        let (root_cert, root_key) = ca::generate_ca().unwrap();
+        let hosts = vec!["app.localhost".to_string()];
+        let chain = generate_custom_project_chain(
+            &root_cert,
+            &root_key,
+            &hosts,
+            &hosts,
+            None,
+            None,
+            Some(vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth]),
+        );
+
+        assert!(
+            validate_project_server_chain_bytes(chain.as_bytes(), root_cert.as_bytes(), &hosts)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn project_cert_has_1_year_validity() {
         let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
         let (cert_pem, _) = generate_project_cert(&ca_cert_pem, &ca_key_pem, &[]).unwrap();
@@ -849,6 +1451,19 @@ mod tests {
 
         // Fresh cert should NOT need renewal
         assert!(!needs_renewal(tmp.path()).unwrap());
+    }
+
+    #[test]
+    fn needs_renewal_rejects_a_certificate_that_is_not_yet_valid() {
+        let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
+        let (ca_cert, ca_key) = issuer_from_ca_pem(&ca_cert_pem, &ca_key_pem).unwrap();
+        let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = project_leaf_params(&["app.localhost".to_string()]).unwrap();
+        params.not_before = OffsetDateTime::now_utc() + Duration::days(2);
+        params.not_after = params.not_before + Duration::days(365);
+        let cert = params.signed_by(&project_key, &ca_cert, &ca_key).unwrap();
+
+        assert!(needs_renewal_bytes(cert.pem().as_bytes()).unwrap());
     }
 
     #[test]

@@ -11,12 +11,22 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const STREAM_RETAIN_BYTES = 64 * 1024;
 const SAMPLE_INTERVAL_MS = 50;
 const STEADY_WINDOW_MS = 350;
-const DEFAULT_TIMEOUT_MS = 15_000;
+const PR_TIMEOUT_MS = 15_000;
+const FULL_TIMEOUT_MS = 60_000;
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 const MiB = 1024 * 1024;
+
+function defaultTimeoutMs(profile) {
+  return profile === 'full' ? FULL_TIMEOUT_MS : PR_TIMEOUT_MS;
+}
+
+function benchmarkShutdownTimeoutMs() {
+  return SHUTDOWN_TIMEOUT_MS;
+}
 
 class BoundedCollector {
   constructor(limit) {
@@ -45,7 +55,10 @@ class BoundedCollector {
   finish() {
     const truncated = this.total > this.limit;
     const separator = truncated ? Buffer.from('\n... output truncated by benchmark harness ...\n') : Buffer.alloc(0);
-    const retained = truncated ? Buffer.concat([this.prefix, separator, this.tail]) : this.prefix;
+    const overlap = Math.max(0, this.prefix.length + this.tail.length - this.total);
+    const retained = truncated
+      ? Buffer.concat([this.prefix, separator, this.tail])
+      : Buffer.concat([this.prefix, this.tail.subarray(overlap)], this.total);
     return {
       total_bytes: this.total,
       retained_bytes: retained.length,
@@ -53,6 +66,79 @@ class BoundedCollector {
       sha256: this.hash.digest('hex'),
       retained: retained.toString('utf8'),
     };
+  }
+}
+
+class WebSocketFrameParser {
+  constructor(onFrame) {
+    this.onFrame = onFrame;
+    this.chunks = [];
+    this.totalBytes = 0;
+  }
+
+  push(chunk) {
+    if (chunk.length === 0) return;
+    this.chunks.push(Buffer.from(chunk));
+    this.totalBytes += chunk.length;
+    while (this.totalBytes >= 2) {
+      const header = this.peek(Math.min(this.totalBytes, 14));
+      const first = header[0];
+      const second = header[1];
+      const masked = (second & 0x80) !== 0;
+      let payloadLength = BigInt(second & 0x7f);
+      let headerLength = 2;
+      if (payloadLength === 126n) {
+        if (this.totalBytes < 4) break;
+        payloadLength = BigInt(header.readUInt16BE(2));
+        headerLength = 4;
+      } else if (payloadLength === 127n) {
+        if (this.totalBytes < 10) break;
+        payloadLength = header.readBigUInt64BE(2);
+        headerLength = 10;
+      }
+      if (payloadLength > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(`WebSocket payload exceeds the parser's safe integer range: ${payloadLength}`);
+      }
+      const maskLength = masked ? 4 : 0;
+      const frameLength = headerLength + maskLength + Number(payloadLength);
+      if (this.totalBytes < frameLength) break;
+      const frame = this.consume(frameLength);
+      const payloadStart = headerLength + maskLength;
+      const payload = frame.subarray(payloadStart, payloadStart + Number(payloadLength));
+      if (masked) {
+        const mask = frame.subarray(headerLength, headerLength + 4);
+        for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
+      }
+      this.onFrame(payload, first & 0x0f);
+    }
+  }
+
+  peek(length) {
+    if (this.chunks[0].length >= length) return this.chunks[0].subarray(0, length);
+    const slices = [];
+    let remaining = length;
+    for (const chunk of this.chunks) {
+      const take = Math.min(remaining, chunk.length);
+      slices.push(chunk.subarray(0, take));
+      remaining -= take;
+      if (remaining === 0) break;
+    }
+    return Buffer.concat(slices, length);
+  }
+
+  consume(length) {
+    const slices = [];
+    let remaining = length;
+    while (remaining > 0) {
+      const chunk = this.chunks[0];
+      const take = Math.min(remaining, chunk.length);
+      slices.push(chunk.subarray(0, take));
+      if (take === chunk.length) this.chunks.shift();
+      else this.chunks[0] = chunk.subarray(take);
+      remaining -= take;
+    }
+    this.totalBytes -= length;
+    return slices.length === 1 ? Buffer.from(slices[0]) : Buffer.concat(slices, length);
   }
 }
 
@@ -69,9 +155,13 @@ if (!['darwin', 'linux'].includes(process.platform)) {
   throw new Error(`runtime readiness supports macOS and Linux, not ${process.platform}`);
 }
 
-const samples = positiveInt(options.samples, options.profile === 'full' ? 10 : 3, '--samples');
+const samples = balancedPairCount(options.samples, options.profile === 'full' ? 10 : 4, '--samples');
 const warmups = nonNegativeInt(options.warmups, 1, '--warmups');
-const timeoutMs = positiveInt(options.timeoutMs, DEFAULT_TIMEOUT_MS, '--timeout-ms');
+const timeoutMs = positiveInt(
+  options.timeoutMs,
+  defaultTimeoutMs(options.profile),
+  '--timeout-ms',
+);
 const binaries = parseBinaries(options.binaries);
 const comparison = parseComparison(options.compare, binaries);
 const allScenarios = buildScenarios();
@@ -98,7 +188,14 @@ const outputDir = path.resolve(options.output ?? defaultOutputDir());
 const thresholds = {
   wall_ms: threshold(options, 'wall', 5, 10, 20, 50),
   startup_ms: threshold(options, 'startup', 5, 10, 20, 50),
+  shutdown_ms: threshold(options, 'shutdown', 10, 20, 50, 100),
   tree_peak_rss_bytes: threshold(options, 'rss', 5, 10, 16 * MiB, 32 * MiB),
+  root_peak_rss_bytes: threshold(options, 'rootRss', 5, 10, 8 * MiB, 16 * MiB),
+  steady_tree_rss_bytes: threshold(options, 'steadyRss', 5, 10, 16 * MiB, 32 * MiB),
+  steady_root_rss_bytes: threshold(options, 'steadyRootRss', 5, 10, 8 * MiB, 16 * MiB),
+  peak_process_count: threshold(options, 'process', 10, 20, 1, 2),
+  maximum_observed_fd_count: threshold(options, 'fd', 10, 20, 8, 16),
+  maximum_observed_thread_count: threshold(options, 'thread', 10, 20, 2, 4),
 };
 const plan = {
   schema_version: SCHEMA_VERSION,
@@ -139,7 +236,7 @@ for (let warmup = 1; warmup <= warmups; warmup += 1) {
       process.stderr.write(`[warmup ${warmup}/${warmups}] ${scenario.id} ${binary.name}\n`);
       const row = await executeScenario({ scenario, binary, sample: warmup, counted: false });
       rows.push(row);
-      if (executionFailed(row) || (binary.name === comparison.candidate && row.contract_ok !== true)) {
+      if (warmupBlocksComparison(binary.name, row, comparison)) {
         throw new Error(`warmup failed: ${scenario.id} ${binary.name}: ${row.failure_reason}`);
       }
     }
@@ -231,6 +328,13 @@ async function executeScenario({ scenario, binary, sample, counted, pairId = nul
     Object.assign(row, result.metrics);
     row.processes = result.processes;
     row.contract = await scenario.validate(context, result);
+    if (result.metrics.forced_shutdown) {
+      row.contract = {
+        ok: false,
+        reason: 'lpm exceeded the benchmark shutdown deadline and required SIGKILL',
+        inner: row.contract,
+      };
+    }
     const outputBoundOk = result.processes.every((process) =>
       process.stdout.retained_bytes <= STREAM_RETAIN_BYTES + 48
       && process.stderr.retained_bytes <= STREAM_RETAIN_BYTES + 48,
@@ -240,25 +344,34 @@ async function executeScenario({ scenario, binary, sample, counted, pairId = nul
     }
     row.exit_ok = result.processes.every((process) =>
       scenario.kind === 'dev'
-        ? process.exit_code === 0 || process.signal === 'SIGTERM'
+        ? process.exit_code === 0
+          || process.signal === 'SIGTERM'
+          || (result.metrics.forced_shutdown && process.signal === 'SIGKILL')
         : process.exit_code === 0,
     );
     row.contract_ok = row.contract.ok;
     row.failure_reason = row.exit_ok && row.contract_ok ? null : row.contract.reason ?? 'process failed';
-    writeJson(path.join(artifactDir, 'metrics.json'), row);
   } catch (error) {
     row.exit_ok = false;
     row.contract_ok = false;
     row.failure_reason = error instanceof Error ? error.stack ?? error.message : String(error);
-    writeJson(path.join(artifactDir, 'metrics.json'), row);
   } finally {
+    const cleanupErrors = [];
     for (const cleanup of context.cleanup.reverse()) {
       try {
-        await cleanup();
+        await withTimeout(Promise.resolve().then(cleanup), 5_000, `${scenario.id} cleanup`);
       } catch (error) {
-        row.cleanup_error = String(error);
+        cleanupErrors.push(String(error));
       }
     }
+    if (cleanupErrors.length > 0) {
+      row.cleanup_errors = cleanupErrors;
+      row.exit_ok = false;
+      row.contract_ok = false;
+      row.failure_reason = `benchmark cleanup failed: ${cleanupErrors.join('; ')}`;
+      row.contract = { ok: false, reason: row.failure_reason, inner: row.contract ?? null };
+    }
+    writeJson(path.join(artifactDir, 'metrics.json'), row);
     if (options.keepWork) {
       fs.writeFileSync(path.join(artifactDir, 'work-root.txt'), `${workRoot}\n`);
     } else {
@@ -274,11 +387,14 @@ async function runProcesses(context, specs, scenario, timeout) {
   const roots = children.map((child) => child.child.pid).filter(Number.isInteger);
   context.state.children = children;
   const samples = [];
+  const metricRootSelector = scenario.metricRootPids
+    ? (tree) => scenario.metricRootPids(context, tree, roots)
+    : () => roots;
   let sampling = true;
   const sampler = (async () => {
-    let detailedTick = 1;
+    let detailedTick = 0;
     while (sampling) {
-      const sample = sampleProcessTree(roots, detailedTick % 5 === 0);
+      const sample = sampleProcessTree(roots, detailedTick % 5 === 0, metricRootSelector);
       sample.elapsed_ms = elapsedMs(startedNs);
       samples.push(sample);
       detailedTick += 1;
@@ -289,29 +405,37 @@ async function runProcesses(context, specs, scenario, timeout) {
   let shutdownMs = null;
   let preShutdown = [];
   let steadyTreeRssBytes = null;
+  let steadyRootRssBytes = null;
   let signalTargets = roots;
   const completion = Promise.all(children.map((child) => child.completion));
   let processCompletedMs = null;
+  let forcedShutdown = false;
   try {
     if (scenario.kind === 'dev') {
       readiness = await withTimeout(scenario.waitReady(context, children), timeout, `${scenario.id} readiness`);
       readiness.elapsed_ms = elapsedMs(startedNs);
       await delay(STEADY_WINDOW_MS);
-      const snapshot = sampleProcessTree(roots, true);
+      const snapshot = sampleProcessTree(roots, true, metricRootSelector);
       snapshot.elapsed_ms = elapsedMs(startedNs);
       samples.push(snapshot);
       steadyTreeRssBytes = snapshot.tree_rss_bytes;
+      steadyRootRssBytes = snapshot.root_rss_bytes;
       preShutdown = snapshot.processes.map((process) => ({ pid: process.pid, start_identity: process.start_identity }));
       signalTargets = scenario.signalTargets
         ? await scenario.signalTargets(context, snapshot, roots)
         : roots;
       const shutdownStarted = process.hrtime.bigint();
       for (const pid of signalTargets) safeKill(pid, 'SIGTERM');
-      const completed = await withTimeout(completion, 5_000, `${scenario.id} shutdown`)
+      const completed = await withTimeout(
+        completion,
+        benchmarkShutdownTimeoutMs(),
+        `${scenario.id} shutdown`,
+      )
         .then(() => true)
         .catch(() => false);
       if (!completed) {
-        const remaining = sampleProcessTree(roots, false).processes.map((process) => ({
+        forcedShutdown = true;
+        const remaining = sampleProcessTree(roots, false, metricRootSelector).processes.map((process) => ({
           pid: process.pid,
           start_identity: process.start_identity,
         }));
@@ -327,7 +451,7 @@ async function runProcesses(context, specs, scenario, timeout) {
       processCompletedMs = elapsedMs(startedNs);
     }
   } catch (error) {
-    const emergencyProcesses = sampleProcessTree(roots, false).processes.map((process) => ({
+    const emergencyProcesses = sampleProcessTree(roots, false, metricRootSelector).processes.map((process) => ({
       pid: process.pid,
       start_identity: process.start_identity,
     }));
@@ -351,8 +475,10 @@ async function runProcesses(context, specs, scenario, timeout) {
   const metrics = summarizeResourceSamples(samples, roots);
   metrics.wall_ms = processCompletedMs ?? elapsedMs(startedNs);
   metrics.startup_ms = readiness?.elapsed_ms ?? null;
-  metrics.steady_tree_rss_bytes = steadyTreeRssBytes ?? samples.findLast((sample) => sample.process_count > 0)?.tree_rss_bytes ?? 0;
+  metrics.steady_tree_rss_bytes = steadyTreeRssBytes;
+  metrics.steady_root_rss_bytes = steadyRootRssBytes;
   metrics.shutdown_ms = shutdownMs;
+  metrics.forced_shutdown = forcedShutdown;
   metrics.readiness = readiness;
   metrics.signal_targets = signalTargets;
   metrics.surviving_processes = survivors;
@@ -402,14 +528,32 @@ function buildScenarios() {
   return [
     runSystemNodeScenario(),
     runDotNodeVersionScenario(),
+    runNodeSelectorPrecedenceScenario(),
+    runLpmJsonNodeSelectorPrecedenceScenario(),
     runTaskEnvManagedNodeScenario(),
     runWorkspaceNodeBunScenario(),
     devSingleScenario(),
     devMultiScenario(),
+    devGraphScenario(10, 'deep'),
+    devGraphScenario(10, 'wide'),
+    devGraphScenario(50, 'deep', true),
+    devGraphScenario(50, 'wide', true),
     concurrentDifferentRuntimeScenario(),
+    concurrentProjectScaleScenario(4, true),
     concurrentFirstInstallScenario(),
     cleanupDescendantScenario(),
+    restartCrashCycleScenario(),
     newlineFreeScenario(),
+    largeReadinessResponseScenario(1),
+    largeReadinessResponseScenario(10, true),
+    largeReadinessResponseScenario(49, true),
+    tunnelManagedNodeEnvMultiScenario(),
+    tunnelResponseScenario(1),
+    tunnelResponseScenario(10, true),
+    tunnelResponseScenario(49, true),
+    tunnelResponseScenario(49, true, 4),
+    tunnelFairnessScenario(),
+    tunnelWebSocketLifecycleScenario(),
     tunnelDashboardScenario(),
   ];
 }
@@ -437,6 +581,43 @@ function runDotNodeVersionScenario() {
     writeFile(context.projectRoot, 'probe.mjs', resultScript({ scenario: 'dot-node-version', env: [] }));
     installManagedRuntime(context.lpmHome, 'node', version);
   }, ['run', 'probe'], (result) => markerContract(result, { scenario: 'dot-node-version', selected_runtime: `node@${version}` }));
+}
+
+function runNodeSelectorPrecedenceScenario() {
+  const version = process.version.slice(1);
+  return runScenario('run/nvmrc-precedes-node-version-no-lpm-json', async (context) => {
+    writePackage(context.projectRoot, {
+      name: 'runtime-selector-precedence',
+      private: true,
+      scripts: { probe: 'node probe.mjs' },
+    });
+    writeFile(context.projectRoot, '.nvmrc', `${version}\n`);
+    writeFile(context.projectRoot, '.node-version', '99.0.0\n');
+    writeFile(context.projectRoot, 'probe.mjs', resultScript({ scenario: 'selector-precedence', env: [] }));
+    installManagedRuntime(context.lpmHome, 'node', version);
+  }, ['run', 'probe'], (result) => markerContract(result, {
+    scenario: 'selector-precedence',
+    selected_runtime: `node@${version}`,
+  }));
+}
+
+function runLpmJsonNodeSelectorPrecedenceScenario() {
+  const version = process.version.slice(1);
+  return runScenario('run/lpm-json-precedes-file-node-selectors', async (context) => {
+    writePackage(context.projectRoot, {
+      name: 'runtime-lpm-json-selector-precedence',
+      private: true,
+      scripts: { probe: 'node probe.mjs' },
+    });
+    writeJson(path.join(context.projectRoot, 'lpm.json'), { runtime: { node: version } });
+    writeFile(context.projectRoot, '.nvmrc', '98.0.0\n');
+    writeFile(context.projectRoot, '.node-version', '99.0.0\n');
+    writeFile(context.projectRoot, 'probe.mjs', resultScript({ scenario: 'lpm-json-selector-precedence', env: [] }));
+    installManagedRuntime(context.lpmHome, 'node', version);
+  }, ['run', 'probe'], (result) => markerContract(result, {
+    scenario: 'lpm-json-selector-precedence',
+    selected_runtime: `node@${version}`,
+  }));
 }
 
 function runTaskEnvManagedNodeScenario() {
@@ -542,6 +723,44 @@ function devMultiScenario() {
   });
 }
 
+function devGraphScenario(serviceCount, shape, fullOnly = false) {
+  const readinessTimeoutMs = graphReadinessTimeoutMs(serviceCount, shape);
+  const scenario = devScenario(`dev/${shape}-${serviceCount}-services`, async (context) => {
+    const services = {};
+    for (let index = 0; index < serviceCount; index += 1) {
+      const name = `service-${String(index).padStart(2, '0')}`;
+      const port = await reservePort();
+      context.ports.push(port);
+      services[name] = {
+        command: `node graph-service.mjs ${name}`,
+        port,
+        readyPort: port,
+        ...(index === serviceCount - 1 ? { primary: true } : {}),
+        ...(shape === 'deep' && index > 0
+          ? { dependsOn: [`service-${String(index - 1).padStart(2, '0')}`] }
+          : {}),
+      };
+    }
+    context.state.graphServices = Object.entries(services).map(([service, config]) => ({
+      service,
+      port: config.port,
+    }));
+    writePackage(context.projectRoot, { name: `runtime-${shape}-${serviceCount}`, private: true });
+    writeJson(path.join(context.projectRoot, 'lpm.json'), { services });
+    writeFile(context.projectRoot, 'graph-service.mjs', graphServiceScript(shape, serviceCount));
+  }, () => ['dev', '--no-open', '--no-install'], async (context) => {
+    const ready = await Promise.all(context.state.graphServices.map(({ service, port }) =>
+      waitForJsonEndpoint(port, { shape, service_count: serviceCount, service }, readinessTimeoutMs)));
+    return { shape, service_count: serviceCount, ready_services: ready.length };
+  });
+  scenario.fullOnly = fullOnly;
+  return scenario;
+}
+
+function graphReadinessTimeoutMs(serviceCount, shape) {
+  return shape === 'deep' ? Math.max(8_000, serviceCount * 500) : 8_000;
+}
+
 function concurrentDifferentRuntimeScenario() {
   const nodeVersion = process.version.slice(1);
   const bunVersion = '1.3.14';
@@ -579,6 +798,50 @@ function concurrentDifferentRuntimeScenario() {
         scenario: 'bun-project', env: { RUNTIME_BENCH_ENV: 'bun-project' }, engine: 'bun', runtime_version: bunVersion,
       });
       return node.ok && bun.ok ? { ok: true } : { ok: false, reason: node.reason ?? bun.reason };
+    },
+  };
+}
+
+function concurrentProjectScaleScenario(projectCount, fullOnly = false) {
+  const nodeVersion = process.version.slice(1);
+  return {
+    id: `concurrency/${projectCount}-projects-managed-node-env`,
+    kind: 'run',
+    fullOnly,
+    allowRuntimeInstall: false,
+    async prepare(context) {
+      installManagedRuntime(context.lpmHome, 'node', nodeVersion);
+      context.state.projects = [];
+      for (let index = 0; index < projectCount; index += 1) {
+        const label = `project-${index}`;
+        const project = path.join(context.projectRoot, label);
+        writePackage(project, { name: label, private: true, scripts: { probe: 'node probe.mjs' } });
+        writeJson(path.join(project, 'lpm.json'), {
+          runtime: { node: nodeVersion },
+          env: { probe: '.env.concurrent' },
+        });
+        writeFile(project, '.env.concurrent', `RUNTIME_BENCH_ENV=${label}\n`);
+        writeFile(project, 'probe.mjs', resultScript({ scenario: label, env: ['RUNTIME_BENCH_ENV'] }));
+        context.state.projects.push({ project, label });
+      }
+    },
+    processes(context) {
+      return context.state.projects.map(({ project, label }) => ({
+        label,
+        cwd: project,
+        args: ['run', 'probe'],
+      }));
+    },
+    async validate(context, result) {
+      for (const { label } of context.state.projects) {
+        const contract = markerContractForProcess(result, label, {
+          scenario: label,
+          env: { RUNTIME_BENCH_ENV: label },
+          selected_runtime: `node@${nodeVersion}`,
+        });
+        if (!contract.ok) return contract;
+      }
+      return { ok: true };
     },
   };
 }
@@ -676,6 +939,57 @@ function cleanupDescendantScenario() {
   });
 }
 
+function restartCrashCycleScenario() {
+  return devScenario('recovery/crash-cycles-resistant-descendants', async (context) => {
+    const readyPort = await reservePort();
+    const descendantPorts = [];
+    for (let index = 0; index < 2; index += 1) descendantPorts.push(await reservePort());
+    context.ports.push(readyPort, ...descendantPorts);
+    Object.assign(context.state, { readyPort, descendantPorts });
+    writePackage(context.projectRoot, { name: 'runtime-restart-cycles', private: true });
+    writeJson(path.join(context.projectRoot, 'lpm.json'), {
+      services: {
+        worker: {
+          command: `node restart-root.mjs ${readyPort} ${descendantPorts.join(' ')}`,
+          port: readyPort,
+          readyPort,
+          readyTimeout: 10,
+          restart: true,
+          primary: true,
+        },
+      },
+    });
+    writeFile(context.projectRoot, 'restart-root.mjs', restartRootScript());
+    writeFile(context.projectRoot, 'resistant-descendant.mjs', resistantDescendantScript());
+    context.cleanup.push(() => {
+      for (const name of fs.readdirSync(context.projectRoot)) {
+        if (!/^descendant-\d+\.pid$/.test(name)) continue;
+        const pid = Number(fs.readFileSync(path.join(context.projectRoot, name), 'utf8'));
+        if (Number.isInteger(pid)) safeKill(pid, 'SIGKILL');
+      }
+    });
+  }, () => ['dev', '--no-open', '--no-install'], async (context) => {
+    const payload = await waitForJsonEndpoint(context.state.readyPort, { scenario: 'restart-cycle' });
+    await waitFor(() => fs.existsSync(path.join(context.projectRoot, 'attempt-count')), 2_000, 'restart attempt count');
+    context.state.attemptCount = Number(fs.readFileSync(path.join(context.projectRoot, 'attempt-count'), 'utf8'));
+    return payload;
+  }, async (context, result) => {
+    const descendantPids = fs.readdirSync(context.projectRoot)
+      .filter((name) => /^descendant-\d+\.pid$/.test(name))
+      .map((name) => Number(fs.readFileSync(path.join(context.projectRoot, name), 'utf8')));
+    const survivingPids = descendantPids.filter(processExists);
+    const clean = result.metrics.surviving_ports.length === 0 && survivingPids.length === 0;
+    const ok = context.state.attemptCount >= 3 && descendantPids.length === 2 && clean;
+    return {
+      ok,
+      reason: ok ? null : `restart attempts=${context.state.attemptCount}, descendant pids=${descendantPids}, surviving pids=${survivingPids}`,
+      restart_attempts: context.state.attemptCount,
+      resistant_descendant_pids: descendantPids,
+      surviving_resistant_descendant_pids: survivingPids,
+    };
+  });
+}
+
 function newlineFreeScenario() {
   const outputBytes = 4 * MiB;
   const digest = crypto.createHash('sha256').update(Buffer.alloc(outputBytes, 'x')).digest('hex');
@@ -700,6 +1014,289 @@ function newlineFreeScenario() {
   });
 }
 
+function largeReadinessResponseScenario(responseMiB, fullOnly = false) {
+  const scenario = devScenario(`readiness/http-${responseMiB}-mib-body`, async (context) => {
+    const port = await reservePort();
+    context.ports.push(port);
+    context.state.port = port;
+    writePackage(context.projectRoot, { name: `runtime-readiness-${responseMiB}-mib`, private: true });
+    writeJson(path.join(context.projectRoot, 'lpm.json'), {
+      services: {
+        web: {
+          command: `node readiness-response.mjs ${responseMiB}`,
+          port,
+          readyUrl: `http://127.0.0.1:${port}/ready`,
+          readyTimeout: 10,
+          primary: true,
+        },
+      },
+    });
+    writeFile(context.projectRoot, 'readiness-response.mjs', largeReadinessResponseScript());
+  }, () => ['dev', '--no-open', '--no-install'], async (context) => {
+    return waitForJsonEndpoint(context.state.port, { scenario: 'large-readiness', response_mib: responseMiB });
+  });
+  scenario.fullOnly = fullOnly;
+  return scenario;
+}
+
+function tunnelManagedNodeEnvMultiScenario() {
+  const nodeVersion = process.version.slice(1);
+  return {
+    id: 'tunnel/managed-node-env-multi-service',
+    kind: 'dev',
+    fullOnly: true,
+    allowRuntimeInstall: false,
+    async prepare(context) {
+      const apiPort = await reservePort();
+      const webPort = await reservePort();
+      context.ports.push(apiPort, webPort);
+      Object.assign(context.state, { apiPort, webPort });
+      writePackage(context.projectRoot, { name: 'runtime-tunnel-managed-multi', private: true });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        runtime: { node: nodeVersion },
+        environments: { benchmark: { file: '.env.benchmark' } },
+        services: {
+          api: { command: 'node service.mjs api', port: apiPort, readyPort: apiPort, env: { SERVICE_ENV: 'api' } },
+          web: {
+            command: 'node service.mjs web',
+            port: webPort,
+            readyPort: webPort,
+            dependsOn: ['api'],
+            env: { SERVICE_ENV: 'web' },
+            primary: true,
+          },
+        },
+      });
+      writeFile(context.projectRoot, '.env.benchmark', 'RUNTIME_BENCH_ENV=tunnel-managed-env\n');
+      writeFile(context.projectRoot, 'service.mjs', multiServiceScript(apiPort));
+      installManagedRuntime(context.lpmHome, 'node', nodeVersion);
+      const relay = await startFakeRelay([{ method: 'GET', url: '/' }]);
+      context.cleanup.push(relay.close);
+      context.state.relay = relay;
+    },
+    processes(context) {
+      return [{
+        label: 'tunnel-managed-multi',
+        args: ['dev', '--tunnel', '--env', 'benchmark', '--no-inspect', '--no-open', '--no-install'],
+        env: {
+          LPM_TOKEN: 'runtime-readiness-token',
+          LPM_TUNNEL_RELAY: context.state.relay.url,
+        },
+      }];
+    },
+    async waitReady(context) {
+      const payload = await waitForJsonEndpoint(context.state.webPort, {
+        scenario: 'multi-dev',
+        service: 'web',
+        env: 'tunnel-managed-env',
+        service_env: 'web',
+        api_ready: true,
+      });
+      await waitFor(() => context.state.relay.responses === 1, 8_000, 'managed multi-service tunnel response');
+      return payload;
+    },
+    async validate(context, result) {
+      const credential = relayCredentialContract(context.state.relay);
+      const response = context.state.relay.responseMessages.get('runtime-readiness-0');
+      const clean = result.metrics.surviving_processes.length === 0 && result.metrics.surviving_ports.length === 0;
+      const ok = credential.ok && response?.status === 200 && clean;
+      return {
+        ok,
+        reason: ok ? null : `managed runtime, env, multi-service tunnel, credential, or cleanup contract failed: credential=${credential.reason}, status=${response?.status}, clean=${clean}`,
+        relay_credential: credential,
+      };
+    },
+  };
+}
+
+function tunnelResponseScenario(responseMiB, fullOnly = false, responseCount = 1) {
+  return {
+    id: `tunnel/response-${responseMiB}-mib${responseCount === 1 ? '' : `-${responseCount}-concurrent`}`,
+    kind: 'dev',
+    fullOnly,
+    allowRuntimeInstall: false,
+    async prepare(context) {
+      const port = await reservePort();
+      context.ports.push(port);
+      context.state.port = port;
+      writePackage(context.projectRoot, { name: `runtime-tunnel-${responseMiB}-mib`, private: true });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        services: { web: { command: `node tunnel-response.mjs ${responseMiB}`, port, readyPort: port, primary: true } },
+      });
+      writeFile(context.projectRoot, 'tunnel-response.mjs', tunnelResponseScript());
+      const relay = await startFakeRelay(Array.from({ length: responseCount }, () => ({ method: 'GET', url: '/large' })));
+      context.cleanup.push(relay.close);
+      context.state.relay = relay;
+    },
+    processes(context) {
+      return [{
+        label: 'tunnel-response',
+        args: [
+          'dev', '--tunnel', '--no-inspect', '--no-open', '--no-install',
+        ],
+        env: {
+          LPM_TOKEN: 'runtime-readiness-token',
+          LPM_TUNNEL_RELAY: context.state.relay.url,
+        },
+      }];
+    },
+    async waitReady(context) {
+      await waitForJsonEndpoint(context.state.port, { scenario: 'tunnel-response', response_mib: responseMiB });
+      await waitFor(() => context.state.relay.responses >= responseCount, 30_000, 'large tunnel responses');
+      return { scenario: 'tunnel-response', response_mib: responseMiB, response_count: responseCount, relay_responses: context.state.relay.responses };
+    },
+    async validate(context, result) {
+      const clean = result.metrics.surviving_processes.length === 0 && result.metrics.surviving_ports.length === 0;
+      const expectedBytes = responseMiB * 1024 * 1024;
+      const expectedDigest = crypto.createHash('sha256').update(Buffer.alloc(expectedBytes, 'x')).digest('hex');
+      const responses = Array.from({ length: responseCount }, (_, index) =>
+        context.state.relay.responseMessages.get(`runtime-readiness-${index}`));
+      const credential = relayCredentialContract(context.state.relay);
+      const ok = credential.ok && context.state.relay.responses === responseCount
+        && responses.every((response) => response?.status === 200
+          && response?.decoded_bytes === expectedBytes
+          && response?.sha256 === expectedDigest)
+        && clean;
+      return {
+        ok,
+        reason: ok ? null : `large tunnel responses invalid: ${JSON.stringify(responses)}, count=${context.state.relay.responses}, clean=${clean}, credential=${credential.reason}`,
+        relay_credential: credential,
+      };
+    },
+  };
+}
+
+function tunnelFairnessScenario() {
+  return {
+    id: 'tunnel/slow-fast-fairness',
+    kind: 'dev',
+    fullOnly: true,
+    allowRuntimeInstall: false,
+    async prepare(context) {
+      const port = await reservePort();
+      context.ports.push(port);
+      context.state.port = port;
+      writePackage(context.projectRoot, { name: 'runtime-tunnel-fairness', private: true });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        services: { web: { command: 'node tunnel-fairness.mjs', port, readyPort: port, primary: true } },
+      });
+      writeFile(context.projectRoot, 'tunnel-fairness.mjs', tunnelFairnessScript());
+      const relay = await startFakeRelay([
+        { method: 'GET', url: '/slow' },
+        { method: 'GET', url: '/fast' },
+      ]);
+      context.cleanup.push(relay.close);
+      context.state.relay = relay;
+    },
+    processes(context) {
+      return [{
+        label: 'tunnel-fairness',
+        args: [
+          'dev', '--tunnel', '--no-inspect', '--no-open', '--no-install',
+        ],
+        env: {
+          LPM_TOKEN: 'runtime-readiness-token',
+          LPM_TUNNEL_RELAY: context.state.relay.url,
+        },
+      }];
+    },
+    async waitReady(context) {
+      await waitForJsonEndpoint(context.state.port, { scenario: 'tunnel-fairness' });
+      await waitFor(() => context.state.relay.responseIds.includes('runtime-readiness-1'), 4_000, 'fast tunneled response');
+      context.state.fastResponseMs = context.state.relay.responseTimes.get('runtime-readiness-1');
+      return { scenario: 'tunnel-fairness', fast_response_ms: context.state.fastResponseMs };
+    },
+    async validate(context, result) {
+      const clean = result.metrics.surviving_processes.length === 0 && result.metrics.surviving_ports.length === 0;
+      const fastBeforeSlow = context.state.relay.responseIds[0] === 'runtime-readiness-1';
+      const promptly = context.state.fastResponseMs < 750;
+      const credential = relayCredentialContract(context.state.relay);
+      const ok = credential.ok && fastBeforeSlow && promptly && clean;
+      return {
+        ok,
+        reason: ok ? null : `response order=${context.state.relay.responseIds}, fast response=${context.state.fastResponseMs}ms, clean=${clean}, credential=${credential.reason}`,
+        response_order: context.state.relay.responseIds,
+        fast_response_ms: context.state.fastResponseMs,
+        relay_credential: credential,
+      };
+    },
+  };
+}
+
+function tunnelWebSocketLifecycleScenario() {
+  const token = `runtime-readiness-ws-${crypto.randomBytes(16).toString('hex')}`;
+  return {
+    id: 'tunnel/websocket-fairness-close-cancellation',
+    kind: 'dev',
+    fullOnly: true,
+    allowRuntimeInstall: false,
+    async prepare(context) {
+      writePackage(context.projectRoot, { name: 'runtime-tunnel-websocket', private: true });
+      const local = await startLocalWebSocketFixture();
+      const relay = await startFakeWebSocketRelay();
+      context.cleanup.push(local.close, relay.close);
+      Object.assign(context.state, { local, relay, token });
+    },
+    processes(context) {
+      return [{
+        label: 'tunnel-websocket',
+        args: ['tunnel', String(context.state.local.port), '--no-inspect'],
+        env: {
+          LPM_TOKEN: context.state.token,
+          LPM_TUNNEL_RELAY: context.state.relay.url,
+        },
+      }];
+    },
+    async waitReady(context) {
+      await waitFor(() => {
+        const { local, relay } = context.state;
+        return relay.localPriorityAt > 0
+          && local.activeClosedAt > 0
+          && local.pendingConnections === 1;
+      }, 8_000, 'WebSocket fairness, relay close, and pending upgrade');
+      return {
+        scenario: 'tunnel-websocket',
+        local_priority_ms: context.state.relay.localPriorityAt - context.state.relay.readyAt,
+        relay_close_ms: context.state.local.activeClosedAt - context.state.relay.closeSentAt,
+      };
+    },
+    async validate(context, result) {
+      await waitFor(() => context.state.local.pendingConnections === 0, 1_000, 'pending local WebSocket cancellation');
+      await waitFor(() => context.state.relay.socketCount === 0, 1_000, 'relay WebSocket shutdown');
+      const credential = relayCredentialContract(context.state.relay, context.state.token);
+      const clean = result.metrics.surviving_processes.length === 0
+        && result.metrics.surviving_ports.length === 0
+        && context.state.local.activeConnections === 0
+        && context.state.local.pendingConnections === 0
+        && context.state.relay.socketCount === 0;
+      const localPriorityMs = context.state.relay.localPriorityAt - context.state.relay.readyAt;
+      const relayCloseMs = context.state.local.activeClosedAt - context.state.relay.closeSentAt;
+      const artifactsClean = !directoryContains(context.artifactDir, Buffer.from(context.state.token));
+      const ok = credential.ok
+        && context.state.relay.textFrames.includes('local-priority')
+        && context.state.relay.binaryFrames.includes('local-binary')
+        && context.state.local.relayTextFrames >= 32
+        && context.state.local.relayBinaryFrames >= 32
+        && localPriorityMs >= 0
+        && localPriorityMs < 750
+        && relayCloseMs >= 0
+        && relayCloseMs < 750
+        && context.state.local.pendingClosed === 1
+        && artifactsClean
+        && clean;
+      return {
+        ok,
+        reason: ok ? null : `WebSocket contract failed: localPriorityMs=${localPriorityMs}, relayCloseMs=${relayCloseMs}, text=${context.state.local.relayTextFrames}, binary=${context.state.local.relayBinaryFrames}, pendingClosed=${context.state.local.pendingClosed}, artifactsClean=${artifactsClean}, clean=${clean}, credential=${credential.reason}`,
+        relay_credential: credential,
+        local_priority_ms: localPriorityMs,
+        relay_close_ms: relayCloseMs,
+        pending_upgrade_closed: context.state.local.pendingClosed === 1,
+        token_absent_from_artifacts: artifactsClean,
+      };
+    },
+  };
+}
+
 function tunnelDashboardScenario() {
   return {
     id: 'tunnel-dashboard/local-relay-burst-pty',
@@ -716,24 +1313,24 @@ function tunnelDashboardScenario() {
         services: { web: { command: 'node server.mjs', port, readyPort: port, primary: true } },
       });
       writeFile(context.projectRoot, 'server.mjs', httpServerScript('tunnel-dashboard'));
-      const relay = await startFakeRelay(64);
+      const relay = await startFakeRelay(Array.from({ length: 64 }, () => ({ method: 'GET', url: '/' })));
       context.cleanup.push(relay.close);
       context.state.relay = relay;
     },
     processes(context) {
       const command = [
-        context.binary.path, '--token', 'runtime-readiness-token', 'dev', '--tunnel', '--dashboard',
+        context.binary.path, 'dev', '--tunnel', '--dashboard',
         '--no-open', '--no-install', '--no-inspect',
       ];
       const script = findExecutable('script');
       if (process.platform === 'darwin') {
-        return [{ label: 'dashboard-pty', executable: script, args: ['-q', '/dev/null', ...command], env: { LPM_TUNNEL_RELAY: context.state.relay.url } }];
+        return [{ label: 'dashboard-pty', executable: script, args: ['-q', '/dev/null', ...command], env: { LPM_TOKEN: 'runtime-readiness-token', LPM_TUNNEL_RELAY: context.state.relay.url } }];
       }
       return [{
         label: 'dashboard-pty',
         executable: script,
         args: ['--quiet', '--return', '--command', shellJoin(command), '/dev/null'],
-        env: { LPM_TUNNEL_RELAY: context.state.relay.url },
+        env: { LPM_TOKEN: 'runtime-readiness-token', LPM_TUNNEL_RELAY: context.state.relay.url },
       }];
     },
     async waitReady(context) {
@@ -741,20 +1338,28 @@ function tunnelDashboardScenario() {
       await waitFor(() => context.state.relay.responses >= 64, 8_000, 'relay response burst');
       return { scenario: 'tunnel-dashboard', relay_responses: context.state.relay.responses };
     },
+    metricRootPids(context, tree) {
+      return tree
+        .filter((process) => processRunsExecutable(process, context.binary.path))
+        .map((process) => process.pid);
+    },
     async signalTargets(context, snapshot) {
-      const exact = snapshot.processes.filter((process) => process.command?.includes(context.binary.path));
+      const exact = this.metricRootPids(context, snapshot.processes);
       if (exact.length !== 1) throw new Error(`expected one lpm process below PTY, found ${exact.length}`);
-      return [exact[0].pid];
+      return exact;
     },
     async validate(context, result) {
       const relay = context.state.relay;
-      const authOk = relay.authorization === 'Bearer runtime-readiness-token';
-      const urlOk = !relay.requestUrl.includes('token') && !relay.requestUrl.includes('auth=');
+      const credential = relayCredentialContract(relay);
       const clean = result.metrics.surviving_processes.length === 0 && result.metrics.surviving_ports.length === 0;
+      const statuses = [...relay.responseMessages.values()].map((response) => response.status);
+      const successful = statuses.filter((status) => status === 200).length;
+      const shed = statuses.filter((status) => status === 503).length;
       return {
-        ok: authOk && urlOk && relay.responses === 64 && clean,
-        reason: authOk && urlOk && relay.responses === 64 && clean ? null : 'local relay, credential, burst, or cleanup contract failed',
-        relay: { request_url: relay.requestUrl, authorization: authOk ? '<redacted-valid-bearer>' : '<invalid>', responses: relay.responses },
+        ok: credential.ok && relay.responses === 64 && successful >= 4 && successful + shed === 64 && clean,
+        reason: credential.ok && relay.responses === 64 && successful >= 4 && successful + shed === 64 && clean ? null : 'local relay, credential, forwarding-capacity, explicit load-shedding, burst, or cleanup contract failed',
+        relay: { request_url: relay.requestUrl, authorization: credential.authorization, responses: relay.responses },
+        response_statuses: { successful, shed },
       };
     },
   };
@@ -781,6 +1386,9 @@ function devScenario(id, prepare, args, waitReady, validate = null) {
     waitReady,
     validate: validate ?? (async (_context, result) => {
       const clean = result.metrics.surviving_processes.length === 0 && result.metrics.surviving_ports.length === 0;
+      if (result.metrics.forced_shutdown) {
+        return { ok: false, reason: 'lpm exceeded the benchmark shutdown deadline and required SIGKILL' };
+      }
       return clean ? { ok: true } : { ok: false, reason: 'process or listener survived lpm shutdown' };
     }),
   };
@@ -823,12 +1431,36 @@ function multiServiceScript(apiPort) {
   return `import http from 'node:http';\nconst service=process.argv[2];\nconst port=Number(process.env.PORT);\nconst server=http.createServer(async (_req,res)=>{let apiReady=true;if(service==='web'){try{const response=await fetch('http://127.0.0.1:${apiPort}');apiReady=response.ok;}catch{apiReady=false;}}res.setHeader('content-type','application/json');res.end(JSON.stringify({scenario:'multi-dev',service,env:process.env.RUNTIME_BENCH_ENV,service_env:process.env.SERVICE_ENV,api_ready:apiReady,pid:process.pid}));});\nserver.listen(port,'127.0.0.1');\n`;
 }
 
+function graphServiceScript(shape, serviceCount) {
+  return `import http from 'node:http';\nconst shape=${JSON.stringify(shape)};\nconst serviceCount=${serviceCount};\nconst service=process.argv[2];\nhttp.createServer((_req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({shape,service_count:serviceCount,service,pid:process.pid}));}).listen(Number(process.env.PORT),'127.0.0.1');\n`;
+}
+
 function descendantParentScript() {
   return `import {spawn} from 'node:child_process';\nimport fs from 'node:fs';\nconst child=spawn(process.execPath,['descendant.mjs'],{env:process.env,stdio:'inherit'});\nfs.writeFileSync('descendant.pid',String(child.pid));\nsetInterval(()=>{},1000);\n`;
 }
 
 function newlineFreeServerScript(outputBytes, digest) {
   return `import crypto from 'node:crypto';\nimport fs from 'node:fs';\nimport http from 'node:http';\nconst bytes=${outputBytes};\nconst block=Buffer.alloc(64*1024,'x');\nconst hash=crypto.createHash('sha256');\nlet written=0;\nwhile(written<bytes){const chunk=block.subarray(0,Math.min(block.length,bytes-written));process.stdout.write(chunk);hash.update(chunk);written+=chunk.length;}\nconst sha256=hash.digest('hex');\nfs.writeFileSync('output-proof.json',JSON.stringify({bytes:written,sha256,expected:${JSON.stringify(digest)}}));\nhttp.createServer((_req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({scenario:'newline-free',bytes:written,sha256}));}).listen(Number(process.env.PORT),'127.0.0.1');\n`;
+}
+
+function largeReadinessResponseScript() {
+  return `import http from 'node:http';\nconst responseMiB=Number(process.argv[2]);\nconst chunk=Buffer.alloc(64*1024,'x');\nhttp.createServer((request,response)=>{response.statusCode=200;if(request.url==='/ready'){let remaining=responseMiB*1024*1024;const write=()=>{while(remaining>0){const bytes=Math.min(chunk.length,remaining);remaining-=bytes;if(!response.write(chunk.subarray(0,bytes))){response.once('drain',write);return;}}response.end();};write();return;}response.setHeader('content-type','application/json');response.end(JSON.stringify({scenario:'large-readiness',response_mib:responseMiB,pid:process.pid}));}).listen(Number(process.env.PORT),'127.0.0.1');\n`;
+}
+
+function restartRootScript() {
+  return `import {spawn} from 'node:child_process';\nimport fs from 'node:fs';\nimport http from 'node:http';\nconst [readyPort,...descendantPorts]=process.argv.slice(2).map(Number);\nlet attempt=0;try{attempt=Number(fs.readFileSync('attempt-count','utf8'));}catch{}attempt+=1;fs.writeFileSync('attempt-count',String(attempt));\nif(attempt<=descendantPorts.length){const child=spawn(process.execPath,['resistant-descendant.mjs',String(descendantPorts[attempt-1])],{stdio:'ignore',detached:false});fs.writeFileSync('descendant-'+attempt+'.pid',String(child.pid));setTimeout(()=>process.exit(1),100);}\nelse{http.createServer((_req,res)=>{res.setHeader('content-type','application/json');res.end(JSON.stringify({scenario:'restart-cycle',attempt,pid:process.pid}));}).listen(readyPort,'127.0.0.1');}\n`;
+}
+
+function resistantDescendantScript() {
+  return `import http from 'node:http';\nprocess.on('SIGTERM',()=>{});\nhttp.createServer((_req,res)=>res.end('old')).listen(Number(process.argv[2]),'127.0.0.1');\n`;
+}
+
+function tunnelResponseScript() {
+  return `import http from 'node:http';\nconst responseMiB=Number(process.argv[2]);\nconst bodyBytes=responseMiB*1024*1024;\nconst chunk=Buffer.alloc(64*1024,'x');\nhttp.createServer((request,response)=>{if(request.url==='/large'){response.setHeader('content-length',String(bodyBytes));let remaining=bodyBytes;const write=()=>{while(remaining>0){const bytes=Math.min(chunk.length,remaining);remaining-=bytes;if(!response.write(chunk.subarray(0,bytes))){response.once('drain',write);return;}}response.end();};write();return;}response.setHeader('content-type','application/json');response.end(JSON.stringify({scenario:'tunnel-response',response_mib:responseMiB,pid:process.pid}));}).listen(Number(process.env.PORT),'127.0.0.1');\n`;
+}
+
+function tunnelFairnessScript() {
+  return `import http from 'node:http';\nhttp.createServer((request,response)=>{if(request.url==='/slow'){setTimeout(()=>response.end('slow'),1500);return;}if(request.url==='/fast'){response.end('fast');return;}response.setHeader('content-type','application/json');response.end(JSON.stringify({scenario:'tunnel-fairness',pid:process.pid}));}).listen(Number(process.env.PORT),'127.0.0.1');\n`;
 }
 
 function installManagedRuntime(lpmHome, runtime, version) {
@@ -918,7 +1550,7 @@ function combinedOutput(result) {
   return result.processes.map((process) => `${process.stdout.retained}\n${process.stderr.retained}`).join('\n');
 }
 
-async function waitForJsonEndpoint(port, expected) {
+async function waitForJsonEndpoint(port, expected, timeoutMs = 8_000) {
   return waitFor(async () => {
     try {
       const payload = await httpGetJson(port);
@@ -929,7 +1561,7 @@ async function waitForJsonEndpoint(port, expected) {
     } catch {
       return false;
     }
-  }, 8_000, `http://127.0.0.1:${port} readiness`);
+  }, timeoutMs, `http://127.0.0.1:${port} readiness`);
 }
 
 function httpGetJson(port) {
@@ -982,11 +1614,22 @@ function canConnect(port) {
   });
 }
 
-async function startFakeRelay(burstCount) {
+async function startFakeRelay(requests) {
   let authorization = null;
   let requestUrl = '';
   let responses = 0;
+  const responseIds = [];
+  const responseTimes = new Map();
+  const responseMessages = new Map();
+  let requestsSentAt = 0;
   const server = http.createServer();
+  const sockets = new Set();
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.once('end', () => socket.destroy());
+    socket.once('error', () => socket.destroy());
+  });
   server.on('upgrade', (request, socket) => {
     authorization = request.headers.authorization ?? null;
     requestUrl = request.url ?? '';
@@ -1002,18 +1645,37 @@ async function startFakeRelay(burstCount) {
       base_domain: 'local',
       domain_kind: 'random',
     })));
-    for (let index = 0; index < burstCount; index += 1) {
+    requestsSentAt = performance.now();
+    for (const [index, relayRequest] of requests.entries()) {
       socket.write(webSocketTextFrame(JSON.stringify({
         type: 'http_request',
         id: `runtime-readiness-${index}`,
-        method: 'GET',
-        url: '/',
+        method: relayRequest.method,
+        url: relayRequest.url,
         headers: {},
         body: '',
       })));
     }
+    const parser = new WebSocketFrameParser((payload, opcode) => {
+      if (opcode !== 0x1 || !payload.includes(Buffer.from('"type":"http_response"'))) return;
+      responses += 1;
+      try {
+        const message = JSON.parse(payload.toString('utf8'));
+        responseIds.push(message.id);
+        responseTimes.set(message.id, performance.now() - requestsSentAt);
+        const body = Buffer.from(message.body ?? '', 'base64');
+        responseMessages.set(message.id, {
+          status: message.status,
+          decoded_bytes: body.length,
+          sha256: crypto.createHash('sha256').update(body).digest('hex'),
+        });
+      } catch {
+        // A malformed response still counts toward the relay contract and is
+        // diagnosed by the scenario's missing response ID.
+      }
+    });
     socket.on('data', (data) => {
-      responses += countWebSocketTextFrames(data, 'http_response');
+      parser.push(data);
     });
   });
   await listen(server);
@@ -1022,57 +1684,282 @@ async function startFakeRelay(burstCount) {
     get authorization() { return authorization; },
     get requestUrl() { return requestUrl; },
     get responses() { return responses; },
-    close: () => closeServer(server),
+    get responseIds() { return responseIds; },
+    get responseTimes() { return responseTimes; },
+    get responseMessages() { return responseMessages; },
+    get socketCount() { return sockets.size; },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await closeServer(server);
+    },
+  };
+}
+
+async function startLocalWebSocketFixture() {
+  const server = http.createServer((_request, response) => {
+    response.statusCode = 426;
+    response.end('WebSocket upgrade required');
+  });
+  const sockets = new Set();
+  let activeConnections = 0;
+  let pendingConnections = 0;
+  let pendingClosed = 0;
+  let activeClosedAt = 0;
+  let relayTextFrames = 0;
+  let relayBinaryFrames = 0;
+
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.once('end', () => socket.destroy());
+    socket.once('error', () => socket.destroy());
+  });
+  server.on('upgrade', (request, socket) => {
+    if (request.url === '/pending') {
+      pendingConnections += 1;
+      socket.once('close', () => {
+        pendingConnections -= 1;
+        pendingClosed += 1;
+      });
+      socket.once('end', () => socket.destroy());
+      socket.once('error', () => socket.destroy());
+      socket.resume();
+      return;
+    }
+    if (request.url !== '/active') {
+      socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      return;
+    }
+
+    acceptWebSocketUpgrade(request, socket);
+    activeConnections += 1;
+    let publishedLocalFrames = false;
+    const parser = new WebSocketFrameParser((payload, opcode) => {
+      if (opcode === 0x8) {
+        socket.write(webSocketFrame(Buffer.alloc(0), 0x8));
+        socket.end();
+        return;
+      }
+      if (opcode !== 0x1 && opcode !== 0x2) return;
+      if (!publishedLocalFrames) {
+        publishedLocalFrames = true;
+        socket.write(webSocketFrame(Buffer.from('local-priority'), 0x1));
+        socket.write(webSocketFrame(Buffer.from('local-binary'), 0x2));
+      }
+      if (opcode === 0x1) relayTextFrames += 1;
+      else relayBinaryFrames += 1;
+      socket.write(webSocketFrame(payload, opcode));
+    });
+    socket.on('data', (data) => parser.push(data));
+    socket.once('close', () => {
+      activeConnections -= 1;
+      activeClosedAt = performance.now();
+    });
+  });
+  await listen(server);
+
+  return {
+    port: server.address().port,
+    get activeConnections() { return activeConnections; },
+    get pendingConnections() { return pendingConnections; },
+    get pendingClosed() { return pendingClosed; },
+    get activeClosedAt() { return activeClosedAt; },
+    get relayTextFrames() { return relayTextFrames; },
+    get relayBinaryFrames() { return relayBinaryFrames; },
+    get socketCount() { return sockets.size; },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await closeServer(server);
+    },
+  };
+}
+
+async function startFakeWebSocketRelay() {
+  let authorization = null;
+  let requestUrl = '';
+  let readyAt = 0;
+  let localPriorityAt = 0;
+  let closeSentAt = 0;
+  const textFrames = [];
+  const binaryFrames = [];
+  const sockets = new Set();
+  const server = http.createServer();
+
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.once('end', () => socket.destroy());
+    socket.once('error', () => socket.destroy());
+  });
+  server.on('upgrade', (request, socket) => {
+    authorization = request.headers.authorization ?? null;
+    requestUrl = request.url ?? '';
+    acceptWebSocketUpgrade(request, socket);
+    socket.write(webSocketTextFrame(JSON.stringify({
+      type: 'hello',
+      subdomain: 'runtime-readiness.local',
+      tunnel_url: 'http://runtime-readiness.local',
+      session_id: 'runtime-readiness-websocket-session',
+      plan: 'free',
+      base_domain: 'local',
+      domain_kind: 'random',
+    })));
+    socket.write(webSocketTextFrame(JSON.stringify({
+      type: 'ws_upgrade',
+      id: 'runtime-readiness-active',
+      url: '/active',
+      headers: {},
+    })));
+
+    const maybeCloseActive = () => {
+      if (closeSentAt > 0
+        || !textFrames.includes('local-priority')
+        || !binaryFrames.includes('local-binary')
+        || textFrames.filter((frame) => frame.startsWith('relay-text-')).length < 32
+        || binaryFrames.filter((frame) => frame.startsWith('relay-binary-')).length < 32) return;
+      closeSentAt = performance.now();
+      socket.write(webSocketTextFrame(JSON.stringify({
+        type: 'ws_close',
+        id: 'runtime-readiness-active',
+        code: 1000,
+        reason: 'benchmark close',
+      })));
+      socket.write(webSocketTextFrame(JSON.stringify({
+        type: 'ws_upgrade',
+        id: 'runtime-readiness-pending',
+        url: '/pending',
+        headers: {},
+      })));
+    };
+    const parser = new WebSocketFrameParser((payload, opcode) => {
+      if (opcode !== 0x1) return;
+      let message;
+      try {
+        message = JSON.parse(payload.toString('utf8'));
+      } catch {
+        return;
+      }
+      if (message.type === 'ws_ready' && message.id === 'runtime-readiness-active') {
+        readyAt = performance.now();
+        for (let index = 0; index < 64; index += 1) {
+          const isBinary = index % 2 === 1;
+          const value = `${isBinary ? 'relay-binary' : 'relay-text'}-${index}`;
+          socket.write(webSocketTextFrame(JSON.stringify({
+            type: 'ws_frame',
+            id: 'runtime-readiness-active',
+            data: Buffer.from(value).toString('base64'),
+            is_binary: isBinary,
+          })));
+        }
+        return;
+      }
+      if (message.type !== 'ws_frame' || message.id !== 'runtime-readiness-active') return;
+      const decoded = Buffer.from(message.data ?? '', 'base64').toString('utf8');
+      if (message.is_binary) binaryFrames.push(decoded);
+      else textFrames.push(decoded);
+      if (decoded === 'local-priority' && localPriorityAt === 0) localPriorityAt = performance.now();
+      maybeCloseActive();
+    });
+    socket.on('data', (data) => parser.push(data));
+  });
+  await listen(server);
+
+  return {
+    url: `ws://127.0.0.1:${server.address().port}/connect`,
+    get authorization() { return authorization; },
+    get requestUrl() { return requestUrl; },
+    get readyAt() { return readyAt; },
+    get localPriorityAt() { return localPriorityAt; },
+    get closeSentAt() { return closeSentAt; },
+    get textFrames() { return textFrames; },
+    get binaryFrames() { return binaryFrames; },
+    get socketCount() { return sockets.size; },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await closeServer(server);
+    },
+  };
+}
+
+function acceptWebSocketUpgrade(request, socket) {
+  const key = request.headers['sec-websocket-key'];
+  if (typeof key !== 'string') {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    return;
+  }
+  const accept = crypto.createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+  socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+}
+
+function relayCredentialContract(relay, token = 'runtime-readiness-token') {
+  const authOk = relay.authorization === `Bearer ${token}`;
+  const urlOk = !relay.requestUrl.includes('token')
+    && !relay.requestUrl.includes('auth=')
+    && !relay.requestUrl.includes(token);
+  return {
+    ok: authOk && urlOk,
+    reason: authOk && urlOk ? null : 'bearer token was missing from the header or leaked into the relay URL',
+    request_url: relay.requestUrl,
+    authorization: authOk ? '<redacted-valid-bearer>' : '<invalid>',
   };
 }
 
 function webSocketTextFrame(text) {
-  const payload = Buffer.from(text);
-  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
-  const header = Buffer.alloc(4);
-  header[0] = 0x81;
-  header[1] = 126;
-  header.writeUInt16BE(payload.length, 2);
+  return webSocketFrame(Buffer.from(text), 0x1);
+}
+
+function webSocketFrame(payload, opcode) {
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x80 | opcode, payload.length]), payload]);
+  if (payload.length <= 0xffff) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([header, payload]);
+  }
+  const header = Buffer.alloc(10);
+  header[0] = 0x80 | opcode;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(payload.length), 2);
   return Buffer.concat([header, payload]);
 }
 
-function countWebSocketTextFrames(buffer, type) {
-  let offset = 0;
-  let count = 0;
-  while (offset + 2 <= buffer.length) {
-    const masked = (buffer[offset + 1] & 0x80) !== 0;
-    let length = buffer[offset + 1] & 0x7f;
-    let header = 2;
-    if (length === 126) {
-      if (offset + 4 > buffer.length) break;
-      length = buffer.readUInt16BE(offset + 2);
-      header = 4;
-    } else if (length === 127) {
-      break;
-    }
-    const maskBytes = masked ? 4 : 0;
-    if (offset + header + maskBytes + length > buffer.length) break;
-    const payload = Buffer.from(buffer.subarray(offset + header + maskBytes, offset + header + maskBytes + length));
-    if (masked) {
-      const mask = buffer.subarray(offset + header, offset + header + 4);
-      for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
-    }
-    if (payload.toString('utf8').includes(`\"type\":\"${type}\"`)) count += 1;
-    offset += header + maskBytes + length;
+function maskedWebSocketTextFrame(text, force64BitLength = false) {
+  const payload = Buffer.from(text);
+  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+  let header;
+  if (force64BitLength) {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 0xff;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+  } else if (payload.length < 126) {
+    header = Buffer.from([0x81, 0x80 | payload.length]);
+  } else {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 0xfe;
+    header.writeUInt16BE(payload.length, 2);
   }
-  return count;
+  const masked = Buffer.from(payload);
+  for (let index = 0; index < masked.length; index += 1) masked[index] ^= mask[index % 4];
+  return Buffer.concat([header, mask, masked]);
 }
 
-function sampleProcessTree(rootPids, detailed) {
+function sampleProcessTree(rootPids, detailed, metricRootSelector = () => rootPids) {
   const processes = process.platform === 'linux' ? linuxProcesses() : macProcesses();
   const tree = descendantProcesses(processes, rootPids);
   if (detailed) enrichProcessDetails(tree);
+  const metricRootPids = metricRootSelector(tree);
   return {
     process_count: tree.length,
     tree_rss_bytes: tree.reduce((sum, process) => sum + process.rss_bytes, 0),
-    root_rss_bytes: tree.filter((process) => rootPids.includes(process.pid)).reduce((sum, process) => sum + process.rss_bytes, 0),
+    root_rss_bytes: metricRootPids.length > 0
+      ? tree.filter((process) => metricRootPids.includes(process.pid)).reduce((sum, process) => sum + process.rss_bytes, 0)
+      : null,
     fd_count: detailed ? tree.reduce((sum, process) => sum + (process.fd_count ?? 0), 0) : null,
     thread_count: detailed ? tree.reduce((sum, process) => sum + (process.thread_count ?? 0), 0) : null,
+    metric_root_pids: metricRootPids,
     processes: tree,
   };
 }
@@ -1092,12 +1979,18 @@ function linuxProcesses() {
       const fields = stat.slice(closingParen + 2).split(' ');
       const startIdentity = fields[19];
       let command = '';
+      let executable = '';
       try {
         command = fs.readFileSync(`/proc/${entry.name}/cmdline`).toString('utf8').replaceAll('\0', ' ').trim();
       } catch {
         // The status and stat files are enough for sampling.
       }
-      processes.push({ pid, ppid, rss_bytes: rssKb * 1024, thread_count: threads, start_identity: startIdentity, command });
+      try {
+        executable = fs.readlinkSync(`/proc/${entry.name}/exe`);
+      } catch {
+        // Executable identity is best-effort because the process can exit.
+      }
+      processes.push({ pid, ppid, rss_bytes: rssKb * 1024, thread_count: threads, start_identity: startIdentity, command, executable });
     } catch {
       // A process can exit during the /proc walk.
     }
@@ -1138,6 +2031,22 @@ function descendantProcesses(processes, roots) {
   return processes.filter((process) => wanted.has(process.pid));
 }
 
+function processRunsExecutable(process, executable) {
+  const expected = canonicalPath(executable);
+  if (process.executable && canonicalPath(process.executable) === expected) return true;
+  const command = process.command?.trim() ?? '';
+  return [executable, shellQuote(executable), JSON.stringify(executable)]
+    .some((prefix) => command === prefix || command.startsWith(`${prefix} `));
+}
+
+function canonicalPath(value) {
+  try {
+    return fs.realpathSync.native(value);
+  } catch {
+    return path.resolve(value);
+  }
+}
+
 function enrichProcessDetails(processes) {
   for (const process of processes) {
     if (process.platform === 'linux' || fs.existsSync(`/proc/${process.pid}`)) {
@@ -1161,9 +2070,19 @@ function sameProcess(identity) {
   return current?.start_identity === identity.start_identity;
 }
 
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
 function summarizeResourceSamples(samples, roots) {
   const detailed = samples.filter((sample) => sample.fd_count != null);
   const ready = samples.at(-1);
+  const elapsed = samples.map((sample) => sample.elapsed_ms).filter(Number.isFinite);
   return {
     tree_peak_rss_bytes: maximum(samples.map((sample) => sample.tree_rss_bytes)),
     root_peak_rss_bytes: maximum(samples.map((sample) => sample.root_rss_bytes)),
@@ -1172,13 +2091,15 @@ function summarizeResourceSamples(samples, roots) {
     maximum_observed_fd_count: maximum(detailed.map((sample) => sample.fd_count)),
     maximum_observed_thread_count: maximum(detailed.map((sample) => sample.thread_count)),
     resource_sample_count: samples.length,
+    resource_sample_span_ms: elapsed.length > 1 ? Math.max(...elapsed) - Math.min(...elapsed) : 0,
     detailed_sample_count: detailed.length,
     root_pids: roots,
   };
 }
 
 function maximum(values) {
-  return values.length > 0 ? Math.max(...values.filter(Number.isFinite)) : 0;
+  const finite = values.filter(Number.isFinite);
+  return finite.length > 0 ? Math.max(...finite) : 0;
 }
 
 function summarize(rows) {
@@ -1199,7 +2120,14 @@ function summarize(rows) {
       contract_passes: group.filter((row) => row.contract_ok).length,
       wall_ms: distribution(successful.map((row) => row.wall_ms)),
       startup_ms: distribution(successful.map((row) => row.startup_ms).filter(Number.isFinite)),
+      shutdown_ms: distribution(successful.map((row) => row.shutdown_ms).filter(Number.isFinite)),
       tree_peak_rss_bytes: distribution(successful.map((row) => row.tree_peak_rss_bytes)),
+      root_peak_rss_bytes: distribution(successful.map((row) => row.root_peak_rss_bytes)),
+      steady_tree_rss_bytes: distribution(successful.map((row) => row.steady_tree_rss_bytes)),
+      steady_root_rss_bytes: distribution(successful.map((row) => row.steady_root_rss_bytes)),
+      peak_process_count: distribution(successful.map((row) => row.peak_process_count)),
+      maximum_observed_fd_count: distribution(successful.map((row) => row.maximum_observed_fd_count)),
+      maximum_observed_thread_count: distribution(successful.map((row) => row.maximum_observed_thread_count)),
     };
   }).sort((a, b) => `${a.scenario}\0${a.binary}`.localeCompare(`${b.scenario}\0${b.binary}`));
 }
@@ -1211,12 +2139,13 @@ function summarizeComparison(rows, comparison, thresholds, expectedSamples) {
   let inconclusive = false;
   for (const scenario of [...new Set(rows.filter((row) => row.counted).map((row) => row.scenario))].sort()) {
     const scenarioRows = rows.filter((row) => row.counted && row.scenario === scenario);
-    const pairs = [];
+    const observedPairs = [];
+    const performancePairs = [];
     const failures = [];
     for (let sample = 1; sample <= expectedSamples; sample += 1) {
       const baseline = scenarioRows.find((row) => row.sample === sample && row.binary === comparison.baseline);
       const candidate = scenarioRows.find((row) => row.sample === sample && row.binary === comparison.candidate);
-      if (!baseline || !candidate || executionFailed(baseline) || candidate.contract_ok !== true || executionFailed(candidate)) {
+      if (!baseline || !candidate) {
         failures.push({ sample, baseline: rowStatus(baseline), candidate: rowStatus(candidate) });
         continue;
       }
@@ -1224,23 +2153,70 @@ function summarizeComparison(rows, comparison, thresholds, expectedSamples) {
         failures.push({ sample, baseline: 'not adjacent', candidate: 'not adjacent' });
         continue;
       }
-      pairs.push({ sample, baseline, candidate });
+      const pair = { sample, baseline, candidate };
+      observedPairs.push(pair);
+      if (runFailed(candidate)) {
+        failures.push({ sample, baseline: rowStatus(baseline), candidate: rowStatus(candidate) });
+        continue;
+      }
+      if (!runFailed(baseline)) performancePairs.push(pair);
     }
     const orders = {
-      'baseline-candidate': pairs.filter((pair) => pair.baseline.pair_order === 'baseline-candidate').length,
-      'candidate-baseline': pairs.filter((pair) => pair.baseline.pair_order === 'candidate-baseline').length,
+      'baseline-candidate': observedPairs.filter((pair) => pair.baseline.pair_order === 'baseline-candidate').length,
+      'candidate-baseline': observedPairs.filter((pair) => pair.baseline.pair_order === 'candidate-baseline').length,
     };
     const correctness = {
-      baseline_contract_failures: pairs.filter((pair) => pair.baseline.contract_ok !== true).length,
-      candidate_contract_failures: pairs.filter((pair) => pair.candidate.contract_ok !== true).length,
+      baseline_failures: observedPairs.filter((pair) => runFailed(pair.baseline)).length,
+      candidate_failures: observedPairs.filter((pair) => runFailed(pair.candidate)).length,
+      baseline_contract_failures: observedPairs.filter((pair) => pair.baseline.contract_ok !== true).length,
+      candidate_contract_failures: observedPairs.filter((pair) => pair.candidate.contract_ok !== true).length,
     };
-    const performanceGates = correctness.baseline_contract_failures === 0;
+    const performanceGates = correctness.baseline_failures === 0;
+    if (correctness.baseline_failures > 0
+      && correctness.candidate_failures < correctness.baseline_failures) {
+      inconclusive = true;
+    }
     if (Math.abs(orders['baseline-candidate'] - orders['candidate-baseline']) > 1) failures.push({ sample: 'schedule', baseline: 'imbalanced AB/BA', candidate: 'imbalanced AB/BA' });
     const kind = scenarioRows[0]?.kind;
     const metrics = {};
-    for (const metric of kind === 'dev' ? ['startup_ms', 'tree_peak_rss_bytes'] : ['wall_ms', 'tree_peak_rss_bytes']) {
-      const metricPairs = pairs.filter((pair) => Number.isFinite(pair.baseline[metric]) && Number.isFinite(pair.candidate[metric]) && pair.baseline[metric] > 0);
-      if (metricPairs.length > 0) metrics[metric] = compareMetric(metricPairs, metric, thresholds[metric]);
+    const metricsForKind = kind === 'dev'
+      ? [
+          'startup_ms',
+          'shutdown_ms',
+          'tree_peak_rss_bytes',
+          'root_peak_rss_bytes',
+          'steady_tree_rss_bytes',
+          'steady_root_rss_bytes',
+          'peak_process_count',
+          'maximum_observed_fd_count',
+          'maximum_observed_thread_count',
+        ]
+      : [
+          'wall_ms',
+          'tree_peak_rss_bytes',
+          'root_peak_rss_bytes',
+          'peak_process_count',
+          'maximum_observed_fd_count',
+          'maximum_observed_thread_count',
+        ];
+    for (const metric of metricsForKind) {
+      const presentPairs = performancePairs.filter((pair) => metricHasValue(pair.baseline, metric)
+        && metricHasValue(pair.candidate, metric));
+      if (presentPairs.length !== performancePairs.length || performancePairs.length === 0) {
+        metrics[metric] = {
+          verdict: 'inconclusive',
+          reason: `metric is present in ${presentPairs.length}/${performancePairs.length} successful pairs`,
+        };
+      } else {
+        const sampledPairs = presentPairs.filter((pair) => metricHasSamplingCoverage(pair.baseline, metric)
+          && metricHasSamplingCoverage(pair.candidate, metric));
+        metrics[metric] = sampledPairs.length === presentPairs.length
+          ? compareMetric(presentPairs, metric, thresholds[metric])
+          : {
+              verdict: 'advisory-insufficient-sampling',
+              reason: `metric has sufficient temporal sampling in ${sampledPairs.length}/${presentPairs.length} successful pairs`,
+            };
+      }
       if (performanceGates && metrics[metric]?.verdict === 'regression') regression = true;
       if (performanceGates && metrics[metric]?.verdict === 'inconclusive') inconclusive = true;
     }
@@ -1248,7 +2224,8 @@ function summarizeComparison(rows, comparison, thresholds, expectedSamples) {
     groups.push({
       scenario,
       expected_pairs: expectedSamples,
-      successful_pairs: pairs.length,
+      observed_pairs: observedPairs.length,
+      successful_pairs: performancePairs.length,
       pair_orders: orders,
       correctness,
       performance_gates: performanceGates,
@@ -1263,6 +2240,29 @@ function summarizeComparison(rows, comparison, thresholds, expectedSamples) {
     verdict: executionFailure ? 'execution-failure' : regression ? 'regression' : inconclusive ? 'inconclusive' : 'pass',
     groups,
   };
+}
+
+function metricHasValue(row, metric) {
+  const value = row[metric];
+  if (!Number.isFinite(value)) return false;
+  if (metric === 'maximum_observed_fd_count'
+    || metric === 'maximum_observed_thread_count') return value >= 0;
+  return value > 0;
+}
+
+function metricHasSamplingCoverage(row, metric) {
+  if (!metricHasValue(row, metric)) return false;
+  if (metric === 'tree_peak_rss_bytes'
+    || metric === 'root_peak_rss_bytes'
+    || metric === 'peak_process_count') {
+    return row.resource_sample_count >= 3
+      && row.resource_sample_span_ms >= SAMPLE_INTERVAL_MS * 2;
+  }
+  if (metric === 'maximum_observed_fd_count'
+    || metric === 'maximum_observed_thread_count') {
+    return row.detailed_sample_count >= 2;
+  }
+  return true;
 }
 
 function compareMetric(pairs, metric, limits) {
@@ -1326,20 +2326,24 @@ function renderMarkdown(summary, comparison) {
     '',
     `Baseline: \`${comparison.baseline}\`. Candidate: \`${comparison.candidate}\`.`,
     '',
-    '| Scenario | Pairs | Metric | Baseline median/p95 | Candidate median/p95 | Delta median/p95 | Result |',
+    '| Scenario | Performance/observed/expected pairs | Metric | Baseline median/p95 | Candidate median/p95 | Delta median/p95 | Result |',
     '| --- | ---: | --- | ---: | ---: | ---: | --- |',
   ];
   for (const group of comparison.groups) {
     for (const [metric, result] of Object.entries(group.metrics)) {
-      const metricVerdict = group.performance_gates ? result.verdict : 'advisory: baseline contract failed';
-      lines.push(`| ${group.scenario} | ${group.successful_pairs}/${group.expected_pairs} | ${metric} | ${formatMetric(metric, result.baseline.median)}/${formatMetric(metric, result.baseline.p95)} | ${formatMetric(metric, result.candidate.median)}/${formatMetric(metric, result.candidate.p95)} | ${result.median_delta_pct}%/${result.p95_delta_pct}% | ${metricVerdict} |`);
+      const metricVerdict = group.performance_gates ? result.verdict : 'advisory: baseline correctness failed';
+      if (!result.baseline || !result.candidate) {
+        lines.push(`| ${group.scenario} | ${group.successful_pairs}/${group.observed_pairs}/${group.expected_pairs} | ${metric} | n/a | n/a | n/a | ${metricVerdict}: ${result.reason} |`);
+        continue;
+      }
+      lines.push(`| ${group.scenario} | ${group.successful_pairs}/${group.observed_pairs}/${group.expected_pairs} | ${metric} | ${formatMetric(metric, result.baseline.median)}/${formatMetric(metric, result.baseline.p95)} | ${formatMetric(metric, result.candidate.median)}/${formatMetric(metric, result.candidate.p95)} | ${result.median_delta_pct}%/${result.p95_delta_pct}% | ${metricVerdict} |`);
     }
   }
-  const transitions = comparison.groups.filter((group) => group.correctness.baseline_contract_failures > 0);
+  const transitions = comparison.groups.filter((group) => group.correctness.baseline_failures > 0);
   if (transitions.length > 0) {
     lines.push('', '## Correctness transitions', '');
     for (const group of transitions) {
-      lines.push(`- ${group.scenario}: baseline contract failures ${group.correctness.baseline_contract_failures}/${group.successful_pairs}; candidate failures ${group.correctness.candidate_contract_failures}/${group.successful_pairs}. Performance deltas are advisory.`);
+      lines.push(`- ${group.scenario}: baseline failures ${group.correctness.baseline_failures}/${group.observed_pairs}; candidate failures ${group.correctness.candidate_failures}/${group.observed_pairs}. Performance deltas are advisory.`);
     }
   }
   const failures = comparison.groups.flatMap((group) => group.failures.map((failure) => ({ group, failure })));
@@ -1347,20 +2351,30 @@ function renderMarkdown(summary, comparison) {
     lines.push('', '## Execution failures', '');
     for (const { group, failure } of failures) lines.push(`- ${group.scenario} sample ${failure.sample}: baseline=${failure.baseline}; candidate=${failure.candidate}.`);
   }
-  lines.push('', '## Distributions', '', '| Scenario | Binary | Samples | Wall median/p95 | Startup median/p95 | Tree RSS median/p95 |', '| --- | --- | ---: | ---: | ---: | ---: |');
+  lines.push(
+    '',
+    '## Distributions',
+    '',
+    '| Scenario | Binary | Samples | Wall | Startup | Shutdown | Tree peak RSS | Root peak RSS | Tree steady RSS | Root steady RSS | Processes | FDs | Threads |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+  );
   for (const group of summary) {
-    lines.push(`| ${group.scenario} | ${group.binary} | ${group.successful_samples}/${group.samples} | ${formatDistribution(group.wall_ms, 'ms')} | ${formatDistribution(group.startup_ms, 'ms')} | ${formatDistribution(group.tree_peak_rss_bytes, 'bytes')} |`);
+    lines.push(`| ${group.scenario} | ${group.binary} | ${group.successful_samples}/${group.samples} | ${formatDistribution(group.wall_ms, 'ms')} | ${formatDistribution(group.startup_ms, 'ms')} | ${formatDistribution(group.shutdown_ms, 'ms')} | ${formatDistribution(group.tree_peak_rss_bytes, 'bytes')} | ${formatDistribution(group.root_peak_rss_bytes, 'bytes')} | ${formatDistribution(group.steady_tree_rss_bytes, 'bytes')} | ${formatDistribution(group.steady_root_rss_bytes, 'bytes')} | ${formatDistribution(group.peak_process_count, 'count')} | ${formatDistribution(group.maximum_observed_fd_count, 'count')} | ${formatDistribution(group.maximum_observed_thread_count, 'count')} |`);
   }
   return lines.join('\n');
 }
 
 function formatMetric(metric, value) {
-  return metric.endsWith('_bytes') ? formatBytes(value) : `${value} ms`;
+  if (metric.endsWith('_bytes')) return formatBytes(value);
+  if (metric.endsWith('_ms')) return `${value} ms`;
+  return String(value);
 }
 
 function formatDistribution(value, kind) {
   if (!value) return 'n/a';
-  return kind === 'bytes' ? `${formatBytes(value.median)}/${formatBytes(value.p95)}` : `${value.median}/${value.p95} ms`;
+  if (kind === 'bytes') return `${formatBytes(value.median)}/${formatBytes(value.p95)}`;
+  if (kind === 'ms') return `${value.median}/${value.p95} ms`;
+  return `${value.median}/${value.p95}`;
 }
 
 function formatBytes(value) {
@@ -1387,10 +2401,46 @@ function parseArgs(argv) {
       case '--p95-regression-pct': parsed.wallP95Pct = value(); parsed.startupP95Pct = parsed.wallP95Pct; break;
       case '--median-regression-ms': parsed.wallMedianAbs = value(); parsed.startupMedianAbs = parsed.wallMedianAbs; break;
       case '--p95-regression-ms': parsed.wallP95Abs = value(); parsed.startupP95Abs = parsed.wallP95Abs; break;
+      case '--wall-median-regression-pct': parsed.wallMedianPct = value(); break;
+      case '--wall-p95-regression-pct': parsed.wallP95Pct = value(); break;
+      case '--wall-median-regression-ms': parsed.wallMedianAbs = value(); break;
+      case '--wall-p95-regression-ms': parsed.wallP95Abs = value(); break;
+      case '--startup-median-regression-pct': parsed.startupMedianPct = value(); break;
+      case '--startup-p95-regression-pct': parsed.startupP95Pct = value(); break;
+      case '--startup-median-regression-ms': parsed.startupMedianAbs = value(); break;
+      case '--startup-p95-regression-ms': parsed.startupP95Abs = value(); break;
       case '--rss-median-regression-pct': parsed.rssMedianPct = value(); break;
       case '--rss-p95-regression-pct': parsed.rssP95Pct = value(); break;
       case '--rss-median-regression-mb': parsed.rssMedianAbs = Number(value()) * MiB; break;
       case '--rss-p95-regression-mb': parsed.rssP95Abs = Number(value()) * MiB; break;
+      case '--root-rss-median-regression-pct': parsed.rootRssMedianPct = value(); break;
+      case '--root-rss-p95-regression-pct': parsed.rootRssP95Pct = value(); break;
+      case '--root-rss-median-regression-mb': parsed.rootRssMedianAbs = Number(value()) * MiB; break;
+      case '--root-rss-p95-regression-mb': parsed.rootRssP95Abs = Number(value()) * MiB; break;
+      case '--shutdown-median-regression-pct': parsed.shutdownMedianPct = value(); break;
+      case '--shutdown-p95-regression-pct': parsed.shutdownP95Pct = value(); break;
+      case '--shutdown-median-regression-ms': parsed.shutdownMedianAbs = value(); break;
+      case '--shutdown-p95-regression-ms': parsed.shutdownP95Abs = value(); break;
+      case '--steady-rss-median-regression-pct': parsed.steadyRssMedianPct = value(); break;
+      case '--steady-rss-p95-regression-pct': parsed.steadyRssP95Pct = value(); break;
+      case '--steady-rss-median-regression-mb': parsed.steadyRssMedianAbs = Number(value()) * MiB; break;
+      case '--steady-rss-p95-regression-mb': parsed.steadyRssP95Abs = Number(value()) * MiB; break;
+      case '--steady-root-rss-median-regression-pct': parsed.steadyRootRssMedianPct = value(); break;
+      case '--steady-root-rss-p95-regression-pct': parsed.steadyRootRssP95Pct = value(); break;
+      case '--steady-root-rss-median-regression-mb': parsed.steadyRootRssMedianAbs = Number(value()) * MiB; break;
+      case '--steady-root-rss-p95-regression-mb': parsed.steadyRootRssP95Abs = Number(value()) * MiB; break;
+      case '--process-median-regression-pct': parsed.processMedianPct = value(); break;
+      case '--process-p95-regression-pct': parsed.processP95Pct = value(); break;
+      case '--process-median-regression-count': parsed.processMedianAbs = value(); break;
+      case '--process-p95-regression-count': parsed.processP95Abs = value(); break;
+      case '--fd-median-regression-pct': parsed.fdMedianPct = value(); break;
+      case '--fd-p95-regression-pct': parsed.fdP95Pct = value(); break;
+      case '--fd-median-regression-count': parsed.fdMedianAbs = value(); break;
+      case '--fd-p95-regression-count': parsed.fdP95Abs = value(); break;
+      case '--thread-median-regression-pct': parsed.threadMedianPct = value(); break;
+      case '--thread-p95-regression-pct': parsed.threadP95Pct = value(); break;
+      case '--thread-median-regression-count': parsed.threadMedianAbs = value(); break;
+      case '--thread-p95-regression-count': parsed.threadP95Abs = value(); break;
       case '--allow-inconclusive': parsed.allowInconclusive = true; break;
       case '--keep-work': parsed.keepWork = true; break;
       case '--dry-run': parsed.dryRun = true; break;
@@ -1434,6 +2484,14 @@ function positiveInt(raw, fallback, flag) {
   if (raw == null) return fallback;
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${flag} must be a positive integer`);
+  return value;
+}
+
+function balancedPairCount(raw, fallback, flag) {
+  const value = positiveInt(raw, fallback, flag);
+  if (value % 2 !== 0) {
+    throw new Error(`${flag} must be even so baseline/candidate order is balanced`);
+  }
   return value;
 }
 
@@ -1549,6 +2607,18 @@ function removeTree(target) {
   fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
+function directoryContains(directory, needle) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const fullPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (directoryContains(fullPath, needle)) return true;
+    } else if (entry.isFile() && fs.readFileSync(fullPath).includes(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function elapsedMs(startedNs) {
   return Number(process.hrtime.bigint() - startedNs) / 1_000_000;
 }
@@ -1573,10 +2643,22 @@ async function waitFor(operation, timeout, description) {
 }
 
 function withTimeout(promise, timeout, description) {
-  return Promise.race([
-    promise,
-    delay(timeout).then(() => { throw new Error(`${description} timed out after ${timeout} ms`); }),
-  ]);
+  return new Promise((resolve, reject) => {
+    const timeoutHandle = setTimeout(
+      () => reject(new Error(`${description} timed out after ${timeout} ms`)),
+      timeout,
+    );
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timeoutHandle);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timeoutHandle);
+        reject(error);
+      },
+    );
+  });
 }
 
 function rowStatus(row) {
@@ -1587,6 +2669,10 @@ function rowStatus(row) {
 
 function runFailed(row) {
   return executionFailed(row) || row.contract_ok !== true;
+}
+
+function warmupBlocksComparison(binaryName, row, comparison) {
+  return binaryName === comparison.candidate && runFailed(row);
 }
 
 function executionFailed(row) {
@@ -1604,11 +2690,12 @@ function printHelp() {
     `\nOptions:\n` +
     `  --compare BASE,CANDIDATE  Binary names to compare (default: first two)\n` +
     `  --profile pr|full         Fixed PR suite or suite including PTY tunnel/dashboard\n` +
-    `  --samples N               Measured adjacent AB/BA pairs\n` +
+    `  --samples N               Even number of measured adjacent AB/BA pairs (PR default: 4)\n` +
     `  --warmups N               Warmup rounds (default: 1)\n` +
     `  --scenarios IDS           Comma-separated fixed scenario IDs\n` +
     `  --timeout-ms N            Per-scenario hard timeout\n` +
     `  --output DIR              JSON, Markdown, bounded logs, and raw samples\n` +
+    `  --*-median-regression-*   Override wall/startup/shutdown/tree/root RSS/process/FD/thread gates\n` +
     `  --allow-inconclusive      Exit zero for an inconclusive performance comparison\n` +
     `  --keep-work               Preserve isolated fixture directories\n` +
     `  --dry-run                 Print the plan without execution\n` +
@@ -1616,6 +2703,14 @@ function printHelp() {
 }
 
 async function runSelfTests() {
+  assert.equal(defaultTimeoutMs('pr'), 15_000);
+  assert.equal(defaultTimeoutMs('full'), 60_000);
+  assert.equal(benchmarkShutdownTimeoutMs(), 10_000);
+  assert.equal(graphReadinessTimeoutMs(10, 'deep'), 8_000);
+  assert.equal(graphReadinessTimeoutMs(50, 'deep'), 25_000);
+  assert.equal(graphReadinessTimeoutMs(50, 'wide'), 8_000);
+  assert.equal(balancedPairCount(undefined, 4, '--samples'), 4);
+  assert.throws(() => balancedPairCount(3, 4, '--samples'), /even/);
   const collector = new BoundedCollector(16);
   collector.push(Buffer.from('hello '));
   collector.push(Buffer.from([0xf0, 0x9f]));
@@ -1625,6 +2720,11 @@ async function runSelfTests() {
   assert.equal(collected.total_bytes, 42);
   assert.equal(collected.truncated, true);
   assert.ok(collected.retained_bytes <= 16 + 48);
+  const nonTruncatedCollector = new BoundedCollector(16);
+  nonTruncatedCollector.push(Buffer.from('twelve-bytes'));
+  const nonTruncated = nonTruncatedCollector.finish();
+  assert.equal(nonTruncated.truncated, false);
+  assert.equal(nonTruncated.retained, 'twelve-bytes');
 
   assert.deepEqual(rotated(['a', 'b', 'c'], 1), ['b', 'c', 'a']);
   const schedules = new Map([['a', []], ['b', []], ['c', []]]);
@@ -1644,15 +2744,190 @@ async function runSelfTests() {
     { pid: 4, ppid: 0, rss_bytes: 4 },
   ];
   assert.deepEqual(descendantProcesses(processes, [1]).map((process) => process.pid), [1, 2, 3]);
+  const executable = '/tmp/lpm-rs';
+  const ptyTree = [
+    { pid: 10, command: `script -q /dev/null ${executable} dev` },
+    { pid: 11, command: `/bin/sh -c '${executable} dev'` },
+    { pid: 12, command: `${executable} dev --dashboard` },
+    { pid: 13, command: 'node service.mjs' },
+  ];
+  assert.deepEqual(ptyTree.filter((process) => processRunsExecutable(process, executable)).map((process) => process.pid), [12]);
   assert.deepEqual(distribution([1, 2, 3, 4]), { min: 1, median: 2.5, p95: 3.85, max: 4, iqr: 1.5, mad: 1 });
 
-  const baseline = { binary: 'main', sample: 1, counted: true, pair_id: 'x', pair_order: 'baseline-candidate', execution_sequence: 1, scenario: 's', kind: 'run', wall_ms: 100, tree_peak_rss_bytes: 100, exit_ok: true, contract_ok: true };
-  const candidate = { ...baseline, binary: 'candidate', execution_sequence: 2, wall_ms: 101, tree_peak_rss_bytes: 101 };
-  const limits = { wall_ms: { median_pct: 5, p95_pct: 10, median_abs: 20, p95_abs: 50 }, startup_ms: { median_pct: 5, p95_pct: 10, median_abs: 20, p95_abs: 50 }, tree_peak_rss_bytes: { median_pct: 5, p95_pct: 10, median_abs: 16, p95_abs: 32 } };
+  const frameText = JSON.stringify({ type: 'http_response', body: 'x'.repeat(256) });
+  for (const force64BitLength of [false, true]) {
+    const frame = maskedWebSocketTextFrame(frameText, force64BitLength);
+    for (let split = 0; split <= frame.length; split += 1) {
+      const parsed = [];
+      const parser = new WebSocketFrameParser((payload, opcode) => {
+        assert.equal(opcode, 0x1);
+        parsed.push(payload.toString('utf8'));
+      });
+      parser.push(frame.subarray(0, split));
+      parser.push(frame.subarray(split));
+      assert.deepEqual(parsed, [frameText], `WebSocket frame split failed at byte ${split}`);
+      assert.equal(parser.totalBytes, 0);
+    }
+  }
+  const concatenatedTexts = ['first', 'second', 'third'];
+  const concatenatedFrames = Buffer.concat(concatenatedTexts.map((text) => maskedWebSocketTextFrame(text)));
+  const parsedConcatenated = [];
+  const concatenatedParser = new WebSocketFrameParser((payload, opcode) => {
+    assert.equal(opcode, 0x1);
+    parsedConcatenated.push(payload.toString('utf8'));
+  });
+  for (let offset = 0; offset < concatenatedFrames.length; offset += 3) {
+    concatenatedParser.push(concatenatedFrames.subarray(offset, offset + 3));
+  }
+  assert.deepEqual(parsedConcatenated, concatenatedTexts);
+
+  const relay = await startFakeRelay([]);
+  const relaySocket = net.connect(Number(new URL(relay.url).port), '127.0.0.1');
+  await new Promise((resolve, reject) => {
+    relaySocket.once('connect', resolve);
+    relaySocket.once('error', reject);
+  });
+  relaySocket.write('GET /connect HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n');
+  await new Promise((resolve, reject) => {
+    const onData = (data) => {
+      if (!data.includes(Buffer.from('101 Switching Protocols'))) return;
+      relaySocket.off('error', reject);
+      resolve();
+    };
+    relaySocket.on('data', onData);
+    relaySocket.once('error', reject);
+  });
+  const relaySocketClosed = new Promise((resolve) => relaySocket.once('close', resolve));
+  await withTimeout(relay.close(), 500, 'fake relay cleanup');
+  await withTimeout(relaySocketClosed, 500, 'fake relay socket close');
+  assert.equal(relay.socketCount, 0);
+
+  const localWebSocket = await startLocalWebSocketFixture();
+  const pendingSocket = net.connect(localWebSocket.port, '127.0.0.1');
+  await new Promise((resolve, reject) => {
+    pendingSocket.once('connect', resolve);
+    pendingSocket.once('error', reject);
+  });
+  pendingSocket.write('GET /pending HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n');
+  await waitFor(() => localWebSocket.pendingConnections === 1, 500, 'pending local WebSocket fixture');
+  pendingSocket.end();
+  await waitFor(() => localWebSocket.pendingConnections === 0, 500, 'pending local WebSocket fixture close');
+  assert.equal(localWebSocket.pendingClosed, 1);
+  await withTimeout(localWebSocket.close(), 500, 'local WebSocket fixture cleanup');
+  assert.equal(localWebSocket.socketCount, 0);
+
+  const baseline = {
+    binary: 'main', sample: 1, counted: true, pair_id: 'x', pair_order: 'baseline-candidate',
+    execution_sequence: 1, scenario: 's', kind: 'run', wall_ms: 100, tree_peak_rss_bytes: 100,
+    root_peak_rss_bytes: 50, steady_tree_rss_bytes: 100, steady_root_rss_bytes: 50,
+    peak_process_count: 2, maximum_observed_fd_count: 10,
+    maximum_observed_thread_count: 4, resource_sample_count: 3,
+    resource_sample_span_ms: 100, detailed_sample_count: 2,
+    exit_ok: true, contract_ok: true,
+  };
+  const candidate = {
+    ...baseline, binary: 'candidate', execution_sequence: 2, wall_ms: 101,
+    tree_peak_rss_bytes: 101, root_peak_rss_bytes: 51,
+    steady_tree_rss_bytes: 101, steady_root_rss_bytes: 51,
+  };
+  const countLimit = { median_pct: 10, p95_pct: 20, median_abs: 1, p95_abs: 2 };
+  const limits = {
+    wall_ms: { median_pct: 5, p95_pct: 10, median_abs: 20, p95_abs: 50 },
+    startup_ms: { median_pct: 5, p95_pct: 10, median_abs: 20, p95_abs: 50 },
+    shutdown_ms: { median_pct: 10, p95_pct: 20, median_abs: 50, p95_abs: 100 },
+    tree_peak_rss_bytes: { median_pct: 5, p95_pct: 10, median_abs: 16, p95_abs: 32 },
+    root_peak_rss_bytes: { median_pct: 5, p95_pct: 10, median_abs: 8, p95_abs: 16 },
+    steady_tree_rss_bytes: { median_pct: 5, p95_pct: 10, median_abs: 16, p95_abs: 32 },
+    steady_root_rss_bytes: { median_pct: 5, p95_pct: 10, median_abs: 8, p95_abs: 16 },
+    peak_process_count: countLimit,
+    maximum_observed_fd_count: { median_pct: 10, p95_pct: 20, median_abs: 8, p95_abs: 16 },
+    maximum_observed_thread_count: { median_pct: 10, p95_pct: 20, median_abs: 2, p95_abs: 4 },
+  };
   assert.equal(summarizeComparison([baseline, candidate], { baseline: 'main', candidate: 'candidate' }, limits, 1).verdict, 'pass');
+  const zeroCandidateDetail = { ...candidate, maximum_observed_fd_count: 0 };
+  const zeroDetailComparison = summarizeComparison(
+    [baseline, zeroCandidateDetail],
+    { baseline: 'main', candidate: 'candidate' },
+    limits,
+    1,
+  );
+  assert.equal(zeroDetailComparison.verdict, 'pass');
+  assert.equal(zeroDetailComparison.groups[0].metrics.maximum_observed_fd_count.verdict, 'pass');
+  const missingCandidateDetail = { ...candidate, maximum_observed_fd_count: null };
+  const missingDetailComparison = summarizeComparison(
+    [baseline, missingCandidateDetail],
+    { baseline: 'main', candidate: 'candidate' },
+    limits,
+    1,
+  );
+  assert.equal(missingDetailComparison.verdict, 'inconclusive');
+  assert.equal(missingDetailComparison.groups[0].metrics.maximum_observed_fd_count.verdict, 'inconclusive');
+  const underSampledCandidate = {
+    ...candidate,
+    root_peak_rss_bytes: 100,
+    maximum_observed_fd_count: 43,
+    resource_sample_count: 1,
+    resource_sample_span_ms: 0,
+    detailed_sample_count: 1,
+  };
+  const underSampledComparison = summarizeComparison(
+    [baseline, underSampledCandidate],
+    { baseline: 'main', candidate: 'candidate' },
+    limits,
+    1,
+  );
+  assert.equal(underSampledComparison.verdict, 'pass');
+  assert.equal(underSampledComparison.groups[0].metrics.root_peak_rss_bytes.verdict, 'advisory-insufficient-sampling');
+  assert.equal(underSampledComparison.groups[0].metrics.maximum_observed_fd_count.verdict, 'advisory-insufficient-sampling');
+  const failedCandidate = {
+    ...candidate,
+    exit_ok: false,
+    contract_ok: false,
+    wall_ms: null,
+    failure_reason: 'candidate readiness timeout',
+  };
+  const candidateFailureComparison = summarizeComparison(
+    [baseline, failedCandidate],
+    { baseline: 'main', candidate: 'candidate' },
+    limits,
+    1,
+  );
+  assert.equal(candidateFailureComparison.verdict, 'execution-failure');
+  assert.equal(candidateFailureComparison.groups[0].correctness.candidate_failures, 1);
+  assert.equal(candidateFailureComparison.groups[0].correctness.candidate_contract_failures, 1);
+  const correctedCandidate = { ...candidate };
+  const brokenBaselineContract = { ...baseline, contract_ok: false };
+  assert.equal(summarizeComparison(
+    [brokenBaselineContract, correctedCandidate],
+    { baseline: 'main', candidate: 'candidate' },
+    limits,
+    1,
+  ).verdict, 'inconclusive');
+  const failedBaselineExecution = {
+    ...baseline,
+    exit_ok: false,
+    contract_ok: false,
+    wall_ms: null,
+    failure_reason: 'readiness timeout',
+  };
+  const executionImprovement = summarizeComparison(
+    [failedBaselineExecution, correctedCandidate],
+    { baseline: 'main', candidate: 'candidate' },
+    limits,
+    1,
+  );
+  assert.equal(executionImprovement.verdict, 'inconclusive');
+  assert.equal(executionImprovement.groups[0].correctness.baseline_failures, 1);
+  assert.equal(executionImprovement.groups[0].correctness.candidate_failures, 0);
+  assert.deepEqual(executionImprovement.groups[0].failures, []);
   const broken = { ...candidate, execution_sequence: 4 };
   assert.equal(summarizeComparison([baseline, broken], { baseline: 'main', candidate: 'candidate' }, limits, 1).verdict, 'execution-failure');
+  const failedCandidateWarmup = { ...candidate, exit_ok: false, failure_reason: 'fixture failed' };
+  assert.equal(warmupBlocksComparison('main', brokenBaselineContract, { baseline: 'main', candidate: 'candidate' }), false);
+  assert.equal(warmupBlocksComparison('candidate', failedCandidateWarmup, { baseline: 'main', candidate: 'candidate' }), true);
+  assert.equal(warmupBlocksComparison('candidate', candidate, { baseline: 'main', candidate: 'candidate' }), false);
   assert.doesNotThrow(() => JSON.stringify({ value: Number.POSITIVE_INFINITY }, jsonFiniteReplacer));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'run/package-system-node-no-lpm-json'));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'tunnel/websocket-fairness-close-cancellation'));
   process.stdout.write('run-runtime-readiness self-test passed\n');
 }

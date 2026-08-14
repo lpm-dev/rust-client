@@ -77,14 +77,14 @@ pub(crate) async fn handle_windows_control_stream(
     context: ControlStreamContext,
     expected_client_sid: String,
 ) -> Result<bool, ProxyError> {
-    let request = match read_proxy_request(&mut stream).await {
+    validate_windows_pipe_client(&stream, &expected_client_sid)?;
+    let request = match read_proxy_request_with_timeout(&mut stream).await {
         Ok(request) => request,
         Err(ProxyError::IpcProtocol(message)) if message == EMPTY_CONTROL_FRAME_MESSAGE => {
             return Ok(false);
         }
         Err(err) => return Err(err),
     };
-    validate_windows_pipe_client(&stream, &expected_client_sid)?;
     handle_control_request(&mut stream, request, context).await
 }
 

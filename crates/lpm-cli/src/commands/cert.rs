@@ -23,8 +23,8 @@ pub async fn run(
         "trust" => run_trust(json_output),
         "uninstall" => run_uninstall(json_output),
         "generate" => run_generate(project_dir, extra_hosts, json_output),
-        "rotate" => run_rotate(extras, json_output),
-        "reconcile" => run_reconcile(extras, json_output),
+        "rotate" => run_rotate(extras, json_output).await,
+        "reconcile" => run_reconcile(extras, json_output).await,
         _ => Err(LpmError::Cert(format!(
             "unknown action '{action}'. Available: status, trust, uninstall, generate, rotate, reconcile"
         ))),
@@ -163,55 +163,9 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
 }
 
 fn run_trust(json_output: bool) -> Result<(), LpmError> {
-    let ca_cert_path = lpm_cert::paths::ca_cert_path()?;
-
-    let ca_dir = lpm_cert::paths::ca_dir()?;
-    lpm_cert::create_dir_secure(&ca_dir)
-        .map_err(|e| LpmError::Cert(format!("failed to secure cert dir: {e}")))?;
-
-    if !ca_cert_path.exists() {
-        let (ca_cert_pem, ca_key_pem) = lpm_cert::ca::generate_ca()
-            .map_err(|e| LpmError::Cert(format!("failed to generate CA: {e}")))?;
-
-        std::fs::write(&ca_cert_path, &ca_cert_pem)
-            .map_err(|e| LpmError::Cert(format!("failed to write CA cert: {e}")))?;
-
-        let key_path = lpm_cert::paths::ca_key_path()?;
-        lpm_cert::write_key_file(&key_path, ca_key_pem.as_bytes())
-            .map_err(|e| LpmError::Cert(format!("failed to write CA key: {e}")))?;
-
-        let fp = lpm_cert::cert::fingerprint_sha256(&ca_cert_path)?;
-        lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaGenerate {
-            fingerprint: lpm_cert::cert::fingerprint_hex(&fp),
-            validity_days: lpm_cert::ca::CA_VALIDITY_DAYS,
-            name_constraints: lpm_cert::ca::wants_name_constraints(),
-        });
-
-        if !json_output {
-            install_ui::done("root CA generated");
-        }
-    }
-
-    let fp = lpm_cert::cert::fingerprint_sha256(&ca_cert_path)?;
-    let fp_hex = lpm_cert::cert::fingerprint_hex(&fp);
-    match lpm_cert::trust::install_ca(&ca_cert_path) {
-        Ok(()) => {
-            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustInstall {
-                fingerprint: fp_hex,
-                store: lpm_cert::trust_store_label(),
-                status: lpm_cert::audit::AuditStatus::Ok,
-                error: None,
-            });
-        }
-        Err(e) => {
-            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustInstall {
-                fingerprint: fp_hex,
-                store: lpm_cert::trust_store_label(),
-                status: lpm_cert::audit::AuditStatus::Error,
-                error: Some(e.to_string()),
-            });
-            return Err(e);
-        }
+    let result = lpm_cert::trust_ca()?;
+    if result.generated && !json_output {
+        install_ui::done("root CA generated");
     }
 
     if json_output {
@@ -221,44 +175,17 @@ fn run_trust(json_output: bool) -> Result<(), LpmError> {
         );
     } else {
         install_ui::done("CA installed to system trust store");
-        let info = lpm_cert::cert::read_cert_info(&ca_cert_path)?;
+        let info = lpm_cert::cert::read_cert_info(&result.cert_path)?;
         print_field("subject", &info.subject);
         print_field("expires", &info.not_after);
-        print_field("path", ca_cert_path.to_string_lossy());
+        print_field("path", result.cert_path.to_string_lossy());
     }
 
     Ok(())
 }
 
 fn run_uninstall(json_output: bool) -> Result<(), LpmError> {
-    let ca_cert_path = lpm_cert::paths::ca_cert_path()?;
-    if !ca_cert_path.exists() {
-        return Err(LpmError::Cert(format!(
-            "no on-disk CA at {}; nothing to uninstall (the fingerprint of the cert to remove is read from this file)",
-            ca_cert_path.display()
-        )));
-    }
-    let fp = lpm_cert::cert::fingerprint_sha256(&ca_cert_path)?;
-    let fp_hex = lpm_cert::cert::fingerprint_hex(&fp);
-    match lpm_cert::trust::uninstall_ca(&ca_cert_path) {
-        Ok(()) => {
-            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustUninstall {
-                fingerprint: fp_hex,
-                store: lpm_cert::trust_store_label(),
-                status: lpm_cert::audit::AuditStatus::Ok,
-                error: None,
-            });
-        }
-        Err(e) => {
-            lpm_cert::audit::append_best_effort(lpm_cert::audit::AuditAction::CaTrustUninstall {
-                fingerprint: fp_hex,
-                store: lpm_cert::trust_store_label(),
-                status: lpm_cert::audit::AuditStatus::Error,
-                error: Some(e.to_string()),
-            });
-            return Err(e);
-        }
-    }
+    let _result = lpm_cert::uninstall_active_ca()?;
 
     if json_output {
         println!(
@@ -321,7 +248,9 @@ fn run_generate(
     Ok(())
 }
 
-fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
+async fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
+    let active_tls_consumers = active_tls_consumers().await?;
+    validate_rotation_runtime_safety(extras.keep_old_trusted_days, &active_tls_consumers)?;
     let opts = lpm_cert::rotate::RotateOptions {
         extra_projects: extras.extra_projects,
         skip_missing: !extras.fail_on_missing,
@@ -350,7 +279,16 @@ fn run_rotate(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
+async fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
+    if !extras.dry_run {
+        let active_tls_consumers = active_tls_consumers().await?;
+        if !active_tls_consumers.is_empty() {
+            return Err(LpmError::Cert(format!(
+                "refusing CA reconciliation while local TLS is active ({}). Stop these `lpm dev` or proxy sessions, restart them so they load the current certificate chain, then retry `lpm cert reconcile`",
+                active_tls_consumers.join(", ")
+            )));
+        }
+    }
     let result = lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions {
         dry_run: extras.dry_run,
     })?;
@@ -374,6 +312,33 @@ fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmError> {
     Ok(())
 }
 
+async fn active_tls_consumers() -> Result<Vec<String>, LpmError> {
+    let mut consumers = std::collections::BTreeSet::new();
+    let proxy_status = lpm_proxy::status()
+        .await
+        .map_err(|error| LpmError::Cert(format!("inspect local proxy TLS state: {error}")))?;
+    if proxy_status.running && proxy_status.tls_addr.is_some() && !proxy_status.routes.is_empty() {
+        consumers.insert("local proxy daemon".to_string());
+    }
+    for session in lpm_runner::dev_session::discover_active_https_sessions()? {
+        consumers.insert(format!("lpm dev at {}", session.project_dir.display()));
+    }
+    Ok(consumers.into_iter().collect())
+}
+
+fn validate_rotation_runtime_safety(
+    keep_old_trusted_days: Option<u32>,
+    active_tls_consumers: &[String],
+) -> Result<(), LpmError> {
+    if keep_old_trusted_days.is_some() || active_tls_consumers.is_empty() {
+        return Ok(());
+    }
+    Err(LpmError::Cert(format!(
+        "refusing hard CA rotation while local TLS is active ({}). Existing processes would keep serving certificates signed by the old CA after it is removed. Stop these `lpm dev` or proxy sessions and retry, or use `--keep-old-trusted-days 1`; restart them before `lpm cert reconcile` removes the old CA",
+        active_tls_consumers.join(", ")
+    )))
+}
+
 fn print_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
     println!(
         "{}",
@@ -383,4 +348,25 @@ fn print_field<T: install_ui::TerminalValue>(label: &'static str, value: T) {
             value
         )
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_ca_rotation_rejects_active_tls_consumers() {
+        let error =
+            validate_rotation_runtime_safety(None, &["lpm dev at /tmp/project".to_string()])
+                .unwrap_err();
+
+        assert!(error.to_string().contains("refusing hard CA rotation"));
+        assert!(error.to_string().contains("keep-old-trusted-days"));
+        assert!(error.to_string().contains("restart"));
+    }
+
+    #[test]
+    fn grace_window_ca_rotation_allows_active_tls_consumers() {
+        validate_rotation_runtime_safety(Some(1), &["local proxy daemon".to_string()]).unwrap();
+    }
 }

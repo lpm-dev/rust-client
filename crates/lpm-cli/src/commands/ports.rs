@@ -886,6 +886,7 @@ mod tests {
         ListeningPort {
             port,
             address: Some("127.0.0.1".to_string()),
+            address_family: Some(lpm_runner::ports::ListeningAddressFamily::Ipv4),
             pid,
             process: process.map(str::to_string),
             command: None,

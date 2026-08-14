@@ -224,7 +224,7 @@ mod integration_tests {
 
         let handle = handle.unwrap();
         assert!(!handle.url.is_empty());
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -238,7 +238,7 @@ mod integration_tests {
             Ok(h) => {
                 assert_eq!(h.port, port);
                 assert!(h.url.contains(&port.to_string()));
-                h.shutdown();
+                h.shutdown().await.unwrap();
             }
             Err(_) => {
                 // Port may be in use — that's OK for CI
@@ -272,7 +272,7 @@ mod integration_tests {
         assert_eq!(body["local_ready"], true);
         assert_eq!(body["captured_count"], 0);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -303,7 +303,7 @@ mod integration_tests {
         assert_eq!(items[0]["id"], "w2");
         assert_eq!(items[1]["id"], "w1");
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -331,7 +331,7 @@ mod integration_tests {
         assert_eq!(body["total"], 1);
         assert_eq!(body["items"][0]["id"], "persisted-w1");
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -441,7 +441,7 @@ mod integration_tests {
                 .contains("charge.succeeded")
         );
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -464,7 +464,7 @@ mod integration_tests {
         .unwrap();
         assert_eq!(resp.status(), 404);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -508,7 +508,7 @@ mod integration_tests {
         let summary = &body["request_body_summary"];
         assert!(summary["total"].as_u64().unwrap() >= 2);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -531,7 +531,7 @@ mod integration_tests {
         .unwrap();
         assert_eq!(resp.status(), 404);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -550,7 +550,7 @@ mod integration_tests {
             .unwrap();
         assert_eq!(resp.status(), 401);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -571,7 +571,7 @@ mod integration_tests {
         .unwrap();
         assert_eq!(resp.status(), 401);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -599,7 +599,7 @@ mod integration_tests {
             .unwrap();
         assert_eq!(resp.status(), 401);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -644,7 +644,7 @@ mod integration_tests {
             "expected SPA bootstrap to patch EventSource"
         );
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -667,7 +667,7 @@ mod integration_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -690,6 +690,6 @@ mod integration_tests {
         assert!(body.contains("LPM Inspector"));
         assert!(body.contains("/api/status"));
 
-        handle.shutdown();
+        handle.shutdown().await.unwrap();
     }
 }

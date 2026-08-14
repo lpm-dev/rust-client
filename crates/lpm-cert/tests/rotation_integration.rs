@@ -12,6 +12,10 @@ use rcgen::{
 };
 use std::path::{Path, PathBuf};
 
+const CONCURRENCY_ACTION_ENV: &str = "LPM_CERT_CONCURRENCY_ACTION";
+const CONCURRENCY_PROJECT_ENV: &str = "LPM_CERT_CONCURRENCY_PROJECT";
+const CONCURRENCY_BARRIER_ENV: &str = "LPM_CERT_CONCURRENCY_BARRIER";
+
 /// All tests in this binary share process-wide env (`HOME`, etc.), so they
 /// must serialize. Each test calls `let _g = serial_guard();` at entry.
 fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -27,6 +31,7 @@ fn setup_home() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
     let tmp = tempfile::tempdir().unwrap();
     unsafe {
         std::env::set_var("HOME", tmp.path());
+        std::env::set_var("LPM_HOME", tmp.path().join(".lpm"));
         std::env::set_var(
             "LPM_CERT_TEST_TRUST_STORE_DIR",
             tmp.path().join("trust-store"),
@@ -105,6 +110,301 @@ fn read_audit_actions(audit_dir: &Path) -> Vec<String> {
 }
 
 #[test]
+fn certificate_concurrency_helper() {
+    let Some(action) = std::env::var_os(CONCURRENCY_ACTION_ENV) else {
+        return;
+    };
+    let project = PathBuf::from(std::env::var_os(CONCURRENCY_PROJECT_ENV).unwrap());
+    if let Some(barrier) = std::env::var_os(CONCURRENCY_BARRIER_ENV) {
+        let barrier = PathBuf::from(barrier);
+        let ready = barrier.join(format!("{}.ready", std::process::id()));
+        std::fs::write(&ready, b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !barrier.join("go").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "certificate concurrency barrier was never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    match action.to_string_lossy().as_ref() {
+        "ensure" => {
+            lpm_cert::ensure_https_with_consent(
+                &project,
+                &[],
+                lpm_cert::TrustStoreConsent::Decline,
+            )
+            .unwrap();
+        }
+        "record" => projects::record(&project).unwrap(),
+        "trust" => {
+            lpm_cert::trust_ca().unwrap();
+        }
+        "audit" => audit::append(audit::AuditAction::CaGenerate {
+            fingerprint: project.to_string_lossy().into_owned(),
+            validity_days: 1,
+            name_constraints: false,
+        })
+        .unwrap(),
+        action => panic!("unknown certificate concurrency helper action: {action}"),
+    }
+}
+
+fn spawn_concurrency_helpers(
+    root: &Path,
+    action: &str,
+    projects: &[PathBuf],
+) -> Vec<std::process::Child> {
+    let executable = std::env::current_exe().unwrap();
+    let barrier = root.join(format!("barrier-{}", std::process::id()));
+    std::fs::create_dir_all(&barrier).unwrap();
+    let children: Vec<_> = projects
+        .iter()
+        .map(|project| {
+            std::process::Command::new(&executable)
+                .args(["--exact", "certificate_concurrency_helper"])
+                .env("HOME", root)
+                .env("LPM_HOME", root.join(".lpm"))
+                .env("LPM_CERT_AUDIT_DIR", root.join("audit"))
+                .env("LPM_CERT_PROJECTS_INDEX", root.join("cert-projects.json"))
+                .env("LPM_CERT_TEST_TRUST_STORE_DIR", root.join("trust-store"))
+                .env(CONCURRENCY_ACTION_ENV, action)
+                .env(CONCURRENCY_PROJECT_ENV, project)
+                .env(CONCURRENCY_BARRIER_ENV, &barrier)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_dir(&barrier)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "ready")
+        })
+        .count()
+        != children.len()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "certificate concurrency helpers did not reach the start barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::fs::write(barrier.join("go"), b"go").unwrap();
+    children
+}
+
+fn wait_for_concurrency_helpers(children: Vec<std::process::Child>) {
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "certificate concurrency helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn concurrent_ca_bootstrap_keeps_one_valid_pair_and_every_project_leaf() {
+    let (tmp, _guard) = setup_home();
+    let projects: Vec<_> = (0..8)
+        .map(|index| {
+            let project = tmp.path().join(format!("project-{index}"));
+            std::fs::create_dir_all(&project).unwrap();
+            project
+        })
+        .collect();
+
+    wait_for_concurrency_helpers(spawn_concurrency_helpers(tmp.path(), "ensure", &projects));
+
+    let ca_cert_path = paths::ca_cert_path().unwrap();
+    let ca_cert = std::fs::read_to_string(&ca_cert_path).unwrap();
+    let ca_key = std::fs::read_to_string(paths::ca_key_path().unwrap()).unwrap();
+    assert!(cert::generate_project_cert(&ca_cert, &ca_key, &[]).is_ok());
+    for project in &projects {
+        let leaf = project.join(".lpm/certs/cert.pem");
+        assert!(cert::project_cert_chains_to_root(&leaf, &ca_cert_path).unwrap());
+    }
+    assert_eq!(projects::list().unwrap().len(), projects.len());
+}
+
+#[test]
+fn concurrent_trust_commands_keep_one_valid_root_pair() {
+    let (tmp, _guard) = setup_home();
+    let markers: Vec<_> = (0..8)
+        .map(|index| tmp.path().join(format!("trust-{index}")))
+        .collect();
+
+    wait_for_concurrency_helpers(spawn_concurrency_helpers(tmp.path(), "trust", &markers));
+
+    let ca_cert = std::fs::read_to_string(paths::ca_cert_path().unwrap()).unwrap();
+    let ca_key = std::fs::read_to_string(paths::ca_key_path().unwrap()).unwrap();
+    assert!(cert::validate_ca_key_pair(&ca_cert, &ca_key).is_ok());
+}
+
+#[test]
+fn uninstall_active_ca_records_the_removed_fingerprint_inside_the_operation() {
+    let (tmp, _guard) = setup_home();
+    let (cert_path, _) = seed_root_ca();
+    let fingerprint = cert::fingerprint_hex(&cert::fingerprint_sha256(&cert_path).unwrap());
+
+    lpm_cert::uninstall_active_ca().unwrap();
+
+    let audit_log = std::fs::read_to_string(tmp.path().join("audit/cert.jsonl")).unwrap();
+    let event = audit_log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["action"] == "ca.trust_uninstall")
+        .expect("certificate uninstall did not append an audit event");
+    assert_eq!(event["fingerprint"], fingerprint);
+    assert_eq!(event["status"], "ok");
+}
+
+#[test]
+fn hard_rotation_preserves_an_active_tls_certificate_generation() {
+    let (_tmp, _guard) = setup_home();
+    let (root_path, _) = seed_root_ca();
+    let project = root_path.parent().unwrap().join("active-runtime-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let setup = lpm_cert::ensure_https_with_consent(
+        &project,
+        &["app.localhost".to_string()],
+        lpm_cert::TrustStoreConsent::Decline,
+    )
+    .unwrap();
+    let original_root = std::fs::read(&root_path).unwrap();
+
+    let error = rotate::rotate(rotate::RotateOptions::default()).unwrap_err();
+
+    assert!(error.to_string().contains("active TLS runtime"), "{error}");
+    assert_eq!(std::fs::read(&root_path).unwrap(), original_root);
+    assert!(trust::is_ca_installed(&root_path).unwrap());
+
+    drop(setup);
+    let result = rotate::rotate(rotate::RotateOptions::default()).unwrap();
+    assert!(result.success);
+    assert_ne!(std::fs::read(&root_path).unwrap(), original_root);
+}
+
+#[test]
+fn concurrent_project_index_updates_preserve_every_project() {
+    let (tmp, _guard) = setup_home();
+    let projects: Vec<_> = (0..16)
+        .map(|index| {
+            let project = tmp.path().join(format!("record-{index}"));
+            std::fs::create_dir_all(&project).unwrap();
+            project
+        })
+        .collect();
+
+    wait_for_concurrency_helpers(spawn_concurrency_helpers(tmp.path(), "record", &projects));
+
+    assert_eq!(projects::list().unwrap().len(), projects.len());
+}
+
+#[test]
+fn concurrent_audit_appends_preserve_complete_json_lines() {
+    let (tmp, _guard) = setup_home();
+    let markers: Vec<_> = (0..16)
+        .map(|index| tmp.path().join(format!("audit-{index}")))
+        .collect();
+
+    wait_for_concurrency_helpers(spawn_concurrency_helpers(tmp.path(), "audit", &markers));
+
+    let log = std::fs::read_to_string(tmp.path().join("audit/cert.jsonl")).unwrap();
+    let lines: Vec<_> = log.lines().collect();
+    assert_eq!(lines.len(), markers.len());
+    assert!(
+        lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_https_rejects_a_project_certificate_directory_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, _guard) = setup_home();
+    seed_root_ca();
+    let project = tmp.path().join("project");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(project.join(".lpm")).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, project.join(".lpm/certs")).unwrap();
+
+    let result =
+        lpm_cert::ensure_https_with_consent(&project, &[], lpm_cert::TrustStoreConsent::Decline);
+
+    assert!(
+        result.is_err(),
+        "symlinked project cert directory was accepted"
+    );
+    assert!(!outside.join("cert.pem").exists());
+    assert!(!outside.join("key.pem").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_https_rejects_a_project_certificate_file_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, _guard) = setup_home();
+    seed_root_ca();
+    let project = tmp.path().join("project");
+    let cert_dir = project.join(".lpm/certs");
+    let outside = tmp.path().join("outside.pem");
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    std::fs::write(&outside, "sentinel").unwrap();
+    symlink(&outside, cert_dir.join("cert.pem")).unwrap();
+
+    let result =
+        lpm_cert::ensure_https_with_consent(&project, &[], lpm_cert::TrustStoreConsent::Decline);
+
+    assert!(
+        result.is_err(),
+        "symlinked project certificate was accepted"
+    );
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel");
+    assert!(!cert_dir.join("key.pem").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_https_rejects_a_project_private_key_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, _g) = setup_home();
+    seed_root_ca();
+    let project = tmp.path().join("proj-key-link");
+    let cert_dir = project.join(".lpm/certs");
+    std::fs::create_dir_all(&cert_dir).unwrap();
+    let outside = tmp.path().join("outside-key.pem");
+    std::fs::write(&outside, b"sentinel").unwrap();
+    symlink(&outside, cert_dir.join("key.pem")).unwrap();
+
+    let result =
+        lpm_cert::ensure_https_with_consent(&project, &[], lpm_cert::TrustStoreConsent::Decline);
+
+    assert!(
+        result.is_err(),
+        "symlinked project private key was accepted"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+}
+
+#[test]
 fn rotate_replaces_root_and_reissues_indexed_leaves() {
     let (tmp, _g) = setup_home();
     let (active_cert, _active_key) = seed_root_ca();
@@ -171,6 +471,35 @@ fn rotate_fails_on_missing_when_flag_set() {
         ..Default::default()
     });
     assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn rotation_failure_on_a_later_project_restores_every_earlier_leaf() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, _guard) = setup_home();
+    let (active_cert, _) = seed_root_ca();
+    let project_a = tmp.path().join("a-project");
+    let project_z = tmp.path().join("z-project");
+    let leaf_a = seed_project_leaf(&project_a);
+    seed_project_leaf(&project_z);
+    let old_leaf_a = std::fs::read(&leaf_a).unwrap();
+    let old_key_a = std::fs::read(project_a.join(".lpm/certs/key.pem")).unwrap();
+
+    let unsafe_cert_dir = project_z.join(".lpm/certs");
+    std::fs::remove_dir_all(&unsafe_cert_dir).unwrap();
+    symlink(tmp.path(), &unsafe_cert_dir).unwrap();
+
+    let error = rotate::rotate(rotate::RotateOptions::default()).unwrap_err();
+
+    assert!(error.to_string().contains("without following links"));
+    assert_eq!(std::fs::read(&leaf_a).unwrap(), old_leaf_a);
+    assert_eq!(
+        std::fs::read(project_a.join(".lpm/certs/key.pem")).unwrap(),
+        old_key_a
+    );
+    assert!(cert::project_cert_chains_to_root(&leaf_a, &active_cert).unwrap());
 }
 
 #[test]
@@ -249,6 +578,57 @@ fn reconcile_removes_grace_entry_when_time_has_passed() {
 }
 
 #[test]
+fn expired_grace_generation_stays_pending_only_while_its_tls_runtime_is_active() {
+    let (tmp, _guard) = setup_home();
+    seed_root_ca();
+    let project = tmp.path().join("leased-grace-project");
+    std::fs::create_dir_all(&project).unwrap();
+    let old_setup = lpm_cert::ensure_https_with_consent(
+        &project,
+        &["app.localhost".to_string()],
+        lpm_cert::TrustStoreConsent::Decline,
+    )
+    .unwrap();
+    rotate::rotate(rotate::RotateOptions {
+        keep_old_trusted_days: Some(0),
+        ..Default::default()
+    })
+    .unwrap();
+    let grace_path = tmp.path().join("cert-grace.json");
+    let json = std::fs::read_to_string(&grace_path).unwrap();
+    std::fs::write(
+        &grace_path,
+        json.replace(
+            &json
+                .lines()
+                .find(|line| line.contains("removes_at"))
+                .unwrap()
+                .to_string(),
+            "      \"removes_at\": \"2020-01-01T00:00:00Z\"",
+        ),
+    )
+    .unwrap();
+    let new_setup = lpm_cert::ensure_https_with_consent(
+        &project,
+        &["app.localhost".to_string()],
+        lpm_cert::TrustStoreConsent::Decline,
+    )
+    .unwrap();
+
+    let pending =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+    assert!(pending.grace_removed.is_empty());
+    assert_eq!(pending.grace_pending.len(), 1);
+
+    drop(old_setup);
+    let removed =
+        lpm_cert::reconcile::reconcile(lpm_cert::reconcile::ReconcileOptions::default()).unwrap();
+    assert_eq!(removed.grace_removed.len(), 1);
+    assert!(removed.grace_pending.is_empty());
+    drop(new_setup);
+}
+
+#[test]
 fn reconcile_keeps_grace_entry_when_time_in_future() {
     let (tmp, _g) = setup_home();
     let (_active_cert, _) = seed_root_ca();
@@ -287,6 +667,36 @@ fn ensure_https_reissues_leaf_when_chain_breaks() {
         "ensure_https must regenerate the project leaf when issuer mismatches"
     );
     assert!(cert::leaf_signed_by(&leaf_path, &active_cert).unwrap());
+}
+
+#[test]
+fn ensure_https_reissues_leaf_when_private_key_does_not_match() {
+    let (tmp, _g) = setup_home();
+    seed_root_ca();
+    let project = tmp.path().join("proj-mismatched-leaf");
+    std::fs::create_dir_all(&project).unwrap();
+    let leaf_path = seed_project_leaf(&project);
+    let original_fp = cert::fingerprint_sha256(&leaf_path).unwrap();
+
+    let ca_cert = std::fs::read_to_string(paths::ca_cert_path().unwrap()).unwrap();
+    let ca_key = std::fs::read_to_string(paths::ca_key_path().unwrap()).unwrap();
+    let (_, unrelated_key) = cert::generate_project_cert(&ca_cert, &ca_key, &[]).unwrap();
+    lpm_cert::write_key_file(
+        &project.join(".lpm/certs/key.pem"),
+        unrelated_key.as_bytes(),
+    )
+    .unwrap();
+
+    let setup = lpm_cert::ensure_https(&project, &[]).unwrap();
+    assert!(
+        setup.cert_freshly_generated,
+        "ensure_https must regenerate a project leaf whose private key does not match"
+    );
+    assert_ne!(
+        original_fp,
+        cert::fingerprint_sha256(&leaf_path).unwrap(),
+        "the mismatched project certificate must be replaced"
+    );
 }
 
 #[test]
@@ -448,7 +858,8 @@ fn rotate_preserves_project_intermediate_extra_dns_constraints() {
         lpm_cert::TrustStoreConsent::PreApproved,
     )
     .unwrap();
-    let leaf = PathBuf::from(setup.cert_path);
+    let leaf = PathBuf::from(&setup.cert_path);
+    drop(setup);
 
     rotate::rotate(rotate::RotateOptions::default()).unwrap();
 

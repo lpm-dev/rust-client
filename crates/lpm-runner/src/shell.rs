@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
-use crate::dev_endpoint::{DevEndpoint, ListenerSnapshot};
+use crate::dev_endpoint::DevEndpoint;
 
 /// Inherited-env names that MUST be stripped from any `lpm run` /
 /// `lpm exec` child before spawn.
@@ -130,6 +130,7 @@ pub(crate) fn strip_inherited_env_hooks(cmd: &mut Command) {
 const MAX_CAPTURED_STREAM_BYTES: usize = 10 * 1024 * 1024;
 const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_ENDPOINT_OUTPUT_LINE_BYTES: usize = 64 * 1024;
+const MAX_PENDING_ENDPOINT_CANDIDATES: usize = 64;
 
 /// Append `line` (plus a newline) to `buf` unless that would push
 /// `buf.len()` past the cap; when the cap is first crossed, push a
@@ -313,10 +314,31 @@ pub fn spawn_shell_with_endpoint(
     requested_port: Option<u16>,
     stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_endpoint: EndpointResultCallback,
+    on_shutdown_started: Option<crate::ShutdownStartedCallback>,
 ) -> Result<ExitStatus, LpmError> {
+    spawn_shell_with_endpoint_using(
+        cmd,
+        requested_port,
+        stop_requested,
+        on_endpoint,
+        on_shutdown_started,
+        crate::ports::terminate_child_process_tree,
+    )
+}
+
+fn spawn_shell_with_endpoint_using<T>(
+    cmd: &ShellCommand,
+    requested_port: Option<u16>,
+    stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_endpoint: EndpointResultCallback,
+    mut on_shutdown_started: Option<crate::ShutdownStartedCallback>,
+    mut terminate_child: T,
+) -> Result<ExitStatus, LpmError>
+where
+    T: FnMut(&mut std::process::Child) -> std::io::Result<ExitStatus>,
+{
     #[cfg(unix)]
     let _stop_signal_registrations = register_stop_signals(&stop_requested)?;
-    let baseline = ListenerSnapshot::capture();
     let mut command = shell_process(cmd.command)?;
     command
         .current_dir(cmd.cwd)
@@ -329,79 +351,142 @@ pub fn spawn_shell_with_endpoint(
     }
     command.env("PATH", cmd.path);
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     let mut child = command.spawn().map_err(|error| {
         LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
     })?;
     let root_pid = child.id();
     let child_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+    let (candidate_tx, candidate_rx) =
+        std::sync::mpsc::sync_channel(MAX_PENDING_ENDPOINT_CANDIDATES);
     let stdout_handle =
         spawn_endpoint_output_reader(child.stdout.take(), false, candidate_tx.clone());
     let stderr_handle = spawn_endpoint_output_reader(child.stderr.take(), true, candidate_tx);
 
     let resolver_project_dir = cmd.cwd.to_path_buf();
     let resolver_child_exited = std::sync::Arc::clone(&child_exited);
+    let resolver_stop_requested = std::sync::Arc::clone(&stop_requested);
     let resolution_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let resolver_failed = std::sync::Arc::clone(&resolution_failed);
     // Script runners can reparent the listener process after discovery, so
     // cancellation retains the verified PID and port instead of relying only
     // on a fresh descendant walk from the original shell.
-    let resolved_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<(u32, u16)>));
+    let resolved_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<DevEndpoint>));
     let resolver_owner = std::sync::Arc::clone(&resolved_owner);
     let resolver_handle = std::thread::spawn(move || {
-        let result = crate::dev_endpoint::resolve_spawned_endpoint(
+        let result = crate::dev_endpoint::resolve_spawned_endpoint_until(
             &resolver_project_dir,
             root_pid,
-            &baseline,
+            None,
             requested_port,
             &candidate_rx,
-            &resolver_child_exited,
-            std::time::Duration::from_secs(30),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            || {
+                resolver_child_exited.load(std::sync::atomic::Ordering::Acquire)
+                    || resolver_stop_requested.load(std::sync::atomic::Ordering::Acquire)
+            },
         );
+        let result = match result {
+            Err(error) if error == crate::dev_endpoint::ENDPOINT_DISCOVERY_CANCELLED => Ok(None),
+            result => result,
+        };
         if result.is_err() {
             resolver_failed.store(true, std::sync::atomic::Ordering::Release);
         }
         if let Ok(Some(endpoint)) = &result
-            && let Some(owner_pid) = endpoint.owner_pid
             && let Ok(mut owner) = resolver_owner.lock()
         {
-            *owner = Some((owner_pid, endpoint.target.port));
+            *owner = Some(endpoint.clone());
         }
         on_endpoint(result);
     });
 
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            LpmError::Script(format!("failed to wait for '{}': {error}", cmd.command))
-        })? {
-            break status;
-        }
-        if resolution_failed.load(std::sync::atomic::Ordering::Acquire)
-            || stop_requested.load(std::sync::atomic::Ordering::Acquire)
-        {
-            let owner = resolved_owner.lock().ok().and_then(|owner| *owner);
-            if let Some((owner_pid, owner_port)) = owner
-                && owner_pid != root_pid
-            {
-                let _ = crate::ports::kill_pid_if_owns_ports(owner_pid, &[owner_port]);
+    let mut shutdown_result = Ok(());
+    let status_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                break Err(LpmError::Script(format!(
+                    "failed to wait for '{}': {error}",
+                    cmd.command
+                )));
             }
-            break crate::ports::terminate_child_process_tree(&mut child).map_err(|error| {
+        }
+        let resolution_failed = resolution_failed.load(std::sync::atomic::Ordering::Acquire);
+        let stop_requested = stop_requested.load(std::sync::atomic::Ordering::Acquire);
+        if resolution_failed || stop_requested {
+            if stop_requested {
+                shutdown_result = crate::invoke_shutdown_started(&mut on_shutdown_started);
+            }
+            break terminate_child(&mut child).map_err(|error| {
                 LpmError::Script(format!("failed to stop '{}': {error}", cmd.command))
-            })?;
+            });
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     child_exited.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(unix)]
+    cleanup_endpoint_process_group(root_pid);
+    let _ = resolver_handle.join();
+    let owner = resolved_owner.lock().ok().and_then(|owner| owner.clone());
+    if let Some(owner) = owner
+        && let Some(owner_pid) = owner.owner_pid
+        && owner_pid != root_pid
+    {
+        #[cfg(not(windows))]
+        if let Some(owner_identity) = owner.owner_identity.as_ref() {
+            let _ = crate::ports::kill_pid_if_identity_owns_ports(
+                owner_pid,
+                owner_identity,
+                &[owner.target.port],
+            );
+        }
+        #[cfg(windows)]
+        let _ = crate::ports::kill_pid_if_owns_ports(owner_pid, &[owner.target.port]);
+    }
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
-    let _ = resolver_handle.join();
-    Ok(status)
+    compose_shell_and_shutdown_result(status_result, shutdown_result)
+}
+
+fn compose_shell_and_shutdown_result(
+    status_result: Result<ExitStatus, LpmError>,
+    shutdown_result: Result<(), LpmError>,
+) -> Result<ExitStatus, LpmError> {
+    match (status_result, shutdown_result) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(shutdown)) => Err(LpmError::Script(format!(
+            "{primary}; shutdown boundary also failed: {shutdown}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_endpoint_process_group(root_pid: u32) {
+    let Ok(process_group) = libc::pid_t::try_from(root_pid) else {
+        return;
+    };
+    if process_group <= 1 {
+        return;
+    }
+    // SAFETY: the negative PID addresses only the process group created for
+    // this endpoint-aware child; SIGKILL does not dereference memory.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
 }
 
 fn spawn_endpoint_output_reader<R>(
     stream: Option<R>,
     is_stderr: bool,
-    candidate_tx: std::sync::mpsc::Sender<lpm_common::LocalTarget>,
+    candidate_tx: std::sync::mpsc::SyncSender<lpm_common::LocalTarget>,
 ) -> std::thread::JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
@@ -411,9 +496,7 @@ where
             return;
         };
         drain_bounded_lines(stream, MAX_ENDPOINT_OUTPUT_LINE_BYTES, |line| {
-            for target in crate::dev_endpoint::parse_local_targets(line) {
-                let _ = candidate_tx.send(target);
-            }
+            publish_endpoint_candidates(line, &candidate_tx);
             let safe = sanitize_terminal_inline(line);
             if is_stderr {
                 eprintln!("{safe}");
@@ -422,6 +505,15 @@ where
             }
         });
     })
+}
+
+fn publish_endpoint_candidates(
+    line: &str,
+    candidate_tx: &std::sync::mpsc::SyncSender<lpm_common::LocalTarget>,
+) {
+    for target in crate::dev_endpoint::parse_local_targets(line) {
+        let _ = candidate_tx.try_send(target);
+    }
 }
 
 /// Extract the exit code from an ExitStatus.
@@ -1056,6 +1148,148 @@ mod tests {
         });
 
         assert_eq!(observed, vec![MAX_ENDPOINT_OUTPUT_LINE_BYTES]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_aware_shell_cleans_background_pipe_holders_after_the_shell_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let started = std::time::Instant::now();
+
+        let status = spawn_shell_with_endpoint(
+            &ShellCommand {
+                command: "sleep 2 & exit 0",
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Box::new(|_| {}),
+            None,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(status.success());
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "background process retained endpoint output pipes for {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_aware_shell_invokes_the_shutdown_boundary_before_child_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let started_path = dir.path().join("started");
+        let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let controller_stop = std::sync::Arc::clone(&stop_requested);
+        let controller_started = started_path.clone();
+        let controller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !controller_started.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(controller_started.exists(), "endpoint child did not start");
+            controller_stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let shutdown_boundary_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_state = std::sync::Arc::clone(&shutdown_boundary_ran);
+
+        let result = spawn_shell_with_endpoint(
+            &ShellCommand {
+                command: &format!(
+                    "touch '{}'; while :; do sleep 1; done",
+                    started_path.display()
+                ),
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            stop_requested,
+            Box::new(|_| {}),
+            Some(Box::new(move || {
+                callback_state.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })),
+        );
+        controller.join().unwrap();
+
+        assert!(result.is_ok(), "endpoint runner failed: {result:?}");
+        assert!(
+            shutdown_boundary_ran.load(std::sync::atomic::Ordering::Acquire),
+            "child cleanup started without acknowledging the shutdown boundary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_aware_shell_preserves_shutdown_and_process_tree_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let envs = empty_envs();
+        let started_path = dir.path().join("started");
+        let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let controller_stop = std::sync::Arc::clone(&stop_requested);
+        let controller_started = started_path.clone();
+        let controller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !controller_started.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(controller_started.exists(), "endpoint child did not start");
+            controller_stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        let error = spawn_shell_with_endpoint_using(
+            &ShellCommand {
+                command: &format!(
+                    "touch '{}'; while :; do sleep 1; done",
+                    started_path.display()
+                ),
+                cwd: dir.path(),
+                path: &path,
+                envs: &envs,
+            },
+            None,
+            stop_requested,
+            Box::new(|_| {}),
+            Some(Box::new(|| {
+                Err(LpmError::Tunnel(
+                    "injected shutdown boundary failure".to_string(),
+                ))
+            })),
+            |child| {
+                let _ = crate::ports::terminate_child_process_tree(child);
+                Err(std::io::Error::other(
+                    "injected endpoint process-tree termination failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        controller.join().unwrap();
+        let message = error.to_string();
+
+        assert!(message.contains("injected endpoint process-tree termination failure"));
+        assert!(message.contains("injected shutdown boundary failure"));
+    }
+
+    #[test]
+    fn endpoint_candidate_hints_are_dropped_when_the_queue_is_full() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        publish_endpoint_candidates("http://localhost:3000", &sender);
+        let started = std::time::Instant::now();
+
+        publish_endpoint_candidates("http://localhost:3001", &sender);
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(receiver.try_iter().count(), 1);
     }
 
     /// Each `spawn_shell` invocation must NOT inherit a parent

@@ -27,9 +27,8 @@ pub fn index_path() -> Result<PathBuf, LpmError> {
     {
         return Ok(PathBuf::from(p));
     }
-    let home = dirs::home_dir()
-        .ok_or_else(|| LpmError::Cert("could not determine home dir for projects index".into()))?;
-    Ok(home.join(".lpm").join("cert-projects.json"))
+    let root = lpm_common::LpmRoot::from_env()?;
+    Ok(root.root().join("cert-projects.json"))
 }
 
 fn read_index() -> Result<IndexFile, LpmError> {
@@ -63,22 +62,35 @@ fn write_index(idx: &IndexFile) -> Result<(), LpmError> {
     .map_err(|e| LpmError::Cert(format!("failed to write projects index: {e}")))
 }
 
+fn with_index_transaction<T>(
+    operation: impl FnOnce(&mut IndexFile) -> Result<T, LpmError>,
+) -> Result<T, LpmError> {
+    let path = index_path()?;
+    let lock_path = path.with_extension("lock");
+    lpm_common::with_exclusive_lock(lock_path, || {
+        let mut index = read_index()?;
+        let result = operation(&mut index)?;
+        write_index(&index)?;
+        Ok(result)
+    })
+}
+
 /// Record `project_dir` as a project we've issued a leaf for. Idempotent.
 pub fn record(project_dir: &Path) -> Result<(), LpmError> {
     let canonical = canonicalize_or_keep(project_dir);
-    let mut idx = read_index()?;
-    idx.projects.insert(canonical);
-    write_index(&idx)
+    with_index_transaction(|index| {
+        index.projects.insert(canonical);
+        Ok(())
+    })
 }
 
 /// Remove a project from the index, e.g. when its directory has been deleted.
 pub fn forget(project_dir: &Path) -> Result<(), LpmError> {
     let canonical = canonicalize_or_keep(project_dir);
-    let mut idx = read_index()?;
-    if idx.projects.remove(&canonical) {
-        write_index(&idx)?;
-    }
-    Ok(())
+    with_index_transaction(|index| {
+        index.projects.remove(&canonical);
+        Ok(())
+    })
 }
 
 /// Every project path the index currently knows about, in stable order.
@@ -176,6 +188,19 @@ mod tests {
         });
     }
 
+    #[test]
+    fn projects_index_follows_lpm_home_override() {
+        let _serial = serial_lock();
+        let root = tempfile::tempdir().unwrap();
+        let _index_override = EnvGuard::remove(PROJECTS_INDEX_ENV);
+        let _lpm_home = EnvGuard::set("LPM_HOME", root.path());
+
+        assert_eq!(
+            index_path().unwrap(),
+            root.path().join("cert-projects.json")
+        );
+    }
+
     #[cfg(not(debug_assertions))]
     #[test]
     fn projects_index_env_is_ignored_in_release_builds() {
@@ -188,11 +213,7 @@ mod tests {
     }
 
     fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        crate::test_env_lock()
     }
 
     struct EnvGuard {
@@ -203,6 +224,12 @@ mod tests {
         fn set<P: AsRef<std::ffi::OsStr>>(key: &'static str, value: P) -> Self {
             let prev = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, prev }
         }
     }

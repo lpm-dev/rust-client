@@ -812,6 +812,12 @@ pub fn acquire_single_file_shared_lock(
     lock_path: impl AsRef<Path>,
 ) -> Result<SingleFileSharedLockHandle, LpmError> {
     let file = open_lock_file(lock_path.as_ref())?;
+    acquire_single_file_shared_lock_from_file(file)
+}
+
+pub fn acquire_single_file_shared_lock_from_file(
+    file: std::fs::File,
+) -> Result<SingleFileSharedLockHandle, LpmError> {
     let mut data = fd_lock::RwLock::new(file);
     poll_until_acquired(
         &mut data,
@@ -832,7 +838,7 @@ pub fn acquire_single_file_exclusive_lock(
     acquire_single_file_exclusive_lock_from_file(file)
 }
 
-pub(crate) fn acquire_single_file_exclusive_lock_from_file(
+pub fn acquire_single_file_exclusive_lock_from_file(
     file: std::fs::File,
 ) -> Result<SingleFileExclusiveLockHandle, LpmError> {
     let mut data = fd_lock::RwLock::new(file);
@@ -843,6 +849,17 @@ pub(crate) fn acquire_single_file_exclusive_lock_from_file(
         None,
     )?;
     Ok(SingleFileExclusiveLockHandle { _data: data })
+}
+
+pub fn try_acquire_single_file_exclusive_lock_from_file(
+    file: std::fs::File,
+) -> Result<Option<SingleFileExclusiveLockHandle>, LpmError> {
+    let mut data = fd_lock::RwLock::new(file);
+    if try_acquire(&mut data, LockMode::Exclusive)? {
+        Ok(Some(SingleFileExclusiveLockHandle { _data: data }))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Try to acquire an exclusive advisory lock without waiting.
@@ -1515,6 +1532,29 @@ mod tests {
 
         rel_tx.send(()).unwrap();
         holder.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn single_file_lock_handles_from_open_files_share_one_lock_domain() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("single-file.lock");
+        let shared_file = open_lock_file(&lock_path).unwrap();
+        let shared = acquire_single_file_shared_lock_from_file(shared_file).unwrap();
+        let blocked_file = open_lock_file(&lock_path).unwrap();
+
+        assert!(
+            try_acquire_single_file_exclusive_lock_from_file(blocked_file)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(shared);
+        let exclusive_file = open_lock_file(&lock_path).unwrap();
+        assert!(
+            try_acquire_single_file_exclusive_lock_from_file(exclusive_file)
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Shared lock blocks an exclusive acquire until released.

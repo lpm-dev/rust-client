@@ -108,8 +108,13 @@ pub fn validate_extra_permitted_dns(
         }
         if normalized.ends_with('.')
             || normalized.contains("..")
-            || normalized.starts_with('-')
-            || normalized.ends_with('-')
+            || normalized.len() > 253
+            || normalized.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+            })
         {
             return Err(LpmError::Cert(format!(
                 "cert.extra_permitted_dns entry {entry:?} is not a valid DNS label \
@@ -294,7 +299,12 @@ mod tests {
 
     #[test]
     fn rejects_label_starting_or_ending_with_hyphen() {
-        for bad in ["-myapp.local", "myapp.local-"] {
+        for bad in [
+            "-myapp.local",
+            "myapp.local-",
+            "api.-bad.local",
+            "api.bad-.local",
+        ] {
             let err = validate_extra_permitted_dns(&[bad.into()], false).unwrap_err();
             assert!(err.to_string().contains("not a valid DNS"));
         }
@@ -304,6 +314,23 @@ mod tests {
     fn rejects_double_dot() {
         let err = validate_extra_permitted_dns(&["a..local".into()], false).unwrap_err();
         assert!(err.to_string().contains("not a valid DNS"));
+    }
+
+    #[test]
+    fn rejects_dns_names_over_the_label_or_total_length_limits() {
+        let long_label = format!("{}.local", "a".repeat(64));
+        let long_name = format!(
+            "{}.{}.{}.{}.local",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+
+        for bad in [long_label, long_name] {
+            let error = validate_extra_permitted_dns(&[bad], false).unwrap_err();
+            assert!(error.to_string().contains("not a valid DNS"));
+        }
     }
 
     #[test]
