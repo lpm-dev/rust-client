@@ -14,6 +14,41 @@ use support::{
     TempProject, configure_fake_node, lpm, lpm_spawnable, lpm_with_registry, write_repeated_file,
 };
 
+#[test]
+fn dev_rejects_an_invalid_env_schema_default_before_starting_the_service() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"invalid-env-default",
+            "version":"1.0.0",
+            "scripts":{"dev":"node should-not-run.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"PORT":{"default":"70000","format":"port"}}}}"#,
+    );
+    project.write_file(
+        "should-not-run.js",
+        "require('fs').writeFileSync('spawned.txt', 'yes');\n",
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with an invalid env schema default");
+
+    assert!(!output.status.success(), "invalid default must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid format"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.file_exists("spawned.txt"),
+        "service started before env schema validation"
+    );
+}
+
 #[cfg(unix)]
 fn install_fake_managed_node(project: &TempProject, version: &str) {
     use std::os::unix::fs::PermissionsExt;

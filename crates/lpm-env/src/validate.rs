@@ -3,8 +3,21 @@
 //! Takes `(schema, env_map)` → `Vec<ValidationError>`. No side effects.
 
 use crate::schema::{EnvSchema, EnvVarRule, VarFormat};
+use regex_automata::{
+    Input, MatchKind, PatternID, PatternSet, meta::Regex, nfa::thompson::WhichCaptures,
+};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+
+const REDACTED_VALUE: &str = "[REDACTED]";
+const MAX_ENV_VAR_NAME_BYTES: usize = 256;
+const MAX_PATTERN_BATCH_SIZE: usize = 64;
+const REGEX_NFA_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
+const REGEX_DFA_SIZE_LIMIT_BYTES: usize = 256 * 1024;
+const REGEX_HYBRID_CACHE_BYTES: usize = 64 * 1024;
+const MAX_TOTAL_REGEX_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+const REGEX_MEMORY_BUDGET_ERROR: &str =
+    "combined envSchema patterns exceed the 8 MiB compiled-regex memory limit";
 
 /// A single validation error for one environment variable.
 #[derive(Debug, Clone)]
@@ -22,6 +35,10 @@ pub struct ValidationError {
 /// The specific validation failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationErrorKind {
+    /// The schema key is not a portable environment variable name.
+    InvalidVariableName,
+    /// The configured regular expression cannot be compiled safely.
+    InvalidPattern { pattern: String, message: String },
     /// Required variable is not set (or is empty).
     Missing,
     /// Value doesn't match the expected format.
@@ -34,74 +51,294 @@ pub enum ValidationErrorKind {
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = TerminalSafe(&self.key);
         match &self.kind {
+            ValidationErrorKind::InvalidVariableName => {
+                write!(
+                    f,
+                    "{}: invalid environment variable name. Use 1 to 256 ASCII letters, numbers, or underscores. Start with a letter or underscore",
+                    key
+                )?;
+            }
+            ValidationErrorKind::InvalidPattern { pattern, message } => {
+                write!(
+                    f,
+                    "{}: invalid regex `{}` in envSchema.pattern: {}",
+                    key,
+                    TerminalSafe(pattern),
+                    TerminalSafe(message)
+                )?;
+            }
             ValidationErrorKind::Missing => {
-                write!(f, "{}: missing (required)", self.key)?;
+                write!(f, "{}: missing (required)", key)?;
                 if let Some(desc) = &self.description {
-                    write!(f, " — {desc}")?;
+                    write!(f, " — {}", TerminalSafe(desc))?;
                 }
             }
             ValidationErrorKind::InvalidFormat { expected, got } => {
-                let display_value = if self.is_secret {
-                    redact_value(got)
-                } else {
-                    got.clone()
-                };
+                let display_value = display_value(got, self.is_secret);
                 write!(
                     f,
-                    "{}: invalid format, expected {expected:?}, got \"{display_value}\"",
-                    self.key
+                    "{}: invalid format, expected {expected:?}, got \"{}\"",
+                    key,
+                    TerminalSafe(display_value)
                 )?;
             }
             ValidationErrorKind::PatternMismatch { pattern, got } => {
-                let display_value = if self.is_secret {
-                    redact_value(got)
-                } else {
-                    got.clone()
-                };
+                let display_value = display_value(got, self.is_secret);
                 write!(
                     f,
-                    "{}: must match pattern `{pattern}`, got \"{display_value}\"",
-                    self.key
+                    "{}: must match pattern `{}`, got \"{}\"",
+                    key,
+                    TerminalSafe(pattern),
+                    TerminalSafe(display_value)
                 )?;
             }
             ValidationErrorKind::NotInEnum { allowed, got } => {
-                let display_value = if self.is_secret {
-                    redact_value(got)
-                } else {
-                    got.clone()
-                };
-                write!(
-                    f,
-                    "{}: must be one of [{}], got \"{display_value}\"",
-                    self.key,
-                    allowed.join(", ")
-                )?;
+                let display_value = display_value(got, self.is_secret);
+                write!(f, "{}: must be one of [", key)?;
+                write_allowed_values(f, allowed, self.is_secret)?;
+                write!(f, "], got \"{}\"", TerminalSafe(display_value))?;
             }
         }
         Ok(())
     }
 }
 
-/// Redact a secret value for display: show first 4 and last 3 *characters*
-/// if long enough.
-///
-/// `len()` and direct byte indexing would panic the moment a non-ASCII
-/// codepoint straddled either slice boundary — a malicious repo could
-/// mark a variable `secret: true`, force a format/pattern/enum failure,
-/// and ship a `.env` value containing a multibyte char to crash the
-/// command. Iterating over `char_indices` keeps us on grapheme-adjacent
-/// boundaries (still not full UAX#29, but enough to never panic).
-fn redact_value(value: &str) -> String {
-    if value.chars().count() > 10 {
-        let start: String = value.chars().take(4).collect();
-        let end: String = {
-            let total = value.chars().count();
-            value.chars().skip(total - 3).collect()
-        };
-        format!("{start}...{end}")
+struct TerminalSafe<'a>(&'a str);
+
+impl std::fmt::Display for TerminalSafe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for character in self.0.chars() {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+            {
+                for escaped in character.escape_default() {
+                    std::fmt::Write::write_char(f, escaped)?;
+                }
+            } else {
+                std::fmt::Write::write_char(f, character)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_allowed_values(
+    f: &mut std::fmt::Formatter<'_>,
+    allowed: &[String],
+    is_secret: bool,
+) -> std::fmt::Result {
+    if is_secret {
+        return f.write_str(REDACTED_VALUE);
+    }
+    for (index, value) in allowed.iter().enumerate() {
+        if index != 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{}", TerminalSafe(value))?;
+    }
+    Ok(())
+}
+
+fn display_value(value: &str, is_secret: bool) -> &str {
+    if is_secret { REDACTED_VALUE } else { value }
+}
+
+fn retained_value(value: &str, is_secret: bool) -> String {
+    if is_secret {
+        REDACTED_VALUE.to_string()
     } else {
-        "••••••".to_string()
+        value.to_string()
+    }
+}
+
+struct CompiledRule<'a> {
+    key: &'a str,
+    rule: &'a EnvVarRule,
+    pattern_index: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PatternLocation {
+    batch: usize,
+    pattern: PatternID,
+}
+
+enum CompiledPattern {
+    Valid(PatternLocation),
+    Invalid(InvalidPatternReason),
+}
+
+enum InvalidPatternReason {
+    Compiler(String),
+    MemoryBudgetExceeded,
+}
+
+impl InvalidPatternReason {
+    fn message(&self) -> String {
+        match self {
+            Self::Compiler(message) => message.clone(),
+            Self::MemoryBudgetExceeded => REGEX_MEMORY_BUDGET_ERROR.to_string(),
+        }
+    }
+}
+
+/// A reusable validator that deduplicates and compiles configured regexes in batches.
+pub struct EnvValidator<'a> {
+    rules: Vec<CompiledRule<'a>>,
+    patterns: Vec<CompiledPattern>,
+    pattern_batches: Vec<Regex>,
+}
+
+impl<'a> EnvValidator<'a> {
+    /// Compile a deterministic validation plan for an environment schema.
+    pub fn new(schema: &'a EnvSchema) -> Self {
+        let mut keys = Vec::with_capacity(schema.vars.len());
+        keys.extend(schema.vars.keys().map(String::as_str));
+        keys.sort_unstable();
+
+        let mut unique_pattern_indices = HashMap::new();
+        let mut unique_patterns = Vec::new();
+        let mut rules = Vec::with_capacity(keys.len());
+        for key in keys {
+            let rule = &schema.vars[key];
+            let pattern_index = rule.pattern.as_deref().map(|pattern| {
+                *unique_pattern_indices.entry(pattern).or_insert_with(|| {
+                    let index = unique_patterns.len();
+                    unique_patterns.push(pattern);
+                    index
+                })
+            });
+            rules.push(CompiledRule {
+                key,
+                rule,
+                pattern_index,
+            });
+        }
+
+        let mut patterns = std::iter::repeat_with(|| None)
+            .take(unique_patterns.len())
+            .collect::<Vec<Option<CompiledPattern>>>();
+        let mut pattern_batches = Vec::new();
+        let mut retained_regex_memory = 0;
+        let mut memory_budget_exceeded = false;
+        let indexed_patterns = unique_patterns.into_iter().enumerate().collect::<Vec<_>>();
+        for batch in indexed_patterns.chunks(MAX_PATTERN_BATCH_SIZE) {
+            if !compile_pattern_batch(
+                batch,
+                &mut patterns,
+                &mut pattern_batches,
+                &mut retained_regex_memory,
+            ) {
+                memory_budget_exceeded = true;
+                break;
+            }
+        }
+        if memory_budget_exceeded {
+            pattern_batches.clear();
+            for pattern in &mut patterns {
+                if !matches!(
+                    pattern,
+                    Some(CompiledPattern::Invalid(InvalidPatternReason::Compiler(_)))
+                ) {
+                    *pattern = Some(CompiledPattern::Invalid(
+                        InvalidPatternReason::MemoryBudgetExceeded,
+                    ));
+                }
+            }
+        }
+        let patterns = patterns
+            .into_iter()
+            .map(|pattern| pattern.expect("every pattern is compiled or rejected"))
+            .collect();
+
+        Self {
+            rules,
+            patterns,
+            pattern_batches,
+        }
+    }
+
+    /// Validate values and inject only defaults that satisfy their complete rule.
+    pub fn validate(&self, env_vars: &mut HashMap<String, String>) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+        let mut matched_patterns = PatternSet::new(MAX_PATTERN_BATCH_SIZE);
+
+        for compiled in &self.rules {
+            let key = compiled.key;
+            let rule = compiled.rule;
+
+            if !is_valid_env_var_name(key) {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidVariableName,
+                ));
+                continue;
+            }
+
+            let pattern = match compiled.pattern_index.map(|index| &self.patterns[index]) {
+                Some(CompiledPattern::Valid(location)) => Some(*location),
+                Some(CompiledPattern::Invalid(reason)) => {
+                    errors.push(validation_error(
+                        key,
+                        rule,
+                        ValidationErrorKind::InvalidPattern {
+                            pattern: rule.pattern.clone().unwrap_or_default(),
+                            message: reason.message(),
+                        },
+                    ));
+                    continue;
+                }
+                None => None,
+            };
+
+            let is_missing_or_empty = env_vars.get(key).is_none_or(String::is_empty);
+            if is_missing_or_empty {
+                if let Some(default) = &rule.default {
+                    if rule.required && default.is_empty() {
+                        errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
+                        continue;
+                    }
+                    let error_count = errors.len();
+                    let pattern_matches = pattern.map(|location| {
+                        self.matches_pattern(default, location, &mut matched_patterns)
+                    });
+                    validate_value(key, default, rule, pattern_matches, &mut errors);
+                    if errors.len() == error_count {
+                        env_vars.insert(key.to_string(), default.clone());
+                    }
+                } else if rule.required {
+                    errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
+                }
+            } else if let Some(value) = env_vars.get(key) {
+                let pattern_matches = pattern
+                    .map(|location| self.matches_pattern(value, location, &mut matched_patterns));
+                validate_value(key, value, rule, pattern_matches, &mut errors);
+            }
+        }
+
+        errors
+    }
+
+    fn matches_pattern(
+        &self,
+        value: &str,
+        location: PatternLocation,
+        matched_patterns: &mut PatternSet,
+    ) -> bool {
+        matched_patterns.clear();
+        self.pattern_batches[location.batch]
+            .which_overlapping_matches(&Input::new(value), matched_patterns);
+        matched_patterns.contains(location.pattern)
     }
 }
 
@@ -110,77 +347,49 @@ fn redact_value(value: &str) -> String {
 /// This is the core validation function — synchronous, pure, no side effects.
 /// Returns an empty `Vec` if all validations pass.
 ///
-/// **Default injection:** if a variable is not set but has a `default` in the schema,
-/// the default is injected into `env_vars` (mutated in place) and no error is raised.
+/// **Default injection:** if a variable is not set, a valid non-empty `default` is
+/// injected into `env_vars`. Invalid defaults return the corresponding validation error.
+/// An empty default cannot satisfy a required variable.
 pub fn validate(
     schema: &EnvSchema,
     env_vars: &mut HashMap<String, String>,
 ) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-
-    // Sort keys for deterministic output order
-    let mut keys: Vec<&String> = schema.vars.keys().collect();
-    keys.sort();
-
-    for key in keys {
-        let rule = &schema.vars[key];
-
-        // Check if the variable is set
-        let value = env_vars.get(key.as_str());
-
-        let is_missing_or_empty = value.is_none() || value.is_some_and(|v| v.is_empty());
-
-        if is_missing_or_empty {
-            if let Some(default) = &rule.default {
-                env_vars.insert(key.clone(), default.clone());
-            } else if rule.required {
-                errors.push(ValidationError {
-                    key: key.clone(),
-                    kind: ValidationErrorKind::Missing,
-                    description: rule.description.clone(),
-                    is_secret: rule.secret,
-                });
-            }
-        } else if let Some(value) = value {
-            validate_value(key, value, rule, &mut errors);
-        }
-    }
-
-    errors
+    EnvValidator::new(schema).validate(env_vars)
 }
 
 /// Validate a single value against its rule.
-fn validate_value(key: &str, value: &str, rule: &EnvVarRule, errors: &mut Vec<ValidationError>) {
+fn validate_value(
+    key: &str,
+    value: &str,
+    rule: &EnvVarRule,
+    pattern_matches: Option<bool>,
+    errors: &mut Vec<ValidationError>,
+) {
     // Format validation
     if let Some(format) = &rule.format
         && !validate_format(value, format)
     {
-        errors.push(ValidationError {
-            key: key.to_string(),
-            kind: ValidationErrorKind::InvalidFormat {
+        errors.push(validation_error(
+            key,
+            rule,
+            ValidationErrorKind::InvalidFormat {
                 expected: format.clone(),
-                got: value.to_string(),
+                got: retained_value(value, rule.secret),
             },
-            description: rule.description.clone(),
-            is_secret: rule.secret,
-        });
+        ));
         // Don't check further rules if format is wrong
         return;
     }
 
-    // Pattern validation (simple glob-like matching, not full regex)
-    if let Some(pattern) = &rule.pattern
-        && !matches_pattern(value, pattern)
-    {
-        errors.push(ValidationError {
-            key: key.to_string(),
-            kind: ValidationErrorKind::PatternMismatch {
-                pattern: pattern.clone(),
-                got: value.to_string(),
+    if pattern_matches == Some(false) {
+        errors.push(validation_error(
+            key,
+            rule,
+            ValidationErrorKind::PatternMismatch {
+                pattern: rule.pattern.clone().unwrap_or_default(),
+                got: retained_value(value, rule.secret),
             },
-            description: rule.description.clone(),
-            is_secret: rule.secret,
-        });
+        ));
         return;
     }
 
@@ -188,16 +397,115 @@ fn validate_value(key: &str, value: &str, rule: &EnvVarRule, errors: &mut Vec<Va
     if let Some(allowed) = &rule.enum_values
         && !allowed.iter().any(|a| a == value)
     {
-        errors.push(ValidationError {
-            key: key.to_string(),
-            kind: ValidationErrorKind::NotInEnum {
-                allowed: allowed.clone(),
-                got: value.to_string(),
+        errors.push(validation_error(
+            key,
+            rule,
+            ValidationErrorKind::NotInEnum {
+                allowed: if rule.secret {
+                    Vec::new()
+                } else {
+                    allowed.clone()
+                },
+                got: retained_value(value, rule.secret),
             },
-            description: rule.description.clone(),
-            is_secret: rule.secret,
-        });
+        ));
     }
+}
+
+fn validation_error(key: &str, rule: &EnvVarRule, kind: ValidationErrorKind) -> ValidationError {
+    ValidationError {
+        key: key.to_string(),
+        kind,
+        description: rule.description.clone(),
+        is_secret: rule.secret,
+    }
+}
+
+fn compile_pattern_batch(
+    indexed_patterns: &[(usize, &str)],
+    compiled_patterns: &mut [Option<CompiledPattern>],
+    batches: &mut Vec<Regex>,
+    retained_memory: &mut usize,
+) -> bool {
+    let patterns = indexed_patterns
+        .iter()
+        .map(|(_, pattern)| *pattern)
+        .collect::<Vec<_>>();
+    match build_pattern_batch(&patterns) {
+        Ok(regex) => {
+            let Some(next_retained_memory) = retained_memory
+                .checked_add(compiled_regex_memory_usage(&regex))
+                .filter(|memory| *memory <= MAX_TOTAL_REGEX_MEMORY_BYTES)
+            else {
+                return false;
+            };
+            let batch = batches.len();
+            batches.push(regex);
+            *retained_memory = next_retained_memory;
+            for (local_index, (original_index, _)) in indexed_patterns.iter().enumerate() {
+                compiled_patterns[*original_index] =
+                    Some(CompiledPattern::Valid(PatternLocation {
+                        batch,
+                        pattern: PatternID::must(local_index),
+                    }));
+            }
+            true
+        }
+        Err(message) if indexed_patterns.len() == 1 => {
+            compiled_patterns[indexed_patterns[0].0] = Some(CompiledPattern::Invalid(
+                InvalidPatternReason::Compiler(message),
+            ));
+            true
+        }
+        Err(_) => {
+            let middle = indexed_patterns.len() / 2;
+            compile_pattern_batch(
+                &indexed_patterns[..middle],
+                compiled_patterns,
+                batches,
+                retained_memory,
+            ) && compile_pattern_batch(
+                &indexed_patterns[middle..],
+                compiled_patterns,
+                batches,
+                retained_memory,
+            )
+        }
+    }
+}
+
+fn compiled_regex_memory_usage(regex: &Regex) -> usize {
+    let cache_memory = regex
+        .create_cache()
+        .memory_usage()
+        .max(2 * REGEX_HYBRID_CACHE_BYTES);
+    regex.memory_usage().saturating_add(cache_memory)
+}
+
+fn build_pattern_batch(patterns: &[&str]) -> Result<Regex, String> {
+    Regex::builder()
+        .configure(
+            Regex::config()
+                .match_kind(MatchKind::All)
+                .which_captures(WhichCaptures::None)
+                .nfa_size_limit(Some(REGEX_NFA_SIZE_LIMIT_BYTES))
+                .dfa_size_limit(Some(REGEX_DFA_SIZE_LIMIT_BYTES))
+                .hybrid_cache_capacity(REGEX_HYBRID_CACHE_BYTES),
+        )
+        .build_many(patterns)
+        .map_err(|error| error.to_string())
+}
+
+fn is_valid_env_var_name(key: &str) -> bool {
+    if key.len() > MAX_ENV_VAR_NAME_BYTES {
+        return false;
+    }
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Validate a value against a built-in format.
@@ -291,113 +599,14 @@ fn validate_ip(value: &str) -> bool {
     value.parse::<Ipv4Addr>().is_ok() || value.parse::<Ipv6Addr>().is_ok()
 }
 
-/// Maximum number of `(a|b|...)` alternation groups allowed in one
-/// pattern, and the per-group branch ceiling.
-///
-/// M58: `matches_pattern` expands alternation by recursive
-/// `format!("{prefix}{alt}{suffix}")` — a repo-controlled pattern
-/// like `(a|b)(a|b)...(a|b)` with 30 groups recurses 2^30 times and
-/// allocates the same number of intermediate `String`s. These caps
-/// bound the work to `MAX_PATTERN_BRANCHES ^ MAX_PATTERN_GROUPS` and
-/// the pattern is treated as a non-match (with `tracing::warn`) on
-/// overflow — same effect as a glob miss.
-const MAX_PATTERN_GROUPS: usize = 8;
-const MAX_PATTERN_BRANCHES: usize = 16;
-
-/// Simple pattern matching with `*` wildcards.
-///
-/// Supports `*` as a wildcard matching any sequence of characters, and `.*` for
-/// regex-like "any chars" patterns. This is NOT full regex — it's deliberately
-/// simple to avoid pulling in the `regex` crate (which adds ~1MB to the binary).
-///
-/// For complex patterns, the `*` wildcard covers the most common use cases:
-/// - `sk_(test|live)_*` — matches `sk_test_abc123` or `sk_live_xyz`
-/// - `postgres://*` — matches any postgres URL
-/// - `*.example.com` — matches subdomains
-///
-/// Parenthesized alternation `(a|b)` is supported, including multiple groups:
-/// `(api|app)_key_(v1|v2)` expands via recursive calls. Nested parens `((a))` are
-/// NOT supported — the parser finds the first `(` and first `)` after it.
+#[cfg(test)]
 fn matches_pattern(value: &str, pattern: &str) -> bool {
-    matches_pattern_bounded(value, pattern, 0)
-}
-
-fn matches_pattern_bounded(value: &str, pattern: &str, depth: usize) -> bool {
-    if depth > MAX_PATTERN_GROUPS {
-        tracing::warn!(
-            pattern = %pattern,
-            "envSchema pattern exceeds max alternation depth ({MAX_PATTERN_GROUPS}) — treating as no-match"
-        );
+    let Ok(compiled) = build_pattern_batch(&[pattern]) else {
         return false;
-    }
-    // Handle alternation groups: `sk_(test|live)_*`
-    if let Some(start) = pattern.find('(')
-        && let Some(end) = pattern[start..].find(')')
-    {
-        let prefix = &pattern[..start];
-        let group = &pattern[start + 1..start + end];
-        let suffix = &pattern[start + end + 1..];
-        let alternatives: Vec<&str> = group.split('|').collect();
-        if alternatives.len() > MAX_PATTERN_BRANCHES {
-            tracing::warn!(
-                pattern = %pattern,
-                branches = alternatives.len(),
-                "envSchema pattern group has too many branches (max {MAX_PATTERN_BRANCHES}) — treating as no-match"
-            );
-            return false;
-        }
-        return alternatives.iter().any(|alt| {
-            matches_pattern_bounded(value, &format!("{prefix}{alt}{suffix}"), depth + 1)
-        });
-    }
-
-    // Simple glob matching with `*`
-    glob_match(value, pattern)
-}
-
-/// Glob-style matching: `*` matches any sequence of characters.
-fn glob_match(value: &str, pattern: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-
-    if parts.len() == 1 {
-        // No wildcards — exact match
-        return value == pattern;
-    }
-
-    let mut pos = 0;
-
-    // First part must be a prefix
-    if !parts[0].is_empty() {
-        if !value.starts_with(parts[0]) {
-            return false;
-        }
-        pos = parts[0].len();
-    }
-
-    // Last part must be a suffix
-    let last = parts[parts.len() - 1];
-    if !last.is_empty() {
-        if !value.ends_with(last) {
-            return false;
-        }
-        // Ensure we don't overlap with the prefix
-        if value.len() < pos + last.len() {
-            return false;
-        }
-    }
-
-    // Middle parts must appear in order
-    for &part in &parts[1..parts.len() - 1] {
-        if part.is_empty() {
-            continue;
-        }
-        match value[pos..].find(part) {
-            Some(idx) => pos += idx + part.len(),
-            None => return false,
-        }
-    }
-
-    true
+    };
+    let mut matched_patterns = PatternSet::new(1);
+    compiled.which_overlapping_matches(&Input::new(value), &mut matched_patterns);
+    matched_patterns.contains(PatternID::ZERO)
 }
 
 #[cfg(test)]
@@ -407,6 +616,21 @@ mod tests {
 
     fn schema_from_json(json: &str) -> EnvSchema {
         serde_json::from_str(json).unwrap()
+    }
+
+    fn schema_exceeding_compiled_regex_budget() -> EnvSchema {
+        let vars = (0..256)
+            .map(|index| {
+                (
+                    format!("PATTERN_{index:03}"),
+                    EnvVarRule {
+                        pattern: Some(format!(r"^(?:a?){{1024}}{index}$")),
+                        ..EnvVarRule::default()
+                    },
+                )
+            })
+            .collect();
+        EnvSchema { vars }
     }
 
     // ── Missing / Required ──
@@ -484,6 +708,76 @@ mod tests {
         let errors = validate(&schema, &mut env);
         assert!(errors.is_empty());
         assert_eq!(env.get("PORT").unwrap(), "3000");
+    }
+
+    #[test]
+    fn empty_default_does_not_satisfy_required_variable() {
+        let schema = schema_from_json(r#"{"vars": {"TOKEN": {"required": true, "default": ""}}}"#);
+        let mut env = HashMap::new();
+
+        let errors = validate(&schema, &mut env);
+
+        assert!(matches!(
+            errors.as_slice(),
+            [ValidationError {
+                kind: ValidationErrorKind::Missing,
+                ..
+            }]
+        ));
+        assert!(!env.contains_key("TOKEN"));
+    }
+
+    #[test]
+    fn invalid_format_default_is_rejected_without_injection() {
+        let schema =
+            schema_from_json(r#"{"vars": {"PORT": {"default": "70000", "format": "port"}}}"#);
+        let mut env = HashMap::new();
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind,
+            ValidationErrorKind::InvalidFormat {
+                expected: VarFormat::Port,
+                ..
+            }
+        ));
+        assert!(!env.contains_key("PORT"));
+    }
+
+    #[test]
+    fn invalid_enum_default_is_rejected_without_injection() {
+        let schema = schema_from_json(
+            r#"{"vars": {"LOG_LEVEL": {"default": "verbose", "enum": ["info", "warn"]}}}"#,
+        );
+        let mut env = HashMap::new();
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind,
+            ValidationErrorKind::NotInEnum { .. }
+        ));
+        assert!(!env.contains_key("LOG_LEVEL"));
+    }
+
+    #[test]
+    fn invalid_pattern_default_is_rejected_without_injection() {
+        let schema = schema_from_json(
+            r#"{"vars": {"API_KEY": {"default": "invalid", "pattern": "^sk_(test|live)_.*$"}}}"#,
+        );
+        let mut env = HashMap::new();
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind,
+            ValidationErrorKind::PatternMismatch { .. }
+        ));
+        assert!(!env.contains_key("API_KEY"));
     }
 
     // ── Format: URL ──
@@ -662,86 +956,198 @@ mod tests {
     }
 
     #[test]
-    fn pattern_wildcard() {
-        assert!(matches_pattern("sk_test_abc123", "sk_test_*"));
-        assert!(matches_pattern("sk_live_xyz", "sk_live_*"));
-        assert!(!matches_pattern("rk_test_abc", "sk_test_*"));
-        assert!(matches_pattern("anything", "*"));
-        assert!(matches_pattern("prefix_middle_suffix", "prefix_*_suffix"));
+    fn regex_without_anchors_matches_a_substring() {
+        assert!(matches_pattern("prefix_hello_suffix", "hello"));
+    }
+
+    #[test]
+    fn pattern_regex_quantifiers() {
+        assert!(matches_pattern("sk_test_abc123", r"^sk_test_.*$"));
+        assert!(matches_pattern("sk_live_xyz", r"^sk_live_\w+$"));
+        assert!(!matches_pattern("rk_test_abc", r"^sk_test_.*$"));
+        assert!(matches_pattern("anything", r"^.*$"));
+        assert!(matches_pattern(
+            "prefix_middle_suffix",
+            r"^prefix_.*_suffix$"
+        ));
     }
 
     #[test]
     fn pattern_alternation() {
-        assert!(matches_pattern("sk_test_abc", "sk_(test|live)_*"));
-        assert!(matches_pattern("sk_live_xyz", "sk_(test|live)_*"));
-        assert!(!matches_pattern("sk_dev_abc", "sk_(test|live)_*"));
+        assert!(matches_pattern("sk_test_abc", r"^sk_(test|live)_.*$"));
+        assert!(matches_pattern("sk_live_xyz", r"^sk_(test|live)_.*$"));
+        assert!(!matches_pattern("sk_dev_abc", r"^sk_(test|live)_.*$"));
+    }
+
+    #[test]
+    fn documented_anchored_regex_accepts_an_allowed_value() {
+        let schema = schema_from_json(
+            r#"{"vars": {"LOG_LEVEL": {"pattern": "^(trace|debug|info|warn|error)$"}}}"#,
+        );
+        let mut env = HashMap::from([("LOG_LEVEL".into(), "info".into())]);
+
+        let errors = validate(&schema, &mut env);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn regex_dot_star_matches_arbitrary_suffix() {
+        let schema =
+            schema_from_json(r#"{"vars": {"API_KEY": {"pattern": "^sk_(test|live)_.*$"}}}"#);
+        let mut env = HashMap::from([("API_KEY".into(), "sk_test_abc".into())]);
+
+        let errors = validate(&schema, &mut env);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn invalid_regex_is_reported_as_a_schema_error() {
+        let schema = schema_from_json(r#"{"vars": {"VALUE": {"pattern": "["}}}"#);
+        let mut env = HashMap::from([("VALUE".into(), "anything".into())]);
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].to_string().contains("invalid regex"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn invalid_regex_does_not_disable_valid_patterns_in_the_same_batch() {
+        let schema = schema_from_json(
+            r#"{"vars": {
+                "BROKEN": {"pattern": "["},
+                "VALID": {"pattern": "^accepted$"}
+            }}"#,
+        );
+        let mut env = HashMap::from([
+            ("BROKEN".into(), "anything".into()),
+            ("VALID".into(), "accepted".into()),
+        ]);
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key, "BROKEN");
+        assert!(matches!(
+            errors[0].kind,
+            ValidationErrorKind::InvalidPattern { .. }
+        ));
+    }
+
+    #[test]
+    fn batched_regex_checks_only_the_rule_assigned_to_each_variable() {
+        let schema = schema_from_json(
+            r#"{"vars": {
+                "FIRST": {"pattern": "^alpha$"},
+                "SECOND": {"pattern": "^beta$"}
+            }}"#,
+        );
+        let mut env = HashMap::from([
+            ("FIRST".into(), "beta".into()),
+            ("SECOND".into(), "beta".into()),
+        ]);
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key, "FIRST");
+        assert!(matches!(
+            errors[0].kind,
+            ValidationErrorKind::PatternMismatch { .. }
+        ));
     }
 
     #[test]
     fn pattern_multiple_alternation_groups() {
-        // Multiple groups: (api|app)_key_(v1|v2)
-        // Recursive expansion handles this — first group expands, recursive call finds second
-        assert!(matches_pattern("api_key_v1", "(api|app)_key_(v1|v2)"));
-        assert!(matches_pattern("app_key_v2", "(api|app)_key_(v1|v2)"));
-        assert!(matches_pattern("api_key_v2", "(api|app)_key_(v1|v2)"));
-        assert!(matches_pattern("app_key_v1", "(api|app)_key_(v1|v2)"));
-        assert!(!matches_pattern("web_key_v1", "(api|app)_key_(v1|v2)"));
-        assert!(!matches_pattern("api_key_v3", "(api|app)_key_(v1|v2)"));
+        let pattern = r"^(api|app)_key_(v1|v2)$";
+        assert!(matches_pattern("api_key_v1", pattern));
+        assert!(matches_pattern("app_key_v2", pattern));
+        assert!(matches_pattern("api_key_v2", pattern));
+        assert!(matches_pattern("app_key_v1", pattern));
+        assert!(!matches_pattern("web_key_v1", pattern));
+        assert!(!matches_pattern("api_key_v3", pattern));
     }
 
     #[test]
     fn pattern_postgres_url() {
         assert!(matches_pattern(
             "postgres://user:pass@localhost:5432/db",
-            "postgres://*"
+            r"^postgres://.*$"
         ));
-        assert!(!matches_pattern("mysql://localhost", "postgres://*"));
+        assert!(!matches_pattern("mysql://localhost", r"^postgres://.*$"));
     }
 
-    /// M58: pattern alternation has bounded recursion depth.
-    /// `(a|b)(a|b)...(a|b)` with many groups would, pre-fix, recurse
-    /// 2^N times and allocate the same number of intermediate Strings.
-    /// The bound treats over-depth patterns as no-match.
     #[test]
-    fn pattern_rejects_excessive_alternation_depth() {
-        // Pattern with > MAX_PATTERN_GROUPS groups must bail.
-        // Build `(a|b)` repeated MAX_PATTERN_GROUPS + 1 times.
-        let mut p = String::new();
-        for _ in 0..(MAX_PATTERN_GROUPS + 1) {
-            p.push_str("(a|b)");
-        }
-        // The value matches in principle but bounded matcher refuses.
-        let value: String = "a".repeat(MAX_PATTERN_GROUPS + 1);
+    fn dense_alternation_is_matched_without_recursive_expansion() {
+        let pattern = format!("^{}$", "(a|b)".repeat(32));
+        let value = "a".repeat(32);
+
+        assert!(matches_pattern(&value, &pattern));
+    }
+
+    #[test]
+    fn compiled_regex_memory_stays_within_the_schema_budget() {
+        let schema = schema_exceeding_compiled_regex_budget();
+
+        let validator = EnvValidator::new(&schema);
+        let retained_memory = validator
+            .pattern_batches
+            .iter()
+            .map(compiled_regex_memory_usage)
+            .sum::<usize>();
+
         assert!(
-            !matches_pattern(&value, &p),
-            "over-depth pattern must be rejected (bounded matcher returns false)"
+            retained_memory <= MAX_TOTAL_REGEX_MEMORY_BYTES,
+            "compiled regexes retained {retained_memory} bytes"
         );
     }
 
-    /// M58: pattern alternation has bounded branch count per group.
-    /// A single group with too many branches is rejected before any
-    /// recursive call.
     #[test]
-    fn pattern_rejects_groups_with_too_many_branches() {
-        let mut alternatives = Vec::with_capacity(MAX_PATTERN_BRANCHES + 1);
-        for i in 0..(MAX_PATTERN_BRANCHES + 1) {
-            alternatives.push(format!("a{i}"));
-        }
-        let pattern = format!("({})_x", alternatives.join("|"));
-        assert!(
-            !matches_pattern("a0_x", &pattern),
-            "over-branch group must be rejected"
-        );
+    fn schema_over_the_compiled_regex_budget_returns_a_truthful_error() {
+        let schema = schema_exceeding_compiled_regex_budget();
+        let validator = EnvValidator::new(&schema);
+
+        let errors = validator.validate(&mut HashMap::new());
+
+        assert_eq!(errors.len(), 256);
+        assert!(errors.iter().all(|error| {
+            matches!(
+                &error.kind,
+                ValidationErrorKind::InvalidPattern { message, .. }
+                    if message == REGEX_MEMORY_BUDGET_ERROR
+            )
+        }));
     }
 
-    /// Patterns within the bounds still match correctly.
     #[test]
-    fn pattern_within_bounds_still_matches() {
-        // 8-group pattern at the depth ceiling exact-fits.
-        assert!(matches_pattern(
-            "abababab",
-            "(a|x)(b|y)(a|x)(b|y)(a|x)(b|y)(a|x)(b|y)"
-        ));
+    fn regex_batch_boundary_accepts_64_and_65_patterns() {
+        for count in [64, 65] {
+            let vars = (0..count)
+                .map(|index| {
+                    (
+                        format!("PATTERN_{index:02}"),
+                        EnvVarRule {
+                            pattern: Some(format!("^value_{index}$")),
+                            ..EnvVarRule::default()
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut env = (0..count)
+                .map(|index| (format!("PATTERN_{index:02}"), format!("value_{index}")))
+                .collect();
+            let schema = EnvSchema { vars };
+
+            let errors = EnvValidator::new(&schema).validate(&mut env);
+
+            assert!(errors.is_empty(), "{count} patterns failed: {errors:?}");
+        }
     }
 
     // ── Enum validation ──
@@ -768,11 +1174,89 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn secret_validation_errors_do_not_retain_or_display_the_value() {
+        let secret = "prefix_private_material_suffix";
+        for rule in [
+            r#"{"format": "url", "secret": true}"#,
+            r#"{"pattern": "^allowed$", "secret": true}"#,
+            r#"{"enum": ["allowed_secret"], "secret": true}"#,
+        ] {
+            let schema = schema_from_json(&format!(r#"{{"vars": {{"TOKEN": {rule}}}}}"#));
+            let mut env = HashMap::from([("TOKEN".into(), secret.into())]);
+
+            let errors = validate(&schema, &mut env);
+            let display = errors[0].to_string();
+            let debug = format!("{errors:?}");
+
+            for fragment in [
+                secret,
+                "prefix",
+                "suffix",
+                "private_material",
+                "allowed_secret",
+            ] {
+                assert!(!display.contains(fragment), "display leaked {fragment}");
+                assert!(!debug.contains(fragment), "debug leaked {fragment}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_schema_variable_name_is_rejected() {
+        let schema = schema_from_json(r#"{"vars": {"DATABASE-URL": {"required": true}}}"#);
+        let mut env = HashMap::new();
+
+        let errors = validate(&schema, &mut env);
+
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("invalid environment variable name"),
+            "{}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn invalid_variable_name_error_escapes_terminal_control_characters() {
+        let schema = EnvSchema {
+            vars: HashMap::from([(
+                "BAD\u{1b}[31m\n\u{202e}KEY".to_string(),
+                EnvVarRule::default(),
+            )]),
+        };
+
+        let message = validate(&schema, &mut HashMap::new())[0].to_string();
+
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert!(!message.contains('\u{202e}'), "{message:?}");
+    }
+
+    #[test]
+    fn schema_variable_name_over_256_bytes_is_rejected() {
+        let key = "A".repeat(257);
+        let schema = EnvSchema {
+            vars: HashMap::from([(key, EnvVarRule::default())]),
+        };
+
+        let errors = validate(&schema, &mut HashMap::new());
+
+        assert!(matches!(
+            errors.as_slice(),
+            [ValidationError {
+                kind: ValidationErrorKind::InvalidVariableName,
+                ..
+            }]
+        ));
+    }
+
     // ── Pattern validation in schema context ──
 
     #[test]
     fn schema_pattern_validation() {
-        let schema = schema_from_json(r#"{"vars": {"KEY": {"pattern": "sk_(test|live)_*"}}}"#);
+        let schema = schema_from_json(r#"{"vars": {"KEY": {"pattern": "^sk_(test|live)_.*$"}}}"#);
         let mut env = HashMap::from([("KEY".into(), "sk_test_abc".into())]);
         assert!(validate(&schema, &mut env).is_empty());
 
@@ -792,19 +1276,78 @@ mod tests {
         let err = ValidationError {
             key: "STRIPE_KEY".into(),
             kind: ValidationErrorKind::PatternMismatch {
-                pattern: "sk_*".into(),
+                pattern: "^sk_.*$".into(),
                 got: "rk_live_supersecretvalue123".into(),
             },
             description: None,
             is_secret: true,
         };
         let msg = err.to_string();
-        assert!(
-            !msg.contains("supersecretvalue123"),
-            "secret should be redacted"
-        );
-        assert!(msg.contains("rk_l"), "should show first 4 chars");
-        assert!(msg.contains("123"), "should show last 3 chars");
+        assert!(!msg.contains("rk_live_supersecretvalue123"));
+        assert!(msg.contains(REDACTED_VALUE));
+    }
+
+    #[test]
+    fn non_secret_value_error_escapes_terminal_control_characters() {
+        let schema = schema_from_json(r#"{"vars": {"PORT": {"format": "port"}}}"#);
+        let mut env = HashMap::from([("PORT".into(), "70000\u{1b}[31m\n".into())]);
+
+        let message = validate(&schema, &mut env)[0].to_string();
+
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+    }
+
+    #[test]
+    fn invalid_pattern_error_escapes_terminal_control_characters() {
+        let schema = EnvSchema {
+            vars: HashMap::from([(
+                "TOKEN".to_string(),
+                EnvVarRule {
+                    pattern: Some("\u{1b}[31m(".to_string()),
+                    ..EnvVarRule::default()
+                },
+            )]),
+        };
+
+        let message = validate(&schema, &mut HashMap::new())[0].to_string();
+
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+    }
+
+    #[test]
+    fn enum_error_escapes_terminal_control_characters() {
+        let schema = EnvSchema {
+            vars: HashMap::from([(
+                "MODE".to_string(),
+                EnvVarRule {
+                    enum_values: Some(vec!["safe\u{1b}[31m\n".to_string()]),
+                    ..EnvVarRule::default()
+                },
+            )]),
+        };
+        let mut env = HashMap::from([("MODE".into(), "other".into())]);
+
+        let message = validate(&schema, &mut env)[0].to_string();
+
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+    }
+
+    #[test]
+    fn missing_description_error_escapes_terminal_control_characters() {
+        let schema = EnvSchema {
+            vars: HashMap::from([(
+                "TOKEN".to_string(),
+                EnvVarRule {
+                    required: true,
+                    description: Some("description\u{1b}[31m\n".to_string()),
+                    ..EnvVarRule::default()
+                },
+            )]),
+        };
+
+        let message = validate(&schema, &mut HashMap::new())[0].to_string();
+
+        assert!(!message.chars().any(char::is_control), "{message:?}");
     }
 
     #[test]
@@ -820,40 +1363,6 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("not_a_port"), "non-secret should be shown");
-    }
-
-    #[test]
-    fn short_secret_fully_redacted() {
-        let redacted = redact_value("short");
-        assert_eq!(redacted, "••••••");
-    }
-
-    #[test]
-    fn long_secret_partially_shown() {
-        let redacted = redact_value("sk_test_abc123xyz");
-        assert_eq!(redacted, "sk_t...xyz");
-    }
-
-    #[test]
-    fn redact_handles_multibyte_codepoints_without_panic() {
-        // Pre-fix the byte-index slices would land mid-codepoint and
-        // panic. Each Japanese kana takes 3 UTF-8 bytes; placing a
-        // non-ASCII run at both slice boundaries forces both
-        // `value[..4]` and `value[value.len() - 3..]` to straddle.
-        let redacted = redact_value("あいうえおかきくけこさ");
-        assert_eq!(redacted, "あいうえ...けこさ");
-
-        // 4-byte codepoints (CJK extension, emoji) — same shape.
-        let redacted = redact_value("🌀🌁🌂🌃🌄🌅🌆🌇🌈🌉🌊");
-        assert_eq!(redacted, "🌀🌁🌂🌃...🌈🌉🌊");
-    }
-
-    #[test]
-    fn redact_uses_char_count_not_byte_length() {
-        // 6 chars total, but 18 UTF-8 bytes — under the
-        // visual-length threshold so it must fully redact.
-        let redacted = redact_value("あいうえおか");
-        assert_eq!(redacted, "••••••");
     }
 
     #[test]
@@ -955,7 +1464,7 @@ mod tests {
             r#"{"vars": {
                 "DATABASE_URL": {"required": true, "format": "url", "secret": true, "description": "PostgreSQL connection string"},
                 "PORT": {"default": "3000", "format": "port"},
-                "STRIPE_SECRET_KEY": {"required": true, "secret": true, "pattern": "sk_(test|live)_*"},
+                "STRIPE_SECRET_KEY": {"required": true, "secret": true, "pattern": "^sk_(test|live)_.*$"},
                 "LOG_LEVEL": {"enum": ["debug", "info", "warn", "error"], "default": "info"},
                 "ENABLE_ANALYTICS": {"format": "boolean", "default": "false"},
                 "APP_URL": {"required": true, "format": "url", "client": true}
@@ -991,39 +1500,5 @@ mod tests {
         let errors = validate(&schema, &mut env);
         let msg = errors[0].to_string();
         assert!(msg.contains("Database URL"));
-    }
-
-    // ── Glob matching edge cases ──
-
-    #[test]
-    fn glob_empty_pattern() {
-        assert!(glob_match("", ""));
-        assert!(!glob_match("a", ""));
-    }
-
-    #[test]
-    fn glob_only_wildcard() {
-        assert!(glob_match("anything", "*"));
-        assert!(glob_match("", "*"));
-    }
-
-    #[test]
-    fn glob_multiple_wildcards() {
-        assert!(glob_match("abc_def_ghi", "*_def_*"));
-        assert!(glob_match("a_b_c_d", "*_b_*_d"));
-        assert!(!glob_match("a_x_c_d", "*_b_*_d"));
-    }
-
-    #[test]
-    fn glob_suffix_only() {
-        assert!(glob_match("test.js", "*.js"));
-        assert!(!glob_match("test.ts", "*.js"));
-    }
-
-    #[test]
-    fn glob_prefix_and_suffix() {
-        assert!(glob_match("sk_test_abc", "sk_*_abc"));
-        assert!(glob_match("sk_live_abc", "sk_*_abc"));
-        assert!(!glob_match("sk_test_xyz", "sk_*_abc"));
     }
 }

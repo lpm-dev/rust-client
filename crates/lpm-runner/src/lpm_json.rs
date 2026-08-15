@@ -834,6 +834,27 @@ mod tests {
         assert_eq!(properties["$schema"]["format"], "uri");
         assert!(properties["vault"]["type"].is_array());
         assert!(properties["vaultSync"]["anyOf"].is_array());
+
+        let env_rule = &schema["$defs"]["EnvVarRule"]["properties"];
+        for field in [
+            "required",
+            "format",
+            "pattern",
+            "enum",
+            "default",
+            "secret",
+            "client",
+            "description",
+        ] {
+            assert!(
+                env_rule.get(field).is_some(),
+                "generated envSchema rule is missing `{field}`"
+            );
+        }
+        assert_eq!(
+            schema["$defs"]["EnvSchema"]["properties"]["vars"]["propertyNames"]["pattern"],
+            "^[A-Za-z_][A-Za-z0-9_]{0,255}$"
+        );
     }
 
     #[test]

@@ -650,6 +650,35 @@ fn exec_no_env_check_skips_schema_validation() {
 }
 
 #[test]
+fn exec_rejects_invalid_schema_variable_name_before_spawn() {
+    let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"DATABASE-URL":{"required":false}}}}"#,
+    );
+    project.write_file(
+        "scripts/should-not-run.js",
+        "require('fs').writeFileSync('spawned.txt', 'yes');\n",
+    );
+
+    let output = lpm(&project)
+        .args(["scripts/should-not-run.js"])
+        .output()
+        .expect("failed to run lpm exec");
+
+    assert!(!output.status.success(), "invalid schema key must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid environment variable name"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.path().join("spawned.txt").exists(),
+        "child process must not start"
+    );
+}
+
+#[test]
 fn exec_typescript_without_safe_runtime_refuses_npx_tsx() {
     let project = TempProject::empty(r#"{"name":"exec-test","version":"1.0.0"}"#);
     project.write_file("scripts/seed.ts", "console.log('seed');\n");

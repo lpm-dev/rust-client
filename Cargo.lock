@@ -3483,6 +3483,7 @@ dependencies = [
 name = "lpm-env"
 version = "0.74.1"
 dependencies = [
+ "regex-automata",
  "schemars",
  "serde",
  "serde_json",

@@ -134,11 +134,11 @@ mod tests {
     #[test]
     fn secret_var() {
         let schema = schema_from_json(
-            r#"{"vars": {"API_KEY": {"required": true, "secret": true, "pattern": "sk_*"}}}"#,
+            r#"{"vars": {"API_KEY": {"required": true, "secret": true, "pattern": "^sk_.*$"}}}"#,
         );
         let output = generate(&schema);
         assert!(output.contains("secret"));
-        assert!(output.contains("pattern: sk_*"));
+        assert!(output.contains("pattern: ^sk_.*$"));
         assert!(output.contains("API_KEY=\n"));
     }
 
@@ -181,7 +181,7 @@ mod tests {
             r#"{"vars": {
                 "DATABASE_URL": {"required": true, "format": "url", "secret": true, "description": "PostgreSQL connection string"},
                 "PORT": {"default": "3000", "format": "port"},
-                "STRIPE_SECRET_KEY": {"required": true, "secret": true, "pattern": "sk_(test|live)_*"},
+                "STRIPE_SECRET_KEY": {"required": true, "secret": true, "pattern": "^sk_(test|live)_.*$"},
                 "LOG_LEVEL": {"enum": ["debug", "info", "warn", "error"], "default": "info"}
             }}"#,
         );

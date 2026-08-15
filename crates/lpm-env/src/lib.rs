@@ -1,6 +1,6 @@
 //! Environment variable schema validation for LPM.
 //!
-//! Parses an `env.schema` section from `lpm.json` and validates a set of
+//! Parses an `envSchema` section from `lpm.json` and validates a set of
 //! environment variables against it. Validation is synchronous and pure —
 //! no network calls, no file I/O. Takes `(schema, env_map)`, returns
 //! `Vec<ValidationError>`.
@@ -9,11 +9,11 @@
 //!
 //! ```json
 //! {
-//!   "env": {
-//!     "schema": {
+//!   "envSchema": {
+//!     "vars": {
 //!       "DATABASE_URL": { "required": true, "format": "url" },
 //!       "PORT": { "default": "3000", "format": "port" },
-//!       "STRIPE_SECRET_KEY": { "required": true, "secret": true, "pattern": "sk_(test|live)_.*" }
+//!       "STRIPE_SECRET_KEY": { "required": true, "secret": true, "pattern": "^sk_(test|live)_.*$" }
 //!     }
 //!   }
 //! }
@@ -31,4 +31,4 @@ pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, reso
 pub use print::{PrintFormat, format_env};
 pub use resolver::{EnvSource, ResolvedEnv, extract_mode_from_env_path};
 pub use schema::{EnvSchema, EnvVarRule, VarFormat};
-pub use validate::{ValidationError, ValidationErrorKind, validate};
+pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate};

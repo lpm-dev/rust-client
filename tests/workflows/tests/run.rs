@@ -10,6 +10,41 @@ use support::{TempProject, lpm, write_repeated_file};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[test]
+fn run_rejects_an_invalid_env_schema_regex_before_starting_the_script() {
+    let project = TempProject::empty(
+        r#"{
+            "name":"invalid-env-regex",
+            "version":"1.0.0",
+            "scripts":{"should-not-run":"node should-not-run.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"TOKEN":{"pattern":"("}}}}"#,
+    );
+    project.write_file(
+        "should-not-run.js",
+        "require('fs').writeFileSync('spawned.txt', 'yes');\n",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "should-not-run"])
+        .output()
+        .expect("run a script with an invalid env schema regex");
+
+    assert!(!output.status.success(), "invalid regex must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid regex"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.file_exists("spawned.txt"),
+        "script started before env schema validation"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn run_rejects_an_environment_file_symlink_outside_the_project() {
