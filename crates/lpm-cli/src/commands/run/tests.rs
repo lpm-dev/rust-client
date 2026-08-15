@@ -407,6 +407,144 @@ fn build_cache_context_changes_with_arguments_and_managed_runtime() {
     assert_ne!(node_20_browser.cache_key, node_22_browser.cache_key);
 }
 
+#[test]
+fn build_cache_context_changes_with_indirect_package_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = lpm_runner::lpm_json::LpmJsonConfig {
+        tasks: std::collections::HashMap::from([(
+            "build".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                cache: true,
+                inputs: vec!["source.txt".into()],
+                outputs: vec!["dist/**".into()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    std::fs::write(dir.path().join("source.txt"), "stable").unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"build":"node build.js","helper":"node helper-v1.js"}}"#,
+    )
+    .unwrap();
+    let before = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        Some(&config),
+    )
+    .unwrap()
+    .unwrap();
+
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"build":"node build.js","helper":"node helper-v2.js"}}"#,
+    )
+    .unwrap();
+    let after = build_cache_context(
+        dir.path(),
+        "build",
+        None,
+        &[],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Absent,
+        Some(&config),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_ne!(before.cache_key, after.cache_key);
+}
+
+#[test]
+fn cache_key_changes_for_every_dependency_resolution_section() {
+    let config = lpm_runner::lpm_json::LpmJsonConfig {
+        tasks: std::collections::HashMap::from([(
+            "build".into(),
+            lpm_runner::lpm_json::TaskConfig {
+                cache: true,
+                inputs: vec!["build.js".into()],
+                outputs: vec!["dist/**".into()],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let cases = [
+        (
+            "devDependencies",
+            r#"{"devDependencies":{"compiler":"1"}}"#,
+            r#"{"devDependencies":{"compiler":"2"}}"#,
+        ),
+        (
+            "optionalDependencies",
+            r#"{"optionalDependencies":{"native":"1"}}"#,
+            r#"{"optionalDependencies":{"native":"2"}}"#,
+        ),
+        (
+            "peerDependencies",
+            r#"{"peerDependencies":{"runtime":"1"}}"#,
+            r#"{"peerDependencies":{"runtime":"2"}}"#,
+        ),
+        (
+            "peerDependenciesMeta",
+            r#"{"peerDependenciesMeta":{"runtime":{"optional":false}}}"#,
+            r#"{"peerDependenciesMeta":{"runtime":{"optional":true}}}"#,
+        ),
+        (
+            "overrides",
+            r#"{"overrides":{"transitive":"1"}}"#,
+            r#"{"overrides":{"transitive":"2"}}"#,
+        ),
+        (
+            "resolutions",
+            r#"{"resolutions":{"transitive":"1"}}"#,
+            r#"{"resolutions":{"transitive":"2"}}"#,
+        ),
+        (
+            "catalogs",
+            r#"{"catalogs":{"default":{"shared":"1"}}}"#,
+            r#"{"catalogs":{"default":{"shared":"2"}}}"#,
+        ),
+        (
+            "lpm.overrides",
+            r#"{"lpm":{"overrides":{"transitive":"1"}}}"#,
+            r#"{"lpm":{"overrides":{"transitive":"2"}}}"#,
+        ),
+    ];
+
+    for (section, before, after) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.js"), "build").unwrap();
+        let package = |contract: &str| {
+            let mut package: serde_json::Value = serde_json::from_str(contract).unwrap();
+            package["name"] = serde_json::json!("cache-contract");
+            package["scripts"] = serde_json::json!({"build": "echo build"});
+            serde_json::to_vec(&package).unwrap()
+        };
+        std::fs::write(dir.path().join("package.json"), package(before)).unwrap();
+        let key_before =
+            build_cache_context(dir.path(), "build", None, &[], &Unknown, Some(&config))
+                .unwrap()
+                .unwrap()
+                .cache_key;
+
+        std::fs::write(dir.path().join("package.json"), package(after)).unwrap();
+        let key_after =
+            build_cache_context(dir.path(), "build", None, &[], &Unknown, Some(&config))
+                .unwrap()
+                .unwrap()
+                .cache_key;
+
+        assert_ne!(
+            key_before, key_after,
+            "{section} did not affect cache identity"
+        );
+    }
+}
+
 // --- Format helpers ---
 
 #[test]

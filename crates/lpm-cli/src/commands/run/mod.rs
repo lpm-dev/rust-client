@@ -52,9 +52,7 @@ pub async fn run_multi(
     reject_direct_hidden_scripts(scripts)?;
 
     // Read lpm.json for task dependencies
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let tasks = lpm_config
         .as_ref()
         .map(|c| c.tasks.clone())

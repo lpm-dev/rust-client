@@ -67,9 +67,7 @@ pub async fn run(
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
     // Read lpm.json once so the cache lookup and task predicate share the same config.
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
     let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
 
@@ -171,9 +169,7 @@ pub fn run_watch(
     reject_direct_hidden_scripts(&[script_name.to_string()])?;
 
     // Read task config for input globs — only trigger on relevant file changes
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let input_globs = lpm_config
         .as_ref()
         .and_then(|c| c.tasks.get(script_name))

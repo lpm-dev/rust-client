@@ -18,6 +18,7 @@ pub mod package_name;
 pub mod paths;
 pub mod peer;
 pub mod platform;
+pub mod project_glob;
 pub mod provenance;
 pub mod symlink;
 pub mod terminal;
@@ -56,6 +57,7 @@ pub use paths::{
     with_exclusive_lock_async, with_shared_lock, with_shared_lock_async,
 };
 pub use peer::PeerEdge;
+pub use project_glob::{rooted_project_glob, validate_project_glob};
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use symlink::{
     create_dir_symlink_or_junction, create_symlink, is_symlink_or_junction, remove_path_entry,
@@ -72,6 +74,9 @@ pub const DEFAULT_REGISTRY_URL: &str = "https://lpm.dev";
 
 /// Default npm upstream registry URL.
 pub const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+
+/// Maximum bytes retained from one task output stream before a truncation marker.
+pub const TASK_OUTPUT_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Check whether a skill name is safe for use in filesystem paths.
 ///

@@ -22,6 +22,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 getrandom = "0.3"
+glob = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }

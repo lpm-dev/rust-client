@@ -71,7 +71,34 @@ pub fn load_project_env_with_schema_validation(
     validate_schema: bool,
 ) -> Result<HashMap<String, String>, LpmError> {
     let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
+    load_project_env_with_config_and_schema_validation(
+        project_dir,
+        env_name,
+        lpm_config.as_ref(),
+        validate_schema,
+    )
+}
 
+/// Load the project environment using a configuration that the caller already parsed.
+pub fn load_project_env_with_config(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    lpm_config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    load_project_env_with_config_and_schema_validation(
+        project_dir,
+        env_name,
+        lpm_config,
+        !crate::script::should_skip_env_validation(),
+    )
+}
+
+fn load_project_env_with_config_and_schema_validation(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    lpm_config: Option<&lpm_json::LpmJsonConfig>,
+    validate_schema: bool,
+) -> Result<HashMap<String, String>, LpmError> {
     // Validate env name to prevent path traversal
     let env_name = env_name.filter(|m| {
         if !m.is_empty()
@@ -91,7 +118,7 @@ pub fn load_project_env_with_schema_validation(
 
     // Load .env files — use inheritance chain if `environments` is configured
     let mut loaded = if let Some(env_name) = env_name
-        && let Some(config) = &lpm_config
+        && let Some(config) = lpm_config
         && let Some(envs_config) = &config.environments
     {
         match lpm_env::resolve_chain(envs_config, env_name) {
@@ -149,7 +176,7 @@ pub fn load_project_env_with_schema_validation(
 
     // Validate against env schema (if defined in lpm.json)
     if validate_schema
-        && let Some(config) = &lpm_config
+        && let Some(config) = lpm_config
         && let Some(schema) = &config.env_schema
         && !schema.is_empty()
     {

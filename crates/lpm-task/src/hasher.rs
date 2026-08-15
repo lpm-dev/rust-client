@@ -2,14 +2,27 @@
 //!
 //! A cache key is a SHA-256 hash of everything that affects a task's output:
 //! - Source files matching input globs
-//! - package.json dependencies
+//! - The complete package.json contract
 //! - The command string
 //! - Environment variables
 //! - Node.js version
 
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::Dir;
+use lpm_common::LpmError;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Component, Path};
+
+const ECOSYSTEM_LOCKFILES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+];
 
 /// Compute a cache key for a task.
 ///
@@ -22,126 +35,146 @@ pub fn compute_cache_key(
     runtime_identities: &[(String, String)],
     input_globs: &[String],
     env_vars: &HashMap<String, String>,
-    deps_json: &str,
-) -> String {
+    package_json: &str,
+) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
 
-    // 0. Cache format version — bump this when changing hash inputs
-    hasher.update(b"cache-v3\n");
+    hash_record(&mut hasher, 0, &[b"cache-v6"]);
 
-    // 1. Command string
-    hasher.update(b"cmd:");
-    hasher.update(command.as_bytes());
-    hasher.update(b"\n");
+    hash_record(&mut hasher, 1, &[command.as_bytes()]);
+
+    // The task contract itself affects cache validity even when callers use
+    // custom input globs. Hash the project config independently so changes to
+    // outputs, environments, or dependency edges cannot reuse an older entry.
+    let project = open_project_directory(project_dir);
+    hash_implicit_project_file(&mut hasher, project.as_ref(), "config", "lpm.json");
+    let has_text_lock =
+        hash_implicit_project_file(&mut hasher, project.as_ref(), "lockfile", "lpm.lock");
+    if !has_text_lock {
+        hash_implicit_project_file(&mut hasher, project.as_ref(), "lockfile", "lpm.lockb");
+    }
+    for name in ECOSYSTEM_LOCKFILES {
+        hash_implicit_project_file(&mut hasher, project.as_ref(), "lockfile", name);
+    }
 
     for argument in extra_args {
-        hasher.update(b"arg:");
-        hasher.update(argument.len().to_le_bytes());
-        hasher.update(b":");
-        hasher.update(argument.as_bytes());
-        hasher.update(b"\n");
+        hash_record(&mut hasher, 2, &[argument.as_bytes()]);
     }
 
     for (runtime, identity) in runtime_identities {
-        hasher.update(b"runtime:");
-        hasher.update(runtime.as_bytes());
-        hasher.update(b"=");
-        hasher.update(identity.as_bytes());
-        hasher.update(b"\n");
+        hash_record(&mut hasher, 3, &[runtime.as_bytes(), identity.as_bytes()]);
     }
 
-    // 2. Dependencies JSON — canonicalize for determinism
-    //    serde_json doesn't guarantee key ordering, so we parse and re-serialize
-    //    with sorted keys to ensure identical JSON produces identical hashes.
-    let canonical_deps = canonicalize_json(deps_json);
-    hasher.update(b"deps:");
-    hasher.update(canonical_deps.as_bytes());
-    hasher.update(b"\n");
+    // 2. Complete package contract, canonicalized for deterministic key ordering.
+    let canonical_package = canonicalize_json(package_json);
+    hash_record(&mut hasher, 4, &[canonical_package.as_bytes()]);
 
     // 3. Environment variables (sorted by key)
     let mut env_keys: Vec<&String> = env_vars.keys().collect();
     env_keys.sort();
     for key in env_keys {
-        hasher.update(b"env:");
-        hasher.update(key.as_bytes());
-        hasher.update(b"=");
-        hasher.update(env_vars[key].as_bytes());
-        hasher.update(b"\n");
+        hash_record(&mut hasher, 5, &[key.as_bytes(), env_vars[key].as_bytes()]);
     }
 
     // 4. Source file contents matching input globs
-    let files = collect_input_files(project_dir, input_globs);
+    let files = collect_input_files(project_dir, input_globs)?;
     for (path, content_hash) in &files {
-        hasher.update(b"file:");
-        hasher.update(path.as_bytes());
-        hasher.update(b":");
-        hasher.update(content_hash.as_bytes());
-        hasher.update(b"\n");
+        hash_record(&mut hasher, 6, &[path.as_bytes(), content_hash.as_bytes()]);
     }
 
     let result = hasher.finalize();
-    hex::encode(result)
+    Ok(hex::encode(result))
+}
+
+fn hash_record(hasher: &mut Sha256, kind: u8, fields: &[&[u8]]) {
+    hasher.update([kind]);
+    hasher.update((fields.len() as u64).to_le_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
 }
 
 /// Collect input files matching glob patterns and hash their contents.
 ///
 /// Returns sorted (relative_path, content_sha256_hex) pairs.
-fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(String, String)> {
+fn collect_input_files(
+    project_dir: &Path,
+    globs: &[String],
+) -> Result<Vec<(String, String)>, LpmError> {
     let mut files = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let canonical_project = project_dir.canonicalize().map_err(|error| {
+        LpmError::Task(format!(
+            "failed to resolve task cache project directory {}: {error}",
+            project_dir.display()
+        ))
+    })?;
+    let project = Dir::open_ambient_dir(&canonical_project, cap_std::ambient_authority())?;
 
     for pattern in globs {
         if !crate::cache::validate_glob_pattern(pattern) {
-            tracing::warn!("skipping unsafe glob pattern: {pattern}");
-            continue;
+            return Err(LpmError::Task(format!(
+                "invalid task cache input glob: {pattern}"
+            )));
         }
 
         // "src/**" → also match "src/**/*" for files at any depth
         let patterns = expand_glob(pattern);
 
         for pat in &patterns {
-            let full_pattern = project_dir.join(pat);
-            let pattern_str = full_pattern.to_string_lossy().to_string();
+            let pattern_str = lpm_common::rooted_project_glob(project_dir, pat);
 
-            if let Ok(entries) = glob::glob(&pattern_str) {
-                for entry in entries.flatten() {
-                    if entry.is_file() {
-                        // M36: glob expansion via `is_file()` follows
-                        // symlinks. A safe-looking pattern like
-                        // `inputs: ["src/**/*"]` against a repo that
-                        // commits `src/escape -> /etc/passwd` would
-                        // hash the target file's contents and fold
-                        // them into the cache key — copying secret
-                        // material across machines / cache shares.
-                        // Require the resolved target to stay under
-                        // `project_dir` via canonicalize().
-                        if !target_stays_in_project(&entry, project_dir) {
-                            tracing::warn!(
-                                "skipping cache input outside project tree: {}",
+            let entries = glob::glob(&pattern_str).map_err(|error| {
+                LpmError::Task(format!(
+                    "invalid task cache input glob {pattern:?}: {error}"
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    LpmError::Task(format!(
+                        "failed to expand task cache input glob {pattern:?}: {error}"
+                    ))
+                })?;
+                let resolved = entry.canonicalize().map_err(|error| {
+                    LpmError::Task(format!(
+                        "failed to resolve task cache input {}: {error}",
+                        entry.display()
+                    ))
+                })?;
+                if !resolved.starts_with(&canonical_project) {
+                    return Err(LpmError::Task(format!(
+                        "task cache input resolves outside project: {}",
+                        entry.display()
+                    )));
+                }
+                let metadata = std::fs::metadata(&resolved)?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                let relative = entry.strip_prefix(project_dir).map_err(|_| {
+                    LpmError::Task(format!(
+                        "task cache input is outside project path: {}",
+                        entry.display()
+                    ))
+                })?;
+                let relative_text = relative.to_string_lossy().into_owned();
+                if seen.insert(relative_text.clone()) {
+                    let resolved_relative =
+                        resolved.strip_prefix(&canonical_project).map_err(|_| {
+                            LpmError::Task(format!(
+                                "task cache input resolves outside project: {}",
                                 entry.display()
-                            );
-                            continue;
-                        }
-                        let rel = entry
-                            .strip_prefix(project_dir)
-                            .unwrap_or(&entry)
-                            .to_string_lossy()
-                            .to_string();
-                        if seen.insert(rel.clone()) {
-                            match sha256_hex_file(&entry) {
-                                Ok(hash) => {
-                                    files.push((rel, hash));
-                                }
-                                Err(e) => {
-                                    tracing::warn!("failed to hash file {}: {e}", entry.display());
-                                    // Include a sentinel so the path still affects the key.
-                                    // Different devs with different read access won't silently
-                                    // get the same cache key.
-                                    files.push((rel.clone(), format!("<unreadable:{rel}>")));
-                                }
-                            }
-                        }
-                    }
+                            ))
+                        })?;
+                    let mut file = open_project_file_nofollow(&project, resolved_relative)?;
+                    let hash = sha256_hex_reader(&mut file).map_err(|error| {
+                        LpmError::Task(format!(
+                            "failed to hash task cache input {}: {error}",
+                            entry.display()
+                        ))
+                    })?;
+                    files.push((relative_text, hash));
                 }
             }
         }
@@ -149,7 +182,45 @@ fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(String, Str
 
     // Sort for deterministic ordering
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    files
+    Ok(files)
+}
+
+fn open_project_file_nofollow(project: &Dir, relative: &Path) -> Result<std::fs::File, LpmError> {
+    let mut components = relative.components().peekable();
+    let mut parent = project.try_clone()?;
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(LpmError::Task(format!(
+                "invalid task cache input path: {}",
+                relative.display()
+            )));
+        };
+        if components.peek().is_some() {
+            parent = parent.open_dir_nofollow(name).map_err(|error| {
+                LpmError::Task(format!(
+                    "task cache input parent is unsafe at {}: {error}",
+                    relative.display()
+                ))
+            })?;
+            continue;
+        }
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = parent.open_with(name, &options).map_err(|error| {
+            LpmError::Task(format!(
+                "failed to open task cache input {} without following links: {error}",
+                relative.display()
+            ))
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(LpmError::Task(format!(
+                "task cache input is not a real file: {}",
+                relative.display()
+            )));
+        }
+        return Ok(file.into_std());
+    }
+    Err(LpmError::Task("invalid empty task cache input path".into()))
 }
 
 fn expand_glob(pattern: &str) -> Vec<String> {
@@ -160,36 +231,69 @@ fn expand_glob(pattern: &str) -> Vec<String> {
     patterns
 }
 
-/// Canonicalize both the entry path and the project root and verify
-/// the entry resolves to a path under the project. Used to refuse
-/// committed symlinks that point outside the repo (`src/escape ->
-/// /etc/passwd`) before their target's bytes are folded into the
-/// cache key.
-///
-/// Returns `false` on canonicalization failure (broken symlink,
-/// permission denied, etc.) so a hostile entry can't bypass the
-/// check by becoming unreadable.
+#[cfg(test)]
 fn target_stays_in_project(entry: &Path, project_dir: &Path) -> bool {
-    let Ok(entry_canon) = entry.canonicalize() else {
-        return false;
+    entry.canonicalize().is_ok_and(|entry| {
+        project_dir
+            .canonicalize()
+            .is_ok_and(|project| entry.starts_with(project))
+    })
+}
+
+fn open_project_directory(project_dir: &Path) -> Option<Dir> {
+    let canonical_project = project_dir.canonicalize().ok()?;
+    Dir::open_ambient_dir(canonical_project, cap_std::ambient_authority()).ok()
+}
+
+fn hash_implicit_project_file(
+    hasher: &mut Sha256,
+    project: Option<&Dir>,
+    kind: &str,
+    name: &str,
+) -> bool {
+    let Some(project) = project else {
+        hasher.update(kind.as_bytes());
+        hasher.update(b":");
+        hasher.update(name.as_bytes());
+        hasher.update(b":<project-unreadable>\n");
+        return true;
     };
-    let Ok(project_canon) = project_dir.canonicalize() else {
-        // Project root unreadable — fail closed.
-        return false;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = match project.open_with(name, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => {
+            hash_implicit_file_value(hasher, kind, name, "<unsafe-or-unreadable>");
+            return true;
+        }
     };
-    entry_canon.starts_with(&project_canon)
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        hash_implicit_file_value(hasher, kind, name, "<unsafe-or-unreadable>");
+        return true;
+    }
+    let hash =
+        sha256_hex_reader(&mut file.into_std()).unwrap_or_else(|_| "<unsafe-or-unreadable>".into());
+    hash_implicit_file_value(hasher, kind, name, &hash);
+    true
+}
+
+fn hash_implicit_file_value(hasher: &mut Sha256, kind: &str, name: &str, value: &str) {
+    hash_record(
+        hasher,
+        7,
+        &[kind.as_bytes(), name.as_bytes(), value.as_bytes()],
+    );
 }
 
 /// Compute SHA-256 hex string of a file using streaming reads.
 ///
 /// Reads in 8 KiB chunks to avoid loading large files entirely into memory.
-fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
-    use std::io::Read;
+fn sha256_hex_reader(reader: &mut impl std::io::Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(path)?;
     let mut buf = [0u8; 8192];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -198,12 +302,15 @@ fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[cfg(test)]
+fn sha256_hex_file(path: &Path) -> std::io::Result<String> {
+    sha256_hex_reader(&mut std::fs::File::open(path)?)
+}
+
 /// Canonicalize a JSON string so key ordering is deterministic.
 ///
 /// Parses the JSON, explicitly sorts object keys recursively via `BTreeMap`,
-/// then re-serializes. This is safe regardless of whether `serde_json` uses
-/// BTreeMap or IndexMap internally (`preserve_order` feature).
-/// If parsing fails (not valid JSON), returns the original string as-is.
+/// then re-serializes. If parsing fails, returns the original string as-is.
 fn canonicalize_json(json: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(json) {
         Ok(value) => {
@@ -251,6 +358,31 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn compute_cache_key(
+        project_dir: &Path,
+        command: &str,
+        extra_args: &[String],
+        runtime_identities: &[(String, String)],
+        input_globs: &[String],
+        env_vars: &HashMap<String, String>,
+        deps_json: &str,
+    ) -> String {
+        super::compute_cache_key(
+            project_dir,
+            command,
+            extra_args,
+            runtime_identities,
+            input_globs,
+            env_vars,
+            deps_json,
+        )
+        .unwrap()
+    }
+
+    fn collect_input_files(project_dir: &Path, globs: &[String]) -> Vec<(String, String)> {
+        super::collect_input_files(project_dir, globs).unwrap()
+    }
+
     #[test]
     fn deterministic_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -293,6 +425,67 @@ mod tests {
     }
 
     #[test]
+    fn lpm_json_change_invalidates_cache_with_custom_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("source.txt"), "source").unwrap();
+        fs::write(dir.path().join("lpm.json"), r#"{"tasks":{}}"#).unwrap();
+        let env = HashMap::new();
+        let inputs = ["source.txt".into()];
+        let key1 = compute_cache_key(dir.path(), "build", &[], &[], &inputs, &env, "{}");
+
+        fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"tasks":{"build":{"dependsOn":["generate"]}}}"#,
+        )
+        .unwrap();
+        let key2 = compute_cache_key(dir.path(), "build", &[], &[], &inputs, &env, "{}");
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn authoritative_lockfile_change_invalidates_cache_with_custom_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("source.txt"), "source").unwrap();
+        fs::write(dir.path().join("lpm.lock"), "resolution = 1").unwrap();
+        let env = HashMap::new();
+        let inputs = ["source.txt".into()];
+        let key1 = compute_cache_key(dir.path(), "build", &[], &[], &inputs, &env, "{}");
+
+        fs::write(dir.path().join("lpm.lock"), "resolution = 2").unwrap();
+        let key2 = compute_cache_key(dir.path(), "build", &[], &[], &inputs, &env, "{}");
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn derived_binary_lockfile_does_not_duplicate_authoritative_lockfile_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.lock"), "resolution = 1").unwrap();
+        fs::write(dir.path().join("lpm.lockb"), "derived one").unwrap();
+        let env = HashMap::new();
+        let key1 = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
+
+        fs::write(dir.path().join("lpm.lockb"), "derived two").unwrap();
+        let key2 = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
+
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn ecosystem_lockfile_change_invalidates_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("pnpm-lock.yaml"), "version: 1").unwrap();
+        let env = HashMap::new();
+        let key1 = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
+
+        fs::write(dir.path().join("pnpm-lock.yaml"), "version: 2").unwrap();
+        let key2 = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
     fn different_env_different_key() {
         let dir = tempfile::tempdir().unwrap();
         let mut env1 = HashMap::new();
@@ -304,6 +497,18 @@ mod tests {
         let key1 = compute_cache_key(dir.path(), "echo", &[], &[], &[], &env1, "{}");
         let key2 = compute_cache_key(dir.path(), "echo", &[], &[], &[], &env2, "{}");
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn environment_hash_framing_distinguishes_embedded_record_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let one_variable = HashMap::from([("A".into(), "x\nenv:B=y".into())]);
+        let two_variables = HashMap::from([("A".into(), "x".into()), ("B".into(), "y".into())]);
+
+        let one_key = compute_cache_key(dir.path(), "build", &[], &[], &[], &one_variable, "{}");
+        let two_keys = compute_cache_key(dir.path(), "build", &[], &[], &[], &two_variables, "{}");
+
+        assert_ne!(one_key, two_keys);
     }
 
     #[test]
@@ -460,6 +665,19 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
+    #[test]
+    fn input_hashing_handles_glob_metacharacters_in_project_path() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project[abc]");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/index.js"), "input").unwrap();
+
+        let files = collect_input_files(&project, &["src/**".into()]);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, Path::new("src/index.js").to_string_lossy());
+    }
+
     // -- canonicalize_value sorts keys explicitly --
 
     #[test]
@@ -506,8 +724,7 @@ mod tests {
         assert_eq!(hex::encode([0xde, 0xad, 0xbe, 0xef]), "deadbeef");
     }
 
-    /// M36: a regular file under project_dir is accepted by the
-    /// containment helper. Round-trip the obvious-allow case.
+    /// A regular file under project_dir is accepted by the containment helper.
     #[test]
     fn target_stays_in_project_accepts_regular_file_under_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -517,10 +734,7 @@ mod tests {
         assert!(target_stays_in_project(&file, dir.path()));
     }
 
-    /// M36: a committed symlink whose target lies OUTSIDE the project
-    /// is refused. Pre-fix the hasher would `is_file()` (follows
-    /// symlink → true) and fold the target's bytes into the cache
-    /// key — copying secret material across machines.
+    /// A committed symlink outside the project must not enter the cache key.
     #[cfg(unix)]
     #[test]
     fn target_stays_in_project_rejects_symlink_pointing_outside() {
@@ -538,7 +752,7 @@ mod tests {
         );
     }
 
-    /// M36: a broken symlink also fails closed (canonicalize errs).
+    /// A broken symlink also fails closed because canonicalization fails.
     /// Without this we'd silently swallow the entry instead of
     /// flagging it.
     #[cfg(unix)]

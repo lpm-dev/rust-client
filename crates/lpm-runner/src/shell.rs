@@ -127,7 +127,7 @@ pub(crate) fn strip_inherited_env_hooks(cmd: &mut Command) {
 /// fill the process with output before later truncation. Accumulation halts at
 /// 10 MiB while the reader keeps draining the pipe so the child
 /// doesn't block — the truncation marker is appended once.
-const MAX_CAPTURED_STREAM_BYTES: usize = 10 * 1024 * 1024;
+const MAX_CAPTURED_STREAM_BYTES: usize = lpm_common::TASK_OUTPUT_CAPTURE_BYTES;
 const OUTPUT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_ENDPOINT_OUTPUT_LINE_BYTES: usize = 64 * 1024;
 const MAX_PENDING_ENDPOINT_CANDIDATES: usize = 64;

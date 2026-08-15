@@ -1,5 +1,5 @@
 use lpm_common::LpmError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Check if a task has caching enabled, using pre-read config.
@@ -35,6 +35,52 @@ pub(super) struct CacheStoreRequest<'a> {
     pub(super) lpm_config: Option<&'a lpm_runner::lpm_json::LpmJsonConfig>,
 }
 
+fn effective_cache_inputs(
+    script_name: &str,
+    task_config: &lpm_runner::lpm_json::TaskConfig,
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Vec<String> {
+    let mut inputs = task_config.effective_inputs();
+    let Some(config) = lpm_config else {
+        return inputs;
+    };
+    let mut seen_tasks = HashSet::with_capacity(config.tasks.len());
+    seen_tasks.insert(script_name);
+    let mut pending: Vec<&str> = task_config
+        .depends_on
+        .iter()
+        .filter(|dependency| !dependency.starts_with('^'))
+        .map(String::as_str)
+        .collect();
+    let has_local_dependencies = !pending.is_empty();
+
+    while let Some(dependency) = pending.pop() {
+        if !seen_tasks.insert(dependency) {
+            continue;
+        }
+        let Some(dependency_config) = config.tasks.get(dependency) else {
+            continue;
+        };
+        inputs.extend(dependency_config.effective_inputs());
+        inputs.extend(dependency_config.outputs.iter().cloned());
+        pending.extend(
+            dependency_config
+                .depends_on
+                .iter()
+                .filter(|dependency| !dependency.starts_with('^'))
+                .map(String::as_str),
+        );
+    }
+
+    if has_local_dependencies {
+        inputs.push("package.json".into());
+    }
+
+    inputs.sort_unstable();
+    inputs.dedup();
+    inputs
+}
+
 /// Build the cache context for a task: reads lpm.json (or uses provided config),
 /// resolves the command, and computes the cache key. Returns `None` if caching
 /// is not enabled or outputs are empty (shared helper eliminates
@@ -64,7 +110,12 @@ pub(super) fn build_cache_context(
         _ => return Ok(None),
     };
 
-    let env_vars = lpm_runner::script::load_script_env(project_dir, script_name, env_mode)?;
+    let env_vars = lpm_runner::script::load_script_env_with_config(
+        project_dir,
+        script_name,
+        env_mode,
+        config_ref,
+    )?;
     let inherited_env = lpm_runner::shell::inherited_child_env();
     let mut child_env = HashMap::with_capacity(inherited_env.len() + env_vars.len());
     child_env.extend(
@@ -87,33 +138,41 @@ pub(super) fn build_cache_context(
     );
 
     let pkg_json_path = project_dir.join("package.json");
-    let deps_json = if pkg_json_path.exists() {
-        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("failed to read package.json: {e}")))?;
-        serde_json::to_string(&pkg.dependencies).unwrap_or_default()
+    let (package, package_json) = if pkg_json_path.exists() {
+        let package_json = lpm_common::read_text_file_capped(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|error| LpmError::Script(format!("failed to read package.json: {error}")))?;
+        let package: lpm_workspace::PackageJson = serde_json::from_str(
+            lpm_common::strip_utf8_bom_str(&package_json),
+        )
+        .map_err(|error| LpmError::Script(format!("failed to parse package.json: {error}")))?;
+        (Some(package), package_json)
     } else {
-        "{}".into()
+        (None, "{}".into())
     };
 
     let command = if let Some(cmd) = &task_config.command {
         cmd.clone()
-    } else if pkg_json_path.exists() {
-        let pkg = lpm_workspace::read_package_json(&pkg_json_path)
-            .map_err(|e| LpmError::Script(format!("{e}")))?;
-        pkg.scripts.get(script_name).cloned().unwrap_or_default()
     } else {
-        String::new()
+        package
+            .as_ref()
+            .and_then(|pkg| pkg.scripts.get(script_name))
+            .cloned()
+            .unwrap_or_default()
     };
 
+    let cache_inputs = effective_cache_inputs(script_name, task_config, config_ref);
     let cache_key = lpm_task::hasher::compute_cache_key(
         project_dir,
         &command,
         extra_args,
         &runtime_identities,
-        &task_config.effective_inputs(),
+        &cache_inputs,
         &child_env,
-        &deps_json,
-    );
+        &package_json,
+    )?;
 
     Ok(Some(CacheContext {
         task_config: task_config.clone(),
@@ -150,13 +209,25 @@ pub(super) fn try_cache_hit_with_config(
     };
 
     if lpm_task::cache::has_cache_hit(&ctx.cache_key) {
-        let hit = lpm_task::cache::restore_cache(&ctx.cache_key, project_dir)?;
-        return Ok(Some(hit));
+        match lpm_task::cache::restore_cache(&ctx.cache_key, project_dir, &ctx.task_config.outputs)
+        {
+            Ok(hit) => return Ok(Some(hit)),
+            Err(error) => {
+                tracing::warn!(
+                    "local task cache entry {} is invalid; treating it as a miss: {error}",
+                    ctx.cache_key
+                );
+            }
+        }
     }
 
     if let Some(remote_cache) = &ctx.remote_cache
-        && let Some(hit) =
-            crate::commands::remote_cache::try_restore(remote_cache, &ctx.cache_key, project_dir)
+        && let Some(hit) = crate::commands::remote_cache::try_restore(
+            remote_cache,
+            &ctx.cache_key,
+            project_dir,
+            &ctx.task_config.outputs,
+        )
     {
         if let Err(error) = lpm_task::cache::store_cache(
             &ctx.cache_key,

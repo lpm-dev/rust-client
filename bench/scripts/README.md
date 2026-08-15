@@ -319,6 +319,8 @@ The fixed PR profile covers:
 - explicit env mapping
 - root Node plus workspace-member Bun
 - 10-task and 100-task deep and wide task graphs
+- a 1 MiB hot task-cache restore
+- two concurrent writers that publish one complete cache entry
 - single-service and dependency-ordered multi-service dev
 - 10-service deep and wide dependency graphs
 - simultaneous projects with different runtimes and env values
@@ -329,11 +331,11 @@ The fixed PR profile covers:
 - a 1 MiB HTTP readiness body, which must not inflate the CLI process
 - a 1 MiB tunneled response through a local deterministic relay
 
-The full profile adds 1,000-task deep and wide graphs. It also adds
-50-service graphs, four concurrent projects, and larger readiness and tunnel
-responses. The profile includes tunnel fairness, WebSocket recovery, and a
-local tunnel burst with the dashboard under a PTY. The PR profile has a
-15-second scenario timeout.
+The full profile adds 1,000-task deep and wide graphs and a 128 MiB hot
+task-cache restore. It also adds 50-service graphs, four concurrent projects,
+and larger readiness and tunnel responses. The profile includes tunnel
+fairness, WebSocket recovery, and a local tunnel burst with the dashboard
+under a PTY. The PR profile has a 15-second scenario timeout.
 The full profile has a 60-second timeout. `--timeout-ms` overrides either value.
 Runtime downloads and tunnel traffic are local and deterministic. The harness
 continuously drains output, retains only a bounded prefix and tail, and records
@@ -398,6 +400,18 @@ node bench/scripts/run-runtime-readiness.mjs \
   --compare main,candidate \
   --profile full \
   --scenarios task/deep-10,task/wide-10,task/deep-100,task/wide-100,task/deep-1000,task/wide-1000 \
+  --samples 10
+```
+
+Run only the task-cache cells:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary main=/tmp/lpm-main/release/lpm-rs \
+  --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
+  --compare main,candidate \
+  --profile full \
+  --scenarios cache/hit-1mib,cache/hit-128mib,cache/hit-500-files,cache/hit-deep-path,cache/removes-stale-output,cache/concurrent-same-key-store \
   --samples 10
 ```
 
