@@ -18,6 +18,7 @@ const STEADY_WINDOW_MS = 350;
 const PR_TIMEOUT_MS = 15_000;
 const FULL_TIMEOUT_MS = 60_000;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
+const TASK_RSS_HOLD_MS = 300;
 const MiB = 1024 * 1024;
 
 function defaultTimeoutMs(profile) {
@@ -532,6 +533,12 @@ function buildScenarios() {
     runLpmJsonNodeSelectorPrecedenceScenario(),
     runTaskEnvManagedNodeScenario(),
     runWorkspaceNodeBunScenario(),
+    taskGraphScenario(10, 'deep'),
+    taskGraphScenario(10, 'wide'),
+    taskGraphScenario(100, 'deep'),
+    taskGraphScenario(100, 'wide'),
+    taskGraphScenario(1_000, 'deep', true),
+    taskGraphScenario(1_000, 'wide', true),
     devSingleScenario(),
     devMultiScenario(),
     devGraphScenario(10, 'deep'),
@@ -673,6 +680,52 @@ function runWorkspaceNodeBunScenario() {
     });
     return node.ok && bun.ok ? { ok: true } : { ok: false, reason: node.reason ?? bun.reason };
   });
+}
+
+function taskGraphScenario(taskCount, shape, fullOnly = false) {
+  const scenarioId = `task/${shape}-${taskCount}`;
+  const tasks = {};
+  let requestedTask;
+  if (shape === 'deep') {
+    let dependency = 'leaf';
+    for (let index = 1; index < taskCount; index += 1) {
+      const name = `task-${index}`;
+      tasks[name] = { dependsOn: [dependency] };
+      dependency = name;
+    }
+    requestedTask = dependency;
+  } else if (shape === 'wide') {
+    const branches = [];
+    for (let index = 0; index < taskCount - 2; index += 1) {
+      const name = `branch-${index}`;
+      tasks[name] = { dependsOn: ['leaf'] };
+      branches.push(name);
+    }
+    requestedTask = 'root';
+    tasks[requestedTask] = { dependsOn: branches };
+  } else {
+    throw new Error(`unknown task graph shape: ${shape}`);
+  }
+
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: `runtime-task-${shape}-${taskCount}`,
+        private: true,
+        scripts: { leaf: 'node probe.mjs' },
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), { tasks });
+      writeFile(
+        context.projectRoot,
+        'probe.mjs',
+        `setTimeout(() => {\n${resultScript({ scenario: scenarioId, env: [] })}}, ${TASK_RSS_HOLD_MS});\n`,
+      );
+    }, shape === 'wide'
+      ? ['run', requestedTask, '--parallel']
+      : ['run', requestedTask],
+    (result) => markerContract(result, { scenario: scenarioId })),
+    fullOnly,
+  };
 }
 
 function devSingleScenario() {
@@ -2928,6 +2981,8 @@ async function runSelfTests() {
   assert.equal(warmupBlocksComparison('candidate', candidate, { baseline: 'main', candidate: 'candidate' }), false);
   assert.doesNotThrow(() => JSON.stringify({ value: Number.POSITIVE_INFINITY }, jsonFiniteReplacer));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'run/package-system-node-no-lpm-json'));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/wide-100'));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'tunnel/websocket-fairness-close-cancellation'));
   process.stdout.write('run-runtime-readiness self-test passed\n');
 }

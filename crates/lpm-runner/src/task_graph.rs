@@ -17,6 +17,16 @@ pub fn build_task_graph(
     tasks: &HashMap<String, TaskConfig>,
     requested: &[String],
 ) -> Result<HashMap<String, Vec<String>>, String> {
+    let graph = build_task_graph_nodes(scripts, tasks, requested)?;
+    dag::topological_levels(&graph)?;
+    Ok(graph)
+}
+
+fn build_task_graph_nodes(
+    scripts: &HashMap<String, String>,
+    tasks: &HashMap<String, TaskConfig>,
+    requested: &[String],
+) -> Result<HashMap<String, Vec<String>>, String> {
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     let mut to_process: Vec<String> = requested.to_vec();
     let mut seen: HashSet<String> = HashSet::new();
@@ -57,11 +67,6 @@ pub fn build_task_graph(
         graph.insert(task_name, local_deps);
     }
 
-    // Validate no cycles (validate_deps checks references, topological_levels checks cycles)
-    dag::validate_deps(&graph)?;
-    // Also run the sort to detect cycles (validate_deps only checks existence)
-    dag::topological_levels(&graph)?;
-
     Ok(graph)
 }
 
@@ -73,8 +78,29 @@ pub fn task_levels(
     tasks: &HashMap<String, TaskConfig>,
     requested: &[String],
 ) -> Result<Vec<Vec<String>>, String> {
-    let graph = build_task_graph(scripts, tasks, requested)?;
-    dag::topological_levels(&graph)
+    let graph = build_task_graph_nodes(scripts, tasks, requested)?;
+    let mut levels = dag::topological_levels(&graph)?;
+    let requested_rank: HashMap<&str, usize> = requested
+        .iter()
+        .enumerate()
+        .map(|(rank, name)| (name.as_str(), rank))
+        .collect();
+    for level in &mut levels {
+        level.sort_by(|left, right| {
+            requested_rank
+                .get(left.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &requested_rank
+                        .get(right.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .then_with(|| left.cmp(right))
+        });
+    }
+    Ok(levels)
 }
 
 #[cfg(test)]
@@ -118,6 +144,16 @@ mod tests {
         let levels = task_levels(&s, &t, &requested).unwrap();
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].len(), 3);
+    }
+
+    #[test]
+    fn independent_requested_tasks_preserve_request_order() {
+        let s = scripts(&[("z-prepare", "prepare"), ("a-consume", "consume")]);
+        let requested = vec!["z-prepare".into(), "a-consume".into()];
+
+        let levels = task_levels(&s, &HashMap::new(), &requested).unwrap();
+
+        assert_eq!(levels, vec![requested]);
     }
 
     #[test]

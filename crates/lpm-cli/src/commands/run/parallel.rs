@@ -37,7 +37,7 @@ pub(super) fn truncate_output(output: String) -> String {
 const TASK_COLORS: &[&str] = &["36", "33", "35", "32", "34", "31"];
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_tasks_parallel(
+pub(super) fn run_tasks_parallel(
     project_dir: &Path,
     levels: &[Vec<String>],
     extra_args: &[String],

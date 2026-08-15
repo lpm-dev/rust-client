@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_tasks_sequential(
+pub(super) fn run_tasks_sequential(
     project_dir: &Path,
     scripts: &[String],
     extra_args: &[String],

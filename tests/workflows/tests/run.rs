@@ -964,6 +964,91 @@ fn script_shortcut_runs_lpm_json_meta_task_and_dependencies() {
     }
 }
 
+#[test]
+fn run_prefers_an_lpm_task_command_over_the_same_named_package_script() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "task-command-precedence",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "node package-build.js"
+            }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "command": "node lpm-build.js"
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "package-build.js",
+        "require('fs').writeFileSync('package-command-ran.txt', 'yes');",
+    );
+    project.write_file(
+        "lpm-build.js",
+        "require('fs').writeFileSync('lpm-command-ran.txt', 'yes');",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run a task with both command sources");
+
+    assert!(
+        output.status.success(),
+        "lpm task command must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.file_exists("lpm-command-ran.txt"),
+        "lpm.json task command did not run"
+    );
+    assert!(
+        !project.file_exists("package-command-ran.txt"),
+        "same-named package.json script overrode the lpm.json task command"
+    );
+}
+
+#[test]
+fn sequential_run_preserves_the_requested_order_for_independent_scripts() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "requested-task-order",
+            "version": "1.0.0",
+            "scripts": {
+                "z-prepare": "node prepare.js",
+                "a-consume": "node consume.js"
+            }
+        }"#,
+    );
+    project.write_file(
+        "prepare.js",
+        "require('fs').writeFileSync('prepared.txt', 'yes');",
+    );
+    project.write_file(
+        "consume.js",
+        "if (!require('fs').existsSync('prepared.txt')) process.exit(23);",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "z-prepare", "a-consume"])
+        .output()
+        .expect("run independent scripts sequentially");
+
+    assert!(
+        output.status.success(),
+        "sequential scripts ran out of request order\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 // ─── Env Loading ─────────────────────────────────────────────────
 
 #[test]
@@ -1981,6 +2066,234 @@ fn member_ran(project: &TempProject, member: &str) -> bool {
     project.file_exists(&format!("packages/{member}/ran-{member}.txt"))
 }
 
+fn seed_workspace_with_upstream_build_tasks(project: &TempProject) {
+    for member in ["app", "core", "utils"] {
+        let pkg_path = format!("packages/{member}/package.json");
+        let pkg_content = project.read_file(&pkg_path);
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&pkg_content).expect("parse member package.json");
+        pkg["scripts"] = serde_json::json!({
+            "build": format!("node -e \"require('fs').writeFileSync('ran-{member}.txt','ok')\""),
+        });
+        project.write_file(&pkg_path, &serde_json::to_string_pretty(&pkg).unwrap());
+        project.write_file(
+            &format!("packages/{member}/lpm.json"),
+            r#"{"tasks":{"build":{"dependsOn":["^build"]}}}"#,
+        );
+    }
+}
+
+#[test]
+fn run_filter_executes_upstream_task_dependencies_before_the_selected_member() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_upstream_build_tasks(&project);
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run a filtered task with upstream task dependencies");
+
+    assert!(
+        output.status.success(),
+        "filtered upstream task graph must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    for member in ["utils", "core", "app"] {
+        assert!(
+            member_ran(&project, member),
+            "{member} build must execute for app's ^build dependency"
+        );
+    }
+}
+
+#[test]
+fn run_filter_json_counts_selected_and_upstream_task_members() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_upstream_build_tasks(&project);
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app", "--json"])
+        .output()
+        .expect("run a filtered upstream task graph as JSON");
+
+    assert!(
+        output.status.success(),
+        "filtered JSON task graph must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["packages"], 3);
+    assert_eq!(json["succeeded"], 3);
+    let mut normalized = json;
+    normalized["duration_ms"] = serde_json::json!(0);
+    insta::assert_json_snapshot!(normalized, @r###"
+    {
+      "success": true,
+      "packages": 3,
+      "succeeded": 3,
+      "duration_ms": 0
+    }
+    "###);
+}
+
+#[test]
+fn run_filter_accepts_an_upstream_meta_task_that_only_has_upstream_dependencies() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["app", "utils"] {
+        let pkg_path = format!("packages/{member}/package.json");
+        let mut pkg: serde_json::Value =
+            serde_json::from_str(&project.read_file(&pkg_path)).expect("parse member package.json");
+        pkg["scripts"] = serde_json::json!({
+            "build": format!("node -e \"require('fs').writeFileSync('ran-{member}.txt','ok')\""),
+        });
+        project.write_file(&pkg_path, &serde_json::to_string_pretty(&pkg).unwrap());
+    }
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{"tasks":{"build":{"dependsOn":["^build"]}}}"#,
+    );
+    project.write_file(
+        "packages/core/lpm.json",
+        r#"{"tasks":{"build":{"dependsOn":["^build"]}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run an upstream caret-only meta-task");
+
+    assert!(
+        output.status.success(),
+        "caret-only meta-task must succeed after its upstream task\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(member_ran(&project, "utils"), "upstream build did not run");
+    assert!(member_ran(&project, "app"), "selected build did not run");
+}
+
+#[test]
+fn run_filter_rejects_a_missing_upstream_workspace_task_before_execution() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let app_package_path = "packages/app/package.json";
+    let mut app_package: serde_json::Value =
+        serde_json::from_str(&project.read_file(app_package_path)).expect("parse app package.json");
+    app_package["scripts"] = serde_json::json!({
+        "build": "node -e \"require('fs').writeFileSync('app-ran.txt','yes')\"",
+    });
+    project.write_file(
+        app_package_path,
+        &serde_json::to_string_pretty(&app_package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{"tasks":{"build":{"dependsOn":["^build"]}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run a missing upstream workspace task");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "missing upstream task was accepted\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("does not define task 'build'"),
+        "missing upstream task diagnostic was unclear: {stderr}"
+    );
+    assert!(
+        !project.file_exists("packages/app/app-ran.txt"),
+        "selected task ran before its upstream graph was validated"
+    );
+}
+
+#[test]
+fn run_filter_rejects_a_workspace_task_cycle_before_execution() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_upstream_build_tasks(&project);
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": { "dependsOn": ["^build", "cycle"] },
+                "cycle": { "dependsOn": ["build"] }
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run a cyclic workspace task graph");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "cyclic workspace task graph was accepted"
+    );
+    assert!(
+        stderr.contains("circular dependency"),
+        "cycle diagnostic was unclear: {stderr}"
+    );
+    for member in ["utils", "core", "app"] {
+        assert!(
+            !member_ran(&project, member),
+            "{member} ran before the workspace task graph was validated"
+        );
+    }
+}
+
+#[test]
+fn run_filter_rejects_malformed_upstream_task_dependencies_before_execution() {
+    for malformed_dependency in ["^", "^^build"] {
+        let project = TempProject::from_fixture("workspace-monorepo");
+        let app_package_path = "packages/app/package.json";
+        let mut app_package: serde_json::Value =
+            serde_json::from_str(&project.read_file(app_package_path))
+                .expect("parse app package.json");
+        app_package["scripts"] = serde_json::json!({
+            "build": "node -e \"require('fs').writeFileSync('app-ran.txt','yes')\"",
+        });
+        project.write_file(
+            app_package_path,
+            &serde_json::to_string_pretty(&app_package).unwrap(),
+        );
+        project.write_file(
+            "packages/app/lpm.json",
+            &serde_json::json!({
+                "tasks": {
+                    "build": { "dependsOn": [malformed_dependency] }
+                }
+            })
+            .to_string(),
+        );
+
+        let output = lpm(&project)
+            .args(["run", "build", "--filter", "@test/app"])
+            .output()
+            .expect("run a malformed upstream task dependency");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "malformed upstream dependency '{malformed_dependency}' was accepted"
+        );
+        assert!(
+            stderr.contains("invalid upstream dependency"),
+            "malformed upstream diagnostic was unclear: {stderr}"
+        );
+        assert!(
+            !project.file_exists("packages/app/app-ran.txt"),
+            "task ran before malformed upstream dependency was rejected"
+        );
+    }
+}
+
 #[test]
 fn run_filter_executes_only_matched_members() {
     let project = TempProject::from_fixture("workspace-monorepo");
@@ -2059,6 +2372,40 @@ fn run_filter_bails_after_first_failed_workspace_member_by_default() {
     assert!(
         !member_ran(&project, "app"),
         "app must not run after an earlier selected package fails by default"
+    );
+}
+
+#[test]
+fn run_no_bail_skips_workspace_caret_dependents_after_an_upstream_task_fails() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_with_failing_leaf_script(&project);
+    for member in ["app", "core", "utils"] {
+        project.write_file(
+            &format!("packages/{member}/lpm.json"),
+            r#"{"tasks":{"check":{"dependsOn":["^check"]}}}"#,
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["run", "check", "--all", "--no-bail"])
+        .output()
+        .expect("run a failing workspace graph with no-bail");
+
+    assert!(
+        !output.status.success(),
+        "workspace run must report the failed dependency"
+    );
+    assert!(
+        member_ran(&project, "utils"),
+        "the failing dependency did not run"
+    );
+    assert!(
+        !member_ran(&project, "core"),
+        "core ran even though its utils dependency failed"
+    );
+    assert!(
+        !member_ran(&project, "app"),
+        "app ran even though its transitive dependency failed"
     );
 }
 
