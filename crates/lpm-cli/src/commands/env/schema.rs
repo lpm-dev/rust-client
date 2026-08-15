@@ -160,19 +160,17 @@ pub(super) fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result
 }
 
 pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
-    let schema = config
-        .and_then(|c| c.env_schema)
+    let schema = lpm_config
+        .as_ref()
+        .and_then(|config| config.env_schema.as_ref())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             LpmError::Script(
                 "no envSchema defined in lpm.json. Add an envSchema section first.".into(),
             )
         })?;
-
-    // Get all environment names from lpm.json env mapping
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     // Discover all environments via the canonical resolver.
     // This produces a consistent, deduplicated list from config + vault,
@@ -188,6 +186,7 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
 
     let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> = Vec::new();
     let mut all_valid = true;
+    let validator = lpm_env::EnvValidator::new(schema);
 
     for env_name in &env_names {
         let mode = if env_name == "default" {
@@ -201,7 +200,7 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
             lpm_runner::dotenv::load_project_env_with_schema_validation(project_dir, mode, false)?;
 
         // Run schema validation manually to collect per-env errors
-        let errors = lpm_env::validate(&schema, &mut env_vars);
+        let errors = validator.validate(&mut env_vars);
         if !errors.is_empty() {
             all_valid = false;
         }
@@ -254,18 +253,19 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
                 )
             );
         } else {
-            let missing: Vec<&str> = errors.iter().map(|e| e.key.as_str()).collect();
             println!(
                 "{}",
                 install_ui::terminal_line!(
-                    "  {}  {}  {}/{} — missing: {}",
+                    "  {}  {}  {}/{} valid",
                     install_ui::bold(name),
                     install_ui::red("✗"),
                     valid,
                     total,
-                    install_ui::red(&missing.join(", ")),
                 )
             );
+            for error in errors {
+                println!("    {}", install_ui::red(&error.to_string()));
+            }
         }
     }
     println!();

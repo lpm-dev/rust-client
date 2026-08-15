@@ -1,6 +1,6 @@
 //! Schema types for environment variable validation.
 //!
-//! Parsed from the `env.schema` section of `lpm.json`.
+//! Parsed from the `envSchema` section of `lpm.json`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,12 +9,13 @@ use std::collections::HashMap;
 ///
 /// Deserialized from `lpm.json`:
 /// ```json
-/// { "env": { "schema": { "DATABASE_URL": { "required": true, "format": "url" } } } }
+/// { "envSchema": { "vars": { "DATABASE_URL": { "required": true, "format": "url" } } } }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct EnvSchema {
     #[serde(default)]
+    #[schemars(extend("propertyNames" = {"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$"}))]
     pub vars: HashMap<String, EnvVarRule>,
 }
 
@@ -30,7 +31,8 @@ pub struct EnvVarRule {
     #[serde(default)]
     pub format: Option<VarFormat>,
 
-    /// Regex pattern the value must match.
+    /// Rust regular expression the value must match.
+    /// Use `^` and `$` to require a full-value match.
     #[serde(default)]
     pub pattern: Option<String>,
 
@@ -38,11 +40,11 @@ pub struct EnvVarRule {
     #[serde(default, rename = "enum")]
     pub enum_values: Option<Vec<String>>,
 
-    /// Default value if not set (injected at runtime, not written to files).
+    /// Default value if not set. It must satisfy the same validation rules.
     #[serde(default)]
     pub default: Option<String>,
 
-    /// Whether this variable contains sensitive data (redacted in logs).
+    /// Whether this variable contains sensitive data (fully redacted in errors and logs).
     #[serde(default)]
     pub secret: bool,
 
@@ -115,7 +117,7 @@ mod tests {
         let json = r#"{
             "required": true,
             "format": "url",
-            "pattern": "postgres://.*",
+            "pattern": "^postgres://.*$",
             "secret": true,
             "client": false,
             "description": "PostgreSQL connection string",
@@ -124,7 +126,7 @@ mod tests {
         let rule: EnvVarRule = serde_json::from_str(json).unwrap();
         assert!(rule.required);
         assert_eq!(rule.format, Some(VarFormat::Url));
-        assert_eq!(rule.pattern.as_deref(), Some("postgres://.*"));
+        assert_eq!(rule.pattern.as_deref(), Some("^postgres://.*$"));
         assert!(rule.secret);
         assert!(!rule.client);
         assert_eq!(

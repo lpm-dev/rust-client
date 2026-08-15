@@ -964,6 +964,92 @@ fn env_check_json_exits_zero_when_environment_is_valid() {
 }
 
 #[test]
+fn env_check_accepts_documented_regex_and_validated_defaults() {
+    let project = TempProject::empty(r#"{"name":"env-check","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+  "envSchema": {
+    "vars": {
+      "LOG_LEVEL": { "pattern": "^(trace|debug|info|warn|error)$" },
+      "PORT": { "default": "3000", "format": "port" }
+    }
+  }
+}"#,
+    );
+    write_dotenv(&project, ".env", "LOG_LEVEL=info\n");
+
+    let output = lpm(&project)
+        .args(["env", "check"])
+        .output()
+        .expect("failed to run lpm env check");
+
+    assert!(
+        output.status.success(),
+        "documented regex and valid default must pass:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn env_check_rejects_invalid_secret_default_without_exposing_it() {
+    let project = TempProject::empty(r#"{"name":"env-check","version":"1.0.0"}"#);
+    let secret = "prefix_private_material_suffix";
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+  "envSchema": {{
+    "vars": {{
+      "TOKEN": {{ "default": "{secret}", "format": "url", "secret": true }}
+    }}
+  }}
+}}"#
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["env", "check"])
+        .output()
+        .expect("failed to run lpm env check");
+
+    assert!(!output.status.success(), "invalid default must fail");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for fragment in [secret, "prefix", "suffix", "private_material"] {
+        assert!(!combined.contains(fragment), "output leaked {fragment}");
+    }
+    assert!(combined.contains("TOKEN"), "{combined}");
+}
+
+#[test]
+fn env_check_human_output_reports_an_invalid_default_as_invalid() {
+    let project = TempProject::empty(r#"{"name":"env-check","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"PORT":{"default":"70000","format":"port"}}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["env", "check"])
+        .output()
+        .expect("run lpm env check with an invalid default");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!output.status.success(), "invalid default must fail");
+    assert!(combined.contains("PORT: invalid format"), "{combined}");
+    assert!(!combined.contains("missing: PORT"), "{combined}");
+}
+
+#[test]
 fn env_check_without_lpm_json_env_schema_fails_with_helpful_message() {
     let project = TempProject::empty(r#"{"name":"env","version":"1.0.0"}"#);
 
