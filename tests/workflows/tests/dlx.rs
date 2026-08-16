@@ -215,9 +215,16 @@ fn dlx_cache_hit_executes_cached_binary_without_extending_ttl() {
         .path()
         .canonicalize()
         .expect("project path must canonicalize");
-    assert!(
-        stdout.contains(&format!("cwd:{}", expected_cwd.display())),
-        "dlx must execute from the caller project directory, got:\n{stdout}"
+    let reported_cwd = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("cwd:"))
+        .expect("cached dlx binary must report its working directory");
+    let reported_cwd = std::path::Path::new(reported_cwd)
+        .canonicalize()
+        .expect("reported working directory must canonicalize");
+    assert_eq!(
+        reported_cwd, expected_cwd,
+        "dlx must execute from the caller project directory; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("args:--loud hello"),
