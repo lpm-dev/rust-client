@@ -12,7 +12,7 @@ use support::auth_state::{
     token_expiry_path, write_credentials_store,
 };
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -292,6 +292,79 @@ async fn whoami_recovers_session_from_refresh_token_only() {
             { ".duration_ms" => "[DURATION]" }
         );
     });
+}
+
+#[tokio::test]
+async fn login_uses_refresh_session_before_starting_browser_flow() {
+    let project =
+        TempProject::empty(r#"{"name":"login-refresh-preflight-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", "Bearer expired-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    mock.with_refresh_expected(
+        "valid-refresh",
+        "rotated-access",
+        "rotated-refresh",
+        "2030-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_authenticated_whoami("rotated-access", "testuser", "test@example.com")
+        .await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("expired-access"),
+            refresh_token: Some("valid-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let mut command = lpm_spawnable(&project);
+    command
+        .args(["--registry", &mock.url(), "--insecure", "login", "--json"])
+        .env("BROWSER", "false");
+    let mut child = command.spawn().expect("failed to spawn lpm login");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("failed to poll lpm login")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("failed to stop stuck browser login");
+            let output = child
+                .wait_with_output()
+                .expect("failed to collect stuck login output");
+            panic!(
+                "login started the browser callback flow instead of refreshing:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect login output");
+    assert!(
+        output.status.success(),
+        "refresh-backed login preflight failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[tokio::test]

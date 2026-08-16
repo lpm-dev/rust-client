@@ -66,12 +66,16 @@ async fn read_capped_exchange_body(mut response: reqwest::Response) -> Result<Ve
 /// 3. User authenticates in browser
 /// 4. Browser posts a short-lived exchange code to the loopback callback
 /// 5. Redeem the PKCE-bound code, verify the token, and store the session
-pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> {
-    // Check if already logged in
-    if let Some(existing) = auth::get_token(registry_url) {
-        let client = lpm_registry::RegistryClient::new()
-            .with_base_url(registry_url.to_string())
-            .with_token(existing);
+pub async fn run(
+    client: &RegistryClient,
+    registry_url: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if client
+        .session()
+        .and_then(|session| session.current_source())
+        .is_some()
+    {
         if let Ok(info) = client.whoami().await {
             let name = info
                 .profile_username
@@ -87,7 +91,6 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
             }
             return Ok(());
         }
-        // Token is invalid — proceed with login
     }
 
     if !json_output {
