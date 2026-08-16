@@ -118,16 +118,25 @@ function assertNpmPublishRecoveryWorkflow(workflowSource) {
   };
 
   assert.match(releaseWorkflow, /^\s+- npm-publish-only$/m);
-  for (const source of [
-    jobSource("publish-npm-platform", "publish-npm-wrapper"),
-    jobSource("publish-npm-wrapper", "update-homebrew"),
-  ]) {
+  assert.match(
+    releaseWorkflow,
+    /if \[ "\$MODE" != "full" \] && \[ "\$GITHUB_REF" != "refs\/heads\/main" \]; then/,
+  );
+  const platformSource = jobSource("publish-npm-platform", "publish-npm-wrapper");
+  const wrapperSource = jobSource("publish-npm-wrapper", "update-homebrew");
+  for (const source of [platformSource, wrapperSource]) {
     assert.match(source, /inputs\.mode == 'npm-publish-only'/);
-    assert.match(source, /run-id: \$\{\{ steps\.source\.outputs\.run_id \}\}/);
+    assert.match(source, /node npm\/release\/validate-recovery-source\.mjs/);
+    assert.match(source, /--purpose (?:npm-publish|"\$RECOVERY_PURPOSE")/);
+    assert.match(source, /artifact-ids: \$\{\{ steps\.source\.outputs\.artifact_id \}\}/);
+    assert.match(source, /run-id: \$\{\{ inputs\.source_run_id \}\}/);
     assert.match(source, /repository: \$\{\{ github\.repository \}\}/);
     assert.match(source, /github-token: \$\{\{ github\.token \}\}/);
     assert.match(source, /test "\$ARTIFACT_VERSION" = "\$INPUT_VERSION"/);
   }
+  assert.match(wrapperSource, /inputs\.mode == 'wrapper-only'/);
+  assert.match(wrapperSource, /'wrapper-publish'/);
+  assert.doesNotMatch(wrapperSource, /--wrapper-only/);
 }
 
 test("npm publish recovery reuses exact source-run artifacts for platforms and wrapper", () => {
@@ -148,6 +157,23 @@ test("npm publish recovery assertions accept Windows CRLF workflow files", () =>
     .replaceAll("\n", "\r\n");
 
   assertNpmPublishRecoveryWorkflow(releaseWorkflow);
+});
+
+test("Windows artifact recovery validates the source run before selecting its artifact ID", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const start = releaseWorkflow.indexOf("\n  smoke-windows-recovery:\n");
+  const end = releaseWorkflow.indexOf("\n  release:\n", start + 1);
+
+  assert.notEqual(start, -1, "missing Windows recovery job");
+  assert.notEqual(end, -1, "missing release job after Windows recovery");
+  const recovery = releaseWorkflow.slice(start, end);
+  assert.match(recovery, /node npm\/release\/validate-recovery-source\.mjs/);
+  assert.match(recovery, /--purpose windows-smoke/);
+  assert.match(recovery, /artifact-ids: \$\{\{ steps\.source\.outputs\.artifact_id \}\}/);
+  assert.match(recovery, /shell: bash/);
 });
 
 test("published wrapper verification tolerates five minutes of registry propagation", () => {

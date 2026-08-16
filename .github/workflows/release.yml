@@ -99,6 +99,11 @@ jobs:
             VERSION="${INPUT_VERSION:-}"
           fi
 
+          if [ "$MODE" != "full" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Recovery workflows must run from the main branch."
+            exit 1
+          fi
+
           if [ "$CHANNEL" = "nightly" ]; then
             if [ "$MODE" = "full" ]; then
               if [ "$GITHUB_REF" != "refs/heads/main" ]; then
@@ -838,31 +843,37 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - name: Validate source release run
-        id: source
-        shell: pwsh
-        env:
-          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
-        run: |
-          if ($env:SOURCE_RUN_ID -notmatch '^[1-9][0-9]*$') {
-            throw "source_run_id must be a positive GitHub Actions run ID"
-          }
-          "run_id=$env:SOURCE_RUN_ID" >> $env:GITHUB_OUTPUT
-
-      - name: Download exact npm tarballs from source release run
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: npm-release-packages
-          path: npm-release-packages
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.source.outputs.run_id }}
-          github-token: ${{ github.token }}
-
       - name: Install Node 22
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
           architecture: x64
+
+      - name: Validate source release run
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          CHANNEL: ${{ needs.release-metadata.outputs.channel }}
+        run: |
+          node npm/release/validate-recovery-source.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$SOURCE_RUN_ID" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --purpose windows-smoke \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download exact npm tarballs from source release run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ steps.source.outputs.artifact_id }}
+          path: npm-release-packages
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Pin npm used by release consumers
         run: npm install --global npm@11.12.1 --no-audit --no-fund
@@ -1053,13 +1064,18 @@ jobs:
         id: source
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
         env:
+          GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          CHANNEL: ${{ needs.release-metadata.outputs.channel }}
         run: |
-          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::source_run_id must be a positive GitHub Actions run ID"
-            exit 1
-          fi
-          echo "run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+          node npm/release/validate-recovery-source.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$SOURCE_RUN_ID" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --purpose npm-publish \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Download verified npm tarballs
         if: inputs.mode != 'npm-publish-only'
@@ -1072,10 +1088,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: npm-release-packages
+          artifact-ids: ${{ steps.source.outputs.artifact_id }}
           path: npm-release-packages
           repository: ${{ github.repository }}
-          run-id: ${{ steps.source.outputs.run_id }}
+          run-id: ${{ inputs.source_run_id }}
           github-token: ${{ github.token }}
 
       - name: Verify recovery artifact version
@@ -1190,44 +1206,45 @@ jobs:
 
       - name: Validate recovery source run
         id: source
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.mode == 'npm-publish-only' || inputs.mode == 'wrapper-only')
         env:
+          GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          CHANNEL: ${{ needs.release-metadata.outputs.channel }}
+          RECOVERY_PURPOSE: ${{ inputs.mode == 'wrapper-only' && 'wrapper-publish' || 'npm-publish' }}
         run: |
-          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::source_run_id must be a positive GitHub Actions run ID"
-            exit 1
-          fi
-          echo "run_id=$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+          node npm/release/validate-recovery-source.mjs \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$SOURCE_RUN_ID" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --purpose "$RECOVERY_PURPOSE" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Download exact npm tarballs from source release run
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.mode == 'npm-publish-only' || inputs.mode == 'wrapper-only')
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: npm-release-packages
+          artifact-ids: ${{ steps.source.outputs.artifact_id }}
           path: npm-release-packages
           repository: ${{ github.repository }}
-          run-id: ${{ steps.source.outputs.run_id }}
+          run-id: ${{ inputs.source_run_id }}
           github-token: ${{ github.token }}
 
       - name: Verify recovery artifact version
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.mode == 'npm-publish-only' || inputs.mode == 'wrapper-only')
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           ARTIFACT_VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
           test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
-
-      - name: Pack wrapper-only recovery artifact
-        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          node npm/release/prepare-packages.mjs \
-            --repo "$PWD" \
-            --output "$PWD/npm-release-packages" \
-            --version "$INPUT_VERSION" \
-            --wrapper-only
 
       - name: Smoke wrapper-only recovery artifact
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'
