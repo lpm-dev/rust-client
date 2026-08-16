@@ -2320,11 +2320,7 @@ fn open_or_create_parent_nofollow(
 
 fn sync_cap_directory(directory: &Dir) -> Result<(), std::io::Error> {
     record_restore_durability_sync();
-    #[cfg(unix)]
-    directory.try_clone()?.into_std_file().sync_all()?;
-    #[cfg(not(unix))]
-    let _ = directory;
-    Ok(())
+    sync_directory_handle(directory)
 }
 
 fn sync_restore_file(file: &std::fs::File) -> Result<(), std::io::Error> {

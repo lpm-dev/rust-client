@@ -15,6 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+mod cache_glob;
+#[cfg(unix)]
+use cache_glob::for_each_cache_glob_match;
+
 const ECOSYSTEM_LOCKFILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -421,26 +426,10 @@ fn compute_validation_fingerprint(
             )));
         }
         for expanded in expand_glob(pattern) {
-            let rooted = lpm_common::rooted_project_glob(&canonical_root, &expanded);
-            let matches = glob::glob(&rooted).map_err(|error| {
-                LpmError::Task(format!(
-                    "invalid task cache validation glob {pattern:?}: {error}"
-                ))
+            for_each_cache_glob_match(&canonical_root, &expanded, |relative| {
+                entries.insert(relative);
+                Ok(())
             })?;
-            for entry in matches {
-                let entry = entry.map_err(|error| {
-                    LpmError::Task(format!(
-                        "failed to expand task cache validation glob {pattern:?}: {error}"
-                    ))
-                })?;
-                let relative = entry.strip_prefix(&canonical_root).map_err(|_| {
-                    LpmError::Task(format!(
-                        "task cache validation path is outside project: {}",
-                        entry.display()
-                    ))
-                })?;
-                entries.insert(relative.to_path_buf());
-            }
         }
     }
 
@@ -732,19 +721,8 @@ fn collect_input_files(
         let patterns = expand_glob(pattern);
 
         for pat in &patterns {
-            let pattern_str = lpm_common::rooted_project_glob(project_dir, pat);
-
-            let entries = glob::glob(&pattern_str).map_err(|error| {
-                LpmError::Task(format!(
-                    "invalid task cache input glob {pattern:?}: {error}"
-                ))
-            })?;
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    LpmError::Task(format!(
-                        "failed to expand task cache input glob {pattern:?}: {error}"
-                    ))
-                })?;
+            for_each_cache_glob_match(&canonical_project, pat, |relative| {
+                let entry = canonical_project.join(&relative);
                 let resolved = entry.canonicalize().map_err(|error| {
                     LpmError::Task(format!(
                         "failed to resolve task cache input {}: {error}",
@@ -759,15 +737,8 @@ fn collect_input_files(
                 }
                 let metadata = std::fs::metadata(&resolved)?;
                 if !metadata.is_file() {
-                    continue;
+                    return Ok(());
                 }
-                let relative = entry.strip_prefix(project_dir).map_err(|_| {
-                    LpmError::Task(format!(
-                        "task cache input is outside project path: {}",
-                        entry.display()
-                    ))
-                })?;
-                let relative = relative.to_path_buf();
                 if seen.insert(relative.clone()) {
                     let resolved_relative =
                         resolved.strip_prefix(&canonical_project).map_err(|_| {
@@ -783,11 +754,16 @@ fn collect_input_files(
                             entry.display()
                         ))
                     })?;
-                    let identity_hash =
-                        hash_input_path_identity(project_dir, &relative, &metadata, &content_hash)?;
+                    let identity_hash = hash_input_path_identity(
+                        &canonical_project,
+                        &relative,
+                        &metadata,
+                        &content_hash,
+                    )?;
                     files.push((relative, identity_hash));
                 }
-            }
+                Ok(())
+            })?;
         }
     }
 
@@ -931,11 +907,43 @@ fn open_project_file_nofollow(project: &Dir, relative: &Path) -> Result<std::fs:
 }
 
 fn expand_glob(pattern: &str) -> Vec<String> {
-    let mut patterns = vec![pattern.to_string()];
-    if pattern.ends_with("/**") {
-        patterns.push(format!("{pattern}/*"));
-    }
+    #[cfg(unix)]
+    let patterns = vec![pattern.to_string()];
+    #[cfg(not(unix))]
+    let patterns = {
+        let mut patterns = vec![pattern.to_string()];
+        if pattern.ends_with("/**") {
+            patterns.push(format!("{pattern}/*"));
+        }
+        patterns
+    };
     patterns
+}
+
+#[cfg(not(unix))]
+fn for_each_cache_glob_match(
+    root: &Path,
+    pattern: &str,
+    mut visit: impl FnMut(PathBuf) -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
+    let rooted = lpm_common::rooted_project_glob(root, pattern);
+    let entries = glob::glob(&rooted)
+        .map_err(|error| LpmError::Task(format!("invalid task cache glob {pattern:?}: {error}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            LpmError::Task(format!(
+                "failed to expand task cache glob {pattern:?}: {error}"
+            ))
+        })?;
+        let relative = entry.strip_prefix(root).map_err(|_| {
+            LpmError::Task(format!(
+                "task cache glob path is outside project: {}",
+                entry.display()
+            ))
+        })?;
+        visit(relative.to_path_buf())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1542,6 +1550,43 @@ mod tests {
         assert_eq!(files[0].0, Path::new("src/index.js"));
     }
 
+    #[test]
+    fn input_hashing_keeps_single_level_globs_shallow() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("src/nested")).unwrap();
+        fs::write(project.path().join("src/direct.js"), "direct").unwrap();
+        fs::write(project.path().join("src/nested/deep.js"), "deep").unwrap();
+
+        let files = collect_input_files(project.path(), &["src/*.js".into()]);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, Path::new("src/direct.js"));
+    }
+
+    #[test]
+    fn input_hashing_accepts_dot_relative_globs() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("src")).unwrap();
+        fs::write(project.path().join("src/index.js"), "input").unwrap();
+
+        let files = collect_input_files(project.path(), &["./src/**".into()]);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, Path::new("src/index.js"));
+    }
+
+    #[test]
+    fn input_hashing_treats_braces_as_literal_path_characters() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("{src,lib}")).unwrap();
+        fs::write(project.path().join("{src,lib}/index.js"), "input").unwrap();
+
+        let files = collect_input_files(project.path(), &["{src,lib}/**".into()]);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, Path::new("{src,lib}/index.js"));
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn input_hashing_keeps_distinct_non_utf8_paths() {
@@ -1569,6 +1614,47 @@ mod tests {
         let files = collect_input_files(project.path(), &["src/**".into()]);
 
         assert_eq!(files.len(), 2);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn filesystem_validation_tracks_non_utf8_inputs() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("src")).unwrap();
+        let input = project
+            .path()
+            .join("src")
+            .join(std::ffi::OsString::from_vec(vec![0x80]));
+        fs::write(&input, "first").unwrap();
+        let first =
+            compute_validation_fingerprint(project.path(), &[], &["src/**".into()]).unwrap();
+
+        fs::write(&input, "second-longer").unwrap();
+        let second =
+            compute_validation_fingerprint(project.path(), &[], &["src/**".into()]).unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_hashing_rejects_files_reached_through_an_external_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        symlink(outside.path(), project.path().join("linked")).unwrap();
+
+        let error = super::collect_input_files(project.path(), &["linked/**".into()])
+            .expect_err("external symlink target was accepted as a cache input");
+
+        assert!(
+            error.to_string().contains("resolves outside project"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]

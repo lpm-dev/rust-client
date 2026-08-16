@@ -241,7 +241,23 @@ fn restrict_open_directory(_dir: &Dir, _label: &str) -> Result<(), LpmError> {
 
 fn sync_open_directory(directory: &Dir) -> Result<(), std::io::Error> {
     record_restore_durability_sync();
-    #[cfg(unix)]
+    sync_directory_handle(directory)
+}
+
+fn sync_directory_handle(directory: &Dir) -> Result<(), std::io::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{Mode, OFlags, fsync, openat};
+
+        let syncable = openat(
+            directory,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?;
+        fsync(syncable)?;
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     directory.try_clone()?.into_std_file().sync_all()?;
     #[cfg(not(unix))]
     let _ = directory;
@@ -4446,6 +4462,15 @@ mod tests {
             0o700,
             "directory should have 0o700 permissions"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_durability_sync_accepts_a_capability_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let opened = Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority()).unwrap();
+
+        sync_open_directory(&opened).unwrap();
     }
 
     #[cfg(unix)]

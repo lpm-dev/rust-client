@@ -16,7 +16,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 globset = "0.4"
-ignore = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 glob = { workspace = true }

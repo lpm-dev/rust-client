@@ -16,6 +16,8 @@ measurement.
 - Pre-optimization candidate SHA-256: `bfa6b3e7eb733c16875b2e8a1163b9a39d19f5e07ebbdf9ae9efd2635e41f6b4`
 - Main benchmark candidate SHA-256: `4f96fa330622a604b3daccff70879e37fa857e718e3de3e47b8786e223d5f2c4`
 - Exact post-review candidate SHA-256: `8add306c0b930de8609aa84b94aa20d8a29ddcbe1472f2f1fa6767ca78f31a02`
+- Rejected full-tree glob candidate SHA-256: `7f8890518c91f4e11e62002f22fbcb518ab0357f4dc356eee64c5473c75eb4d3`
+- Portable component-glob candidate SHA-256: `44d03fc3802fdda9215a8adbc621c4cf02f26b19103d9047ddf2a51b059708c0`
 
 All candidate samples passed their correctness contracts. Main failed all six
 workspace-graph contracts because it did not execute the required work.
@@ -123,6 +125,28 @@ four-pair cold sample reported an 8.35% median increase. The ten-pair run did
 not reproduce it. The warm-cache median improved, while its four-pair p95 was
 too noisy to establish a tail-latency change.
 
+## Unix input-glob portability
+
+The `glob` crate skipped non-UTF-8 file names on Unix. The first replacement
+used a full-tree walker for each task input pattern.
+
+The first six-pair A/B run rejected that replacement. Cold wall time increased
+by 8.22% for 10 tasks and 9.82% for 100 tasks.
+
+The final replacement descends through pattern components. It uses the UTF-8
+matcher for normal names. It initializes the raw-path matcher only for a
+non-UTF-8 name.
+
+| Scenario | Post-review median / p95 | Portable median / p95 | Median change | Portable peak RSS change |
+| --- | ---: | ---: | ---: | ---: |
+| 10 tasks, cold | 329.07 / 343.86 ms | 309.10 / 311.87 ms | -6.07% | +0.21% |
+| 100 tasks, cold | 3260.96 / 3368.28 ms | 3047.87 / 3075.29 ms | -6.53% | +0.82% |
+| 10 tasks, warm | 610.32 / 628.59 ms | 583.02 / 609.26 ms | -4.47% | -0.09% |
+| 100 tasks, warm | 5990.91 / 6097.11 ms | 5861.84 / 5946.09 ms | -2.15% | -0.34% |
+
+All six pairs passed their correctness contracts. File descriptor, thread,
+process, and root-RSS metrics also passed their gates.
+
 ## File-descriptor investigation
 
 The first landing run reported 57 baseline descriptors and 67 candidate
@@ -157,6 +181,19 @@ node bench/scripts/run-runtime-readiness.mjs \
   --allow-inconclusive
 ```
 
+The final Unix input-glob run used:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary baseline=/private/tmp/lpm-task-cache-perf-postreview \
+  --lpm-binary candidate=/private/tmp/lpm-task-cache-component-glob-candidate \
+  --compare baseline,candidate \
+  --profile full \
+  --scenarios task/cache-cold-deep-10,task/cache-warm-deep-10,task/cache-cold-deep-100,task/cache-warm-deep-100 \
+  --samples 6 \
+  --output /private/tmp/lpm-task-cache-component-glob-bench-20260816
+```
+
 Raw artifacts:
 
 - Landing matrix: `/private/tmp/lpm-task-cache-safety-final-bench`
@@ -170,6 +207,8 @@ Raw artifacts:
 - Post-review workspace caret pairs: `/private/tmp/lpm-task-cache-postreview-caret-20260816`
 - Post-review cache-chain pairs: `/private/tmp/lpm-task-cache-postreview-chains-20260816`
 - Expanded post-review 100-task cold pairs: `/private/tmp/lpm-task-cache-postreview-cold-100-20260816`
+- Rejected Unix glob pairs: `/private/tmp/lpm-task-cache-portable-glob-bench-20260816`
+- Final Unix glob pairs: `/private/tmp/lpm-task-cache-component-glob-bench-20260816`
 
 The changes do not modify dependency installation or runtime acquisition.
 Therefore, the install-readiness benchmark is not part of this gate.
