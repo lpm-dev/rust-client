@@ -91,6 +91,31 @@ test("Apple Silicon release builds keep enough timeout headroom for cold builds"
   );
 });
 
+test("stable full releases require their exact tag and never overwrite assets", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+
+  assert.match(
+    releaseWorkflow,
+    /if \[ "\$CHANNEL" = "stable" \] && \[ "\$MODE" = "full" \]; then[\s\S]*EXPECTED_REF="refs\/tags\/v\$\{VERSION\}"[\s\S]*if \[ "\$GITHUB_REF" != "\$EXPECTED_REF" \]; then/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /TAG_SHA=\$\(git rev-parse "\$\{GITHUB_REF_NAME\}\^\{commit\}"\)[\s\S]*if \[ "\$TAG_SHA" != "\$GITHUB_SHA" \]; then/,
+  );
+
+  const createReleaseStart = releaseWorkflow.indexOf("      - name: Create GitHub Release\n");
+  const nextJob = releaseWorkflow.indexOf("\n  smoke-standalone-installer:\n", createReleaseStart);
+  assert.notEqual(createReleaseStart, -1, "missing Create GitHub Release step");
+  assert.notEqual(nextJob, -1, "missing job after Create GitHub Release step");
+  assert.match(
+    releaseWorkflow.slice(createReleaseStart, nextJob),
+    /^\s+overwrite_files:\s*false\s*$/m,
+  );
+});
+
 test("npm publish workflow treats release tarballs as local filesystem paths", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(

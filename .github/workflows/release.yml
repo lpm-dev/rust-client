@@ -225,6 +225,20 @@ jobs:
               ;;
           esac
 
+          if [ "$CHANNEL" = "stable" ] && [ "$MODE" = "full" ]; then
+            EXPECTED_REF="refs/tags/v${VERSION}"
+            if [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
+              echo "::error::Stable full releases must run from $EXPECTED_REF."
+              exit 1
+            fi
+
+            TAG_SHA=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+            if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "::error::Stable release tag does not resolve to the workflow commit."
+              exit 1
+            fi
+          fi
+
           if [ "$MODE" = "full" ]; then
             WORKSPACE_VERSION=$(node --input-type=module -e \
               'import { workspaceStableVersion } from "./npm/release/nightly-version.mjs"; console.log(workspaceStableVersion("."));')
@@ -951,6 +965,7 @@ jobs:
           files: binaries/*
           body_path: ${{ runner.temp }}/release-notes.md
           append_body: false
+          overwrite_files: false
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           make_latest: ${{ needs.release-metadata.outputs.channel == 'stable' }}
           target_commitish: ${{ github.sha }}
