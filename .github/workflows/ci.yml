@@ -389,6 +389,9 @@ jobs:
           key: ${{ runner.os }}-cargo-fuzz-nightly-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-fuzz-nightly-
 
+      - name: Verify fuzz dependency lockfile
+        run: cargo +nightly metadata --locked --manifest-path fuzz/Cargo.toml --format-version=1 > /dev/null
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
