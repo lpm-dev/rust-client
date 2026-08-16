@@ -1831,18 +1831,18 @@ mod tests {
         };
 
         let t1 = task(1, log.clone());
-        // Give task 1 a moment to acquire the lock first.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let t2 = task(2, log.clone());
 
         t1.await.unwrap().unwrap();
         t2.await.unwrap().unwrap();
 
         let events = log.lock().await.clone();
-        assert_eq!(
-            events,
-            vec![(1, 0), (1, 1), (2, 0), (2, 1)],
-            "with_exclusive_lock_async must serialize: task 1 enters, task 1 exits, then task 2 — never interleaved"
+        assert!(
+            matches!(
+                events.as_slice(),
+                [(1, 0), (1, 1), (2, 0), (2, 1)] | [(2, 0), (2, 1), (1, 0), (1, 1)]
+            ),
+            "with_exclusive_lock_async must serialize both tasks without interleaving: {events:?}"
         );
     }
 
