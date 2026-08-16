@@ -503,11 +503,8 @@ fn hash_validation_path(
         ))
     })?;
     let is_link = lpm_common::is_symlink_or_junction(&metadata);
-    let metadata_bytes = if metadata.is_dir() && !is_link {
-        metadata_object_identity_bytes(&metadata)
-    } else {
-        metadata_identity_bytes(&metadata)
-    };
+    let metadata_bytes =
+        validation_metadata_identity_bytes(path, follow, &metadata, metadata.is_dir() && !is_link);
     if is_link {
         let target = std::fs::read_link(path).map_err(|error| {
             LpmError::Task(format!(
@@ -538,13 +535,8 @@ fn metadata_object_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
 fn metadata_object_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
     use std::os::windows::fs::MetadataExt as _;
 
-    let mut bytes = Vec::with_capacity(32);
-    for value in [
-        metadata.file_attributes() as u64,
-        metadata.creation_time(),
-        metadata.volume_serial_number().unwrap_or(0) as u64,
-        metadata.file_index().unwrap_or(0),
-    ] {
+    let mut bytes = Vec::with_capacity(16);
+    for value in [metadata.file_attributes() as u64, metadata.creation_time()] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes
@@ -556,7 +548,7 @@ fn metadata_object_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
 }
 
 #[cfg(unix)]
-pub(crate) fn metadata_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
+fn metadata_identity_bytes_from_metadata(metadata: &std::fs::Metadata) -> Vec<u8> {
     use std::os::unix::fs::MetadataExt as _;
 
     let mut bytes = Vec::with_capacity(80);
@@ -576,18 +568,15 @@ pub(crate) fn metadata_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
 }
 
 #[cfg(windows)]
-pub(crate) fn metadata_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
+fn metadata_identity_bytes_from_metadata(metadata: &std::fs::Metadata) -> Vec<u8> {
     use std::os::windows::fs::MetadataExt as _;
 
-    let mut bytes = Vec::with_capacity(72);
+    let mut bytes = Vec::with_capacity(32);
     for value in [
         metadata.file_attributes() as u64,
         metadata.creation_time(),
         metadata.last_write_time(),
         metadata.file_size(),
-        metadata.volume_serial_number().unwrap_or(0) as u64,
-        metadata.number_of_links().unwrap_or(0) as u64,
-        metadata.file_index().unwrap_or(0),
     ] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -595,8 +584,115 @@ pub(crate) fn metadata_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn metadata_identity_bytes(metadata: &std::fs::Metadata) -> Vec<u8> {
+fn metadata_identity_bytes_from_metadata(metadata: &std::fs::Metadata) -> Vec<u8> {
     format!("{metadata:?}").into_bytes()
+}
+
+fn validation_metadata_identity_bytes(
+    path: &Path,
+    follow: bool,
+    metadata: &std::fs::Metadata,
+    object_only: bool,
+) -> Vec<u8> {
+    let bytes = if object_only {
+        metadata_object_identity_bytes(metadata)
+    } else {
+        metadata_identity_bytes_from_metadata(metadata)
+    };
+    #[cfg(windows)]
+    let bytes = {
+        let mut bytes = bytes;
+        append_windows_file_identity(&mut bytes, windows_path_identity(path, follow));
+        bytes
+    };
+    #[cfg(not(windows))]
+    let _ = (path, follow);
+    bytes
+}
+
+pub(crate) fn archive_metadata_identity_bytes(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Vec<u8> {
+    let bytes = metadata_identity_bytes_from_metadata(metadata);
+    #[cfg(windows)]
+    let bytes = {
+        let mut bytes = bytes;
+        append_windows_file_identity(&mut bytes, windows_handle_identity(file));
+        bytes
+    };
+    #[cfg(not(windows))]
+    let _ = file;
+    bytes
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u32,
+    number_of_links: u32,
+    file_index: u64,
+}
+
+#[cfg(windows)]
+fn append_windows_file_identity(bytes: &mut Vec<u8>, identity: Option<WindowsFileIdentity>) {
+    bytes.reserve(25);
+    let Some(identity) = identity else {
+        bytes.push(0);
+        return;
+    };
+    bytes.push(1);
+    for value in [
+        u64::from(identity.volume_serial_number),
+        u64::from(identity.number_of_links),
+        identity.file_index,
+    ] {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[cfg(windows)]
+fn windows_path_identity(path: &Path, follow: bool) -> Option<WindowsFileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let flags = FILE_FLAG_BACKUP_SEMANTICS
+        | if follow {
+            0
+        } else {
+            FILE_FLAG_OPEN_REPARSE_POINT
+        };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(flags)
+        .open(path)
+        .ok()?;
+    windows_handle_identity(&file)
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &std::fs::File) -> Option<WindowsFileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle belongs to the live `File`, and `information` is
+    // writable storage of the exact Win32 structure expected by the API.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return None;
+    }
+    Some(WindowsFileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        number_of_links: information.nNumberOfLinks,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
 }
 
 fn hash_record(hasher: &mut Sha256, kind: u8, fields: &[&[u8]]) {
@@ -1487,6 +1583,36 @@ mod tests {
             encode_relative_path(&first).unwrap(),
             encode_relative_path(&second).unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_matches_for_hard_links() {
+        let project = tempfile::tempdir().unwrap();
+        let first = project.path().join("first.txt");
+        let second = project.path().join("second.txt");
+        fs::write(&first, "same object").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+
+        let first_identity = windows_path_identity(&first, true).unwrap();
+        let second_identity = windows_path_identity(&second, true).unwrap();
+
+        assert_eq!(first_identity, second_identity);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_differs_for_distinct_live_files() {
+        let project = tempfile::tempdir().unwrap();
+        let first = project.path().join("first.txt");
+        let second = project.path().join("second.txt");
+        fs::write(&first, "same content").unwrap();
+        fs::write(&second, "same content").unwrap();
+
+        let first_identity = windows_path_identity(&first, true).unwrap();
+        let second_identity = windows_path_identity(&second, true).unwrap();
+
+        assert_ne!(first_identity, second_identity);
     }
 
     #[cfg(unix)]

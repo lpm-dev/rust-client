@@ -46,7 +46,7 @@ static STAGED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
 static PUBLISHED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 static STAGED_TREE_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -1316,7 +1316,7 @@ fn clean_cache_with_root(root: &LpmRoot) -> Result<u64, LpmError> {
     lpm_common::with_exclusive_lock(root.cache_clean_lock(), || clean_open_cache(&cache.tasks))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clean_cache_locked(dir: &Path) -> Result<u64, LpmError> {
     ensure_real_directory(dir, "task cache directory")?;
     let cache = Dir::open_ambient_dir(dir, cap_std::ambient_authority())?;
@@ -1494,7 +1494,7 @@ fn append_collected_output_files<W: Write>(
         let mut source = open_project_file_nofollow(project, relative, "task output")?;
         let metadata = source.metadata()?;
         let size = metadata.len();
-        let identity = crate::hasher::metadata_identity_bytes(&metadata);
+        let identity = crate::hasher::archive_metadata_identity_bytes(&source, &metadata);
         check_archive_size_limits(size, &mut total_bytes, relative, "task output archive")?;
         #[cfg(test)]
         wait_for_cache_race_barrier(&ARCHIVE_SIZE_RACE_BARRIER, &project_dir.join(relative));
@@ -1523,7 +1523,7 @@ fn append_collected_output_files<W: Write>(
         let mut extra = [0u8; 1];
         let final_metadata = source.metadata()?;
         if source.read(&mut extra)? != 0
-            || crate::hasher::metadata_identity_bytes(&final_metadata) != identity
+            || crate::hasher::archive_metadata_identity_bytes(&source, &final_metadata) != identity
         {
             return Err(LpmError::Task(format!(
                 "task output changed while archiving: {}",
