@@ -49,6 +49,39 @@ fn arc_key(name: &str, version: &str) -> Arc<GraphKey> {
     Arc::new(sample_key(name, version))
 }
 
+fn populate_after_releasing_held_entry_lock(
+    store: Store,
+    request: LinkEntryRequest,
+    held_lock: lpm_common::SingleFileExclusiveLockHandle,
+) -> LinkEntry {
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if started_tx.send(()).is_err() {
+            return;
+        }
+        let _ = finished_tx.send(store.populate_link_entry(request));
+    });
+
+    started_rx
+        .recv_timeout(LOCK_RELEASE_WATCHDOG)
+        .expect("populate worker did not start before the watchdog expired");
+    assert!(
+        matches!(
+            finished_rx.recv_timeout(std::time::Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "populate completed while the graph-entry mutation lock was held"
+    );
+    drop(held_lock);
+    let populated = finished_rx
+        .recv_timeout(LOCK_RELEASE_WATCHDOG)
+        .expect("populate did not finish after the held lock was released")
+        .unwrap();
+    worker.join().unwrap();
+    populated
+}
+
 /// Compute a real SHA-512 SRI string over `seed`. Tests need
 /// valid base64-padded SRIs because [`Integrity::parse`] enforces
 /// canonical encoding; hand-rolled placeholders fail at parse time.
@@ -1110,24 +1143,9 @@ fn populate_link_entry_waits_for_graph_entry_mutation_lock() {
         platform: Arc::new(sample_meta_platform()),
     };
     let held_lock = store.acquire_build_entry_lock(&key.digest_hex()).unwrap();
-    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let populated = populate_after_releasing_held_entry_lock(store, request, held_lock);
 
-    let worker = std::thread::spawn(move || {
-        finished_tx
-            .send(store.populate_link_entry(request))
-            .unwrap();
-    });
-
-    assert!(matches!(
-        finished_rx.recv_timeout(std::time::Duration::from_millis(150)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    ));
-    drop(held_lock);
-    finished_rx
-        .recv_timeout(LOCK_RELEASE_WATCHDOG)
-        .unwrap()
-        .unwrap();
-    worker.join().unwrap();
+    assert!(populated.freshly_populated);
 }
 
 #[test]
@@ -1161,25 +1179,9 @@ fn reusable_link_entry_waits_for_graph_entry_mutation_lock() {
         platform: Arc::new(sample_meta_platform()),
     };
     let held_lock = store.acquire_build_entry_lock(&key.digest_hex()).unwrap();
-    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let reused = populate_after_releasing_held_entry_lock(store, request, held_lock);
 
-    let worker = std::thread::spawn(move || {
-        finished_tx
-            .send(store.populate_link_entry(request))
-            .unwrap();
-    });
-
-    assert!(matches!(
-        finished_rx.recv_timeout(std::time::Duration::from_millis(150)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    ));
-    drop(held_lock);
-    let reused = finished_rx
-        .recv_timeout(LOCK_RELEASE_WATCHDOG)
-        .unwrap()
-        .unwrap();
     assert!(!reused.freshly_populated);
-    worker.join().unwrap();
 }
 
 #[test]

@@ -2,6 +2,7 @@
 name = "lpm-auth"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Authentication, secure token storage, and lazy session management for the LPM Rust client"
@@ -40,13 +41,20 @@ tokio = { workspace = true, features = ["sync"] }
 # Diagnostics
 tracing = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypto-rust"] }
+
 [target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dependencies]
 keyring = { workspace = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
 core-foundation = "0.10"
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext"] }
 security-framework = "3"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [dev-dependencies]
 tempfile = "3"

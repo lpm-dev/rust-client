@@ -39,6 +39,25 @@ function releaseTargetTimeout(releaseWorkflow, target) {
   return Number(timeout[1]);
 }
 
+function releaseJobSource(releaseWorkflow, job, nextJob) {
+  const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
+  const end = nextJob
+    ? releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1)
+    : releaseWorkflow.length;
+
+  assert.notEqual(start, -1, `missing ${job} job`);
+  assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+  return releaseWorkflow.slice(start, end);
+}
+
+function releaseJobTimeout(releaseWorkflow, job, nextJob) {
+  const source = releaseJobSource(releaseWorkflow, job, nextJob);
+  const timeout = source.match(/^ {4}timeout-minutes:\s*(\d+)\s*$/m);
+
+  assert.ok(timeout, `missing ${job} timeout`);
+  return Number(timeout[1]);
+}
+
 test("release versions accept stable and prerelease semver values", () => {
   assert.equal(parseReleaseVersion("0.69.0"), "0.69.0");
   assert.equal(parseReleaseVersion("1.0.0-beta.2"), "1.0.0-beta.2");
@@ -70,11 +89,20 @@ test("Windows release builds keep enough timeout headroom for signing", () => {
   const releaseWorkflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
-  const timeout = releaseTargetTimeout(releaseWorkflow, "x86_64-pc-windows-msvc");
+  const buildTimeout = releaseJobTimeout(releaseWorkflow, "build-windows", "sign-windows");
+  const signingTimeout = releaseJobTimeout(
+    releaseWorkflow,
+    "sign-windows",
+    "pack-npm-packages",
+  );
 
   assert.ok(
-    timeout >= 60,
-    `Windows release timeout must be at least 60 minutes, found ${timeout}`,
+    buildTimeout >= 60,
+    `Windows build timeout must be at least 60 minutes, found ${buildTimeout}`,
+  );
+  assert.ok(
+    signingTimeout >= 20,
+    `Windows signing timeout must be at least 20 minutes, found ${signingTimeout}`,
   );
 });
 
@@ -112,6 +140,53 @@ test("Windows filesystem gate isolates file-count stress from lock timing tests"
     /test\(extract_accepts_exact_max_file_count\) \|\s+test\(extract_rejects_more_than_max_file_count\)/,
   );
   assert.match(stressStep, /--test-threads=1/);
+});
+
+test("release workflow grants write permissions only to jobs that use them", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const topLevelPermissions = releaseWorkflow.slice(
+    releaseWorkflow.indexOf("\npermissions:\n"),
+    releaseWorkflow.indexOf("\nenv:\n"),
+  );
+  const writePermissions = source =>
+    [...source.matchAll(/^ {6}([a-z-]+): write(?:\s+#.*)?$/gm)].map(match => match[1]);
+
+  assert.equal(topLevelPermissions, "\npermissions:\n  contents: read\n");
+
+  const jobs = [
+    ["release-metadata", "verify", []],
+    ["verify", "verify-windows-filesystem", []],
+    ["verify-windows-filesystem", "build", []],
+    ["build", "build-windows", []],
+    ["build-windows", "sign-windows", []],
+    ["sign-windows", "pack-npm-packages", ["id-token"]],
+    ["pack-npm-packages", "smoke-npm-packages", []],
+    ["smoke-npm-packages", "smoke-windows-recovery", []],
+    ["smoke-windows-recovery", "release", []],
+    ["release", "smoke-standalone-installer", ["contents", "id-token", "attestations"]],
+    ["smoke-standalone-installer", "publish-npm-platform", []],
+    ["publish-npm-platform", "publish-npm-wrapper", ["id-token"]],
+    ["publish-npm-wrapper", "update-homebrew", ["id-token"]],
+    ["update-homebrew", undefined, []],
+  ];
+
+  for (const [job, nextJob, expected] of jobs) {
+    assert.deepEqual(
+      writePermissions(releaseJobSource(releaseWorkflow, job, nextJob)),
+      expected,
+      `${job} has unexpected write permissions`,
+    );
+  }
+
+  const windowsSigningJob = releaseJobSource(
+    releaseWorkflow,
+    "sign-windows",
+    "pack-npm-packages",
+  );
+  assert.doesNotMatch(windowsSigningJob, /actions\/checkout|\bcargo\b|--version/);
 });
 
 test("npm publish workflow treats release tarballs as local filesystem paths", () => {
@@ -194,21 +269,22 @@ test("immutable npm versions are accepted only after registry verification", () 
 
 function assertNpmPublishRecoveryWorkflow(workflowSource) {
   const releaseWorkflow = workflowSource.replaceAll("\r\n", "\n");
-  const jobSource = (job, nextJob) => {
-    const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
-    const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
-    assert.notEqual(start, -1, `missing ${job} job`);
-    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
-    return releaseWorkflow.slice(start, end);
-  };
 
   assert.match(releaseWorkflow, /^\s+- npm-publish-only$/m);
   assert.match(
     releaseWorkflow,
     /if \[ "\$MODE" != "full" \] && \[ "\$GITHUB_REF" != "refs\/heads\/main" \]; then/,
   );
-  const platformSource = jobSource("publish-npm-platform", "publish-npm-wrapper");
-  const wrapperSource = jobSource("publish-npm-wrapper", "update-homebrew");
+  const platformSource = releaseJobSource(
+    releaseWorkflow,
+    "publish-npm-platform",
+    "publish-npm-wrapper",
+  );
+  const wrapperSource = releaseJobSource(
+    releaseWorkflow,
+    "publish-npm-wrapper",
+    "update-homebrew",
+  );
   for (const source of [platformSource, wrapperSource]) {
     assert.match(source, /inputs\.mode == 'npm-publish-only'/);
     assert.match(source, /node npm\/release\/validate-recovery-source\.mjs/);

@@ -2,6 +2,7 @@
 name = "lpm-audit-corpus"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Top-N npm static-gate audit harness for Phase 46 calibration."

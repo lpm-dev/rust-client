@@ -3,6 +3,7 @@ name = "lpm-proxy"
 description = "Shared local-domain proxy route registry for LPM dev"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

@@ -2,6 +2,7 @@
 name = "lpm-global"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Phase 37 — global install state: manifest, WAL, and crash-safe transactions for ~/.lpm/global/"

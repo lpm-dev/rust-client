@@ -8,6 +8,7 @@
 pub mod atomic_write;
 pub mod bounded_read;
 pub mod color;
+pub mod command_name;
 pub mod error;
 pub mod integrity;
 pub mod known_projects;
@@ -37,6 +38,7 @@ pub use bounded_read::{
     read_text_file_capped, read_text_file_capped_from_open_file,
     read_text_file_capped_with_metadata,
 };
+pub use command_name::{PortableCommandNameError, validate_portable_command_name};
 pub use error::{
     ArtifactUnavailableErrorContext, ArtifactUnavailableKind, LpmError, ResolutionErrorContext,
     ResolutionFailureKind, TyposquatErrorContext, TyposquatErrorFinding,

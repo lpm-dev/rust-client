@@ -39,7 +39,7 @@
 //! path additionally goes through [`validate_windows_target_path`] to
 //! reject characters that have meaning inside `.cmd` files.
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, validate_portable_command_name};
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -105,39 +105,10 @@ const BACKOFF_STEPS_MS: [u64; MAX_BACKOFF_RETRIES as usize] = [50, 150, 450, 135
 /// crash the shell at exec time. Conservative on purpose — package
 /// authors rarely need exotic characters in their bin names.
 pub fn validate_command_name(name: &str) -> Result<(), ShimError> {
-    if name.is_empty() {
-        return Err(ShimError::InvalidCommandName {
-            name: name.to_string(),
-            reason: "empty command name",
-        });
-    }
-    if name.len() > 255 {
-        return Err(ShimError::InvalidCommandName {
-            name: name.to_string(),
-            reason: "command name longer than 255 chars",
-        });
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err(ShimError::InvalidCommandName {
-            name: name.to_string(),
-            reason: "command name contains path separator",
-        });
-    }
-    if name.contains("..") {
-        return Err(ShimError::InvalidCommandName {
-            name: name.to_string(),
-            reason: "command name contains '..'",
-        });
-    }
-    if name.contains('\0') {
-        return Err(ShimError::InvalidCommandName {
-            name: name.to_string(),
-            reason: "command name contains NUL byte",
-        });
-    }
-    // Note on leading `-`: this is UX policy rather than a real safety
-    // boundary. Real bin entries with leading dashes are rare but exist.
-    Ok(())
+    validate_portable_command_name(name).map_err(|error| ShimError::InvalidCommandName {
+        name: name.to_string(),
+        reason: error.reason(),
+    })
 }
 
 /// Windows-specific defense: the target path is interpolated literally
@@ -428,6 +399,16 @@ mod tests {
     #[test]
     fn validate_command_name_rejects_null_byte() {
         assert!(validate_command_name("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn validate_command_name_rejects_windows_invalid_names() {
+        for name in ["CON", "nul.js", "foo:bar", "foo.", "foo "] {
+            assert!(
+                validate_command_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub(crate) fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        let _ = metadata;
         Ok(())
     }
 }

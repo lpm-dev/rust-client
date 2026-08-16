@@ -1,4 +1,4 @@
-use lpm_common::{LpmError, is_symlink_or_junction};
+use lpm_common::{LpmError, is_symlink_or_junction, validate_portable_command_name};
 use std::path::{Component, Path, PathBuf};
 
 /// Validate a self-reference package name to prevent path traversal.
@@ -186,60 +186,8 @@ const SHADOWED_BINARIES: &[&str] = &[
 /// same sanity check regardless of whether it came from
 /// `package.json` or a CLI flag.
 pub fn validate_bin_name(name: &str, pkg_name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("bin name is empty".to_string());
-    }
-    if name.contains('\0') {
-        return Err("bin name contains null byte".to_string());
-    }
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(format!(
-            "bin name \"{name}\" contains path separators or traversal components"
-        ));
-    }
-    // NTFS alternate-data-stream separator — `foo:bar` opens the ADS.
-    if name.contains(':') {
-        return Err(format!(
-            "bin name \"{name}\" contains ':' (NTFS alternate data stream separator)"
-        ));
-    }
-    // Windows CreateFile silently strips trailing `.` and ` `.
-    if name.ends_with('.') || name.ends_with(' ') {
-        return Err(format!(
-            "bin name \"{name}\" ends with a dot or space (invalid on Windows)"
-        ));
-    }
-    // Windows reserved device names — match the stem against both ASCII
-    // and Unicode-superscript digit shapes (the Win32 parser folds them
-    // together before the device match).
-    const RESERVED_WIN_DEVICES: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-        "LPT9",
-    ];
-    let stem = name.split_once('.').map_or(name, |(s, _)| s);
-    let stem_upper: String = stem
-        .chars()
-        .map(|c| match c {
-            '\u{2070}' => '0',
-            '\u{00B9}' => '1',
-            '\u{00B2}' => '2',
-            '\u{00B3}' => '3',
-            '\u{2074}' => '4',
-            '\u{2075}' => '5',
-            '\u{2076}' => '6',
-            '\u{2077}' => '7',
-            '\u{2078}' => '8',
-            '\u{2079}' => '9',
-            other => other,
-        })
-        .flat_map(char::to_uppercase)
-        .collect();
-    if RESERVED_WIN_DEVICES.contains(&stem_upper.as_str()) {
-        return Err(format!(
-            "bin name \"{name}\" is a Windows reserved device name"
-        ));
-    }
+    validate_portable_command_name(name)
+        .map_err(|error| format!("bin name \"{name}\" {}", error.reason()))?;
 
     // Warn (don't reject) for shadowing common system binaries
     if SHADOWED_BINARIES.contains(&name) {
