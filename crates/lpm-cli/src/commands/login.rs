@@ -212,21 +212,9 @@ pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> 
         .unwrap_or("unknown")
         .to_string();
 
-    // Store the token
-    let access_backend = auth::set_token_with_backend(registry_url, &token)
-        .map_err(|e| LpmError::Registry(format!("failed to store token: {e}")))?;
-    let mut storage_status = auth::AuthStorageStatus::from_backend(access_backend);
-
-    auth::set_session_access_token_expiry(registry_url, &expires_at);
-    match auth::set_refresh_token_with_backend(registry_url, &refresh_token) {
-        Ok(refresh_backend) => {
-            storage_status =
-                auth::AuthStorageStatus::from_backends(Some(access_backend), Some(refresh_backend));
-        }
-        Err(error) => {
-            tracing::warn!("failed to store refresh token securely: {error}");
-        }
-    }
+    let storage_status =
+        auth::store_refresh_backed_session(registry_url, &token, &refresh_token, &expires_at)
+            .await?;
 
     if json_output {
         let json = serde_json::json!({
