@@ -91,6 +91,29 @@ test("Apple Silicon release builds keep enough timeout headroom for cold builds"
   );
 });
 
+test("Windows filesystem gate isolates file-count stress from lock timing tests", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/windows-filesystem-gate.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const regularStart = workflow.indexOf("      - name: Windows filesystem crate tests\n");
+  const stressStart = workflow.indexOf("      - name: Windows extractor file-count stress tests\n");
+
+  assert.notEqual(regularStart, -1, "missing regular Windows filesystem test step");
+  assert.ok(stressStart > regularStart, "extractor stress tests must run after regular crate tests");
+  const regularStep = workflow.slice(regularStart, stressStart);
+  const stressStep = workflow.slice(stressStart);
+  assert.match(
+    regularStep,
+    /not \(test\(extract_accepts_exact_max_file_count\) \|\s+test\(extract_rejects_more_than_max_file_count\)\)/,
+  );
+  assert.match(
+    stressStep,
+    /test\(extract_accepts_exact_max_file_count\) \|\s+test\(extract_rejects_more_than_max_file_count\)/,
+  );
+  assert.match(stressStep, /--test-threads=1/);
+});
+
 test("npm publish workflow treats release tarballs as local filesystem paths", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(
@@ -105,6 +128,68 @@ test("npm publish workflow treats release tarballs as local filesystem paths", (
     "./npm-release-packages/$tarball",
     "./npm-release-packages/$TARBALL",
   ]);
+});
+
+test("OIDC publish jobs verify release archives before consuming them", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const jobSource = (job, nextJob) => {
+    const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
+    const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
+    assert.notEqual(start, -1, `missing ${job} job`);
+    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+    return releaseWorkflow.slice(start, end);
+  };
+  const platformJob = jobSource("publish-npm-platform", "publish-npm-wrapper");
+  const wrapperJob = jobSource("publish-npm-wrapper", "update-homebrew");
+  for (const [job, firstConsumer] of [
+    [platformJob, "npx npm@11.12.1 publish"],
+    [wrapperJob, "npm install --prefix"],
+  ]) {
+    const verification = job.indexOf("node npm/release/verify-packages.mjs");
+    const consumption = job.indexOf(firstConsumer);
+    assert.notEqual(verification, -1, "release package verification is missing");
+    assert.notEqual(consumption, -1, `release package consumer is missing: ${firstConsumer}`);
+    assert.ok(verification < consumption, "release packages must be verified before consumption");
+  }
+});
+
+test("immutable npm versions are accepted only after registry verification", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const jobSource = (job, nextJob) => {
+    const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
+    const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
+    assert.notEqual(start, -1, `missing ${job} job`);
+    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+    return releaseWorkflow.slice(start, end);
+  };
+
+  const platform = jobSource("publish-npm-platform", "publish-npm-wrapper");
+  const wrapper = jobSource("publish-npm-wrapper", "update-homebrew");
+  const assertImmutableBranch = (source, packageArgument, tarballArgument) => {
+    const start = source.indexOf(
+      'if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then',
+    );
+    assert.notEqual(start, -1, "missing immutable-version branch");
+    const branchLength = source.slice(start).search(/\n\s+else\s*$/m);
+    assert.notEqual(branchLength, -1, "missing immutable-version failure branch");
+    const branch = source.slice(start, start + branchLength);
+    assert.match(branch, /node npm\/release\/verify-published-package\.mjs/);
+    assert.match(branch, /--manifest "\$MANIFEST"/);
+    assert.ok(branch.includes(`--package ${packageArgument}`));
+    assert.match(branch, /--tag "\$NPM_TAG"/);
+    assert.match(branch, /--source-sha "\$EXPECTED_SOURCE_SHA"/);
+    assert.match(branch, /--source-run-id "\$EXPECTED_SOURCE_RUN_ID"/);
+    assert.ok(branch.includes(`--tarball ${tarballArgument}`));
+  };
+  assertImmutableBranch(platform, '"$package"', '"./npm-release-packages/$tarball"');
+  assertImmutableBranch(wrapper, '"@lpm-registry/cli"', '"./npm-release-packages/$TARBALL"');
+  assert.doesNotMatch(releaseWorkflow, /Already published — skipping/);
 });
 
 function assertNpmPublishRecoveryWorkflow(workflowSource) {
@@ -380,6 +465,32 @@ test("packed-file inventory expands declared directories without allowing traver
     () => expectedPackedFiles(root, { files: ["../secret"] }),
     /unsafe package file path/,
   );
+});
+
+test("packed-file inventory rejects paths that require PAX metadata", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-pax-path-"));
+  const longName = "x".repeat(101);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, longName), "long path");
+  fs.writeFileSync(path.join(root, "package.json"), "{}");
+
+  assert.throws(
+    () => expectedPackedFiles(root, { files: [longName] }),
+    /requires unsupported PAX metadata/,
+  );
+});
+
+test("packed-file inventory accepts paths that fit the USTAR prefix field", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-ustar-prefix-"));
+  const directory = "a".repeat(80);
+  const file = "b".repeat(30);
+  const relative = `${directory}/${file}`;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, directory));
+  fs.writeFileSync(path.join(root, relative), "prefixed path");
+  fs.writeFileSync(path.join(root, "package.json"), "{}");
+
+  assert.deepEqual(expectedPackedFiles(root, { files: [relative] }), [relative, "package.json"]);
 });
 
 test("runtime platform selection distinguishes glibc and musl", () => {

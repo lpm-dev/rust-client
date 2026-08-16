@@ -81,7 +81,10 @@ test("scheduled nightly publishing is changed-only and preserves stable release 
     /github\.event_name == 'schedule' \|\| inputs\.channel == 'nightly'/,
   );
   assert.match(workflow, /LPM_BUILD_VERSION: \$\{\{ needs\.release-metadata\.outputs\.version \}\}/);
-  assert.equal(workflow.match(/--tag "\$NPM_TAG"/g)?.length, 2);
+  assert.equal(
+    workflow.match(/--provenance --access public --tag "\$NPM_TAG"/g)?.length,
+    2,
+  );
   assert.match(workflow, /prerelease: \$\{\{ needs\.release-metadata\.outputs\.prerelease \}\}/);
   assert.match(workflow, /make_latest: \$\{\{ needs\.release-metadata\.outputs\.channel == 'stable' \}\}/);
   assert.match(
