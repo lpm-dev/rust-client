@@ -142,7 +142,6 @@ test("OIDC publish jobs verify release archives before consuming them", () => {
     assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
     return releaseWorkflow.slice(start, end);
   };
-
   const platformJob = jobSource("publish-npm-platform", "publish-npm-wrapper");
   const wrapperJob = jobSource("publish-npm-wrapper", "update-homebrew");
   for (const [job, firstConsumer] of [
@@ -155,6 +154,42 @@ test("OIDC publish jobs verify release archives before consuming them", () => {
     assert.notEqual(consumption, -1, `release package consumer is missing: ${firstConsumer}`);
     assert.ok(verification < consumption, "release packages must be verified before consumption");
   }
+});
+
+test("immutable npm versions are accepted only after registry verification", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const jobSource = (job, nextJob) => {
+    const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
+    const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
+    assert.notEqual(start, -1, `missing ${job} job`);
+    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+    return releaseWorkflow.slice(start, end);
+  };
+
+  const platform = jobSource("publish-npm-platform", "publish-npm-wrapper");
+  const wrapper = jobSource("publish-npm-wrapper", "update-homebrew");
+  const assertImmutableBranch = (source, packageArgument, tarballArgument) => {
+    const start = source.indexOf(
+      'if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then',
+    );
+    assert.notEqual(start, -1, "missing immutable-version branch");
+    const branchLength = source.slice(start).search(/\n\s+else\s*$/m);
+    assert.notEqual(branchLength, -1, "missing immutable-version failure branch");
+    const branch = source.slice(start, start + branchLength);
+    assert.match(branch, /node npm\/release\/verify-published-package\.mjs/);
+    assert.match(branch, /--manifest "\$MANIFEST"/);
+    assert.ok(branch.includes(`--package ${packageArgument}`));
+    assert.match(branch, /--tag "\$NPM_TAG"/);
+    assert.match(branch, /--source-sha "\$EXPECTED_SOURCE_SHA"/);
+    assert.match(branch, /--source-run-id "\$EXPECTED_SOURCE_RUN_ID"/);
+    assert.ok(branch.includes(`--tarball ${tarballArgument}`));
+  };
+  assertImmutableBranch(platform, '"$package"', '"./npm-release-packages/$tarball"');
+  assertImmutableBranch(wrapper, '"@lpm-registry/cli"', '"./npm-release-packages/$TARBALL"');
+  assert.doesNotMatch(releaseWorkflow, /Already published — skipping/);
 });
 
 function assertNpmPublishRecoveryWorkflow(workflowSource) {

@@ -1126,6 +1126,9 @@ jobs:
           done
 
       - name: Publish platform packages via trusted publishers (OIDC, tokenless)
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-metadata.outputs.mode == 'full' && github.sha || steps.source.outputs.source_sha }}
+          EXPECTED_SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.mode == 'full' && github.run_id || inputs.source_run_id }}
         run: |
           set -euo pipefail
           MANIFEST=npm-release-packages/release-packages.json
@@ -1149,7 +1152,13 @@ jobs:
             set -e
             if [ "$exit_code" -ne 0 ]; then
               if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
-                echo "Already published — skipping"
+                node npm/release/verify-published-package.mjs \
+                  --manifest "$MANIFEST" \
+                  --package "$package" \
+                  --tag "$NPM_TAG" \
+                  --source-sha "$EXPECTED_SOURCE_SHA" \
+                  --source-run-id "$EXPECTED_SOURCE_RUN_ID" \
+                  --tarball "./npm-release-packages/$tarball"
               else
                 return "$exit_code"
               fi
@@ -1275,6 +1284,9 @@ jobs:
           "$PREFIX/node_modules/.bin/lpx" --help >/dev/null
 
       - name: Publish exact verified wrapper tarball
+        env:
+          EXPECTED_SOURCE_SHA: ${{ needs.release-metadata.outputs.mode == 'full' && github.sha || steps.source.outputs.source_sha }}
+          EXPECTED_SOURCE_RUN_ID: ${{ needs.release-metadata.outputs.mode == 'full' && github.run_id || inputs.source_run_id }}
         run: |
           set -euo pipefail
           MANIFEST=npm-release-packages/release-packages.json
@@ -1292,7 +1304,13 @@ jobs:
           set -e
           if [ "$exit_code" -ne 0 ]; then
             if grep -q "cannot publish over the previously published" /tmp/npm-publish.log; then
-              echo "Already published — skipping"
+              node npm/release/verify-published-package.mjs \
+                --manifest "$MANIFEST" \
+                --package "@lpm-registry/cli" \
+                --tag "$NPM_TAG" \
+                --source-sha "$EXPECTED_SOURCE_SHA" \
+                --source-run-id "$EXPECTED_SOURCE_RUN_ID" \
+                --tarball "./npm-release-packages/$TARBALL"
             else
               exit "$exit_code"
             fi
