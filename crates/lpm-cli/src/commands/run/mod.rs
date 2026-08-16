@@ -97,7 +97,13 @@ pub async fn run_multi(
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
 
     // Fast path: single task with no dependencies — delegate to simple runner
-    if total_tasks == 1 && scripts.len() == 1 && !json_output {
+    let has_lpm_task_command = scripts.first().is_some_and(|script| {
+        tasks
+            .get(script)
+            .and_then(|task| task.command.as_ref())
+            .is_some()
+    });
+    if total_tasks == 1 && scripts.len() == 1 && !json_output && !has_lpm_task_command {
         return run(
             project_dir,
             &scripts[0],
@@ -125,7 +131,6 @@ pub async fn run_multi(
             &bin_hint,
             pkg_scripts.as_ref(),
         )
-        .await
     } else {
         // Sequential: run tasks in topological order (deps before dependents)
         let topo_order: Vec<String> = levels.into_iter().flatten().collect();
@@ -142,7 +147,6 @@ pub async fn run_multi(
             &bin_hint,
             pkg_scripts.as_ref(),
         )
-        .await
     }
 }
 
