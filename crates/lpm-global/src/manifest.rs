@@ -246,9 +246,8 @@ impl GlobalManifest {
         self.packages.is_empty() && self.pending.is_empty() && self.aliases.is_empty()
     }
 
-    /// Set of every command name currently exposed on PATH. Union of all
-    /// `packages.*.commands` and the keys of `[aliases]`. Used by collision
-    /// detection at install time.
+    /// Set of every command spelling currently exposed on PATH. Union of all
+    /// `packages.*.commands` and the keys of `[aliases]`.
     pub fn exposed_commands(&self) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
         for entry in self.packages.values() {
@@ -265,11 +264,16 @@ impl GlobalManifest {
     /// Resolve a command name on PATH back to the owning package + the
     /// package's declared bin name. Returns `None` if no install exposes
     /// `command`. All borrows tie to `self` so the result outlives the
-    /// input `command` slice.
+    /// input `command` slice. Matching follows the host's global-shim
+    /// filesystem policy.
     pub fn owner_of_command(&self, command: &str) -> Option<CommandOwner<'_>> {
         // Aliases take precedence — an alias is by construction the user's
         // explicit override.
-        if let Some(alias) = self.aliases.get(command) {
+        if let Some(alias) = self
+            .aliases
+            .iter()
+            .find_map(|(name, alias)| command_name_eq(name, command).then_some(alias))
+        {
             return Some(CommandOwner {
                 package: alias.package.as_str(),
                 bin: alias.bin.as_str(),
@@ -277,7 +281,11 @@ impl GlobalManifest {
             });
         }
         for (name, entry) in &self.packages {
-            if let Some(bin) = entry.commands.iter().find(|c| c.as_str() == command) {
+            if let Some(bin) = entry
+                .commands
+                .iter()
+                .find(|candidate| command_name_eq(candidate, command))
+            {
                 return Some(CommandOwner {
                     package: name.as_str(),
                     bin: bin.as_str(),
@@ -427,6 +435,16 @@ fn install_root_component_eq(left: &str, right: &str) -> bool {
     left == right
 }
 
+#[cfg(any(target_os = "macos", windows))]
+fn command_name_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn command_name_eq(left: &str, right: &str) -> bool {
+    left == right
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandOwner<'a> {
     pub package: &'a str,
@@ -465,12 +483,8 @@ pub fn find_command_collisions(
     candidate_package: &str,
     candidate_commands: &[String],
 ) -> Vec<CommandCollision> {
-    let exposed = manifest.exposed_commands();
     let mut out = Vec::new();
     for cmd in candidate_commands {
-        if !exposed.contains(cmd) {
-            continue;
-        }
         match manifest.owner_of_command(cmd) {
             Some(owner) if owner.package == candidate_package => continue,
             Some(owner) => out.push(CommandCollision {
@@ -478,11 +492,7 @@ pub fn find_command_collisions(
                 current_owner: owner.package.to_string(),
                 via_alias: owner.via_alias,
             }),
-            None => out.push(CommandCollision {
-                command: cmd.clone(),
-                current_owner: "<unknown>".to_string(),
-                via_alias: false,
-            }),
+            None => {}
         }
     }
     out
@@ -794,6 +804,39 @@ mystery_field = 42
         assert_eq!(collisions[0].command, "eslint");
         assert_eq!(collisions[0].current_owner, "eslint");
         assert!(!collisions[0].via_alias);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn find_command_collisions_matches_case_insensitive_filesystem_names() {
+        let manifest = sample_manifest();
+
+        let collisions = find_command_collisions(&manifest, "alt-eslint", &["ESLint".to_string()]);
+
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].current_owner, "eslint");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn find_command_collisions_matches_case_insensitive_aliases() {
+        let manifest = sample_manifest();
+
+        let collisions = find_command_collisions(&manifest, "pkg-c", &["SRV".to_string()]);
+
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(collisions[0].current_owner, "pkg-b");
+        assert!(collisions[0].via_alias);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn find_command_collisions_excludes_case_insensitive_self_owner() {
+        let manifest = sample_manifest();
+
+        let collisions = find_command_collisions(&manifest, "eslint", &["ESLint".to_string()]);
+
+        assert!(collisions.is_empty());
     }
 
     #[test]
