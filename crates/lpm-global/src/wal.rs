@@ -65,6 +65,11 @@ pub const RECORD_SENTINEL: u8 = 0x0A;
 /// torn-tail and break recovery cleanly.
 pub const MAX_RECORD_PAYLOAD_BYTES: usize = 1024 * 1024;
 
+/// Maximum WAL size accepted by recovery or produced by the writer.
+/// Global state files share one conservative bound so startup work cannot
+/// reserve memory from an attacker-controlled file length.
+pub const MAX_WAL_FILE_BYTES: u64 = lpm_common::STATE_FILE_SIZE_CAP_BYTES;
+
 /// Minimum bytes needed to even begin parsing a record: 4 (len) + 4
 /// (crc) + 0 (empty payload allowed) + 1 (sentinel).
 pub const MIN_RECORD_BYTES: usize = 4 + 4 + 1;
@@ -73,8 +78,10 @@ pub const MIN_RECORD_BYTES: usize = 4 + 4 + 1;
 pub enum WalError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("payload too large for u32 length prefix: {0} bytes")]
+    #[error("WAL record payload exceeds the {MAX_RECORD_PAYLOAD_BYTES}-byte limit: {0} bytes")]
     PayloadTooLarge(usize),
+    #[error("WAL file exceeds the {cap}-byte limit: {size} bytes")]
+    FileTooLarge { size: u64, cap: u64 },
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -345,6 +352,9 @@ impl WalWriter {
     /// durable on platforms that honour fsync.
     pub fn append(&mut self, record: &WalRecord) -> Result<(), WalError> {
         let payload = serde_json::to_vec(record)?;
+        if payload.len() > MAX_RECORD_PAYLOAD_BYTES {
+            return Err(WalError::PayloadTooLarge(payload.len()));
+        }
         let len: u32 = payload
             .len()
             .try_into()
@@ -361,6 +371,21 @@ impl WalWriter {
         frame.extend_from_slice(&crc.to_be_bytes());
         frame.extend_from_slice(&payload);
         frame.push(RECORD_SENTINEL);
+
+        let current_len = self.file.metadata()?.len();
+        let next_len =
+            current_len
+                .checked_add(frame.len() as u64)
+                .ok_or(WalError::FileTooLarge {
+                    size: u64::MAX,
+                    cap: MAX_WAL_FILE_BYTES,
+                })?;
+        if next_len > MAX_WAL_FILE_BYTES {
+            return Err(WalError::FileTooLarge {
+                size: next_len,
+                cap: MAX_WAL_FILE_BYTES,
+            });
+        }
 
         self.file.write_all(&frame)?;
         self.file.sync_all()?;
@@ -471,7 +496,7 @@ impl WalReader {
     /// a missing or empty file — both are valid no-op states.
     pub fn scan(&self) -> Result<WalScan, WalError> {
         let extended = as_extended_path(&self.path);
-        let mut file = match std::fs::OpenOptions::new().read(true).open(&extended) {
+        let file = match std::fs::OpenOptions::new().read(true).open(&extended) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(WalScan {
@@ -493,11 +518,24 @@ impl WalReader {
                 stop: ScanStop::Eof,
             });
         }
+        if file_len > MAX_WAL_FILE_BYTES {
+            return Err(WalError::FileTooLarge {
+                size: file_len,
+                cap: MAX_WAL_FILE_BYTES,
+            });
+        }
 
-        // Read the whole file into memory. WALs are bounded in size by
-        // the rotation policy (default 10MB cap, see plan open Q13).
+        // Bound the read as well as the initial capacity. The second check
+        // closes the metadata-to-read race if an external writer grows the
+        // file without participating in the transaction lock.
         let mut buf = Vec::with_capacity(file_len as usize);
-        file.read_to_end(&mut buf)?;
+        file.take(MAX_WAL_FILE_BYTES + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_WAL_FILE_BYTES {
+            return Err(WalError::FileTooLarge {
+                size: buf.len() as u64,
+                cap: MAX_WAL_FILE_BYTES,
+            });
+        }
 
         let mut records = Vec::new();
         let mut offset: usize = 0;
@@ -1164,5 +1202,64 @@ mod tests {
             ScanStop::TornTail { offset } => assert_eq!(offset, 0),
             other => panic!("expected TornTail at offset 0, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wal_scan_rejects_file_larger_than_state_cap_before_reading_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(lpm_common::STATE_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let result = WalReader::at(&path).scan();
+        assert!(
+            matches!(
+                result,
+                Err(WalError::FileTooLarge { size, cap })
+                    if size == MAX_WAL_FILE_BYTES + 1 && cap == MAX_WAL_FILE_BYTES
+            ),
+            "oversized WAL must fail before allocating from its length"
+        );
+    }
+
+    #[test]
+    fn wal_writer_rejects_records_the_reader_cannot_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal");
+        let mut record = intent("tx-large", "large-package");
+        let WalRecord::Intent(payload) = &mut record else {
+            unreachable!("intent helper always returns an Intent")
+        };
+        payload.new_row_json = serde_json::json!({
+            "padding": "x".repeat(MAX_RECORD_PAYLOAD_BYTES),
+        });
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        let result = writer.append(&record);
+        assert!(
+            matches!(result, Err(WalError::PayloadTooLarge(size)) if size > MAX_RECORD_PAYLOAD_BYTES),
+            "writer must not persist a record that its reader rejects"
+        );
+    }
+
+    #[test]
+    fn wal_writer_does_not_grow_file_past_reader_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_WAL_FILE_BYTES - 1).unwrap();
+
+        let mut writer = WalWriter::open(&path).unwrap();
+        let result = writer.append(&commit("tx-over-file-limit"));
+        assert!(
+            matches!(result, Err(WalError::FileTooLarge { size, cap }) if size > cap && cap == MAX_WAL_FILE_BYTES),
+            "writer must preserve the reader's whole-file size contract"
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_WAL_FILE_BYTES - 1,
+            "rejected append must not mutate the WAL"
+        );
     }
 }
