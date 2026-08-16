@@ -18,12 +18,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 
 test("release package verification accepts the exact full package set", async t => {
   const { binaries, output } = createFullFixture(t);
-  prepareReleasePackages({
-    repoRoot,
-    binariesDir: binaries,
-    outputDir: output,
-    version: VERSION,
-  });
+  prepareValidFullPackageSet(binaries, output);
 
   const manifest = await verifyReleasePackages({
     packagesDir: output,
@@ -31,6 +26,18 @@ test("release package verification accepts the exact full package set", async t 
   });
 
   assert.equal(manifest.packages.length, PLATFORM_PACKAGES.length + 1);
+});
+
+test("release package verification accepts canonical Windows test archives", async t => {
+  const { binaries, output } = createFullFixture(t);
+  prepareValidFullPackageSet(binaries, output, "win32");
+
+  await assert.doesNotReject(
+    verifyReleasePackages({
+      packagesDir: output,
+      expectedVersion: VERSION,
+    }),
+  );
 });
 
 test("release package verification rejects a changed tarball", async t => {
@@ -445,12 +452,7 @@ test("release package verification rejects a self-declared unsafe file mode", as
 
 test("release package verification rejects an incorrect binary digest", async t => {
   const { binaries, output } = createFullFixture(t);
-  const manifest = prepareReleasePackages({
-    repoRoot,
-    binariesDir: binaries,
-    outputDir: output,
-    version: VERSION,
-  });
+  const manifest = prepareValidFullPackageSet(binaries, output);
   const platform = PLATFORM_PACKAGES[0];
   const record = manifest.packages.find(entry => entry.name === platform.packageName);
   record.binaries[platform.binaries[0].destination].sha256 = "0".repeat(64);
@@ -547,12 +549,7 @@ test("release package verification reports archive read errors without waiting",
 
 test("release package verification streams the outer directory inventory", async t => {
   const output = createWrapperFixture(t);
-  prepareReleasePackages({
-    repoRoot,
-    outputDir: output,
-    version: VERSION,
-    wrapperOnly: true,
-  });
+  prepareValidWrapperPackageSet(output);
 
   const readdirSync = fs.readdirSync;
   fs.readdirSync = () => {
@@ -584,6 +581,83 @@ function createFullFixture(t) {
   return { binaries, output };
 }
 
+function prepareValidFullPackageSet(binaries, output, hostPlatform = process.platform) {
+  if (hostPlatform !== "win32") {
+    return prepareReleasePackages({
+      repoRoot,
+      binariesDir: binaries,
+      outputDir: output,
+      version: VERSION,
+    });
+  }
+
+  fs.mkdirSync(output);
+  const packages = PLATFORM_PACKAGES.map(platform => {
+    const sourceManifest = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, platform.directory, "package.json"), "utf8"),
+    );
+    const packageManifest = manifestForRelease(sourceManifest, VERSION, platform);
+    const contents = [
+      ["README.md", Buffer.from("platform readme\n"), 0o644],
+      ["package.json", Buffer.from(JSON.stringify(packageManifest)), 0o644],
+      ...platform.binaries.map(mapping => [
+        mapping.destination,
+        fs.readFileSync(path.join(binaries, mapping.artifact)),
+        platform.os === "win32" ? 0o644 : 0o755,
+      ]),
+    ];
+    const entries = contents.map(([relative, body, mode]) =>
+      tarFile(`package/${relative}`, body, mode),
+    );
+    const files = contents.map(([relative, body, mode]) => packedFile(relative, body.length, mode));
+    const binaryHashes = Object.fromEntries(
+      platform.binaries.map(mapping => {
+        const body = contents.find(([relative]) => relative === mapping.destination)[1];
+        return [
+          mapping.destination,
+          { artifact: mapping.artifact, sha256: digest(body, "sha256", "hex") },
+        ];
+      }),
+    );
+    return writeSyntheticPackageArtifact(
+      output,
+      platform.packageName,
+      platform.key,
+      entries,
+      files,
+      binaryHashes,
+    );
+  });
+  const wrapper = syntheticWrapperContents(wrapperManifest());
+  packages.push(
+    writeSyntheticPackageArtifact(
+      output,
+      WRAPPER_PACKAGE,
+      null,
+      wrapper.entries,
+      wrapper.files,
+      {},
+    ),
+  );
+  const manifest = { schemaVersion: 1, version: VERSION, wrapperOnly: false, packages };
+  writeJson(path.join(output, "release-packages.json"), manifest);
+  return manifest;
+}
+
+function prepareValidWrapperPackageSet(output) {
+  if (process.platform !== "win32") {
+    return prepareReleasePackages({
+      repoRoot,
+      outputDir: output,
+      version: VERSION,
+      wrapperOnly: true,
+    });
+  }
+  const { entries, files } = syntheticWrapperContents(wrapperManifest());
+  writeSyntheticWrapperArtifact(output, entries, files);
+  return JSON.parse(fs.readFileSync(path.join(output, "release-packages.json"), "utf8"));
+}
+
 function createWrapperFixture(t) {
   const output = path.join(
     os.tmpdir(),
@@ -600,27 +674,37 @@ function wrapperManifest() {
 
 function writeSyntheticWrapperArtifact(output, entries, files) {
   fs.mkdirSync(output);
-  const tarball = "lpm-registry-cli-0.69.0.tgz";
-  const archive = createTarGz(entries);
-  fs.writeFileSync(path.join(output, tarball), archive);
+  const record = writeSyntheticPackageArtifact(
+    output,
+    WRAPPER_PACKAGE,
+    null,
+    entries,
+    files,
+    {},
+  );
   writeJson(path.join(output, "release-packages.json"), {
     schemaVersion: 1,
     version: VERSION,
     wrapperOnly: true,
-    packages: [
-      {
-        name: WRAPPER_PACKAGE,
-        version: VERSION,
-        platform: null,
-        tarball,
-        sha256: digest(archive, "sha256", "hex"),
-        shasum: digest(archive, "sha1", "hex"),
-        integrity: `sha512-${digest(archive, "sha512", "base64")}`,
-        files,
-        binaries: {},
-      },
-    ],
+    packages: [record],
   });
+}
+
+function writeSyntheticPackageArtifact(output, packageName, platform, entries, files, binaries) {
+  const tarball = `${packageName.replace(/^@/u, "").replace("/", "-")}-${VERSION}.tgz`;
+  const archive = createTarGz(entries);
+  fs.writeFileSync(path.join(output, tarball), archive);
+  return {
+    name: packageName,
+    version: VERSION,
+    platform,
+    tarball,
+    sha256: digest(archive, "sha256", "hex"),
+    shasum: digest(archive, "sha1", "hex"),
+    integrity: `sha512-${digest(archive, "sha512", "base64")}`,
+    files,
+    binaries,
+  };
 }
 
 function createTarGz(entries) {
