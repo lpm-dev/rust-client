@@ -44,6 +44,9 @@ keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypt
 [target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dependencies]
 keyring = { workspace = true, features = ["vendored"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
 
