@@ -13,6 +13,8 @@ use support::auth_state::{
 };
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 const GITHUB_REGISTRY_URL: &str = "https://npm.pkg.github.com";
@@ -705,6 +707,49 @@ async fn env_token_takes_precedence_over_refreshable_stored_session() {
         expiry[&mock.url()]["session_access_expires_at"],
         "2000-01-01T00:00:00Z",
         "using LPM_TOKEN should not mutate stored session expiry metadata"
+    );
+}
+
+#[tokio::test]
+async fn rejected_explicit_token_preserves_stored_session_credentials() {
+    let project =
+        TempProject::empty(r#"{"name":"auth-explicit-token-rejection-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", "Bearer rejected-explicit-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("stored-access-token"),
+            refresh_token: Some("stored-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let credentials_before = read_credentials(project.home());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--token", "rejected-explicit-token", "whoami", "--json"])
+        .output()
+        .expect("failed to run whoami with rejected explicit token");
+
+    assert!(
+        !output.status.success(),
+        "rejected explicit token unexpectedly succeeded:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        read_credentials(project.home()),
+        credentials_before,
+        "rejecting an explicit token must not delete an unrelated stored session"
     );
 }
 

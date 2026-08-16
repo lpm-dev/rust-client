@@ -1,7 +1,7 @@
 use clap::{CommandFactory, Parser};
 use miette::Diagnostic as _;
 
-use crate::{auth, install_ui};
+use crate::install_ui;
 
 use super::args::{Cli, Commands};
 use super::helpers::{args_for_cli_parse, argv_requests_json, clap_help_hint_from_argv};
@@ -90,19 +90,11 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
     }
 }
 
-pub(super) fn exit_with_lpm_error(
-    error: &lpm_common::LpmError,
-    json_output: bool,
-    registry_url: &str,
-) -> ! {
+pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         print_json_error(error);
     } else if !json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         render_slim_error(error);
-    }
-
-    if matches!(error, lpm_common::LpmError::AuthRequired) {
-        let _ = auth::clear_token(registry_url);
     }
 
     match error {
