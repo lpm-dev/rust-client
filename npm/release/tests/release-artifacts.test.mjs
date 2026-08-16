@@ -91,6 +91,29 @@ test("Apple Silicon release builds keep enough timeout headroom for cold builds"
   );
 });
 
+test("Windows filesystem gate isolates file-count stress from lock timing tests", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/windows-filesystem-gate.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const regularStart = workflow.indexOf("      - name: Windows filesystem crate tests\n");
+  const stressStart = workflow.indexOf("      - name: Windows extractor file-count stress tests\n");
+
+  assert.notEqual(regularStart, -1, "missing regular Windows filesystem test step");
+  assert.ok(stressStart > regularStart, "extractor stress tests must run after regular crate tests");
+  const regularStep = workflow.slice(regularStart, stressStart);
+  const stressStep = workflow.slice(stressStart);
+  assert.match(
+    regularStep,
+    /not \(test\(extract_accepts_exact_max_file_count\) \|\s+test\(extract_rejects_more_than_max_file_count\)\)/,
+  );
+  assert.match(
+    stressStep,
+    /test\(extract_accepts_exact_max_file_count\) \|\s+test\(extract_rejects_more_than_max_file_count\)/,
+  );
+  assert.match(stressStep, /--test-threads=1/);
+});
+
 test("npm publish workflow treats release tarballs as local filesystem paths", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(

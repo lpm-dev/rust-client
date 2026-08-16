@@ -22,6 +22,8 @@ use crate::v2::platform::PlatformTuple;
 use crate::v2::tree_hash::metadata_hash_implementations_match_for_test;
 use crate::v2::tree_hash::{ObjectTreeStats, TreeIntegrities, compute_tree_metadata_integrity};
 
+const LOCK_RELEASE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn macos_arm64() -> PlatformTuple {
     PlatformTuple::new("darwin", "arm64", None)
 }
@@ -1122,7 +1124,7 @@ fn populate_link_entry_waits_for_graph_entry_mutation_lock() {
     ));
     drop(held_lock);
     finished_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(LOCK_RELEASE_WATCHDOG)
         .unwrap()
         .unwrap();
     worker.join().unwrap();
@@ -1173,7 +1175,7 @@ fn reusable_link_entry_waits_for_graph_entry_mutation_lock() {
     ));
     drop(held_lock);
     let reused = finished_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
+        .recv_timeout(LOCK_RELEASE_WATCHDOG)
         .unwrap()
         .unwrap();
     assert!(!reused.freshly_populated);

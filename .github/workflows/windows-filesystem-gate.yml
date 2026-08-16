@@ -47,7 +47,21 @@ jobs:
         run: cargo build --locked -p lpm-cli
 
       - name: Windows filesystem crate tests
-        run: cargo nextest run --locked -p lpm-cert -p lpm-common -p lpm-extractor -p lpm-linker -p lpm-store -p lpm-global -p lpm-sandbox --no-fail-fast --status-level slow --final-status-level fail
+        run: >-
+          cargo nextest run --locked
+          -p lpm-cert -p lpm-common -p lpm-extractor -p lpm-linker
+          -p lpm-store -p lpm-global -p lpm-sandbox
+          -E 'not (test(extract_accepts_exact_max_file_count) |
+          test(extract_rejects_more_than_max_file_count))'
+          --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Windows extractor file-count stress tests
+        run: >-
+          cargo nextest run --locked -p lpm-extractor
+          -E 'test(extract_accepts_exact_max_file_count) |
+          test(extract_rejects_more_than_max_file_count)'
+          --test-threads=1
+          --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Windows CLI filesystem unit tests
         run: cargo test --locked -p lpm-cli --bin lpm-rs remove_owned_cmd_shim
