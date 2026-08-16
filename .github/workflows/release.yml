@@ -1102,6 +1102,12 @@ jobs:
           ARTIFACT_VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
           test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
 
+      - name: Verify npm release package artifacts
+        run: >-
+          node npm/release/verify-packages.mjs
+          --packages "$PWD/npm-release-packages"
+          --version "${{ needs.release-metadata.outputs.version }}"
+
       - name: Bootstrap npm 11 (required for trusted publishers OIDC)
         run: |
           npx --yes npm@11.12.1 --version
@@ -1245,6 +1251,12 @@ jobs:
         run: |
           ARTIFACT_VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
           test "$ARTIFACT_VERSION" = "$INPUT_VERSION"
+
+      - name: Verify npm release package artifacts
+        run: >-
+          node npm/release/verify-packages.mjs
+          --packages "$PWD/npm-release-packages"
+          --version "${{ needs.release-metadata.outputs.version }}"
 
       - name: Smoke wrapper-only recovery artifact
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'wrapper-only'

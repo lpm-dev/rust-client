@@ -130,6 +130,33 @@ test("npm publish workflow treats release tarballs as local filesystem paths", (
   ]);
 });
 
+test("OIDC publish jobs verify release archives before consuming them", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const jobSource = (job, nextJob) => {
+    const start = releaseWorkflow.indexOf(`\n  ${job}:\n`);
+    const end = releaseWorkflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
+    assert.notEqual(start, -1, `missing ${job} job`);
+    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+    return releaseWorkflow.slice(start, end);
+  };
+
+  const platformJob = jobSource("publish-npm-platform", "publish-npm-wrapper");
+  const wrapperJob = jobSource("publish-npm-wrapper", "update-homebrew");
+  for (const [job, firstConsumer] of [
+    [platformJob, "npx npm@11.12.1 publish"],
+    [wrapperJob, "npm install --prefix"],
+  ]) {
+    const verification = job.indexOf("node npm/release/verify-packages.mjs");
+    const consumption = job.indexOf(firstConsumer);
+    assert.notEqual(verification, -1, "release package verification is missing");
+    assert.notEqual(consumption, -1, `release package consumer is missing: ${firstConsumer}`);
+    assert.ok(verification < consumption, "release packages must be verified before consumption");
+  }
+});
+
 function assertNpmPublishRecoveryWorkflow(workflowSource) {
   const releaseWorkflow = workflowSource.replaceAll("\r\n", "\n");
   const jobSource = (job, nextJob) => {
@@ -403,6 +430,32 @@ test("packed-file inventory expands declared directories without allowing traver
     () => expectedPackedFiles(root, { files: ["../secret"] }),
     /unsafe package file path/,
   );
+});
+
+test("packed-file inventory rejects paths that require PAX metadata", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-pax-path-"));
+  const longName = "x".repeat(101);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, longName), "long path");
+  fs.writeFileSync(path.join(root, "package.json"), "{}");
+
+  assert.throws(
+    () => expectedPackedFiles(root, { files: [longName] }),
+    /requires unsupported PAX metadata/,
+  );
+});
+
+test("packed-file inventory accepts paths that fit the USTAR prefix field", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-ustar-prefix-"));
+  const directory = "a".repeat(80);
+  const file = "b".repeat(30);
+  const relative = `${directory}/${file}`;
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, directory));
+  fs.writeFileSync(path.join(root, relative), "prefixed path");
+  fs.writeFileSync(path.join(root, "package.json"), "{}");
+
+  assert.deepEqual(expectedPackedFiles(root, { files: [relative] }), [relative, "package.json"]);
 });
 
 test("runtime platform selection distinguishes glibc and musl", () => {

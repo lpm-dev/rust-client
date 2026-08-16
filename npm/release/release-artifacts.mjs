@@ -179,32 +179,46 @@ function safePackagePath(value) {
   if (normalized === "." || normalized === ".." || normalized.startsWith("../")) {
     throw new Error(`unsafe package file path: ${JSON.stringify(value)}`);
   }
+  assertUstarPath(normalized);
   return normalized;
 }
 
 function collectPackedPath(packageRoot, relative, files) {
-  const absolute = path.resolve(packageRoot, ...relative.split("/"));
+  const safeRelative = safePackagePath(relative);
+  const absolute = path.resolve(packageRoot, ...safeRelative.split("/"));
   const withinRoot = absolute.startsWith(`${packageRoot}${path.sep}`);
   if (!withinRoot) {
-    throw new Error(`unsafe package file path: ${JSON.stringify(relative)}`);
+    throw new Error(`unsafe package file path: ${JSON.stringify(safeRelative)}`);
   }
 
   const metadata = fs.lstatSync(absolute, { throwIfNoEntry: false });
   if (!metadata) {
-    throw new Error(`declared package file does not exist: ${relative}`);
+    throw new Error(`declared package file does not exist: ${safeRelative}`);
   }
   if (metadata.isSymbolicLink()) {
-    throw new Error(`release packages must not contain symbolic links: ${relative}`);
+    throw new Error(`release packages must not contain symbolic links: ${safeRelative}`);
   }
   if (metadata.isFile()) {
-    files.add(relative);
+    files.add(safeRelative);
     return;
   }
   if (!metadata.isDirectory()) {
-    throw new Error(`unsupported package file type: ${relative}`);
+    throw new Error(`unsupported package file type: ${safeRelative}`);
   }
 
   for (const entry of fs.readdirSync(absolute, { withFileTypes: true })) {
-    collectPackedPath(packageRoot, path.posix.join(relative, entry.name), files);
+    collectPackedPath(packageRoot, path.posix.join(safeRelative, entry.name), files);
   }
+}
+
+function assertUstarPath(relative) {
+  const archivePath = `package/${relative}`;
+  if (Buffer.byteLength(archivePath) <= 100) return;
+
+  for (let slash = archivePath.indexOf("/"); slash !== -1; slash = archivePath.indexOf("/", slash + 1)) {
+    const prefix = archivePath.slice(0, slash);
+    const name = archivePath.slice(slash + 1);
+    if (Buffer.byteLength(prefix) <= 155 && Buffer.byteLength(name) <= 100) return;
+  }
+  throw new Error(`package file path requires unsupported PAX metadata: ${JSON.stringify(relative)}`);
 }
