@@ -353,36 +353,51 @@ pub(crate) fn resolve_execution_node_engine_requirements(
                 .unwrap_or_default());
         }
     };
+    let member_package = if start_dir != root_dir {
+        let package_path = start_dir.join("package.json");
+        if package_path.exists() {
+            Some(read_package_json(&package_path).map_err(|error| {
+                LpmError::Workspace(format!("could not read package.json: {error}"))
+            })?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let engine_strict = engine_strict_config::resolve_for_root(false, root_pkg);
+    Ok(workspace_node_engine_requirements(
+        root_pkg,
+        member_package.as_ref(),
+        engine_strict,
+    ))
+}
+
+pub(crate) fn workspace_node_engine_requirements(
+    root_package: &PackageJson,
+    member_package: Option<&PackageJson>,
+    engine_strict: bool,
+) -> Vec<NodeEngineRequirement> {
     let mut requirements = Vec::with_capacity(2);
-    if let Some(required) = root_pkg.engines.get("node") {
+    if let Some(required) = root_package.engines.get("node") {
         requirements.push(NodeEngineRequirement {
             required: required.clone(),
             engine_strict,
             source: "workspace root package.json > engines.node".to_string(),
         });
     }
-
-    if start_dir != root_dir {
-        let package_path = start_dir.join("package.json");
-        if package_path.exists() {
-            let package = read_package_json(&package_path).map_err(|error| {
-                LpmError::Workspace(format!("could not read package.json: {error}"))
-            })?;
-            if let Some(required) = package.engines.get("node")
-                && !requirements
-                    .iter()
-                    .any(|requirement| requirement.required == *required)
-            {
-                requirements.push(NodeEngineRequirement {
-                    required: required.clone(),
-                    engine_strict,
-                    source: "service package.json > engines.node".to_string(),
-                });
-            }
-        }
+    if let Some(required) = member_package.and_then(|package| package.engines.get("node"))
+        && !requirements
+            .iter()
+            .any(|requirement| requirement.required == *required)
+    {
+        requirements.push(NodeEngineRequirement {
+            required: required.clone(),
+            engine_strict,
+            source: "service package.json > engines.node".to_string(),
+        });
     }
-    Ok(requirements)
+    requirements
 }
 
 /// Variant that takes the already-resolved root + manifest. Use this
@@ -650,6 +665,46 @@ mod tests {
         let dir = tempdir().unwrap();
         let pkg = PackageJson::default();
         assert!(enforce_with_root(dir.path(), &pkg, true, false).is_ok());
+    }
+
+    #[test]
+    fn workspace_engine_requirements_reuse_parsed_root_and_member_manifests() {
+        let root = PackageJson {
+            engines: engines(&[("node", ">=20")]),
+            ..Default::default()
+        };
+        let member = PackageJson {
+            engines: engines(&[("node", "^22")]),
+            ..Default::default()
+        };
+
+        let requirements = workspace_node_engine_requirements(&root, Some(&member), true);
+
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements[0].required, ">=20");
+        assert_eq!(requirements[1].required, "^22");
+        assert_eq!(
+            requirements[0].source,
+            "workspace root package.json > engines.node"
+        );
+        assert_eq!(
+            requirements[1].source,
+            "service package.json > engines.node"
+        );
+    }
+
+    #[test]
+    fn workspace_engine_requirements_deduplicate_equal_constraints() {
+        let root = PackageJson {
+            engines: engines(&[("node", "^22")]),
+            ..Default::default()
+        };
+        let member = root.clone();
+
+        let requirements = workspace_node_engine_requirements(&root, Some(&member), true);
+
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].required, "^22");
     }
 
     #[test]

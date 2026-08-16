@@ -427,7 +427,7 @@ impl ServiceConfig {
 }
 
 /// Configuration for a single task in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct TaskConfig {
     /// Command to run (overrides package.json scripts).
@@ -446,7 +446,7 @@ pub struct TaskConfig {
     #[serde(default)]
     pub outputs: Vec<String>,
 
-    /// Input file globs that invalidate cache (default: `["src/**", "package.json"]`).
+    /// Input globs that invalidate cache. Empty lists use the documented project defaults.
     #[serde(default)]
     pub inputs: Vec<String>,
 
@@ -465,7 +465,16 @@ impl TaskConfig {
                 "app/**".into(),
                 "pages/**".into(),
                 "components/**".into(),
+                "scripts/**".into(),
+                "bin/**".into(),
+                "*.js".into(),
+                "*.cjs".into(),
+                "*.mjs".into(),
+                "*.ts".into(),
+                "*.tsx".into(),
+                "*.jsx".into(),
                 "package.json".into(),
+                "lpm.json".into(),
                 "tsconfig.json".into(),
                 "tsconfig.*.json".into(),
                 "*.config.js".into(),
@@ -697,6 +706,8 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
             }
         })?;
 
+    validate_task_cache_globs(&config)?;
+
     if let Some(vault_id) = config.vault.as_deref()
         && !lpm_vault::vault_id::is_safe_vault_id(vault_id)
     {
@@ -710,6 +721,24 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
     validate_and_normalize_local_domain_hosts(&mut config)?;
 
     Ok(Some(config))
+}
+
+fn validate_task_cache_globs(config: &LpmJsonConfig) -> Result<(), String> {
+    let mut task_names: Vec<_> = config.tasks.keys().collect();
+    task_names.sort_unstable();
+    for task_name in task_names {
+        let task = &config.tasks[task_name];
+        for (field, patterns) in [("inputs", &task.inputs), ("outputs", &task.outputs)] {
+            for pattern in patterns {
+                lpm_common::validate_project_glob(pattern).map_err(|reason| {
+                    format!(
+                        "invalid lpm.json data: tasks.{task_name}.{field} contains invalid glob {pattern:?}: {reason}"
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validated_cert_extra_permitted_dns(
@@ -1112,6 +1141,8 @@ mod tests {
         let inputs = t.effective_inputs();
         assert!(inputs.contains(&"src/**".to_string()));
         assert!(inputs.contains(&"package.json".to_string()));
+        assert!(inputs.contains(&"*.js".to_string()));
+        assert!(inputs.contains(&"lpm.json".to_string()));
     }
 
     #[test]

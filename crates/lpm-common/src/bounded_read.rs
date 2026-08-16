@@ -114,7 +114,7 @@ pub fn read_file_capped_from_open_file(
         });
     }
 
-    let bytes = read_opened_file_capped(&mut file, path, limit)?;
+    let bytes = read_opened_file_capped(&mut file, path, limit, metadata.len())?;
     Ok((bytes, metadata))
 }
 
@@ -169,13 +169,19 @@ fn read_opened_file_capped<R: Read>(
     reader: &mut R,
     path: &Path,
     limit: u64,
+    estimated_len: u64,
 ) -> Result<Vec<u8>, BoundedReadError> {
     let read_limit = limit.checked_add(1).ok_or_else(|| BoundedReadError::Io {
         path: path.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "file size limit is too large"),
     })?;
-    let initial_capacity = usize::try_from(read_limit.min(INITIAL_BUFFER_CAPACITY_BYTES))
-        .expect("bounded initial capacity fits usize");
+    let initial_capacity = usize::try_from(
+        estimated_len
+            .saturating_add(1)
+            .min(read_limit)
+            .min(INITIAL_BUFFER_CAPACITY_BYTES),
+    )
+    .expect("bounded initial capacity fits usize");
     let mut bytes = Vec::with_capacity(initial_capacity);
     reader
         .take(read_limit)
@@ -223,6 +229,21 @@ mod tests {
     }
 
     #[test]
+    fn small_file_read_does_not_retain_the_generic_read_buffer_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small");
+        std::fs::write(&path, b"small").unwrap();
+
+        let bytes = read_file_capped(&path, 1024 * 1024).unwrap();
+
+        assert!(
+            bytes.capacity() <= 64,
+            "small descriptor-backed read retained {} bytes",
+            bytes.capacity()
+        );
+    }
+
+    #[test]
     fn file_one_byte_over_limit_returns_too_large() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized");
@@ -253,7 +274,7 @@ mod tests {
         let mut reader = Cursor::new(b"123456789".as_slice());
 
         assert!(matches!(
-            read_opened_file_capped(&mut reader, path, 5),
+            read_opened_file_capped(&mut reader, path, 5, 0),
             Err(BoundedReadError::TooLarge { limit: 5, .. })
         ));
         assert_eq!(reader.position(), 6);

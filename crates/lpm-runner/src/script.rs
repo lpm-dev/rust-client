@@ -1207,28 +1207,35 @@ fn resolve_and_load_env(
     explicit_mode: Option<&str>,
 ) -> Result<LoadedEnv, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
+    resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config.as_ref())
+}
 
+fn resolve_and_load_env_with_config(
+    project_dir: &Path,
+    script_name: &str,
+    explicit_mode: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<LoadedEnv, LpmError> {
     // Determine the canonical env name via the resolver.
     // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
     let (env_name, alias, source) = if let Some(m) = explicit_mode {
-        let resolved = match &config {
+        let resolved = match config {
             Some(c) => lpm_env::resolver::resolve(m, &c.env, c.environments.as_ref()),
             None => lpm_env::resolver::resolve(m, &Default::default(), None),
         };
         let alias = resolved.alias.clone();
         (Some(resolved.canonical), alias, "--env flag")
     } else if let Some(task_mode) = config
-        .as_ref()
         .and_then(|config| config.tasks.get(script_name))
         .and_then(|task| task.env.as_deref())
     {
-        let config = config.as_ref().expect("task mode requires lpm.json");
+        let config = config.expect("task mode requires lpm.json");
         let resolved =
             lpm_env::resolver::resolve(task_mode, &config.env, config.environments.as_ref());
         let alias = resolved.alias.clone();
         (Some(resolved.canonical), alias, "lpm.json task")
     } else {
-        match config.as_ref().and_then(|c| {
+        match config.and_then(|c| {
             lpm_env::resolver::resolve_from_script(script_name, &c.env, c.environments.as_ref())
         }) {
             Some(r) => {
@@ -1250,7 +1257,7 @@ fn resolve_and_load_env(
     };
 
     // Delegate to the unified loader (handles inheritance, vault, schema validation)
-    let vars = dotenv::load_project_env(project_dir, env_name.as_deref())?;
+    let vars = dotenv::load_project_env_with_config(project_dir, env_name.as_deref(), config)?;
 
     Ok(LoadedEnv {
         vars,
@@ -1272,6 +1279,16 @@ pub fn load_script_env(
     explicit_mode: Option<&str>,
 ) -> Result<HashMap<String, String>, LpmError> {
     Ok(resolve_and_load_env(project_dir, script_name, explicit_mode)?.vars)
+}
+
+/// Load a script environment using a configuration that the caller already parsed.
+pub fn load_script_env_with_config(
+    project_dir: &Path,
+    script_name: &str,
+    explicit_mode: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    Ok(resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config)?.vars)
 }
 
 /// Resolve only a script command from package.json or lpm.json tasks.

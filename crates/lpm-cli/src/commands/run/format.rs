@@ -1,4 +1,9 @@
 use crate::install_ui;
+use lpm_common::LpmError;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use super::cache::CompletedTaskCacheIdentity;
 
 pub(super) fn print_captured_stdout(output: &str) {
     print!("{}", lpm_common::sanitize_terminal_multiline(output));
@@ -14,6 +19,61 @@ pub(super) struct TaskResult {
     pub(super) duration: std::time::Duration,
     pub(super) cached: bool,
     pub(super) skipped: bool,
+}
+
+pub(super) struct TaskRunReport {
+    results: Vec<TaskResult>,
+    cache_identities: HashMap<String, Arc<CompletedTaskCacheIdentity>>,
+}
+
+impl TaskRunReport {
+    pub(super) fn new(results: Vec<TaskResult>) -> Self {
+        Self {
+            results,
+            cache_identities: HashMap::new(),
+        }
+    }
+
+    pub(super) fn with_cache_identities(
+        results: Vec<TaskResult>,
+        cache_identities: HashMap<String, Arc<CompletedTaskCacheIdentity>>,
+    ) -> Self {
+        Self {
+            results,
+            cache_identities,
+        }
+    }
+
+    pub(super) fn is_successful(&self) -> bool {
+        self.results.iter().all(|result| result.success)
+    }
+
+    pub(super) fn task_states(&self) -> HashMap<String, bool> {
+        self.results
+            .iter()
+            .map(|result| (result.name.clone(), result.success))
+            .collect()
+    }
+
+    pub(super) fn task_cache_identity(
+        &self,
+        task_name: &str,
+    ) -> Option<&Arc<CompletedTaskCacheIdentity>> {
+        self.cache_identities.get(task_name)
+    }
+
+    pub(super) fn into_result(self) -> Result<(), LpmError> {
+        let failure_count = self
+            .results
+            .iter()
+            .filter(|result| !result.success && !result.skipped)
+            .count();
+        if failure_count == 0 {
+            Ok(())
+        } else {
+            Err(LpmError::ExitCode(failure_count as i32))
+        }
+    }
 }
 
 pub(super) fn print_task_result(result: &TaskResult) {

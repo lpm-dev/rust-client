@@ -312,6 +312,7 @@ async function executeScenario({ scenario, binary, sample, counted, pairId = nul
     pair_id: pairId,
     pair_order: pairOrder,
     execution_sequence: ++executionSequence,
+    timeout_ms: scenario.timeoutMs ?? timeoutMs,
     started_at: new Date().toISOString(),
   };
   try {
@@ -325,7 +326,12 @@ async function executeScenario({ scenario, binary, sample, counted, pairId = nul
       env: { ...env, ...spec.env },
       label: spec.label ?? 'lpm',
     }));
-    const result = await runProcesses(context, processSpecs, scenario, timeoutMs);
+    const result = await runProcesses(
+      context,
+      processSpecs,
+      scenario,
+      scenario.timeoutMs ?? timeoutMs,
+    );
     Object.assign(row, result.metrics);
     row.processes = result.processes;
     row.contract = await scenario.validate(context, result);
@@ -539,6 +545,33 @@ function buildScenarios() {
     taskGraphScenario(100, 'wide'),
     taskGraphScenario(1_000, 'deep', true),
     taskGraphScenario(1_000, 'wide', true),
+    cachedTaskChainScenario(10, 'cold'),
+    cachedTaskChainScenario(10, 'warm'),
+    cachedTaskChainScenario(100, 'cold', true),
+    cachedTaskChainScenario(100, 'warm', true),
+    cachedTaskChainScenario(1_000, 'cold', true),
+    cachedTaskChainScenario(1_000, 'warm', true),
+    workspaceCaretChainScenario(10),
+    workspaceCaretChainScenario(100, true),
+    workspaceCaretChainScenario(1_000, true),
+    workspaceTaskCacheScenario(10, 'cold'),
+    workspaceTaskCacheScenario(10, 'warm'),
+    workspaceTaskCacheScenario(100, 'cold', true),
+    workspaceTaskCacheScenario(100, 'warm', true),
+    workspaceTaskCacheScenario(1_000, 'cold', true),
+    workspaceTaskCacheScenario(1_000, 'warm', true),
+    workspaceRootLockCacheScenario(1, 'cold'),
+    workspaceRootLockCacheScenario(1, 'warm'),
+    workspaceRootLockCacheScenario(10, 'cold', true),
+    workspaceRootLockCacheScenario(10, 'warm', true),
+    workspaceRootLockCacheScenario(50, 'cold', true),
+    workspaceRootLockCacheScenario(50, 'warm', true),
+    cacheHitScenario(1),
+    cacheHitScenario(128, true),
+    cacheManyFileRestoreScenario(),
+    cacheDeepPathRestoreScenario(),
+    cacheStaleOutputRemovalScenario(),
+    concurrentCacheStoreScenario(),
     devSingleScenario(),
     devMultiScenario(),
     devGraphScenario(10, 'deep'),
@@ -725,6 +758,490 @@ function taskGraphScenario(taskCount, shape, fullOnly = false) {
       : ['run', requestedTask],
     (result) => markerContract(result, { scenario: scenarioId })),
     fullOnly,
+  };
+}
+
+function cachedTaskChainScenario(taskCount, mode, fullOnly = false) {
+  const scenarioId = `task/cache-${mode}-deep-${taskCount}`;
+  const tasks = {};
+  for (let index = 0; index < taskCount; index += 1) {
+    const name = `task-${index}`;
+    tasks[name] = {
+      command: `mkdir -p dist executions && printf '${index}\\n' > dist/${name}.txt && printf 'run\\n' >> executions/${name}.txt`,
+      cache: true,
+      outputs: [`dist/${name}.txt`],
+      ...(index === 0 ? {} : { dependsOn: [`task-${index - 1}`] }),
+    };
+  }
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: `runtime-cache-${mode}-deep-${taskCount}`,
+        private: true,
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), { tasks });
+      if (mode === 'warm') {
+        runPreparationCommand(
+          context,
+          context.projectRoot,
+          ['run', `task-${taskCount - 1}`],
+          taskCount >= 1_000 ? 180_000 : 30_000,
+        );
+        fs.rmSync(path.join(context.projectRoot, 'dist'), { recursive: true, force: true });
+      }
+    }, ['run', `task-${taskCount - 1}`], () => ({ ok: true })),
+    fullOnly,
+    timeoutMs: taskCount >= 1_000 ? 180_000 : undefined,
+    async validate(context) {
+      for (let index = 0; index < taskCount; index += 1) {
+        const name = `task-${index}`;
+        if (!fs.existsSync(path.join(context.projectRoot, `dist/${name}.txt`))) {
+          return { ok: false, reason: `cached task chain did not produce ${name}` };
+        }
+        const executions = fs.readFileSync(
+          path.join(context.projectRoot, `executions/${name}.txt`),
+          'utf8',
+        );
+        if (executions !== 'run\n') {
+          return { ok: false, reason: `cached task chain executed ${name} more or less than once` };
+        }
+      }
+      return { ok: true, task_count: taskCount, cache_mode: mode };
+    },
+  };
+}
+
+function workspaceCaretChainScenario(packageCount, fullOnly = false) {
+  const scenarioId = `task/workspace-caret-deep-${packageCount}`;
+  const targetName = `runtime-workspace-caret-${packageCount - 1}`;
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: `runtime-workspace-caret-root-${packageCount}`,
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      for (let index = 0; index < packageCount; index += 1) {
+        const name = `runtime-workspace-caret-${index}`;
+        const member = path.join(context.projectRoot, `packages/member-${index}`);
+        writePackage(member, {
+          name,
+          private: true,
+          ...(index === 0
+            ? { scripts: { build: "mkdir -p dist && printf 'run\\n' > dist/executions.txt" } }
+            : { dependencies: { [`runtime-workspace-caret-${index - 1}`]: 'workspace:*' } }),
+        });
+        if (index > 0) {
+          writeJson(path.join(member, 'lpm.json'), {
+            tasks: { build: { dependsOn: ['^build'] } },
+          });
+        }
+      }
+    }, ['run', 'build', '--filter', targetName], () => ({ ok: true })),
+    fullOnly,
+    async validate(context) {
+      const executions = path.join(
+        context.projectRoot,
+        'packages/member-0/dist/executions.txt',
+      );
+      if (!fs.existsSync(executions) || fs.readFileSync(executions, 'utf8') !== 'run\n') {
+        return { ok: false, reason: 'workspace caret chain did not execute its leaf exactly once' };
+      }
+      return { ok: true, package_count: packageCount };
+    },
+  };
+}
+
+function workspaceTaskCacheScenario(taskCount, mode, fullOnly = false) {
+  const upstreamCount = taskCount <= 10 ? 3 : taskCount <= 100 ? 10 : 50;
+  const localTaskCount = taskCount - upstreamCount;
+  const scenarioId = `task/workspace-cache-${mode}-wide-deep-${taskCount}`;
+  const appName = 'runtime-workspace-cache-app';
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      const dependencies = {};
+      const memberDirectories = [];
+      const upstreamNames = Array.from(
+        { length: upstreamCount },
+        (_, index) => `runtime-workspace-cache-upstream-${index}`,
+      );
+      const rootCount = Math.max(1, Math.floor(upstreamCount / 2));
+      for (let index = 0; index < upstreamCount; index += 1) {
+        const name = upstreamNames[index];
+        const relativeDirectory = `packages/upstream-${index}`;
+        const member = path.join(context.projectRoot, relativeDirectory);
+        const memberDependencies = {};
+        if (index >= rootCount) {
+          memberDependencies[upstreamNames[(index - rootCount) % rootCount]] = 'workspace:*';
+          dependencies[name] = 'workspace:*';
+        }
+        memberDirectories.push(member);
+        writePackage(member, { name, private: true, dependencies: memberDependencies });
+        writeJson(path.join(member, 'lpm.json'), {
+          tasks: {
+            build: {
+              command: `mkdir -p dist && printf '${index}\\n' > dist/value.txt && printf 'run\\n' >> executions.txt`,
+              cache: true,
+              outputs: ['dist/**'],
+            },
+          },
+        });
+      }
+
+      writePackage(context.projectRoot, {
+        name: 'runtime-workspace-cache-root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      const app = path.join(context.projectRoot, 'packages/app');
+      memberDirectories.push(app);
+      writePackage(app, { name: appName, private: true, dependencies });
+      const tasks = { 'stage-0': { dependsOn: ['^build'] } };
+      let previous = 'stage-0';
+      for (let index = 1; index < localTaskCount - 1; index += 1) {
+        const name = `stage-${index}`;
+        tasks[name] = { dependsOn: [previous] };
+        previous = name;
+      }
+      tasks.result = {
+        dependsOn: [previous],
+        command: "mkdir -p dist && printf 'ready\\n' > dist/result.txt && printf 'run\\n' >> executions.txt",
+        cache: true,
+        outputs: ['dist/**'],
+      };
+      writeJson(path.join(app, 'lpm.json'), { tasks });
+      writeFile(context.projectRoot, 'lpm.lock', 'workspace-cache-contract\n');
+      context.state.workspaceTaskCache = { app, memberDirectories, upstreamCount };
+
+      if (mode === 'warm') {
+        runPreparationCommand(context, context.projectRoot, ['run', 'result', '--filter', appName]);
+        for (const member of memberDirectories) {
+          fs.rmSync(path.join(member, 'dist'), { recursive: true, force: true });
+        }
+      }
+    }, ['run', 'result', '--filter', appName], () => ({ ok: true })),
+    fullOnly,
+    async validate(context) {
+      const fixture = context.state.workspaceTaskCache;
+      if (!fs.existsSync(path.join(fixture.app, 'dist/result.txt'))) {
+        return { ok: false, reason: 'workspace cache graph did not produce the final output' };
+      }
+      for (const member of fixture.memberDirectories) {
+        const executions = path.join(member, 'executions.txt');
+        if (!fs.existsSync(executions) || fs.readFileSync(executions, 'utf8') !== 'run\n') {
+          return { ok: false, reason: `workspace cache graph executed ${member} more or less than once` };
+        }
+      }
+      return {
+        ok: true,
+        task_count: taskCount,
+        upstream_packages: fixture.upstreamCount,
+        local_tasks: taskCount - fixture.upstreamCount,
+        cache_mode: mode,
+      };
+    },
+  };
+}
+
+function workspaceRootLockCacheScenario(lockMiB, mode, fullOnly = false) {
+  const taskCount = 10;
+  const scenarioId = `cache/workspace-root-lock-${mode}-${lockMiB}mib-${taskCount}-tasks`;
+  const appName = 'runtime-workspace-root-lock-app';
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: 'runtime-workspace-root-lock-root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      const app = path.join(context.projectRoot, 'packages/app');
+      writePackage(app, { name: appName, private: true });
+      const tasks = {};
+      const taskNames = [];
+      for (let index = 0; index < taskCount; index += 1) {
+        const name = `task-${index}`;
+        taskNames.push(name);
+        tasks[name] = {
+          command: `mkdir -p dist/${name} executions && printf '${index}\\n' > dist/${name}/value.txt && printf 'run\\n' >> executions/${name}.txt`,
+          cache: true,
+          outputs: [`dist/${name}/**`],
+        };
+      }
+      writeJson(path.join(app, 'lpm.json'), { tasks });
+      fs.writeFileSync(path.join(context.projectRoot, 'lpm.lock'), Buffer.alloc(lockMiB * MiB, 0x78));
+      context.state.workspaceRootLockCache = { app, taskNames };
+      if (mode === 'warm') {
+        runPreparationCommand(context, context.projectRoot, [
+          'run',
+          ...taskNames,
+          '--filter',
+          appName,
+          '--parallel',
+        ]);
+        fs.rmSync(path.join(app, 'dist'), { recursive: true, force: true });
+      }
+    }, (context) => [
+      'run',
+      ...context.state.workspaceRootLockCache.taskNames,
+      '--filter',
+      appName,
+      '--parallel',
+    ], () => ({ ok: true })),
+    fullOnly,
+    async validate(context) {
+      const fixture = context.state.workspaceRootLockCache;
+      for (const name of fixture.taskNames) {
+        if (!fs.existsSync(path.join(fixture.app, `dist/${name}/value.txt`))) {
+          return { ok: false, reason: `root-lock cache scenario did not restore ${name}` };
+        }
+        const executions = fs.readFileSync(path.join(fixture.app, `executions/${name}.txt`), 'utf8');
+        if (executions !== 'run\n') {
+          return { ok: false, reason: `root-lock cache scenario re-executed ${name}` };
+        }
+      }
+      return { ok: true, lock_mib: lockMiB, task_count: taskCount, cache_mode: mode };
+    },
+  };
+}
+
+function cacheHitScenario(outputMiB, fullOnly = false) {
+  const scenarioId = `cache/hit-${outputMiB}mib`;
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: `runtime-cache-hit-${outputMiB}mib`,
+        private: true,
+        scripts: { build: 'node build.mjs' },
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        tasks: { build: { cache: true, outputs: ['dist/**'] } },
+      });
+      writeFile(context.projectRoot, 'build.mjs', cachePayloadScript(scenarioId, outputMiB));
+      runPreparationCommand(context, context.projectRoot, ['run', 'build']);
+      fs.rmSync(path.join(context.projectRoot, 'dist'), { recursive: true, force: true });
+      fs.rmSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'), { force: true });
+    }, ['run', 'build'], () => ({ ok: true })),
+    fullOnly,
+    async validate(context, result) {
+      const marker = markerContract(result, { scenario: scenarioId, bytes: outputMiB * MiB });
+      if (!marker.ok) return marker;
+      const payloadPath = path.join(context.projectRoot, 'dist/payload.bin');
+      if (!fs.existsSync(payloadPath)) return { ok: false, reason: 'cache hit did not restore dist/payload.bin' };
+      if (fs.existsSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'))) {
+        return { ok: false, reason: 'cache-hit scenario executed the build script instead of restoring' };
+      }
+      const payload = await sha256FileStreaming(payloadPath);
+      const ok = payload.bytes === outputMiB * MiB && payload.sha256 === marker.actual.sha256;
+      return {
+        ok,
+        reason: ok ? null : `restored payload mismatch: bytes=${payload.bytes}, sha256=${payload.sha256}`,
+        restored_bytes: payload.bytes,
+        restored_sha256: payload.sha256,
+      };
+    },
+  };
+}
+
+function cacheManyFileRestoreScenario() {
+  const scenarioId = 'cache/hit-500-files';
+  const fileCount = 500;
+  const fileBytes = 4 * 1024;
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: 'runtime-cache-hit-many-files',
+        private: true,
+        scripts: { build: 'node build.mjs' },
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        tasks: { build: { cache: true, outputs: ['dist/**'] } },
+      });
+      writeFile(
+        context.projectRoot,
+        'build.mjs',
+        cacheManyFileScript(scenarioId, fileCount, fileBytes),
+      );
+      runPreparationCommand(context, context.projectRoot, ['run', 'build']);
+      fs.rmSync(path.join(context.projectRoot, 'dist'), { recursive: true, force: true });
+      fs.rmSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'), { force: true });
+    }, ['run', 'build'], () => ({ ok: true })),
+    fullOnly: true,
+    async validate(context, result) {
+      const marker = markerContract(result, {
+        scenario: scenarioId,
+        file_count: fileCount,
+        file_bytes: fileBytes,
+      });
+      if (!marker.ok) return marker;
+      if (fs.existsSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'))) {
+        return { ok: false, reason: 'many-file cache hit executed the build script instead of restoring' };
+      }
+      const tree = validateManyFileTree(path.join(context.projectRoot, 'dist'), fileCount, fileBytes);
+      return {
+        ok: tree.ok,
+        reason: tree.ok ? null : tree.reason,
+        restored_files: tree.files,
+        restored_bytes: tree.bytes,
+      };
+    },
+  };
+}
+
+function cacheDeepPathRestoreScenario() {
+  const scenarioId = 'cache/hit-deep-path';
+  const depth = 64;
+  const outputBytes = MiB;
+  const relativePayload = path.join(
+    'dist',
+    ...Array.from({ length: depth }, (_, index) => `level-${String(index).padStart(2, '0')}`),
+    'payload.bin',
+  );
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: 'runtime-cache-hit-deep-path',
+        private: true,
+        scripts: { build: 'node build.mjs' },
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        tasks: { build: { cache: true, outputs: ['dist/**'] } },
+      });
+      writeFile(
+        context.projectRoot,
+        'build.mjs',
+        cacheDeepPathScript(scenarioId, relativePayload, outputBytes),
+      );
+      runPreparationCommand(context, context.projectRoot, ['run', 'build']);
+      fs.rmSync(path.join(context.projectRoot, 'dist'), { recursive: true, force: true });
+      fs.rmSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'), { force: true });
+    }, ['run', 'build'], () => ({ ok: true })),
+    fullOnly: true,
+    async validate(context, result) {
+      const marker = markerContract(result, {
+        scenario: scenarioId,
+        depth,
+        bytes: outputBytes,
+      });
+      if (!marker.ok) return marker;
+      if (fs.existsSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'))) {
+        return { ok: false, reason: 'deep-path cache hit executed the build script instead of restoring' };
+      }
+      const payloadPath = path.join(context.projectRoot, relativePayload);
+      if (!fs.existsSync(payloadPath)) {
+        return { ok: false, reason: `cache hit did not restore ${relativePayload}` };
+      }
+      const payload = await sha256FileStreaming(payloadPath);
+      const ok = payload.bytes === outputBytes && payload.sha256 === marker.actual.sha256;
+      return {
+        ok,
+        reason: ok ? null : `deep-path payload mismatch: bytes=${payload.bytes}, sha256=${payload.sha256}`,
+        restored_bytes: payload.bytes,
+        restored_sha256: payload.sha256,
+      };
+    },
+  };
+}
+
+function cacheStaleOutputRemovalScenario() {
+  const scenarioId = 'cache/removes-stale-output';
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: 'runtime-cache-removes-stale-output',
+        private: true,
+        scripts: { build: 'node build.mjs' },
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), {
+        tasks: { build: { cache: true, outputs: ['dist/**'] } },
+      });
+      writeFile(context.projectRoot, 'build.mjs', cacheStaleOutputScript(scenarioId));
+      runPreparationCommand(context, context.projectRoot, ['run', 'build']);
+      fs.rmSync(path.join(context.projectRoot, 'dist'), { recursive: true, force: true });
+      fs.mkdirSync(path.join(context.projectRoot, 'dist'));
+      writeFile(context.projectRoot, 'dist/stale.txt', 'must be removed\n');
+      fs.rmSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'), { force: true });
+    }, ['run', 'build'], () => ({ ok: true })),
+    async validate(context, result) {
+      const marker = markerContract(result, { scenario: scenarioId });
+      if (!marker.ok) return marker;
+      if (fs.existsSync(path.join(context.projectRoot, '.lpm-bench-cache-executed'))) {
+        return { ok: false, reason: 'stale-output cache scenario executed the build script instead of restoring' };
+      }
+      const restored = path.join(context.projectRoot, 'dist/restored.txt');
+      const stale = path.join(context.projectRoot, 'dist/stale.txt');
+      const ok = fs.readFileSync(restored, 'utf8') === 'restored\n' && !fs.existsSync(stale);
+      return {
+        ok,
+        reason: ok ? null : 'cache restore did not replace the declared output tree exactly',
+        stale_output_present: fs.existsSync(stale),
+      };
+    },
+  };
+}
+
+function concurrentCacheStoreScenario() {
+  const scenarioId = 'cache/concurrent-same-key-store';
+  return {
+    id: scenarioId,
+    kind: 'run',
+    allowRuntimeInstall: false,
+    async prepare(context) {
+      context.state.projects = ['first', 'second'].map((producer) => {
+        const project = path.join(context.projectRoot, producer);
+        writePackage(project, {
+          name: 'runtime-concurrent-cache-store',
+          private: true,
+          scripts: { build: 'node build.mjs' },
+        });
+        writeJson(path.join(project, 'lpm.json'), {
+          tasks: { build: { cache: true, outputs: ['dist/**'] } },
+        });
+        writeFile(project, 'producer.txt', producer);
+        writeFile(project, 'build.mjs', concurrentCachePayloadScript());
+        return { producer, project };
+      });
+      fs.mkdirSync(path.join(context.projectRoot, 'barrier'));
+    },
+    processes(context) {
+      return context.state.projects.map(({ producer, project }) => ({
+        label: producer,
+        cwd: project,
+        args: ['run', 'build'],
+      }));
+    },
+    async validate(context) {
+      const cacheRoot = path.join(context.lpmHome, 'cache/tasks');
+      const entries = fs.readdirSync(cacheRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && /^[a-f0-9]+$/i.test(entry.name));
+      if (entries.length !== 1) {
+        return { ok: false, reason: `expected one cache entry, found ${entries.length}` };
+      }
+
+      const verifier = context.state.projects[0];
+      fs.rmSync(path.join(verifier.project, 'dist'), { recursive: true, force: true });
+      const executionCounter = path.join(verifier.project, '.lpm-bench-cache-executed');
+      const executionsBefore = fs.statSync(executionCounter).size;
+      const restored = runPreparationCommand(context, verifier.project, ['run', 'build']);
+      const executionsAfter = fs.statSync(executionCounter).size;
+      if (executionsAfter !== executionsBefore) {
+        return { ok: false, reason: 'cache verifier executed the build script instead of restoring' };
+      }
+      const marker = markerContractOutput(`${restored.stdout}\n${restored.stderr}`, { scenario: scenarioId });
+      if (!marker.ok) return marker;
+      const payloadPath = path.join(verifier.project, 'dist/payload.bin');
+      if (!fs.existsSync(payloadPath)) return { ok: false, reason: 'published cache entry did not restore its payload' };
+      const expectedByte = marker.actual.producer === 'first' ? 0x31 : marker.actual.producer === 'second' ? 0x32 : -1;
+      const payload = expectedByte >= 0
+        ? await validateRepeatedByteFile(payloadPath, expectedByte)
+        : { bytes: 0, matches: false };
+      const ok = payload.bytes === 8 * MiB && payload.matches;
+      return {
+        ok,
+        reason: ok ? null : `published cache payload did not match producer ${marker.actual.producer}`,
+        producer: marker.actual.producer,
+        restored_bytes: payload.bytes,
+      };
+    },
   };
 }
 
@@ -1470,10 +1987,125 @@ function benchmarkEnv(context, allowRuntimeInstall) {
   return env;
 }
 
+function runPreparationCommand(context, cwd, args, timeout = 30_000) {
+  const result = spawnSync(context.binary.path, args, {
+    cwd,
+    env: benchmarkEnv(context, false),
+    encoding: 'utf8',
+    maxBuffer: 4 * MiB,
+    timeout,
+  });
+  if (result.status !== 0) {
+    throw new Error(`preparation command failed (${args.join(' ')}):\n${result.stdout ?? ''}\n${result.stderr ?? ''}`);
+  }
+  return result;
+}
+
 function resultScript({ scenario, env }) {
   return `const result = {scenario:${JSON.stringify(scenario)},engine:typeof Bun==='undefined'?'node':'bun',runtime_version:typeof Bun==='undefined'?process.version:Bun.version,selected_runtime:process.env.LPM_BENCH_SELECTED_RUNTIME??null,env:{}};\n${env
     .map((name) => `result.env[${JSON.stringify(name)}] = process.env[${JSON.stringify(name)}] ?? null;`)
     .join('\n')}\nconsole.log('LPM_RUNTIME_RESULT=' + JSON.stringify(result));\n`;
+}
+
+function cachePayloadScript(scenario, outputMiB) {
+  return `import crypto from 'node:crypto';
+import fs from 'node:fs';
+const bytes=${outputMiB * MiB};
+fs.appendFileSync('.lpm-bench-cache-executed','1');
+fs.mkdirSync('dist',{recursive:true});
+const file=fs.openSync('dist/payload.bin','w');
+const hash=crypto.createHash('sha256');
+const chunk=Buffer.alloc(64*1024);
+let state=0x12345678;
+let written=0;
+while(written<bytes){const size=Math.min(chunk.length,bytes-written);for(let index=0;index<size;index+=1){state^=state<<13;state^=state>>>17;state^=state<<5;chunk[index]=state&255;}const slice=chunk.subarray(0,size);fs.writeSync(file,slice);hash.update(slice);written+=size;}
+fs.closeSync(file);
+console.log('LPM_RUNTIME_RESULT='+JSON.stringify({scenario:${JSON.stringify(scenario)},bytes,sha256:hash.digest('hex')}));
+`;
+}
+
+function cacheManyFileScript(scenario, fileCount, fileBytes) {
+  return `import fs from 'node:fs';
+const fileCount=${fileCount};
+const fileBytes=${fileBytes};
+fs.appendFileSync('.lpm-bench-cache-executed','1');
+for(let index=0;index<fileCount;index+=1){const shard=String(Math.floor(index/100)).padStart(2,'0');const name=String(index).padStart(4,'0');if(index%100===0)fs.mkdirSync('dist/'+shard,{recursive:true});fs.writeFileSync('dist/'+shard+'/file-'+name+'.bin',Buffer.alloc(fileBytes,index%251));}
+console.log('LPM_RUNTIME_RESULT='+JSON.stringify({scenario:${JSON.stringify(scenario)},file_count:fileCount,file_bytes:fileBytes}));
+`;
+}
+
+function cacheDeepPathScript(scenario, relativePayload, outputBytes) {
+  return `import crypto from 'node:crypto';
+import fs from 'node:fs';
+const relativePayload=${JSON.stringify(relativePayload)};
+const bytes=${outputBytes};
+const payload=Buffer.alloc(bytes,0x5a);
+fs.appendFileSync('.lpm-bench-cache-executed','1');
+fs.mkdirSync(relativePayload.slice(0,relativePayload.lastIndexOf(${JSON.stringify(path.sep)})),{recursive:true});
+fs.writeFileSync(relativePayload,payload);
+console.log('LPM_RUNTIME_RESULT='+JSON.stringify({scenario:${JSON.stringify(scenario)},depth:${relativePayload.split(path.sep).length - 2},bytes,sha256:crypto.createHash('sha256').update(payload).digest('hex')}));
+`;
+}
+
+function cacheStaleOutputScript(scenario) {
+  return `import fs from 'node:fs';
+fs.appendFileSync('.lpm-bench-cache-executed','1');
+fs.mkdirSync('dist',{recursive:true});
+fs.writeFileSync('dist/restored.txt','restored\\n');
+console.log('LPM_RUNTIME_RESULT='+JSON.stringify({scenario:${JSON.stringify(scenario)}}));
+`;
+}
+
+function validateManyFileTree(root, fileCount, fileBytes) {
+  if (!fs.existsSync(root)) return { ok: false, reason: 'many-file cache hit did not restore dist', files: 0, bytes: 0 };
+  const stack = [root];
+  let files = 0;
+  let bytes = 0;
+  while (stack.length > 0) {
+    const directory = stack.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(entryPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        return { ok: false, reason: `unexpected non-file cache output: ${entryPath}`, files, bytes };
+      }
+      const expectedIndex = Number.parseInt(entry.name.slice(5, -4), 10);
+      const content = fs.readFileSync(entryPath);
+      files += 1;
+      bytes += content.length;
+      if (!Number.isInteger(expectedIndex)
+        || content.length !== fileBytes
+        || content[0] !== expectedIndex % 251
+        || content[content.length - 1] !== expectedIndex % 251) {
+        return { ok: false, reason: `invalid many-file cache output: ${entryPath}`, files, bytes };
+      }
+    }
+  }
+  const ok = files === fileCount && bytes === fileCount * fileBytes;
+  return {
+    ok,
+    reason: ok ? null : `many-file output mismatch: files=${files}, bytes=${bytes}`,
+    files,
+    bytes,
+  };
+}
+
+function concurrentCachePayloadScript() {
+  return `import fs from 'node:fs';
+const producer=fs.readFileSync('producer.txt','utf8').trim();
+fs.appendFileSync('.lpm-bench-cache-executed','1');
+const barrier='../barrier';
+fs.writeFileSync(barrier+'/'+producer,'ready');
+const deadline=Date.now()+5000;
+while(fs.readdirSync(barrier).length<2){if(Date.now()>deadline)throw new Error('cache benchmark barrier timed out');await new Promise(resolve=>setTimeout(resolve,10));}
+fs.mkdirSync('dist',{recursive:true});
+const byte=producer==='first'?0x31:0x32;
+fs.writeFileSync('dist/payload.bin',Buffer.alloc(8*1024*1024,byte));
+console.log('LPM_RUNTIME_RESULT='+JSON.stringify({scenario:'cache/concurrent-same-key-store',producer}));
+`;
 }
 
 function httpServerScript(scenario) {
@@ -2608,6 +3240,26 @@ function sha256File(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
+async function sha256FileStreaming(file) {
+  const hash = crypto.createHash('sha256');
+  let bytes = 0;
+  for await (const chunk of fs.createReadStream(file)) {
+    bytes += chunk.length;
+    hash.update(chunk);
+  }
+  return { bytes, sha256: hash.digest('hex') };
+}
+
+async function validateRepeatedByteFile(file, expectedByte) {
+  let bytes = 0;
+  let matches = true;
+  for await (const chunk of fs.createReadStream(file)) {
+    bytes += chunk.length;
+    if (!chunk.every((byte) => byte === expectedByte)) matches = false;
+  }
+  return { bytes, matches };
+}
+
 function commandOutput(command, args, cwd = repoRoot) {
   const result = spawnSync(command, args, { cwd, encoding: 'utf8' });
   return result.status === 0 ? result.stdout.trim() : null;
@@ -2983,6 +3635,17 @@ async function runSelfTests() {
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'run/package-system-node-no-lpm-json'));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/deep-1000' && scenario.fullOnly));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/wide-100'));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/cache-warm-deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/workspace-caret-deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/workspace-cache-cold-wide-deep-10' && !scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/workspace-cache-warm-wide-deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/workspace-root-lock-cold-1mib-10-tasks' && !scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/workspace-root-lock-warm-50mib-10-tasks' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/hit-128mib' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/hit-500-files' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/hit-deep-path' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/removes-stale-output'));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/concurrent-same-key-store'));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'tunnel/websocket-fairness-close-cancellation'));
   process.stdout.write('run-runtime-readiness self-test passed\n');
 }

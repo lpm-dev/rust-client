@@ -6,7 +6,7 @@
 mod support;
 
 use std::sync::{Arc, Mutex};
-use support::{TempProject, lpm, write_repeated_file};
+use support::{TempProject, lpm, lpm_spawnable, lpm_spawnable_from_path, write_repeated_file};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -1352,6 +1352,290 @@ fn run_rejects_oversized_dotenv_before_spawning_script() {
 
 // ─── Task Caching ────────────────────────────────────────────────
 
+fn populated_task_cache_entry(project: &TempProject) -> std::path::PathBuf {
+    let task_cache = project.home().join(".lpm/cache/tasks");
+    let entries: Vec<_> = std::fs::read_dir(&task_cache)
+        .expect("read task cache")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.chars().all(|character| character.is_ascii_hexdigit()))
+        })
+        .collect();
+    assert_eq!(entries.len(), 1, "expected one task cache entry");
+    entries.into_iter().next().unwrap()
+}
+
+fn task_cache_restore_lock_path(project: &TempProject) -> std::path::PathBuf {
+    use sha2::{Digest as _, Sha256};
+
+    let canonical_project = std::fs::canonicalize(project.path()).unwrap();
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        hasher.update(canonical_project.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        for unit in canonical_project.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    project
+        .home()
+        .join(".lpm/cache/tasks/.locks")
+        .join(format!("project-{:x}.lock", hasher.finalize()))
+}
+
+fn wait_for_task_marker(
+    child: &mut std::process::Child,
+    marker: &std::path::Path,
+    description: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect blocked task process")
+                .is_none(),
+            "task exited before {description}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "task did not reach {description}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn successful_task_remains_successful_when_cache_publication_fails() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-publication-failure",
+            "version": "1.0.0",
+            "scripts": {"build": "node build.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {"cache": true, "outputs": ["dist/**"]}
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/value.txt', 'built');"#,
+    );
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    std::fs::write(project.home().join(".lpm/cache"), "not a directory").unwrap();
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run a successful task with an unavailable cache");
+
+    assert!(
+        output.status.success(),
+        "cache publication changed task success: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "built");
+}
+
+#[cfg(unix)]
+#[test]
+fn contained_input_symlink_retarget_invalidates_task_cache() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-input-symlink",
+            "version": "1.0.0",
+            "scripts": {"build": "node build.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["src/current"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/value.txt', fs.readlinkSync('src/current'));"#,
+    );
+    project.write_file("src/a.txt", "same");
+    project.write_file("src/b.txt", "same");
+    symlink("a.txt", project.path().join("src/current")).unwrap();
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+    std::fs::remove_file(project.path().join("src/current")).unwrap();
+    symlink("b.txt", project.path().join("src/current")).unwrap();
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/value.txt"), "b.txt");
+}
+
+fn corrupt_local_cache_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+            "name": "corrupt-local-cache",
+            "version": "1.0.0",
+            "scripts": {"build": "node build.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {"cache": true, "outputs": ["dist/**"]}
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+const count = fs.existsSync('execution-count') ? Number(fs.readFileSync('execution-count')) + 1 : 1;
+fs.writeFileSync('execution-count', String(count));
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/value.txt', `fresh-${count}`);"#,
+    );
+    project
+}
+
+#[test]
+fn run_missing_local_cache_archive_executes_task() {
+    let project = corrupt_local_cache_project();
+    lpm(&project).args(["run", "build"]).assert().success();
+    let entry = populated_task_cache_entry(&project);
+    std::fs::remove_file(entry.join("outputs.tar.gz")).expect("remove local cache archive");
+    std::fs::remove_dir_all(project.path().join("dist")).expect("remove built output");
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run task with missing local cache archive");
+
+    assert!(
+        output.status.success(),
+        "task should recover from missing archive"
+    );
+    assert_eq!(project.read_file("execution-count"), "2");
+    assert_eq!(project.read_file("dist/value.txt"), "fresh-2");
+}
+
+#[test]
+fn run_corrupt_local_cache_archive_executes_task() {
+    let project = corrupt_local_cache_project();
+    lpm(&project).args(["run", "build"]).assert().success();
+    let entry = populated_task_cache_entry(&project);
+    std::fs::write(entry.join("outputs.tar.gz"), b"not a gzip archive")
+        .expect("corrupt local cache archive");
+    std::fs::remove_dir_all(project.path().join("dist")).expect("remove built output");
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run task with corrupt local cache archive");
+
+    assert!(
+        output.status.success(),
+        "task should recover from corrupt archive"
+    );
+    assert_eq!(project.read_file("execution-count"), "2");
+    assert_eq!(project.read_file("dist/value.txt"), "fresh-2");
+}
+
+#[test]
+fn run_cache_revalidates_inputs_after_waiting_for_the_restore_lock() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-restore-input-race",
+            "version": "1.0.0",
+            "scripts": {"build": "node build.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"cache":true,"inputs":["src/**"],"outputs":["dist/**"]}}}"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+const count = fs.existsSync('execution-count') ? Number(fs.readFileSync('execution-count')) + 1 : 1;
+fs.writeFileSync('execution-count', String(count));
+fs.mkdirSync('dist', {recursive: true});
+fs.copyFileSync('src/value.txt', 'dist/value.txt');"#,
+    );
+    project.write_file("src/value.txt", "v1");
+    lpm(&project).args(["run", "build"]).assert().success();
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+
+    let lock_path = task_cache_restore_lock_path(&project);
+    let restore_lock = lpm_common::acquire_single_file_exclusive_lock(&lock_path)
+        .expect("hold the task cache project restore lock");
+    let wait_log = project.home().join("task-cache-restore-wait.log");
+    let mut command = lpm_spawnable(&project);
+    command.stderr(std::process::Stdio::from(
+        std::fs::File::create(&wait_log).unwrap(),
+    ));
+    command.args(["run", "build"]);
+    let mut child = command.spawn().expect("start a blocked cache restore");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting = std::fs::read_to_string(&wait_log)
+            .is_ok_and(|stderr| stderr.contains("Waiting for another lpm operation"));
+        if waiting {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "cache restore exited before waiting for its project lock"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cache restore did not wait for its project lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    project.write_file("src/value.txt", "v2");
+    drop(restore_lock);
+    let output = child
+        .wait_with_output()
+        .expect("finish the cache restore race");
+    let stderr = std::fs::read_to_string(wait_log).unwrap();
+
+    assert!(
+        output.status.success(),
+        "cache restore race failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+    assert_eq!(project.read_file("execution-count"), "2");
+    assert_eq!(project.read_file("dist/value.txt"), "v2");
+}
+
 #[test]
 fn run_cache_hit_replays_output() {
     let project = TempProject::empty(
@@ -1416,6 +1700,512 @@ fn run_cache_hit_replays_output() {
         combined2.contains("cache") || combined2.contains("restored"),
         "cache hit should mention cache, got:\n{combined2}"
     );
+}
+
+#[test]
+fn run_cache_restore_removes_files_absent_from_the_cached_output_set() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-exact-outputs",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js", "mode.txt"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+fs.rmSync('dist', {recursive: true, force: true});
+fs.mkdirSync('dist', {recursive: true});
+const mode = fs.readFileSync('mode.txt', 'utf8').trim();
+fs.writeFileSync('dist/current.txt', mode);
+if (mode === 'expanded') fs.writeFileSync('dist/stale.txt', 'stale');
+fs.appendFileSync('executions.txt', `${mode}\n`);"#,
+    );
+
+    project.write_file("mode.txt", "minimal\n");
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    project.write_file("mode.txt", "expanded\n");
+    lpm(&project).args(["run", "build"]).assert().success();
+    assert!(project.file_exists("dist/stale.txt"));
+
+    project.write_file("mode.txt", "minimal\n");
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/current.txt"), "minimal");
+    assert!(
+        !project.file_exists("dist/stale.txt"),
+        "cache restore retained an output absent from the cached result"
+    );
+    assert_eq!(project.read_file("executions.txt"), "minimal\nexpanded\n");
+}
+
+#[test]
+fn run_rejects_invalid_task_cache_globs_before_starting_script() {
+    for field in ["inputs", "outputs"] {
+        let project = TempProject::empty(
+            r#"{
+                "name": "invalid-cache-glob",
+                "version": "1.0.0",
+                "scripts": {
+                    "build": "node build.js"
+                }
+            }"#,
+        );
+        project.write_file(
+            "build.js",
+            "require('fs').writeFileSync('task-started.txt', 'yes');",
+        );
+        let mut task = serde_json::json!({
+            "cache": true,
+            "outputs": ["dist/**"]
+        });
+        task[field] = serde_json::json!(["["]);
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({ "tasks": { "build": task } }).to_string(),
+        );
+
+        let output = lpm(&project)
+            .args(["run", "build"])
+            .output()
+            .expect("run a task with an invalid cache glob");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "invalid task {field} glob was accepted\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(field) && stderr.contains("invalid glob"),
+            "invalid task {field} glob diagnostic was unclear: {stderr}"
+        );
+        assert!(
+            !project.file_exists("task-started.txt"),
+            "task started before its {field} glob was validated"
+        );
+    }
+}
+
+#[test]
+fn run_cache_invalidates_when_a_default_top_level_script_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-top-level-script",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": { "cache": true, "outputs": ["dist/**"] }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','v1'); fs.appendFileSync('executions.txt','run\n');",
+    );
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    assert_eq!(project.read_file("dist/value.txt"), "v1");
+
+    project.write_file(
+        "build.js",
+        r"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','v2'); fs.appendFileSync('executions.txt','run\n');",
+    );
+    std::fs::remove_dir_all(project.path().join("dist")).expect("remove first build output");
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/value.txt"), "v2");
+    assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
+}
+
+#[test]
+fn run_cache_invalidates_when_lockfile_resolution_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-lockfile-resolution",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/resolution.txt', fs.readFileSync('lpm.lock', 'utf8'));
+fs.appendFileSync('executions.txt', 'run\n');"#,
+    );
+
+    project.write_file("lpm.lock", "resolution = \"1.0.0\"\n");
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    project.write_file("lpm.lock", "resolution = \"2.0.0\"\n");
+    std::fs::remove_dir_all(project.path().join("dist")).expect("remove cached output");
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(
+        project.read_file("dist/resolution.txt"),
+        "resolution = \"2.0.0\"\n"
+    );
+    assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
+}
+
+#[test]
+fn run_cache_invalidates_when_a_development_dependency_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-development-dependency",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" },
+            "devDependencies": { "compiler": "1.0.0" }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        r#"const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+fs.mkdirSync('dist', {recursive: true});
+fs.writeFileSync('dist/compiler.txt', pkg.devDependencies.compiler);
+fs.appendFileSync('executions.txt', 'run\n');"#,
+    );
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "cache-development-dependency",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" },
+            "devDependencies": { "compiler": "2.0.0" }
+        }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("dist")).expect("remove cached output");
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/compiler.txt"), "2.0.0");
+    assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
+}
+
+#[test]
+fn run_cache_invalidates_when_a_lifecycle_hook_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-lifecycle-command",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "node build.js",
+                "postbuild": "node post-v1.js"
+            }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        "require('fs').mkdirSync('dist',{recursive:true});",
+    );
+    project.write_file(
+        "post-v1.js",
+        "require('fs').writeFileSync('dist/value.txt','v1');",
+    );
+    project.write_file(
+        "post-v2.js",
+        "require('fs').writeFileSync('dist/value.txt','v2');",
+    );
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "cache-lifecycle-command",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "node build.js",
+                "postbuild": "node post-v2.js"
+            }
+        }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/value.txt"), "v2");
+}
+
+#[test]
+fn run_cache_invalidates_when_an_indirect_package_script_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-indirect-script",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "node build.js",
+                "helper": "node helper-v1.js"
+            }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["source.txt"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("source.txt", "stable");
+    project.write_file(
+        "build.js",
+        "const fs=require('fs'); const helper=JSON.parse(fs.readFileSync('package.json')).scripts.helper; fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',helper.includes('v2')?'v2':'v1'); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "cache-indirect-script",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "node build.js",
+                "helper": "node helper-v2.js"
+            }
+        }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("dist")).expect("remove cached output");
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/value.txt"), "v2");
+    assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_rejects_cache_input_symlinks_that_escape_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-external-input",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["src/**"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "build.js",
+        "const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',fs.readFileSync('src/value.txt'));",
+    );
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("value.txt"), "outside").unwrap();
+    symlink(
+        outside.path().join("value.txt"),
+        project.path().join("src/value.txt"),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["run", "build"])
+        .output()
+        .expect("run task with an external cache input");
+
+    assert!(
+        !output.status.success(),
+        "external cache input was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside project"),
+        "external cache input diagnostic was unclear: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!project.file_exists("dist/value.txt"));
+}
+
+#[test]
+fn run_cache_invalidates_a_dependent_when_dependency_inputs_change() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-task-dependency",
+            "version": "1.0.0",
+            "scripts": {
+                "generate": "node generate.js",
+                "build": "node build.js"
+            }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "generate": {
+                    "cache": true,
+                    "inputs": ["generate.js"],
+                    "outputs": ["generated/**"]
+                },
+                "build": {
+                    "dependsOn": ["generate"],
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "generate.js",
+        r"const fs=require('fs'); fs.mkdirSync('generated',{recursive:true}); fs.writeFileSync('generated/value.txt','v1'); fs.appendFileSync('generate-executions.txt','run\n');",
+    );
+    project.write_file(
+        "build.js",
+        r"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',fs.readFileSync('generated/value.txt')); fs.appendFileSync('build-executions.txt','run\n');",
+    );
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    assert_eq!(project.read_file("dist/value.txt"), "v1");
+
+    project.write_file(
+        "generate.js",
+        r"const fs=require('fs'); fs.mkdirSync('generated',{recursive:true}); fs.writeFileSync('generated/value.txt','v2'); fs.appendFileSync('generate-executions.txt','run\n');",
+    );
+    std::fs::remove_dir_all(project.path().join("generated")).unwrap();
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/value.txt"), "v2");
+    assert_eq!(project.read_file("generate-executions.txt"), "run\nrun\n");
+    assert_eq!(project.read_file("build-executions.txt"), "run\nrun\n");
+}
+
+#[test]
+fn run_cache_invalidates_a_dependent_when_its_dependency_command_changes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-dependency-command",
+            "version": "1.0.0",
+            "scripts": {
+                "generate": "node generate-v1.js",
+                "build": "node build.js"
+            }
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "generate": {
+                    "inputs": ["generate-*.js"]
+                },
+                "build": {
+                    "dependsOn": ["generate"],
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "generate-v1.js",
+        "require('fs').mkdirSync('generated',{recursive:true}); require('fs').writeFileSync('generated/value.txt','v1');",
+    );
+    project.write_file(
+        "generate-v2.js",
+        "require('fs').mkdirSync('generated',{recursive:true}); require('fs').writeFileSync('generated/value.txt','v2');",
+    );
+    project.write_file(
+        "build.js",
+        "const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',fs.readFileSync('generated/value.txt')); fs.appendFileSync('build-executions.txt','run\\n');",
+    );
+
+    lpm(&project).args(["run", "build"]).assert().success();
+    assert_eq!(project.read_file("dist/value.txt"), "v1");
+
+    project.write_file(
+        "package.json",
+        r#"{
+            "name": "cache-dependency-command",
+            "version": "1.0.0",
+            "scripts": {
+                "generate": "node generate-v2.js",
+                "build": "node build.js"
+            }
+        }"#,
+    );
+    std::fs::remove_dir_all(project.path().join("generated")).unwrap();
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+
+    lpm(&project).args(["run", "build"]).assert().success();
+
+    assert_eq!(project.read_file("dist/value.txt"), "v2");
+    assert_eq!(project.read_file("build-executions.txt"), "run\nrun\n");
 }
 
 #[test]
@@ -1622,6 +2412,34 @@ fn run_no_cache_flag_skips_cache() {
     assert!(
         combined.contains("no-cache-output"),
         "should re-execute script, got:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_workspace_no_cache_does_not_read_cache_contract_files() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({ "build": "node -e \"console.log('ran')\"" });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file("real.lock", "resolution = 1\n");
+    std::os::unix::fs::symlink("real.lock", project.path().join("lpm.lock")).unwrap();
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app", "--no-cache"])
+        .output()
+        .expect("run workspace task without cache");
+
+    assert!(
+        output.status.success(),
+        "--no-cache inspected cache contract files:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -1965,6 +2783,43 @@ fn run_watch_rejects_workspace_selection_flags() {
     );
 }
 
+#[test]
+fn run_watch_rejects_invalid_task_globs_without_starting_the_watcher() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "watch-invalid-glob",
+            "version": "1.0.0",
+            "scripts": { "build": "node build.js" }
+        }"#,
+    );
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"inputs":["["]}}}"#);
+    project.write_file(
+        "build.js",
+        "require('fs').writeFileSync('task-started.txt','yes');",
+    );
+    let mut command = lpm_spawnable(&project);
+    command.args(["run", "build", "--watch"]);
+    let mut child = command.spawn().expect("spawn invalid watch configuration");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll invalid watch configuration") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("watch mode did not reject the invalid task glob promptly");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    assert!(!status.success(), "invalid watch configuration succeeded");
+    assert!(
+        !project.file_exists("task-started.txt"),
+        "watch mode started the task before validating its input glob"
+    );
+}
+
 // ─── Parallel Execution ──────────────────────────────────────────
 
 #[test]
@@ -2103,6 +2958,40 @@ fn run_filter_executes_upstream_task_dependencies_before_the_selected_member() {
         assert!(
             member_ran(&project, member),
             "{member} build must execute for app's ^build dependency"
+        );
+    }
+}
+
+#[test]
+fn run_filter_expands_one_caret_task_through_the_full_workspace_dependency_chain() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["app", "core", "utils"] {
+        let package_path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&package_path))
+                .expect("parse workspace package.json");
+        package["scripts"] = serde_json::json!({
+            "build": format!("node -e \"require('fs').writeFileSync('ran-{member}.txt','ok')\"")
+        });
+        project.write_file(
+            &package_path,
+            &serde_json::to_string_pretty(&package).unwrap(),
+        );
+    }
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{"tasks":{"build":{"dependsOn":["^build"]}}}"#,
+    );
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    for member in ["utils", "core", "app"] {
+        assert!(
+            member_ran(&project, member),
+            "{member} build must execute for the selected app's ^build dependency"
         );
     }
 }
@@ -2295,6 +3184,1043 @@ fn run_filter_rejects_malformed_upstream_task_dependencies_before_execution() {
 }
 
 #[test]
+fn run_workspace_cache_invalidates_when_the_root_lockfile_changes() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({ "build": "node build.js" });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["source.txt"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/source.txt", "stable");
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); const lock=fs.readFileSync('../../lpm.lock','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',lock); fs.appendFileSync('executions.txt','run\\n');",
+    );
+    project.write_file("lpm.lock", "root-resolution-v1\n");
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove cached workspace output");
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\n",
+        "unchanged root contract did not restore the workspace task"
+    );
+
+    project.write_file("lpm.lock", "root-resolution-v2\n");
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove cached workspace output");
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "root-resolution-v2\n"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_revalidates_the_root_contract_before_a_later_cache_hit() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({
+        "wait": "node wait.js",
+        "build": "node build.js"
+    });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/app/wait.js",
+        "const fs=require('fs'); fs.writeFileSync('wait.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2);",
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); const lock=fs.readFileSync('../../lpm.lock','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',lock); fs.appendFileSync('executions.txt','run\\n');",
+    );
+    project.write_file("lpm.lock", "root-resolution-v1\n");
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("packages/app/dist")).unwrap();
+
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "wait", "build", "--filter", "@test/app"]);
+    let mut child = command.spawn().expect("start a blocked workspace run");
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join("packages/app/wait.marker"),
+        "the independent predecessor",
+    );
+    project.write_file("lpm.lock", "root-resolution-v2\n");
+    project.write_file("packages/app/release.marker", "release");
+    let output = child.wait_with_output().expect("finish workspace run");
+
+    assert!(
+        output.status.success(),
+        "workspace run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "root-resolution-v2\n"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_does_not_publish_with_a_stale_member_output_contract() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({
+        "wait": "node wait.js",
+        "build": "node build.js"
+    });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["old/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/app/wait.js",
+        "const fs=require('fs'); fs.writeFileSync('wait.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2);",
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); fs.mkdirSync('old',{recursive:true}); fs.mkdirSync('new',{recursive:true}); fs.writeFileSync('old/value.txt','old'); fs.writeFileSync('new/value.txt','new'); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "wait", "build", "--filter", "@test/app"]);
+    let mut child = command.spawn().expect("start a blocked workspace run");
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join("packages/app/wait.marker"),
+        "the stale member configuration",
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["old/**", "new/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/release.marker", "release");
+    let first = child.wait_with_output().expect("finish workspace run");
+    assert!(
+        first.status.success(),
+        "first workspace run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("packages/app/old")).unwrap();
+    std::fs::remove_dir_all(project.path().join("packages/app/new")).unwrap();
+
+    let second = lpm_spawnable_from_path(&project, &binary)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run with the updated output contract");
+    assert!(
+        second.status.success(),
+        "second workspace run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_eq!(project.read_file("packages/app/old/value.txt"), "old");
+    assert_eq!(project.read_file("packages/app/new/value.txt"), "new");
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_does_not_publish_output_under_a_changed_root_contract() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({ "build": "node build.js" });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const lock=fs.readFileSync('../../lpm.lock','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',lock); fs.appendFileSync('executions.txt','run\\n');",
+    );
+    project.write_file("lpm.lock", "root-resolution-v1\n");
+
+    let binary = std::env::var_os("LPM_CACHE_RACE_TEST_BINARY").map_or_else(
+        || assert_cmd::cargo::cargo_bin("lpm-rs"),
+        std::path::PathBuf::from,
+    );
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "build", "--filter", "@test/app"]);
+    let mut child = command.spawn().expect("start the blocked workspace task");
+    let marker = project.path().join("packages/app/read.marker");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect blocked workspace task")
+                .is_none(),
+            "workspace task exited before it read the root contract"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace task did not read the root contract"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    project.write_file("lpm.lock", "root-resolution-v2\n");
+    project.write_file("packages/app/release.marker", "release");
+    let first = child
+        .wait_with_output()
+        .expect("finish the blocked workspace task");
+    assert!(
+        first.status.success(),
+        "first workspace run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove the first output");
+    project.write_file("lpm.lock", "root-resolution-v1\n");
+
+    let second = lpm_spawnable_from_path(&project, &binary)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run the task with the changed root contract");
+    assert!(
+        second.status.success(),
+        "second workspace run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "root-resolution-v1\n"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_does_not_publish_output_when_member_inputs_change_during_execution() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({ "build": "node build.js" });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["source.txt", "build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/source.txt", "source-v1");
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); const source=fs.readFileSync('source.txt','utf8'); fs.writeFileSync('read.marker',source); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',source); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    let binary = std::env::var_os("LPM_CACHE_RACE_TEST_BINARY").map_or_else(
+        || assert_cmd::cargo::cargo_bin("lpm-rs"),
+        std::path::PathBuf::from,
+    );
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "build", "--filter", "@test/app"]);
+    let mut child = command.spawn().expect("start the blocked workspace task");
+    let marker = project.path().join("packages/app/read.marker");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect blocked workspace task")
+                .is_none(),
+            "workspace task exited before it read the member input"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "workspace task did not read the member input"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    project.write_file("packages/app/source.txt", "source-v2");
+    project.write_file("packages/app/release.marker", "release");
+    let first = child
+        .wait_with_output()
+        .expect("finish the blocked workspace task");
+    assert!(
+        first.status.success(),
+        "first workspace run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove the first output");
+
+    let second = lpm_spawnable_from_path(&project, &binary)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run the task with the changed member input");
+    assert!(
+        second.status.success(),
+        "second workspace run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "source-v2"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_does_not_publish_output_when_a_local_dependency_output_changes() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({
+        "generate": "node generate.js",
+        "build": "node build.js"
+    });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "generate": {
+                    "cache": true,
+                    "inputs": ["source.txt", "generate.js"],
+                    "outputs": ["generated/**"]
+                },
+                "build": {
+                    "dependsOn": ["generate"],
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/source.txt", "source-v1");
+    project.write_file(
+        "packages/app/generate.js",
+        "const fs=require('fs'); const value=fs.readFileSync('source.txt','utf8'); fs.mkdirSync('generated',{recursive:true}); fs.writeFileSync('generated/value.txt',value);",
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const value=fs.readFileSync('generated/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "build", "--filter", "@test/app"]);
+    let mut child = command.spawn().expect("start the blocked dependent task");
+    let marker = project.path().join("packages/app/read.marker");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            child
+                .try_wait()
+                .expect("inspect blocked dependent task")
+                .is_none(),
+            "dependent task exited before it signalled readiness"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dependent task did not signal readiness"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    project.write_file("packages/app/generated/value.txt", "source-v2");
+    project.write_file("packages/app/release.marker", "release");
+    let first = child.wait_with_output().expect("finish the dependent task");
+    assert!(
+        first.status.success(),
+        "first dependent run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove the first dependent output");
+
+    let second = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run the dependent task after restoring its dependency");
+    assert!(
+        second.status.success(),
+        "second dependent run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "source-v1"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_rechecks_transitive_local_dependency_outputs_before_publication() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({
+        "generate": "node generate.js",
+        "build": "node build.js"
+    });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "generate": {
+                    "cache": true,
+                    "inputs": ["source.txt", "generate.js"],
+                    "outputs": ["generated/**"]
+                },
+                "meta": {"dependsOn": ["generate"]},
+                "build": {
+                    "dependsOn": ["meta"],
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/source.txt", "source-v1");
+    project.write_file(
+        "packages/app/generate.js",
+        "const fs=require('fs'); const value=fs.readFileSync('source.txt','utf8'); fs.mkdirSync('generated',{recursive:true}); fs.writeFileSync('generated/value.txt',value);",
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const value=fs.readFileSync('generated/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "build", "--filter", "@test/app"]);
+    let mut child = command.spawn().expect("start the blocked dependent task");
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join("packages/app/read.marker"),
+        "the transitive dependent task",
+    );
+    project.write_file("packages/app/generated/value.txt", "source-v2");
+    project.write_file("packages/app/release.marker", "release");
+    let first = child.wait_with_output().expect("finish the dependent task");
+    assert!(
+        first.status.success(),
+        "first dependent run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("packages/app/dist")).unwrap();
+
+    let second = lpm_spawnable_from_path(&project, &binary)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("rerun the transitive dependent task");
+    assert!(
+        second.status.success(),
+        "second dependent run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_eq!(
+        project.read_file("packages/app/generated/value.txt"),
+        "source-v1"
+    );
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "source-v1"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_rechecks_upstream_outputs_before_downstream_publication() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["utils", "core"] {
+        let package_path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&package_path))
+                .expect("parse workspace package.json");
+        package["scripts"] = serde_json::json!({"build": "node build.js"});
+        project.write_file(
+            &package_path,
+            &serde_json::to_string_pretty(&package).unwrap(),
+        );
+        project.write_file(
+            &format!("packages/{member}/lpm.json"),
+            &serde_json::json!({
+                "tasks": {
+                    "build": {
+                        "dependsOn": if member == "core" { serde_json::json!(["^build"]) } else { serde_json::json!([]) },
+                        "cache": true,
+                        "inputs": ["build.js", "source.txt"],
+                        "outputs": ["dist/**"]
+                    }
+                }
+            })
+            .to_string(),
+        );
+        project.write_file(&format!("packages/{member}/source.txt"), "stable");
+    }
+    project.write_file(
+        "packages/utils/build.js",
+        "const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','upstream-v1');",
+    );
+    project.write_file(
+        "packages/core/build.js",
+        "const fs=require('fs'); fs.writeFileSync('read.marker','ready'); const deadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); const value=fs.readFileSync('../utils/dist/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "build", "--filter", "@test/core"]);
+    let mut child = command.spawn().expect("start the blocked workspace task");
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join("packages/core/read.marker"),
+        "the downstream workspace task",
+    );
+    project.write_file("packages/utils/dist/value.txt", "upstream-v2");
+    project.write_file("packages/core/release.marker", "release");
+    let first = child.wait_with_output().expect("finish workspace task");
+    assert!(
+        first.status.success(),
+        "first workspace run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("packages/core/dist")).unwrap();
+
+    let second = lpm_spawnable_from_path(&project, &binary)
+        .args(["run", "build", "--filter", "@test/core"])
+        .output()
+        .expect("rerun the downstream workspace task");
+    assert!(
+        second.status.success(),
+        "second workspace run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_eq!(
+        project.read_file("packages/utils/dist/value.txt"),
+        "upstream-v1"
+    );
+    assert_eq!(
+        project.read_file("packages/core/dist/value.txt"),
+        "upstream-v1"
+    );
+    assert_eq!(
+        project.read_file("packages/core/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn task_cache_rejects_an_input_aba_change_during_execution() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cache-input-aba",
+            "version": "1.0.0",
+            "scripts": {"build": "node build.js"}
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["source.txt", "build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("source.txt", "source-a");
+    project.write_file("coordinate.marker", "coordinate");
+    project.write_file(
+        "build.js",
+        "const fs=require('fs'); let value; if(fs.existsSync('coordinate.marker')) { fs.writeFileSync('ready.marker','ready'); const changeDeadline=Date.now()+10000; while(fs.readFileSync('source.txt','utf8')!=='source-b'&&Date.now()<changeDeadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); value=fs.readFileSync('source.txt','utf8'); fs.writeFileSync('read.marker','read'); const releaseDeadline=Date.now()+10000; while(!fs.existsSync('release.marker')&&Date.now()<releaseDeadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); if(!fs.existsSync('release.marker')) process.exit(2); } else { value=fs.readFileSync('source.txt','utf8'); } fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    let mut command = lpm_spawnable_from_path(&project, &binary);
+    command.args(["run", "build"]);
+    let mut child = command.spawn().expect("start the ABA task");
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join("ready.marker"),
+        "the pre-execution input snapshot",
+    );
+    project.write_file("source.txt", "source-b");
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join("read.marker"),
+        "the transient input read",
+    );
+    project.write_file("source.txt", "source-a");
+    project.write_file("release.marker", "release");
+    let first = child.wait_with_output().expect("finish the ABA task");
+    assert!(
+        first.status.success(),
+        "first ABA run failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+    std::fs::remove_file(project.path().join("coordinate.marker")).unwrap();
+
+    let second = lpm_spawnable_from_path(&project, &binary)
+        .args(["run", "build"])
+        .output()
+        .expect("rerun the ABA task");
+    assert!(
+        second.status.success(),
+        "second ABA run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    assert_eq!(project.read_file("dist/value.txt"), "source-a");
+    assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
+}
+
+#[test]
+fn run_workspace_single_task_uses_configured_cache() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({ "build": "node build.js" });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["source.txt", "build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/source.txt", "stable");
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','built'); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove cached workspace output");
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    assert_eq!(project.read_file("packages/app/dist/value.txt"), "built");
+    assert_eq!(project.read_file("packages/app/executions.txt"), "run\n");
+}
+
+#[test]
+fn run_workspace_cache_invalidates_downstream_tasks_after_upstream_output_changes() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["utils", "core", "app"] {
+        let package_path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&package_path))
+                .expect("parse workspace package.json");
+        package["scripts"] = serde_json::json!({ "build": "node build.js" });
+        project.write_file(
+            &package_path,
+            &serde_json::to_string_pretty(&package).unwrap(),
+        );
+
+        let depends_on = if member == "utils" {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(["^build"])
+        };
+        project.write_file(
+            &format!("packages/{member}/lpm.json"),
+            &serde_json::json!({
+                "tasks": {
+                    "build": {
+                        "dependsOn": depends_on,
+                        "cache": true,
+                        "inputs": ["build.js", "source.txt"],
+                        "outputs": ["dist/**"]
+                    }
+                }
+            })
+            .to_string(),
+        );
+        project.write_file(&format!("packages/{member}/source.txt"), "stable");
+    }
+    project.write_file(
+        "packages/utils/build.js",
+        "const fs=require('fs'); const value=fs.readFileSync('source.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+    project.write_file(
+        "packages/core/build.js",
+        "const fs=require('fs'); const value=fs.readFileSync('../utils/dist/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); const value=fs.readFileSync('../core/dist/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+    project.write_file("packages/utils/source.txt", "upstream-v1");
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    for member in ["utils", "core", "app"] {
+        std::fs::remove_dir_all(project.path().join(format!("packages/{member}/dist")))
+            .expect("remove cached workspace output");
+    }
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+    for member in ["utils", "core", "app"] {
+        assert_eq!(
+            project.read_file(&format!("packages/{member}/executions.txt")),
+            "run\n",
+            "unchanged {member} task did not restore from cache"
+        );
+    }
+
+    project.write_file("packages/utils/source.txt", "upstream-v2");
+    for member in ["utils", "core", "app"] {
+        std::fs::remove_dir_all(project.path().join(format!("packages/{member}/dist")))
+            .expect("remove cached workspace output");
+    }
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "upstream-v2"
+    );
+    for member in ["utils", "core", "app"] {
+        assert_eq!(
+            project.read_file(&format!("packages/{member}/executions.txt")),
+            "run\nrun\n",
+            "{member} cache key did not include the upstream task result"
+        );
+    }
+}
+
+#[test]
+fn run_workspace_does_not_cache_dependents_of_non_cacheable_upstream_tasks() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["utils", "core"] {
+        let package_path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&package_path))
+                .expect("parse workspace package.json");
+        package["scripts"] = serde_json::json!({ "build": "node build.js" });
+        project.write_file(
+            &package_path,
+            &serde_json::to_string_pretty(&package).unwrap(),
+        );
+    }
+    project.write_file(
+        "packages/utils/lpm.json",
+        r#"{"tasks":{"build":{"cache":false,"outputs":["dist/**"]}}}"#,
+    );
+    project.write_file(
+        "packages/core/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "dependsOn": ["^build"],
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/utils/build.js",
+        "const fs=require('fs'); const count=fs.existsSync('run-count.txt')?Number(fs.readFileSync('run-count.txt','utf8'))+1:1; fs.writeFileSync('run-count.txt',String(count)); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',String(count));",
+    );
+    project.write_file(
+        "packages/core/build.js",
+        "const fs=require('fs'); const value=fs.readFileSync('../utils/dist/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/core"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("packages/core/dist"))
+        .expect("remove downstream output");
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/core"])
+        .assert()
+        .success();
+
+    assert_eq!(project.read_file("packages/utils/dist/value.txt"), "2");
+    assert_eq!(project.read_file("packages/core/dist/value.txt"), "2");
+    assert_eq!(
+        project.read_file("packages/core/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn run_workspace_does_not_restore_when_package_script_dependency_has_no_cache_contract() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({
+        "generate": "node generate.js",
+        "build": "node build.js"
+    });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "dependsOn": ["generate"],
+                    "cache": true,
+                    "inputs": ["build.js"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file("packages/app/schema.txt", "schema-v1");
+    project.write_file(
+        "packages/app/generate.js",
+        "const fs=require('fs'); const value=fs.readFileSync('schema.txt','utf8'); fs.mkdirSync('generated',{recursive:true}); fs.writeFileSync('generated/value.txt',value);",
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "const fs=require('fs'); const value=fs.readFileSync('generated/value.txt','utf8'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',value); fs.appendFileSync('executions.txt','run\\n');",
+    );
+
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    project.write_file("packages/app/schema.txt", "schema-v2");
+    std::fs::remove_dir_all(project.path().join("packages/app/generated"))
+        .expect("remove generated input");
+    std::fs::remove_dir_all(project.path().join("packages/app/dist"))
+        .expect("remove cached output");
+    lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        project.read_file("packages/app/dist/value.txt"),
+        "schema-v2"
+    );
+    assert_eq!(
+        project.read_file("packages/app/executions.txt"),
+        "run\nrun\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_workspace_rejects_cache_input_symlinks_that_escape_the_member() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let package_path = "packages/app/package.json";
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file(package_path)).expect("parse app package.json");
+    package["scripts"] = serde_json::json!({ "build": "node build.js" });
+    project.write_file(
+        package_path,
+        &serde_json::to_string_pretty(&package).unwrap(),
+    );
+    project.write_file(
+        "packages/app/lpm.json",
+        r#"{
+            "tasks": {
+                "build": {
+                    "cache": true,
+                    "inputs": ["src/**"],
+                    "outputs": ["dist/**"]
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "packages/app/build.js",
+        "require('fs').writeFileSync('task-started.txt','yes');",
+    );
+    std::fs::create_dir(project.path().join("packages/app/src")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("value.txt"), "outside").unwrap();
+    symlink(
+        outside.path().join("value.txt"),
+        project.path().join("packages/app/src/escape"),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["run", "build", "--filter", "@test/app"])
+        .output()
+        .expect("run a workspace task with an external cache input");
+
+    assert!(
+        !output.status.success(),
+        "external cache input was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("outside project"),
+        "external cache input diagnostic was unclear: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project.file_exists("packages/app/task-started.txt"),
+        "workspace task ran after cache-key validation failed"
+    );
+}
+
+#[test]
 fn run_filter_executes_only_matched_members() {
     let project = TempProject::from_fixture("workspace-monorepo");
     seed_workspace_with_unique_scripts(&project);
@@ -2407,6 +4333,58 @@ fn run_no_bail_skips_workspace_caret_dependents_after_an_upstream_task_fails() {
         !member_ran(&project, "app"),
         "app ran even though its transitive dependency failed"
     );
+}
+
+#[test]
+fn run_no_bail_runs_workspace_tasks_whose_caret_dependencies_succeeded() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["app", "core", "utils"] {
+        let package_path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&package_path))
+                .expect("parse workspace package.json");
+        let lint_command = if member == "utils" {
+            "node -e \"process.exit(1)\"".to_string()
+        } else {
+            format!("node -e \"require('fs').writeFileSync('ran-lint-{member}.txt','ok')\"")
+        };
+        package["scripts"] = serde_json::json!({
+            "build": format!("node -e \"require('fs').writeFileSync('ran-build-{member}.txt','ok')\""),
+            "lint": lint_command
+        });
+        project.write_file(
+            &package_path,
+            &serde_json::to_string_pretty(&package).unwrap(),
+        );
+        project.write_file(
+            &format!("packages/{member}/lpm.json"),
+            r#"{
+                "tasks": {
+                    "build": { "dependsOn": ["^build"] },
+                    "lint": { "dependsOn": ["^lint"] }
+                }
+            }"#,
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["run", "build", "lint", "--filter", "@test/app", "--no-bail"])
+        .output()
+        .expect("run independent caret task chains with no-bail");
+
+    assert!(!output.status.success(), "the failed lint task was ignored");
+    for member in ["utils", "core", "app"] {
+        assert!(
+            project.file_exists(&format!("packages/{member}/ran-build-{member}.txt")),
+            "{member} build was skipped because an unrelated lint task failed"
+        );
+    }
+    for member in ["core", "app"] {
+        assert!(
+            !project.file_exists(&format!("packages/{member}/ran-lint-{member}.txt")),
+            "{member} lint ran after its caret dependency failed"
+        );
+    }
 }
 
 #[test]

@@ -3436,6 +3436,7 @@ dependencies = [
  "dirs",
  "fd-lock",
  "getrandom 0.3.4",
+ "glob",
  "libc",
  "miette",
  "serde",
@@ -3895,13 +3896,17 @@ dependencies = [
 name = "lpm-task"
 version = "0.74.1"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "flate2",
+ "getrandom 0.3.4",
  "glob",
  "globset",
- "ignore",
  "lpm-common",
  "lpm-workspace",
  "notify",
+ "rustix",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",
@@ -3910,6 +3915,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -9,7 +9,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -68,8 +68,10 @@ pub fn try_restore(
     client: &RemoteCacheClient,
     key: &str,
     project_dir: &Path,
+    output_globs: &[String],
+    validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
-    match client.restore(key, project_dir) {
+    match client.restore(key, project_dir, output_globs, validate) {
         Ok(hit) => hit,
         Err(reason) => {
             warn_once(&reason);
@@ -249,14 +251,18 @@ impl RemoteCacheClient {
         &self,
         key: &str,
         project_dir: &Path,
+        output_globs: &[String],
+        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
-        run_blocking_http(|| self.restore_blocking(key, project_dir))
+        run_blocking_http(|| self.restore_blocking(key, project_dir, output_globs, validate))
     }
 
     fn restore_blocking(
         &self,
         key: &str,
         project_dir: &Path,
+        output_globs: &[String],
+        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
         let client = blocking_http_client()?;
         let url = self.artifact_url(key)?;
@@ -330,9 +336,18 @@ impl RemoteCacheClient {
             verify_artifact_tag(key, &tag, &digests.hmac_tag)?;
         }
 
-        lpm_task::cache::restore_remote_artifact(key, temp.path(), project_dir)
-            .map(Some)
-            .map_err(|e| format!("remote cache artifact could not be restored: {e}"))
+        let artifact = temp
+            .as_file()
+            .try_clone()
+            .map_err(|e| format!("failed to retain verified remote cache artifact: {e}"))?;
+        lpm_task::cache::restore_remote_artifact_from_file_if(
+            key,
+            artifact,
+            project_dir,
+            output_globs,
+            validate,
+        )
+        .map_err(|e| format!("remote cache artifact could not be restored: {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -371,9 +386,10 @@ impl RemoteCacheClient {
         duration_ms: u64,
     ) -> Result<(), String> {
         let client = blocking_http_client()?;
-        let artifact = tempfile::NamedTempFile::new()
+        let mut artifact = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache artifact temp file: {e}"))?;
-        lpm_task::cache::create_remote_artifact(lpm_task::cache::RemoteArtifactCreate {
+        let artifact_path = artifact.path().to_path_buf();
+        let artifact_args = lpm_task::cache::RemoteArtifactCreate {
             key,
             project_dir,
             command,
@@ -381,9 +397,10 @@ impl RemoteCacheClient {
             stdout,
             stderr,
             duration_ms,
-            artifact_path: artifact.path(),
-        })
-        .map_err(|e| format!("failed to create remote cache artifact: {e}"))?;
+            artifact_path: &artifact_path,
+        };
+        lpm_task::cache::create_remote_artifact_in_file(artifact_args, artifact.as_file_mut())
+            .map_err(|e| format!("failed to create remote cache artifact: {e}"))?;
 
         let artifact_len = artifact
             .as_file()
@@ -397,9 +414,18 @@ impl RemoteCacheClient {
             ));
         }
 
-        let digests = hash_artifact(artifact.path(), self.signature_key.as_deref())?;
-        let body_file = File::open(artifact.path())
-            .map_err(|e| format!("failed to reopen remote cache artifact: {e}"))?;
+        let hash_file = artifact
+            .as_file()
+            .try_clone()
+            .map_err(|e| format!("failed to retain remote cache artifact for hashing: {e}"))?;
+        let digests = hash_artifact(hash_file, self.signature_key.as_deref())?;
+        let mut body_file = artifact
+            .as_file()
+            .try_clone()
+            .map_err(|e| format!("failed to retain remote cache artifact for upload: {e}"))?;
+        body_file
+            .rewind()
+            .map_err(|e| format!("failed to rewind remote cache artifact for upload: {e}"))?;
         let url = self.artifact_url(key)?;
 
         let mut request = client
@@ -778,9 +804,9 @@ fn copy_response_to_temp(
     })
 }
 
-fn hash_artifact(path: &Path, signature_key: Option<&str>) -> Result<ArtifactDigests, String> {
-    let mut file =
-        File::open(path).map_err(|e| format!("failed to hash remote cache artifact: {e}"))?;
+fn hash_artifact(mut file: File, signature_key: Option<&str>) -> Result<ArtifactDigests, String> {
+    file.rewind()
+        .map_err(|e| format!("failed to rewind remote cache artifact: {e}"))?;
     let mut sha = Sha256::new();
     let mut mac = signature_key.map(new_hmac).transpose()?;
     let mut buffer = [0u8; 64 * 1024];
@@ -983,6 +1009,20 @@ mod tests {
     fn artifact_sha_rejects_mismatch() {
         let err = verify_artifact_sha(&"0".repeat(64), &"1".repeat(64)).unwrap_err();
         assert!(err.contains("content-hash"));
+    }
+
+    #[test]
+    fn artifact_hash_uses_the_open_file_after_its_path_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, "verified").unwrap();
+        let open = File::open(&path).unwrap();
+        std::fs::rename(&path, directory.path().join("moved")).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+
+        let digest = hash_artifact(open, None).unwrap();
+
+        assert_eq!(digest.sha256_hex, hex::encode(Sha256::digest(b"verified")));
     }
 
     #[test]

@@ -16,14 +16,21 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 globset = "0.4"
-ignore = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 glob = { workspace = true }
 notify = "7"
-
-[dev-dependencies]
 tempfile = "3"
+cap-std = "4"
+cap-fs-ext = "4"
+getrandom = "0.3"
+same-file = "1"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true

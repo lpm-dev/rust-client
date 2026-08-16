@@ -870,7 +870,11 @@ pub fn lpm_v1_with_registry(project: &TempProject, registry_url: &str) -> assert
 /// capture output after a `kill()` — `inherit` would lose it.
 pub fn lpm_spawnable(project: &TempProject) -> std::process::Command {
     let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
-    let mut cmd = std::process::Command::new(bin);
+    lpm_spawnable_from_path(project, &bin)
+}
+
+pub fn lpm_spawnable_from_path(project: &TempProject, binary: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(binary);
     cmd.current_dir(project.path());
     apply_lpm_env(&mut cmd, project);
     cmd.stdout(std::process::Stdio::piped());
