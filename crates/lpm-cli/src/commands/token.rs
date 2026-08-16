@@ -1,4 +1,5 @@
 use crate::install_ui;
+use lpm_auth::TokenSource;
 use lpm_common::LpmError;
 use lpm_registry::{RegistryClient, parse_capped_api_json};
 use secrecy::{ExposeSecret, SecretString};
@@ -28,7 +29,7 @@ pub async fn run_rotate(
     otp: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    require_locally_managed_auth(client)?;
+    let auth_source = require_locally_managed_auth(client)?;
     let otp = otp.map(OtpCode::parse).transpose()?;
 
     if !json_output {
@@ -48,6 +49,10 @@ pub async fn run_rotate(
         {
             let prompted_otp = prompt_otp()?;
             rotate_once(client, &url, Some(&prompted_otp)).await?
+        }
+        Err(LpmError::AuthRequired) => {
+            clear_rejected_legacy_token(registry_url, auth_source)?;
+            return Err(LpmError::AuthRequired);
         }
         result => result?,
     };
@@ -107,19 +112,31 @@ pub async fn run_rotate(
     Ok(())
 }
 
-fn require_locally_managed_auth(client: &RegistryClient) -> Result<(), LpmError> {
+fn require_locally_managed_auth(client: &RegistryClient) -> Result<TokenSource, LpmError> {
     let source = client
         .session()
         .and_then(|session| session.current_source())
         .ok_or(LpmError::AuthRequired)?;
     if source.is_locally_managed() {
-        return Ok(());
+        return Ok(source);
     }
 
     Err(LpmError::UnsupportedAuthSource {
         command: COMMAND,
         auth_source: source.label(),
     })
+}
+
+fn clear_rejected_legacy_token(
+    registry_url: &str,
+    auth_source: TokenSource,
+) -> Result<(), LpmError> {
+    if auth_source != TokenSource::StoredLegacy {
+        return Ok(());
+    }
+
+    crate::auth::clear_login_state(registry_url)
+        .map_err(|error| LpmError::Registry(format!("failed to clear rejected token: {error}")))
 }
 
 async fn rotate_once(
