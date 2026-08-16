@@ -88,7 +88,7 @@ impl LpmRoot {
     /// performs **no** filesystem I/O and is safe to call from any command
     /// path, including read-only ones like `--help`.
     pub fn from_env() -> Result<Self, LpmError> {
-        if let Ok(explicit) = std::env::var("LPM_HOME")
+        if let Some(explicit) = std::env::var_os("LPM_HOME")
             && !explicit.is_empty()
         {
             return Ok(LpmRoot {
@@ -1199,6 +1199,11 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_filesystem_magic_classifies_nfs_as_network() {
@@ -1213,10 +1218,8 @@ mod tests {
 
     #[test]
     fn from_env_respects_lpm_home_override() {
+        let _guard = env_lock();
         let tmp = TempDir::new().unwrap();
-        // Use set_var under a mutex in a real project; for one-shot tests the
-        // env is process-local and we're not racing with other threads that
-        // read LPM_HOME.
         unsafe {
             std::env::set_var("LPM_HOME", tmp.path());
         }
@@ -1229,11 +1232,30 @@ mod tests {
 
     #[test]
     fn from_env_falls_back_to_home_dot_lpm() {
+        let _guard = env_lock();
         unsafe {
             std::env::remove_var("LPM_HOME");
         }
         let root = LpmRoot::from_env().unwrap();
         assert_eq!(root.root().file_name().unwrap(), ".lpm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_env_preserves_non_unicode_lpm_home_override() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = env_lock();
+        let explicit = std::ffi::OsString::from_vec(b"lpm-home-\xff".to_vec());
+        unsafe {
+            std::env::set_var("LPM_HOME", &explicit);
+        }
+        let root = LpmRoot::from_env().unwrap();
+        unsafe {
+            std::env::remove_var("LPM_HOME");
+        }
+
+        assert_eq!(root.root().as_os_str(), explicit);
     }
 
     #[test]

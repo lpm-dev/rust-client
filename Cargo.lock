@@ -3943,7 +3943,6 @@ version = "0.74.1"
 dependencies = [
  "base64",
  "chrono",
- "dirs",
  "futures-util",
  "hex",
  "hmac",

@@ -9,30 +9,32 @@
 //! 1. `LPM_TUNNEL_RELAY` env var — wins over everything. Per-process,
 //!    matches the conventional shape of the rest of the LPM env-var
 //!    surface (`LPM_TOKEN`, `LPM_RESOLVER`, …).
-//! 2. `~/.lpm/config.toml` `tunnel.relay-url` — per-user persistent
-//!    override. Lives under a nested `[tunnel]` table so the key set
-//!    can grow (`tunnel.pin-host`, `tunnel.no-pin`, …) without
-//!    polluting the top-level namespace shared with `save-prefix`,
-//!    `linker`, etc.
+//! 2. The LPM root's `config.toml` `tunnel.relay-url` — per-user
+//!    persistent override. The root defaults to `~/.lpm` and honors
+//!    `LPM_HOME`. The setting lives under a nested `[tunnel]` table so
+//!    the key set can grow (`tunnel.pin-host`, `tunnel.no-pin`, …)
+//!    without polluting the top-level namespace shared with
+//!    `save-prefix`, `linker`, etc.
 //! 3. [`crate::DEFAULT_RELAY_URL`] (`wss://relay.lpm.fyi/connect`).
 //!
 //! TOFU certificate pins are now stored **per host** under
-//! `~/.lpm/relay-pins/<host>` (e.g. `relay.lpm.fyi`). A single global
-//! `~/.lpm/relay-pin` file from earlier versions is still consulted —
+//! `<LPM root>/relay-pins/<host>` (e.g. `relay.lpm.fyi`). A single legacy
+//! `<LPM root>/relay-pin` file from earlier versions is still consulted —
 //! see [`tofu_pin_path_for_host`] and [`legacy_tofu_pin_path`].
 
 use std::path::{Path, PathBuf};
 
 /// Resolve the WebSocket relay URL the CLI should connect to.
 ///
-/// Precedence: `LPM_TUNNEL_RELAY` env > `~/.lpm/config.toml`
-/// `tunnel.relay-url` > [`crate::DEFAULT_RELAY_URL`]. Returns the
+/// Precedence: `LPM_TUNNEL_RELAY` env > `<LPM root>/config.toml`
+/// `tunnel.relay-url` > [`crate::DEFAULT_RELAY_URL`]. The LPM root honors
+/// `LPM_HOME` and otherwise defaults to `~/.lpm`. Returns the
 /// fully-qualified `wss://...` (or `ws://...` for local dev) URL ready
 /// to hand to [`crate::client::TunnelOptions`].
 ///
 /// Whitespace is trimmed and empty values are ignored — an env var
 /// accidentally set to `""` falls through to the next tier rather than
-/// silently breaking the tunnel. Bad TOML in `~/.lpm/config.toml` falls
+/// silently breaking the tunnel. Bad TOML in the LPM config falls
 /// through to the default with a debug log; we never abort the tunnel
 /// for a malformed user config (the install pipeline has its own
 /// stricter loader if we ever add one).
@@ -44,10 +46,10 @@ pub fn resolve_relay_url() -> String {
         return accept_relay_override(&trimmed, "LPM_TUNNEL_RELAY");
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".lpm").join("config.toml");
+    if let Ok(root) = lpm_common::LpmRoot::from_env() {
+        let path = root.root().join("config.toml");
         if let Some(val) = read_relay_url_from_config(&path) {
-            return accept_relay_override(&val, "~/.lpm/config.toml tunnel.relay-url");
+            return accept_relay_override(&val, "LPM config.toml tunnel.relay-url");
         }
     }
 
@@ -149,7 +151,7 @@ fn read_relay_url_from_config(path: &Path) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-/// Path to the per-host TOFU pin file (`~/.lpm/relay-pins/<host>`).
+/// Path to the per-host TOFU pin file (`<LPM root>/relay-pins/<host>`).
 ///
 /// `host` is the relay's hostname (e.g. `relay.lpm.fyi`) — the same
 /// value rustls passes the certificate verifier as `ServerName`. Pin
@@ -158,11 +160,11 @@ fn read_relay_url_from_config(path: &Path) -> Option<String> {
 /// and so re-pointing the CLI at a new relay never silently inherits
 /// a pin for a different server.
 pub fn tofu_pin_path_for_host(host: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".lpm").join("relay-pins").join(host))
+    let root = lpm_common::LpmRoot::from_env().ok()?;
+    Some(root.root().join("relay-pins").join(host))
 }
 
-/// Path to the legacy single-file TOFU pin (`~/.lpm/relay-pin`).
+/// Path to the legacy single-file TOFU pin (`<LPM root>/relay-pin`).
 ///
 /// Earlier versions stored exactly one pin globally, regardless of which
 /// relay the CLI was connecting to. New installations only write to the
@@ -170,12 +172,12 @@ pub fn tofu_pin_path_for_host(host: &str) -> Option<PathBuf> {
 /// canonically-default relay (`relay.lpm.fyi`) to avoid forcing every
 /// existing user to delete their pin file when they upgrade.
 pub fn legacy_tofu_pin_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".lpm").join("relay-pin"))
+    let root = lpm_common::LpmRoot::from_env().ok()?;
+    Some(root.root().join("relay-pin"))
 }
 
 /// Hostname of the canonical default relay
-/// (`wss://relay.lpm.fyi/connect`). The legacy `~/.lpm/relay-pin` file
+/// (`wss://relay.lpm.fyi/connect`). The legacy `<LPM root>/relay-pin` file
 /// is treated as a pin for this host only — connecting to any other
 /// host always uses the per-host layout.
 pub const DEFAULT_RELAY_HOST: &str = "relay.lpm.fyi";
@@ -258,6 +260,38 @@ mod tests {
         }
 
         assert_eq!(got, "wss://from-config/connect");
+    }
+
+    #[test]
+    fn lpm_home_config_takes_precedence_over_home_config() {
+        let _g = crate::test_env_lock();
+        let lpm_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            lpm_home.path().join("config.toml"),
+            "[tunnel]\nrelay-url = \"wss://from-lpm-home/connect\"\n",
+        )
+        .unwrap();
+        let home_config = home.path().join(".lpm").join("config.toml");
+        std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            home_config,
+            "[tunnel]\nrelay-url = \"wss://from-home/connect\"\n",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::remove_var("LPM_TUNNEL_RELAY");
+            std::env::set_var("LPM_HOME", lpm_home.path());
+            std::env::set_var("HOME", home.path());
+        }
+        let got = resolve_relay_url();
+        unsafe {
+            std::env::remove_var("LPM_HOME");
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(got, "wss://from-lpm-home/connect");
     }
 
     /// Coexistence: other top-level keys (`save-prefix`, `linker`, …)
@@ -349,8 +383,30 @@ mod tests {
         );
     }
 
-    /// Legacy global pin path is unchanged from earlier versions —
-    /// still `~/.lpm/relay-pin` (no `s`, no subdirectory) — so existing
+    #[test]
+    fn pin_paths_use_lpm_home_override() {
+        let _g = crate::test_env_lock();
+        let lpm_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("LPM_HOME", lpm_home.path());
+            std::env::set_var("HOME", home.path());
+        }
+        let per_host = tofu_pin_path_for_host("relay.lpm.fyi").unwrap();
+        let legacy = legacy_tofu_pin_path().unwrap();
+        unsafe {
+            std::env::remove_var("LPM_HOME");
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(
+            per_host,
+            lpm_home.path().join("relay-pins").join("relay.lpm.fyi")
+        );
+        assert_eq!(legacy, lpm_home.path().join("relay-pin"));
+    }
+
+    /// The legacy filename remains `relay-pin` at the LPM root so existing
     /// installs keep working.
     #[test]
     fn legacy_pin_path_unchanged() {
