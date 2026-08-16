@@ -208,6 +208,13 @@ jobs:
                 echo "::error::Stable release version must be X.Y.Z, got '$VERSION'."
                 exit 1
               fi
+              if [ "$MODE" = "full" ]; then
+                EXPECTED_REF="refs/tags/v${VERSION}"
+                if [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
+                  echo "::error::Stable full releases must run from $EXPECTED_REF, got $GITHUB_REF."
+                  exit 1
+                fi
+              fi
               NPM_TAG=latest
               PRERELEASE=false
               ;;
@@ -951,6 +958,8 @@ jobs:
           files: binaries/*
           body_path: ${{ runner.temp }}/release-notes.md
           append_body: false
+          fail_on_unmatched_files: true
+          overwrite_files: false
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
           make_latest: ${{ needs.release-metadata.outputs.channel == 'stable' }}
           target_commitish: ${{ github.sha }}
