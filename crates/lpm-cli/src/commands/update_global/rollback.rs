@@ -99,7 +99,10 @@ pub(super) fn rollback_aborted_upgrade(
     // the install root inline (could be locked on Windows by a tool
     // the user is running). Tombstone it for `store gc`.
     let install_root_ext = lpm_common::as_extended_path(&staged.install_root);
-    if install_root_ext.exists()
+    let root_is_referenced = manifest
+        .install_root_is_referenced_excluding_pending(&staged.install_root_relative, package);
+    if !root_is_referenced
+        && install_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
     {
         tracing::debug!("upgrade rollback: deferring install-root cleanup via tombstone: {e}");
@@ -123,6 +126,94 @@ mod tests {
     use super::super::test_support::make_complete_install_root;
     use super::*;
     use lpm_semver::Version;
+
+    #[test]
+    fn rollback_aborted_upgrade_preserves_root_referenced_by_active_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let relative = "installs/foo@2.0.0";
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^2".into(),
+                resolved: "2.0.0".into(),
+                integrity: "sha512-pending".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                started_at: chrono::Utc::now(),
+                root: relative.into(),
+                commands: Vec::new(),
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        manifest.packages.insert(
+            "current-owner".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^2".into(),
+                resolved: "2.0.0".into(),
+                integrity: "sha512-current".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                installed_at: chrono::Utc::now(),
+                root: relative.into(),
+                commands: Vec::new(),
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let staged = StagedUpgrade {
+            tx_id: "tx-shared".into(),
+            install_root: install_root.clone(),
+            install_root_relative: relative.into(),
+        };
+
+        rollback_aborted_upgrade(&root, &mut manifest, &staged, "foo", "test reason").unwrap();
+
+        assert!(
+            install_root.exists(),
+            "upgrade rollback must preserve a root still referenced by an active package"
+        );
+    }
+
+    #[test]
+    fn rollback_aborted_upgrade_deletes_root_referenced_only_by_own_pending_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+
+        let relative = "installs/foo@2.0.0";
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^2".into(),
+                resolved: "2.0.0".into(),
+                integrity: "sha512-pending".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                started_at: chrono::Utc::now(),
+                root: relative.into(),
+                commands: Vec::new(),
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+        let staged = StagedUpgrade {
+            tx_id: "tx-unshared".into(),
+            install_root: install_root.clone(),
+            install_root_relative: relative.into(),
+        };
+
+        rollback_aborted_upgrade(&root, &mut manifest, &staged, "foo", "test reason").unwrap();
+
+        assert!(
+            !install_root.exists(),
+            "the transaction's own pending row must not prevent rollback cleanup"
+        );
+    }
+
     /// Post-emit rollback restores prior shim targets or removes net-new shims.
     #[test]
     #[cfg(unix)]

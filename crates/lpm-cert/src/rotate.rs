@@ -966,7 +966,7 @@ mod transactional_tests {
         let trust_dir = home.path().join("trust");
         let project = home.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let operation = paths::CertificateOperation::begin().unwrap();
@@ -1061,7 +1061,7 @@ mod transactional_tests {
         let home = tempfile::tempdir().unwrap();
         let audit_dir = home.path().join("audit");
         let trust_dir = home.path().join("trust");
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let operation = paths::CertificateOperation::begin().unwrap();
@@ -1132,7 +1132,7 @@ mod transactional_tests {
         let home = tempfile::tempdir().unwrap();
         let audit_dir = home.path().join("audit");
         let trust_dir = home.path().join("trust");
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let operation = paths::CertificateOperation::begin().unwrap();
@@ -1227,7 +1227,7 @@ mod transactional_tests {
         let audit_dir = home.path().join("audit");
         let trust_dir = home.path().join("trust");
         let grace_file = home.path().join("grace.json");
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let _grace = EnvGuard::set(GRACE_FILE_ENV, &grace_file);
@@ -1286,7 +1286,7 @@ mod transactional_tests {
         let audit_dir = home.path().join("audit");
         let trust_dir = home.path().join("trust");
         let grace_file = home.path().join("grace.json");
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let _grace = EnvGuard::set(GRACE_FILE_ENV, &grace_file);
@@ -1351,7 +1351,7 @@ mod transactional_tests {
         let home = tempfile::tempdir().unwrap();
         let audit_dir = home.path().join("audit");
         let trust_dir = home.path().join("trust");
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let operation = paths::CertificateOperation::begin().unwrap();
@@ -1428,7 +1428,7 @@ mod transactional_tests {
         let trust_dir = home.path().join("trust");
         let project = home.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let _projects = EnvGuard::set(
@@ -1485,7 +1485,7 @@ mod transactional_tests {
         let home = tempfile::tempdir().unwrap();
         let audit_dir = home.path().join("audit");
         let trust_dir = home.path().join("trust");
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let _audit = EnvGuard::set("LPM_CERT_AUDIT_DIR", &audit_dir);
         let _trust = EnvGuard::set("LPM_CERT_TEST_TRUST_STORE_DIR", &trust_dir);
         let _projects = EnvGuard::set(
@@ -1834,7 +1834,7 @@ mod tests {
     fn committed_rotation_does_not_fail_after_the_journal_was_unlinked() {
         let _serial = serial_lock();
         let home = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set("HOME", home.path());
+        let _lpm_home = EnvGuard::set("LPM_HOME", home.path().join(".lpm"));
         let operation = paths::CertificateOperation::begin().unwrap();
         operation
             .ca

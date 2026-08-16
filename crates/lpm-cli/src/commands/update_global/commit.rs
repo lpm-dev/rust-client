@@ -210,13 +210,10 @@ pub(super) fn commit_upgrade_locked(
     // Flip [pending] → [packages]. Tombstone the OLD install root
     // (its path is in prior_active_row_json.root) so `store gc` can
     // sweep it after any tools holding files in it have exited.
-    if let Some(prior_root) = prep
+    let prior_root = prep
         .prior_active_row_json
         .get("root")
-        .and_then(|v| v.as_str())
-    {
-        manifest.tombstones.push(prior_root.to_string());
-    }
+        .and_then(|v| v.as_str());
     let active = PackageEntry {
         saved_spec: prep.new_saved_spec.clone(),
         resolved: prep.new_version.to_string(),
@@ -232,6 +229,11 @@ pub(super) fn commit_upgrade_locked(
     };
     manifest.packages.insert(prep.name.clone(), active);
     manifest.pending.remove(&prep.name);
+    if let Some(prior_root) = prior_root
+        && !manifest.install_root_is_referenced(prior_root)
+    {
+        manifest.tombstones.push(prior_root.to_string());
+    }
     // Aliases are already in `manifest.aliases` from the prior install
     // — we're carrying them forward unchanged. Same alias entries
     // referencing the same package + bin still resolve correctly now
@@ -260,6 +262,75 @@ mod tests {
     use super::super::test_support::{make_complete_install_root, pre_upgrade_manifest_with_alias};
     use super::*;
     use lpm_semver::Version;
+
+    #[test]
+    fn upgrade_does_not_tombstone_prior_root_referenced_by_another_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let prior_root = root.install_root_for("foo", "1.0.0");
+        std::fs::create_dir_all(&prior_root).unwrap();
+        make_complete_install_root(&prior_root, &[]);
+        let new_root = root.install_root_for("foo", "2.0.0");
+        std::fs::create_dir_all(&new_root).unwrap();
+        make_complete_install_root(&new_root, &[]);
+
+        let prior_relative = "installs/foo@1.0.0";
+        let mut manifest = lpm_global::GlobalManifest::default();
+        let prior_entry = lpm_global::PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-old".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            installed_at: chrono::Utc::now(),
+            root: prior_relative.into(),
+            commands: Vec::new(),
+        };
+        manifest.packages.insert("foo".into(), prior_entry.clone());
+        manifest
+            .packages
+            .insert("other".into(), prior_entry.clone());
+        manifest.pending.insert(
+            "foo".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^2".into(),
+                resolved: "2.0.0".into(),
+                integrity: "sha512-new".into(),
+                source: lpm_global::PackageSource::UpstreamNpm,
+                started_at: chrono::Utc::now(),
+                root: "installs/foo@2.0.0".into(),
+                commands: Vec::new(),
+                replaces_version: Some("1.0.0".into()),
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let prep = UpgradePrep {
+            name: "foo".into(),
+            current_version: "1.0.0".into(),
+            new_version: Version::parse("2.0.0").unwrap(),
+            new_saved_spec: "^2".into(),
+            new_integrity: "sha512-new".into(),
+            source: lpm_global::PackageSource::UpstreamNpm,
+            prior_active_row_json: serde_json::to_value(prior_entry).unwrap(),
+            prior_aliases_json: serde_json::json!({}),
+        };
+        let staged = StagedUpgrade {
+            tx_id: "tx-shared-prior".into(),
+            install_root: new_root,
+            install_root_relative: "installs/foo@2.0.0".into(),
+        };
+
+        commit_upgrade_locked(&root, &prep, &staged).unwrap();
+
+        let final_manifest = lpm_global::read_for(&root).unwrap();
+        assert!(
+            !final_manifest
+                .tombstones
+                .contains(&prior_relative.to_string()),
+            "a prior root still referenced by another package must not be tombstoned"
+        );
+    }
+
     /// A package originally installed with an alias keeps that alias through upgrade.
     #[test]
     #[cfg(unix)]

@@ -127,22 +127,23 @@ pub(super) fn roll_forward(
     // 4. Flip [pending] into [packages]. If this is an upgrade, queue
     //    the prior install root in tombstones for the post-commit
     //    sweep / next `store gc`.
-    if let Some(prior) = pending.replaces_version.as_ref() {
+    let prior_root = if let Some(prior) = pending.replaces_version.as_ref() {
         let prior_root = intent
             .prior_active_row_json
             .as_ref()
             .and_then(|v| v.get("root"))
             .and_then(|v| v.as_str());
-        if let Some(p) = prior_root {
-            manifest.tombstones.push(p.to_string());
-        } else {
+        if prior_root.is_none() {
             tracing::warn!(
                 "recover: upgrade Intent for {} (replacing {}) had no prior root in payload",
                 intent.package,
                 prior
             );
         }
-    }
+        prior_root
+    } else {
+        None
+    };
     let active = PackageEntry {
         saved_spec: pending.saved_spec,
         resolved: pending.resolved,
@@ -158,6 +159,11 @@ pub(super) fn roll_forward(
     };
     manifest.packages.insert(intent.package.clone(), active);
     manifest.pending.remove(&intent.package);
+    if let Some(prior_root) = prior_root
+        && !manifest.install_root_is_referenced(prior_root)
+    {
+        manifest.tombstones.push(prior_root.to_string());
+    }
 
     // 5. Persist manifest BEFORE WAL append. See reconcile_one's
     //    Case A discussion — the manifest must be at the committed
@@ -343,11 +349,23 @@ pub(super) fn roll_forward_uninstall(
 
     // 4. Tombstone the install root if it still exists and isn't
     //    already queued. Avoids double-pushing on every recovery pass.
-    if intent.new_root_path.exists()
-        && let Some(rel) = relative_install_root(root, &intent.new_root_path)
-        && !manifest.tombstones.contains(&rel)
-    {
-        manifest.tombstones.push(rel);
+    let validated_root =
+        crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path);
+    let relative_root = validated_root
+        .as_ref()
+        .ok()
+        .and_then(|validated| relative_install_root(root, validated));
+    let root_is_referenced = relative_root
+        .as_deref()
+        .is_some_and(|relative| manifest.install_root_is_referenced(relative));
+    let root_is_valid = relative_root.is_some();
+    let should_tombstone = !root_is_referenced
+        && validated_root.as_ref().is_ok_and(|root| root.exists())
+        && relative_root
+            .as_ref()
+            .is_some_and(|relative| !manifest.tombstones.contains(relative));
+    if should_tombstone && let Some(relative) = relative_root {
+        manifest.tombstones.push(relative);
     }
 
     // 5. Persist manifest BEFORE WAL Commit (manifest-before-commit ordering invariant).
@@ -360,12 +378,14 @@ pub(super) fn roll_forward_uninstall(
     // the `installs/<name>@<version>` shape. The sweep step already
     // refused to push the relative form if it was not under
     // `global_root`, so the tombstone retry will not fire either.
-    let new_root_ext = as_extended_path(&intent.new_root_path);
-    if new_root_ext.exists()
-        && crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path)
-            .is_ok()
+    if root_is_valid
+        && !root_is_referenced
+        && let Ok(validated_root) = &validated_root
     {
-        let _ = std::fs::remove_dir_all(&new_root_ext);
+        let validated_root_ext = as_extended_path(validated_root);
+        if validated_root_ext.exists() {
+            let _ = std::fs::remove_dir_all(&validated_root_ext);
+        }
     }
 
     // 7. Append Commit.
