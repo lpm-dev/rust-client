@@ -38,11 +38,9 @@ concurrency:
   group: release-${{ (github.event_name == 'schedule' || inputs.channel == 'nightly') && 'nightly' || format('{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: false
 
+# Jobs that publish, attest, or request an OIDC token grant those scopes locally.
 permissions:
-  actions: read
-  contents: write
-  id-token: write # Required for npm OIDC trusted publishing (no token needed) + Sigstore Fulcio
-  attestations: write # Required for actions/attest-build-provenance to mint the artifact attestation
+  contents: read
 
 env:
   RUST_TOOLCHAIN: "1.94.0"
@@ -58,6 +56,9 @@ jobs:
     name: Resolve release metadata
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
     outputs:
       channel: ${{ steps.metadata.outputs.channel }}
       mode: ${{ steps.metadata.outputs.mode }}
@@ -340,7 +341,6 @@ jobs:
       - verify-windows-filesystem
     if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ${{ matrix.os }}
-    environment: windows-signing
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
@@ -373,11 +373,6 @@ jobs:
             portable_glibc: true
             build_image: quay.io/pypa/manylinux_2_28_aarch64@sha256:34368babc008d6405b4b74c77868d6a5d15b6010cb953574d1f2bb9184392a9b
             runtime_image: rockylinux/rockylinux:8.10-minimal@sha256:55ddcbe11a7bf1696f67ce3b2ffcc6d58b3d33007be03bc372d61fc147a92015
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            binary: lpm-win32-x64.exe
-            timeout_minutes: 60
-
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -431,15 +426,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo rustc --locked --release --target ${{ matrix.target }} -p lpm-cli --bin lpm-rs -- -C link-arg=-static
 
-      # The Windows runtime ships an additional helper binary for
-      # AppContainer strict-mode. Build it with the CLI so the release
-      # artifact and npm platform package consume the same signed bytes.
-      - name: Build sandbox helper (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-sandbox --bin lpm-sandbox-helper
-
-      - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Stage binary
         run: |
           cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
           chmod +x ${{ matrix.binary }}
@@ -578,85 +565,6 @@ jobs:
               --timeout 30m
           fi
 
-      - name: Stage binaries (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cp target/${{ matrix.target }}/release/lpm-rs.exe ${{ matrix.binary }}
-          cp target/${{ matrix.target }}/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
-
-      - name: Validate Windows signing configuration
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          WINDOWS_SIGNING_AZURE_CLIENT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
-          WINDOWS_SIGNING_AZURE_TENANT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
-          WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
-          WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
-          WINDOWS_SIGNING_ACCOUNT_NAME: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
-          WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
-        run: |
-          $missing = @()
-          foreach ($name in @(
-            "WINDOWS_SIGNING_AZURE_CLIENT_ID",
-            "WINDOWS_SIGNING_AZURE_TENANT_ID",
-            "WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID",
-            "WINDOWS_SIGNING_ENDPOINT",
-            "WINDOWS_SIGNING_ACCOUNT_NAME",
-            "WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME"
-          )) {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-              $missing += $name
-            }
-          }
-
-          if ($missing.Count -gt 0) {
-            Write-Error ("Set Windows signing repository secrets/variables before publishing Windows release artifacts. Missing: " + ($missing -join ", "))
-            exit 1
-          }
-
-      - name: Azure login (Windows signing)
-        if: runner.os == 'Windows'
-        uses: azure/login@2dd0bbf4064d5a1812889dc200bb8eed2597f82a # v3
-        with:
-          client-id: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
-
-      - name: Sign binaries (Windows)
-        if: runner.os == 'Windows'
-        uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30 # v2
-        with:
-          endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
-          certificate-profile-name: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
-          files: |
-            ${{ github.workspace }}\${{ matrix.binary }}
-            ${{ github.workspace }}\lpm-sandbox-helper-win32-x64.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          description: LPM CLI
-          description-url: https://github.com/lpm-dev/rust-client
-
-      - name: Verify signatures (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          foreach ($file in @(".\${{ matrix.binary }}", ".\lpm-sandbox-helper-win32-x64.exe")) {
-            $signature = Get-AuthenticodeSignature -FilePath $file
-            $signature | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
-
-            if ($signature.Status -ne "Valid") {
-              Write-Error "Authenticode signature for $file is $($signature.Status): $($signature.StatusMessage)"
-              exit 1
-            }
-
-            if ($null -eq $signature.TimeStamperCertificate) {
-              Write-Error "Authenticode signature for $file does not include a timestamp."
-              exit 1
-            }
-          }
-
       - name: Execute release binary (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -686,29 +594,11 @@ jobs:
           actual=$("./${{ matrix.binary }}" --version)
           test "$actual" = "lpm $VERSION"
 
-      - name: Execute release binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = "${{ needs.release-metadata.outputs.version }}"
-          $actual = (& ".\${{ matrix.binary }}" --version | Out-String).Trim()
-          if ($actual -ne "lpm $version") {
-            Write-Error "Release binary reported '$actual', expected 'lpm $version'."
-            exit 1
-          }
-
       - name: Upload artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: ${{ matrix.binary }}
           path: ${{ matrix.binary }}
-
-      - name: Upload helper artifact (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: lpm-sandbox-helper-win32-x64.exe
-          path: lpm-sandbox-helper-win32-x64.exe
 
       - name: Delete temporary signing keychain (macOS)
         if: always() && runner.os == 'macOS'
@@ -717,10 +607,160 @@ jobs:
             security delete-keychain "$APPLE_SIGNING_KEYCHAIN" || true
           fi
 
+  build-windows:
+    name: Build x86_64-pc-windows-msvc
+    needs:
+      - release-metadata
+      - verify
+      - verify-windows-filesystem
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build CLI
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lpm-cli
+
+      - name: Build sandbox helper
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p lpm-sandbox --bin lpm-sandbox-helper
+
+      - name: Stage unsigned binaries
+        run: |
+          cp target/x86_64-pc-windows-msvc/release/lpm-rs.exe lpm-win32-x64.exe
+          cp target/x86_64-pc-windows-msvc/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
+
+      - name: Execute release binary
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-metadata.outputs.version }}"
+          $actual = (& ".\lpm-win32-x64.exe" --version | Out-String).Trim()
+          if ($actual -ne "lpm $version") {
+            Write-Error "Release binary reported '$actual', expected 'lpm $version'."
+            exit 1
+          }
+
+      - name: Upload unsigned binaries
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unsigned-windows-binaries
+          path: |
+            lpm-win32-x64.exe
+            lpm-sandbox-helper-win32-x64.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-windows:
+    name: Sign Windows binaries
+    needs:
+      - build-windows
+      - release-metadata
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    runs-on: windows-latest
+    environment: windows-signing
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+    steps:
+      - name: Download unsigned binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unsigned-windows-binaries
+
+      - name: Validate Windows signing configuration
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_AZURE_CLIENT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
+          WINDOWS_SIGNING_AZURE_TENANT_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
+          WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
+          WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          WINDOWS_SIGNING_ACCOUNT_NAME: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
+          WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          $missing = @()
+          foreach ($name in @(
+            "WINDOWS_SIGNING_AZURE_CLIENT_ID",
+            "WINDOWS_SIGNING_AZURE_TENANT_ID",
+            "WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID",
+            "WINDOWS_SIGNING_ENDPOINT",
+            "WINDOWS_SIGNING_ACCOUNT_NAME",
+            "WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME"
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            Write-Error ("Set Windows signing repository secrets/variables before publishing Windows release artifacts. Missing: " + ($missing -join ", "))
+            exit 1
+          }
+
+      - name: Azure login
+        uses: azure/login@2dd0bbf4064d5a1812889dc200bb8eed2597f82a # v3
+        with:
+          client-id: ${{ secrets.WINDOWS_SIGNING_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign binaries
+        uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30 # v2
+        with:
+          endpoint: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.WINDOWS_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: |
+            ${{ github.workspace }}\lpm-win32-x64.exe
+            ${{ github.workspace }}\lpm-sandbox-helper-win32-x64.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: LPM CLI
+          description-url: https://github.com/lpm-dev/rust-client
+
+      - name: Verify signatures
+        shell: pwsh
+        run: |
+          foreach ($file in @(".\lpm-win32-x64.exe", ".\lpm-sandbox-helper-win32-x64.exe")) {
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            $signature | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+
+            if ($signature.Status -ne "Valid") {
+              Write-Error "Authenticode signature for $file is $($signature.Status): $($signature.StatusMessage)"
+              exit 1
+            }
+
+            if ($null -eq $signature.TimeStamperCertificate) {
+              Write-Error "Authenticode signature for $file does not include a timestamp."
+              exit 1
+            }
+          }
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: lpm-win32-x64.exe
+          path: lpm-win32-x64.exe
+
+      - name: Upload helper artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: lpm-sandbox-helper-win32-x64.exe
+          path: lpm-sandbox-helper-win32-x64.exe
+
   pack-npm-packages:
     name: Pack exact npm release artifacts
     needs:
       - build
+      - sign-windows
       - release-metadata
     if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ubuntu-latest
