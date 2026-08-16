@@ -1,9 +1,10 @@
 use super::cache::{
-    CacheStoreRequest, is_task_cached_with_config, try_cache_hit_with_config,
-    try_cache_store_with_output_and_config,
+    CacheStoreRequest, CompletedTaskCacheIdentity, WorkspaceCacheContract,
+    WorkspaceDependencyIdentities, complete_task_cache_identity, prepare_cache_context_with_config,
+    resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
 };
 use super::format::{
-    TaskResult, print_captured_stderr, print_captured_stdout, print_json_summary,
+    TaskResult, TaskRunReport, print_captured_stderr, print_captured_stdout, print_json_summary,
     print_results_summary, print_task_result,
 };
 use super::task::{is_meta_task, run_task, run_task_captured};
@@ -16,6 +17,8 @@ use std::path::Path;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_tasks_sequential(
     project_dir: &Path,
+    workspace_contract: Option<&WorkspaceCacheContract>,
+    workspace_dependency_identities: &WorkspaceDependencyIdentities,
     scripts: &[String],
     extra_args: &[String],
     env_mode: Option<&str>,
@@ -26,22 +29,23 @@ pub(super) fn run_tasks_sequential(
     json_output: bool,
     bin_hint: &ManagedRuntimeHint,
     pkg_scripts: Option<&HashMap<String, String>>,
-) -> Result<(), LpmError> {
+    initially_failed_tasks: &HashSet<String>,
+) -> Result<TaskRunReport, LpmError> {
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
-    let mut failed_tasks: HashSet<String> = HashSet::new();
+    let mut failed_tasks = initially_failed_tasks.clone();
+    let mut cache_identities = HashMap::new();
 
     for (idx, script) in scripts.iter().enumerate() {
         // Skip tasks whose dependencies failed (topological order means deps
         // were already processed)
-        let deps_failed = if let Some(tc) = tasks.get(script.as_str()) {
-            tc.depends_on
-                .iter()
-                .filter(|d| !d.starts_with('^'))
-                .any(|d| failed_tasks.contains(d.as_str()))
-        } else {
-            false
-        };
+        let deps_failed = failed_tasks.contains(script)
+            || tasks.get(script.as_str()).is_some_and(|task| {
+                task.depends_on
+                    .iter()
+                    .filter(|dependency| !dependency.starts_with('^'))
+                    .any(|dependency| failed_tasks.contains(dependency.as_str()))
+            });
 
         if deps_failed {
             results.push(TaskResult {
@@ -56,11 +60,26 @@ pub(super) fn run_tasks_sequential(
             continue;
         }
 
+        let start = std::time::Instant::now();
+        let dependency_identities = (!no_cache).then(|| {
+            resolve_task_dependency_identities(
+                script,
+                tasks,
+                workspace_dependency_identities,
+                &cache_identities,
+            )
+        });
+        let dependency_identities = dependency_identities.flatten();
+
         // Meta-task: has dependsOn but no command and no package.json script.
         // All deps completed successfully (checked above), so the meta-task succeeds.
-        let is_meta_task = is_meta_task(script, tasks, pkg_scripts);
-        if is_meta_task {
-            let start = std::time::Instant::now();
+        if is_meta_task(script, tasks, pkg_scripts) {
+            if let Some(dependency_identities) = &dependency_identities {
+                cache_identities.insert(
+                    script.clone(),
+                    CompletedTaskCacheIdentity::meta(dependency_identities),
+                );
+            }
             results.push(TaskResult {
                 name: script.clone(),
                 success: true,
@@ -72,19 +91,25 @@ pub(super) fn run_tasks_sequential(
             continue;
         }
 
-        let start = std::time::Instant::now();
-
-        // Check cache
-        if !no_cache
-            && let Ok(Some(hit)) = try_cache_hit_with_config(
+        let cache_context = match dependency_identities.as_deref() {
+            Some(dependency_identities) => prepare_cache_context_with_config(
                 project_dir,
+                workspace_contract,
+                dependency_identities,
                 script,
                 env_mode,
                 extra_args,
                 bin_hint,
                 lpm_config,
-            )
-        {
+            )?,
+            None => None,
+        };
+        let cache_hit = cache_context
+            .as_ref()
+            .map(|context| try_cache_hit_with_context(project_dir, context))
+            .transpose()?
+            .flatten();
+        if let Some(hit) = cache_hit {
             if !hit.stdout.is_empty() {
                 print_captured_stdout(&hit.stdout);
             }
@@ -98,6 +123,12 @@ pub(super) fn run_tasks_sequential(
                 cached: true,
                 skipped: false,
             });
+            let context = cache_context.as_ref().ok_or_else(|| {
+                LpmError::Task(format!("cache context missing for task '{script}'"))
+            })?;
+            if let Some(identity) = complete_task_cache_identity(project_dir, script, context) {
+                cache_identities.insert(script.clone(), identity);
+            }
             print_task_result(results.last().unwrap());
             continue;
         }
@@ -107,7 +138,7 @@ pub(super) fn run_tasks_sequential(
             lpm_common::sanitize_terminal_inline(script)
         ));
 
-        let caching_enabled = !no_cache && is_task_cached_with_config(script, lpm_config);
+        let caching_enabled = cache_context.is_some();
         let task_start = std::time::Instant::now();
 
         // Resolve command: lpm.json task command > package.json script
@@ -115,17 +146,27 @@ pub(super) fn run_tasks_sequential(
             match run_task_captured(project_dir, script, extra_args, env_mode, tasks, bin_hint) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
-                    let _ = try_cache_store_with_output_and_config(CacheStoreRequest {
-                        project_dir,
-                        script_name: script,
-                        env_mode,
-                        extra_args,
-                        bin_hint,
-                        duration_ms,
-                        stdout: &captured.stdout,
-                        stderr: &captured.stderr,
-                        lpm_config,
-                    });
+                    let context = cache_context.as_ref().ok_or_else(|| {
+                        LpmError::Task(format!("cache context missing for task '{script}'"))
+                    })?;
+                    if try_cache_store_with_context(
+                        CacheStoreRequest {
+                            project_dir,
+                            workspace_contract,
+                            script_name: script,
+                            env_mode,
+                            extra_args,
+                            bin_hint,
+                            duration_ms,
+                            stdout: &captured.stdout,
+                            stderr: &captured.stderr,
+                        },
+                        context,
+                    ) && let Some(identity) =
+                        complete_task_cache_identity(project_dir, script, context)
+                    {
+                        cache_identities.insert(script.clone(), identity);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -179,16 +220,11 @@ pub(super) fn run_tasks_sequential(
 
     print_results_summary(&results, total_start.elapsed());
 
-    let failure_count = results.iter().filter(|r| !r.success && !r.skipped).count();
-    if failure_count > 0 {
-        if json_output {
-            print_json_summary(&results, total_start.elapsed());
-        }
-        Err(LpmError::ExitCode(failure_count as i32))
-    } else {
-        if json_output {
-            print_json_summary(&results, total_start.elapsed());
-        }
-        Ok(())
+    if json_output {
+        print_json_summary(&results, total_start.elapsed());
     }
+    Ok(TaskRunReport::with_cache_identities(
+        results,
+        cache_identities,
+    ))
 }

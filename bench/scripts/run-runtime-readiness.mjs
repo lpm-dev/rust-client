@@ -312,6 +312,7 @@ async function executeScenario({ scenario, binary, sample, counted, pairId = nul
     pair_id: pairId,
     pair_order: pairOrder,
     execution_sequence: ++executionSequence,
+    timeout_ms: scenario.timeoutMs ?? timeoutMs,
     started_at: new Date().toISOString(),
   };
   try {
@@ -325,7 +326,12 @@ async function executeScenario({ scenario, binary, sample, counted, pairId = nul
       env: { ...env, ...spec.env },
       label: spec.label ?? 'lpm',
     }));
-    const result = await runProcesses(context, processSpecs, scenario, timeoutMs);
+    const result = await runProcesses(
+      context,
+      processSpecs,
+      scenario,
+      scenario.timeoutMs ?? timeoutMs,
+    );
     Object.assign(row, result.metrics);
     row.processes = result.processes;
     row.contract = await scenario.validate(context, result);
@@ -539,6 +545,27 @@ function buildScenarios() {
     taskGraphScenario(100, 'wide'),
     taskGraphScenario(1_000, 'deep', true),
     taskGraphScenario(1_000, 'wide', true),
+    cachedTaskChainScenario(10, 'cold'),
+    cachedTaskChainScenario(10, 'warm'),
+    cachedTaskChainScenario(100, 'cold', true),
+    cachedTaskChainScenario(100, 'warm', true),
+    cachedTaskChainScenario(1_000, 'cold', true),
+    cachedTaskChainScenario(1_000, 'warm', true),
+    workspaceCaretChainScenario(10),
+    workspaceCaretChainScenario(100, true),
+    workspaceCaretChainScenario(1_000, true),
+    workspaceTaskCacheScenario(10, 'cold'),
+    workspaceTaskCacheScenario(10, 'warm'),
+    workspaceTaskCacheScenario(100, 'cold', true),
+    workspaceTaskCacheScenario(100, 'warm', true),
+    workspaceTaskCacheScenario(1_000, 'cold', true),
+    workspaceTaskCacheScenario(1_000, 'warm', true),
+    workspaceRootLockCacheScenario(1, 'cold'),
+    workspaceRootLockCacheScenario(1, 'warm'),
+    workspaceRootLockCacheScenario(10, 'cold', true),
+    workspaceRootLockCacheScenario(10, 'warm', true),
+    workspaceRootLockCacheScenario(50, 'cold', true),
+    workspaceRootLockCacheScenario(50, 'warm', true),
     cacheHitScenario(1),
     cacheHitScenario(128, true),
     cacheManyFileRestoreScenario(),
@@ -731,6 +758,249 @@ function taskGraphScenario(taskCount, shape, fullOnly = false) {
       : ['run', requestedTask],
     (result) => markerContract(result, { scenario: scenarioId })),
     fullOnly,
+  };
+}
+
+function cachedTaskChainScenario(taskCount, mode, fullOnly = false) {
+  const scenarioId = `task/cache-${mode}-deep-${taskCount}`;
+  const tasks = {};
+  for (let index = 0; index < taskCount; index += 1) {
+    const name = `task-${index}`;
+    tasks[name] = {
+      command: `mkdir -p dist executions && printf '${index}\\n' > dist/${name}.txt && printf 'run\\n' >> executions/${name}.txt`,
+      cache: true,
+      outputs: [`dist/${name}.txt`],
+      ...(index === 0 ? {} : { dependsOn: [`task-${index - 1}`] }),
+    };
+  }
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: `runtime-cache-${mode}-deep-${taskCount}`,
+        private: true,
+      });
+      writeJson(path.join(context.projectRoot, 'lpm.json'), { tasks });
+      if (mode === 'warm') {
+        runPreparationCommand(
+          context,
+          context.projectRoot,
+          ['run', `task-${taskCount - 1}`],
+          taskCount >= 1_000 ? 180_000 : 30_000,
+        );
+        fs.rmSync(path.join(context.projectRoot, 'dist'), { recursive: true, force: true });
+      }
+    }, ['run', `task-${taskCount - 1}`], () => ({ ok: true })),
+    fullOnly,
+    timeoutMs: taskCount >= 1_000 ? 180_000 : undefined,
+    async validate(context) {
+      for (let index = 0; index < taskCount; index += 1) {
+        const name = `task-${index}`;
+        if (!fs.existsSync(path.join(context.projectRoot, `dist/${name}.txt`))) {
+          return { ok: false, reason: `cached task chain did not produce ${name}` };
+        }
+        const executions = fs.readFileSync(
+          path.join(context.projectRoot, `executions/${name}.txt`),
+          'utf8',
+        );
+        if (executions !== 'run\n') {
+          return { ok: false, reason: `cached task chain executed ${name} more or less than once` };
+        }
+      }
+      return { ok: true, task_count: taskCount, cache_mode: mode };
+    },
+  };
+}
+
+function workspaceCaretChainScenario(packageCount, fullOnly = false) {
+  const scenarioId = `task/workspace-caret-deep-${packageCount}`;
+  const targetName = `runtime-workspace-caret-${packageCount - 1}`;
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: `runtime-workspace-caret-root-${packageCount}`,
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      for (let index = 0; index < packageCount; index += 1) {
+        const name = `runtime-workspace-caret-${index}`;
+        const member = path.join(context.projectRoot, `packages/member-${index}`);
+        writePackage(member, {
+          name,
+          private: true,
+          ...(index === 0
+            ? { scripts: { build: "mkdir -p dist && printf 'run\\n' > dist/executions.txt" } }
+            : { dependencies: { [`runtime-workspace-caret-${index - 1}`]: 'workspace:*' } }),
+        });
+        if (index > 0) {
+          writeJson(path.join(member, 'lpm.json'), {
+            tasks: { build: { dependsOn: ['^build'] } },
+          });
+        }
+      }
+    }, ['run', 'build', '--filter', targetName], () => ({ ok: true })),
+    fullOnly,
+    async validate(context) {
+      const executions = path.join(
+        context.projectRoot,
+        'packages/member-0/dist/executions.txt',
+      );
+      if (!fs.existsSync(executions) || fs.readFileSync(executions, 'utf8') !== 'run\n') {
+        return { ok: false, reason: 'workspace caret chain did not execute its leaf exactly once' };
+      }
+      return { ok: true, package_count: packageCount };
+    },
+  };
+}
+
+function workspaceTaskCacheScenario(taskCount, mode, fullOnly = false) {
+  const upstreamCount = taskCount <= 10 ? 3 : taskCount <= 100 ? 10 : 50;
+  const localTaskCount = taskCount - upstreamCount;
+  const scenarioId = `task/workspace-cache-${mode}-wide-deep-${taskCount}`;
+  const appName = 'runtime-workspace-cache-app';
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      const dependencies = {};
+      const memberDirectories = [];
+      const upstreamNames = Array.from(
+        { length: upstreamCount },
+        (_, index) => `runtime-workspace-cache-upstream-${index}`,
+      );
+      const rootCount = Math.max(1, Math.floor(upstreamCount / 2));
+      for (let index = 0; index < upstreamCount; index += 1) {
+        const name = upstreamNames[index];
+        const relativeDirectory = `packages/upstream-${index}`;
+        const member = path.join(context.projectRoot, relativeDirectory);
+        const memberDependencies = {};
+        if (index >= rootCount) {
+          memberDependencies[upstreamNames[(index - rootCount) % rootCount]] = 'workspace:*';
+          dependencies[name] = 'workspace:*';
+        }
+        memberDirectories.push(member);
+        writePackage(member, { name, private: true, dependencies: memberDependencies });
+        writeJson(path.join(member, 'lpm.json'), {
+          tasks: {
+            build: {
+              command: `mkdir -p dist && printf '${index}\\n' > dist/value.txt && printf 'run\\n' >> executions.txt`,
+              cache: true,
+              outputs: ['dist/**'],
+            },
+          },
+        });
+      }
+
+      writePackage(context.projectRoot, {
+        name: 'runtime-workspace-cache-root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      const app = path.join(context.projectRoot, 'packages/app');
+      memberDirectories.push(app);
+      writePackage(app, { name: appName, private: true, dependencies });
+      const tasks = { 'stage-0': { dependsOn: ['^build'] } };
+      let previous = 'stage-0';
+      for (let index = 1; index < localTaskCount - 1; index += 1) {
+        const name = `stage-${index}`;
+        tasks[name] = { dependsOn: [previous] };
+        previous = name;
+      }
+      tasks.result = {
+        dependsOn: [previous],
+        command: "mkdir -p dist && printf 'ready\\n' > dist/result.txt && printf 'run\\n' >> executions.txt",
+        cache: true,
+        outputs: ['dist/**'],
+      };
+      writeJson(path.join(app, 'lpm.json'), { tasks });
+      writeFile(context.projectRoot, 'lpm.lock', 'workspace-cache-contract\n');
+      context.state.workspaceTaskCache = { app, memberDirectories, upstreamCount };
+
+      if (mode === 'warm') {
+        runPreparationCommand(context, context.projectRoot, ['run', 'result', '--filter', appName]);
+        for (const member of memberDirectories) {
+          fs.rmSync(path.join(member, 'dist'), { recursive: true, force: true });
+        }
+      }
+    }, ['run', 'result', '--filter', appName], () => ({ ok: true })),
+    fullOnly,
+    async validate(context) {
+      const fixture = context.state.workspaceTaskCache;
+      if (!fs.existsSync(path.join(fixture.app, 'dist/result.txt'))) {
+        return { ok: false, reason: 'workspace cache graph did not produce the final output' };
+      }
+      for (const member of fixture.memberDirectories) {
+        const executions = path.join(member, 'executions.txt');
+        if (!fs.existsSync(executions) || fs.readFileSync(executions, 'utf8') !== 'run\n') {
+          return { ok: false, reason: `workspace cache graph executed ${member} more or less than once` };
+        }
+      }
+      return {
+        ok: true,
+        task_count: taskCount,
+        upstream_packages: fixture.upstreamCount,
+        local_tasks: taskCount - fixture.upstreamCount,
+        cache_mode: mode,
+      };
+    },
+  };
+}
+
+function workspaceRootLockCacheScenario(lockMiB, mode, fullOnly = false) {
+  const taskCount = 10;
+  const scenarioId = `cache/workspace-root-lock-${mode}-${lockMiB}mib-${taskCount}-tasks`;
+  const appName = 'runtime-workspace-root-lock-app';
+  return {
+    ...runScenario(scenarioId, async (context) => {
+      writePackage(context.projectRoot, {
+        name: 'runtime-workspace-root-lock-root',
+        private: true,
+        workspaces: ['packages/*'],
+      });
+      const app = path.join(context.projectRoot, 'packages/app');
+      writePackage(app, { name: appName, private: true });
+      const tasks = {};
+      const taskNames = [];
+      for (let index = 0; index < taskCount; index += 1) {
+        const name = `task-${index}`;
+        taskNames.push(name);
+        tasks[name] = {
+          command: `mkdir -p dist/${name} executions && printf '${index}\\n' > dist/${name}/value.txt && printf 'run\\n' >> executions/${name}.txt`,
+          cache: true,
+          outputs: [`dist/${name}/**`],
+        };
+      }
+      writeJson(path.join(app, 'lpm.json'), { tasks });
+      fs.writeFileSync(path.join(context.projectRoot, 'lpm.lock'), Buffer.alloc(lockMiB * MiB, 0x78));
+      context.state.workspaceRootLockCache = { app, taskNames };
+      if (mode === 'warm') {
+        runPreparationCommand(context, context.projectRoot, [
+          'run',
+          ...taskNames,
+          '--filter',
+          appName,
+          '--parallel',
+        ]);
+        fs.rmSync(path.join(app, 'dist'), { recursive: true, force: true });
+      }
+    }, (context) => [
+      'run',
+      ...context.state.workspaceRootLockCache.taskNames,
+      '--filter',
+      appName,
+      '--parallel',
+    ], () => ({ ok: true })),
+    fullOnly,
+    async validate(context) {
+      const fixture = context.state.workspaceRootLockCache;
+      for (const name of fixture.taskNames) {
+        if (!fs.existsSync(path.join(fixture.app, `dist/${name}/value.txt`))) {
+          return { ok: false, reason: `root-lock cache scenario did not restore ${name}` };
+        }
+        const executions = fs.readFileSync(path.join(fixture.app, `executions/${name}.txt`), 'utf8');
+        if (executions !== 'run\n') {
+          return { ok: false, reason: `root-lock cache scenario re-executed ${name}` };
+        }
+      }
+      return { ok: true, lock_mib: lockMiB, task_count: taskCount, cache_mode: mode };
+    },
   };
 }
 
@@ -1717,13 +1987,13 @@ function benchmarkEnv(context, allowRuntimeInstall) {
   return env;
 }
 
-function runPreparationCommand(context, cwd, args) {
+function runPreparationCommand(context, cwd, args, timeout = 30_000) {
   const result = spawnSync(context.binary.path, args, {
     cwd,
     env: benchmarkEnv(context, false),
     encoding: 'utf8',
     maxBuffer: 4 * MiB,
-    timeout: 30_000,
+    timeout,
   });
   if (result.status !== 0) {
     throw new Error(`preparation command failed (${args.join(' ')}):\n${result.stdout ?? ''}\n${result.stderr ?? ''}`);
@@ -3365,6 +3635,12 @@ async function runSelfTests() {
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'run/package-system-node-no-lpm-json'));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/deep-1000' && scenario.fullOnly));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/wide-100'));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/cache-warm-deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/workspace-caret-deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/workspace-cache-cold-wide-deep-10' && !scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'task/workspace-cache-warm-wide-deep-1000' && scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/workspace-root-lock-cold-1mib-10-tasks' && !scenario.fullOnly));
+  assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/workspace-root-lock-warm-50mib-10-tasks' && scenario.fullOnly));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/hit-128mib' && scenario.fullOnly));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/hit-500-files' && scenario.fullOnly));
   assert.ok(buildScenarios().some((scenario) => scenario.id === 'cache/hit-deep-path' && scenario.fullOnly));

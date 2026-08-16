@@ -43,6 +43,10 @@ static STAGED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+static PUBLISHED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
 static STAGED_TREE_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -82,6 +86,10 @@ struct BackupSyncFailure {
 
 #[cfg(test)]
 static BACKUP_SYNC_FAILURE: std::sync::Mutex<Option<BackupSyncFailure>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static STAGING_CLEANUP_FAILURE: std::sync::Mutex<Option<std::ffi::OsString>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -391,17 +399,41 @@ pub fn restore_cache(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
-    let root = LpmRoot::from_env()
-        .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
-    restore_cache_with_root(&root, key, project_dir, output_globs)
+    restore_cache_if(key, project_dir, output_globs, || Ok(true))?.ok_or_else(|| {
+        LpmError::Task("unconditional task cache restore was unexpectedly rejected".into())
+    })
 }
 
+pub fn restore_cache_if(
+    key: &str,
+    project_dir: &Path,
+    output_globs: &[String],
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<Option<CacheHit>, LpmError> {
+    let root = LpmRoot::from_env()
+        .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
+    restore_cache_with_root_if(&root, key, project_dir, output_globs, validate)
+}
+
+#[cfg(test)]
 fn restore_cache_with_root(
     root: &LpmRoot,
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
+    restore_cache_with_root_if(root, key, project_dir, output_globs, || Ok(true))?.ok_or_else(
+        || LpmError::Task("unconditional task cache restore was unexpectedly rejected".into()),
+    )
+}
+
+fn restore_cache_with_root_if(
+    root: &LpmRoot,
+    key: &str,
+    project_dir: &Path,
+    output_globs: &[String],
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<Option<CacheHit>, LpmError> {
     validate_cache_key(key)?;
     let project = open_project(project_dir)?;
     let cache = open_task_cache(root, false)?.ok_or_else(|| {
@@ -419,17 +451,18 @@ fn restore_cache_with_root(
         #[cfg(test)]
         wait_for_cache_race_barrier(&PROJECT_PATH_RACE_BARRIER, &project.path);
         verify_open_project(&project)?;
-        restore_cache_locked(root, &cache, key, &project, output_globs)
+        restore_cache_locked_if(root, &cache, key, &project, output_globs, validate)
     })
 }
 
-fn restore_cache_locked(
+fn restore_cache_locked_if(
     root: &LpmRoot,
     cache: &OpenTaskCache,
     key: &str,
     project: &OpenProject,
     output_globs: &[String],
-) -> Result<CacheHit, LpmError> {
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<Option<CacheHit>, LpmError> {
     let entry = open_cache_entry(cache, key)?;
     let meta = read_cache_meta(&entry, key)?;
     let stdout = read_cache_log(&entry, "stdout.log")?;
@@ -441,26 +474,32 @@ fn restore_cache_locked(
             "cache entry is missing outputs archive".into(),
         ));
     }
-    if let Some(archive) = archive {
+    let accepted = if let Some(archive) = archive {
         #[cfg(test)]
         wait_for_cache_race_barrier(
             &CACHE_FILE_READ_RACE_BARRIER,
             &entry.path.join("outputs.tar.gz"),
         );
-        restore_archive_with_expected_count(
+        restore_archive_with_expected_count_if(
             root,
             archive,
             project,
             meta.output_file_count,
             output_globs,
-        )?;
+            validate,
+        )?
+    } else {
+        validate()?
+    };
+    if !accepted {
+        return Ok(None);
     }
 
-    Ok(CacheHit {
+    Ok(Some(CacheHit {
         meta,
         stdout,
         stderr,
-    })
+    }))
 }
 
 /// Store task outputs to cache.
@@ -509,6 +548,9 @@ fn store_cache_with_root(
     lpm_common::with_shared_lock(root.cache_clean_lock(), || {
         let _entry_lock =
             lpm_common::acquire_single_file_exclusive_lock(cache_entry_lock_path(root, key)?)?;
+        if validate_local_cache_entry(&cache, key).is_ok() {
+            return Ok(());
+        }
         let _project_lock = lpm_common::acquire_single_file_shared_lock(
             canonical_project_restore_lock_path(root, &canonical_project),
         )?;
@@ -540,10 +582,6 @@ fn store_cache_locked(
     duration_ms: u64,
 ) -> Result<(), LpmError> {
     let entry = cache.path.join(key);
-    if validate_local_cache_entry(cache, key).is_ok() {
-        return Ok(());
-    }
-
     let (staging_name, staging) = create_private_cache_directory(&cache.tasks)?;
     #[cfg(test)]
     wait_for_cache_race_barrier(&CACHE_STORE_STAGING_RACE_BARRIER, &cache.path);
@@ -1026,9 +1064,31 @@ pub fn restore_remote_artifact_from_file(
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
+    restore_remote_artifact_from_file_if(expected_key, artifact, project_dir, output_globs, || {
+        Ok(true)
+    })?
+    .ok_or_else(|| {
+        LpmError::Task("unconditional remote cache restore was unexpectedly rejected".into())
+    })
+}
+
+pub fn restore_remote_artifact_from_file_if(
+    expected_key: &str,
+    artifact: std::fs::File,
+    project_dir: &Path,
+    output_globs: &[String],
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<Option<CacheHit>, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|error| LpmError::Task(format!("could not determine LPM home: {error}")))?;
-    restore_remote_artifact_file_with_root(&root, expected_key, artifact, project_dir, output_globs)
+    restore_remote_artifact_file_with_root_if(
+        &root,
+        expected_key,
+        artifact,
+        project_dir,
+        output_globs,
+        validate,
+    )
 }
 
 #[cfg(test)]
@@ -1046,10 +1106,31 @@ fn restore_remote_artifact_with_root(
 fn restore_remote_artifact_file_with_root(
     root: &LpmRoot,
     expected_key: &str,
-    mut artifact: std::fs::File,
+    artifact: std::fs::File,
     project_dir: &Path,
     output_globs: &[String],
 ) -> Result<CacheHit, LpmError> {
+    restore_remote_artifact_file_with_root_if(
+        root,
+        expected_key,
+        artifact,
+        project_dir,
+        output_globs,
+        || Ok(true),
+    )?
+    .ok_or_else(|| {
+        LpmError::Task("unconditional remote cache restore was unexpectedly rejected".into())
+    })
+}
+
+fn restore_remote_artifact_file_with_root_if(
+    root: &LpmRoot,
+    expected_key: &str,
+    mut artifact: std::fs::File,
+    project_dir: &Path,
+    output_globs: &[String],
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<Option<CacheHit>, LpmError> {
     validate_cache_key(expected_key)?;
     artifact.rewind()?;
     let project = open_project(project_dir)?;
@@ -1058,17 +1139,25 @@ fn restore_remote_artifact_file_with_root(
             canonical_project_restore_lock_path(root, &project.path),
         )?;
         verify_open_project(&project)?;
-        restore_remote_artifact_locked(root, expected_key, artifact, &project, output_globs)
+        restore_remote_artifact_locked_if(
+            root,
+            expected_key,
+            artifact,
+            &project,
+            output_globs,
+            validate,
+        )
     })
 }
 
-fn restore_remote_artifact_locked(
+fn restore_remote_artifact_locked_if(
     root: &LpmRoot,
     expected_key: &str,
     file: std::fs::File,
     project: &OpenProject,
     output_globs: &[String],
-) -> Result<CacheHit, LpmError> {
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<Option<CacheHit>, LpmError> {
     let dec = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(dec);
     archive.set_preserve_permissions(false);
@@ -1176,13 +1265,15 @@ fn restore_remote_artifact_locked(
         LpmError::Task("remote cache artifact is missing .lpm-cache/stderr.log".into())
     })?;
 
-    staged_outputs.apply(output_globs)?;
+    if !staged_outputs.apply_if(output_globs, validate)? {
+        return Ok(None);
+    }
 
-    Ok(CacheHit {
+    Ok(Some(CacheHit {
         meta,
         stdout,
         stderr,
-    })
+    }))
 }
 
 fn open_file_path_nofollow(path: &Path, label: &str) -> Result<std::fs::File, LpmError> {
@@ -1403,6 +1494,7 @@ fn append_collected_output_files<W: Write>(
         let mut source = open_project_file_nofollow(project, relative, "task output")?;
         let metadata = source.metadata()?;
         let size = metadata.len();
+        let identity = crate::hasher::metadata_identity_bytes(&metadata);
         check_archive_size_limits(size, &mut total_bytes, relative, "task output archive")?;
         #[cfg(test)]
         wait_for_cache_race_barrier(&ARCHIVE_SIZE_RACE_BARRIER, &project_dir.join(relative));
@@ -1429,9 +1521,12 @@ fn append_collected_output_files<W: Write>(
             }
         }
         let mut extra = [0u8; 1];
-        if source.read(&mut extra)? != 0 || source.metadata()?.len() != size {
+        let final_metadata = source.metadata()?;
+        if source.read(&mut extra)? != 0
+            || crate::hasher::metadata_identity_bytes(&final_metadata) != identity
+        {
             return Err(LpmError::Task(format!(
-                "task output changed size while archiving: {}",
+                "task output changed while archiving: {}",
                 project_dir.join(relative).display()
             )));
         }
@@ -1590,10 +1685,11 @@ mod restore;
 
 #[cfg(test)]
 use restore::{
-    RESTORE_JOURNAL_MAGIC, RESTORE_OWNER_NAME, RestoreTransaction, register_restore_for_test,
-    restore_archive, write_restore_journal,
+    RESTORE_JOURNAL_MAGIC, RESTORE_OWNER_NAME, RestoreTransaction,
+    mark_restore_registration_committed_for_test, register_restore_for_test, restore_archive,
+    write_restore_committed_for_test, write_restore_journal,
 };
-use restore::{StagedOutputs, restore_archive_with_expected_count, scan_cache_archive};
+use restore::{StagedOutputs, restore_archive_with_expected_count_if, scan_cache_archive};
 fn normalize_archive_path(path: &Path, label: &str) -> Result<PathBuf, LpmError> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -2688,6 +2784,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_snapshot_rejects_same_size_rewrite_after_validation() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        let output = project.path().join("dist/value.txt");
+        fs::write(&output, "before").unwrap();
+        let archive_path = project.path().join("outputs.tar.gz");
+        let barrier = install_race_barrier(&ARCHIVE_SIZE_RACE_BARRIER, output.clone());
+        let project_path = project.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            create_archive(&project_path, &["dist/**".into()], &archive_path)
+        });
+
+        barrier.validated.wait();
+        fs::write(&output, "after!").unwrap();
+        barrier.resume.wait();
+        let result = worker.join().unwrap();
+        clear_race_barrier(&ARCHIVE_SIZE_RACE_BARRIER, &barrier);
+
+        assert!(
+            result.is_err(),
+            "a task output rewritten after validation was archived"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn restore_remote_artifact_rejects_preexisting_symlink_destination() {
@@ -3103,6 +3224,35 @@ mod tests {
         assert_eq!(fs::read_to_string(restored).unwrap(), "verified");
     }
 
+    #[test]
+    fn restore_keeps_an_inode_receipt_for_each_published_file_until_commit() {
+        let project = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir_in(project.path()).unwrap();
+        fs::create_dir_all(staging.path().join("outputs/dist")).unwrap();
+        fs::create_dir(staging.path().join("backups")).unwrap();
+        let staged_output = staging.path().join("outputs/dist/value.txt");
+        fs::write(&staged_output, "verified").unwrap();
+        let destination = project.path().join("dist/value.txt");
+        let barrier = install_race_barrier(&PUBLISHED_OUTPUT_RACE_BARRIER, destination.clone());
+        let project_path = project.path().to_path_buf();
+        let staging_path = staging.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut transaction = RestoreTransaction::new(project_path, &staging_path, 1).unwrap();
+            transaction.install(Path::new("dist/value.txt"), false)?;
+            transaction.commit()
+        });
+
+        barrier.validated.wait();
+        let staged_identity = same_file::Handle::from_path(&staged_output).unwrap();
+        let destination_identity = same_file::Handle::from_path(&destination).unwrap();
+        barrier.resume.wait();
+        let result = worker.join().unwrap();
+        clear_race_barrier(&PUBLISHED_OUTPUT_RACE_BARRIER, &barrier);
+
+        result.unwrap();
+        assert_eq!(staged_identity, destination_identity);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restore_rolls_back_an_atomically_installed_output_tree_after_a_later_failure() {
@@ -3309,12 +3459,13 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_restore_recovery_removes_a_newly_installed_output() {
+    fn interrupted_restore_recovery_removes_a_newly_installed_per_file_output() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
         let abandoned = project.path().join(".lpm-cache-restore-interrupted-new");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
+        fs::write(abandoned.join("outputs/dist/value.txt"), "installed").unwrap();
         write_restore_journal(
             &abandoned,
             project.path(),
@@ -3323,13 +3474,100 @@ mod tests {
         .unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
-        fs::write(project.path().join("dist/value.txt"), "installed").unwrap();
+        fs::hard_link(
+            abandoned.join("outputs/dist/value.txt"),
+            project.path().join("dist/value.txt"),
+        )
+        .unwrap();
 
         drop(StagedOutputs::new(&cache.root, project.path()).unwrap());
 
         assert!(
             !project.path().join("dist/value.txt").exists(),
             "recovery kept an output that did not exist before the interrupted restore"
+        );
+    }
+
+    #[test]
+    fn failed_staging_cleanup_remains_discoverable_for_the_next_restore() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let abandoned = staged.temp_path().to_path_buf();
+        *STAGING_CLEANUP_FAILURE.lock().unwrap() = Some(
+            abandoned
+                .file_name()
+                .expect("restore staging directory name")
+                .to_os_string(),
+        );
+
+        drop(staged);
+        drop(StagedOutputs::new(&cache.root, project.path()).unwrap());
+
+        assert!(
+            !abandoned.exists(),
+            "failed cleanup removed its recovery registration"
+        );
+    }
+
+    #[test]
+    fn committed_restore_recovery_preserves_published_outputs() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let abandoned = project.path().join(".lpm-cache-restore-committed");
+        fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
+        fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "installed").unwrap();
+        fs::write(abandoned.join("backups/dist/value.txt"), "original").unwrap();
+        write_restore_journal(
+            &abandoned,
+            project.path(),
+            &[PathBuf::from("dist/value.txt")],
+        )
+        .unwrap();
+        register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
+        write_restore_committed_for_test(&abandoned).unwrap();
+
+        drop(StagedOutputs::new(&cache.root, project.path()).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "installed"
+        );
+        assert!(
+            !abandoned.exists(),
+            "committed restore staging directory was not removed"
+        );
+    }
+
+    #[test]
+    fn committed_restore_recovery_survives_commit_marker_cleanup() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let abandoned = project.path().join(".lpm-cache-restore-committed-cleanup");
+        fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
+        fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "installed").unwrap();
+        fs::write(abandoned.join("backups/dist/value.txt"), "original").unwrap();
+        write_restore_journal(
+            &abandoned,
+            project.path(),
+            &[PathBuf::from("dist/value.txt")],
+        )
+        .unwrap();
+        register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
+        write_restore_committed_for_test(&abandoned).unwrap();
+        mark_restore_registration_committed_for_test(&cache.root, project.path(), &abandoned)
+            .unwrap();
+        fs::remove_file(abandoned.join("committed")).unwrap();
+
+        drop(StagedOutputs::new(&cache.root, project.path()).unwrap());
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "installed"
         );
     }
 
@@ -3833,6 +4071,58 @@ mod tests {
         assert_eq!(
             fs::read(restored.path().join("dist/payload.bin")).unwrap(),
             expected[producer]
+        );
+    }
+
+    #[test]
+    fn existing_cache_entry_does_not_wait_for_the_project_snapshot_lock() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "cached").unwrap();
+        let key = unique_key("existing-entry-project-lock");
+        cache
+            .store(
+                &key,
+                project.path(),
+                "build",
+                &["dist/**".into()],
+                "",
+                "",
+                1,
+            )
+            .unwrap();
+        let project_lock = lpm_common::acquire_single_file_exclusive_lock(
+            project_restore_lock_path(&cache.root, project.path()).unwrap(),
+        )
+        .unwrap();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let root = cache.root;
+        let project_path = project.path().to_path_buf();
+        let worker_key = key;
+        let worker = std::thread::spawn(move || {
+            let result = store_cache_with_root(
+                &root,
+                &worker_key,
+                &project_path,
+                "build",
+                &["dist/**".into()],
+                "",
+                "",
+                1,
+            );
+            completed_tx.send(()).unwrap();
+            result
+        });
+
+        let completed = completed_rx.recv_timeout(std::time::Duration::from_secs(1));
+        drop(project_lock);
+        let result = worker.join().unwrap();
+
+        result.unwrap();
+        assert!(
+            completed.is_ok(),
+            "an existing cache entry waited for an unnecessary project snapshot lock"
         );
     }
 

@@ -214,6 +214,31 @@ fn sequential_excludes_skipped() {
 
 // --- Cache context ---
 
+fn write_lpm_json_config(project_dir: &Path, config: &lpm_runner::lpm_json::LpmJsonConfig) {
+    let tasks = config
+        .tasks
+        .iter()
+        .map(|(name, task)| {
+            (
+                name.clone(),
+                serde_json::json!({
+                    "command": task.command,
+                    "dependsOn": task.depends_on,
+                    "cache": task.cache,
+                    "outputs": task.outputs,
+                    "inputs": task.inputs,
+                    "env": task.env,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    std::fs::write(
+        project_dir.join("lpm.json"),
+        serde_json::to_vec(&serde_json::json!({ "tasks": tasks })).unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn build_cache_context_returns_none_without_lpm_json() {
     let dir = tempfile::tempdir().unwrap();
@@ -253,6 +278,7 @@ fn build_cache_context_returns_none_when_cache_false() {
         },
         ..Default::default()
     };
+    write_lpm_json_config(dir.path(), &config);
     let ctx = build_cache_context(
         dir.path(),
         "build",
@@ -288,6 +314,7 @@ fn build_cache_context_returns_none_when_outputs_empty() {
         },
         ..Default::default()
     };
+    write_lpm_json_config(dir.path(), &config);
     let ctx = build_cache_context(
         dir.path(),
         "build",
@@ -323,6 +350,7 @@ fn build_cache_context_returns_some_when_properly_configured() {
         },
         ..Default::default()
     };
+    write_lpm_json_config(dir.path(), &config);
     let ctx = build_cache_context(
         dir.path(),
         "build",
@@ -357,6 +385,7 @@ fn build_cache_context_changes_with_arguments_and_managed_runtime() {
         )]),
         ..Default::default()
     };
+    write_lpm_json_config(dir.path(), &config);
     let node_20 = lpm_runner::bin_path::ManagedRuntimeHint::Resolved(vec![
         lpm_runner::bin_path::ManagedRuntimeBin {
             runtime: lpm_runtime::detect::RuntimeKind::Node,
@@ -422,6 +451,7 @@ fn build_cache_context_changes_with_indirect_package_scripts() {
         )]),
         ..Default::default()
     };
+    write_lpm_json_config(dir.path(), &config);
     std::fs::write(dir.path().join("source.txt"), "stable").unwrap();
     std::fs::write(
         dir.path().join("package.json"),
@@ -517,6 +547,7 @@ fn cache_key_changes_for_every_dependency_resolution_section() {
 
     for (section, before, after) in cases {
         let dir = tempfile::tempdir().unwrap();
+        write_lpm_json_config(dir.path(), &config);
         std::fs::write(dir.path().join("build.js"), "build").unwrap();
         let package = |contract: &str| {
             let mut package: serde_json::Value = serde_json::from_str(contract).unwrap();

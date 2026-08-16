@@ -1,77 +1,175 @@
-# Task-cache safety benchmark
+# Task graph and cache benchmark
 
-- Date: 2026-08-15
-- Host: macOS arm64
-- Samples: 10 adjacent AB/BA pairs per scenario
-- Hot-restore warmups: one run per binary
-- Correctness-cell warmups: none
+- Measurement dates: 2026-08-15 and 2026-08-16
+- Host: Apple M5 Pro, macOS arm64, 48 GiB RAM
+- Toolchain: Rust 1.94.0
+- Samples: 10 adjacent AB/BA pairs for each landing scenario
+- Warmups: one run for each binary
 
-The harness used two preserved Rust 1.94.0 release binaries. It did not build
-during measurement.
+The harness used preserved release binaries. It did not build during a
+measurement.
 
 - Main commit: `226f5767297ff843c999d06076baec0be7c40f7d`
-- Main binary: `/private/tmp/lpm-task-cache-binaries/main-lpm-rs`
-- Main SHA-256: `7c3c83d2973a7ddf5ca0b9d3db661b6aaa0265d7ae036f48ea17a96c17da3cd7`
-- Candidate binary: `/private/tmp/lpm-task-cache-binaries/candidate-tree-publish-lpm-rs`
-- Candidate SHA-256: `e90b24c7a78a8fb24062db12ad0dc3a5c1fac76c1c280d96a7004e0055f62f3d`
+- Main binary SHA-256: `0f5c0e3bbef8a20b60077e99dee192a6f146ad9ec58335284dfe06bdedf8e870`
+- Initial candidate SHA-256: `0c5925e8385b64741a43bf8d550c20ca17463a5f65d43774dc96fba8a3f1555b`
+- Cache-safety candidate SHA-256: `f35eefd88649e98ba06bc0414bc70a58238b25e64b9f3db7b13170af34d7b618`
+- Pre-optimization candidate SHA-256: `bfa6b3e7eb733c16875b2e8a1163b9a39d19f5e07ebbdf9ae9efd2635e41f6b4`
+- Main benchmark candidate SHA-256: `4f96fa330622a604b3daccff70879e37fa857e718e3de3e47b8786e223d5f2c4`
+- Exact post-review candidate SHA-256: `8add306c0b930de8609aa84b94aa20d8a29ddcbe1472f2f1fa6767ca78f31a02`
 
-All candidate samples passed their correctness contracts. The hot-restore
-comparison was inconclusive. Small output trees retained an absolute overhead
-of 15.74 to 29.40 ms. The 128 MiB candidate median was 51.80 ms faster, and its
-peak RSS increased by 0.44 MiB.
+All candidate samples passed their correctness contracts. Main failed all six
+workspace-graph contracts because it did not execute the required work.
+Therefore, the harness reports these comparisons as inconclusive.
 
-| Scenario | Main median / p95 | Candidate median / p95 | Median change | Result |
-| --- | ---: | ---: | ---: | --- |
-| 128 MiB restore wall time | 612.32 / 715.89 ms | 560.52 / 791.59 ms | -8.46% (-51.80 ms) | Inconclusive; p95 increased |
-| 128 MiB peak tree RSS | 16.86 / 16.92 MiB | 17.30 / 17.36 MiB | +2.59% (+0.44 MiB) | Pass |
-| 1 MiB restore wall time | 59.75 / 94.64 ms | 75.49 / 107.31 ms | +26.34% (+15.74 ms) | Passes the absolute gate |
-| 500-file restore wall time | 77.67 / 125.66 ms | 107.07 / 150.24 ms | +37.85% (+29.40 ms) | Inconclusive; passes the absolute gate |
-| 64-level path restore wall time | 57.88 / 86.92 ms | 78.31 / 94.65 ms | +35.30% (+20.43 ms) | Inconclusive; passes the absolute gate |
+## Restore and publication results
 
-The first transactional implementation took 8.55 seconds at the 500-file
-median. Bounded durability syncs reduced that median to 334 ms. Parent
-descriptor reuse reduced it to 307 ms. Atomic no-replace publication of a
-missing top-level output tree reduced it to 107 ms. Existing and mixed output
-trees keep the per-file transactional fallback.
+The 18-scenario landing run measured restore size, file count, path depth,
+concurrent writers, workspace graphs, and root lockfile size.
 
-The final candidate also reduced the 64-level path median from the initial
-399 ms result to 78.31 ms. Immediate durability remains enabled for recovery
-records and irreplaceable backups.
+| Scenario | Main median | Candidate median | Change |
+| --- | ---: | ---: | ---: |
+| 128 MiB restore wall time | 2221.99 ms | 497.16 ms | -77.63% |
+| 128 MiB restore peak RSS | 39.39 MiB | 17.53 MiB | -55.49% |
+| 500-file restore wall time | 117.14 ms | 110.26 ms | -5.87% |
+| Concurrent same-key publication | 284.18 ms | 177.39 ms | -37.58% |
+| 1 MiB restore wall time | 75.62 ms | 74.07 ms | -2.05% |
 
-The correctness cells used no warmup because `main` contains the reproduced
-faults:
+The candidate passed ten of ten concurrent-publication samples. Each restored
+entry contained one complete producer result. The candidate also removed
+stale outputs and validated deep output paths in every sample.
 
-- Exact stale-output removal: main failed 10/10; candidate passed 10/10.
-- Concurrent same-key publication: main failed 2/10; candidate passed 10/10.
+## Workspace graph scaling
 
-Performance deltas for these cells are advisory because the binaries did not
-perform equivalent work.
+The first candidate recursively validated the complete dependency chain during
+each meta-task identity resolution. This work was quadratic for a deep graph.
+The final candidate validates the graph only at cache boundaries. One visited
+set also prevents repeated validation of shared diamond nodes.
 
-Commands:
+| Scenario | Initial candidate median | Final candidate median | Change |
+| --- | ---: | ---: | ---: |
+| 1,000 tasks, cold cache | 4957.50 ms | 1175.48 ms | -76.29% |
+| 1,000 tasks, warm cache | 5437.97 ms | 1749.10 ms | -67.84% |
+
+The final 10-sample distributions were:
+
+| Tasks | Cold median / p95 | Warm median / p95 | Cold peak RSS | Warm peak RSS |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 156.59 / 172.13 ms | 232.58 / 235.67 ms | 20.30 MiB | 19.27 MiB |
+| 100 | 301.92 / 358.54 ms | 497.67 / 522.53 ms | 26.23 MiB | 21.03 MiB |
+| 1,000 | 1175.48 / 1238.68 ms | 1749.10 / 1802.27 ms | 42.67 MiB | 31.78 MiB |
+
+## Deep cache-boundary scaling
+
+The expanded harness gives every task a cache boundary and a distinct output.
+The 10-task and 100-task cells used ten adjacent AB/BA pairs.
+
+| Scenario | Pre-optimization median / p95 | Current median / p95 | Median change | Current peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 10 tasks, cold | 411.70 / 592.34 ms | 411.81 / 637.80 ms | +0.03% | 19.24 MiB |
+| 10 tasks, warm | 658.09 / 707.20 ms | 655.52 / 697.15 ms | -0.39% | 17.84 MiB |
+| 100 tasks, cold | 4670.35 / 6883.63 ms | 3935.83 / 4740.99 ms | -15.73% | 21.05 MiB |
+| 100 tasks, warm | 7203.25 / 11044.49 ms | 7497.43 / 10650.22 ms | +4.08% | 18.13 MiB |
+
+The 100-task warm median stayed inside the 5% gate. Its p95 decreased by
+3.57%, and its median peak RSS was unchanged.
+
+The 1,000-task cells used two adjacent AB/BA pairs because each old-binary
+sample took more than two minutes.
+
+| Scenario | Pre-optimization median / p95 | Current median / p95 | Median change | Current peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000 tasks, cold | 120202.57 / 120561.64 ms | 52803.31 / 54109.84 ms | -56.07% | 29.07 MiB |
+| 1,000 tasks, warm | 132059.56 / 136408.33 ms | 80176.92 / 89236.46 ms | -39.29% | 22.73 MiB |
+
+Cold peak RSS increased by 4.67% to 29.07 MiB. This result stayed inside the
+configured gate. Warm peak RSS decreased by 1.22%.
+
+Output-producing tasks are cache-validation boundaries. Meta tasks still
+forward validation to their nearest output-producing dependencies. This rule
+removes repeated validation of the same transitive cache identities.
+
+## Workspace caret scaling
+
+A macOS process sample found repeated workspace discovery below
+`validate_runtime_with_cache`. Each member reparsed the complete workspace to
+resolve its Node requirement. This behavior made a deep workspace quadratic.
+
+The current candidate derives all member requirements from the parsed
+workspace manifests. It resolves the root `engineStrict` value one time.
+
+| Packages | Pre-optimization median / p95 | Current median / p95 | Median change | Current peak RSS |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 53.41 / 77.51 ms | 53.37 / 80.69 ms | -0.07% | 1.77 MiB |
+| 100 | 244.97 / 341.05 ms | 53.43 / 65.73 ms | -78.19% | 2.07 MiB |
+| 1,000 | 24903.08 / 32699.65 ms | 165.13 / 458.65 ms | -99.34% | 52.55 MiB |
+
+All ten candidate samples executed the required leaf task exactly one time.
+The 1,000-package median peak RSS decreased from 53.26 MiB to 52.55 MiB.
+
+## Post-review equivalence
+
+The exact post-review binary includes the final error-propagation cleanup.
+Alternating comparisons against the main benchmark candidate checked that this
+source-only cleanup did not invalidate the performance conclusions.
+
+| Scenario | Samples | Benchmark candidate median / p95 | Post-review median / p95 | Change |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000-package caret graph | 10 pairs | 157.04 / 196.27 ms | 157.42 / 180.59 ms | +0.24% / -7.99% |
+| 100 cold cache tasks | 10 pairs | 3801.16 / 4718.73 ms | 3878.78 / 4465.25 ms | +2.04% / -5.37% |
+| 100 warm cache tasks | 4 pairs | 7290.24 / 9065.69 ms | 6559.50 / 10425.95 ms | -10.02% / +15.00% |
+
+The expanded cold-cache run passed its wall-time and peak-RSS gates. A prior
+four-pair cold sample reported an 8.35% median increase. The ten-pair run did
+not reproduce it. The warm-cache median improved, while its four-pair p95 was
+too noisy to establish a tail-latency change.
+
+## File-descriptor investigation
+
+The first landing run reported 57 baseline descriptors and 67 candidate
+descriptors for ten parallel warm restores. A separate two-pair run measured a
+baseline median of 62 and p95 of 68.3. The candidate used 67 descriptors.
+
+A 10 ms `lsof` trace measured a candidate peak of 68 and a baseline peak of
+62. Both traces contained the same descriptor classes:
+
+- one task lock for each active worker
+- clean and project locks held by waiting restore workers
+- project and cache directory handles
+- the active restore staging directory
+
+The candidate adds handles for the active rollback-protected staging tree. The
+trace found no socket, pipe, archive, or output-file leak. All processes exited
+without survivors. The count is bounded by the configured workspace and task
+concurrency.
+
+## Commands and artifacts
+
+The final graph run used:
 
 ```bash
 node bench/scripts/run-runtime-readiness.mjs \
-  --lpm-binary main=/private/tmp/lpm-task-cache-binaries/main-lpm-rs \
-  --lpm-binary candidate=/private/tmp/lpm-task-cache-binaries/candidate-tree-publish-lpm-rs \
-  --compare main,candidate \
+  --lpm-binary baseline=/private/tmp/lpm-task-cache-safety-baseline \
+  --lpm-binary candidate=/private/tmp/lpm-task-cache-safety-candidate \
+  --compare baseline,candidate \
   --profile full \
-  --scenarios cache/hit-1mib,cache/hit-128mib,cache/hit-500-files,cache/hit-deep-path \
+  --scenarios task/workspace-cache-cold-wide-deep-10,task/workspace-cache-warm-wide-deep-10,task/workspace-cache-cold-wide-deep-100,task/workspace-cache-warm-wide-deep-100,task/workspace-cache-cold-wide-deep-1000,task/workspace-cache-warm-wide-deep-1000 \
   --samples 10 \
-  --warmups 1 \
-  --allow-inconclusive
-
-node bench/scripts/run-runtime-readiness.mjs \
-  --lpm-binary main=/private/tmp/lpm-task-cache-binaries/main-lpm-rs \
-  --lpm-binary candidate=/private/tmp/lpm-task-cache-binaries/candidate-tree-publish-lpm-rs \
-  --compare main,candidate \
-  --profile full \
-  --scenarios cache/removes-stale-output,cache/concurrent-same-key-store \
-  --samples 10 \
-  --warmups 0 \
   --allow-inconclusive
 ```
 
 Raw artifacts:
 
-- Hot restores: `/var/folders/p2/32lgcl857ds0wkcnkg0qk51h0000gn/T/lpm-runtime-readiness-20260815T193425527Z-90980`
-- Correctness cells: `/var/folders/p2/32lgcl857ds0wkcnkg0qk51h0000gn/T/lpm-runtime-readiness-20260815T193552846Z-13038`
+- Landing matrix: `/private/tmp/lpm-task-cache-safety-final-bench`
+- Final workspace graphs: `/private/tmp/lpm-task-cache-safety-workspace-bench-20260816`
+- FD diagnostic: `/private/tmp/lpm-task-cache-fd-trace-20260816`
+- Workspace discovery process sample: `/private/tmp/lpm-task-cache-workspace-debug-sample.txt`
+- Final workspace caret pairs: `/private/tmp/lpm-task-cache-caret-final-20260816`
+- Final 10-task and 100-task cache pairs: `/private/tmp/lpm-task-cache-chains-final-20260816`
+- Final 1,000-task cold pairs: `/private/tmp/lpm-task-cache-chain-1000-final-20260816`
+- Final 1,000-task warm pairs: `/private/tmp/lpm-task-cache-chain-warm-1000-final-20260816`
+- Post-review workspace caret pairs: `/private/tmp/lpm-task-cache-postreview-caret-20260816`
+- Post-review cache-chain pairs: `/private/tmp/lpm-task-cache-postreview-chains-20260816`
+- Expanded post-review 100-task cold pairs: `/private/tmp/lpm-task-cache-postreview-cold-100-20260816`
+
+The changes do not modify dependency installation or runtime acquisition.
+Therefore, the install-readiness benchmark is not part of this gate.

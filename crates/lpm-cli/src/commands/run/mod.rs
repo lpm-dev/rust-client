@@ -8,7 +8,7 @@ mod task;
 mod workspace;
 
 use lpm_common::LpmError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::install_ui;
@@ -113,10 +113,14 @@ pub async fn run_multi(
         .await;
     }
 
-    if parallel {
+    let workspace_dependency_identities = HashMap::new();
+    let initially_failed_tasks = HashSet::new();
+    let report = if parallel {
         // Parallel: run independent tasks concurrently within each level
         run_tasks_parallel(
             project_dir,
+            None,
+            &workspace_dependency_identities,
             &levels,
             extra_args,
             env_mode,
@@ -128,12 +132,15 @@ pub async fn run_multi(
             json_output,
             &bin_hint,
             pkg_scripts.as_ref(),
+            &initially_failed_tasks,
         )
     } else {
         // Sequential: run tasks in topological order (deps before dependents)
         let topo_order: Vec<String> = levels.into_iter().flatten().collect();
         run_tasks_sequential(
             project_dir,
+            None,
+            &workspace_dependency_identities,
             &topo_order,
             extra_args,
             env_mode,
@@ -144,8 +151,10 @@ pub async fn run_multi(
             json_output,
             &bin_hint,
             pkg_scripts.as_ref(),
+            &initially_failed_tasks,
         )
-    }
+    }?;
+    report.into_result()
 }
 
 /// Run an unknown top-level command as a script/task shortcut, then as a

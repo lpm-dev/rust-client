@@ -69,8 +69,9 @@ pub fn try_restore(
     key: &str,
     project_dir: &Path,
     output_globs: &[String],
+    validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
-    match client.restore(key, project_dir, output_globs) {
+    match client.restore(key, project_dir, output_globs, validate) {
         Ok(hit) => hit,
         Err(reason) => {
             warn_once(&reason);
@@ -251,8 +252,9 @@ impl RemoteCacheClient {
         key: &str,
         project_dir: &Path,
         output_globs: &[String],
+        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
-        run_blocking_http(|| self.restore_blocking(key, project_dir, output_globs))
+        run_blocking_http(|| self.restore_blocking(key, project_dir, output_globs, validate))
     }
 
     fn restore_blocking(
@@ -260,6 +262,7 @@ impl RemoteCacheClient {
         key: &str,
         project_dir: &Path,
         output_globs: &[String],
+        validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
         let client = blocking_http_client()?;
         let url = self.artifact_url(key)?;
@@ -337,9 +340,14 @@ impl RemoteCacheClient {
             .as_file()
             .try_clone()
             .map_err(|e| format!("failed to retain verified remote cache artifact: {e}"))?;
-        lpm_task::cache::restore_remote_artifact_from_file(key, artifact, project_dir, output_globs)
-            .map(Some)
-            .map_err(|e| format!("remote cache artifact could not be restored: {e}"))
+        lpm_task::cache::restore_remote_artifact_from_file_if(
+            key,
+            artifact,
+            project_dir,
+            output_globs,
+            validate,
+        )
+        .map_err(|e| format!("remote cache artifact could not be restored: {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]

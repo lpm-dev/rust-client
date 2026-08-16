@@ -70,6 +70,22 @@ pub fn validate_runtime_with_cache(
 ) -> Result<(), LpmError> {
     let requirements =
         crate::engine_check::resolve_execution_node_engine_requirements(project_dir)?;
+    validate_runtime_requirements_with_cache(
+        project_dir,
+        hint,
+        json_output,
+        node_versions,
+        &requirements,
+    )
+}
+
+pub fn validate_runtime_requirements_with_cache(
+    project_dir: &Path,
+    hint: &ManagedRuntimeHint,
+    json_output: bool,
+    node_versions: &mut PathNodeVersionCache,
+    requirements: &[crate::engine_check::NodeEngineRequirement],
+) -> Result<(), LpmError> {
     if requirements.is_empty() {
         return Ok(());
     }
@@ -77,9 +93,9 @@ pub fn validate_runtime_with_cache(
     let effective_node = node_versions.resolve(project_dir, std::ffi::OsStr::new(&script_path));
     for requirement in requirements {
         crate::engine_check::enforce_resolved_node_requirement_for_run(
-            requirement.required,
+            requirement.required.clone(),
             requirement.engine_strict,
-            requirement.source,
+            requirement.source.clone(),
             effective_node.clone(),
             json_output,
         )?;

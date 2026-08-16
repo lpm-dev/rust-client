@@ -1,9 +1,10 @@
 use super::cache::{
-    CacheStoreRequest, is_task_cached_with_config, try_cache_hit_with_config,
-    try_cache_store_with_output_and_config,
+    CacheStoreRequest, CompletedTaskCacheIdentity, WorkspaceCacheContract,
+    WorkspaceDependencyIdentities, complete_task_cache_identity, prepare_cache_context_with_config,
+    resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
 };
 use super::format::{
-    TaskResult, format_failed_task_output_footer, format_failed_task_output_header,
+    TaskResult, TaskRunReport, format_failed_task_output_footer, format_failed_task_output_header,
     format_run_failure_detail, print_captured_stderr, print_captured_stdout, print_json_summary,
     print_results_summary, print_task_result,
 };
@@ -16,6 +17,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(super) const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024;
+
+type TaskWorkerResult = Result<
+    (
+        TaskResult,
+        String,
+        String,
+        Option<Arc<CompletedTaskCacheIdentity>>,
+    ),
+    LpmError,
+>;
 
 /// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
 /// the last newline boundary to avoid splitting a line.
@@ -39,6 +50,8 @@ const TASK_COLORS: &[&str] = &["36", "33", "35", "32", "34", "31"];
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_tasks_parallel(
     project_dir: &Path,
+    workspace_contract: Option<&WorkspaceCacheContract>,
+    workspace_dependency_identities: &WorkspaceDependencyIdentities,
     levels: &[Vec<String>],
     extra_args: &[String],
     env_mode: Option<&str>,
@@ -50,10 +63,12 @@ pub(super) fn run_tasks_parallel(
     json_output: bool,
     bin_hint: &ManagedRuntimeHint,
     pkg_scripts: Option<&HashMap<String, String>>,
-) -> Result<(), LpmError> {
+    initially_failed_tasks: &HashSet<String>,
+) -> Result<TaskRunReport, LpmError> {
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
-    let mut failed_tasks: HashSet<String> = HashSet::new();
+    let mut failed_tasks = initially_failed_tasks.clone();
+    let mut cache_identities = HashMap::new();
 
     // Show execution plan when there's parallelism
     let total_tasks: usize = levels.iter().map(|l| l.len()).sum();
@@ -72,6 +87,7 @@ pub(super) fn run_tasks_parallel(
     let tasks_arc = Arc::new(tasks.clone());
     let config_arc = lpm_config.cloned().map(Arc::new);
     let pkg_scripts_arc = pkg_scripts.cloned().map(Arc::new);
+    let workspace_contract = workspace_contract.cloned();
 
     let mut color_idx = 0usize;
 
@@ -81,11 +97,12 @@ pub(super) fn run_tasks_parallel(
             .iter()
             .filter(|task| {
                 if let Some(tc) = tasks.get(task.as_str()) {
-                    let deps_failed = tc
-                        .depends_on
-                        .iter()
-                        .filter(|d| !d.starts_with('^'))
-                        .any(|d| failed_tasks.contains(d));
+                    let deps_failed = failed_tasks.contains(*task)
+                        || tc
+                            .depends_on
+                            .iter()
+                            .filter(|d| !d.starts_with('^'))
+                            .any(|d| failed_tasks.contains(d));
                     !deps_failed
                 } else {
                     !failed_tasks.contains(task.as_str())
@@ -117,9 +134,25 @@ pub(super) fn run_tasks_parallel(
             // Single task in this level — run directly (no thread overhead)
             let task_name = runnable[0];
             let start = std::time::Instant::now();
+            let dependency_identities = if no_cache {
+                None
+            } else {
+                resolve_task_dependency_identities(
+                    task_name,
+                    tasks,
+                    workspace_dependency_identities,
+                    &cache_identities,
+                )
+            };
 
             // Meta-task: no command, no script — just a dependency group
             if is_meta_task(task_name, tasks, pkg_scripts) {
+                if let Some(dependency_identities) = &dependency_identities {
+                    cache_identities.insert(
+                        task_name.clone(),
+                        CompletedTaskCacheIdentity::meta(dependency_identities),
+                    );
+                }
                 all_results.push(TaskResult {
                     name: task_name.clone(),
                     success: true,
@@ -131,17 +164,25 @@ pub(super) fn run_tasks_parallel(
                 continue;
             }
 
-            // Check cache
-            if !no_cache
-                && let Ok(Some(hit)) = try_cache_hit_with_config(
+            let cache_context = match dependency_identities.as_deref() {
+                Some(dependency_identities) => prepare_cache_context_with_config(
                     project_dir,
+                    workspace_contract.as_ref(),
+                    dependency_identities,
                     task_name,
                     env_mode,
                     extra_args,
                     bin_hint,
                     lpm_config,
-                )
-            {
+                )?,
+                None => None,
+            };
+            let cache_hit = cache_context
+                .as_ref()
+                .map(|context| try_cache_hit_with_context(project_dir, context))
+                .transpose()?
+                .flatten();
+            if let Some(hit) = cache_hit {
                 if !hit.stdout.is_empty() {
                     print_captured_stdout(&hit.stdout);
                 }
@@ -155,6 +196,14 @@ pub(super) fn run_tasks_parallel(
                     cached: true,
                     skipped: false,
                 });
+                let context = cache_context.as_ref().ok_or_else(|| {
+                    LpmError::Task(format!("cache context missing for task '{task_name}'"))
+                })?;
+                if let Some(identity) =
+                    complete_task_cache_identity(project_dir, task_name, context)
+                {
+                    cache_identities.insert(task_name.clone(), identity);
+                }
                 print_task_result(all_results.last().unwrap());
                 continue;
             }
@@ -165,7 +214,7 @@ pub(super) fn run_tasks_parallel(
             ));
 
             // Use captured execution when caching is enabled.
-            let caching_enabled = !no_cache && is_task_cached_with_config(task_name, lpm_config);
+            let caching_enabled = cache_context.is_some();
 
             if caching_enabled {
                 match run_task_captured(
@@ -178,17 +227,27 @@ pub(super) fn run_tasks_parallel(
                 ) {
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        let _ = try_cache_store_with_output_and_config(CacheStoreRequest {
-                            project_dir,
-                            script_name: task_name,
-                            env_mode,
-                            extra_args,
-                            bin_hint,
-                            duration_ms,
-                            stdout: &output.stdout,
-                            stderr: &output.stderr,
-                            lpm_config,
-                        });
+                        let context = cache_context.as_ref().ok_or_else(|| {
+                            LpmError::Task(format!("cache context missing for task '{task_name}'"))
+                        })?;
+                        if try_cache_store_with_context(
+                            CacheStoreRequest {
+                                project_dir,
+                                workspace_contract: workspace_contract.as_ref(),
+                                script_name: task_name,
+                                env_mode,
+                                extra_args,
+                                bin_hint,
+                                duration_ms,
+                                stdout: &output.stdout,
+                                stderr: &output.stderr,
+                            },
+                            context,
+                        ) && let Some(identity) =
+                            complete_task_cache_identity(project_dir, task_name, context)
+                        {
+                            cache_identities.insert(task_name.clone(), identity);
+                        }
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: true,
@@ -271,15 +330,29 @@ pub(super) fn run_tasks_parallel(
                         let tasks_clone = Arc::clone(&tasks_arc);
                         let config_clone = config_arc.clone();
                         let pkg_scripts_clone = pkg_scripts_arc.clone();
+                        let workspace_contract = workspace_contract.clone();
                         let is_stream = stream;
                         let color = chunk_colors[ci].clone();
+                        let dependency_identities = if no_cache {
+                            None
+                        } else {
+                            resolve_task_dependency_identities(
+                                task_name,
+                                tasks,
+                                workspace_dependency_identities,
+                                &cache_identities,
+                            )
+                        };
 
-                        std::thread::spawn(move || -> (TaskResult, String, String) {
+                        std::thread::spawn(move || -> TaskWorkerResult {
                             let start = std::time::Instant::now();
 
                             // Meta-task — skip execution
                             if is_meta_task(&name, &tasks_clone, pkg_scripts_clone.as_deref()) {
-                                return (
+                                let cache_identity = dependency_identities
+                                    .as_deref()
+                                    .map(CompletedTaskCacheIdentity::meta);
+                                return Ok((
                                     TaskResult {
                                         name,
                                         success: true,
@@ -289,21 +362,37 @@ pub(super) fn run_tasks_parallel(
                                     },
                                     String::new(),
                                     String::new(),
-                                );
+                                    cache_identity,
+                                ));
                             }
 
-                            // Check cache
-                            if !no_cache
-                                && let Ok(Some(hit)) = try_cache_hit_with_config(
+                            let cache_context = match dependency_identities.as_deref() {
+                                Some(dependency_identities) => prepare_cache_context_with_config(
                                     &dir,
+                                    workspace_contract.as_ref(),
+                                    dependency_identities,
                                     &name,
                                     mode.as_deref(),
                                     &args,
                                     &hint_clone,
                                     config_clone.as_deref(),
-                                )
-                            {
-                                return (
+                                )?,
+                                None => None,
+                            };
+                            let cache_hit = cache_context
+                                .as_ref()
+                                .map(|context| try_cache_hit_with_context(&dir, context))
+                                .transpose()?
+                                .flatten();
+                            if let Some(hit) = cache_hit {
+                                let context = cache_context.as_ref().ok_or_else(|| {
+                                    LpmError::Task(format!(
+                                        "cache context missing for task '{name}'"
+                                    ))
+                                })?;
+                                let cache_identity =
+                                    complete_task_cache_identity(&dir, &name, context);
+                                return Ok((
                                     TaskResult {
                                         name,
                                         success: true,
@@ -313,7 +402,8 @@ pub(super) fn run_tasks_parallel(
                                     },
                                     hit.stdout,
                                     hit.stderr,
-                                );
+                                    cache_identity,
+                                ));
                             }
 
                             // Resolve command from lpm.json or package.json
@@ -368,12 +458,12 @@ pub(super) fn run_tasks_parallel(
 
                             match result {
                                 Ok(output) => {
-                                    // Store cache
-                                    if !no_cache {
+                                    let cache_identity = if let Some(context) = &cache_context {
                                         let duration_ms = start.elapsed().as_millis() as u64;
-                                        let _ = try_cache_store_with_output_and_config(
+                                        if try_cache_store_with_context(
                                             CacheStoreRequest {
                                                 project_dir: &dir,
+                                                workspace_contract: workspace_contract.as_ref(),
                                                 script_name: &name,
                                                 env_mode: mode.as_deref(),
                                                 extra_args: &args,
@@ -381,11 +471,17 @@ pub(super) fn run_tasks_parallel(
                                                 duration_ms,
                                                 stdout: &output.stdout,
                                                 stderr: &output.stderr,
-                                                lpm_config: config_clone.as_deref(),
                                             },
-                                        );
-                                    }
-                                    (
+                                            context,
+                                        ) {
+                                            complete_task_cache_identity(&dir, &name, context)
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    Ok((
                                         TaskResult {
                                             name,
                                             success: true,
@@ -395,9 +491,10 @@ pub(super) fn run_tasks_parallel(
                                         },
                                         truncate_output(output.stdout),
                                         truncate_output(output.stderr),
-                                    )
+                                        cache_identity,
+                                    ))
                                 }
-                                Err(LpmError::ScriptWithOutput { stdout, stderr, .. }) => (
+                                Err(LpmError::ScriptWithOutput { stdout, stderr, .. }) => Ok((
                                     TaskResult {
                                         name,
                                         success: false,
@@ -407,8 +504,9 @@ pub(super) fn run_tasks_parallel(
                                     },
                                     truncate_output(stdout),
                                     truncate_output(stderr),
-                                ),
-                                Err(_) => (
+                                    None,
+                                )),
+                                Err(_) => Ok((
                                     TaskResult {
                                         name,
                                         success: false,
@@ -418,7 +516,8 @@ pub(super) fn run_tasks_parallel(
                                     },
                                     String::new(),
                                     String::new(),
-                                ),
+                                    None,
+                                )),
                             }
                         })
                     })
@@ -429,7 +528,7 @@ pub(super) fn run_tasks_parallel(
 
                 for (i, handle) in handles.into_iter().enumerate() {
                     match handle.join() {
-                        Ok((result, stdout, stderr)) => {
+                        Ok(Ok((result, stdout, stderr, cache_identity))) => {
                             if !stream {
                                 // Buffered mode: print captured output now
                                 if !stdout.is_empty() {
@@ -447,9 +546,13 @@ pub(super) fn run_tasks_parallel(
                                 }
                                 failed_tasks.insert(result.name.clone());
                             }
+                            if let Some(cache_identity) = cache_identity {
+                                cache_identities.insert(result.name.clone(), cache_identity);
+                            }
                             print_task_result(&result);
                             all_results.push(result);
                         }
+                        Ok(Err(error)) => return Err(error),
                         Err(_) => {
                             let name = chunk_names[i].clone();
                             install_ui::detail_line(format_run_failure_detail(
@@ -509,13 +612,8 @@ pub(super) fn run_tasks_parallel(
         print_json_summary(&all_results, total_start.elapsed());
     }
 
-    let failure_count = all_results
-        .iter()
-        .filter(|r| !r.success && !r.skipped)
-        .count();
-    if failure_count > 0 {
-        Err(LpmError::ExitCode(failure_count as i32))
-    } else {
-        Ok(())
-    }
+    Ok(TaskRunReport::with_cache_identities(
+        all_results,
+        cache_identities,
+    ))
 }

@@ -427,7 +427,7 @@ impl ServiceConfig {
 }
 
 /// Configuration for a single task in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct TaskConfig {
     /// Command to run (overrides package.json scripts).

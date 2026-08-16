@@ -4,7 +4,10 @@ const RESTORE_JOURNAL_NAME: &str = "transaction.bin";
 pub(super) const RESTORE_JOURNAL_MAGIC: &[u8] = b"LPMRESTORE\x02";
 pub(super) const RESTORE_OWNER_NAME: &str = "owner";
 const RESTORE_OWNER_MAGIC: &[u8] = b"LPMRESTOREOWNER\x01";
-const RESTORE_REGISTRY_MAGIC: &[u8] = b"LPMRESTORERECORD\x01";
+const RESTORE_COMMITTED_NAME: &str = "committed";
+const RESTORE_COMMITTED_MAGIC: &[u8] = b"LPMRESTORECOMMITTED\x01";
+const RESTORE_REGISTRY_MAGIC_V1: &[u8] = b"LPMRESTORERECORD\x01";
+const RESTORE_REGISTRY_MAGIC: &[u8] = b"LPMRESTORERECORD\x02";
 const RESTORE_REGISTRY_DIR: &str = ".task-restores";
 const RESTORE_TOKEN_BYTES: usize = 32;
 const MAX_RESTORE_REGISTRY_BYTES: u64 = 16 * 1024;
@@ -21,13 +24,14 @@ pub(super) fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result
     staged.apply(&[])
 }
 
-pub(super) fn restore_archive_with_expected_count(
+pub(super) fn restore_archive_with_expected_count_if(
     root: &LpmRoot,
     archive: std::fs::File,
     project: &OpenProject,
     expected_count: usize,
     output_globs: &[String],
-) -> Result<(), LpmError> {
+    validate: impl FnOnce() -> Result<bool, LpmError>,
+) -> Result<bool, LpmError> {
     let staged = stage_cache_archive_with_project(root, archive, project, "task cache archive")?;
     if staged.file_count() != expected_count {
         return Err(LpmError::Task(format!(
@@ -35,7 +39,7 @@ pub(super) fn restore_archive_with_expected_count(
             staged.file_count()
         )));
     }
-    staged.apply(output_globs)
+    staged.apply_if(output_globs, validate)
 }
 
 #[cfg(test)]
@@ -149,6 +153,7 @@ pub(super) struct StagedOutputs {
     output: Dir,
     canonical_project: PathBuf,
     registry_record: RestoreRegistryRecord,
+    token: [u8; RESTORE_TOKEN_BYTES],
     cleanup_registry_on_drop: bool,
     seen_paths: HashSet<PathBuf>,
     files: Vec<PathBuf>,
@@ -189,7 +194,7 @@ impl StagedOutputs {
         staging.create_dir("backups")?;
         sync_cap_directory(&staging)?;
         let output = staging.open_dir_nofollow("outputs")?;
-        write_restore_registration(&registry_record, temp.path(), &token)?;
+        write_restore_registration(&registry_record, temp.path(), &token, false)?;
         let temp_path = temp.keep();
 
         Ok(Self {
@@ -199,6 +204,7 @@ impl StagedOutputs {
             output,
             canonical_project,
             registry_record,
+            token,
             cleanup_registry_on_drop: true,
             seen_paths: HashSet::new(),
             files: Vec::new(),
@@ -303,7 +309,23 @@ impl StagedOutputs {
         self.files.len()
     }
 
+    #[cfg(test)]
     pub(super) fn apply(self, output_globs: &[String]) -> Result<(), LpmError> {
+        if self.apply_if(output_globs, || Ok(true))? {
+            Ok(())
+        } else {
+            Err(LpmError::Task(
+                "task cache restore validation unexpectedly rejected an unconditional restore"
+                    .into(),
+            ))
+        }
+    }
+
+    pub(super) fn apply_if(
+        self,
+        output_globs: &[String],
+        validate: impl FnOnce() -> Result<bool, LpmError>,
+    ) -> Result<bool, LpmError> {
         let mut this = self;
         verify_open_directory_path(
             &this.project,
@@ -381,6 +403,28 @@ impl StagedOutputs {
                 return Err(error);
             }
         }
+        match validate() {
+            Ok(true) => {}
+            Ok(false) => {
+                let error = LpmError::Task(
+                    "task cache context changed while cached outputs were restored".into(),
+                );
+                let (error, rollback_failed) = transaction.rollback_error(error);
+                drop(transaction);
+                if rollback_failed {
+                    return Err(this.preserve_recovery_data(error));
+                }
+                return Ok(false);
+            }
+            Err(error) => {
+                let (error, rollback_failed) = transaction.rollback_error(error);
+                drop(transaction);
+                if rollback_failed {
+                    return Err(this.preserve_recovery_data(error));
+                }
+                return Err(error);
+            }
+        }
         if let Err(error) = transaction.prepare_commit() {
             let (error, rollback_failed) = transaction.rollback_error(error);
             drop(transaction);
@@ -389,7 +433,9 @@ impl StagedOutputs {
             }
             return Err(error);
         }
-        if let Err(error) = remove_restore_registration(&this.registry_record) {
+        if let Err(error) =
+            write_restore_registration(&this.registry_record, &this.temp_path, &this.token, true)
+        {
             let (error, rollback_failed) = transaction.rollback_error(error);
             drop(transaction);
             if rollback_failed {
@@ -409,7 +455,8 @@ impl StagedOutputs {
                 .take()
                 .expect("restore staging directory exists"),
         )?;
-        Ok(())
+        remove_restore_registration(&this.registry_record)?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -430,11 +477,15 @@ impl StagedOutputs {
 impl Drop for StagedOutputs {
     fn drop(&mut self) {
         if self.cleanup_registry_on_drop {
-            let _ = remove_restore_registration(&self.registry_record);
-            if let Some(staging) = self.staging.take()
+            let cleanup_succeeded = if let Some(staging) = self.staging.take()
                 && let Some(name) = self.temp_path.file_name()
             {
-                let _ = cleanup_open_staging(&self.project, Path::new(name), staging);
+                cleanup_open_staging(&self.project, Path::new(name), staging).is_ok()
+            } else {
+                true
+            };
+            if cleanup_succeeded {
+                let _ = remove_restore_registration(&self.registry_record);
             }
         }
     }
@@ -693,10 +744,53 @@ fn write_restore_owner_open(
     Ok(())
 }
 
+#[cfg(test)]
+fn write_restore_committed(staging: &Dir) -> Result<(), LpmError> {
+    write_open_file_atomic_with(
+        staging,
+        std::ffi::OsStr::new(RESTORE_COMMITTED_NAME),
+        |file| {
+            file.write_all(RESTORE_COMMITTED_MAGIC)?;
+            Ok(())
+        },
+    )
+}
+
+#[cfg(test)]
+pub(super) fn write_restore_committed_for_test(restore_dir: &Path) -> Result<(), LpmError> {
+    let staging = Dir::open_ambient_dir(restore_dir, cap_std::ambient_authority())?;
+    write_restore_committed(&staging)
+}
+
+fn restore_is_committed(staging: &Dir, restore_dir: &Path) -> Result<bool, LpmError> {
+    let Some(marker) = open_optional_regular_file(
+        staging,
+        std::ffi::OsStr::new(RESTORE_COMMITTED_NAME),
+        "task cache restore commit marker",
+    )?
+    else {
+        return Ok(false);
+    };
+    let marker_path = restore_dir.join(RESTORE_COMMITTED_NAME);
+    let (bytes, metadata) = lpm_common::read_file_capped_from_open_file(
+        marker.into_std(),
+        &marker_path,
+        RESTORE_COMMITTED_MAGIC.len() as u64,
+    )?;
+    if !metadata.is_file() || bytes != RESTORE_COMMITTED_MAGIC {
+        return Err(LpmError::Task(format!(
+            "invalid task cache restore commit marker: {}",
+            marker_path.display()
+        )));
+    }
+    Ok(true)
+}
+
 fn write_restore_registration(
     record: &RestoreRegistryRecord,
     restore_dir: &Path,
     token: &[u8; RESTORE_TOKEN_BYTES],
+    committed: bool,
 ) -> Result<(), LpmError> {
     let staging_name = restore_dir.file_name().ok_or_else(|| {
         LpmError::Task(format!(
@@ -719,9 +813,10 @@ fn write_restore_registration(
     let name_len = u32::try_from(name_bytes.len())
         .map_err(|_| LpmError::Task("task cache restore directory name is too long".into()))?;
     let mut record_bytes = Vec::with_capacity(
-        RESTORE_REGISTRY_MAGIC.len() + 4 + name_bytes.len() + RESTORE_TOKEN_BYTES,
+        RESTORE_REGISTRY_MAGIC.len() + 1 + 4 + name_bytes.len() + RESTORE_TOKEN_BYTES,
     );
     record_bytes.extend_from_slice(RESTORE_REGISTRY_MAGIC);
+    record_bytes.push(u8::from(committed));
     record_bytes.extend_from_slice(&name_len.to_le_bytes());
     record_bytes.extend_from_slice(&name_bytes);
     record_bytes.extend_from_slice(token);
@@ -735,15 +830,31 @@ fn write_restore_registration(
 struct RestoreRegistration {
     staging_name: PathBuf,
     token: [u8; RESTORE_TOKEN_BYTES],
+    committed: bool,
 }
 
 fn decode_restore_registration(bytes: &[u8]) -> Result<RestoreRegistration, LpmError> {
-    if !bytes.starts_with(RESTORE_REGISTRY_MAGIC) {
+    let (mut cursor, committed) = if bytes.starts_with(RESTORE_REGISTRY_MAGIC) {
+        let state = *bytes
+            .get(RESTORE_REGISTRY_MAGIC.len())
+            .ok_or_else(|| LpmError::Task("truncated task cache restore registry record".into()))?;
+        let committed = match state {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LpmError::Task(
+                    "invalid task cache restore registry state".into(),
+                ));
+            }
+        };
+        (RESTORE_REGISTRY_MAGIC.len() + 1, committed)
+    } else if bytes.starts_with(RESTORE_REGISTRY_MAGIC_V1) {
+        (RESTORE_REGISTRY_MAGIC_V1.len(), false)
+    } else {
         return Err(LpmError::Task(
             "invalid task cache restore registry record".into(),
         ));
-    }
-    let mut cursor = RESTORE_REGISTRY_MAGIC.len();
+    };
     let name_len = read_restore_journal_u32(bytes, &mut cursor)? as usize;
     let name_end = cursor.checked_add(name_len).ok_or_else(|| {
         LpmError::Task("invalid task cache restore registry record length".into())
@@ -780,6 +891,7 @@ fn decode_restore_registration(bytes: &[u8]) -> Result<RestoreRegistration, LpmE
     Ok(RestoreRegistration {
         staging_name,
         token,
+        committed,
     })
 }
 
@@ -803,7 +915,18 @@ pub(super) fn register_restore_for_test(
     let token = [0x5au8; RESTORE_TOKEN_BYTES];
     set_dir_permissions_restricted(restore_dir)?;
     write_restore_owner(restore_dir, &token)?;
-    write_restore_registration(&record, restore_dir, &token)
+    write_restore_registration(&record, restore_dir, &token, false)
+}
+
+#[cfg(test)]
+pub(super) fn mark_restore_registration_committed_for_test(
+    root: &LpmRoot,
+    project_dir: &Path,
+    restore_dir: &Path,
+) -> Result<(), LpmError> {
+    let canonical_project = std::fs::canonicalize(project_dir)?;
+    let record = restore_registry_record(root, &canonical_project)?;
+    write_restore_registration(&record, restore_dir, &[0x5au8; RESTORE_TOKEN_BYTES], true)
 }
 
 fn recover_interrupted_restore(
@@ -847,7 +970,13 @@ fn recover_interrupted_restore(
         }
     };
     let restore_dir = project_dir.join(&registration.staging_name);
-    recover_registered_restore(project_dir, &restore_dir, record, &registration.token)
+    recover_registered_restore(
+        project_dir,
+        &restore_dir,
+        record,
+        &registration.token,
+        registration.committed,
+    )
 }
 
 fn recover_registered_restore(
@@ -855,6 +984,7 @@ fn recover_registered_restore(
     restore_dir: &Path,
     record: &RestoreRegistryRecord,
     token: &[u8; RESTORE_TOKEN_BYTES],
+    committed: bool,
 ) -> Result<(), LpmError> {
     let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
     let staging_name = restore_dir.strip_prefix(project_dir).map_err(|_| {
@@ -881,12 +1011,17 @@ fn recover_registered_restore(
         remove_restore_registration(record)?;
         return Ok(());
     }
+    if committed || restore_is_committed(&staging, restore_dir)? {
+        cleanup_open_staging(&project, staging_name, staging)?;
+        remove_restore_registration(record)?;
+        return Ok(());
+    }
     let journal_path = restore_dir.join(RESTORE_JOURNAL_NAME);
     let journal_file = match open_cap_file_nofollow(&staging, Path::new(RESTORE_JOURNAL_NAME)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            remove_restore_registration(record)?;
             cleanup_open_staging(&project, staging_name, staging)?;
+            remove_restore_registration(record)?;
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -950,10 +1085,9 @@ fn recover_registered_restore(
                 &destination_parent,
                 &destination_name,
                 "task cache recovery backup",
-                PublicationDurability::Immediate,
             )?;
         } else if !had_existing
-            && lookup_file_nofollow(&output, &relative, "recovery output")?.is_none()
+            && recovery_output_was_installed(&output, &project, &relative)?
             && let Some((destination_parent, destination_name)) =
                 lookup_path_parent_nofollow(&project, &relative, "recovery destination")?
         {
@@ -981,12 +1115,41 @@ fn recover_registered_restore(
         }
     }
 
-    remove_restore_registration(record)?;
     cleanup_open_staging(&project, staging_name, staging)?;
+    remove_restore_registration(record)?;
     Ok(())
 }
 
+fn recovery_output_was_installed(
+    output: &Dir,
+    project: &Dir,
+    relative: &Path,
+) -> Result<bool, LpmError> {
+    let Some(staged) = lookup_file_nofollow(output, relative, "recovery output")? else {
+        return Ok(true);
+    };
+    let Some(destination) = lookup_file_nofollow(project, relative, "recovery destination")? else {
+        return Ok(false);
+    };
+    let staged_identity = same_file::Handle::from_file(staged.into_std())?;
+    let destination_identity = same_file::Handle::from_file(destination.into_std())?;
+    Ok(staged_identity == destination_identity)
+}
+
 fn cleanup_open_staging(project: &Dir, staging_name: &Path, staging: Dir) -> Result<(), LpmError> {
+    #[cfg(test)]
+    {
+        let mut failure = STAGING_CLEANUP_FAILURE
+            .lock()
+            .expect("staging cleanup failure lock");
+        if failure.as_deref() == staging_name.file_name() {
+            failure.take();
+            return Err(LpmError::Task(format!(
+                "failed to clean task cache restore staging directory {}: injected failure",
+                staging_name.display()
+            )));
+        }
+    }
     clean_open_cache_ephemeral(&staging)?;
     drop(staging);
     match project.remove_dir(staging_name) {
@@ -1060,12 +1223,6 @@ fn open_optional_regular_file(
 }
 
 #[derive(Clone, Copy)]
-enum PublicationDurability {
-    Immediate,
-    Deferred,
-}
-
-#[derive(Clone, Copy)]
 enum DirectoryCreationDurability {
     Immediate,
     Deferred,
@@ -1076,7 +1233,6 @@ fn publish_verified_file(
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
     label: &str,
-    durability: PublicationDurability,
 ) -> Result<(), LpmError> {
     use std::io::{Read as _, Seek as _, Write as _};
 
@@ -1114,18 +1270,14 @@ fn publish_verified_file(
             ))?;
         }
         temporary.flush()?;
-        if matches!(durability, PublicationDurability::Immediate) {
-            sync_restore_file(&temporary)?;
-        }
+        sync_restore_file(&temporary)?;
         drop(temporary);
         destination_parent.rename(
             Path::new(&temporary_name),
             destination_parent,
             Path::new(destination_name),
         )?;
-        if matches!(durability, PublicationDurability::Immediate) {
-            sync_cap_directory(destination_parent)?;
-        }
+        sync_cap_directory(destination_parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1134,127 +1286,139 @@ fn publish_verified_file(
     result
 }
 
-fn publish_reconstructible_file(
+fn publish_staged_file(
     source: cap_std::fs::File,
     source_parent: &Dir,
     source_name: &Path,
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
-    label: &str,
 ) -> Result<(), LpmError> {
-    let expected_identity = same_file::Handle::from_file(source.try_clone()?.into_std())?;
-    match source_parent.hard_link(source_name, destination_parent, destination_name) {
-        Ok(()) => {
-            let linked_identity = open_optional_regular_file(
-                destination_parent,
-                destination_name,
-                "linked task cache output",
-            )
-            .ok()
-            .flatten()
-            .and_then(|linked| same_file::Handle::from_file(linked.into_std()).ok());
-            if linked_identity.as_ref() == Some(&expected_identity) {
-                return Ok(());
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut source = source.into_std();
+    let metadata = source.metadata()?;
+    source.rewind()?;
+    let (temporary_name, temporary) = create_private_restore_file(destination_parent)?;
+    let mut temporary = temporary.into_std();
+    let result = (|| {
+        let size = metadata.len();
+        {
+            let mut limited = (&mut source).take(size);
+            std::io::copy(&mut limited, &mut temporary)?;
+            if limited.limit() != 0 {
+                return Err(LpmError::Task(
+                    "staged task cache output became shorter while it was copied".into(),
+                ));
             }
-            destination_parent.remove_file_or_symlink(destination_name)?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(LpmError::Task(format!(
-                "task cache output appeared during publication: {}",
-                destination_name.to_string_lossy()
-            )));
+        let mut extra = [0u8; 1];
+        if source.read(&mut extra)? != 0 || source.metadata()?.len() != size {
+            return Err(LpmError::Task(
+                "staged task cache output changed size while it was copied".into(),
+            ));
         }
-        Err(_) => {}
+        temporary.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            temporary.set_permissions(std::fs::Permissions::from_mode(
+                metadata.permissions().mode() & 0o777,
+            ))?;
+        }
+        temporary.flush()?;
+        sync_restore_file(&temporary)?;
+        let temporary_identity = same_file::Handle::from_file(temporary.try_clone()?)?;
+        drop(temporary);
+        match source_parent.remove_file_or_symlink(source_name) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        destination_parent.hard_link(Path::new(&temporary_name), source_parent, source_name)?;
+        let receipt = open_optional_regular_file(
+            source_parent,
+            source_name.as_os_str(),
+            "task cache restore publication receipt",
+        )?
+        .ok_or_else(|| {
+            LpmError::Task("task cache restore publication receipt disappeared".into())
+        })?;
+        if same_file::Handle::from_file(receipt.into_std())? != temporary_identity {
+            return Err(LpmError::Task(
+                "task cache restore publication receipt changed while it was created".into(),
+            ));
+        }
+        sync_cap_directory(source_parent)?;
+        match rename_staged_file_noreplace(
+            destination_parent,
+            Path::new(&temporary_name),
+            destination_parent,
+            destination_name,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(LpmError::Task(format!(
+                    "task cache output appeared during publication: {}",
+                    destination_name.to_string_lossy()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        sync_cap_directory(destination_parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = destination_parent.remove_file_or_symlink(&temporary_name);
     }
-    if try_clone_verified_file(&source, destination_parent, destination_name)? {
-        return Ok(());
-    }
-    publish_verified_file(
-        source,
-        destination_parent,
-        destination_name,
-        label,
-        PublicationDurability::Deferred,
-    )
+    result
 }
 
-#[cfg(target_os = "macos")]
-fn try_clone_verified_file(
-    source: &cap_std::fs::File,
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_staged_file_noreplace(
+    source_parent: &Dir,
+    source_name: &Path,
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
-) -> Result<bool, LpmError> {
-    use rustix::fs::{CloneFlags, fclonefileat};
-    use rustix::io::Errno;
+) -> Result<(), std::io::Error> {
+    use rustix::fs::{RenameFlags, renameat_with};
 
-    match fclonefileat(
-        source,
+    renameat_with(
+        source_parent,
+        source_name,
         destination_parent,
         Path::new(destination_name),
-        CloneFlags::empty(),
-    ) {
-        Ok(()) => Ok(true),
-        Err(Errno::NOTSUP | Errno::XDEV | Errno::NOSYS) => Ok(false),
-        Err(error) => Err(std::io::Error::from(error).into()),
-    }
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
 }
 
-#[cfg(target_os = "linux")]
-fn try_clone_verified_file(
-    source: &cap_std::fs::File,
+#[cfg(windows)]
+fn rename_staged_file_noreplace(
+    source_parent: &Dir,
+    source_name: &Path,
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
-) -> Result<bool, LpmError> {
-    use rustix::fs::ioctl_ficlone;
-    use rustix::io::Errno;
-
-    let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .follow(FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let destination = destination_parent.open_with(destination_name, &options)?;
-    match ioctl_ficlone(&destination, source) {
-        Ok(()) => {
-            let source_metadata = source.metadata()?;
-            let destination = destination.into_std();
-            destination
-                .set_times(std::fs::FileTimes::new().set_modified(source_metadata.modified()?))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                destination.set_permissions(std::fs::Permissions::from_mode(
-                    source_metadata.permissions().mode() & 0o777,
-                ))?;
-            }
-            Ok(true)
-        }
-        Err(Errno::NOTSUP | Errno::XDEV | Errno::INVAL | Errno::NOSYS) => {
-            drop(destination);
-            destination_parent.remove_file_or_symlink(destination_name)?;
-            Ok(false)
-        }
-        Err(error) => {
-            drop(destination);
-            let _ = destination_parent.remove_file_or_symlink(destination_name);
-            Err(std::io::Error::from(error).into())
-        }
-    }
+) -> Result<(), std::io::Error> {
+    source_parent.rename(source_name, destination_parent, Path::new(destination_name))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn try_clone_verified_file(
-    _source: &cap_std::fs::File,
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_staged_file_noreplace(
+    source_parent: &Dir,
+    source_name: &Path,
     _destination_parent: &Dir,
     _destination_name: &std::ffi::OsStr,
-) -> Result<bool, LpmError> {
-    Ok(false)
+) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "atomic task cache publication is unsupported for {}",
+            source_parent
+                .metadata(source_name)
+                .map(|_| source_name.display().to_string())
+                .unwrap_or_else(|_| "staged output".into())
+        ),
+    ))
 }
 
 fn create_private_restore_file(directory: &Dir) -> Result<(String, cap_std::fs::File), LpmError> {
@@ -1753,7 +1917,6 @@ impl RestoreTransaction {
                 &backup_parent,
                 &backup_name,
                 "task cache restore backup source",
-                PublicationDurability::Immediate,
             )?;
             applied.backed_up = true;
             #[cfg(test)]
@@ -1777,14 +1940,18 @@ impl RestoreTransaction {
             &STAGED_OUTPUT_RACE_BARRIER,
             &self.project_dir.join(relative),
         );
-        publish_reconstructible_file(
+        publish_staged_file(
             output_file,
             output_parent,
             Path::new(destination_name),
             destination_parent,
             destination_name,
-            "staged task cache output",
         )?;
+        #[cfg(test)]
+        wait_for_cache_race_barrier(
+            &PUBLISHED_OUTPUT_RACE_BARRIER,
+            &self.project_dir.join(relative),
+        );
         applied.installed = true;
         self.mutated_dirs
             .insert(destination_parent_path.to_path_buf());
@@ -1836,7 +2003,6 @@ impl RestoreTransaction {
                 &backup_parent,
                 &backup_name,
                 "task cache restore backup source",
-                PublicationDurability::Immediate,
             )?;
             applied.backed_up = true;
             #[cfg(test)]
@@ -1980,7 +2146,6 @@ impl RestoreTransaction {
                             &destination_parent,
                             &destination_name,
                             "task cache restore backup",
-                            PublicationDurability::Immediate,
                         ) && first_error.is_none()
                         {
                             first_error = Some(std::io::Error::other(error.to_string()));

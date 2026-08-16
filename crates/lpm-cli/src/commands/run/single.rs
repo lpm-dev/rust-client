@@ -1,6 +1,6 @@
 use super::cache::{
-    CacheStoreRequest, is_task_cached_with_config, try_cache_hit_with_config,
-    try_cache_store_with_output_and_config,
+    CacheStoreRequest, prepare_cache_context_with_config, try_cache_hit_with_context,
+    try_cache_store_with_context,
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::ensure_runtime;
@@ -69,18 +69,27 @@ pub async fn run(
     // Read lpm.json once so the cache lookup and task predicate share the same config.
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
-    let caching_enabled = !no_cache && is_task_cached_with_config(script_name, lpm_config.as_ref());
-
-    // Check if caching is enabled for this task
-    if !no_cache
-        && let Some(hit) = try_cache_hit_with_config(
+    let cache_context = if no_cache {
+        None
+    } else {
+        prepare_cache_context_with_config(
             project_dir,
+            None,
+            &[],
             script_name,
             env_mode,
             extra_args,
             bin_hint,
             lpm_config.as_ref(),
         )?
+    };
+    let caching_enabled = cache_context.is_some();
+
+    if let Some(hit) = cache_context
+        .as_ref()
+        .map(|context| try_cache_hit_with_context(project_dir, context))
+        .transpose()?
+        .flatten()
     {
         // Cache hit — replay output
         if !hit.stdout.is_empty() {
@@ -125,17 +134,23 @@ pub async fn run(
             bin_hint,
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        let _ = try_cache_store_with_output_and_config(CacheStoreRequest {
-            project_dir,
-            script_name,
-            env_mode,
-            extra_args,
-            bin_hint,
-            duration_ms,
-            stdout: &output.stdout,
-            stderr: &output.stderr,
-            lpm_config: lpm_config.as_ref(),
-        });
+        let context = cache_context.as_ref().ok_or_else(|| {
+            LpmError::Task(format!("cache context missing for task '{script_name}'"))
+        })?;
+        let _ = try_cache_store_with_context(
+            CacheStoreRequest {
+                project_dir,
+                workspace_contract: None,
+                script_name,
+                env_mode,
+                extra_args,
+                bin_hint,
+                duration_ms,
+                stdout: &output.stdout,
+                stderr: &output.stderr,
+            },
+            context,
+        );
     } else {
         // Run normally (inherited stdio, no capture)
         lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;

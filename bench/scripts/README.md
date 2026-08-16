@@ -319,6 +319,10 @@ The fixed PR profile covers:
 - explicit env mapping
 - root Node plus workspace-member Bun
 - 10-task and 100-task deep and wide task graphs
+- cold and warm 10-task output-producing cache chains
+- a 10-package deep workspace `^task` chain
+- cold and warm workspace-cache graphs with 10 tasks
+- cold and warm 1 MiB workspace lockfiles shared by ten cached tasks
 - a 1 MiB hot task-cache restore
 - two concurrent writers that publish one complete cache entry
 - single-service and dependency-ordered multi-service dev
@@ -331,11 +335,18 @@ The fixed PR profile covers:
 - a 1 MiB HTTP readiness body, which must not inflate the CLI process
 - a 1 MiB tunneled response through a local deterministic relay
 
-The full profile adds 1,000-task deep and wide graphs and a 128 MiB hot
-task-cache restore. It also adds 50-service graphs, four concurrent projects,
-and larger readiness and tunnel responses. The profile includes tunnel
-fairness, WebSocket recovery, and a local tunnel burst with the dashboard
-under a PTY. The PR profile has a 15-second scenario timeout.
+The full profile adds 100-task and 1,000-task output-producing cache chains,
+100-package and 1,000-package deep workspace `^task` chains, and 100-task and
+1,000-task workspace-cache graphs. The workspace-cache graphs combine wide
+upstream fan-in with a deep local task chain. The profile also adds 10 MiB and
+50 MiB workspace lockfiles, with ten cached tasks per lockfile. It includes the
+1,000-task deep and wide graphs and a 128 MiB hot task-cache restore. It also
+adds 50-service graphs, four concurrent projects, and larger readiness and
+tunnel responses. The profile includes tunnel fairness, WebSocket recovery,
+and a local tunnel burst with the dashboard under a PTY. The PR profile has a
+15-second scenario timeout. The 1,000-task output-producing cache-chain cells
+have a three-minute timeout because they intentionally execute or restore all
+1,000 dependency-ordered task boundaries.
 The full profile has a 60-second timeout. `--timeout-ms` overrides either value.
 Runtime downloads and tunnel traffic are local and deterministic. The harness
 continuously drains output, retains only a bounded prefix and tail, and records
@@ -363,7 +374,7 @@ binaries run first the same number of times. JSON, Markdown, bounded logs,
 resource samples, runtime request counts, and survivor evidence are written to
 a unique temporary artifact directory by default.
 
-Validate the harness:
+Run the harness self-test:
 
 ```bash
 node bench/scripts/run-runtime-readiness.mjs --self-test
@@ -403,6 +414,42 @@ node bench/scripts/run-runtime-readiness.mjs \
   --samples 10
 ```
 
+Run only the workspace task-cache graphs:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary main=/tmp/lpm-main/release/lpm-rs \
+  --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
+  --compare main,candidate \
+  --profile full \
+  --scenarios task/workspace-cache-cold-wide-deep-10,task/workspace-cache-warm-wide-deep-10,task/workspace-cache-cold-wide-deep-100,task/workspace-cache-warm-wide-deep-100,task/workspace-cache-cold-wide-deep-1000,task/workspace-cache-warm-wide-deep-1000 \
+  --samples 10
+```
+
+Run only the deep task-cache and workspace-caret graphs:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary main=/tmp/lpm-main/release/lpm-rs \
+  --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
+  --compare main,candidate \
+  --profile full \
+  --scenarios task/cache-cold-deep-10,task/cache-warm-deep-10,task/cache-cold-deep-100,task/cache-warm-deep-100,task/cache-cold-deep-1000,task/cache-warm-deep-1000,task/workspace-caret-deep-10,task/workspace-caret-deep-100,task/workspace-caret-deep-1000 \
+  --samples 10
+```
+
+Run the workspace lockfile cells:
+
+```bash
+node bench/scripts/run-runtime-readiness.mjs \
+  --lpm-binary main=/tmp/lpm-main/release/lpm-rs \
+  --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
+  --compare main,candidate \
+  --profile full \
+  --scenarios cache/workspace-root-lock-cold-1mib-10-tasks,cache/workspace-root-lock-warm-1mib-10-tasks,cache/workspace-root-lock-cold-10mib-10-tasks,cache/workspace-root-lock-warm-10mib-10-tasks,cache/workspace-root-lock-cold-50mib-10-tasks,cache/workspace-root-lock-warm-50mib-10-tasks \
+  --samples 10
+```
+
 Run only the task-cache cells:
 
 ```bash
@@ -411,7 +458,7 @@ node bench/scripts/run-runtime-readiness.mjs \
   --lpm-binary candidate=/tmp/lpm-candidate/release/lpm-rs \
   --compare main,candidate \
   --profile full \
-  --scenarios cache/hit-1mib,cache/hit-128mib,cache/hit-500-files,cache/hit-deep-path,cache/removes-stale-output,cache/concurrent-same-key-store \
+  --scenarios cache/hit-1mib,cache/hit-128mib,cache/hit-500-files,cache/hit-deep-path,cache/removes-stale-output,cache/concurrent-same-key-store,cache/workspace-root-lock-cold-1mib-10-tasks,cache/workspace-root-lock-warm-1mib-10-tasks,cache/workspace-root-lock-cold-10mib-10-tasks,cache/workspace-root-lock-warm-10mib-10-tasks,cache/workspace-root-lock-cold-50mib-10-tasks,cache/workspace-root-lock-warm-50mib-10-tasks \
   --samples 10
 ```
 

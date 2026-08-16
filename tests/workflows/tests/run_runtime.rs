@@ -672,6 +672,47 @@ fn run_workspace_rejects_member_runtime_that_violates_root_node_engine() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_workspace_rejects_member_runtime_that_violates_member_node_engine() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "runtime-selection-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{
+            "name": "runtime-selection-app",
+            "version": "1.0.0",
+            "engines": {"node": ">=22"},
+            "scripts": {"node-version": "node --version"}
+        }"#,
+    );
+    project.write_file("packages/app/.nvmrc", "18.0.0\n");
+    install_fake_managed_node(&project, "18.0.0");
+    let mut command = lpm(&project);
+    configure_fake_node(&mut command, &project, "22.0.0");
+
+    let output = command
+        .args(["run", "node-version", "--all"])
+        .output()
+        .expect("run workspace member with an incompatible member constraint");
+    let combined = command_output_text(&output);
+
+    assert!(
+        !output.status.success(),
+        "workspace member ignored its Node constraint:\n{combined}"
+    );
+    assert!(
+        combined.contains(">=22") && combined.contains("18.0.0") && combined.contains(".nvmrc"),
+        "member runtime mismatch did not identify the constraint and selector:\n{combined}"
+    );
+}
+
 #[test]
 fn doctor_reports_node_engine_mismatch_for_incompatible_system_runtime() {
     let project = node_version_project("^20");
