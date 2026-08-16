@@ -2,6 +2,7 @@
 name = "lpm-task"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Task graph, caching, and workspace-aware execution for LPM"

@@ -2,6 +2,7 @@
 name = "lpm-triage-advisor"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Layer-4 triage advisor adapter — claude-cli, codex, ollama."

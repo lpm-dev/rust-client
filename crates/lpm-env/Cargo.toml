@@ -2,6 +2,7 @@
 name = "lpm-env"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Environment variable schema validation for LPM — fail-fast before process spawn"

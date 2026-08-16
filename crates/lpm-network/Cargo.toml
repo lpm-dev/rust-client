@@ -3,6 +3,7 @@ name = "lpm-network"
 description = "Network interface discovery, QR code generation, and mDNS for LPM dev runner"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

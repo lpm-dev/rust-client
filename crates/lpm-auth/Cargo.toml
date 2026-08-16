@@ -2,6 +2,7 @@
 name = "lpm-auth"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Authentication, secure token storage, and lazy session management for the LPM Rust client"

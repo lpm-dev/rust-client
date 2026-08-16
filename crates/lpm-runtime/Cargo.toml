@@ -2,6 +2,7 @@
 name = "lpm-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Runtime version management for LPM — download, install, and auto-switch Node.js and Bun versions"

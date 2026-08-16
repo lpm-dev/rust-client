@@ -3,6 +3,7 @@ name = "lpm-dashboard"
 description = "TUI dashboard for LPM dev server — multi-service log viewer with status indicators"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

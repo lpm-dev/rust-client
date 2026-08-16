@@ -2,6 +2,7 @@
 name = "lpm-plugin"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Plugin management for LPM — lazy-download external tool binaries"

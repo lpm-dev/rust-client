@@ -3,6 +3,7 @@ name = "lpm-tunnel"
 description = "WebSocket tunnel client for exposing localhost to the internet via LPM"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
