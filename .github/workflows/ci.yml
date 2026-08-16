@@ -194,6 +194,39 @@ jobs:
             node:22-alpine@sha256:b74031e546d7f4faf561d797ac1b76beccac856a042815ca77db4fd047581605 \
             sh /work/tests/npm-musl/run.sh /work/$binary
 
+  experimental-http3:
+    name: Experimental HTTP/3 feature
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: "--cfg reqwest_unstable"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-http3-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-http3-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Linux keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+
+      - name: Check HTTP/3 feature graph
+        run: cargo check --locked -p lpm-registry --all-features
+
+      - name: Check CLI HTTP/3 feature forwarding
+        run: cargo check --locked -p lpm-cli --features experimental-http3
+
   test:
     name: Fast tests
     runs-on: ubuntu-latest
