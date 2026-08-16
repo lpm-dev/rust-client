@@ -312,23 +312,33 @@ fn reconcile_one(
         // path still resolves via WAL Abort but no outside-tree
         // filesystem mutation runs.
         let mut tombstoned = false;
-        let new_root_ext = as_extended_path(&intent.new_root_path);
-        let path_shape = crate::sweep::validated_install_root_absolute(
+        let validated_root = crate::sweep::validated_install_root_absolute(
             &root.global_root(),
             &intent.new_root_path,
         );
-        if let Err(reason) = &path_shape {
+        if let Err(reason) = &validated_root {
             tracing::warn!(
                 "recover: orphan-root path for tx {} is structurally invalid ({reason}); \
                  skipping inline delete and tombstone push",
                 intent.tx_id,
             );
         }
-        if path_shape.is_ok()
-            && new_root_ext.exists()
-            && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
+        let relative_root = validated_root
+            .as_ref()
+            .ok()
+            .and_then(|validated| relative_install_root(root, validated));
+        let root_is_referenced = relative_root
+            .as_deref()
+            .is_some_and(|relative| manifest.install_root_is_referenced(relative));
+        if relative_root.is_some()
+            && !root_is_referenced
+            && let Ok(validated_root) = &validated_root
         {
-            if let Some(rel) = relative_install_root(root, &intent.new_root_path) {
+            let validated_root_ext = as_extended_path(validated_root);
+            if validated_root_ext.exists()
+                && let Err(e) = std::fs::remove_dir_all(&validated_root_ext)
+                && let Some(rel) = relative_root
+            {
                 tracing::debug!(
                     "recover: deferring orphan-root cleanup for tx {} via tombstone: {}",
                     intent.tx_id,
@@ -336,12 +346,6 @@ fn reconcile_one(
                 );
                 manifest.tombstones.push(rel);
                 tombstoned = true;
-            } else {
-                tracing::warn!(
-                    "recover: orphan root {} could not be cleaned and is outside global_root, dropping: {}",
-                    intent.new_root_path.display(),
-                    e
-                );
             }
         }
         // Persist tombstone before WAL ABORT so recovery's "manifest
@@ -410,7 +414,6 @@ fn reconcile_one(
             manifest,
             wal,
             intent,
-            &pending,
             synthetic_status,
             &marker_commands,
         );

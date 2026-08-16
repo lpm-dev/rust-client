@@ -157,6 +157,84 @@ fn fresh_install_with_partial_root_rolls_back() {
 }
 
 #[test]
+fn rollback_does_not_delete_install_root_referenced_by_an_active_package() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    let install_root = root.install_root_for("pkg", "1.0.0");
+    std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+    std::fs::write(install_root.join("lpm.lock"), b"x").unwrap();
+
+    let relative = "installs/pkg@1.0.0";
+    let mut manifest = GlobalManifest::default();
+    manifest
+        .pending
+        .insert("pkg".into(), pending_install("pkg", relative, &["pkg"]));
+    manifest.packages.insert(
+        "current-owner".into(),
+        PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-current".into(),
+            source: PackageSource::LpmDev,
+            installed_at: Utc::now(),
+            root: relative.into(),
+            commands: vec!["current-owner".into()],
+        },
+    );
+    write_for(&root, &manifest).unwrap();
+
+    let mut wal = WalWriter::open(root.global_wal()).unwrap();
+    wal.append(&intent_install("tx1", "pkg", &install_root, &["pkg"]))
+        .unwrap();
+
+    let report = recover(&root).unwrap();
+
+    assert!(matches!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::RolledBack { .. }
+    ));
+    assert!(
+        install_root.exists(),
+        "rollback must preserve a root still referenced by an active package"
+    );
+}
+
+#[test]
+fn rollback_does_not_delete_install_root_referenced_by_another_pending_package() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    let install_root = root.install_root_for("pkg", "1.0.0");
+    std::fs::create_dir_all(install_root.join("node_modules").join(".bin")).unwrap();
+    std::fs::write(install_root.join("lpm.lock"), b"x").unwrap();
+
+    let relative = "installs/pkg@1.0.0";
+    let mut manifest = GlobalManifest::default();
+    manifest
+        .pending
+        .insert("pkg".into(), pending_install("pkg", relative, &["pkg"]));
+    manifest.pending.insert(
+        "other".into(),
+        pending_install("other", relative, &["other"]),
+    );
+    write_for(&root, &manifest).unwrap();
+
+    let mut wal = WalWriter::open(root.global_wal()).unwrap();
+    wal.append(&intent_install("tx1", "pkg", &install_root, &["pkg"]))
+        .unwrap();
+
+    let report = recover(&root).unwrap();
+
+    assert!(matches!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::RolledBack { .. }
+    ));
+    assert!(
+        install_root.exists(),
+        "rollback must preserve a root still referenced by another pending package"
+    );
+}
+
+#[test]
 fn recovery_defers_partial_install_while_inflight_tx_lock_is_held() {
     let tmp = TempDir::new().unwrap();
     let root = LpmRoot::from_dir(tmp.path());
@@ -943,6 +1021,48 @@ fn recovery_uninstall_is_idempotent_across_repeated_invocations() {
     assert!(m.packages.is_empty());
 }
 
+#[test]
+fn recovery_uninstall_preserves_install_root_referenced_by_another_package() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    let install_root = root.install_root_for("pkg", "1.0.0");
+    std::fs::create_dir_all(&install_root).unwrap();
+
+    let shared_root = "installs/pkg@1.0.0";
+    let mut manifest = GlobalManifest::default();
+    for package in ["pkg", "other"] {
+        manifest.packages.insert(
+            package.into(),
+            PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: format!("sha512-{package}"),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: shared_root.into(),
+                commands: Vec::new(),
+            },
+        );
+    }
+    write_for(&root, &manifest).unwrap();
+
+    let mut wal = WalWriter::open(root.global_wal()).unwrap();
+    wal.append(&intent_uninstall("tx", "pkg", &install_root, &[], &[]))
+        .unwrap();
+
+    let report = recover(&root).unwrap();
+
+    assert_eq!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::RolledForward
+    );
+    assert!(
+        install_root.exists(),
+        "uninstall recovery must preserve a root still referenced by another package"
+    );
+    assert!(read_for(&root).unwrap().tombstones.is_empty());
+}
+
 /// A colliding install may have already emitted a shim before crashing.
 /// Fresh installs can have empty `pending.commands`, so rollback must
 /// use marker-derived commands to clean the leaked shim and restore the
@@ -1341,6 +1461,74 @@ fn case_c_orphaned_intent_cleans_up_and_aborts() {
     assert!(!install_root.exists(), "orphan root should be cleaned up");
 }
 
+#[test]
+#[cfg(unix)]
+fn orphan_recovery_rejects_non_native_separator_in_absolute_wal_root() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    let non_native_root = root.global_root().join(r"installs\pkg@1.0.0");
+    std::fs::create_dir_all(&non_native_root).unwrap();
+
+    let mut wal = WalWriter::open(root.global_wal()).unwrap();
+    wal.append(&intent_install(
+        "tx-non-native-separator",
+        "pkg",
+        &non_native_root,
+        &[],
+    ))
+    .unwrap();
+
+    let report = recover(&root).unwrap();
+
+    assert_eq!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::NothingToDo
+    );
+    assert!(
+        non_native_root.exists(),
+        "recovery must not delete a different path than the absolute validator authorized"
+    );
+}
+
+#[test]
+fn orphan_recovery_does_not_delete_root_referenced_by_mismatched_active_row() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    let install_root = root.install_root_for("pkg", "1.0.0");
+    std::fs::create_dir_all(&install_root).unwrap();
+    std::fs::write(install_root.join("active"), b"current").unwrap();
+
+    let mut manifest = GlobalManifest::default();
+    manifest.packages.insert(
+        "pkg".into(),
+        PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-current".into(),
+            source: PackageSource::LpmDev,
+            installed_at: Utc::now(),
+            root: "installs/pkg@1.0.0".into(),
+            commands: vec!["pkg".into()],
+        },
+    );
+    write_for(&root, &manifest).unwrap();
+
+    let mut wal = WalWriter::open(root.global_wal()).unwrap();
+    wal.append(&intent_with_new_row("tx1", "pkg", &install_root, &["pkg"]))
+        .unwrap();
+
+    let report = recover(&root).unwrap();
+
+    assert_eq!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::NothingToDo
+    );
+    assert!(
+        install_root.exists(),
+        "orphan reconciliation must preserve a root still referenced by the active manifest"
+    );
+}
+
 /// When Case-C cleanup fails, the orphan path must be queued as a
 /// tombstone so `store gc` or the next recovery pass can retry instead
 /// of leaving permanent debris.
@@ -1539,6 +1727,85 @@ fn recovery_rollback_defers_when_shim_removal_fails() {
 /// the prior install's aliases must not emit a direct shim for the
 /// aliased-away bin, and must keep the alias row in manifest pointing at
 /// the new install root.
+#[test]
+fn recovery_upgrade_does_not_tombstone_prior_root_referenced_by_another_package() {
+    let tmp = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    let prior_root = root.install_root_for("foo", "1.0.0");
+    std::fs::create_dir_all(&prior_root).unwrap();
+    make_complete_install_root(&prior_root, &[]);
+    let new_root = root.install_root_for("foo", "2.0.0");
+    std::fs::create_dir_all(&new_root).unwrap();
+    make_complete_install_root(&new_root, &[]);
+
+    let prior_relative = "installs/foo@1.0.0";
+    let prior_entry = PackageEntry {
+        saved_spec: "^1".into(),
+        resolved: "1.0.0".into(),
+        integrity: "sha512-old".into(),
+        source: PackageSource::UpstreamNpm,
+        installed_at: Utc::now(),
+        root: prior_relative.into(),
+        commands: Vec::new(),
+    };
+    let mut manifest = GlobalManifest::default();
+    manifest.packages.insert("foo".into(), prior_entry.clone());
+    manifest
+        .packages
+        .insert("other".into(), prior_entry.clone());
+    manifest.pending.insert(
+        "foo".into(),
+        PendingEntry {
+            saved_spec: "^2".into(),
+            resolved: "2.0.0".into(),
+            integrity: "sha512-new".into(),
+            source: PackageSource::UpstreamNpm,
+            started_at: Utc::now(),
+            root: "installs/foo@2.0.0".into(),
+            commands: Vec::new(),
+            replaces_version: Some("1.0.0".into()),
+        },
+    );
+    write_for(&root, &manifest).unwrap();
+
+    let intent = WalRecord::Intent(Box::new(IntentPayload {
+        tx_id: "tx-shared-prior".into(),
+        kind: TxKind::Upgrade,
+        package: "foo".into(),
+        new_root_path: new_root,
+        new_row_json: serde_json::json!({
+            "saved_spec": "^2",
+            "resolved": "2.0.0",
+            "integrity": "sha512-new",
+            "source": "upstream-npm",
+            "root": "installs/foo@2.0.0",
+            "commands": [],
+            "replaces_version": "1.0.0",
+        }),
+        prior_active_row_json: Some(serde_json::to_value(prior_entry).unwrap()),
+        prior_command_ownership_json: serde_json::json!({}),
+        new_aliases_json: serde_json::json!({}),
+        ownership_delta: Vec::new(),
+        uninstall_trust_prune: Vec::new(),
+    }));
+    let mut wal = WalWriter::open(root.global_wal()).unwrap();
+    wal.append(&intent).unwrap();
+
+    let report = recover(&root).unwrap();
+
+    assert_eq!(
+        report.reconciled[0].outcome,
+        ReconciliationOutcome::RolledForward
+    );
+    assert!(
+        !read_for(&root)
+            .unwrap()
+            .tombstones
+            .contains(&prior_relative.to_string()),
+        "a prior root still referenced by another package must not be tombstoned"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn roll_forward_upgrade_with_preserved_aliases_omits_aliased_away_direct_shim() {

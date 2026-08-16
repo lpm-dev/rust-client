@@ -60,7 +60,10 @@ pub(super) fn rollback_aborted_commit(
     }
 
     let install_root_ext = lpm_common::as_extended_path(&prep.install_root);
-    if install_root_ext.exists()
+    let root_is_referenced = manifest
+        .install_root_is_referenced_excluding_pending(&prep.install_root_relative, &prep.name);
+    if !root_is_referenced
+        && install_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
     {
         tracing::debug!(
@@ -137,6 +140,62 @@ mod tests {
             .iter()
             .any(|r| matches!(r, lpm_global::WalRecord::Abort { tx_id, .. } if tx_id == "tx1"));
         assert!(has_abort, "Abort record must be appended");
+    }
+
+    #[test]
+    fn rollback_aborted_commit_preserves_root_referenced_by_active_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = lpm_common::LpmRoot::from_dir(tmp.path());
+        let install_root = root.install_root_for("pkg", "1.0.0");
+        std::fs::create_dir_all(&install_root).unwrap();
+        std::fs::write(install_root.join("package.json"), "{}").unwrap();
+
+        let relative = "installs/pkg@1.0.0";
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.pending.insert(
+            "pkg".into(),
+            lpm_global::PendingEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-pending".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                started_at: chrono::Utc::now(),
+                root: relative.into(),
+                commands: Vec::new(),
+                replaces_version: None,
+            },
+        );
+        manifest.packages.insert(
+            "current-owner".into(),
+            lpm_global::PackageEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-current".into(),
+                source: lpm_global::PackageSource::LpmDev,
+                installed_at: chrono::Utc::now(),
+                root: relative.into(),
+                commands: Vec::new(),
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let prep = PrepResult {
+            tx_id: "tx-shared".into(),
+            name: "pkg".into(),
+            version: lpm_semver::Version::parse("1.0.0").unwrap(),
+            saved_spec: "^1".into(),
+            integrity: "sha512-pending".into(),
+            source: lpm_global::PackageSource::LpmDev,
+            install_root: install_root.clone(),
+            install_root_relative: relative.into(),
+        };
+
+        rollback_aborted_commit(&root, &mut manifest, &prep, "test reason", &[]).unwrap();
+
+        assert!(
+            install_root.exists(),
+            "rollback must preserve a root still referenced by an active package"
+        );
     }
 
     /// When `rollback_aborted_commit` is handed emitted shim names, it

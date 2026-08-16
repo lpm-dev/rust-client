@@ -5,6 +5,7 @@ use super::ReconciliationOutcome;
 use super::manifest_ops::{
     parse_package_entry_from_json, restore_prior_aliases, revert_ownership_change,
 };
+use super::wal::relative_install_root;
 use crate::install_root::InstallRootStatus;
 use crate::manifest::{GlobalManifest, PendingEntry, write_for};
 use crate::shim::{Shim, emit_shim, remove_shim};
@@ -23,15 +24,7 @@ pub(super) fn roll_back(
     // instead so it can pass the marker-derived list (fresh installs have
     // empty pending.commands; collision-leaked shims would otherwise survive
     // rollback).
-    roll_back_with_authoritative_commands(
-        root,
-        manifest,
-        wal,
-        intent,
-        pending,
-        status,
-        &pending.commands,
-    )
+    roll_back_with_authoritative_commands(root, manifest, wal, intent, status, &pending.commands)
 }
 
 /// Roll-back variant that takes an explicit list of commands to clean
@@ -55,7 +48,6 @@ pub(super) fn roll_back_with_authoritative_commands(
     manifest: &mut GlobalManifest,
     wal: &mut WalWriter,
     intent: &IntentPayload,
-    pending: &PendingEntry,
     status: InstallRootStatus,
     cleanup_commands: &[String],
 ) -> Result<ReconciliationOutcome, LpmError> {
@@ -69,26 +61,39 @@ pub(super) fn roll_back_with_authoritative_commands(
     // `installs/<name>@<version>` shape before any unlink. A corrupt
     // Intent with `new_root_path` outside `global_root` skips both the
     // inline delete and the tombstone push.
-    let new_root_ext = as_extended_path(&intent.new_root_path);
-    let path_shape =
+    let validated_root =
         crate::sweep::validated_install_root_absolute(&root.global_root(), &intent.new_root_path);
-    if let Err(reason) = &path_shape {
+    if let Err(reason) = &validated_root {
         tracing::warn!(
             "recover: install-root path for {} is structurally invalid ({reason}); \
              skipping inline delete and tombstone push",
             intent.package,
         );
     }
-    if path_shape.is_ok()
-        && new_root_ext.exists()
-        && let Err(e) = std::fs::remove_dir_all(&new_root_ext)
+    let relative_root = validated_root
+        .as_ref()
+        .ok()
+        .and_then(|validated| relative_install_root(root, validated));
+    let root_is_referenced = relative_root.as_deref().is_some_and(|relative| {
+        manifest.install_root_is_referenced_excluding_pending(relative, &intent.package)
+    });
+    if relative_root.is_some()
+        && !root_is_referenced
+        && let Ok(validated_root) = &validated_root
     {
-        tracing::debug!(
-            "recover: deferring install-root cleanup for {} via tombstone: {}",
-            intent.package,
-            e
-        );
-        manifest.tombstones.push(pending.root.clone());
+        let validated_root_ext = as_extended_path(validated_root);
+        if validated_root_ext.exists()
+            && let Err(e) = std::fs::remove_dir_all(&validated_root_ext)
+        {
+            tracing::debug!(
+                "recover: deferring install-root cleanup for {} via tombstone: {}",
+                intent.package,
+                e
+            );
+            if let Some(relative) = relative_root {
+                manifest.tombstones.push(relative);
+            }
+        }
     }
 
     // 1.5 Revert `ownership_delta` mutations.

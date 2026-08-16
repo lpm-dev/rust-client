@@ -313,7 +313,10 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     for (alias_name, _) in &owned_aliases {
         manifest.aliases.remove(alias_name);
     }
-    manifest.tombstones.push(active.root.clone());
+    let root_is_referenced = manifest.install_root_is_referenced(&active.root);
+    if !root_is_referenced {
+        manifest.tombstones.push(active.root.clone());
+    }
 
     // Persist BEFORE step 4 so that a crash leaves the manifest at
     // the post-uninstall state. The next recovery treats the
@@ -322,13 +325,16 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     write_for(root, &manifest)?;
 
     // ─── Step 4: delete install root (best-effort) ─────────────────
-    let mut install_root_remaining = false;
+    let mut install_root_remaining = root_is_referenced;
+    let mut install_root_cleanup_deferred = false;
     let install_root_ext = lpm_common::as_extended_path(&install_root_abs);
-    if install_root_ext.exists()
+    if !root_is_referenced
+        && install_root_ext.exists()
         && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
     {
         tracing::debug!("uninstall -g: install root cleanup deferred to tombstone sweep: {e}");
         install_root_remaining = true;
+        install_root_cleanup_deferred = true;
     }
 
     // ─── Step 5: append WAL Commit ─────────────────────────────────
@@ -344,6 +350,7 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
         aliases: owned_aliases.iter().map(|(k, _)| k.clone()).collect(),
         install_root: install_root_abs,
         install_root_remaining,
+        install_root_cleanup_deferred,
         trust_entries_pruned,
     })
 }
@@ -412,6 +419,7 @@ struct UninstallOutcome {
     aliases: Vec<String>,
     install_root: PathBuf,
     install_root_remaining: bool,
+    install_root_cleanup_deferred: bool,
     /// Host-global trust entries pruned from
     /// `~/.lpm/global/trusted-dependencies.json` because they were
     /// reachable only through this install's tree. Surfaced in both
@@ -588,10 +596,15 @@ fn print_success(out: &UninstallOutcome, json_output: bool) {
     if out.trust_entries_pruned > 0 {
         uninstall_ui::warn_pruned_trust_entries(out.trust_entries_pruned);
     }
-    if out.install_root_remaining {
+    if out.install_root_cleanup_deferred {
         let root_safe = sanitize_for_terminal(&out.install_root.display().to_string());
         crate::install_ui::warn_untrusted(&format!(
             "Install root could not be removed (locked or permission). Queued as tombstone for `lpm cache prune --apply` to retry: {root_safe}"
+        ));
+    } else if out.install_root_remaining {
+        let root_safe = sanitize_for_terminal(&out.install_root.display().to_string());
+        crate::install_ui::warn_untrusted(&format!(
+            "Install root was preserved because another manifest row references it or has an invalid root path: {root_safe}"
         ));
     }
 }
@@ -755,6 +768,31 @@ mod tests {
         assert_eq!(scan.records.len(), 2);
         assert!(matches!(scan.records[0], WalRecord::Intent(_)));
         assert!(matches!(scan.records[1], WalRecord::Commit { .. }));
+    }
+
+    #[test]
+    fn uninstall_preserves_install_root_referenced_by_another_package() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = seed_active_package(&root, "pkg", &[]);
+
+        let mut manifest = read_for(&root).unwrap();
+        let mut shared_entry = manifest.packages["pkg"].clone();
+        shared_entry.integrity = "sha512-other".into();
+        manifest.packages.insert("other".into(), shared_entry);
+        write_for(&root, &manifest).unwrap();
+
+        let outcome = run_under_lock(&root, "pkg").unwrap();
+
+        assert!(
+            install_root.exists(),
+            "uninstall must preserve a root still referenced by another package"
+        );
+        assert!(
+            outcome.install_root_remaining,
+            "the uninstall result must report that the shared install root remains"
+        );
+        assert!(read_for(&root).unwrap().tombstones.is_empty());
     }
 
     #[test]

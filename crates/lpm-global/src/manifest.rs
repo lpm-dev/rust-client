@@ -287,6 +287,144 @@ impl GlobalManifest {
         }
         None
     }
+
+    /// Return whether any active or pending manifest row references an
+    /// install root. Ambiguous non-local rows also return `true` so callers
+    /// fail closed before destructive cleanup.
+    pub fn install_root_is_referenced(&self, root: &str) -> bool {
+        self.install_root_reference_status_impl(root, None)
+            != InstallRootReferenceStatus::Unreferenced
+    }
+
+    /// Return whether an install root is referenced after excluding one
+    /// package's pending row. Active rows and every other pending row still
+    /// count, including an active row for the excluded package.
+    pub fn install_root_is_referenced_excluding_pending(
+        &self,
+        root: &str,
+        excluded_pending_package: &str,
+    ) -> bool {
+        self.install_root_reference_status_impl(root, Some(excluded_pending_package))
+            != InstallRootReferenceStatus::Unreferenced
+    }
+
+    pub(crate) fn install_root_reference_status(&self, root: &str) -> InstallRootReferenceStatus {
+        self.install_root_reference_status_impl(root, None)
+    }
+
+    fn install_root_reference_status_impl(
+        &self,
+        root: &str,
+        excluded_pending_package: Option<&str>,
+    ) -> InstallRootReferenceStatus {
+        let Some(target_leaf) = install_root_leaf(root) else {
+            return InstallRootReferenceStatus::Indeterminate;
+        };
+        let mut status = InstallRootReferenceStatus::Unreferenced;
+
+        for entry in self.packages.values() {
+            match install_root_entry_status(entry.source, &entry.root, target_leaf) {
+                InstallRootReferenceStatus::Referenced => {
+                    return InstallRootReferenceStatus::Referenced;
+                }
+                InstallRootReferenceStatus::Indeterminate => {
+                    status = InstallRootReferenceStatus::Indeterminate;
+                }
+                InstallRootReferenceStatus::Unreferenced => {}
+            }
+        }
+        for (package, entry) in &self.pending {
+            if excluded_pending_package == Some(package.as_str()) {
+                continue;
+            }
+            match install_root_entry_status(entry.source, &entry.root, target_leaf) {
+                InstallRootReferenceStatus::Referenced => {
+                    return InstallRootReferenceStatus::Referenced;
+                }
+                InstallRootReferenceStatus::Indeterminate => {
+                    status = InstallRootReferenceStatus::Indeterminate;
+                }
+                InstallRootReferenceStatus::Unreferenced => {}
+            }
+        }
+
+        status
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallRootReferenceStatus {
+    Unreferenced,
+    Referenced,
+    Indeterminate,
+}
+
+fn install_root_entry_status(
+    source: PackageSource,
+    root: &str,
+    target_leaf: &str,
+) -> InstallRootReferenceStatus {
+    if let Some(entry_leaf) = install_root_leaf(root) {
+        return if install_root_component_eq(entry_leaf, target_leaf) {
+            InstallRootReferenceStatus::Referenced
+        } else {
+            InstallRootReferenceStatus::Unreferenced
+        };
+    }
+    if source == PackageSource::LocalLink && local_link_root_is_valid(root) {
+        InstallRootReferenceStatus::Unreferenced
+    } else {
+        InstallRootReferenceStatus::Indeterminate
+    }
+}
+
+fn install_root_leaf(root: &str) -> Option<&str> {
+    let mut segments = root.split(['/', '\\']);
+    let prefix = segments.next()?;
+    let leaf = segments.next()?;
+    if segments.next().is_some()
+        || !install_root_component_eq(prefix, "installs")
+        || leaf.is_empty()
+        || leaf == "."
+        || leaf == ".."
+        || !leaf.contains('@')
+        || leaf.contains([':', '\0'])
+        || leaf
+            .as_bytes()
+            .last()
+            .is_some_and(|last| matches!(*last, b'.' | b' '))
+    {
+        return None;
+    }
+    Some(leaf)
+}
+
+fn local_link_root_is_valid(root: &str) -> bool {
+    let mut segments = root.split(['/', '\\']);
+    let prefix = segments.next();
+    let leaf = segments.next();
+    segments.next().is_none()
+        && prefix.is_some_and(|prefix| install_root_component_eq(prefix, "links"))
+        && leaf.is_some_and(|leaf| {
+            !leaf.is_empty()
+                && leaf != "."
+                && leaf != ".."
+                && !leaf.contains([':', '\0'])
+                && !leaf
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|last| matches!(*last, b'.' | b' '))
+        })
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn install_root_component_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn install_root_component_eq(left: &str, right: &str) -> bool {
+    left == right
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,6 +534,106 @@ mod tests {
         let m = GlobalManifest::default();
         assert_eq!(m.schema_version, SCHEMA_VERSION);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn install_root_is_referenced_by_active_package() {
+        let manifest = sample_manifest();
+
+        assert!(manifest.install_root_is_referenced("installs/eslint@9.24.0"));
+    }
+
+    #[test]
+    fn install_root_is_referenced_by_pending_package() {
+        let mut manifest = GlobalManifest::default();
+        manifest.pending.insert(
+            "pkg".into(),
+            PendingEntry {
+                saved_spec: "^1".into(),
+                resolved: "1.0.0".into(),
+                integrity: "sha512-pending".into(),
+                source: PackageSource::LpmDev,
+                started_at: Utc::now(),
+                root: "installs/pkg@1.0.0".into(),
+                commands: Vec::new(),
+                replaces_version: None,
+            },
+        );
+
+        assert!(manifest.install_root_is_referenced("installs/pkg@1.0.0"));
+    }
+
+    #[test]
+    fn install_root_reference_matches_portable_separator_forms() {
+        let manifest = sample_manifest();
+
+        assert!(manifest.install_root_is_referenced(r"installs\eslint@9.24.0"));
+    }
+
+    #[test]
+    fn malformed_non_local_root_blocks_destructive_cleanup() {
+        let mut manifest = sample_manifest();
+        manifest.packages.get_mut("eslint").unwrap().root = "installs//eslint@9.24.0".into();
+
+        assert!(manifest.install_root_is_referenced("installs/eslint@9.24.0"));
+    }
+
+    #[test]
+    fn valid_local_link_root_does_not_block_install_root_cleanup() {
+        let mut manifest = sample_manifest();
+        let entry = manifest.packages.get_mut("eslint").unwrap();
+        entry.source = PackageSource::LocalLink;
+        entry.root = "links/eslint".into();
+
+        assert!(!manifest.install_root_is_referenced("installs/other@1.0.0"));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", windows))]
+    fn install_root_reference_matches_case_insensitive_filesystem_aliases() {
+        let mut manifest = sample_manifest();
+        manifest.packages.get_mut("eslint").unwrap().root = "installs/ESLINT@9.24.0".into();
+
+        assert!(manifest.install_root_is_referenced("installs/eslint@9.24.0"));
+    }
+
+    #[test]
+    fn install_root_reference_exclusion_ignores_only_named_pending_row() {
+        let mut manifest = GlobalManifest::default();
+        let pending = PendingEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-pending".into(),
+            source: PackageSource::LpmDev,
+            started_at: Utc::now(),
+            root: "installs/pkg@1.0.0".into(),
+            commands: Vec::new(),
+            replaces_version: None,
+        };
+        manifest.pending.insert("pkg".into(), pending.clone());
+        assert!(
+            !manifest.install_root_is_referenced_excluding_pending("installs/pkg@1.0.0", "pkg")
+        );
+
+        manifest.pending.insert("other".into(), pending);
+        assert!(manifest.install_root_is_referenced_excluding_pending("installs/pkg@1.0.0", "pkg"));
+    }
+
+    #[test]
+    fn install_root_reference_exclusion_never_ignores_active_rows() {
+        let manifest = sample_manifest();
+
+        assert!(
+            manifest
+                .install_root_is_referenced_excluding_pending("installs/eslint@9.24.0", "eslint")
+        );
+    }
+
+    #[test]
+    fn unknown_install_root_is_not_referenced() {
+        let manifest = sample_manifest();
+
+        assert!(!manifest.install_root_is_referenced("installs/unknown@1.0.0"));
     }
 
     #[test]

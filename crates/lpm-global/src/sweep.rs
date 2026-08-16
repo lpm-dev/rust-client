@@ -33,7 +33,7 @@
 //! running it 100 times in a row against an empty tombstone set is cheap
 //! (one lock acquire, one manifest read, no mutations, no writes).
 
-use crate::manifest::{read_for, write_for};
+use crate::manifest::{InstallRootReferenceStatus, read_for, write_for};
 use lpm_common::{LpmError, LpmRoot, as_extended_path, try_with_exclusive_lock};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
@@ -43,13 +43,13 @@ use std::path::{Component, Path, PathBuf};
 /// emit without further conversion in the caller.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Tombstones whose on-disk root was deleted (including those that
-    /// were already absent — those count as "swept" because the user's
-    /// mental model is "cleanup is done" either way).
+    /// Tombstones whose cleanup is resolved. The root was deleted, was
+    /// already absent, or is still referenced by a live manifest row and the
+    /// stale tombstone was discarded without deleting it.
     pub swept: Vec<String>,
-    /// Tombstones that remain because the on-disk delete failed with
-    /// something other than `NotFound` (e.g. Windows sharing violation,
-    /// perms). Stays in the manifest for the next sweep to retry.
+    /// Tombstones that remain because the on-disk delete failed or manifest
+    /// state made reachability indeterminate. They stay in the manifest for
+    /// the next sweep to retry.
     pub retained: Vec<SweepFailure>,
     /// Bytes freed across all successful deletes (zero for NotFound).
     pub freed_bytes: u64,
@@ -169,6 +169,23 @@ fn sweep_under_lock(root: &LpmRoot) -> Result<SweepReport, LpmError> {
                 continue;
             }
         };
+        match manifest.install_root_reference_status(&relative_path) {
+            InstallRootReferenceStatus::Referenced => {
+                swept.push(relative_path);
+                continue;
+            }
+            InstallRootReferenceStatus::Indeterminate => {
+                retained.push(SweepFailure {
+                    relative_path: relative_path.clone(),
+                    reason: "refusing install-root cleanup because a non-local manifest row has \
+                             an invalid or ambiguous root path"
+                        .to_string(),
+                });
+                manifest.tombstones.push(relative_path);
+                continue;
+            }
+            InstallRootReferenceStatus::Unreferenced => {}
+        }
         match delete_install_root(&abs) {
             Ok(bytes) => {
                 freed_bytes = freed_bytes.saturating_add(bytes);
@@ -326,8 +343,18 @@ pub fn validated_install_root_absolute(
              (manifest / WAL may be poisoned)"
         )
     })?;
-    let rel_str = rel.to_string_lossy();
-    validated_tombstone_path(global_root, &rel_str)
+    let rel_str = rel.to_str().ok_or_else(|| {
+        format!("refusing to act on {abs_path:?}: install-root path is not valid UTF-8")
+    })?;
+    let validated = validated_tombstone_path(global_root, rel_str)?;
+    let native_path = global_root.join(rel);
+    if validated != native_path {
+        return Err(format!(
+            "refusing to act on {abs_path:?}: absolute install-root path uses a non-native \
+             separator representation"
+        ));
+    }
+    Ok(validated)
 }
 
 fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
@@ -389,6 +416,15 @@ fn validated_tombstone_path(global_root: &Path, relative_path: &str) -> Result<P
         return Err(format!(
             "refusing to sweep tombstone {relative_path:?}: leaf must match `<name>@<version>` \
              (no `@` found)"
+        ));
+    }
+    if leaf
+        .as_bytes()
+        .last()
+        .is_some_and(|last| matches!(*last, b'.' | b' '))
+    {
+        return Err(format!(
+            "refusing to sweep tombstone {relative_path:?}: leaf must not end in a dot or space"
         ));
     }
 
@@ -455,7 +491,8 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{GlobalManifest, write_for};
+    use crate::manifest::{GlobalManifest, PackageEntry, PackageSource, PendingEntry, write_for};
+    use chrono::Utc;
     use std::fs;
 
     fn seed_manifest_with_tombstones(root: &LpmRoot, tombstones: &[&str]) {
@@ -477,6 +514,31 @@ mod tests {
         fs::write(abs.join("nested/deeper/b.txt"), b"world").unwrap();
         // 1024 + 5 + 5 = 1034 bytes
         1034
+    }
+
+    fn active_entry(root: &str) -> PackageEntry {
+        PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-active".into(),
+            source: PackageSource::LpmDev,
+            installed_at: Utc::now(),
+            root: root.into(),
+            commands: vec!["pkg".into()],
+        }
+    }
+
+    fn pending_entry(root: &str) -> PendingEntry {
+        PendingEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-pending".into(),
+            source: PackageSource::LpmDev,
+            started_at: Utc::now(),
+            root: root.into(),
+            commands: vec!["pkg".into()],
+            replaces_version: None,
+        }
     }
 
     #[test]
@@ -573,6 +635,81 @@ mod tests {
 
         let m = read_for(&root).unwrap();
         assert!(m.tombstones.is_empty());
+    }
+
+    #[test]
+    fn sweep_discards_stale_tombstone_without_deleting_active_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let relative = "installs/pkg@1.0.0";
+        let install_root = root.global_root().join(relative);
+        seed_install_root(&root, relative);
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), active_entry(relative));
+        manifest.tombstones.push(relative.into());
+        write_for(&root, &manifest).unwrap();
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        assert_eq!(report.swept, vec![relative.to_string()]);
+        assert_eq!(report.freed_bytes, 0);
+        assert!(
+            install_root.exists(),
+            "a stale tombstone must not delete an active install root; report: {report:?}"
+        );
+        assert!(read_for(&root).unwrap().tombstones.is_empty());
+    }
+
+    #[test]
+    fn sweep_discards_stale_tombstone_without_deleting_pending_install_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let relative = "installs/pkg@1.0.0";
+        let install_root = root.global_root().join(relative);
+        seed_install_root(&root, relative);
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .pending
+            .insert("pkg".into(), pending_entry(relative));
+        manifest.tombstones.push(relative.into());
+        write_for(&root, &manifest).unwrap();
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        assert_eq!(report.swept, vec![relative.to_string()]);
+        assert_eq!(report.freed_bytes, 0);
+        assert!(
+            install_root.exists(),
+            "a stale tombstone must not delete a pending install root; report: {report:?}"
+        );
+        assert!(read_for(&root).unwrap().tombstones.is_empty());
+    }
+
+    #[test]
+    fn sweep_retains_tombstone_when_non_local_manifest_root_is_malformed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let relative = "installs/pkg@1.0.0";
+        let install_root = root.global_root().join(relative);
+        seed_install_root(&root, relative);
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), active_entry("installs/./pkg@1.0.0"));
+        manifest.tombstones.push(relative.into());
+        write_for(&root, &manifest).unwrap();
+
+        let report = sweep_tombstones(&root).unwrap();
+
+        assert!(report.swept.is_empty());
+        assert_eq!(report.retained.len(), 1);
+        assert!(install_root.exists());
+        assert_eq!(read_for(&root).unwrap().tombstones, vec![relative]);
     }
 
     /// Mixed outcome: one tombstone sweeps cleanly, another fails.
@@ -856,6 +993,18 @@ mod tests {
         // Leaf must contain `@`.
         let no_at = validated_tombstone_path(global_root, "installs/eslint").unwrap_err();
         assert!(no_at.contains("`<name>@<version>`"));
+
+        assert!(validated_tombstone_path(global_root, "installs/pkg@1.0.0.").is_err());
+        assert!(validated_tombstone_path(global_root, "installs/pkg@1.0.0 ").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn absolute_install_root_validator_rejects_non_native_separator_alias() {
+        let global_root = Path::new("/home/user/.lpm/global");
+        let non_native = global_root.join(r"installs\pkg@1.0.0");
+
+        assert!(validated_install_root_absolute(global_root, &non_native).is_err());
     }
 
     /// End-to-end poisoning scenario. A tombstone of `"."` would (pre-fix)
