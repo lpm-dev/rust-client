@@ -6,6 +6,7 @@
 use crate::bin_path;
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
 use lpm_workspace::read_package_json;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Once;
@@ -435,24 +436,12 @@ pub fn build_dlx_command(
 ) -> Result<Command, LpmError> {
     let bin_dir = cache_dir.join("node_modules").join(".bin");
     let bin_name = resolve_dlx_bin_name(cache_dir, package_spec)?;
-    let bin_path = bin_dir.join(bin_name);
+    let bin_path = dlx_program_path(&bin_dir, &bin_name, cfg!(windows));
 
     // Build PATH with the dlx cache's .bin prepended
-    let mut path_parts = vec![bin_dir.to_string_lossy().to_string()];
-
-    // Also include the project's .bin dirs
     let project_bin_dirs = bin_path::find_bin_dirs(project_dir);
-    for d in &project_bin_dirs {
-        path_parts.push(d.to_string_lossy().to_string());
-    }
-
-    let existing_path = std::env::var("PATH").unwrap_or_default();
-    if !existing_path.is_empty() {
-        path_parts.push(existing_path);
-    }
-
-    let separator = if cfg!(windows) { ";" } else { ":" };
-    let path = path_parts.join(separator);
+    let existing_path = std::env::var_os("PATH");
+    let path = build_dlx_path(&bin_dir, &project_bin_dirs, existing_path.as_deref())?;
 
     let mut command = Command::new(&bin_path);
     crate::shell::strip_inherited_env_hooks(&mut command);
@@ -465,6 +454,33 @@ pub fn build_dlx_command(
         .stderr(Stdio::inherit());
 
     Ok(command)
+}
+
+fn dlx_program_path(bin_dir: &Path, bin_name: &str, windows: bool) -> PathBuf {
+    if windows {
+        let mut shim_name = OsString::with_capacity(bin_name.len() + ".cmd".len());
+        shim_name.push(bin_name);
+        shim_name.push(".cmd");
+        bin_dir.join(shim_name)
+    } else {
+        bin_dir.join(bin_name)
+    }
+}
+
+fn build_dlx_path(
+    bin_dir: &Path,
+    project_bin_dirs: &[PathBuf],
+    existing_path: Option<&std::ffi::OsStr>,
+) -> Result<OsString, LpmError> {
+    let mut path_parts = Vec::with_capacity(project_bin_dirs.len() + 2);
+    path_parts.push(bin_dir.to_path_buf());
+    path_parts.extend(project_bin_dirs.iter().cloned());
+    if let Some(existing_path) = existing_path.filter(|path| !path.is_empty()) {
+        path_parts.extend(std::env::split_paths(existing_path));
+    }
+
+    std::env::join_paths(path_parts)
+        .map_err(|error| LpmError::Script(format!("could not construct dlx PATH: {error}")))
 }
 
 /// Execute the dlx binary from the cache directory.
@@ -866,8 +882,13 @@ mod tests {
 
         // Verify the command is a direct binary invocation, not sh -c
         let program = cmd.get_program().to_string_lossy().to_string();
+        let expected_program = if cfg!(windows) {
+            "cowsay.cmd"
+        } else {
+            "cowsay"
+        };
         assert!(
-            program.ends_with("cowsay"),
+            program.ends_with(expected_program),
             "program should be the binary path, not 'sh': {program}"
         );
 
@@ -905,10 +926,41 @@ mod tests {
         let cache_dir = dir.path().join("cache");
         seed_installed_package(&cache_dir, "foo", r#"{"serve":"./cli.js"}"#, &["serve"]);
 
-        let expected = cache_dir.join("node_modules/.bin/serve");
+        let expected_name = if cfg!(windows) { "serve.cmd" } else { "serve" };
+        let expected = cache_dir.join("node_modules/.bin").join(expected_name);
 
         let cmd = build_dlx_command(dir.path(), &cache_dir, "foo", &[]).unwrap();
         assert_eq!(cmd.get_program(), expected.as_os_str());
+    }
+
+    #[test]
+    fn dlx_program_path_selects_the_windows_command_shim() {
+        let bin_dir = Path::new("/cache/node_modules/.bin");
+
+        assert_eq!(
+            dlx_program_path(bin_dir, "serve", true),
+            bin_dir.join("serve.cmd")
+        );
+        assert_eq!(
+            dlx_program_path(bin_dir, "serve", false),
+            bin_dir.join("serve")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_dlx_path_preserves_non_unicode_inherited_entries() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let bin_dir = PathBuf::from("/cache/node_modules/.bin");
+        let project_bin_dir = PathBuf::from("/project/node_modules/.bin");
+        let system_bin_dir = PathBuf::from(OsString::from_vec(b"/system/bin-\xff".to_vec()));
+        let inherited_path = std::env::join_paths([&system_bin_dir]).unwrap();
+        let expected = std::env::join_paths([&bin_dir, &project_bin_dir, &system_bin_dir]).unwrap();
+
+        let actual = build_dlx_path(&bin_dir, &[project_bin_dir], Some(&inherited_path)).unwrap();
+
+        assert_eq!(actual.into_vec(), expected.into_vec());
     }
 
     #[test]
@@ -922,7 +974,8 @@ mod tests {
             &["foo", "other"],
         );
 
-        let expected = cache_dir.join("node_modules/.bin/foo");
+        let expected_name = if cfg!(windows) { "foo.cmd" } else { "foo" };
+        let expected = cache_dir.join("node_modules/.bin").join(expected_name);
         let cmd = build_dlx_command(dir.path(), &cache_dir, "@scope/foo", &[]).unwrap();
         assert_eq!(cmd.get_program(), expected.as_os_str());
     }
