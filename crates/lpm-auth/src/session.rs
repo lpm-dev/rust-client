@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
-use crate::{
-    clear_refresh_token, clear_token, set_refresh_token, set_session_access_token_expiry, set_token,
-};
+use crate::{get_refresh_token, persist_refresh_backed_session_unlocked, session_lock_path};
 
 /// Where the current effective token came from.
 ///
@@ -163,9 +161,8 @@ pub struct SessionManager {
     /// peer rotated the token and they return the cached value
     /// without making a redundant HTTP call.
     refresh_generation: AtomicU64,
-    /// Single-flight gate around the refresh HTTP call. The lock is
-    /// held only across the network round-trip; readers stay on the
-    /// `RwLock`.
+    /// In-process single-flight gate around refresh coordination. The
+    /// per-registry file lock provides the matching cross-process gate.
     refresh_lock: Mutex<()>,
     /// HTTP client used for silent refresh. Constructed lazily on
     /// first refresh attempt (no startup cost when refresh never
@@ -180,6 +177,14 @@ struct CachedToken {
     secret: SecretString,
     source: TokenSource,
     refresh_state: RefreshState,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RefreshSessionResponse {
+    token: String,
+    refresh_token: String,
+    expires_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,17 +612,37 @@ impl SessionManager {
             return Ok(secret);
         }
 
-        let new_token = self.do_silent_refresh().await?;
-        let secret = SecretString::from(new_token.clone());
+        let refresh_before_process_lock = self.load_refresh_token()?;
+        let lock_path = session_lock_path(&self.registry_url).map_err(LpmError::Registry)?;
+        let secret = lpm_common::paths::with_exclusive_lock_async(lock_path, async {
+            let current_refresh = self.load_refresh_token()?;
 
-        // Persist + cache the rotated token. The source stays
-        // StoredSession because refresh rotates the secret, not the source.
-        if let Err(e) = set_token(&self.registry_url, &new_token) {
-            tracing::warn!(
-                "refreshed token obtained but failed to persist: {e}. Session may require re-login."
-            );
-        }
-        self.cache_rotated_stored_session(secret.clone());
+            if current_refresh != refresh_before_process_lock
+                && let Some(peer_access) = crate::get_stored_access_token(&self.registry_url)
+                && !peer_access.is_empty()
+            {
+                let secret = SecretString::from(peer_access);
+                self.cache_rotated_stored_session(secret.clone());
+                return Ok(secret);
+            }
+
+            let refreshed = self.do_silent_refresh(&current_refresh).await?;
+            persist_refresh_backed_session_unlocked(
+                &self.registry_url,
+                &refreshed.token,
+                &refreshed.refresh_token,
+                &refreshed.expires_at,
+            )
+            .map_err(|error| {
+                LpmError::Registry(format!("failed to persist refreshed session: {error}"))
+            })?;
+
+            let secret = SecretString::from(refreshed.token);
+            self.cache_rotated_stored_session(secret.clone());
+            Ok(secret)
+        })
+        .await?;
+
         self.refresh_generation.fetch_add(1, Ordering::AcqRel);
 
         Ok(secret)
@@ -627,18 +652,38 @@ impl SessionManager {
     /// metadata) and drop the in-memory cache. Used when the server
     /// authoritatively rejects the session.
     pub fn clear_session(&self) {
-        let _ = clear_token(&self.registry_url);
-        let _ = clear_refresh_token(&self.registry_url);
+        match crate::clear_login_state(&self.registry_url) {
+            Ok(()) => self.clear_cached_session(),
+            Err(error) => {
+                tracing::warn!("failed to clear rejected local session state: {error}");
+            }
+        }
+    }
+
+    fn clear_cached_session(&self) {
         if let Ok(mut guard) = self.cached.write() {
             *guard = None;
         }
     }
 
+    fn clear_rejected_session_if_current(&self, rejected_refresh: &str) -> Result<(), LpmError> {
+        if get_refresh_token(&self.registry_url).as_deref() != Some(rejected_refresh) {
+            return Ok(());
+        }
+
+        crate::clear_login_state(&self.registry_url).map_err(|error| {
+            LpmError::Registry(format!("failed to clear rejected session: {error}"))
+        })?;
+        self.clear_cached_session();
+        Ok(())
+    }
+
     /// Perform the HTTP silent-refresh round-trip. Called inside the
     /// single-flight lock; never called directly from outside.
-    async fn do_silent_refresh(&self) -> Result<String, LpmError> {
-        let refresh_token = self.load_refresh_token()?;
-
+    async fn do_silent_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> Result<RefreshSessionResponse, LpmError> {
         let device_fingerprint = compute_device_fingerprint();
         let refresh_url = format!("{}/api/cli/refresh", self.registry_url);
 
@@ -666,43 +711,27 @@ impl SessionManager {
 
         if !resp.status().is_success() {
             tracing::debug!("silent refresh failed: {}", resp.status());
-            // 401 = refresh token authoritatively rejected
-            // (revoked / replay-killed / 90-day inactivity cleanup).
-            // We must wipe ALL local session state — access token,
-            // refresh token, expiry metadata, and the in-memory
-            // cache — otherwise the dead access token stays cached
-            // and every subsequent command keeps replaying it,
-            // each one re-entering this same failure loop.
-            //
-            // Without this wipe, a user with a revoked session would keep
-            // sending the dead bearer until manual `lpm logout`.
+            // A 401 authoritatively rejects the submitted refresh token.
+            // Clear the local session only while that exact token remains
+            // current; a peer may have durably rotated the shared session
+            // while this request was in flight.
             //
             // 5xx and network errors are transient — keep state
             // intact so the next attempt can recover.
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-                self.clear_session();
+                self.clear_rejected_session_if_current(refresh_token)?;
             }
             return Err(LpmError::SessionExpired);
         }
 
-        let data: serde_json::Value = resp
+        let data: RefreshSessionResponse = resp
             .json()
             .await
             .map_err(|e| LpmError::Registry(format!("refresh response parse: {e}")))?;
+        crate::validate_refresh_backed_session(&data.token, &data.refresh_token, &data.expires_at)
+            .map_err(LpmError::Registry)?;
 
-        let new_token = data["token"]
-            .as_str()
-            .ok_or_else(|| LpmError::Registry("refresh response missing token".into()))?
-            .to_string();
-
-        if let Some(rt) = data["refreshToken"].as_str() {
-            set_refresh_token(&self.registry_url, rt);
-        }
-        if let Some(ea) = data["expiresAt"].as_str() {
-            set_session_access_token_expiry(&self.registry_url, ea);
-        }
-
-        Ok(new_token)
+        Ok(data)
     }
 }
 
@@ -1502,8 +1531,68 @@ mod refresh_http_tests {
 
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::sync::Barrier;
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[derive(Clone)]
+    struct RotatingRefreshResponder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for RotatingRefreshResponder {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(50))
+                    .set_body_json(serde_json::json!({
+                        "token": "at-rotated",
+                        "refreshToken": "rt-rotated",
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                    }))
+            } else {
+                ResponseTemplate::new(401).set_delay(std::time::Duration::from_millis(150))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct BreakCredentialStoreBeforeSuccess {
+        credentials_path: std::path::PathBuf,
+    }
+
+    impl Respond for BreakCredentialStoreBeforeSuccess {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            std::fs::remove_file(&self.credentials_path)
+                .expect("remove credential file before refresh response");
+            std::fs::create_dir(&self.credentials_path)
+                .expect("replace credential file with an unwritable directory");
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PeerRotationBeforeUnauthorized {
+        registry_url: String,
+    }
+
+    impl Respond for PeerRotationBeforeUnauthorized {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            crate::persist_refresh_backed_session_unlocked(
+                &self.registry_url,
+                "at-peer",
+                "rt-peer",
+                "2099-01-01T00:00:00Z",
+            )
+            .expect("peer rotation should persist");
+            ResponseTemplate::new(401)
+        }
+    }
 
     /// Per-test isolation guard. Each test gets:
     ///
@@ -1590,6 +1679,163 @@ mod refresh_http_tests {
         assert_eq!(cached.unwrap().expose_secret(), "at-rotated");
     }
 
+    #[tokio::test]
+    async fn independent_managers_reuse_credentials_rotated_by_a_peer() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(RotatingRefreshResponder {
+                calls: Arc::clone(&calls),
+            })
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let manager_a = manager_for(&server.uri());
+        let manager_b = manager_for(&server.uri());
+        let barrier = Arc::new(Barrier::new(3));
+
+        let barrier_a = Arc::clone(&barrier);
+        let task_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            manager_a.refresh_now().await
+        });
+        let barrier_b = Arc::clone(&barrier);
+        let task_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            manager_b.refresh_now().await
+        });
+        barrier.wait().await;
+
+        let result_a = task_a.await.expect("first refresh task should finish");
+        let result_b = task_b.await.expect("second refresh task should finish");
+        let stored_access = crate::get_token(&server.uri());
+        let stored_refresh = crate::get_refresh_token(&server.uri());
+
+        assert!(
+            result_a.is_ok()
+                && result_b.is_ok()
+                && stored_access.as_deref() == Some("at-rotated")
+                && stored_refresh.as_deref() == Some("rt-rotated")
+                && calls.load(AtomicOrdering::SeqCst) == 1,
+            "both managers must reuse one durable rotation: result_a={result_a:?}, result_b={result_b:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}, calls={}",
+            calls.load(AtomicOrdering::SeqCst),
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_success_without_replacement_refresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server.uri()).refresh_now().await;
+
+        assert!(
+            result.is_err(),
+            "a rotating refresh response without its replacement token must fail: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_success_with_empty_access_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server.uri()).refresh_now().await;
+
+        assert!(
+            result.is_err(),
+            "an empty access token must never become the active bearer: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_success_with_invalid_expiry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "tomorrow",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server.uri()).refresh_now().await;
+
+        assert!(
+            result.is_err(),
+            "a malformed access-token expiry must fail closed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_fails_when_rotated_credentials_cannot_be_persisted() {
+        let server = MockServer::start().await;
+        let _isolated = isolate_test_env();
+        let manager = manager_for(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(BreakCredentialStoreBeforeSuccess {
+                credentials_path: crate::credentials_path()
+                    .expect("credentials path should resolve"),
+            })
+            .mount(&server)
+            .await;
+
+        let result = manager.refresh_now().await;
+
+        assert!(
+            result.is_err(),
+            "refresh must not report success unless the rotation is durable: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_unauthorized_does_not_delete_credentials_rotated_by_a_peer() {
+        let server = MockServer::start().await;
+        let _isolated = isolate_test_env();
+        let manager = manager_for(&server.uri());
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(PeerRotationBeforeUnauthorized {
+                registry_url: server.uri(),
+            })
+            .mount(&server)
+            .await;
+
+        let result = manager.refresh_now().await;
+        let stored_access = crate::get_token(&server.uri());
+        let stored_refresh = crate::get_refresh_token(&server.uri());
+
+        assert!(
+            result.is_err()
+                && stored_access.as_deref() == Some("at-peer")
+                && stored_refresh.as_deref() == Some("rt-peer"),
+            "a rejection of the old refresh token must preserve newer peer credentials: result={result:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}"
+        );
+    }
+
     /// A 401 from `/api/cli/refresh` must wipe **both** the refresh token
     /// AND the cached access token, so subsequent commands don't keep
     /// replaying a dead bearer (which causes a permanent auth-loop until
@@ -1670,6 +1916,7 @@ mod refresh_http_tests {
                     .set_body_json(serde_json::json!({
                         "token": "at-rotated",
                         "refreshToken": "rt-rotated",
+                        "expiresAt": "2099-01-01T00:00:00Z",
                     })),
             )
             .expect(1) // ← assertion: server hit exactly once

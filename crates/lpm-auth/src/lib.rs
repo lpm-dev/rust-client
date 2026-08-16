@@ -1051,6 +1051,15 @@ pub fn set_token_expiry(registry: &str, expires: &str) {
 
 /// Store the precise expiry for a short-lived session access token.
 pub fn set_session_access_token_expiry(registry: &str, expires_at: &str) {
+    if let Err(error) = set_session_access_token_expiry_checked(registry, expires_at) {
+        tracing::warn!("failed to store session access-token expiry: {error}");
+    }
+}
+
+pub(crate) fn set_session_access_token_expiry_checked(
+    registry: &str,
+    expires_at: &str,
+) -> Result<(), String> {
     let mut expiries = read_token_expiries();
     let entry = expiries.entry(registry.to_string()).or_default();
     entry.session_access_expires_at = Some(expires_at.to_string());
@@ -1059,16 +1068,22 @@ pub fn set_session_access_token_expiry(registry: &str, expires_at: &str) {
     entry.reminded_7d = false;
     entry.reminded_1d = false;
 
-    if let Some(path) = token_expiry_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&expiries)
-            && std::fs::write(&path, json).is_ok()
-        {
-            restrict_credential_metadata_perms(&path);
-        }
+    let path = token_expiry_path().ok_or("could not determine token-expiry path")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("mkdir error: {error}"))?;
     }
+    let json =
+        serde_json::to_string_pretty(&expiries).map_err(|error| format!("json error: {error}"))?;
+    std::fs::write(&path, json).map_err(|error| format!("write error: {error}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("permissions error: {error}"))?;
+    }
+
+    Ok(())
 }
 
 fn session_access_token_expiry(registry: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1218,6 +1233,97 @@ fn scoped_refresh_account(registry_url: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(registry_url.as_bytes());
     format!("{}:{}", REFRESH_ACCOUNT_PREFIX, hex::encode(&hash[..8]))
+}
+
+pub(crate) fn session_lock_path(registry_url: &str) -> Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+
+    let hash = Sha256::digest(registry_url.as_bytes());
+    let lpm_dir = lpm_dir()?;
+    let lock_dir = lpm_dir.join("locks");
+    std::fs::create_dir_all(&lock_dir).map_err(|error| format!("lock mkdir error: {error}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        std::fs::set_permissions(&lpm_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("lpm directory permissions error: {error}"))?;
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("lock directory permissions error: {error}"))?;
+
+        let path = lock_dir.join(format!("auth-session-{}.lock", hex::encode(&hash[..16])));
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("lock file create error: {error}"))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("lock file permissions error: {error}"))?;
+        Ok(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(lock_dir.join(format!("auth-session-{}.lock", hex::encode(&hash[..16]))))
+    }
+}
+
+fn validate_refresh_backed_session(
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: &str,
+) -> Result<(), String> {
+    if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
+        return Err("session response contained an empty credential".to_string());
+    }
+    chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|error| format!("invalid session access-token expiry: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn persist_refresh_backed_session_unlocked(
+    registry: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: &str,
+) -> Result<AuthStorageStatus, String> {
+    validate_refresh_backed_session(access_token, refresh_token, expires_at)?;
+
+    // The replacement refresh token is the recovery credential after the
+    // server consumes its predecessor, so it must become durable first.
+    let refresh_backend = set_refresh_token_with_backend(registry, refresh_token)?;
+    let access_backend = set_token_with_backend(registry, access_token)?;
+    set_session_access_token_expiry_checked(registry, expires_at)?;
+
+    Ok(AuthStorageStatus::from_backends(
+        Some(access_backend),
+        Some(refresh_backend),
+    ))
+}
+
+/// Store a complete refresh-backed session under the same per-registry lock
+/// used by silent refreshes.
+pub async fn store_refresh_backed_session(
+    registry: &str,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: &str,
+) -> Result<AuthStorageStatus, lpm_common::LpmError> {
+    validate_refresh_backed_session(access_token, refresh_token, expires_at)
+        .map_err(lpm_common::LpmError::Registry)?;
+    let lock_path = session_lock_path(registry).map_err(lpm_common::LpmError::Registry)?;
+
+    lpm_common::paths::with_exclusive_lock_async(lock_path, async {
+        persist_refresh_backed_session_unlocked(registry, access_token, refresh_token, expires_at)
+            .map_err(|error| {
+                lpm_common::LpmError::Registry(format!("failed to store refresh session: {error}"))
+            })
+    })
+    .await
 }
 
 /// Store a refresh token for a registry (keychain first, encrypted file fallback).
@@ -2052,10 +2158,8 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
         if encrypted.is_empty() {
             serde_json::json!({})
         } else {
-            decrypt(encrypted)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({}))
+            let decrypted = decrypt(encrypted)?;
+            serde_json::from_str(&decrypted).map_err(|error| format!("json error: {error}"))?
         }
     } else {
         serde_json::json!({})
@@ -2110,9 +2214,9 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let json_str = decrypt(encrypted).unwrap_or_else(|_| "{}".to_string());
+    let json_str = decrypt(encrypted)?;
     let mut store: serde_json::Value =
-        serde_json::from_str(&json_str).unwrap_or(serde_json::json!({}));
+        serde_json::from_str(&json_str).map_err(|error| format!("json error: {error}"))?;
 
     if let Some(obj) = store.as_object_mut() {
         obj.remove(registry_url);
@@ -2259,6 +2363,70 @@ mod tests {
             Ok(value) => value,
             Err(payload) => resume_unwind(payload),
         }
+    }
+
+    #[test]
+    fn credential_update_preserves_unreadable_encrypted_store() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let path = credentials_path().expect("credentials path should resolve");
+            let original = b"not-valid-ciphertext";
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            std::fs::write(&path, original).expect("write malformed credential store");
+
+            let result = set_token_in_file("https://registry.example", "replacement-token");
+            let after = std::fs::read(&path).expect("read credential store after failed update");
+
+            assert!(
+                result.is_err() && after == original,
+                "an unreadable credential store must fail closed without changing its bytes: result={result:?}, after={after:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn credential_clear_preserves_store_with_invalid_json() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            let original = encrypt("not-json").expect("encrypt malformed JSON fixture");
+            std::fs::write(&path, &original).expect("write malformed credential store");
+
+            let result = clear_token_from_file("https://registry.example");
+            let after =
+                std::fs::read_to_string(&path).expect("read credential store after failed clear");
+
+            assert!(
+                result.is_err() && after == original,
+                "invalid credential JSON must fail closed without changing its bytes: result={result:?}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_lock_uses_owner_only_file_and_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_home(|_| {
+            let path = session_lock_path("https://registry.example")
+                .expect("session lock path should initialize");
+            let file_mode = std::fs::metadata(&path)
+                .expect("session lock file should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            let directory_mode = std::fs::metadata(path.parent().expect("lock path has parent"))
+                .expect("session lock directory should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+
+            assert_eq!((file_mode, directory_mode), (0o600, 0o700));
+        });
     }
 
     #[test]
