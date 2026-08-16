@@ -268,7 +268,7 @@ jobs:
     needs: release-metadata
     if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -276,6 +276,7 @@ jobs:
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -290,6 +291,43 @@ jobs:
       - name: Install Linux keyring build deps
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
 
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Cargo dependency policy
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          rust-version: ${{ env.RUST_TOOLCHAIN }}
+          command: check
+          arguments: --all-features
+          command-arguments: --hide-inclusion-graph advisories bans licenses
+
+      - name: Reject fancy-regex (ReDoS prevention)
+        run: |
+          if grep -r 'fancy-regex' crates/*/Cargo.toml; then
+            echo "::error::fancy-regex found in Cargo.toml dependencies. The regex crate (linear-time) must be used for scanning untrusted input."
+            exit 1
+          fi
+          echo "✓ No fancy-regex dependencies found"
+
+      - name: install.sh smoke tests
+        run: sh tests/install-sh/run.sh
+
+      - name: Audit harness helper tests
+        run: bash bench/test-audit-install-args.sh
+
+      - name: Local install bench helper tests
+        run: bash bench/test-local-install.sh
+
+      - name: Live metadata route bench helper tests
+        run: bash bench/test-live-metadata-route.sh
+
+      - name: README bench helper tests
+        run: bash bench/test-run-readme.sh
+
       - name: Install nextest
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
 
@@ -297,6 +335,18 @@ jobs:
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
+
+      - name: Install readiness bench helper tests
+        run: node bench/scripts/run-install-readiness.mjs --self-test
+
+      - name: Runtime readiness bench helper tests
+        run: node bench/scripts/run-runtime-readiness.mjs --self-test
+
+      - name: npm wrapper tests
+        run: npm --prefix npm/cli test
+
+      - name: npm wrapper pack check
+        run: npm --prefix npm/cli run pack:check
 
       - name: Cache npm (Verdaccio test harness)
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
