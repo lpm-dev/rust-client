@@ -187,6 +187,43 @@ struct RefreshSessionResponse {
     expires_at: String,
 }
 
+const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
+
+async fn parse_capped_refresh_response(
+    mut response: reqwest::Response,
+) -> Result<RefreshSessionResponse, LpmError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REFRESH_RESPONSE_BYTES as u64)
+    {
+        return Err(LpmError::Registry(
+            "refresh response exceeded the 64 KiB limit".to_string(),
+        ));
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(1024)
+            .min(MAX_REFRESH_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| LpmError::Registry(format!("refresh response read: {error}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_REFRESH_RESPONSE_BYTES {
+            return Err(LpmError::Registry(
+                "refresh response exceeded the 64 KiB limit".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body)
+        .map_err(|error| LpmError::Registry(format!("refresh response parse: {error}")))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RefreshState {
     NotRefreshable,
@@ -724,10 +761,7 @@ impl SessionManager {
             return Err(LpmError::SessionExpired);
         }
 
-        let data: RefreshSessionResponse = resp
-            .json()
-            .await
-            .map_err(|e| LpmError::Registry(format!("refresh response parse: {e}")))?;
+        let data = parse_capped_refresh_response(resp).await?;
         crate::validate_refresh_backed_session(&data.token, &data.refresh_token, &data.expires_at)
             .map_err(LpmError::Registry)?;
 
@@ -1532,6 +1566,7 @@ mod refresh_http_tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Barrier;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -1655,6 +1690,53 @@ mod refresh_http_tests {
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
         }
+    }
+
+    async fn spawn_chunked_refresh_server(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked refresh server");
+        let address = listener.local_addr().expect("read chunked server address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept refresh request");
+            let mut request = Vec::with_capacity(1024);
+            let mut scratch = [0_u8; 1024];
+            loop {
+                let count = stream
+                    .read(&mut scratch)
+                    .await
+                    .expect("read refresh request");
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&scratch[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for chunk in body.chunks(4096) {
+                let prefix = format!("{:X}\r\n", chunk.len());
+                if stream.write_all(prefix.as_bytes()).await.is_err()
+                    || stream.write_all(chunk).await.is_err()
+                    || stream.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        (format!("http://{address}"), task)
     }
 
     #[tokio::test]
@@ -1786,6 +1868,50 @@ mod refresh_http_tests {
         assert!(
             result.is_err(),
             "a malformed access-token expiry must fail closed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_success_response_above_64_kib() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+                "padding": "x".repeat(64 * 1024),
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server.uri()).refresh_now().await;
+
+        assert!(
+            matches!(&result, Err(LpmError::Registry(message)) if message.contains("64 KiB")),
+            "an oversized refresh response must fail at the byte limit: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_chunked_success_response_above_64_kib() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "token": "at-rotated",
+            "refreshToken": "rt-rotated",
+            "expiresAt": "2099-01-01T00:00:00Z",
+            "padding": "x".repeat(64 * 1024),
+        }))
+        .expect("encode oversized refresh response");
+        let (server_url, server_task) = spawn_chunked_refresh_server(body).await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server_url).refresh_now().await;
+        server_task.await.expect("chunked refresh server task");
+
+        assert!(
+            matches!(&result, Err(LpmError::Registry(message)) if message.contains("64 KiB")),
+            "a chunked oversized refresh response must fail at the byte limit: {result:?}"
         );
     }
 
