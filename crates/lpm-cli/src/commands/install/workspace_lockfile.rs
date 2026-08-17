@@ -431,6 +431,34 @@ struct WorkspaceLockfileTransaction {
 tokio::task_local! {
     static ACTIVE_TARGET: WorkspaceLockfileTarget;
     static ACTIVE_TRANSACTION: WorkspaceLockfileTransaction;
+    static ACTIVE_PROJECT_INSTALL_ROOT: PathBuf;
+}
+
+pub(super) async fn with_project_install_lock<F, T>(
+    project_root: &Path,
+    future: F,
+) -> Result<T, LpmError>
+where
+    F: Future<Output = Result<T, LpmError>>,
+{
+    let canonical_root = project_root.canonicalize().map_err(LpmError::Io)?;
+    if let Ok(active_root) = ACTIVE_PROJECT_INSTALL_ROOT.try_with(Clone::clone) {
+        if active_root != canonical_root {
+            return Err(LpmError::Script(format!(
+                "nested install transaction changed project root ({} -> {}); retry the command",
+                active_root.display(),
+                canonical_root.display(),
+            )));
+        }
+        return future.await;
+    }
+
+    let lock_path = lpm_common::project_install_lock(&canonical_root);
+    let transaction = ACTIVE_PROJECT_INSTALL_ROOT.scope(canonical_root.clone(), async {
+        crate::release_plan::ensure_no_pending_release_transaction(&canonical_root)?;
+        future.await
+    });
+    lpm_common::with_exclusive_lock_async(lock_path, transaction).await
 }
 
 pub(super) async fn scope<F, T>(
@@ -470,11 +498,13 @@ where
         let importer = importer_key(&root, project_dir)?;
         return scope(coordinator, Arc::<str>::from(importer), future).await;
     }
-    let Some(initial_workspace) = discover_workspace(project_dir)? else {
+    if ACTIVE_PROJECT_INSTALL_ROOT.try_with(|_| ()).is_ok() {
         return future.await;
+    }
+    let Some(initial_workspace) = discover_workspace(project_dir)? else {
+        return with_project_install_lock(project_dir, future).await;
     };
     let workspace_root = initial_workspace.root;
-    let workspace_lock = lpm_common::project_install_lock(&workspace_root);
     let transaction = async {
         let workspace = discover_workspace(project_dir)?
             .ok_or_else(|| workspace_changed_while_waiting(&workspace_root, None))?;
@@ -507,7 +537,7 @@ where
         }
         Ok(result)
     };
-    lpm_common::with_exclusive_lock_async(workspace_lock, transaction).await
+    with_project_install_lock(&workspace_root, transaction).await
 }
 
 pub(crate) async fn scope_workspace_mutation<F, T>(
@@ -542,12 +572,13 @@ where
     F: Future<Output = Result<T, LpmError>>,
 {
     let future = Box::pin(future);
-    if ACTIVE_TRANSACTION.try_with(|_| ()).is_ok() {
+    if ACTIVE_TRANSACTION.try_with(|_| ()).is_ok()
+        || ACTIVE_PROJECT_INSTALL_ROOT.try_with(|_| ()).is_ok()
+    {
         return future.await;
     }
 
     let Some(initial_workspace) = discover_workspace(cwd)? else {
-        let project_lock = lpm_common::project_install_lock(cwd);
         let transaction = async {
             if let Some(workspace) = discover_workspace(cwd)? {
                 return Err(LpmError::Script(format!(
@@ -557,11 +588,10 @@ where
             }
             future.await
         };
-        return lpm_common::with_exclusive_lock_async(project_lock, transaction).await;
+        return with_project_install_lock(cwd, transaction).await;
     };
 
     let workspace_root = initial_workspace.root;
-    let workspace_lock = lpm_common::project_install_lock(&workspace_root);
     let transaction = async {
         let workspace = discover_workspace(cwd)?
             .ok_or_else(|| workspace_changed_while_waiting(&workspace_root, None))?;
@@ -610,7 +640,7 @@ where
         }
         Ok(result)
     };
-    lpm_common::with_exclusive_lock_async(workspace_lock, transaction).await
+    with_project_install_lock(&workspace_root, transaction).await
 }
 
 fn discover_workspace(project_dir: &Path) -> Result<Option<lpm_workspace::Workspace>, LpmError> {

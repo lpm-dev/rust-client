@@ -38,11 +38,9 @@ pub(crate) struct ReleasePublishOptions {
     pub(crate) provenance_file: Option<PathBuf>,
 }
 
-struct PublishMember {
-    idx: usize,
-    name: String,
-    version: String,
-    already_published: bool,
+struct ReleasePublishMember {
+    path: PathBuf,
+    intent: publish::PublishIntent,
 }
 
 pub(crate) fn plan(
@@ -51,7 +49,7 @@ pub(crate) fn plan(
     bump: Option<&VersionBump>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let plan = build_plan(project_dir, selection, bump)?;
+    let plan = build_plan_read_only(project_dir, selection, bump)?;
     emit_plan(&plan, true, json_output)
 }
 
@@ -62,19 +60,79 @@ pub(crate) fn apply(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let plan = if dry_run {
-        build_plan(project_dir, selection, bump)?
-    } else {
+    if dry_run {
+        return emit_plan(
+            &build_plan_read_only(project_dir, selection, bump)?,
+            true,
+            json_output,
+        );
+    }
+
+    let initial_workspace = discover_release_workspace(project_dir)?;
+    let initial_root = initial_workspace
+        .root
+        .canonicalize()
+        .map_err(LpmError::Io)?;
+    let allowed_manifests = release_workspace_manifest_paths(&initial_workspace, true);
+    let transaction_operation = release_apply_transaction_operation(selection, bump)?;
+    let lock_path = lpm_common::project_install_lock(&initial_root);
+    let plan = lpm_common::with_exclusive_lock(lock_path, || {
+        if matches!(
+            release_plan::recover_pending_operation_transaction(
+                &initial_root,
+                &allowed_manifests,
+                &transaction_operation,
+            )?,
+            release_plan::ReleaseOperationRecoveryOutcome::Completed { .. }
+        ) {
+            return Ok(None);
+        }
         let workspace = discover_release_workspace(project_dir)?;
-        let lock_path = lpm_common::project_install_lock(&workspace.root);
-        lpm_common::with_exclusive_lock(lock_path, || {
-            let plan = build_plan_for_workspace(&workspace, selection, bump)?;
-            let planned = plan.planned_manifests()?;
-            release_plan::write_planned_manifests(&planned)?;
-            Ok(plan)
-        })?
-    };
-    emit_plan(&plan, dry_run, json_output)
+        ensure_workspace_root_unchanged(&initial_root, &workspace.root)?;
+        let plan = build_plan_for_workspace(&workspace, selection, bump)?;
+        let planned = plan.planned_manifests()?;
+        release_plan::write_planned_manifests(&workspace.root, &planned, transaction_operation)?;
+        Ok(Some(plan))
+    })?;
+    match plan {
+        Some(plan) => emit_plan(&plan, false, json_output),
+        None if json_output => {
+            println!(
+                "{}",
+                output::format_json_answer(&serde_json::json!({
+                    "success": true,
+                    "dry_run": false,
+                    "recovered": true,
+                }))?
+            );
+            Ok(())
+        }
+        None => {
+            install_ui::done("Recovered completed release apply");
+            Ok(())
+        }
+    }
+}
+
+fn release_apply_transaction_operation(
+    selection: &ReleaseSelection,
+    bump: Option<&VersionBump>,
+) -> Result<release_plan::ReleaseTransactionOperation, LpmError> {
+    let identity = serde_json::to_vec(&serde_json::json!({
+        "all": selection.all,
+        "affected": selection.affected,
+        "base": selection.base,
+        "filter": selection.filter,
+        "filter_prod": selection.filter_prod,
+        "changed_files_ignore_pattern": selection.changed_files_ignore_pattern,
+        "test_pattern": selection.test_pattern,
+        "fail_if_no_match": selection.fail_if_no_match,
+        "bump": bump.map(VersionBump::as_str),
+    }))?;
+    Ok(release_plan::ReleaseTransactionOperation::new(
+        release_plan::ReleaseTransactionOperationKind::ReleaseApply,
+        &identity,
+    ))
 }
 
 pub(crate) async fn publish(
@@ -84,23 +142,91 @@ pub(crate) async fn publish(
     options: &ReleasePublishOptions,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let workspace = discover_release_workspace(project_dir)?;
+    let initial_root = workspace.root.canonicalize().map_err(LpmError::Io)?;
+    let allowed_manifests = release_workspace_manifest_paths(&workspace, true);
+    let install_lock = lpm_common::project_install_lock(&initial_root);
+    let plan = plan_release_publish_under_workspace_lock(
+        project_dir,
+        selection,
+        options,
+        initial_root.clone(),
+        allowed_manifests,
+    );
+    let members = if options.dry_run {
+        lpm_common::with_shared_lock_async(install_lock.clone(), plan).await?
+    } else {
+        lpm_common::with_exclusive_lock_async(install_lock.clone(), plan).await?
+    };
+    let publish_lock = lpm_common::project_publish_lock(&initial_root);
+    lpm_common::with_exclusive_lock_async(
+        publish_lock,
+        publish_intent_members(
+            client,
+            &initial_root,
+            install_lock,
+            members,
+            options,
+            json_output,
+        ),
+    )
+    .await
+}
+
+async fn plan_release_publish_under_workspace_lock(
+    project_dir: &Path,
+    selection: &ReleaseSelection,
+    options: &ReleasePublishOptions,
+    initial_root: PathBuf,
+    allowed_manifests: Vec<PathBuf>,
+) -> Result<Vec<ReleasePublishMember>, LpmError> {
+    if options.dry_run {
+        release_plan::ensure_no_pending_release_transaction(&initial_root)?;
+    } else {
+        release_plan::recover_pending_release_transaction(&initial_root, &allowed_manifests)?;
+    }
     let (workspace, graph, selected) = resolve_workspace_selection(project_dir, selection)?;
+    ensure_workspace_root_unchanged(&initial_root, &workspace.root)?;
     release_plan::validate_workspace_internal_ranges(&workspace)?;
     let selected = release_plan::ensure_unique_selection(&selected);
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
     let publish_order = release_plan::sorted_selected_indices(&graph, &selected_set)?;
     let mut members = Vec::with_capacity(publish_order.len());
     for idx in publish_order {
-        members
-            .push(publish_member_preflight(client, &workspace.members[idx], idx, options).await?);
+        let member = &workspace.members[idx];
+        let path = member.path.canonicalize().map_err(LpmError::Io)?;
+        let intent = publish::plan_publish_intent(
+            &member.path,
+            &workspace,
+            options.npm,
+            options.lpm,
+            options.github,
+            options.gitlab,
+            options.publish_registry.as_deref(),
+        )?;
+        members.push(ReleasePublishMember { path, intent });
     }
-    let mut results = Vec::with_capacity(members.len());
+    Ok(members)
+}
 
-    for publish_member in &members {
-        let member = &workspace.members[publish_member.idx];
-        let name = publish_member.name.as_str();
-        let version = publish_member.version.as_str();
-        if publish_member.already_published {
+async fn publish_intent_members(
+    client: &RegistryClient,
+    initial_root: &Path,
+    install_lock: PathBuf,
+    members: Vec<ReleasePublishMember>,
+    options: &ReleasePublishOptions,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let mut results = Vec::with_capacity(members.len());
+    let mut already_published = Vec::with_capacity(members.len());
+    for member in &members {
+        already_published.push(publish_member_preflight(client, &member.intent).await?);
+    }
+
+    for (index, (member, is_published)) in members.iter().zip(&already_published).enumerate() {
+        let name = member.intent.package_name().to_string();
+        let version = member.intent.package_version().to_string();
+        if *is_published {
             results.push(serde_json::json!({
                 "name": name,
                 "version": version,
@@ -114,6 +240,30 @@ pub(crate) async fn publish(
             continue;
         }
 
+        let prepared = match prepare_release_publish_member(
+            initial_root,
+            install_lock.clone(),
+            member,
+            options,
+            json_output,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let error_summary = release_publish_error_summary(&error);
+                append_failed_and_unattempted_results(
+                    &mut results,
+                    member,
+                    &members[index + 1..],
+                    &error_summary,
+                    &[],
+                );
+                emit_release_publish_results(&results, members.len(), options, json_output, false)?;
+                return Err(LpmError::ExitCode(1));
+            }
+        };
+
         if options.dry_run {
             results.push(serde_json::json!({
                 "name": name,
@@ -121,14 +271,166 @@ pub(crate) async fn publish(
                 "path": member.path,
                 "status": "planned",
             }));
+            drop(prepared);
             continue;
         }
 
-        let _stdout = output::suppress_stdout(json_output).map_err(LpmError::Script)?;
-        publish::run(
-            client,
+        let publish_result: Result<publish::PublishExecutionReport, LpmError> =
+            publish::execute_prepared_for_release(client, prepared).await;
+        match publish_result {
+            Ok(report) if report.success => {}
+            Ok(report) => {
+                append_failed_and_unattempted_results(
+                    &mut results,
+                    member,
+                    &members[index + 1..],
+                    "one or more publish targets failed",
+                    &report.results,
+                );
+                emit_release_publish_results(&results, members.len(), options, json_output, false)?;
+                return Err(LpmError::ExitCode(1));
+            }
+            Err(error) => {
+                let error_summary = release_publish_error_summary(&error);
+                append_failed_and_unattempted_results(
+                    &mut results,
+                    member,
+                    &members[index + 1..],
+                    &error_summary,
+                    &[],
+                );
+                emit_release_publish_results(&results, members.len(), options, json_output, false)?;
+                return Err(LpmError::ExitCode(1));
+            }
+        }
+        results.push(serde_json::json!({
+            "name": name,
+            "version": version,
+            "path": member.path,
+            "status": "published",
+        }));
+    }
+
+    emit_release_publish_results(&results, members.len(), options, json_output, true)
+}
+
+fn append_failed_and_unattempted_results(
+    results: &mut Vec<serde_json::Value>,
+    failed: &ReleasePublishMember,
+    remaining: &[ReleasePublishMember],
+    error: &str,
+    target_results: &[serde_json::Value],
+) {
+    let mut failed_result = serde_json::json!({
+        "name": failed.intent.package_name(),
+        "version": failed.intent.package_version(),
+        "path": failed.path,
+        "status": "failed",
+        "error": error,
+    });
+    if !target_results.is_empty() {
+        failed_result["targets"] = serde_json::Value::Array(target_results.to_vec());
+    }
+    results.push(failed_result);
+    results.reserve(remaining.len());
+    for member in remaining {
+        results.push(serde_json::json!({
+            "name": member.intent.package_name(),
+            "version": member.intent.package_version(),
+            "path": member.path,
+            "status": "not_attempted",
+            "reason": "a previous package failed",
+        }));
+    }
+}
+
+fn release_publish_error_summary(error: &LpmError) -> String {
+    match error {
+        LpmError::ExitCode(_) => "one or more publish targets failed".to_string(),
+        error => lpm_common::sanitize_terminal_inline(&error.to_string())
+            .chars()
+            .take(500)
+            .collect(),
+    }
+}
+
+fn emit_release_publish_results(
+    results: &[serde_json::Value],
+    package_count: usize,
+    options: &ReleasePublishOptions,
+    json_output: bool,
+    success: bool,
+) -> Result<(), LpmError> {
+    let published = results
+        .iter()
+        .filter(|result| result["status"] == "published")
+        .count();
+    let warning = (!success).then_some({
+        if published > 0 {
+            "Publishing is not transactional. Successful uploads were not rolled back; retry only failed and not-attempted packages."
+        } else {
+            "Publishing stopped before all selected packages were processed; retry failed and not-attempted packages."
+        }
+    });
+    let mut json = serde_json::json!({
+        "success": success,
+        "dry_run": options.dry_run,
+        "packages": package_count,
+        "results": results,
+    });
+    if let Some(warning) = warning {
+        json["warning"] = serde_json::Value::String(warning.to_string());
+    }
+    if json_output {
+        println!("{}", output::format_json_answer(&json)?);
+    } else {
+        if !success {
+            for result in results.iter().filter(|result| result["status"] == "failed") {
+                let name = result["name"].as_str().unwrap_or("package");
+                let version = result["version"].as_str().unwrap_or("unknown");
+                let error = result["error"].as_str().unwrap_or("publish failed");
+                install_ui::failed_untrusted(&format!("{name}@{version}: {error}"));
+            }
+        }
+        if let Some(warning) = warning {
+            install_ui::warn_untrusted(warning);
+        } else {
+            install_ui::done_untrusted(&format!(
+                "release publish processed {package_count} packages"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_release_publish_member(
+    initial_root: &Path,
+    install_lock: PathBuf,
+    member: &ReleasePublishMember,
+    options: &ReleasePublishOptions,
+    json_output: bool,
+) -> Result<publish::PreparedPublish, LpmError> {
+    let prepare = async {
+        let workspace = discover_release_workspace(initial_root)?;
+        ensure_workspace_root_unchanged(initial_root, &workspace.root)?;
+        release_plan::validate_workspace_internal_ranges(&workspace)?;
+        let remains_a_member = workspace.members.iter().any(|current| {
+            current
+                .path
+                .canonicalize()
+                .is_ok_and(|path| path == member.path)
+        });
+        if !remains_a_member {
+            return Err(LpmError::Registry(format!(
+                "{} changed after release publish preflight; retry the command",
+                member.path.display()
+            )));
+        }
+        publish::prepare_intent_with_workspace_lock_held(
             &member.path,
-            false,
+            &workspace,
+            &member.intent,
+            options.dry_run,
             false,
             false,
             None,
@@ -146,56 +448,37 @@ pub(crate) async fn publish(
             options.no_provenance,
             options.provenance_file.as_deref(),
         )
-        .await?;
-        results.push(serde_json::json!({
-            "name": name,
-            "version": version,
-            "path": member.path,
-            "status": "published",
-        }));
-    }
-
-    let json = serde_json::json!({
-        "success": true,
-        "dry_run": options.dry_run,
-        "packages": results.len(),
-        "results": results,
-    });
-    if json_output {
-        println!("{}", output::format_json_answer(&json)?);
+        .await
+    };
+    if options.dry_run {
+        lpm_common::with_shared_lock_async(install_lock, prepare).await
     } else {
-        install_ui::done_untrusted(&format!(
-            "release publish processed {} packages",
-            results.len()
-        ));
+        lpm_common::with_exclusive_lock_async(install_lock, prepare).await
     }
-    Ok(())
 }
 
 async fn publish_member_preflight(
     client: &RegistryClient,
-    member: &lpm_workspace::WorkspaceMember,
-    idx: usize,
-    options: &ReleasePublishOptions,
-) -> Result<PublishMember, LpmError> {
-    let manifest = publish::read_publish_manifest(&member.path)?;
-    let name = manifest.name.clone();
-    let version = manifest.version.clone();
-    let target_names = resolved_publish_target_names(&manifest, options)?;
+    publish: &publish::PublishIntent,
+) -> Result<bool, LpmError> {
+    let name = publish.package_name();
+    let version = publish.package_version();
     let mut checked_targets = 0usize;
     let mut existing_targets = Vec::new();
+    let mut target_count = 0usize;
 
-    for (target, target_name) in &target_names {
+    for (target, target_name) in publish.resolved_targets() {
+        target_count += 1;
         match target {
             publish::PublishTarget::Lpm => {
                 checked_targets += 1;
-                if lpm_version_exists(client, target_name, &version).await? {
+                if lpm_version_exists(client, target_name, version).await? {
                     existing_targets.push(target.display_name().to_string());
                 }
             }
             publish::PublishTarget::Npm => {
                 checked_targets += 1;
-                if npm_version_exists(client, target_name, &version).await? {
+                if npm_version_exists(client, target_name, version).await? {
                     existing_targets.push(target.display_name().to_string());
                 }
             }
@@ -205,7 +488,7 @@ async fn publish_member_preflight(
         }
     }
 
-    let already_published = checked_targets > 0 && existing_targets.len() == target_names.len();
+    let already_published = checked_targets > 0 && existing_targets.len() == target_count;
     if !already_published && !existing_targets.is_empty() {
         return Err(LpmError::Registry(format!(
             "{}@{} already exists on {}; release publish cannot partially skip targets. Re-run with a narrower publish target.",
@@ -215,44 +498,55 @@ async fn publish_member_preflight(
         )));
     }
 
-    Ok(PublishMember {
-        idx,
-        name,
-        version,
-        already_published,
-    })
+    Ok(already_published)
 }
 
-fn resolved_publish_target_names(
-    manifest: &publish::PublishManifest,
-    options: &ReleasePublishOptions,
-) -> Result<Vec<(publish::PublishTarget, String)>, LpmError> {
-    let targets = publish::resolve_targets(
-        options.npm,
-        options.lpm,
-        options.github,
-        options.gitlab,
-        options.publish_registry.as_deref(),
-        manifest.publish_config.as_ref(),
-    )?;
-    let mut names = publish::resolve_target_names(manifest, &targets)?;
-    let mut out = Vec::with_capacity(targets.len());
-    for target in targets {
-        let resolved = names.remove(&target.key()).ok_or_else(|| {
-            LpmError::Registry(format!("no name resolved for {}", target.display_name()))
-        })?;
-        out.push((target, resolved));
-    }
-    Ok(out)
-}
-
-fn build_plan(
+fn build_plan_read_only(
     project_dir: &Path,
     selection: &ReleaseSelection,
     bump: Option<&VersionBump>,
 ) -> Result<ReleasePlan, LpmError> {
-    let workspace = discover_release_workspace(project_dir)?;
-    build_plan_for_workspace(&workspace, selection, bump)
+    let initial_workspace = discover_release_workspace(project_dir)?;
+    let initial_root = initial_workspace
+        .root
+        .canonicalize()
+        .map_err(LpmError::Io)?;
+    let lock_path = lpm_common::project_install_lock(&initial_root);
+    lpm_common::with_shared_lock(lock_path, || {
+        release_plan::ensure_no_pending_release_transaction(&initial_root)?;
+        let workspace = discover_release_workspace(project_dir)?;
+        ensure_workspace_root_unchanged(&initial_root, &workspace.root)?;
+        build_plan_for_workspace(&workspace, selection, bump)
+    })
+}
+
+pub(crate) fn release_workspace_manifest_paths(
+    workspace: &lpm_workspace::Workspace,
+    include_root: bool,
+) -> Vec<PathBuf> {
+    let mut manifests = Vec::with_capacity(workspace.members.len() + usize::from(include_root));
+    if include_root {
+        manifests.push(workspace.root.join("package.json"));
+    }
+    manifests.extend(
+        workspace
+            .members
+            .iter()
+            .map(|member| member.path.join("package.json")),
+    );
+    manifests
+}
+
+fn ensure_workspace_root_unchanged(expected: &Path, actual: &Path) -> Result<(), LpmError> {
+    let actual = actual.canonicalize().map_err(LpmError::Io)?;
+    if actual != expected {
+        return Err(LpmError::Script(format!(
+            "release workspace root changed while waiting for the transaction lock ({} -> {}); retry the command",
+            expected.display(),
+            actual.display()
+        )));
+    }
+    Ok(())
 }
 
 fn build_plan_for_workspace(

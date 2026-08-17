@@ -4,13 +4,11 @@ use crate::{install_ui, quality};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
-use std::path::Path;
 
 /// Publish to the LPM registry (existing behavior).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_to_lpm(
     client: &RegistryClient,
-    project_dir: &Path,
     name: &str,
     version: &str,
     readme: &Option<String>,
@@ -18,13 +16,12 @@ pub(super) async fn publish_to_lpm(
     tarball_files: &[TarballFile],
     version_data: &serde_json::Value,
     quality_result: &Option<quality::QualityResult>,
+    lpm_config: &Option<serde_json::Value>,
     provided_otp: Option<&str>,
     json_output: bool,
     detected_ecosystem: &str,
     swift_manifest: &Option<serde_json::Value>,
 ) -> Result<serde_json::Value, LpmError> {
-    let lpm_config = super::prepare::read_optional_lpm_config(project_dir)?;
-
     // Credentials must not travel over plain HTTP for LPM publish.
     let registry_url = client.base_url();
     if !registry_url.starts_with("https://")
@@ -110,7 +107,7 @@ pub(super) async fn publish_to_lpm(
 
     // Read lpm.config.json for version payload
     if let Some(config) = lpm_config {
-        lpm_version["_lpmConfig"] = config;
+        lpm_version["_lpmConfig"] = config.clone();
     }
 
     if detected_ecosystem != "js" {

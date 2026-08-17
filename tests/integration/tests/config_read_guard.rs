@@ -83,7 +83,11 @@ const AUDITED_CONFIGURATION_LOADERS: &[&str] = &[
     "crates/lpm-cli/src/manifest_tx.rs",
     "crates/lpm-cli/src/release_age_config.rs",
     "crates/lpm-cli/src/release_lookup.rs",
-    "crates/lpm-cli/src/release_plan.rs",
+    "crates/lpm-cli/src/release_plan/mod.rs",
+    "crates/lpm-cli/src/release_plan/planning.rs",
+    "crates/lpm-cli/src/release_plan/transaction/fs.rs",
+    "crates/lpm-cli/src/release_plan/transaction/mod.rs",
+    "crates/lpm-cli/src/release_plan/version_git.rs",
     "crates/lpm-cli/src/sandbox_config.rs",
     "crates/lpm-cli/src/save_config.rs",
     "crates/lpm-cli/src/script_policy_config.rs",
@@ -212,6 +216,14 @@ impl RawReadAudit {
                 "crates/lpm-cli/src/commands/install/state.rs",
                 "write_post_install_hash",
                 "std::fs::read_to_string"
+            ) | (
+                "crates/lpm-cli/src/release_plan/transaction/fs.rs",
+                "read_private_state_file_capped",
+                ".read_to_end"
+            ) | (
+                "crates/lpm-cli/src/release_plan/transaction/fs.rs",
+                "read_manifest_target",
+                ".read_to_end"
             ) | (
                 "crates/lpm-cli/src/commands/install/state.rs",
                 "dependency_engine_freshness_key_for_state",

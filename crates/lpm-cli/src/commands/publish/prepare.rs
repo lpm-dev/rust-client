@@ -21,7 +21,30 @@ pub(crate) fn prepare_publish_project(
     scan_secrets: bool,
 ) -> Result<PublishProject, LpmError> {
     let manifest = read_publish_manifest(project_dir)?;
-    prepare_publish_project_from_manifest(project_dir, manifest, scan_secrets)
+    let workspace = discover_workspace_for_publish(project_dir, &manifest)?;
+    prepare_publish_project_from_manifest(project_dir, manifest, workspace.as_ref(), scan_secrets)
+}
+
+pub(super) fn discover_workspace_for_publish(
+    project_dir: &Path,
+    manifest: &PublishManifest,
+) -> Result<Option<lpm_workspace::Workspace>, LpmError> {
+    if !publish_common::package_json_requires_workspace_projection(
+        manifest.package_json_content.as_bytes(),
+    ) {
+        return Ok(None);
+    }
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    workspace.map_or_else(
+        || {
+            Err(LpmError::Registry(
+                "package.json uses workspace: or catalog: dependencies outside a workspace"
+                    .to_string(),
+            ))
+        },
+        |workspace| Ok(Some(workspace)),
+    )
 }
 
 pub(crate) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifest, LpmError> {
@@ -136,6 +159,7 @@ fn valid_semver_identifiers(identifiers: &str, allow_numeric_leading_zeroes: boo
 pub(super) fn prepare_publish_project_from_manifest(
     project_dir: &Path,
     manifest: PublishManifest,
+    workspace: Option<&lpm_workspace::Workspace>,
     scan_secrets: bool,
 ) -> Result<PublishProject, LpmError> {
     let PublishManifest {
@@ -148,16 +172,21 @@ pub(super) fn prepare_publish_project_from_manifest(
         publish_config,
     } = manifest;
     let readme = publish_common::read_readme(project_dir);
-    let workspace = lpm_workspace::discover_workspace(project_dir)
-        .ok()
-        .flatten();
     let mut prepared_package_json =
         package_json_override.unwrap_or_else(|| package_json_content.into_bytes());
-    if let Some(ref ws) = workspace
-        && let Some(rewritten) =
-            publish_common::rewrite_workspace_deps_in_package_json(&prepared_package_json, ws)?
-    {
-        prepared_package_json = rewritten;
+    if publish_common::package_json_requires_workspace_projection(&prepared_package_json) {
+        let workspace = workspace.ok_or_else(|| {
+            LpmError::Registry(
+                "package.json uses workspace: or catalog: dependencies outside a workspace"
+                    .to_string(),
+            )
+        })?;
+        if let Some(rewritten) = publish_common::rewrite_workspace_deps_in_package_json(
+            &prepared_package_json,
+            workspace,
+        )? {
+            prepared_package_json = rewritten;
+        }
     }
 
     let prepared_tarball = publish_common::prepare_tarball(
@@ -172,7 +201,9 @@ pub(super) fn prepare_publish_project_from_manifest(
     let tarball_size = tarball_data.len();
     validate_publish_tarball_size(tarball_size)?;
 
-    let (detected_ecosystem, swift_manifest) = detect_publish_ecosystem(project_dir)?;
+    let lpm_config = read_optional_lpm_config(project_dir)?;
+    let (detected_ecosystem, swift_manifest) =
+        detect_publish_ecosystem(project_dir, lpm_config.as_ref());
 
     Ok(PublishProject {
         pkg_json,
@@ -184,6 +215,7 @@ pub(super) fn prepare_publish_project_from_manifest(
         tarball_files: prepared_tarball.files,
         secret_scan: prepared_tarball.secret_scan,
         tarball_size,
+        lpm_config,
         detected_ecosystem,
         swift_manifest,
     })
@@ -214,9 +246,10 @@ pub(super) fn read_optional_lpm_config(
 
 pub(super) fn detect_publish_ecosystem(
     project_dir: &Path,
-) -> Result<(String, Option<serde_json::Value>), LpmError> {
+    lpm_config: Option<&serde_json::Value>,
+) -> (String, Option<serde_json::Value>) {
     let mut detected_ecosystem = "js".to_string();
-    if let Some(config) = read_optional_lpm_config(project_dir)?
+    if let Some(config) = lpm_config
         && let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str())
     {
         detected_ecosystem = eco.to_string();
@@ -239,7 +272,7 @@ pub(super) fn detect_publish_ecosystem(
         None
     };
 
-    Ok((detected_ecosystem, swift_manifest))
+    (detected_ecosystem, swift_manifest)
 }
 
 #[cfg(test)]

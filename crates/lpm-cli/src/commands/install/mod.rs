@@ -416,6 +416,10 @@ pub(crate) async fn run_with_options_with_lpm_root(
     reserve_stdout: bool,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    let transaction_root = lpm_workspace::find_workspace_root(project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?
+        .unwrap_or_else(|| project_dir.to_path_buf());
+    crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;
     let dependency_engine_policy = Arc::new(crate::engine_check::prepare_dependency_policy(
         project_dir,

@@ -606,6 +606,7 @@ fn acquire_shared_with_hint(
     let queue_path = writer_queue_path_for(data_path);
 
     let mut on_first_wait = Some(Box::new(on_first_wait) as Box<dyn FnOnce() + Send>);
+    let mut on_first_contention = test_lock_contention_callback(data_path);
     let start = std::time::Instant::now();
 
     // poll the writer-queue baton until no writer is queued.
@@ -618,6 +619,9 @@ fn acquire_shared_with_hint(
         let mut queue_rw = fd_lock::RwLock::new(queue_file);
         if probe_queue_empty(&mut queue_rw)? {
             break;
+        }
+        if let Some(callback) = on_first_contention.take() {
+            callback();
         }
         // queue_rw drops here, closing the fd — no carry between iterations.
         if on_first_wait.is_some()
@@ -632,12 +636,22 @@ fn acquire_shared_with_hint(
     // acquire gate-shared. Uncontended in the steady state.
     let intent_file = open_lock_file(&intent_path)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
-    poll_until_acquired(&mut intent_rw, LockMode::Shared, on_first_wait, None)?;
+    poll_until_acquired(
+        &mut intent_rw,
+        LockMode::Shared,
+        on_first_wait,
+        Some(&mut on_first_contention),
+    )?;
 
     // acquire data-shared.
     let data_file = open_lock_file(data_path)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
-    poll_until_acquired(&mut data_rw, LockMode::Shared, None, None)?;
+    poll_until_acquired(
+        &mut data_rw,
+        LockMode::Shared,
+        None,
+        Some(&mut on_first_contention),
+    )?;
 
     // Drop gate so new writers can raise it immediately.
     drop(intent_rw);
@@ -992,6 +1006,15 @@ where
 /// the canonical project-local LPM state directory.
 pub fn project_install_lock(project_dir: &Path) -> PathBuf {
     project_dir.join(".lpm").join(".install.lock")
+}
+
+/// Return the lock that serializes publication for one project or workspace.
+///
+/// Publication holds this lock only after local artifacts are immutable and
+/// the install lock has been released. Concurrent installs can therefore
+/// proceed while a publish waits for credentials, a registry, or review.
+pub fn project_publish_lock(project_dir: &Path) -> PathBuf {
+    project_dir.join(".lpm").join(".publish.lock")
 }
 
 // ─── Windows long-path helper ─────────────────────────────────────────

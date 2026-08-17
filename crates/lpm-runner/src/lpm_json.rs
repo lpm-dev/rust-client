@@ -11,7 +11,7 @@
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, read_text_file_capped};
 use lpm_env::{EnvSchema, EnvironmentsConfig};
 use serde::de::{MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -81,7 +81,7 @@ pub struct LpmJsonConfig {
 
     /// Publish configuration for multi-registry publishing.
     /// e.g., `{"registries": ["lpm", "npm"], "npm": {"name": "@scope/pkg"}}`
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish: Option<PublishConfig>,
 
     /// Environment variable schema for validation.
@@ -253,7 +253,7 @@ pub struct ProxyConfig {
 ///
 /// Controls which registries `lpm publish` targets and per-registry settings.
 /// CLI flags (`--npm`, `--lpm`) override these values.
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublishConfig {
     /// Target registries. e.g., `["lpm", "npm"]`.
@@ -262,19 +262,19 @@ pub struct PublishConfig {
     pub registries: Vec<String>,
 
     /// LPM registry publish settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lpm: Option<LpmPublishConfig>,
 
     /// npm-specific publish settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub npm: Option<NpmPublishConfig>,
 
     /// GitHub Packages publish settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubPublishConfig>,
 
     /// GitLab Packages publish settings.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gitlab: Option<GitlabPublishConfig>,
 }
 
@@ -295,7 +295,7 @@ impl Default for PublishConfig {
 }
 
 /// LPM registry publish configuration in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct LpmPublishConfig {
     /// Override package name for LPM (must be `@lpm.dev/owner.pkg` format).
@@ -304,7 +304,7 @@ pub struct LpmPublishConfig {
 }
 
 /// npm-specific publish configuration in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(deny_unknown_fields)]
 pub struct NpmPublishConfig {
@@ -332,7 +332,7 @@ pub struct NpmPublishConfig {
 }
 
 /// GitHub Packages publish configuration in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(deny_unknown_fields)]
 pub struct GithubPublishConfig {
@@ -346,7 +346,7 @@ pub struct GithubPublishConfig {
 }
 
 /// GitLab Packages publish configuration in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(deny_unknown_fields)]
 pub struct GitlabPublishConfig {

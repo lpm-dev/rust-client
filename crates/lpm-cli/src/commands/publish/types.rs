@@ -5,7 +5,7 @@ use lpm_runner::lpm_json;
 use std::path::Path;
 
 /// Target registries for a publish operation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishTarget {
     Lpm,
     Npm,
@@ -205,6 +205,7 @@ pub(crate) struct PublishProject {
     pub(crate) tarball_files: Vec<TarballFile>,
     pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
     pub(crate) tarball_size: usize,
+    pub(crate) lpm_config: Option<serde_json::Value>,
     pub(crate) detected_ecosystem: String,
     pub(crate) swift_manifest: Option<serde_json::Value>,
 }

@@ -1,167 +1,4 @@
-use crate::manifest_tx::ManifestTransaction;
-use lpm_common::LpmError;
-use lpm_semver::{Version, VersionBump, VersionReq};
-use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-const DEPENDENCY_SECTIONS: &[&str] = &[
-    "dependencies",
-    "devDependencies",
-    "peerDependencies",
-    "optionalDependencies",
-];
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ReleasePlan {
-    pub(crate) packages: Vec<PackageRelease>,
-    pub(crate) dependency_updates: Vec<DependencyUpdate>,
-    pub(crate) files: Vec<FileUpdate>,
-    #[serde(skip)]
-    source_manifests: BTreeMap<PathBuf, SourceManifest>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct PackageRelease {
-    pub(crate) name: String,
-    pub(crate) path: PathBuf,
-    pub(crate) manifest_path: PathBuf,
-    pub(crate) old_version: String,
-    pub(crate) new_version: String,
-    pub(crate) bump: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DependencyUpdate {
-    pub(crate) dependent: String,
-    pub(crate) dependency: String,
-    pub(crate) section: String,
-    pub(crate) manifest_path: PathBuf,
-    pub(crate) old_spec: String,
-    pub(crate) new_spec: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct FileUpdate {
-    pub(crate) path: PathBuf,
-    pub(crate) changes: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PlannedManifest {
-    pub(crate) path: PathBuf,
-    original_bytes: Arc<[u8]>,
-    updated_bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct SourceManifest {
-    original_bytes: Arc<[u8]>,
-    json: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
-struct WorkspaceManifest {
-    name: String,
-    version: Version,
-    path: PathBuf,
-    manifest_path: PathBuf,
-    original_bytes: Arc<[u8]>,
-    json: serde_json::Value,
-}
-
-impl ReleasePlan {
-    pub(crate) fn to_json(&self, dry_run: bool) -> serde_json::Value {
-        serde_json::json!({
-            "success": true,
-            "dry_run": dry_run,
-            "packages": self.packages,
-            "dependency_updates": self.dependency_updates,
-            "files": self.files,
-        })
-    }
-
-    pub(crate) fn planned_manifests(&self) -> Result<Vec<PlannedManifest>, LpmError> {
-        let mut manifests: BTreeMap<PathBuf, SourceManifest> = BTreeMap::new();
-
-        for package in &self.packages {
-            let entry = self.manifest_draft(&mut manifests, &package.manifest_path)?;
-            replace_top_level_string(
-                &mut entry.json,
-                "version",
-                &package.old_version,
-                &package.new_version,
-            )?;
-        }
-
-        for update in &self.dependency_updates {
-            let entry = self.manifest_draft(&mut manifests, &update.manifest_path)?;
-            replace_dependency_string(
-                &mut entry.json,
-                &update.section,
-                &update.dependency,
-                &update.old_spec,
-                &update.new_spec,
-            )?;
-        }
-
-        manifests
-            .into_iter()
-            .map(|(path, manifest)| {
-                let mut updated_bytes = serde_json::to_vec_pretty(&manifest.json)?;
-                updated_bytes.push(b'\n');
-                Ok(PlannedManifest {
-                    path,
-                    original_bytes: manifest.original_bytes,
-                    updated_bytes,
-                })
-            })
-            .collect()
-    }
-
-    fn manifest_draft<'a>(
-        &'a self,
-        manifests: &'a mut BTreeMap<PathBuf, SourceManifest>,
-        path: &Path,
-    ) -> Result<&'a mut SourceManifest, LpmError> {
-        match manifests.entry(path.to_path_buf()) {
-            std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let source = self.source_manifests.get(path).ok_or_else(|| {
-                    LpmError::Script(format!(
-                        "release plan is missing the original bytes for {}",
-                        path.display()
-                    ))
-                })?;
-                Ok(entry.insert(source.clone()))
-            }
-        }
-    }
-}
-
-pub(crate) fn write_planned_manifests(manifests: &[PlannedManifest]) -> Result<(), LpmError> {
-    write_planned_manifests_with(manifests, |path, bytes| {
-        lpm_common::write_file_atomic(path, bytes)
-    })
-}
-
-fn write_planned_manifests_with(
-    manifests: &[PlannedManifest],
-    mut write_manifest: impl FnMut(&Path, &[u8]) -> std::io::Result<()>,
-) -> Result<(), LpmError> {
-    let required = manifests
-        .iter()
-        .map(|manifest| (manifest.path.as_path(), manifest.original_bytes.as_ref()))
-        .collect::<Vec<_>>();
-    let transaction =
-        ManifestTransaction::snapshot_install_state_if_unchanged(&required, &[], &[])?;
-    for manifest in manifests {
-        write_manifest(&manifest.path, &manifest.updated_bytes)?;
-    }
-    transaction.commit();
-    Ok(())
-}
+use super::*;
 
 pub(crate) fn plan_single_package(
     project_dir: &Path,
@@ -299,7 +136,7 @@ pub(crate) fn validate_workspace_internal_ranges(
     Ok(())
 }
 
-fn read_workspace_manifest(
+pub(super) fn read_workspace_manifest(
     path: &Path,
     manifest_path: PathBuf,
 ) -> Result<WorkspaceManifest, LpmError> {
@@ -345,7 +182,7 @@ fn read_workspace_manifest(
     })
 }
 
-fn bumped_package(
+pub(super) fn bumped_package(
     manifest: &WorkspaceManifest,
     bump: &VersionBump,
 ) -> Result<PackageRelease, LpmError> {
@@ -366,7 +203,7 @@ fn bumped_package(
     })
 }
 
-fn plan_dependency_updates(
+pub(super) fn plan_dependency_updates(
     manifests: &[WorkspaceManifest],
     bumped_versions: &HashMap<String, (&str, &str)>,
 ) -> Result<Vec<DependencyUpdate>, LpmError> {
@@ -421,11 +258,15 @@ fn plan_dependency_updates(
     Ok(updates)
 }
 
-fn dynamic_workspace_spec(spec: &str) -> bool {
+pub(super) fn dynamic_workspace_spec(spec: &str) -> bool {
     matches!(spec.strip_prefix("workspace:"), Some("*" | "^" | "~"))
 }
 
-fn updated_dependency_spec(old_spec: &str, old_version: &str, new_version: &str) -> Option<String> {
+pub(super) fn updated_dependency_spec(
+    old_spec: &str,
+    old_version: &str,
+    new_version: &str,
+) -> Option<String> {
     let (workspace_prefix, inner) = old_spec
         .strip_prefix("workspace:")
         .map_or(("", old_spec), |inner| ("workspace:", inner));
@@ -452,7 +293,7 @@ fn updated_dependency_spec(old_spec: &str, old_version: &str, new_version: &str)
     replacement.map(|spec| format!("{workspace_prefix}{spec}"))
 }
 
-fn range_satisfies_version(range: &str, version: &str) -> bool {
+pub(super) fn range_satisfies_version(range: &str, version: &str) -> bool {
     let Ok(req) = VersionReq::parse(range) else {
         return false;
     };
@@ -462,7 +303,7 @@ fn range_satisfies_version(range: &str, version: &str) -> bool {
     req.matches(&version)
 }
 
-fn summarize_file_updates(
+pub(super) fn summarize_file_updates(
     packages: &[PackageRelease],
     dependency_updates: &[DependencyUpdate],
 ) -> Vec<FileUpdate> {
@@ -479,7 +320,7 @@ fn summarize_file_updates(
         .collect()
 }
 
-fn replace_top_level_string(
+pub(super) fn replace_top_level_string(
     json: &mut serde_json::Value,
     key: &str,
     expected: &str,
@@ -501,7 +342,7 @@ fn replace_top_level_string(
     Ok(())
 }
 
-fn replace_dependency_string(
+pub(super) fn replace_dependency_string(
     json: &mut serde_json::Value,
     section: &str,
     dependency: &str,
@@ -557,7 +398,7 @@ pub(crate) fn load_change_bumps(
     Ok(bumps)
 }
 
-fn parse_change_file(
+pub(super) fn parse_change_file(
     content: &str,
     path: &Path,
     bumps: &mut HashMap<String, VersionBump>,
@@ -611,146 +452,4 @@ pub(crate) fn ensure_unique_selection(selected: &[usize]) -> Vec<usize> {
         .copied()
         .filter(|idx| seen.insert(*idx))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lpm_workspace::{PackageJson, Workspace, WorkspaceMember};
-    use tempfile::TempDir;
-
-    fn write_manifest(dir: &Path, body: &str) {
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("package.json"), body).unwrap();
-    }
-
-    fn workspace_with_app_dep(app_dep: &str) -> (TempDir, Workspace) {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        let core = root.join("packages/core");
-        let app = root.join("packages/app");
-        write_manifest(&core, r#"{"name":"core","version":"1.2.3"}"#);
-        write_manifest(
-            &app,
-            &format!(r#"{{"name":"app","version":"2.0.0","dependencies":{{"core":"{app_dep}"}}}}"#),
-        );
-        let workspace = Workspace {
-            root,
-            root_package: PackageJson::default(),
-            members: vec![
-                WorkspaceMember {
-                    path: core.clone(),
-                    package: lpm_workspace::read_package_json(&core.join("package.json")).unwrap(),
-                },
-                WorkspaceMember {
-                    path: app.clone(),
-                    package: lpm_workspace::read_package_json(&app.join("package.json")).unwrap(),
-                },
-            ],
-        };
-        (tmp, workspace)
-    }
-
-    #[test]
-    fn plan_workspace_updates_dependent_range_when_new_version_is_outside_existing_range() {
-        let (_tmp, workspace) = workspace_with_app_dep("^1.2.3");
-        let plan =
-            plan_workspace(&workspace, &[0], &HashMap::new(), Some(&VersionBump::Major)).unwrap();
-
-        assert_eq!(plan.dependency_updates.len(), 1);
-        assert_eq!(plan.dependency_updates[0].old_spec, "^1.2.3");
-        assert_eq!(plan.dependency_updates[0].new_spec, "^2.0.0");
-    }
-
-    #[test]
-    fn plan_workspace_leaves_dependent_range_when_new_version_is_satisfied() {
-        let (_tmp, workspace) = workspace_with_app_dep("^1.2.3");
-        let plan =
-            plan_workspace(&workspace, &[0], &HashMap::new(), Some(&VersionBump::Patch)).unwrap();
-
-        assert!(plan.dependency_updates.is_empty());
-    }
-
-    #[test]
-    fn plan_workspace_leaves_workspace_caret_range_when_new_version_is_satisfied() {
-        let (_tmp, workspace) = workspace_with_app_dep("workspace:^1.2.3");
-        let plan =
-            plan_workspace(&workspace, &[0], &HashMap::new(), Some(&VersionBump::Patch)).unwrap();
-
-        assert!(plan.dependency_updates.is_empty());
-    }
-
-    #[test]
-    fn plan_workspace_rejects_unselected_dependent_with_unrewritable_range() {
-        let (_tmp, workspace) = workspace_with_app_dep(">=1 <2");
-        let err = plan_workspace(&workspace, &[0], &HashMap::new(), Some(&VersionBump::Major))
-            .unwrap_err();
-
-        assert!(err.to_string().contains("will not accept 2.0.0"));
-    }
-
-    #[test]
-    fn plan_workspace_rejects_selected_dependent_with_unrewritable_stale_range() {
-        let (_tmp, workspace) = workspace_with_app_dep(">=1 <2");
-        let err = plan_workspace(
-            &workspace,
-            &[0, 1],
-            &HashMap::new(),
-            Some(&VersionBump::Major),
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("will not accept 2.0.0"));
-    }
-
-    #[test]
-    fn write_planned_manifests_rejects_external_edits_made_after_planning() {
-        let (tmp, workspace) = workspace_with_app_dep("^1.2.3");
-        let plan =
-            plan_workspace(&workspace, &[0], &HashMap::new(), Some(&VersionBump::Major)).unwrap();
-        let planned = plan.planned_manifests().unwrap();
-        let core_manifest = tmp.path().join("packages/core/package.json");
-        let edited = r#"{"name":"core","version":"1.2.3","description":"external edit"}"#;
-        std::fs::write(&core_manifest, edited).unwrap();
-
-        let error = write_planned_manifests(&planned).unwrap_err();
-
-        assert!(error.to_string().contains("changed since it was read"));
-        assert_eq!(std::fs::read_to_string(core_manifest).unwrap(), edited);
-    }
-
-    #[test]
-    fn write_planned_manifests_restores_earlier_files_when_a_later_write_fails() {
-        let tmp = TempDir::new().unwrap();
-        let first_path = tmp.path().join("a-package.json");
-        let second_path = tmp.path().join("z-package.json");
-        let first_original: Arc<[u8]> = Vec::from(br#"{"name":"a","version":"1.0.0"}"#).into();
-        let second_original: Arc<[u8]> = Vec::from(br#"{"name":"z","version":"1.0.0"}"#).into();
-        std::fs::write(&first_path, &first_original).unwrap();
-        std::fs::write(&second_path, &second_original).unwrap();
-        let manifests = vec![
-            PlannedManifest {
-                path: first_path.clone(),
-                original_bytes: Arc::clone(&first_original),
-                updated_bytes: Vec::from(br#"{"name":"a","version":"2.0.0"}"#),
-            },
-            PlannedManifest {
-                path: second_path,
-                original_bytes: second_original,
-                updated_bytes: Vec::from(br#"{"name":"z","version":"2.0.0"}"#),
-            },
-        ];
-        let mut write_count = 0;
-
-        let result = write_planned_manifests_with(&manifests, |path, bytes| {
-            write_count += 1;
-            if write_count == 2 {
-                return Err(std::io::Error::other("injected second write failure"));
-            }
-            lpm_common::write_file_atomic(path, bytes)
-        });
-
-        assert!(result.is_err());
-        assert_eq!(std::fs::read(first_path).unwrap(), first_original.as_ref());
-    }
 }
