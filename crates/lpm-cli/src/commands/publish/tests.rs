@@ -11,7 +11,7 @@ use super::prepare::{
 use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_json};
 use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
 use super::swift::extract_swift_metadata;
-use super::target::{deduplicate_targets, resolve_targets};
+use super::target::{deduplicate_targets, resolve_targets, validate_custom_publish_registry_url};
 use super::types::{LpmPublicationStatus, PublicationWaitResult, PublishResult, PublishTarget};
 use super::version_data::integrity_to_sha512_hex;
 use super::wait::poll_publication_status;
@@ -354,6 +354,19 @@ fn resolve_targets_cli_flags_override() {
         targets,
         vec![PublishTarget::Custom("https://npm.corp.com".into())]
     );
+}
+
+#[test]
+fn custom_publish_registry_rejects_embedded_credentials() {
+    let error = validate_custom_publish_registry_url(
+        "https://publish-user:publish-password@example.com/registry",
+        "--publish-registry",
+    )
+    .expect_err("userinfo must not be accepted in a publish URL");
+
+    let message = error.to_string();
+    assert!(!message.contains("publish-user"));
+    assert!(!message.contains("publish-password"));
 }
 
 #[test]

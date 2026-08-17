@@ -120,17 +120,18 @@ fn resolve_release_url(env_var: &str, default_url: &str) -> String {
         Some(v) => v,
         None => return default_url.to_string(),
     };
+    let safe_url = crate::install_ui::safe_url_origin(&raw);
     if accept_override(&raw) {
         tracing::warn!(
             env_var = env_var,
-            override_url = %raw,
+            override_url = %safe_url,
             "release-lookup endpoint override honoured — confirm this is expected",
         );
         return raw;
     }
     tracing::warn!(
         env_var = env_var,
-        override_url = %raw,
+        override_url = %safe_url,
         "rejecting release-lookup endpoint override: plain HTTP non-loopback URL; \
          falling back to default — set the override to an https:// URL to use a private mirror",
     );
@@ -145,6 +146,9 @@ fn accept_override(url: &str) -> bool {
         Ok(u) => u,
         Err(_) => return false,
     };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
     match parsed.scheme() {
         "https" => true,
         "http" => parsed.host_str().is_some_and(is_loopback_host),
@@ -514,6 +518,17 @@ fn github_token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+fn github_token_for_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("api.github.com")
+        || parsed.port_or_known_default() != Some(443)
+    {
+        return None;
+    }
+    github_token()
+}
+
 /// Which release source we're probing. Drives both the etag slot in
 /// the cache and the version-extraction shape of the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,7 +694,7 @@ async fn probe_one(
         }
         Source::GitHub => {
             req = req.header("Accept", "application/vnd.github.v3+json");
-            if let Some(token) = github_token() {
+            if let Some(token) = github_token_for_url(&url) {
                 req = req.header("Authorization", format!("Bearer {token}"));
             }
         }
@@ -839,7 +854,7 @@ pub async fn fetch_github_release_published_at(
         .get(&url)
         .header("User-Agent", "lpm-cli")
         .header("Accept", "application/vnd.github.v3+json");
-    if let Some(token) = github_token() {
+    if let Some(token) = github_token_for_url(&url) {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
@@ -1952,6 +1967,13 @@ mod tests {
         assert!(!accept_override(""));
     }
 
+    #[test]
+    fn accept_override_rejects_embedded_credentials() {
+        assert!(!accept_override(
+            "https://release-user:release-password@example.com/releases"
+        ));
+    }
+
     /// End-to-end through `resolve_release_url`: a rejected override
     /// falls back to the default URL (and emits a `warn` log; we
     /// don't capture tracing in this unit test but the assertion
@@ -2018,6 +2040,39 @@ mod tests {
             assert_eq!(parsed.to_rfc3339(), "2026-05-10T12:34:56+00:00");
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn github_token_is_not_sent_to_release_override_origin() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "published_at": "2026-05-10T12:34:56Z",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        let _env = crate::test_env::ScopedEnv::set([
+            (RELEASE_BY_TAG_OVERRIDE_KEY, template.into()),
+            ("GITHUB_TOKEN", "must-not-leave-github".into()),
+        ]);
+        fetch_github_release_published_at("0.42.0")
+            .await
+            .expect("override response must parse");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server must retain requests");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get("authorization").is_none(),
+            "off-origin override must not receive ambient GitHub credentials"
+        );
     }
 
     #[tokio::test]

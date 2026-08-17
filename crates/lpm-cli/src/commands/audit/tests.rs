@@ -706,3 +706,10 @@ fn osv_override_rejects_unsupported_schemes() {
     assert!(!osv_override_is_accepted("javascript:alert(1)"));
     assert!(!osv_override_is_accepted("not a url"));
 }
+
+#[test]
+fn osv_override_rejects_embedded_credentials() {
+    assert!(!osv_override_is_accepted(
+        "https://osv-user:osv-password@example.com/v1/querybatch"
+    ));
+}
