@@ -29,9 +29,44 @@ impl CredentialKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum CredentialAuthority {
+pub(super) enum CredentialBackend {
     Keychain,
     EncryptedFileFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(super) enum CredentialAuthority {
+    Active {
+        backend: CredentialBackend,
+        credential_digest: String,
+    },
+    Revoked,
+}
+
+impl CredentialAuthority {
+    pub(super) fn active(backend: CredentialBackend, token: &str) -> Self {
+        Self::Active {
+            backend,
+            credential_digest: token_digest(token),
+        }
+    }
+
+    pub(super) fn backend(&self) -> Option<CredentialBackend> {
+        match self {
+            Self::Active { backend, .. } => Some(*backend),
+            Self::Revoked => None,
+        }
+    }
+
+    pub(super) fn matches_token(&self, token: &str) -> bool {
+        match self {
+            Self::Active {
+                credential_digest, ..
+            } => credential_digest == &token_digest(token),
+            Self::Revoked => false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,7 +93,7 @@ pub(super) fn read(
     Ok(store
         .credentials
         .get(&credential_id(registry, kind))
-        .copied())
+        .cloned())
 }
 
 pub(super) fn set(
@@ -90,6 +125,10 @@ fn credential_id(registry: &str, kind: CredentialKind) -> String {
     digest.update([0]);
     digest.update(registry.as_bytes());
     hex::encode(digest.finalize())
+}
+
+fn token_digest(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 fn read_store() -> Result<CredentialAuthorityStore, String> {

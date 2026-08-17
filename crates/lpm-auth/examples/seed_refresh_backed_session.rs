@@ -20,6 +20,7 @@ fn main() {
 
     lpm_auth::set_token(&registry_url, &access_token)
         .unwrap_or_else(|error| panic!("failed to store access token: {error}"));
-    lpm_auth::set_refresh_token(&registry_url, &refresh_token);
+    lpm_auth::set_refresh_token(&registry_url, &refresh_token)
+        .unwrap_or_else(|error| panic!("failed to store refresh token: {error}"));
     lpm_auth::set_session_access_token_expiry(&registry_url, &expires_at);
 }

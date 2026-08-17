@@ -315,7 +315,7 @@ mod tests {
         let (_home, _env) = scoped_home_dir();
         let registry = "https://whoami-refresh.test";
 
-        auth::set_refresh_token(registry, "refresh-token");
+        auth::set_refresh_token(registry, "refresh-token").unwrap();
 
         assert!(has_local_whoami_auth(registry));
     }

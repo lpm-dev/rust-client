@@ -1360,7 +1360,7 @@ mod tests {
     fn encrypted_file_refresh_only_recovery_emits_no_keychain_notice() {
         let _env = token_classify_isolate();
         let registry = "https://notice-refresh-only.invalid";
-        crate::set_refresh_token(registry, "stored-refresh");
+        crate::set_refresh_token(registry, "stored-refresh").unwrap();
 
         let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&notices);
@@ -1382,7 +1382,7 @@ mod tests {
         let _env = token_classify_isolate();
         let registry = "https://notice-session-required.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
-        crate::set_refresh_token(registry, "stored-refresh");
+        crate::set_refresh_token(registry, "stored-refresh").unwrap();
 
         let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&notices);
@@ -1438,7 +1438,7 @@ mod tests {
         let _env = token_classify_isolate();
         let registry = "https://confirm-refresh.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
-        crate::set_refresh_token(registry, "stored-refresh");
+        crate::set_refresh_token(registry, "stored-refresh").unwrap();
 
         let mgr = SessionManager::new(registry, None);
         assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
@@ -1493,7 +1493,7 @@ mod tests {
             token_classify_isolate_with_lpm_token(Some("env-token"), CiTokenTestEnv::Cleared);
         let registry = "https://stored-session.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
-        crate::set_refresh_token(registry, "stored-refresh");
+        crate::set_refresh_token(registry, "stored-refresh").unwrap();
         let mgr = SessionManager::new(registry, None);
 
         assert_eq!(mgr.current_source_peek(), Some(TokenSource::EnvVar));
@@ -1669,7 +1669,7 @@ mod refresh_http_tests {
     /// of the test** so the writes land in a per-test temp HOME and
     /// don't escape into the user's keychain.
     fn manager_for(server_url: &str) -> SessionManager {
-        crate::set_refresh_token(server_url, "rt-original");
+        crate::set_refresh_token(server_url, "rt-original").unwrap();
 
         // classified=true so the pre-seeded `cached` StoredSession value is
         // authoritative without triggering `classify_keychain_sources`
