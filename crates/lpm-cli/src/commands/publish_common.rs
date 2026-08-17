@@ -5,8 +5,11 @@
 
 use crate::install_ui;
 use lpm_common::LpmError;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+const MAX_README_BYTES: usize = 1_000_000;
 
 /// A file entry in the tarball.
 #[derive(Debug, Clone)]
@@ -81,21 +84,38 @@ pub fn read_readme(project_dir: &Path) -> Option<String> {
         "README.markdown",
     ];
 
-    for name in &candidates {
+    for name in candidates {
         let path = project_dir.join(name);
-        if path.exists()
-            && let Ok(content) = std::fs::read_to_string(&path)
-        {
-            // Cap at 1MB
-            let trimmed = if content.len() > 1_000_000 {
-                content[..1_000_000].to_string()
-            } else {
-                content
-            };
-            return Some(trimmed);
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        if let Ok(Some(content)) = read_readme_content(file) {
+            return Some(content);
         }
     }
     None
+}
+
+fn read_readme_content(reader: impl Read) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(MAX_README_BYTES + 1);
+    reader
+        .take((MAX_README_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() <= MAX_README_BYTES {
+        return Ok(String::from_utf8(bytes).ok());
+    }
+
+    bytes.truncate(MAX_README_BYTES);
+    match String::from_utf8(bytes) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.utf8_error().error_len().is_none() => {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            Ok(String::from_utf8(bytes).ok())
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,6 +1636,45 @@ mod tests {
         assert_eq!(hashes.shasum, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
         // SHA-512 integrity must start with sha512-
         assert!(hashes.integrity.starts_with("sha512-"));
+    }
+
+    #[test]
+    fn read_readme_truncates_before_a_split_utf8_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut readme = "a".repeat(999_999);
+        readme.push('é');
+        std::fs::write(dir.path().join("README.md"), readme).unwrap();
+
+        let content = read_readme(dir.path()).unwrap();
+
+        assert_eq!(content.len(), 999_999);
+    }
+
+    #[test]
+    fn read_readme_content_does_not_read_past_the_prefix_limit() {
+        struct ErrorsAfterPrefix {
+            remaining: usize,
+        }
+
+        impl std::io::Read for ErrorsAfterPrefix {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::other("reader advanced past prefix"));
+                }
+                let read = self.remaining.min(buffer.len());
+                buffer[..read].fill(b'a');
+                self.remaining -= read;
+                Ok(read)
+            }
+        }
+
+        let content = read_readme_content(ErrorsAfterPrefix {
+            remaining: MAX_README_BYTES + 1,
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(content.len(), MAX_README_BYTES);
     }
 
     #[test]
