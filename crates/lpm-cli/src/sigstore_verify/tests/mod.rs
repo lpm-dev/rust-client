@@ -3244,6 +3244,24 @@ fn identity_check_rejects_workflow_path_mismatch() {
 }
 
 #[test]
+fn identity_check_rejects_workflow_path_with_expected_name_as_prefix() {
+    let san =
+        "https://github.com/lpm-dev/rust-client/.github/workflows/release.yml-evil@refs/heads/main";
+    let der = leaf_with_san_and_issuer(san, None);
+    let (_, parsed) = X509Certificate::from_der(&der).unwrap();
+    let expectations = IdentityExpectations {
+        expected_workflow_path: Some(".github/workflows/release.yml".into()),
+        ..IdentityExpectations::none()
+    };
+    let err = check_identity_expectations(&parsed, &expectations)
+        .expect_err("the workflow path must match exactly");
+    match err {
+        VerifyError::IdentityMismatch { field, .. } => assert_eq!(field, "workflow_path"),
+        other => panic!("expected IdentityMismatch, got: {other:?}"),
+    }
+}
+
+#[test]
 fn identity_check_rejects_fulcio_oidc_issuer_mismatch() {
     let san = "https://github.com/lpm-dev/rust-client/.github/workflows/release.yml@refs/tags/v1";
     let der = leaf_with_san_and_issuer(san, Some("https://malicious-issuer.example.com"));

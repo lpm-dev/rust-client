@@ -7,11 +7,12 @@ use crate::release_lookup::{
 };
 use crate::sigstore_verify::{
     IdentityExpectations, VerifiedProvenance, VerifyError, VerifyOptions,
-    extract_in_toto_subject_digest, verify_sigstore_bundle,
+    extract_subject_digest_from_statement, verify_sigstore_bundle,
 };
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -164,6 +165,17 @@ pub async fn run(
 
     let method = detect_install_method();
     method.ensure_channel_supported(target_channel)?;
+    let cargo_source_commit = if method == InstallMethod::Cargo {
+        let client = release_http_client()?;
+        Some(
+            fetch_verified_release_manifest(&client, &latest)
+                .await?
+                .source_commit,
+        )
+    } else {
+        None
+    };
+    let update_command = method.command(&latest, cargo_source_commit.as_deref())?;
 
     // For non-Standalone channels the JSON contract is plan-only: emit
     // the update command, return without invoking the channel's
@@ -178,7 +190,7 @@ pub async fn run(
             "latest": latest,
             "up_to_date": false,
             "install_method": method.name(),
-            "update_command": method.command(&latest),
+            "update_command": update_command,
             "cache_hit": cache_hit,
             "channel": channel.as_str(),
             "target_channel": target_channel.as_str(),
@@ -195,7 +207,7 @@ pub async fn run(
             method.name().cyan()
         );
         install_ui::phase("Update command");
-        eprintln!("    {}", install_ui::yellow(&method.command(&latest)));
+        eprintln!("    {}", install_ui::yellow(&update_command));
     }
 
     let mut standalone_audit: Option<AttestationAudit> = None;
@@ -206,31 +218,14 @@ pub async fn run(
         }
         InstallMethod::Homebrew => run_shell_update("brew", &["upgrade", "lpm"])?,
         InstallMethod::Cargo => {
-            let tag = format!("v{latest}");
-            // `--locked` forces resolution against the Cargo.lock
-            // shipped with the tag rather than re-solving the
-            // dependency graph at install time. Without it, an
-            // attacker who compromised any direct or transitive dep's
-            // registry entry between our release time and the user's
-            // install could inject a different transitive package
-            // version into the build — same supply-chain blast as the
-            // mutable-git-tag concern in the finding, just one hop
-            // further down. `--locked` was a behaviour change in
-            // recent cargo (now standard for reproducible installs);
-            // every modern cargo (≥1.74) supports it.
-            run_shell_update(
-                "cargo",
-                &[
-                    "install",
-                    "--git",
-                    "https://github.com/lpm-dev/rust-client",
-                    "--tag",
-                    &tag,
-                    "lpm-cli",
-                    "--force",
-                    "--locked",
-                ],
-            )?;
+            let source_commit = cargo_source_commit.as_deref().ok_or_else(|| {
+                LpmError::SelfUpdate(
+                    "Cargo update has no verified release source commit".to_string(),
+                )
+            })?;
+            let args = cargo_install_args(source_commit);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run_shell_update("cargo", &arg_refs)?;
         }
         InstallMethod::Standalone => {
             standalone_audit = Some(run_standalone_update(&latest).await?);
@@ -239,7 +234,7 @@ pub async fn run(
 
     // Post-upgrade cache stamp policy:
     // - Standalone: we downloaded the exact tag → safe to stamp.
-    // - Cargo: now `--tag`-pinned → safe to stamp.
+    // - Cargo: installed from the attested source commit → safe to stamp.
     // - Npm: now `@{latest}`-pinned → safe to stamp.
     // - Homebrew: `brew upgrade lpm` is channel-latest, not tag-pinned;
     //   we can't prove which version actually landed. Clear the cache
@@ -340,15 +335,26 @@ impl InstallMethod {
         }
     }
 
-    fn command(&self, version: &str) -> String {
-        match self {
+    fn command(
+        &self,
+        version: &str,
+        cargo_source_commit: Option<&str>,
+    ) -> Result<String, LpmError> {
+        Ok(match self {
             InstallMethod::Npm => format!("npm install -g @lpm-registry/cli@{version}"),
             InstallMethod::Homebrew => "brew upgrade lpm".into(),
-            InstallMethod::Cargo => format!(
-                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{version} lpm-cli --force --locked"
-            ),
+            InstallMethod::Cargo => {
+                let source_commit = cargo_source_commit.ok_or_else(|| {
+                    LpmError::SelfUpdate(
+                        "Cargo update has no verified release source commit".to_string(),
+                    )
+                })?;
+                format!(
+                    "cargo install --git https://github.com/lpm-dev/rust-client --rev {source_commit} lpm-cli --force --locked"
+                )
+            }
             InstallMethod::Standalone => standalone_command(version),
-        }
+        })
     }
 
     fn ensure_channel_supported(&self, channel: ReleaseChannel) -> Result<(), LpmError> {
@@ -530,6 +536,19 @@ fn run_shell_update(cmd: &str, args: &[&str]) -> Result<(), LpmError> {
     Ok(())
 }
 
+fn cargo_install_args(source_commit: &str) -> Vec<String> {
+    vec![
+        "install".to_string(),
+        "--git".to_string(),
+        "https://github.com/lpm-dev/rust-client".to_string(),
+        "--rev".to_string(),
+        source_commit.to_string(),
+        "lpm-cli".to_string(),
+        "--force".to_string(),
+        "--locked".to_string(),
+    ]
+}
+
 /// `SHA256SUMS.txt` size cap (4 KiB). The real manifest is ~600 B
 /// today (six lines of `<sha>  <name>`); 4 KiB leaves comfortable
 /// headroom for future binaries without giving a hostile server an
@@ -569,6 +588,7 @@ struct AttestationAudit {
     manifest_sha256: String,
     asset_sha256: String,
     asset_name: String,
+    source_commit: String,
 }
 
 /// Map a `VerifyError` into the user-facing `LpmError::SelfUpdate`
@@ -606,7 +626,8 @@ fn parse_manifest_line(line: &str) -> Option<(String, String)> {
 /// `SHA256SUMS.txt` body. Skips blank lines and rejects lines that
 /// fail [`parse_manifest_line`] — a malformed manifest is an integrity
 /// failure, not a silent miss.
-fn lookup_platform_sha(manifest: &str, basename: &str) -> Result<String, LpmError> {
+fn parse_release_manifest(manifest: &str) -> Result<HashMap<String, String>, LpmError> {
+    let mut entries = HashMap::with_capacity(manifest.lines().count());
     for (idx, raw_line) in manifest.lines().enumerate() {
         if raw_line.trim().is_empty() {
             continue;
@@ -618,17 +639,128 @@ fn lookup_platform_sha(manifest: &str, basename: &str) -> Result<String, LpmErro
                 idx + 1
             ))
         })?;
-        if name == basename {
-            return Ok(sha);
+        if entries.insert(name.clone(), sha).is_some() {
+            return Err(LpmError::SelfUpdate(format!(
+                "SHA256SUMS.txt enumerates `{name}` more than once — refusing an ambiguous release manifest"
+            )));
         }
     }
-    Err(LpmError::SelfUpdate(format!(
-        "SHA256SUMS.txt does not enumerate `{basename}` for this platform — release pipeline may be missing artifacts"
-    )))
+    Ok(entries)
+}
+
+#[cfg(test)]
+fn lookup_platform_sha(manifest: &str, basename: &str) -> Result<String, LpmError> {
+    parse_release_manifest(manifest)?
+        .remove(basename)
+        .ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "SHA256SUMS.txt does not enumerate `{basename}` for this platform — release pipeline may be missing artifacts"
+            ))
+        })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn validate_release_provenance(
+    version: &str,
+    snapshot: &lpm_workspace::ProvenanceSnapshot,
+    statement: &serde_json::Value,
+) -> Result<String, LpmError> {
+    const REPOSITORY: &str = "https://github.com/lpm-dev/rust-client";
+    const PUBLISHER: &str = "github:lpm-dev/rust-client";
+    const WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+
+    let channel = ReleaseChannel::from_installed_version(version);
+    let expected_ref = match channel {
+        ReleaseChannel::Stable => format!("refs/tags/v{version}"),
+        ReleaseChannel::Nightly => "refs/heads/main".to_string(),
+    };
+    let invalid = |detail: String| {
+        LpmError::SelfUpdate(format!(
+            "release v{version} has invalid signed provenance: {detail}"
+        ))
+    };
+
+    if !snapshot.present
+        || snapshot.publisher.as_deref() != Some(PUBLISHER)
+        || snapshot.workflow_path.as_deref() != Some(WORKFLOW_PATH)
+        || snapshot.workflow_ref.as_deref() != Some(expected_ref.as_str())
+    {
+        return Err(invalid(format!(
+            "certificate identity must be `{PUBLISHER}` workflow `{WORKFLOW_PATH}` at `{expected_ref}`"
+        )));
+    }
+
+    let required_str = |pointer: &str, field: &str| {
+        statement
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid(format!("missing string `{field}`")))
+    };
+    if required_str("/_type", "_type")? != "https://in-toto.io/Statement/v1" {
+        return Err(invalid("unexpected in-toto statement type".to_string()));
+    }
+    if required_str("/predicateType", "predicateType")? != "https://slsa.dev/provenance/v1" {
+        return Err(invalid("unexpected SLSA predicate type".to_string()));
+    }
+
+    let workflow = "/predicate/buildDefinition/externalParameters/workflow";
+    if required_str(&format!("{workflow}/repository"), "workflow.repository")? != REPOSITORY
+        || required_str(&format!("{workflow}/path"), "workflow.path")? != WORKFLOW_PATH
+        || required_str(&format!("{workflow}/ref"), "workflow.ref")? != expected_ref
+    {
+        return Err(invalid(format!(
+            "workflow identity must be `{REPOSITORY}/{WORKFLOW_PATH}@{expected_ref}`"
+        )));
+    }
+
+    let expected_uri = format!("git+{REPOSITORY}@{expected_ref}");
+    let dependencies = statement
+        .pointer("/predicate/buildDefinition/resolvedDependencies")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid("missing `resolvedDependencies` array".to_string()))?;
+    let mut source_commit = None;
+    for dependency in dependencies {
+        if dependency.get("uri").and_then(serde_json::Value::as_str) != Some(&expected_uri) {
+            continue;
+        }
+        let commit = dependency
+            .pointer("/digest/gitCommit")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid("source dependency has no `digest.gitCommit`".to_string()))?;
+        if source_commit.replace(commit).is_some() {
+            return Err(invalid(format!(
+                "source dependency `{expected_uri}` appears more than once"
+            )));
+        }
+    }
+    let source_commit = source_commit
+        .ok_or_else(|| invalid(format!("missing source dependency `{expected_uri}`")))?;
+    if source_commit.len() != 40
+        || !source_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "source commit must be a 40-character lowercase hexadecimal Git object ID".to_string(),
+        ));
+    }
+
+    if channel == ReleaseChannel::Nightly {
+        let version_commit = version
+            .rsplit_once('.')
+            .map(|(_, suffix)| suffix.strip_prefix('g').unwrap_or(suffix))
+            .ok_or_else(|| invalid("nightly version has no commit suffix".to_string()))?;
+        if version_commit.len() != 7 || !source_commit.starts_with(version_commit) {
+            return Err(invalid(format!(
+                "nightly commit suffix `{version_commit}` does not match signed source commit `{source_commit}`"
+            )));
+        }
+    }
+
+    Ok(source_commit.to_string())
 }
 
 /// Fetch a bounded-size body from a URL with a 30 s timeout. Returns
@@ -700,17 +832,26 @@ async fn fetch_bounded(
     Ok(Some(buf))
 }
 
-/// Cryptographically verify a release-artifact triple (manifest,
-/// Sigstore bundle, platform binary) end-to-end and return the audit
-/// trail on success. Every gate fails closed.
-fn verify_release_artifacts(
+#[derive(Debug)]
+struct VerifiedReleaseManifest {
+    publisher: Option<String>,
+    workflow_path: Option<String>,
+    workflow_ref: Option<String>,
+    integrated_time: chrono::DateTime<chrono::Utc>,
+    log_index: i64,
+    log_id: String,
+    leaf_cert_sha256: String,
+    manifest_sha256: String,
+    source_commit: String,
+    entries: HashMap<String, String>,
+}
+
+fn verify_release_manifest(
     version: &str,
     manifest_bytes: &[u8],
     bundle_bytes: &[u8],
-    asset_bytes: &[u8],
-    asset_basename: &str,
     published_at: chrono::DateTime<chrono::Utc>,
-) -> Result<AttestationAudit, LpmError> {
+) -> Result<VerifiedReleaseManifest, LpmError> {
     let expectations = IdentityExpectations {
         expected_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
         expected_san_uri_prefix: Some("https://github.com/lpm-dev/rust-client/".to_string()),
@@ -720,11 +861,14 @@ fn verify_release_artifacts(
 
     let VerifiedProvenance {
         snapshot,
+        statement,
         integrated_time,
         leaf_cert_sha256,
         log_id,
         log_index,
     } = verify_sigstore_bundle(bundle_bytes, &expectations, options).map_err(map_verify_error)?;
+
+    let source_commit = validate_release_provenance(version, &snapshot, &statement)?;
 
     let integrated_time_utc: chrono::DateTime<chrono::Utc> = integrated_time.into();
     let earliest = published_at - REPLAY_PRE_WINDOW;
@@ -738,7 +882,13 @@ fn verify_release_artifacts(
     }
 
     let (subject_name, subject_sha256) =
-        extract_in_toto_subject_digest(bundle_bytes).map_err(map_verify_error)?;
+        extract_subject_digest_from_statement(&statement, "sha256", true)
+            .map_err(map_verify_error)?;
+    if subject_name != "SHA256SUMS.txt" {
+        return Err(LpmError::SelfUpdate(format!(
+            "Sigstore bundle attests unexpected subject `{subject_name}` instead of `SHA256SUMS.txt`"
+        )));
+    }
     let manifest_sha256 = sha256_hex(manifest_bytes);
     if subject_sha256 != manifest_sha256 {
         return Err(LpmError::SelfUpdate(format!(
@@ -753,9 +903,34 @@ fn verify_release_artifacts(
             "SHA256SUMS.txt is not valid UTF-8 — refusing to parse: {e}"
         ))
     })?;
-    let expected_asset_sha = lookup_platform_sha(manifest_text, asset_basename)?;
+    let entries = parse_release_manifest(manifest_text)?;
+
+    Ok(VerifiedReleaseManifest {
+        publisher: snapshot.publisher,
+        workflow_path: snapshot.workflow_path,
+        workflow_ref: snapshot.workflow_ref,
+        integrated_time: integrated_time_utc,
+        log_index,
+        log_id,
+        leaf_cert_sha256,
+        manifest_sha256,
+        source_commit,
+        entries,
+    })
+}
+
+fn verify_release_asset(
+    release: &VerifiedReleaseManifest,
+    asset_bytes: &[u8],
+    asset_basename: &str,
+) -> Result<AttestationAudit, LpmError> {
+    let expected_asset_sha = release.entries.get(asset_basename).ok_or_else(|| {
+        LpmError::SelfUpdate(format!(
+            "SHA256SUMS.txt does not enumerate `{asset_basename}` for this platform — release pipeline may be missing artifacts"
+        ))
+    })?;
     let actual_asset_sha = sha256_hex(asset_bytes);
-    if actual_asset_sha != expected_asset_sha {
+    if &actual_asset_sha != expected_asset_sha {
         return Err(LpmError::SelfUpdate(format!(
             "downloaded `{asset_basename}` SHA-256 mismatch: signed manifest declares \
              {expected_asset_sha}, actual download is {actual_asset_sha}. \
@@ -764,16 +939,17 @@ fn verify_release_artifacts(
     }
 
     Ok(AttestationAudit {
-        publisher: snapshot.publisher.clone(),
-        workflow_path: snapshot.workflow_path.clone(),
-        workflow_ref: snapshot.workflow_ref,
-        integrated_time: integrated_time_utc,
-        log_index,
-        log_id,
-        leaf_cert_sha256,
-        manifest_sha256,
+        publisher: release.publisher.clone(),
+        workflow_path: release.workflow_path.clone(),
+        workflow_ref: release.workflow_ref.clone(),
+        integrated_time: release.integrated_time,
+        log_index: release.log_index,
+        log_id: release.log_id.clone(),
+        leaf_cert_sha256: release.leaf_cert_sha256.clone(),
+        manifest_sha256: release.manifest_sha256.clone(),
         asset_sha256: actual_asset_sha,
         asset_name: asset_basename.to_string(),
+        source_commit: release.source_commit.clone(),
     })
 }
 
@@ -807,6 +983,7 @@ async fn run_standalone_update(version: &str) -> Result<AttestationAudit, LpmErr
         manifest_sha256 = %assets.audit.manifest_sha256,
         asset_sha256 = %assets.audit.asset_sha256,
         asset_name = %assets.audit.asset_name,
+        source_commit = %assets.audit.source_commit,
         "standalone self-update verified and applied"
     );
     Ok(assets.audit)
@@ -827,6 +1004,7 @@ fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
         "manifest_sha256": audit.manifest_sha256,
         "asset_sha256": audit.asset_sha256,
         "asset_name": audit.asset_name,
+        "source_commit": audit.source_commit,
     })
 }
 
@@ -840,55 +1018,79 @@ struct StandaloneAssets {
     audit: AttestationAudit,
 }
 
-async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
-    let (platform, ext) = detect_platform()?;
-    let binary_name = format!("lpm-{platform}{ext}");
-    let manifest_url = github_release_download_url(version, "SHA256SUMS.txt");
-    let bundle_url = github_release_download_url(version, "SHA256SUMS.txt.sigstore");
-    let asset_url = github_release_download_url(version, &binary_name);
-
-    let client = lpm_http::client_builder()
+fn release_http_client() -> Result<reqwest::Client, LpmError> {
+    lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
-        .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))?;
+        .map_err(|e| LpmError::Network(format!("failed to create HTTP client: {e}")))
+}
+
+async fn fetch_verified_release_manifest(
+    client: &reqwest::Client,
+    version: &str,
+) -> Result<VerifiedReleaseManifest, LpmError> {
+    let manifest_url = github_release_download_url(version, "SHA256SUMS.txt");
+    let bundle_url = github_release_download_url(version, "SHA256SUMS.txt.sigstore");
 
     install_ui::phase_untrusted(&format!("Fetching signed checksums for v{version}"));
 
-    let manifest_bytes = fetch_bounded(&client, &manifest_url, MANIFEST_MAX_BYTES)
-        .await?
-        .ok_or_else(|| {
-            LpmError::SelfUpdate(format!(
-                "release v{version} does not ship SHA256SUMS.txt — this release predates LPM's \
-                 signed-install gate. Install manually from \
-                 https://github.com/lpm-dev/rust-client/releases/v{version}"
-            ))
-        })?;
-    let bundle_bytes = fetch_bounded(&client, &bundle_url, BUNDLE_MAX_BYTES)
-        .await?
-        .ok_or_else(|| {
-            LpmError::SelfUpdate(format!(
-                "release v{version} ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore — \
-                 cannot cryptographically verify the manifest. Install manually."
-            ))
-        })?;
+    let manifest = async {
+        fetch_bounded(client, &manifest_url, MANIFEST_MAX_BYTES)
+            .await?
+            .ok_or_else(|| {
+                LpmError::SelfUpdate(format!(
+                    "release v{version} does not ship SHA256SUMS.txt — this release predates LPM's \
+                     signed-install gate. Install manually from \
+                     https://github.com/lpm-dev/rust-client/releases/v{version}"
+                ))
+            })
+    };
+    let bundle = async {
+        fetch_bounded(client, &bundle_url, BUNDLE_MAX_BYTES)
+            .await?
+            .ok_or_else(|| {
+                LpmError::SelfUpdate(format!(
+                    "release v{version} ships SHA256SUMS.txt but not SHA256SUMS.txt.sigstore — \
+                     cannot cryptographically verify the manifest. Install manually."
+                ))
+            })
+    };
+    let release_metadata = async {
+        fetch_github_release_published_at(version)
+            .await
+            .map_err(|e| match e {
+                LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
+                    "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window. \
+                     Install manually."
+                )),
+                LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
+                    "release v{version} did not expose valid release metadata: {msg}. \
+                     Cannot bind the Sigstore attestation to the requested release."
+                )),
+                other => LpmError::Network(format!(
+                    "could not fetch release metadata for v{version}: {other}"
+                )),
+            })
+    };
 
-    let published_at = fetch_github_release_published_at(version)
-        .await
-        .map_err(|e| match e {
-            LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
-                "GitHub has no release at tag v{version} — cannot anchor the Sigstore replay window. \
-                 Install manually."
-            )),
-            LookupError::MalformedResponse(msg) => LpmError::SelfUpdate(format!(
-                "release v{version} did not expose a parseable `published_at` timestamp: {msg}. \
-                 Cannot anchor the Sigstore replay window."
-            )),
-            other => LpmError::Network(format!(
-                "could not fetch release metadata for v{version}: {other}"
-            )),
-        })?;
-
+    let (manifest_bytes, bundle_bytes, published_at) =
+        tokio::try_join!(manifest, bundle, release_metadata)?;
     install_ui::phase("Verifying Sigstore attestation");
+    verify_release_manifest(version, &manifest_bytes, &bundle_bytes, published_at)
+}
+
+async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
+    let (platform, ext) = detect_platform()?;
+    let binary_name = format!("lpm-{platform}{ext}");
+    let asset_url = github_release_download_url(version, &binary_name);
+
+    let client = release_http_client()?;
+    let release = fetch_verified_release_manifest(&client, version).await?;
+    if !release.entries.contains_key(&binary_name) {
+        return Err(LpmError::SelfUpdate(format!(
+            "SHA256SUMS.txt does not enumerate `{binary_name}` for this platform — release pipeline may be missing artifacts"
+        )));
+    }
 
     let asset_vec = fetch_bounded(&client, &asset_url, ASSET_MAX_BYTES)
         .await?
@@ -898,14 +1100,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
             ))
         })?;
 
-    let audit = verify_release_artifacts(
-        version,
-        &manifest_bytes,
-        &bundle_bytes,
-        &asset_vec,
-        &binary_name,
-        published_at,
-    )?;
+    let audit = verify_release_asset(&release, &asset_vec, &binary_name)?;
 
     install_ui::done_untrusted(&format!(
         "Verified Sigstore attestation for {} ({}, integratedTime {})",
@@ -1295,12 +1490,114 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     #[test]
+    fn lookup_platform_sha_rejects_malformed_line_after_target() {
+        let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  lpm-linux-x64
+not-a-valid-line
+";
+        let err = lookup_platform_sha(manifest, "lpm-linux-x64")
+            .expect_err("the complete manifest must be valid");
+        match err {
+            LpmError::SelfUpdate(msg) => assert!(msg.contains("malformed")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_platform_sha_rejects_duplicate_target() {
+        let manifest = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  lpm-linux-x64
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
+";
+        let err = lookup_platform_sha(manifest, "lpm-linux-x64")
+            .expect_err("a platform must have exactly one digest");
+        match err {
+            LpmError::SelfUpdate(msg) => assert!(msg.contains("more than once")),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn sha256_hex_matches_known_vector() {
         let got = sha256_hex(b"abc");
         assert_eq!(
             got,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    fn release_provenance_fixture(
+        workflow_ref: &str,
+        source_commit: &str,
+    ) -> (lpm_workspace::ProvenanceSnapshot, serde_json::Value) {
+        let snapshot = lpm_workspace::ProvenanceSnapshot {
+            present: true,
+            publisher: Some("github:lpm-dev/rust-client".to_string()),
+            workflow_path: Some(".github/workflows/release.yml".to_string()),
+            workflow_ref: Some(workflow_ref.to_string()),
+            attestation_cert_sha256: Some("sha256-fixture".to_string()),
+        };
+        let statement = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{
+                "name": "SHA256SUMS.txt",
+                "digest": { "sha256": "a".repeat(64) },
+            }],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+                "buildDefinition": {
+                    "externalParameters": {
+                        "workflow": {
+                            "ref": workflow_ref,
+                            "repository": "https://github.com/lpm-dev/rust-client",
+                            "path": ".github/workflows/release.yml",
+                        },
+                    },
+                    "resolvedDependencies": [{
+                        "uri": format!("git+https://github.com/lpm-dev/rust-client@{workflow_ref}"),
+                        "digest": { "gitCommit": source_commit },
+                    }],
+                },
+            },
+        });
+        (snapshot, statement)
+    }
+
+    #[test]
+    fn release_provenance_rejects_stable_workflow_ref_for_another_version() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let (snapshot, statement) = release_provenance_fixture("refs/tags/v0.74.1", source_commit);
+        let err = validate_release_provenance("0.75.0", &snapshot, &statement)
+            .expect_err("a stable release must be signed from its requested tag");
+        assert!(err.to_string().contains("refs/tags/v0.75.0"));
+    }
+
+    #[test]
+    fn release_provenance_rejects_nightly_version_from_another_commit() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let (snapshot, statement) = release_provenance_fixture("refs/heads/main", source_commit);
+        let err =
+            validate_release_provenance("0.75.0-nightly.20260817.1.fffffff", &snapshot, &statement)
+                .expect_err("a nightly version must name its signed source commit");
+        assert!(err.to_string().contains("fffffff"));
+    }
+
+    #[test]
+    fn release_provenance_accepts_exact_stable_tag_and_source_commit() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let (snapshot, statement) = release_provenance_fixture("refs/tags/v0.74.1", source_commit);
+        let verified = validate_release_provenance("0.74.1", &snapshot, &statement).unwrap();
+        assert_eq!(verified, source_commit);
+    }
+
+    #[test]
+    fn release_provenance_accepts_nightly_commit_suffix() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let (snapshot, statement) = release_provenance_fixture("refs/heads/main", source_commit);
+        let verified =
+            validate_release_provenance("0.75.0-nightly.20260817.1.1e98fb8", &snapshot, &statement)
+                .unwrap();
+        assert_eq!(verified, source_commit);
     }
 
     /// Wire-shape pin for the audit JSON surface — `--json self-update`
@@ -1323,6 +1620,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             manifest_sha256: "deadbeef".to_string(),
             asset_sha256: "cafebabe".to_string(),
             asset_name: "lpm-linux-x64".to_string(),
+            source_commit: "1e98fb8efbcc00f620678fc8091b512ed503768f".to_string(),
         };
         let json = audit_json(&audit);
         let obj = json.as_object().expect("audit_json returns an object");
@@ -1337,6 +1635,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             "manifest_sha256",
             "asset_sha256",
             "asset_name",
+            "source_commit",
         ] {
             assert!(
                 obj.contains_key(key),
@@ -1433,12 +1732,38 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         })
     }
 
+    async fn mount_release_metadata(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(mount_release_tag_with_published_at("0.42.0")),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_placeholder_bundle(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/download/v0.42.0/SHA256SUMS.txt.sigstore",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn standalone_update_refuses_when_manifest_is_404() {
         let server = wiremock::MockServer::start().await;
+        mount_release_metadata(&server).await;
+        mount_placeholder_bundle(&server).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
-            .respond_with(wiremock::ResponseTemplate::new(404))
+            .respond_with(
+                wiremock::ResponseTemplate::new(404)
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
             .mount(&server)
             .await;
 
@@ -1463,6 +1788,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[tokio::test]
     async fn standalone_update_refuses_when_bundle_is_404() {
         let server = wiremock::MockServer::start().await;
+        mount_release_metadata(&server).await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(
@@ -1536,6 +1862,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path(&asset_path))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -1665,6 +1992,8 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[tokio::test]
     async fn standalone_update_refuses_when_manifest_exceeds_size_cap() {
         let server = wiremock::MockServer::start().await;
+        mount_release_metadata(&server).await;
+        mount_placeholder_bundle(&server).await;
         // 8 KiB of zeros — well over the 4 KiB cap.
         let huge = vec![b'0'; 8 * 1024];
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1694,6 +2023,8 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[tokio::test]
     async fn standalone_update_refuses_when_manifest_streams_past_cap_without_content_length() {
         let server = wiremock::MockServer::start().await;
+        mount_release_metadata(&server).await;
+        mount_placeholder_bundle(&server).await;
         let huge = vec![b'0'; 8 * 1024];
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download/v0.42.0/SHA256SUMS.txt"))
@@ -1934,7 +2265,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
 
     #[test]
     fn install_method_command_npm_pins_exact_version() {
-        let cmd = InstallMethod::Npm.command("0.25.0");
+        let cmd = InstallMethod::Npm.command("0.25.0", None).unwrap();
         assert!(cmd.contains("@lpm-registry/cli@0.25.0"), "cmd: {cmd}");
         assert!(!cmd.contains("@latest"), "must not use @latest: {cmd}");
     }
@@ -2026,20 +2357,34 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     #[test]
-    fn install_method_command_cargo_uses_tag() {
-        // Without --tag, `cargo install --git ... --force` tracks
-        // the default branch HEAD — so the docs claim "you'll be
-        // on v{latest}" is a lie. The fix is mandatory --tag pinning;
-        // this test pins the contract.
-        let cmd = InstallMethod::Cargo.command("0.25.0");
-        assert!(cmd.contains("--tag v0.25.0"), "cmd: {cmd}");
+    fn install_method_command_cargo_uses_verified_revision() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let cmd = InstallMethod::Cargo
+            .command("0.25.0", Some(source_commit))
+            .unwrap();
+        assert!(
+            cmd.contains(&format!("--rev {source_commit}")),
+            "cmd: {cmd}"
+        );
+        assert!(!cmd.contains("--tag"), "cmd: {cmd}");
         assert!(cmd.contains("--force"), "cmd: {cmd}");
+    }
+
+    #[test]
+    fn cargo_install_arguments_use_verified_source_commit_instead_of_tag() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let args = cargo_install_args(source_commit);
+        assert!(
+            args.windows(2).any(|pair| pair == ["--rev", source_commit]),
+            "Cargo arguments do not bind the verified commit: {args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "--tag"));
     }
 
     #[test]
     fn install_method_command_homebrew_unchanged() {
         assert_eq!(
-            InstallMethod::Homebrew.command("0.25.0"),
+            InstallMethod::Homebrew.command("0.25.0", None).unwrap(),
             "brew upgrade lpm"
         );
     }
@@ -2053,7 +2398,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     /// this divergence.
     #[test]
     fn install_method_command_standalone_pins_resolved_version() {
-        let cmd = InstallMethod::Standalone.command("0.25.0");
+        let cmd = InstallMethod::Standalone.command("0.25.0", None).unwrap();
         // Must NOT use install.sh (which re-resolves latest itself).
         assert!(
             !cmd.contains("install.sh"),

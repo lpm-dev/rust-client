@@ -62,10 +62,9 @@ pub struct IdentityExpectations {
     /// site (`rust-client` vs `rust-client/`) — always include the
     /// trailing `/` to anchor.
     pub expected_san_uri_prefix: Option<String>,
-    /// Required workflow-path substring inside the SAN URI.
+    /// Required workflow path inside the SAN URI.
     /// Example: `.github/workflows/release.yml`. The full SAN URI
-    /// shape is `<prefix><workflow_path>@<ref>` so substring match
-    /// is structurally safe.
+    /// shape is `<prefix><workflow_path>@<ref>`.
     pub expected_workflow_path: Option<String>,
 }
 
@@ -93,6 +92,7 @@ impl IdentityExpectations {
 #[derive(Debug, Clone)]
 pub struct VerifiedProvenance {
     pub snapshot: lpm_workspace::ProvenanceSnapshot,
+    pub statement: serde_json::Value,
     pub integrated_time: SystemTime,
     pub leaf_cert_sha256: String,
     pub log_id: String,
@@ -229,6 +229,7 @@ pub fn verify_sigstore_bundle(
 
     Ok(VerifiedProvenance {
         snapshot,
+        statement: components.statement,
         integrated_time: at_time,
         leaf_cert_sha256,
         log_id: components.tlog_entry.log_id.key_id.clone(),
@@ -241,6 +242,7 @@ pub fn verify_sigstore_bundle(
 #[derive(Debug)]
 pub(super) struct BundleComponents {
     pub(super) dsse_envelope: DsseEnvelope,
+    pub(super) statement: serde_json::Value,
     pub(super) leaf_cert_der: Vec<u8>,
     pub(super) chain_der: Vec<Vec<u8>>,
     pub(super) tlog_entry: crate::sigstore::TlogEntry,
@@ -349,6 +351,11 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
         .ok_or_else(|| VerifyError::BundleParse("bundle missing `dsseEnvelope`".into()))?;
     let dsse_envelope: DsseEnvelope = serde_json::from_value(dsse_value.clone())
         .map_err(|e| VerifyError::BundleParse(format!("dsseEnvelope shape: {e}")))?;
+    let payload_bytes = BASE64
+        .decode(dsse_envelope.payload.as_bytes())
+        .map_err(|e| VerifyError::BundleParse(format!("DSSE payload not base64: {e}")))?;
+    let statement: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| VerifyError::BundleParse(format!("DSSE payload not JSON: {e}")))?;
 
     // Tlog entry — take the first. Sigstore bundles ship one
     // `tlogEntries[0]` for the canonical Rekor entry.
@@ -368,6 +375,7 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
 
     Ok(BundleComponents {
         dsse_envelope,
+        statement,
         leaf_cert_der,
         chain_der,
         tlog_entry,
@@ -384,10 +392,6 @@ fn parse_inner_bundle(bundle: &serde_json::Value) -> Result<BundleComponents, Ve
 /// to the SHA-256 of the `SHA256SUMS.txt` manifest it just downloaded.
 ///
 /// Returns `(subject_name, subject_sha256)`. Hex digest is lowercase.
-pub(crate) fn extract_in_toto_subject_digest(body: &[u8]) -> Result<(String, String), VerifyError> {
-    extract_in_toto_subject_digest_for_algorithm(body, "sha256", false)
-}
-
 pub(crate) fn extract_npm_subject_sha512(body: &[u8]) -> Result<(String, String), VerifyError> {
     extract_in_toto_subject_digest_for_algorithm(body, "sha512", true)
 }
@@ -398,12 +402,18 @@ fn extract_in_toto_subject_digest_for_algorithm(
     require_exactly_one_subject: bool,
 ) -> Result<(String, String), VerifyError> {
     let components = parse_bundle_components(body)?;
-    let payload_bytes = BASE64
-        .decode(components.dsse_envelope.payload.as_bytes())
-        .map_err(|e| VerifyError::BundleParse(format!("DSSE payload not base64: {e}")))?;
-    let statement: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| VerifyError::BundleParse(format!("DSSE payload not JSON: {e}")))?;
+    extract_subject_digest_from_statement(
+        &components.statement,
+        algorithm,
+        require_exactly_one_subject,
+    )
+}
 
+pub(crate) fn extract_subject_digest_from_statement(
+    statement: &serde_json::Value,
+    algorithm: &str,
+    require_exactly_one_subject: bool,
+) -> Result<(String, String), VerifyError> {
     let subjects = statement
         .get("subject")
         .and_then(|v| v.as_array())
@@ -530,14 +540,16 @@ pub(super) fn check_identity_expectations(
                 actual: san_uri,
             });
         }
-        if let Some(workflow) = &expectations.expected_workflow_path
-            && !san_uri.contains(workflow)
-        {
-            return Err(VerifyError::IdentityMismatch {
-                field: "workflow_path",
-                expected: workflow.clone(),
-                actual: san_uri,
-            });
+        if let Some(expected_workflow) = &expectations.expected_workflow_path {
+            let actual_workflow = parse_github_actions_identity(&san_uri)
+                .map_or_else(|| san_uri.clone(), |(_, workflow, _)| workflow);
+            if &actual_workflow != expected_workflow {
+                return Err(VerifyError::IdentityMismatch {
+                    field: "workflow_path",
+                    expected: expected_workflow.clone(),
+                    actual: actual_workflow,
+                });
+            }
         }
     }
 

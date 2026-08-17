@@ -913,6 +913,21 @@ pub async fn fetch_github_release_published_at(
 
     let body = parse_release_json(resp, "release-by-tag body").await?;
 
+    let expected_tag = format!("v{version}");
+    let tag_name = body
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            LookupError::MalformedResponse(format!(
+                "release v{version} response missing string `tag_name`"
+            ))
+        })?;
+    if tag_name != expected_tag {
+        return Err(LookupError::MalformedResponse(format!(
+            "release-by-tag response returned `{tag_name}` for requested tag `{expected_tag}`"
+        )));
+    }
+
     let published_at_str = body
         .get("published_at")
         .and_then(|v| v.as_str())
@@ -2057,6 +2072,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_github_release_published_at_rejects_mismatched_tag_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.41.0",
+                    "published_at": "2026-05-10T12:34:56Z",
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        with_release_by_tag_override(&template, async {
+            let err = fetch_github_release_published_at("0.42.0")
+                .await
+                .expect_err("the response tag must match the requested release");
+            match err {
+                LookupError::MalformedResponse(msg) => assert!(msg.contains("v0.41.0")),
+                other => panic!("expected MalformedResponse, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn fetch_github_release_published_at_rejects_oversized_body() {
         const RESPONSE_CAP: usize = 4 * 1024 * 1024;
         let server = wiremock::MockServer::start().await;
@@ -2090,6 +2132,7 @@ mod tests {
             .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "tag_name": "v0.42.0",
                     "published_at": "2026-05-10T12:34:56Z",
                 })),
             )
