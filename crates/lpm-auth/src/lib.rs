@@ -34,6 +34,8 @@ use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
 use std::path::{Path, PathBuf};
 
+use credential_authority::{CredentialAuthority, CredentialKind};
+
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{
     delete_generic_password as macos_delete_generic_password,
@@ -48,6 +50,7 @@ use security_framework::{
     os::macos::passwords::find_generic_password as macos_find_generic_password,
 };
 
+mod credential_authority;
 mod session;
 pub use session::{
     AuthRequirement, AuthStorageAccessKind, RefreshPolicy, SessionManager, TokenSource,
@@ -78,6 +81,12 @@ enum KeychainCredentialProbe {
     #[cfg(any(target_os = "macos", test))]
     InteractionRequired,
     Failed,
+}
+
+enum KeychainCredentialResolution {
+    Found(String),
+    NotFound,
+    Unavailable,
 }
 
 #[cfg(target_os = "macos")]
@@ -318,13 +327,7 @@ pub fn get_token(registry_url: &str) -> Option<String> {
         return Some(token);
     }
 
-    // 2. OS keychain (catch any panics from the keyring crate)
-    if let Some(token) = get_token_from_keychain_safe(registry_url) {
-        return Some(token);
-    }
-
-    // 3. Encrypted file fallback (Rust-native format, NOT compatible with JS CLI's format)
-    get_token_from_file(registry_url)
+    get_stored_access_token(registry_url)
     // Expiry-based warnings are emitted at command level via
     // check_token_expiry_warnings().
 }
@@ -337,11 +340,8 @@ pub(crate) fn get_stored_access_token_with_interaction_notice(
     registry_url: &str,
     notice: impl FnOnce(),
 ) -> Option<String> {
-    let account = scoped_account(registry_url);
-    get_password_from_keychain_account_with_interaction_notice(&account, notice, || {
-        get_token_from_file(registry_url)
-    })
-    .filter(|token| !token.is_empty())
+    get_stored_credential_with_backend(registry_url, CredentialKind::Access, notice)
+        .map(|stored| stored.token)
 }
 
 /// Check whether a non-empty access token is stored for the given registry.
@@ -364,15 +364,97 @@ pub fn set_token_with_backend(
     registry_url: &str,
     token: &str,
 ) -> Result<AuthStorageBackend, String> {
-    // Try keychain first
-    if set_token_in_keychain(registry_url, token).is_ok() {
-        return Ok(AuthStorageBackend::Keychain);
-    }
+    set_credential_with_backend(registry_url, CredentialKind::Access, token, || {
+        set_token_in_keychain(registry_url, token)
+    })
+}
 
-    // Fall back to encrypted file
-    tracing::warn!("system keychain unavailable — using encrypted file storage");
-    set_token_in_file(registry_url, token)?;
-    Ok(AuthStorageBackend::EncryptedFileFallback)
+fn set_credential_with_backend(
+    registry: &str,
+    kind: CredentialKind,
+    token: &str,
+    keychain_write: impl FnOnce() -> Result<(), String>,
+) -> Result<AuthStorageBackend, String> {
+    with_credential_store_lock(|| {
+        set_credential_with_keychain_writer_unlocked(registry, kind, token, keychain_write)
+    })
+}
+
+fn set_credential_with_keychain_writer_unlocked(
+    registry: &str,
+    kind: CredentialKind,
+    token: &str,
+    keychain_write: impl FnOnce() -> Result<(), String>,
+) -> Result<AuthStorageBackend, String> {
+    let file_key = kind.file_key(registry);
+    match keychain_write() {
+        Ok(()) => {
+            credential_authority::set(registry, kind, CredentialAuthority::Keychain)
+                .map_err(|error| format!("failed to record keychain authority: {error}"))?;
+            clear_token_from_file(&file_key).map_err(|error| {
+                format!(
+                    "keychain credential stored but stale encrypted fallback could not be removed: {error}"
+                )
+            })?;
+            Ok(AuthStorageBackend::Keychain)
+        }
+        Err(keychain_error) => {
+            tracing::warn!("system keychain unavailable — using encrypted file storage");
+            set_token_in_file(&file_key, token).map_err(|file_error| {
+                format!(
+                    "keychain write failed ({keychain_error}); encrypted fallback failed: {file_error}"
+                )
+            })?;
+            credential_authority::set(
+                registry,
+                kind,
+                CredentialAuthority::EncryptedFileFallback,
+            )
+            .map_err(|error| format!("failed to record encrypted fallback authority: {error}"))?;
+            Ok(AuthStorageBackend::EncryptedFileFallback)
+        }
+    }
+}
+
+fn clear_stored_credential(
+    registry: &str,
+    kind: CredentialKind,
+    keychain_clear: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    with_credential_store_lock(|| {
+        let file_key = kind.file_key(registry);
+        combine_credential_results([
+            keychain_clear(),
+            clear_token_from_file(&file_key),
+            credential_authority::clear(registry, kind),
+        ])
+    })
+}
+
+fn with_credential_store_lock<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = session_lock_path("lpm-auth://credential-store")?;
+    lpm_common::paths::with_exclusive_lock(lock_path, || {
+        operation().map_err(lpm_common::LpmError::Registry)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn combine_credential_results<const N: usize>(
+    results: [Result<(), String>; N],
+) -> Result<(), String> {
+    let mut errors = Vec::with_capacity(N);
+    for result in results {
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub fn auth_storage_status(registry_url: &str) -> AuthStorageStatus {
@@ -388,12 +470,12 @@ pub fn clear_token(registry_url: &str) -> Result<(), String> {
 }
 
 fn clear_stored_token(registry_url: &str) -> Result<(), String> {
-    let keychain_result = clear_token_from_keychain(registry_url);
-    let file_result = clear_token_from_file(registry_url);
-
-    combine_clear_results(keychain_result, file_result)
+    clear_stored_credential(registry_url, CredentialKind::Access, || {
+        clear_token_from_keychain(registry_url)
+    })
 }
 
+#[cfg(not(test))]
 fn combine_clear_results(
     keychain_result: Result<(), String>,
     file_result: Result<(), String>,
@@ -421,6 +503,8 @@ pub fn clear_login_state(registry_url: &str) -> Result<(), String> {
     let result = {
         clear_token_from_file(registry_url)?;
         clear_token_from_file(&format!("refresh:{registry_url}"))?;
+        credential_authority::clear(registry_url, CredentialKind::Access)?;
+        credential_authority::clear(registry_url, CredentialKind::Refresh)?;
         clear_token_expiry(registry_url);
         Ok(())
     };
@@ -649,21 +733,7 @@ fn non_empty_environment_credential(
 }
 
 fn get_stored_access_token_with_backend(registry_url: &str) -> Option<StoredToken> {
-    if let Some(token) =
-        get_token_from_keychain_safe(registry_url).filter(|token| !token.is_empty())
-    {
-        return Some(StoredToken {
-            token,
-            backend: AuthStorageBackend::Keychain,
-        });
-    }
-
-    get_token_from_file(registry_url)
-        .filter(|token| !token.is_empty())
-        .map(|token| StoredToken {
-            token,
-            backend: AuthStorageBackend::EncryptedFileFallback,
-        })
+    get_stored_credential_with_backend(registry_url, CredentialKind::Access, || {})
 }
 
 fn stored_access_backend(registry_url: &str) -> Option<AuthStorageBackend> {
@@ -671,26 +741,128 @@ fn stored_access_backend(registry_url: &str) -> Option<AuthStorageBackend> {
 }
 
 fn stored_refresh_backend(registry_url: &str) -> Option<AuthStorageBackend> {
-    let account = scoped_refresh_account(registry_url);
-    if get_password_from_keychain_account(&account)
-        .filter(|token| !token.is_empty())
-        .is_some()
-    {
-        return Some(AuthStorageBackend::Keychain);
-    }
-
-    get_token_from_file(&format!("refresh:{registry_url}"))
-        .filter(|token| !token.is_empty())
-        .map(|_| AuthStorageBackend::EncryptedFileFallback)
+    get_stored_credential_with_backend(registry_url, CredentialKind::Refresh, || {})
+        .map(|stored| stored.backend)
 }
 
-fn get_token_from_keychain_safe(registry_url: &str) -> Option<String> {
-    match std::panic::catch_unwind(|| get_token_from_keychain(registry_url)) {
-        Ok(token) => token,
-        Err(_) => {
-            tracing::debug!("keychain access panicked, falling through to file");
-            None
+fn get_stored_credential_with_backend(
+    registry: &str,
+    kind: CredentialKind,
+    notice: impl FnOnce(),
+) -> Option<StoredToken> {
+    let file_key = kind.file_key(registry);
+    if force_file_auth() {
+        return get_token_from_file(&file_key)
+            .filter(|token| !token.is_empty())
+            .map(|token| StoredToken {
+                token,
+                backend: AuthStorageBackend::EncryptedFileFallback,
+            });
+    }
+
+    let authority = match credential_authority::read(registry, kind) {
+        Ok(authority) => authority,
+        Err(error) => {
+            tracing::warn!(
+                "credential authority unavailable; refusing ambiguous fallback: {error}"
+            );
+            return None;
         }
+    };
+    let account = match kind {
+        CredentialKind::Access => scoped_account(registry),
+        CredentialKind::Refresh => scoped_refresh_account(registry),
+    };
+
+    let resolved = resolve_stored_credential_from_backends(
+        authority,
+        || {
+            std::panic::catch_unwind(|| {
+                probe_keychain_credential(keychain_service().as_ref(), &account)
+            })
+            .unwrap_or_else(|_| {
+                tracing::debug!("keychain access panicked");
+                KeychainCredentialProbe::Failed
+            })
+        },
+        notice,
+        || get_password_from_keychain_account(&account),
+        || get_token_from_file(&file_key),
+    )?;
+
+    if authority.is_none() && resolved.backend == AuthStorageBackend::Keychain {
+        let migrated_authority = match promote_legacy_keychain_authority(registry, kind) {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to migrate credential backend authority; refusing ambiguous state: {error}"
+                );
+                return None;
+            }
+        };
+        return match migrated_authority {
+            CredentialAuthority::Keychain => get_password_from_keychain_account(&account)
+                .filter(|token| !token.is_empty())
+                .map(|token| StoredToken {
+                    token,
+                    backend: AuthStorageBackend::Keychain,
+                }),
+            CredentialAuthority::EncryptedFileFallback => get_token_from_file(&file_key)
+                .filter(|token| !token.is_empty())
+                .map(|token| StoredToken {
+                    token,
+                    backend: AuthStorageBackend::EncryptedFileFallback,
+                }),
+        };
+    }
+
+    Some(resolved)
+}
+
+fn promote_legacy_keychain_authority(
+    registry: &str,
+    kind: CredentialKind,
+) -> Result<CredentialAuthority, String> {
+    with_credential_store_lock(|| match credential_authority::read(registry, kind)? {
+        Some(authority) => Ok(authority),
+        None => {
+            clear_token_from_file(&kind.file_key(registry))?;
+            credential_authority::set(registry, kind, CredentialAuthority::Keychain)?;
+            Ok(CredentialAuthority::Keychain)
+        }
+    })
+}
+
+fn resolve_stored_credential_from_backends(
+    authority: Option<CredentialAuthority>,
+    keychain_probe: impl FnOnce() -> KeychainCredentialProbe,
+    notice: impl FnOnce(),
+    interactive_retry: impl FnOnce() -> Option<String>,
+    file_lookup: impl FnOnce() -> Option<String>,
+) -> Option<StoredToken> {
+    if authority == Some(CredentialAuthority::EncryptedFileFallback) {
+        return file_lookup()
+            .filter(|token| !token.is_empty())
+            .map(|token| StoredToken {
+                token,
+                backend: AuthStorageBackend::EncryptedFileFallback,
+            });
+    }
+
+    match resolve_keychain_probe(keychain_probe(), notice, interactive_retry) {
+        KeychainCredentialResolution::Found(token) if !token.is_empty() => Some(StoredToken {
+            token,
+            backend: AuthStorageBackend::Keychain,
+        }),
+        KeychainCredentialResolution::NotFound if authority.is_none() => file_lookup()
+            .filter(|token| !token.is_empty())
+            .map(|token| StoredToken {
+                token,
+                backend: AuthStorageBackend::EncryptedFileFallback,
+            }),
+        KeychainCredentialResolution::Found(_)
+        | KeychainCredentialResolution::NotFound
+        | KeychainCredentialResolution::Unavailable => None,
     }
 }
 
@@ -1360,37 +1532,23 @@ pub fn set_refresh_token_with_backend(
     token: &str,
 ) -> Result<AuthStorageBackend, String> {
     let account = scoped_refresh_account(registry);
-
-    if set_password_in_keychain_account(&account, token).is_ok() {
-        return Ok(AuthStorageBackend::Keychain);
-    }
-
-    // Fall back to encrypted file (same AES-256-GCM as main tokens)
-    set_token_in_file(&format!("refresh:{registry}"), token)?;
-    Ok(AuthStorageBackend::EncryptedFileFallback)
+    set_credential_with_backend(registry, CredentialKind::Refresh, token, || {
+        set_password_in_keychain_account(&account, token)
+    })
 }
 
 /// Get the stored refresh token for a registry.
 pub fn get_refresh_token(registry: &str) -> Option<String> {
-    let account = scoped_refresh_account(registry);
-
-    if let Some(token) = get_password_from_keychain_account(&account) {
-        return Some(token);
-    }
-
-    // Fall back to encrypted file
-    get_token_from_file(&format!("refresh:{registry}"))
+    get_stored_credential_with_backend(registry, CredentialKind::Refresh, || {})
+        .map(|stored| stored.token)
 }
 
 pub(crate) fn get_refresh_token_with_interaction_notice(
     registry: &str,
     notice: impl FnOnce(),
 ) -> Option<String> {
-    let account = scoped_refresh_account(registry);
-    get_password_from_keychain_account_with_interaction_notice(&account, notice, || {
-        get_token_from_file(&format!("refresh:{registry}"))
-    })
-    .filter(|token| !token.is_empty())
+    get_stored_credential_with_backend(registry, CredentialKind::Refresh, notice)
+        .map(|stored| stored.token)
 }
 
 /// Check whether a refresh token is stored for the given registry.
@@ -1401,10 +1559,9 @@ pub fn has_refresh_token(registry: &str) -> bool {
 /// Clear the stored refresh token for a registry.
 pub fn clear_refresh_token(registry: &str) -> Result<(), String> {
     let account = scoped_refresh_account(registry);
-    combine_clear_results(
-        clear_password_from_keychain_account(&account),
-        clear_token_from_file(&format!("refresh:{registry}")),
-    )
+    clear_stored_credential(registry, CredentialKind::Refresh, || {
+        clear_password_from_keychain_account(&account)
+    })
 }
 
 /// Parse the npm auth token from `.npmrc` files.
@@ -1559,39 +1716,37 @@ fn get_password_from_keychain_account(account: &str) -> Option<String> {
     None
 }
 
-fn get_password_from_keychain_account_with_interaction_notice(
-    account: &str,
+#[cfg(test)]
+fn resolve_keychain_credential(
+    probe: KeychainCredentialProbe,
     notice: impl FnOnce(),
+    interactive_retry: impl FnOnce() -> Option<String>,
     fallback: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    if force_file_auth() {
-        return fallback();
+    match resolve_keychain_probe(probe, notice, interactive_retry) {
+        KeychainCredentialResolution::Found(token) => Some(token),
+        KeychainCredentialResolution::NotFound => fallback(),
+        KeychainCredentialResolution::Unavailable => None,
     }
-
-    let service = keychain_service();
-    let probe = probe_keychain_credential(service.as_ref(), account);
-    resolve_keychain_credential(
-        probe,
-        notice,
-        || get_password_from_keychain_account(account),
-        fallback,
-    )
 }
 
-fn resolve_keychain_credential(
+fn resolve_keychain_probe(
     probe: KeychainCredentialProbe,
     _notice: impl FnOnce(),
     _interactive_retry: impl FnOnce() -> Option<String>,
-    fallback: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+) -> KeychainCredentialResolution {
     match probe {
-        KeychainCredentialProbe::Found(token) => Some(token),
+        KeychainCredentialProbe::Found(token) => KeychainCredentialResolution::Found(token),
+        KeychainCredentialProbe::NotFound => KeychainCredentialResolution::NotFound,
         #[cfg(any(target_os = "macos", test))]
         KeychainCredentialProbe::InteractionRequired => {
             _notice();
-            _interactive_retry().or_else(fallback)
+            _interactive_retry().map_or(
+                KeychainCredentialResolution::Unavailable,
+                KeychainCredentialResolution::Found,
+            )
         }
-        KeychainCredentialProbe::NotFound | KeychainCredentialProbe::Failed => fallback(),
+        KeychainCredentialProbe::Failed => KeychainCredentialResolution::Unavailable,
     }
 }
 
@@ -1862,11 +2017,6 @@ fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
             Err(e) => Err(format!("keychain delete error: {e}")),
         }
     }
-}
-
-fn get_token_from_keychain(registry_url: &str) -> Option<String> {
-    let account = scoped_account(registry_url);
-    get_password_from_keychain_account(&account)
 }
 
 fn set_token_in_keychain(registry_url: &str, token: &str) -> Result<(), String> {
@@ -2196,14 +2346,16 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
 
     let dir = lpm_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir error: {e}"))?;
-    std::fs::write(&path, &encrypted).map_err(|e| format!("write error: {e}"))?;
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        encrypted,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
+    )
+    .map_err(|e| format!("write error: {e}"))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("permissions error: {e}"))?;
-    }
     #[cfg(windows)]
     {
         // Use icacls to restrict to current user only
@@ -2240,17 +2392,28 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
     let mut store: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|error| format!("json error: {error}"))?;
 
-    if let Some(obj) = store.as_object_mut() {
-        obj.remove(registry_url);
+    let removed = store
+        .as_object_mut()
+        .is_some_and(|object| object.remove(registry_url).is_some());
+    if !removed {
+        return Ok(());
     }
 
     if store.as_object().is_none_or(|o| o.is_empty()) {
         // No more tokens — remove the file
-        let _ = std::fs::remove_file(&path);
+        std::fs::remove_file(&path).map_err(|e| format!("remove error: {e}"))?;
     } else {
         let json_str = serde_json::to_string(&store).map_err(|e| format!("json error: {e}"))?;
         let encrypted = encrypt(&json_str)?;
-        std::fs::write(&path, &encrypted).map_err(|e| format!("write error: {e}"))?;
+        lpm_common::write_file_atomic_with_options(
+            &path,
+            encrypted,
+            lpm_common::AtomicWriteOptions::new()
+                .unix_mode(0o600)
+                .sync_file()
+                .sync_parent(),
+        )
+        .map_err(|e| format!("write error: {e}"))?;
     }
 
     Ok(())
@@ -2428,6 +2591,139 @@ mod tests {
         });
     }
 
+    #[test]
+    fn successful_keychain_write_removes_stale_encrypted_fallback() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            set_token_in_file(registry, "stale-file-token").unwrap();
+
+            let backend = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-keychain-token",
+                || Ok(()),
+            )
+            .unwrap();
+
+            assert_eq!(backend, AuthStorageBackend::Keychain);
+            assert_eq!(get_token_from_file(registry), None);
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(CredentialAuthority::Keychain)
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_keychain_migration_removes_stale_encrypted_fallback() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            set_token_in_file(registry, "stale-file-token").unwrap();
+
+            let authority =
+                promote_legacy_keychain_authority(registry, CredentialKind::Access).unwrap();
+
+            assert_eq!(authority, CredentialAuthority::Keychain);
+            assert_eq!(get_token_from_file(registry), None);
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(CredentialAuthority::Keychain)
+            );
+        });
+    }
+
+    #[test]
+    fn failed_keychain_write_makes_new_file_credential_authoritative() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let backend = set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-file-token",
+                || Err("transient keychain failure".to_owned()),
+            )
+            .unwrap();
+            let authority = credential_authority::read(registry, CredentialKind::Access).unwrap();
+
+            let resolved = resolve_stored_credential_from_backends(
+                authority,
+                || KeychainCredentialProbe::Found("stale-keychain-token".to_owned()),
+                || {},
+                || None,
+                || get_token_from_file(registry),
+            )
+            .unwrap();
+
+            assert_eq!(backend, AuthStorageBackend::EncryptedFileFallback);
+            assert_eq!(resolved.token, "new-file-token");
+            assert_eq!(resolved.backend, AuthStorageBackend::EncryptedFileFallback);
+        });
+    }
+
+    #[test]
+    fn credential_authority_is_independent_for_access_and_refresh_tokens() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            credential_authority::set(
+                registry,
+                CredentialKind::Access,
+                CredentialAuthority::Keychain,
+            )
+            .unwrap();
+            credential_authority::set(
+                registry,
+                CredentialKind::Refresh,
+                CredentialAuthority::EncryptedFileFallback,
+            )
+            .unwrap();
+
+            assert_eq!(
+                (
+                    credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                    credential_authority::read(registry, CredentialKind::Refresh).unwrap(),
+                ),
+                (
+                    Some(CredentialAuthority::Keychain),
+                    Some(CredentialAuthority::EncryptedFileFallback),
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn corrupt_credential_authority_fails_closed_without_using_file_token() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            set_token_in_file(registry, "file-token").unwrap();
+            let path = credential_authority::path_for_test().unwrap();
+            std::fs::write(&path, b"{not valid json").unwrap();
+
+            assert!(get_stored_access_token_with_backend(registry).is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), b"{not valid json");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_authority_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_home(|_| {
+            credential_authority::set(
+                "https://registry.example",
+                CredentialKind::Access,
+                CredentialAuthority::Keychain,
+            )
+            .unwrap();
+            let path = credential_authority::path_for_test().unwrap();
+
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn session_lock_uses_owner_only_file_and_directory_permissions() {
@@ -2541,6 +2837,49 @@ mod tests {
     }
 
     #[test]
+    fn keychain_authority_does_not_activate_stale_file_when_keychain_is_unavailable() {
+        let file_lookups = std::cell::Cell::new(0);
+
+        let credential = resolve_stored_credential_from_backends(
+            Some(CredentialAuthority::Keychain),
+            || KeychainCredentialProbe::Failed,
+            || {},
+            || None,
+            || {
+                file_lookups.set(file_lookups.get() + 1);
+                Some("stale-file-token".to_owned())
+            },
+        );
+
+        assert!(credential.is_none());
+        assert_eq!(file_lookups.get(), 0);
+    }
+
+    #[test]
+    fn file_authority_does_not_probe_stale_keychain() {
+        let keychain_probes = std::cell::Cell::new(0);
+
+        let credential = resolve_stored_credential_from_backends(
+            Some(CredentialAuthority::EncryptedFileFallback),
+            || {
+                keychain_probes.set(keychain_probes.get() + 1);
+                KeychainCredentialProbe::Found("stale-keychain-token".to_owned())
+            },
+            || {},
+            || None,
+            || Some("new-file-token".to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(credential.token, "new-file-token");
+        assert_eq!(
+            credential.backend,
+            AuthStorageBackend::EncryptedFileFallback
+        );
+        assert_eq!(keychain_probes.get(), 0);
+    }
+
+    #[test]
     fn conditional_keychain_probe_uses_legacy_lookup_after_modern_miss() {
         let legacy_lookups = std::cell::Cell::new(0);
 
@@ -2558,7 +2897,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_keychain_notice_skips_notice_for_probe_failure_fallback() {
+    fn keychain_probe_failure_does_not_activate_ambiguous_file_fallback() {
         let notices = std::cell::Cell::new(0);
         let retries = std::cell::Cell::new(0);
 
@@ -2572,7 +2911,7 @@ mod tests {
             || Some("file-token".to_string()),
         );
 
-        assert_eq!(credential.as_deref(), Some("file-token"));
+        assert_eq!(credential, None);
         assert_eq!(notices.get(), 0);
         assert_eq!(retries.get(), 0);
     }
