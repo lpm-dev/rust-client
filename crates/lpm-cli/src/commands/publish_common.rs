@@ -456,8 +456,9 @@ fn collect_package_files(
         }
     } else {
         // No `files` field — include everything with common ignores
-        collect_all_files(project_dir, project_dir, canonical_root, &mut result)?;
+        collect_all_files(project_dir, canonical_root, &mut result)?;
     }
+    collect_required_manifest_files(project_dir, pkg_json, canonical_root, &mut result)?;
 
     // Always include README and LICENSE
     for extra in [
@@ -480,11 +481,116 @@ fn collect_package_files(
         }
     }
 
+    result.retain(|file| !is_npm_strict_exclusion(&file.path));
+
     // Deduplicate by path
     let mut seen = std::collections::HashSet::new();
     result.retain(|f| seen.insert(f.path.clone()));
 
     Ok(result)
+}
+
+fn collect_required_manifest_files(
+    project_dir: &Path,
+    pkg_json: &serde_json::Value,
+    canonical_root: &Path,
+    result: &mut Vec<TarballFile>,
+) -> Result<(), LpmError> {
+    for field in ["main", "browser"] {
+        if let Some(path) = pkg_json.get(field).and_then(serde_json::Value::as_str) {
+            collect_required_manifest_path(project_dir, path, canonical_root, result)?;
+        }
+    }
+    match pkg_json.get("bin") {
+        Some(serde_json::Value::String(path)) => {
+            collect_required_manifest_path(project_dir, path, canonical_root, result)?;
+        }
+        Some(serde_json::Value::Object(entries)) => {
+            for path in entries.values().filter_map(serde_json::Value::as_str) {
+                collect_required_manifest_path(project_dir, path, canonical_root, result)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_required_manifest_path(
+    project_dir: &Path,
+    manifest_path: &str,
+    canonical_root: &Path,
+    result: &mut Vec<TarballFile>,
+) -> Result<(), LpmError> {
+    let normalized = manifest_path.replace('\\', "/");
+    let mut relative_path = PathBuf::new();
+    for component in Path::new(&normalized).components() {
+        match component {
+            std::path::Component::Normal(segment) => relative_path.push(segment),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(LpmError::Registry(format!(
+                    "required publish entrypoint must be a project-relative path: {}",
+                    lpm_common::sanitize_terminal_inline(manifest_path)
+                )));
+            }
+        }
+    }
+    if relative_path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let path = project_dir.join(&relative_path);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    if !is_safe_entry(&path, canonical_root) {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        return collect_dir_files(&path, project_dir, canonical_root, result);
+    }
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let relative = path.strip_prefix(project_dir).map_err(|_| {
+        LpmError::Registry(format!(
+            "required publish entrypoint resolves outside the project: {manifest_path}"
+        ))
+    })?;
+    result.push(TarballFile {
+        path: relative.to_string_lossy().into_owned(),
+        size: metadata.len(),
+    });
+    Ok(())
+}
+
+fn is_npm_strict_exclusion(path: &str) -> bool {
+    let mut segment_count = 0;
+    let mut file_name = None;
+    for segment in path
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+    {
+        if matches!(segment, ".git" | "node_modules") {
+            return true;
+        }
+        segment_count += 1;
+        file_name = Some(segment);
+    }
+    let Some(file_name) = file_name else {
+        return false;
+    };
+    if matches!(file_name, ".npmrc" | ".npmignore" | ".gitignore") {
+        return true;
+    }
+    segment_count == 1
+        && matches!(
+            file_name,
+            "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "bun.lock" | "bun.lockb"
+        )
 }
 
 fn collect_dir_files(
@@ -522,17 +628,7 @@ fn collect_dir_files(
     Ok(())
 }
 
-/// Common ignore patterns when no `files` field is specified.
-///
-/// M48: expanded the lists to cover the most common
-/// secret-bearing directory and file names that real-world
-/// projects commit alongside source code. Conservative on
-/// directory-style additions — `tests/`, `docs/`, `examples/` are
-/// intentionally NOT added because legitimate packages publish
-/// them; only the canonically-secret-bearing names are added.
-/// Full `.npmignore` / `.gitignore` parsing is a larger fix
-/// tracked separately; this hardcoded list closes the most-common
-/// accidental-secrets shape without adding a new dep.
+/// Security-sensitive defaults applied in addition to project ignore rules.
 const IGNORE_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -541,11 +637,8 @@ const IGNORE_DIRS: &[&str] = &[
     "coverage",
     ".nyc_output",
     ".cache",
-    "dist",
     ".next",
     ".nuxt",
-    "build",
-    // M48: secret-bearing dirs.
     "private",
     "secrets",
     ".secrets",
@@ -563,9 +656,6 @@ const IGNORE_FILES: &[&str] = &[
     ".env",
     ".env.local",
     ".env.live",
-    // M48: additional .env shapes + private-key file shapes.
-    // The walker matches on exact basename — conservative shapes
-    // only. `*.pem` etc. would need glob support (follow-up).
     ".env.development",
     ".env.production",
     ".env.staging",
@@ -579,49 +669,74 @@ const IGNORE_FILES: &[&str] = &[
 ];
 
 fn collect_all_files(
-    dir: &Path,
     project_root: &Path,
     canonical_root: &Path,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
-    if is_materialized_package_skill_path(dir, project_root) {
-        return Ok(());
+    let ignore_file = if project_root.join(".npmignore").is_file() {
+        Some(".npmignore")
+    } else if project_root.join(".gitignore").is_file() {
+        Some(".gitignore")
+    } else {
+        None
+    };
+    let mut walker = ignore::WalkBuilder::new(project_root);
+    walker
+        .standard_filters(false)
+        .hidden(false)
+        .parents(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let Some(file_type) = entry.file_type() else {
+                return true;
+            };
+            if !file_type.is_dir() {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            !(IGNORE_DIRS.contains(&name.as_ref()) || entry.depth() == 1 && name == ".lpm")
+        });
+    if let Some(ignore_file) = ignore_file {
+        walker.add_custom_ignore_filename(ignore_file);
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        let path = entry.path();
 
-        if !is_safe_entry(&path, canonical_root) {
+    for entry in walker.build() {
+        let entry = entry.map_err(|error| {
+            LpmError::Registry(format!("failed to enumerate publish files: {error}"))
+        })?;
+        if entry.depth() == 0 {
             continue;
         }
-
-        if path.is_dir() {
-            if IGNORE_DIRS.contains(&name_str.as_ref()) {
-                continue;
-            }
-            if dir == project_root && name_str == ".lpm" {
-                collect_implicit_lpm_files(&path, project_root, canonical_root, result)?;
-                continue;
-            }
-            collect_all_files(&path, project_root, canonical_root, result)?;
-        } else if path.is_file() {
-            if IGNORE_FILES.contains(&name_str.as_ref()) {
-                continue;
-            }
-            if let Ok(rel) = path.strip_prefix(project_root) {
-                let rel_str = rel.to_string_lossy().to_string();
-                if rel_str != "package.json" {
-                    let meta = std::fs::symlink_metadata(&path)?;
-                    result.push(TarballFile {
-                        path: rel_str,
-                        size: meta.len(),
-                    });
-                }
+        let path = entry.path();
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || !is_safe_entry(path, canonical_root) {
+            continue;
+        }
+        if IGNORE_FILES.contains(&entry.file_name().to_string_lossy().as_ref()) {
+            continue;
+        }
+        if let Ok(relative) = path.strip_prefix(project_root) {
+            let relative = relative.to_string_lossy().into_owned();
+            if relative != "package.json" {
+                let metadata = std::fs::symlink_metadata(path)?;
+                result.push(TarballFile {
+                    path: relative,
+                    size: metadata.len(),
+                });
             }
         }
     }
+    collect_implicit_lpm_files(
+        &project_root.join(".lpm"),
+        project_root,
+        canonical_root,
+        result,
+    )?;
     Ok(())
 }
 
@@ -1524,6 +1639,244 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"package.json"));
         assert!(paths.contains(&"index.js"));
+    }
+
+    #[test]
+    fn implicit_publish_includes_dist_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "dist-entrypoint",
+            "version": "1.0.0",
+            "main": "dist/index.js"
+        });
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("dist/index.js"), "module.exports = 1;").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(files.iter().any(|file| file.path == "dist/index.js"));
+    }
+
+    #[test]
+    fn implicit_publish_includes_build_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "build-entrypoint",
+            "version": "1.0.0",
+            "main": "build/index.js"
+        });
+        std::fs::create_dir_all(project.join("build")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("build/index.js"), "module.exports = 1;").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(files.iter().any(|file| file.path == "build/index.js"));
+    }
+
+    #[test]
+    fn implicit_publish_applies_npmignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({"name": "npmignore", "version": "1.0.0"});
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        std::fs::write(project.join("private.txt"), "not for publication").unwrap();
+        std::fs::write(project.join(".npmignore"), "private.txt\n").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(!files.iter().any(|file| file.path == "private.txt"));
+    }
+
+    #[test]
+    fn implicit_publish_uses_gitignore_when_npmignore_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({"name": "gitignore", "version": "1.0.0"});
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        std::fs::write(project.join("private.txt"), "not for publication").unwrap();
+        std::fs::write(project.join(".gitignore"), "private.txt\n").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(!files.iter().any(|file| file.path == "private.txt"));
+    }
+
+    #[test]
+    fn implicit_publish_prefers_npmignore_over_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({"name": "ignore-precedence", "version": "1.0.0"});
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        std::fs::write(project.join("private.txt"), "not for publication").unwrap();
+        std::fs::write(project.join(".gitignore"), "index.js\n").unwrap();
+        std::fs::write(project.join(".npmignore"), "private.txt\n").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(files.iter().any(|file| file.path == "index.js"));
+        assert!(!files.iter().any(|file| file.path == "private.txt"));
+    }
+
+    #[test]
+    fn implicit_publish_honors_npmignore_negation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({"name": "ignore-negation", "version": "1.0.0"});
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("private.txt"), "not for publication").unwrap();
+        std::fs::write(project.join("public.txt"), "published").unwrap();
+        std::fs::write(project.join(".npmignore"), "*.txt\n!public.txt\n").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(files.iter().any(|file| file.path == "public.txt"));
+        assert!(!files.iter().any(|file| file.path == "private.txt"));
+    }
+
+    #[test]
+    fn implicit_publish_applies_nested_npmignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({"name": "nested-ignore", "version": "1.0.0"});
+        std::fs::create_dir_all(project.join("subdir")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join(".npmignore"), "").unwrap();
+        std::fs::write(project.join("subdir/.npmignore"), "private.txt\n").unwrap();
+        std::fs::write(project.join("subdir/private.txt"), "not for publication").unwrap();
+        std::fs::write(project.join("subdir/public.txt"), "published").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        assert!(files.iter().any(|file| file.path == "subdir/public.txt"));
+        assert!(!files.iter().any(|file| file.path == "subdir/private.txt"));
+    }
+
+    #[test]
+    fn required_manifest_entrypoints_override_npmignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "required-entrypoints",
+            "version": "1.0.0",
+            "main": "dist/main.js",
+            "browser": "dist/browser.js",
+            "bin": {"required-entrypoints": "bin/cli.js"}
+        });
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        std::fs::create_dir_all(project.join("bin")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("dist/main.js"), "module.exports = 1;").unwrap();
+        std::fs::write(project.join("dist/browser.js"), "window.value = 1;").unwrap();
+        std::fs::write(project.join("bin/cli.js"), "#!/usr/bin/env node\n").unwrap();
+        std::fs::write(project.join(".npmignore"), "dist/\nbin/\n").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let required =
+            std::collections::HashSet::from(["dist/main.js", "dist/browser.js", "bin/cli.js"]);
+
+        assert_eq!(paths.intersection(&required).count(), 3);
+    }
+
+    #[test]
+    fn required_manifest_entrypoint_rejects_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let manifest = serde_json::json!({
+            "name": "escaping-entrypoint",
+            "version": "1.0.0",
+            "main": "../outside.js"
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("outside.js"), "external bytes").unwrap();
+
+        let error = create_tarball(&project, &manifest).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("must be a project-relative path")
+        );
+    }
+
+    #[test]
+    fn explicit_publish_excludes_npm_credentials_and_root_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "strict-exclusions",
+            "version": "1.0.0",
+            "files": ["index.js", ".npmrc", "package-lock.json"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        std::fs::write(
+            project.join(".npmrc"),
+            "//registry.example/:_authToken=opaque-credential\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("package-lock.json"), "{}\n").unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(paths.contains("index.js"));
+        assert!(!paths.contains(".npmrc"));
+        assert!(!paths.contains("package-lock.json"));
     }
 
     #[test]

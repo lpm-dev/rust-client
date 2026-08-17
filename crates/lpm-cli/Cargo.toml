@@ -103,6 +103,7 @@ flate2 = { workspace = true }
 
 # File collection
 glob = { workspace = true }
+ignore = { workspace = true }
 pathdiff = { workspace = true }
 
 # URL encoding
