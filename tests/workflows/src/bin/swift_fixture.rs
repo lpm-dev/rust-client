@@ -51,6 +51,16 @@ fn main() {
             )
             .expect("write Swift registry configuration");
         }
+        (Some("package-registry"), Some("login")) => {
+            let remaining: Vec<_> = args.collect();
+            if let Ok(path) = std::env::var("LPM_TEST_SWIFT_LOGIN_ARGS_PATH") {
+                std::fs::write(
+                    path,
+                    serde_json::to_vec(&remaining).expect("serialize Swift login arguments"),
+                )
+                .expect("write Swift login arguments");
+            }
+        }
         _ => std::process::exit(64),
     }
 }

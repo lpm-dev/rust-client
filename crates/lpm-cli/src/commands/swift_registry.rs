@@ -4,20 +4,32 @@ use lpm_common::LpmError;
 use std::path::Path;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-/// resolve a usable LPM bearer for Swift Package Manager
-/// integration. SPM's login flow takes the token as a CLI arg, so a
-/// SecretString round-trip would just leak immediately — this helper
-/// returns `Option<String>` to preserve the existing "skip auth on
-/// missing token" semantics without spreading `ExposeSecret` here.
-async fn resolve_lpm_bearer_optional(registry_url: &str, json_output: bool) -> Option<String> {
+async fn resolve_lpm_bearer_optional(
+    session: &lpm_auth::SessionManager,
+) -> Result<Option<String>, LpmError> {
+    match session
+        .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
+        .await
+    {
+        Ok(token) => Ok(Some(token)),
+        Err(LpmError::AuthRequired) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn resolve_lpm_bearer_best_effort(
+    session: Option<&lpm_auth::SessionManager>,
+    registry_url: &str,
+    json_output: bool,
+) -> Option<String> {
+    if let Some(session) = session {
+        return resolve_lpm_bearer_optional(session).await.ok().flatten();
+    }
     let session = auth_storage_notice::attach(
         lpm_auth::SessionManager::new(registry_url, None),
         json_output,
     );
-    session
-        .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
-        .await
-        .ok()
+    resolve_lpm_bearer_optional(&session).await.ok().flatten()
 }
 
 /// Minimum size in bytes for a valid DER certificate.
@@ -69,7 +81,12 @@ fn setup_action(repaired: bool) -> &'static str {
 /// 1. swift package-registry set --scope lpmdev <registry_url>/api/swift-registry
 /// 2. swift package-registry login --token <lpm_token> (HTTPS only)
 /// 3. Download signing certificate to ~/.swiftpm/security/trusted-root-certs/lpm.der
-pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(), LpmError> {
+pub async fn run(
+    session: &lpm_auth::SessionManager,
+    registry_url: &str,
+    json_output: bool,
+    force: bool,
+) -> Result<(), LpmError> {
     // H20: refuse to globally install SwiftPM signing trust for a
     // registry URL that fails the same gating contract used for
     // LPM_REGISTRY_URL itself (H16). HTTPS is accepted for any host
@@ -145,7 +162,7 @@ pub async fn run(registry_url: &str, json_output: bool, force: bool) -> Result<(
 
     // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
     if is_https {
-        if let Some(token) = resolve_lpm_bearer_optional(registry_url, json_output).await {
+        if let Some(token) = resolve_lpm_bearer_optional(session).await? {
             if !json_output {
                 install_ui::phase("Configuring authentication");
             }
@@ -323,6 +340,7 @@ fn evaluate_existing_lpmdev_scope(
 /// Called automatically during `lpm install` so the user never has to run `lpm swift-registry`
 /// as a separate step.
 pub async fn ensure_configured(
+    session: Option<&lpm_auth::SessionManager>,
     registry_url: &str,
     package_dir: &std::path::Path,
     json_output: bool,
@@ -389,7 +407,8 @@ pub async fn ensure_configured(
         }
 
         if is_https
-            && let Some(token) = resolve_lpm_bearer_optional(registry_url, json_output).await
+            && let Some(token) =
+                resolve_lpm_bearer_best_effort(session, registry_url, json_output).await
         {
             let _ = tokio::process::Command::new("swift")
                 .args([
@@ -912,6 +931,22 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn automatic_setup_prefers_the_dispatch_explicit_bearer_over_the_environment() {
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_TOKEN",
+            std::ffi::OsString::from("environment-token"),
+        )]);
+        let registry_url = "https://registry.example";
+        let dispatch_session =
+            lpm_auth::SessionManager::new(registry_url, Some("explicit-token".to_string()));
+
+        let resolved =
+            resolve_lpm_bearer_best_effort(Some(&dispatch_session), registry_url, true).await;
+
+        assert_eq!(resolved.as_deref(), Some("explicit-token"));
     }
 
     #[test]
@@ -1467,7 +1502,7 @@ mod tests {
         write_matching_package_scope(package.path(), &server.uri());
         write_global_signing_trust(home.path(), &complete_signing_trust());
 
-        ensure_configured(&server.uri(), package.path(), true)
+        ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
@@ -1492,7 +1527,7 @@ mod tests {
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         fs::write(&cert_path, vec![0x30; MIN_CERT_SIZE as usize]).unwrap();
 
-        ensure_configured(&server.uri(), package.path(), true)
+        ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
@@ -1516,7 +1551,7 @@ mod tests {
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         fs::write(&cert_path, stale).unwrap();
 
-        ensure_configured(&server.uri(), package.path(), true)
+        ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
@@ -1539,7 +1574,7 @@ mod tests {
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         fs::write(cert_path, certificate).unwrap();
 
-        ensure_configured(&server.uri(), package.path(), true)
+        ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
@@ -1565,7 +1600,7 @@ mod tests {
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         fs::write(cert_path, certificate).unwrap();
 
-        ensure_configured(&server.uri(), package.path(), true)
+        ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
@@ -1597,7 +1632,7 @@ mod tests {
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         fs::write(cert_path, certificate).unwrap();
 
-        let outcome = ensure_configured(&server.uri(), package.path(), true)
+        let outcome = ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 
@@ -1635,7 +1670,7 @@ mod tests {
         fs::create_dir_all(blocked_directory.parent().unwrap()).unwrap();
         fs::write(&blocked_directory, "not a directory").unwrap();
 
-        let error = ensure_configured(&server.uri(), package.path(), true)
+        let error = ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap_err();
 
@@ -1667,7 +1702,7 @@ mod tests {
         let cert_inode = fs::metadata(&cert_path).unwrap().ino();
         let config_inode = fs::metadata(&config_path).unwrap().ino();
 
-        let outcome = ensure_configured(&server.uri(), package.path(), true)
+        let outcome = ensure_configured(None, &server.uri(), package.path(), true)
             .await
             .unwrap();
 

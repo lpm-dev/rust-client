@@ -9,6 +9,7 @@
 
 mod support;
 
+use support::auth_state::seed_sessions;
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{method, path};
@@ -183,6 +184,10 @@ fn configure_fake_swift_lockfile_write(command: &mut assert_cmd::Command, conten
     command.env("LPM_TEST_SWIFT_PACKAGE_RESOLVED", content);
 }
 
+fn configure_fake_swift_login_capture(command: &mut assert_cmd::Command, path: &std::path::Path) {
+    command.env("LPM_TEST_SWIFT_LOGIN_ARGS_PATH", path);
+}
+
 fn fake_swift_executable_name(windows: bool) -> &'static str {
     if windows { "swift.exe" } else { "swift" }
 }
@@ -334,6 +339,82 @@ async fn swift_registry_json_output() {
         );
     }
     // If it didn't produce JSON, that's also acceptable (may fail without real Swift)
+}
+
+#[tokio::test]
+async fn swift_registry_passes_the_global_explicit_bearer_to_swiftpm() {
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url().replacen("http://", "https://", 1);
+    let project = TempProject::empty(r#"{"name":"swift-auth","version":"1.0.0"}"#);
+    let login_args_path = project.path().join("swift-login-args.json");
+    let mut command = lpm(&project);
+    configure_fake_swift(&mut command, &project, &[], 0);
+    configure_fake_swift_login_capture(&mut command, &login_args_path);
+
+    let output = command
+        .args([
+            "--registry",
+            &registry_url,
+            "--token",
+            "explicit-swift-token",
+            "swift-registry",
+        ])
+        .output()
+        .expect("run swift-registry with a global explicit token");
+
+    let login_args: Vec<String> =
+        serde_json::from_slice(&std::fs::read(&login_args_path).unwrap_or_else(|_| {
+            panic!(
+                "swift-registry ignored the global explicit token:\n{}",
+                combined_output(&output)
+            )
+        }))
+        .expect("Swift login arguments must be JSON");
+    assert_eq!(
+        login_args,
+        [
+            format!("{registry_url}/api/swift-registry"),
+            "--token".to_string(),
+            "explicit-swift-token".to_string(),
+            "--no-confirm".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn swift_registry_propagates_a_stored_session_refresh_failure() {
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url().replacen("http://", "https://", 1);
+    let project = TempProject::empty(r#"{"name":"swift-auth","version":"1.0.0"}"#);
+    seed_sessions(
+        project.home(),
+        &[support::auth_state::SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("expired-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2000-01-01T00:00:00Z"),
+        }],
+    );
+    let login_args_path = project.path().join("swift-login-args.json");
+    let mut command = lpm(&project);
+    configure_fake_swift(&mut command, &project, &[], 0);
+    configure_fake_swift_login_capture(&mut command, &login_args_path);
+
+    let output = command
+        .args(["--registry", &registry_url, "swift-registry"])
+        .output()
+        .expect("run swift-registry during a refresh outage");
+
+    assert!(!output.status.success());
+    assert!(
+        combined_output(&output).contains("silent refresh"),
+        "swift-registry hid the refresh failure:\n{}",
+        combined_output(&output)
+    );
+    assert!(
+        !login_args_path.exists(),
+        "SwiftPM login must not run with a stale bearer after refresh fails"
+    );
 }
 
 #[tokio::test]
