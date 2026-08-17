@@ -2083,9 +2083,11 @@ fn publish_custom_registry_dry_run_rejects_http_cli_url() {
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert!(
         envelope["error"].as_str().is_some_and(|error| {
-            error.contains("http://packages.example.test/npm") && error.contains("HTTPS")
+            error.contains("http://packages.example.test")
+                && !error.contains("http://packages.example.test/npm")
+                && error.contains("HTTPS")
         }),
-        "HTTP registry rejection must name the URL and HTTPS requirement: {envelope:#}",
+        "HTTP registry rejection must name the safe origin and HTTPS requirement: {envelope:#}",
     );
 }
 
