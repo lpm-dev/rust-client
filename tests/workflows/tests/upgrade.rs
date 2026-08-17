@@ -1196,6 +1196,88 @@ async fn setup_up7_failed_install_fixture(project: &TempProject) -> MockRegistry
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 
+#[tokio::test]
+async fn upgrade_json_emits_one_document_after_successful_install() {
+    let project = TempProject::empty("");
+    let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("spawn JSON upgrade");
+    assert!(
+        out.status.success(),
+        "upgrade must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope = parse_stdout_json(&out.stdout, &out.stderr);
+    assert_eq!(envelope["upgraded"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn upgrade_json_emits_one_error_document_when_install_fails() {
+    let project = TempProject::empty("");
+    let mock = setup_up7_failed_install_fixture(&project).await;
+    up7_write_lockfile(&project, &[(UP7_PKG, UP7_CURRENT)]);
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("spawn failing JSON upgrade");
+    assert!(!out.status.success(), "upgrade must fail");
+
+    let envelope = parse_stdout_json(&out.stdout, &out.stderr);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn upgrade_metadata_failure_is_not_reported_as_up_to_date() {
+    let package = "@lpm.dev/owner.unreachable-upgrade";
+    let project = TempProject::empty("");
+    seed_pinned_dep(&project, package, "^1.0.0", "1.0.0");
+    let mock = MockRegistry::start().await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("spawn upgrade with unavailable metadata");
+    assert!(
+        !out.status.success(),
+        "metadata failure must not be a successful up-to-date result: {}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    let envelope = parse_stdout_json(&out.stdout, &out.stderr);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+}
+
+#[test]
+fn upgrade_rejects_invalid_lpm_dependency_names() {
+    let invalid_name = "@lpm.dev/invalid name";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"invalid-upgrade","version":"1.0.0","dependencies":{{"{invalid_name}":"^1.0.0"}}}}"#
+    ));
+
+    let out = lpm(&project)
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("spawn upgrade with invalid dependency name");
+    assert!(
+        !out.status.success(),
+        "invalid dependency must fail upgrade"
+    );
+
+    let envelope = parse_stdout_json(&out.stdout, &out.stderr);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains(invalid_name)),
+        "error must name the invalid dependency: {envelope}",
+    );
+}
+
 /// `upgrade -y --json` against an npm-only project (no `@lpm.dev/*`
 /// deps) emits the legacy-success envelope: `success: true`,
 /// `upgraded: 0`, empty packages array. Pins the no-network short-circuit

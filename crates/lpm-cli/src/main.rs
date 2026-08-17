@@ -26,6 +26,7 @@ mod linker_config;
 mod lpm_config;
 mod lpm_insights_config;
 mod lpm_skills_config;
+mod manifest_dependency;
 mod manifest_tx;
 pub mod migration_warnings;
 mod npm_firewall_config;
