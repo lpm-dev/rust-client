@@ -846,6 +846,122 @@ async fn publish_wait_json_reports_upload_and_active_publication_states() {
 }
 
 #[tokio::test]
+async fn publish_json_fails_when_upload_response_reports_rejected_publication() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.rejected-json";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "rejected",
+            "currentLatestVersion": "0.9.0",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{PACKAGE_NAME}",
+  "version": "1.0.0",
+  "description": "Rejected publication JSON contract fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run lpm publish --json for a rejected publication");
+
+    assert!(
+        !output.status.success(),
+        "a known rejected publication must fail the command"
+    );
+    let mut json = parse_json_output(&output.stdout);
+    json["results"][0]["duration_ms"] = serde_json::json!(0);
+    insta::assert_json_snapshot!(json, @r###"
+    {
+      "success": false,
+      "results": [
+        {
+          "registry": "lpm",
+          "success": true,
+          "error": null,
+          "publication_status": "rejected",
+          "current_latest_version": "0.9.0",
+          "duration_ms": 0
+        }
+      ]
+    }
+    "###);
+}
+
+#[tokio::test]
+async fn publish_wait_does_not_poll_after_upload_reports_terminal_rejection() {
+    const PACKAGE_NAME: &str = "@lpm.dev/testuser.rejected-wait";
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "rejected",
+            "currentLatestVersion": "0.9.0",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{PACKAGE_NAME}",
+  "version": "1.0.0",
+  "description": "Rejected publication wait fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--wait",
+        ])
+        .output()
+        .expect("run lpm publish --wait for a rejected publication");
+
+    assert!(
+        !output.status.success(),
+        "a known rejected publication must fail without polling"
+    );
+    let status_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/registry/-/package/publication-status")
+        .count();
+    assert_eq!(status_requests, 0);
+}
+
+#[tokio::test]
 async fn publish_wait_accepts_an_authoritative_active_upload_without_polling() {
     const PACKAGE_NAME: &str = "@lpm.dev/testuser.wait-already-active";
     const VERSION: &str = "1.0.0";
