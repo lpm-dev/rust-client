@@ -75,22 +75,21 @@ pub async fn run(
         .session()
         .and_then(|session| session.current_source())
         .is_some()
+        && let Ok(info) = client.whoami().await
     {
-        if let Ok(info) = client.whoami().await {
-            let name = info
-                .profile_username
-                .as_deref()
-                .or(info.username.as_deref())
-                .unwrap_or("unknown");
-            if !json_output {
-                install_ui::done_line(crate::install_ui::terminal_line!(
-                    "Already logged in as {}. Use {} to log out first.",
-                    install_ui::cyan(name),
-                    install_ui::dim("lpm logout")
-                ));
-            }
-            return Ok(());
+        let name = info
+            .profile_username
+            .as_deref()
+            .or(info.username.as_deref())
+            .unwrap_or("unknown");
+        if !json_output {
+            install_ui::done_line(crate::install_ui::terminal_line!(
+                "Already logged in as {}. Use {} to log out first.",
+                install_ui::cyan(name),
+                install_ui::dim("lpm logout")
+            ));
         }
+        return Ok(());
     }
 
     if !json_output {
