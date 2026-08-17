@@ -1887,6 +1887,151 @@ async fn publish_npm_repo_configured_custom_registry_uses_registry_scoped_token(
 }
 
 #[tokio::test]
+async fn publish_npm_refuses_to_move_implicit_latest_to_a_lower_version() {
+    let mock = MockRegistry::start().await;
+    let package = "implicit-latest-downgrade";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "versions": {
+                "2.0.0": {"name": package, "version": "2.0.0"}
+            }
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.9.0",
+        "description": "Implicit latest downgrade fixture",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store custom registry token");
+    assert!(login.status.success());
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("publish a lower version with implicit latest");
+
+    assert!(
+        !output.status.success(),
+        "implicit latest downgrade must fail"
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], false);
+    assert!(
+        envelope["results"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Cannot implicitly apply the \"latest\" tag")),
+        "failure must explain how to use an explicit tag: {envelope:#}"
+    );
+}
+
+#[tokio::test]
+async fn publish_npm_allows_a_lower_version_with_an_explicit_tag() {
+    let mock = MockRegistry::start().await;
+    let package = "explicit-maintenance-tag";
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "versions": {
+                "2.0.0": {"name": package, "version": "2.0.0"}
+            }
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/{package}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "{package}",
+        "version": "1.9.0",
+        "description": "Explicit maintenance tag fixture",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"registry":"{}","tag":"maintenance"}}}}}}"#,
+            mock.url()
+        ),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store custom registry token");
+    assert!(login.status.success());
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("publish a lower version with an explicit maintenance tag");
+
+    assert!(
+        output.status.success(),
+        "explicit maintenance tag must allow the lower version\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn publish_npm_repo_configured_custom_registry_refuses_ambient_npm_token() {
     let mock = MockRegistry::start().await;
     let package = "repo-custom-publish-no-scoped-token";
