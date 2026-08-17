@@ -632,31 +632,6 @@ pub(super) fn tunnel_action_requires_session(action: &str) -> bool {
     !matches!(action, "inspect" | "replay" | "log" | "logs")
 }
 
-fn relay_url_host_is_loopback(relay_url: &str) -> bool {
-    let Some((scheme, rest)) = relay_url.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "ws" | "wss") {
-        return false;
-    }
-
-    let host_port = rest.split('/').next().unwrap_or("");
-    let host = if host_port.starts_with('[') {
-        host_port
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('[')
-    } else {
-        host_port.split(':').next().unwrap_or("")
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|addr| addr.is_loopback())
-}
-
 pub(super) async fn resolve_tunnel_bearer(
     session: Option<&lpm_auth::SessionManager>,
     relay_url: &str,
@@ -665,7 +640,7 @@ pub(super) async fn resolve_tunnel_bearer(
         return Ok(None);
     };
 
-    let auth_requirement = if relay_url_host_is_loopback(relay_url) {
+    let auth_requirement = if lpm_tunnel::client::relay_url_is_loopback(relay_url) {
         lpm_auth::AuthRequirement::TokenRequired
     } else {
         lpm_auth::AuthRequirement::SessionRequired

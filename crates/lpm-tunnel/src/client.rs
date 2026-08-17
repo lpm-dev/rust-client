@@ -13,6 +13,8 @@ use crate::{
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -98,12 +100,50 @@ enum ClientExtensionMessage {
 enum RetryClass {
     Permanent,
     Transient,
+    AuthRejected,
 }
 
 #[derive(Debug)]
 struct TunnelConnectError {
     error: LpmError,
     retry_class: RetryClass,
+}
+
+/// Future returned by a dynamic tunnel token callback.
+pub type TunnelTokenFuture =
+    Pin<Box<dyn Future<Output = Result<String, LpmError>> + Send + 'static>>;
+
+/// Dynamic bearer source used when a CLI session can refresh its access token.
+#[derive(Clone)]
+pub struct TunnelTokenProvider {
+    current: Arc<dyn Fn() -> TunnelTokenFuture + Send + Sync>,
+    refresh_after_rejection: Arc<dyn Fn() -> TunnelTokenFuture + Send + Sync>,
+}
+
+impl TunnelTokenProvider {
+    pub fn new(
+        current: impl Fn() -> TunnelTokenFuture + Send + Sync + 'static,
+        refresh_after_rejection: impl Fn() -> TunnelTokenFuture + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            current: Arc::new(current),
+            refresh_after_rejection: Arc::new(refresh_after_rejection),
+        }
+    }
+
+    async fn current(&self) -> Result<String, LpmError> {
+        (self.current)().await
+    }
+
+    async fn refresh_after_rejection(&self) -> Result<String, LpmError> {
+        (self.refresh_after_rejection)().await
+    }
+}
+
+impl std::fmt::Debug for TunnelTokenProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TunnelTokenProvider([redacted callbacks])")
+    }
 }
 
 /// Captured webhook plus reservations for its queued request and response bodies.
@@ -133,6 +173,22 @@ impl TunnelConnectError {
             retry_class: RetryClass::Transient,
         }
     }
+
+    fn auth_rejected(message: impl Into<String>) -> Self {
+        Self {
+            error: LpmError::Tunnel(message.into()),
+            retry_class: RetryClass::AuthRejected,
+        }
+    }
+
+    fn from_token_provider(error: LpmError) -> Self {
+        let retry_class = if matches!(error, LpmError::AuthRequired | LpmError::SessionExpired) {
+            RetryClass::Permanent
+        } else {
+            RetryClass::Transient
+        };
+        Self { error, retry_class }
+    }
 }
 
 impl std::fmt::Display for TunnelConnectError {
@@ -159,8 +215,8 @@ struct RelayRejectionBody {
 
 fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
     match code {
-        "auth_failed"
-        | "plan_required"
+        "auth_failed" => Some(RetryClass::AuthRejected),
+        "plan_required"
         | "domain_not_owned"
         | "concurrent_limit"
         | "billing_inactive"
@@ -186,7 +242,9 @@ fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
     );
 
     let retry_class = code.and_then(relay_code_retry_class).unwrap_or({
-        if status >= 500 {
+        if status == 401 {
+            RetryClass::AuthRejected
+        } else if status >= 500 {
             RetryClass::Transient
         } else {
             RetryClass::Permanent
@@ -195,6 +253,7 @@ fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
     match retry_class {
         RetryClass::Permanent => TunnelConnectError::permanent(message),
         RetryClass::Transient => TunnelConnectError::transient(message),
+        RetryClass::AuthRejected => TunnelConnectError::auth_rejected(message),
     }
 }
 
@@ -666,6 +725,8 @@ pub struct TunnelOptions {
     pub relay_url: String,
     /// LPM auth token.
     pub token: String,
+    /// Dynamic refresh-backed bearer source. Static callers can leave this unset.
+    pub token_provider: Option<TunnelTokenProvider>,
     /// Validated local HTTP endpoint to tunnel.
     pub local_target: lpm_common::LocalTarget,
     /// Live endpoint source for dev services that can restart.
@@ -766,6 +827,7 @@ impl TunnelOptions {
         Self {
             relay_url: DEFAULT_RELAY_URL.to_string(),
             token,
+            token_provider: None,
             local_target: lpm_common::LocalTarget::loopback(
                 lpm_common::LocalScheme::Http,
                 local_port,
@@ -850,6 +912,8 @@ pub async fn connect_with_usage_fallible(
     crate::validate_forward_target(&options.current_local_target())?;
     let mut retry_count = 0;
     let max_retries = 10;
+    let auth_refresh_attempted = std::sync::atomic::AtomicBool::new(false);
+    let mut retry_token = None;
 
     loop {
         if options
@@ -860,13 +924,46 @@ pub async fn connect_with_usage_fallible(
             return Ok(());
         }
         let connection_start = std::time::Instant::now();
-        match try_connect(options, &on_connected, &on_usage).await {
+        let attempt_token = retry_token.take();
+        let mark_authenticated = |session: &TunnelSession| {
+            auth_refresh_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
+            on_connected(session)
+        };
+        match try_connect_with_token(
+            options,
+            attempt_token.as_deref(),
+            &mark_authenticated,
+            &on_usage,
+        )
+        .await
+        {
             Ok(()) => {
                 // Clean disconnect
                 tracing::info!("tunnel closed");
                 return Ok(());
             }
-            Err(e) => {
+            Err(mut e) => {
+                if e.retry_class == RetryClass::AuthRejected {
+                    let Some(provider) = options.token_provider.as_ref() else {
+                        return Err(e.error);
+                    };
+                    if auth_refresh_attempted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        return Err(e.error);
+                    }
+                    match provider.refresh_after_rejection().await {
+                        Ok(token) => {
+                            retry_token = Some(token);
+                            continue;
+                        }
+                        Err(error) => {
+                            e = TunnelConnectError::from_token_provider(error);
+                            if e.retry_class == RetryClass::Transient {
+                                auth_refresh_attempted
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
                 if e.retry_class == RetryClass::Permanent {
                     return Err(e.error);
                 }
@@ -1566,29 +1663,43 @@ impl rustls::client::danger::ServerCertVerifier for TofuPinningVerifier {
     }
 }
 
-/// Check if a relay URL points to localhost (skip pinning for local development).
-fn is_localhost_relay(url: &str) -> bool {
-    let host_port = url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
-        .unwrap_or("");
-    // Handle bracketed IPv6: [::1]:8787
-    let host = if host_port.starts_with('[') {
-        host_port
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('[')
-    } else {
-        host_port.split(':').next().unwrap_or("")
+/// Return whether a relay URL resolves directly to a loopback host.
+pub fn relay_url_is_loopback(url: &str) -> bool {
+    let Ok(uri) = url.parse::<tokio_tungstenite::tungstenite::http::Uri>() else {
+        return false;
     };
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
+    if !uri
+        .scheme_str()
+        .is_some_and(|scheme| matches!(scheme, "ws" | "wss"))
+    {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// Single connection attempt to the relay.
+#[cfg(test)]
 async fn try_connect(
     options: &TunnelOptions,
+    on_connected: &impl Fn(&TunnelSession) -> Result<(), LpmError>,
+    on_usage: &impl Fn(&TunnelUsageMetadata, bool),
+) -> Result<(), TunnelConnectError> {
+    try_connect_with_token(options, None, on_connected, on_usage).await
+}
+
+async fn try_connect_with_token(
+    options: &TunnelOptions,
+    token_override: Option<&str>,
     on_connected: &impl Fn(&TunnelSession) -> Result<(), LpmError>,
     on_usage: &impl Fn(&TunnelUsageMetadata, bool),
 ) -> Result<(), TunnelConnectError> {
@@ -1610,7 +1721,7 @@ async fn try_connect(
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let use_pinning = !options.no_pin && !is_localhost_relay(&options.relay_url);
+    let use_pinning = !options.no_pin && !relay_url_is_loopback(&options.relay_url);
 
     let mut tls_config = if use_pinning {
         let default_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
@@ -1639,11 +1750,24 @@ async fn try_connect(
     // Build WebSocket request with auth token in Authorization header
     // tunnel_auth goes in X-Tunnel-Auth header (not URL) to avoid leaking in proxy/CDN logs
     // Use IntoClientRequest so tungstenite generates the required upgrade headers.
-    let request = build_websocket_connect_request(
-        &connect_url,
-        &options.token,
-        options.tunnel_auth.as_deref(),
-    )?;
+    let dynamic_token = if token_override.is_none() {
+        match options.token_provider.as_ref() {
+            Some(provider) => Some(
+                provider
+                    .current()
+                    .await
+                    .map_err(TunnelConnectError::from_token_provider)?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let token = token_override
+        .or(dynamic_token.as_deref())
+        .unwrap_or(&options.token);
+    let request =
+        build_websocket_connect_request(&connect_url, token, options.tunnel_auth.as_deref())?;
 
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         write_buffer_size: WEBSOCKET_WRITE_BUFFER_BYTES,
@@ -1747,6 +1871,7 @@ async fn try_connect(
                     return Err(match retry_class {
                         RetryClass::Permanent => TunnelConnectError::permanent(detail),
                         RetryClass::Transient => TunnelConnectError::transient(detail),
+                        RetryClass::AuthRejected => TunnelConnectError::auth_rejected(detail),
                     });
                 }
             }
@@ -2517,6 +2642,9 @@ async fn try_connect(
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     /// RAII guard that sets `HOME` to the given path and restores it
     /// on drop. Centralises the `unsafe` env mutation behind one
     /// SAFETY justification so individual tests don't need to repeat
@@ -2551,11 +2679,79 @@ mod tests {
         }
     }
 
+    async fn reject_next_tunnel_request(
+        listener: &tokio::net::TcpListener,
+        rejection: &[u8],
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "WebSocket request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let request = std::str::from_utf8(&request).unwrap();
+        let token = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then_some(value.trim())?
+                    .strip_prefix("Bearer ")
+            })
+            .expect("tunnel request omitted bearer auth")
+            .to_string();
+
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    rejection.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(rejection).await.unwrap();
+        socket.shutdown().await.unwrap();
+        token
+    }
+
+    fn rotating_test_provider() -> (TunnelTokenProvider, Arc<AtomicUsize>) {
+        let current_token = Arc::new(Mutex::new("stale-access-token".to_string()));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let provider = TunnelTokenProvider::new(
+            {
+                let current_token = Arc::clone(&current_token);
+                move || {
+                    let token = current_token.lock().unwrap().clone();
+                    Box::pin(async move { Ok(token) })
+                }
+            },
+            {
+                let current_token = Arc::clone(&current_token);
+                let refresh_calls = Arc::clone(&refresh_calls);
+                move || {
+                    refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    let mut token = current_token.lock().unwrap();
+                    *token = "fresh-access-token".to_string();
+                    let refreshed = token.clone();
+                    Box::pin(async move { Ok(refreshed) })
+                }
+            },
+        );
+        (provider, refresh_calls)
+    }
+
     #[test]
     fn tunnel_options_defaults() {
         let opts = TunnelOptions::new("lpm_test".to_string(), 3000);
         assert_eq!(opts.relay_url, DEFAULT_RELAY_URL);
         assert_eq!(opts.local_target.port, 3000);
+        assert!(opts.token_provider.is_none());
         assert!(opts.domain.is_none());
         assert!(opts.tunnel_auth.is_none());
         assert!(opts.webhook_tx.is_none());
@@ -2704,7 +2900,6 @@ mod tests {
     #[test]
     fn relay_quota_errors_have_stable_retry_classification() {
         for code in [
-            "auth_failed",
             "plan_required",
             "domain_not_owned",
             "concurrent_limit",
@@ -2721,13 +2916,19 @@ mod tests {
             let error = classify_relay_rejection(503, body.as_bytes());
             assert_eq!(error.retry_class, RetryClass::Transient, "code={code}");
         }
+
+        let auth_error = classify_relay_rejection(
+            401,
+            br#"{"error":"expired access token","code":"auth_failed"}"#,
+        );
+        assert_eq!(auth_error.retry_class, RetryClass::AuthRejected);
     }
 
     #[test]
     fn relay_http_status_fallback_does_not_retry_client_errors() {
         assert_eq!(
             classify_relay_rejection(401, br#"{"error":"Unauthorized"}"#).retry_class,
-            RetryClass::Permanent
+            RetryClass::AuthRejected
         );
         assert_eq!(
             classify_relay_rejection(
@@ -2740,6 +2941,222 @@ mod tests {
         assert_eq!(
             classify_relay_rejection(503, br#"{"error":"Unavailable"}"#).retry_class,
             RetryClass::Transient
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback's rejection type"
+    )]
+    async fn rejected_dynamic_bearer_refreshes_once_and_reconnects_without_backoff() {
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let seen_tokens = Arc::new(Mutex::new(Vec::new()));
+        let relay_tokens = Arc::clone(&seen_tokens);
+        let relay = tokio::spawn(async move {
+            let rejection = br#"{"error":"expired access token","code":"auth_failed"}"#;
+            let first_token = reject_next_tunnel_request(&relay_listener, rejection).await;
+            relay_tokens.lock().unwrap().push(first_token);
+
+            let (second_socket, _) = relay_listener.accept().await.unwrap();
+            let callback_tokens = Arc::clone(&relay_tokens);
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                second_socket,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    let token = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .expect("retried tunnel request omitted bearer auth");
+                    callback_tokens.lock().unwrap().push(token.to_string());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "refresh.localhost",
+                        "tunnel_url": "http://refresh.localhost",
+                        "session_id": "refreshed-session",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+
+        let (provider, refresh_calls) = rotating_test_provider();
+        let mut options = TunnelOptions::new("stale-access-token".to_string(), 5173);
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.token_provider = Some(provider);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            connect_with_usage(&options, |_| {}, |_| {}, |_, _| {}),
+        )
+        .await
+        .expect("tunnel auth recovery did not finish");
+        let relay_result = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+
+        assert!(
+            result.is_ok(),
+            "tunnel did not recover auth rejection: {result:?}"
+        );
+        relay_result
+            .expect("tunnel never reconnected with refreshed auth")
+            .unwrap();
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *seen_tokens.lock().unwrap(),
+            ["stale-access-token", "fresh-access-token"]
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_bearer_rejected_again_stops_without_a_second_refresh() {
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let seen_tokens = Arc::new(Mutex::new(Vec::new()));
+        let relay_tokens = Arc::clone(&seen_tokens);
+        let relay = tokio::spawn(async move {
+            for _ in 0..2 {
+                let rejection = br#"{"error":"invalid access token","code":"auth_failed"}"#;
+                let token = reject_next_tunnel_request(&relay_listener, rejection).await;
+                relay_tokens.lock().unwrap().push(token);
+            }
+        });
+
+        let (provider, refresh_calls) = rotating_test_provider();
+        let mut options = TunnelOptions::new("stale-access-token".to_string(), 5173);
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.token_provider = Some(provider);
+
+        let error = connect_with_usage(&options, |_| {}, |_| {}, |_, _| {})
+            .await
+            .unwrap_err();
+        relay.await.unwrap();
+
+        assert!(error.to_string().contains("auth_failed"));
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *seen_tokens.lock().unwrap(),
+            ["stale-access-token", "fresh-access-token"]
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback's rejection type"
+    )]
+    async fn transient_refresh_failure_allows_a_later_tunnel_refresh() {
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let seen_tokens = Arc::new(Mutex::new(Vec::new()));
+        let relay_tokens = Arc::clone(&seen_tokens);
+        let relay = tokio::spawn(async move {
+            let rejection = br#"{"error":"expired access token","code":"auth_failed"}"#;
+            for _ in 0..2 {
+                let token = reject_next_tunnel_request(&relay_listener, rejection).await;
+                relay_tokens.lock().unwrap().push(token);
+            }
+
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let callback_tokens = Arc::clone(&relay_tokens);
+            let mut websocket = tokio_tungstenite::accept_hdr_async(
+                socket,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    let token = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .expect("recovered tunnel request omitted bearer auth");
+                    callback_tokens.lock().unwrap().push(token.to_string());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "refresh.localhost",
+                        "tunnel_url": "http://refresh.localhost",
+                        "session_id": "refreshed-session",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+
+        let current_token = Arc::new(Mutex::new("stale-access-token".to_string()));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let provider = TunnelTokenProvider::new(
+            {
+                let current_token = Arc::clone(&current_token);
+                move || {
+                    let token = current_token.lock().unwrap().clone();
+                    Box::pin(async move { Ok(token) })
+                }
+            },
+            {
+                let current_token = Arc::clone(&current_token);
+                let refresh_calls = Arc::clone(&refresh_calls);
+                move || {
+                    let attempt = refresh_calls.fetch_add(1, Ordering::SeqCst);
+                    let result = if attempt == 0 {
+                        Err(LpmError::Network("temporary refresh outage".to_string()))
+                    } else {
+                        let mut token = current_token.lock().unwrap();
+                        *token = "fresh-access-token".to_string();
+                        Ok(token.clone())
+                    };
+                    Box::pin(async move { result })
+                }
+            },
+        );
+        let mut options = TunnelOptions::new("stale-access-token".to_string(), 5173);
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.token_provider = Some(provider);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            connect_with_usage(&options, |_| {}, |_| {}, |_, _| {}),
+        )
+        .await
+        .expect("tunnel auth recovery did not finish");
+        if result.is_err() {
+            relay.abort();
+        }
+
+        assert!(
+            result.is_ok(),
+            "transient refresh failure prevented later recovery: {result:?}"
+        );
+        relay.await.unwrap();
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *seen_tokens.lock().unwrap(),
+            [
+                "stale-access-token",
+                "stale-access-token",
+                "fresh-access-token"
+            ]
         );
     }
 
@@ -3047,11 +3464,17 @@ mod tests {
 
     #[test]
     fn localhost_relay_detection() {
-        assert!(is_localhost_relay("wss://localhost:8787/connect"));
-        assert!(is_localhost_relay("ws://127.0.0.1:8787/connect"));
-        assert!(is_localhost_relay("wss://[::1]:8787/connect"));
-        assert!(!is_localhost_relay("wss://relay.lpm.fyi/connect"));
-        assert!(!is_localhost_relay("wss://example.com/connect"));
+        assert!(relay_url_is_loopback("wss://localhost:8787/connect"));
+        assert!(relay_url_is_loopback("wss://LOCALHOST:8787/connect"));
+        assert!(relay_url_is_loopback("ws://127.0.0.1:8787/connect"));
+        assert!(relay_url_is_loopback("ws://127.0.0.2:8787/connect"));
+        assert!(relay_url_is_loopback("wss://[::1]:8787/connect"));
+        assert!(!relay_url_is_loopback("https://127.0.0.1/connect"));
+        assert!(!relay_url_is_loopback(
+            "wss://localhost:8787@relay.example/connect"
+        ));
+        assert!(!relay_url_is_loopback("wss://relay.lpm.fyi/connect"));
+        assert!(!relay_url_is_loopback("wss://example.com/connect"));
     }
 
     #[test]
@@ -3153,6 +3576,7 @@ mod tests {
         let options = TunnelOptions {
             relay_url: "wss://relay.lpm.fyi/connect".to_string(),
             token: "test-token".to_string(),
+            token_provider: None,
             local_target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3000),
             live_local_target: None,
             domain: Some("myapp.lpm.fyi".to_string()),

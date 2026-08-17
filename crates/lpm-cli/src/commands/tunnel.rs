@@ -80,6 +80,10 @@ pub async fn run(
         "start" | "" => {
             reject_local_options("start", extra_args)?;
             let local_target = resolve_local_target(port)?;
+            let effective_relay_url =
+                relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned);
+            let token_provider =
+                crate::tunnel_session_auth::refresh_backed_provider(client, &effective_relay_url)?;
             run_start(
                 token,
                 local_target,
@@ -91,7 +95,8 @@ pub async fn run(
                 inspect_port,
                 auto_ack,
                 session_name,
-                relay_url,
+                Some(&effective_relay_url),
+                token_provider,
                 None,
             )
             .await
@@ -101,6 +106,12 @@ pub async fn run(
             if let Ok(p) = action.parse::<u16>() {
                 reject_local_options("start", extra_args)?;
                 let local_target = resolve_local_target(Some(p))?;
+                let effective_relay_url =
+                    relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned);
+                let token_provider = crate::tunnel_session_auth::refresh_backed_provider(
+                    client,
+                    &effective_relay_url,
+                )?;
                 return run_start(
                     token,
                     local_target,
@@ -112,7 +123,8 @@ pub async fn run(
                     inspect_port,
                     auto_ack,
                     session_name,
-                    relay_url,
+                    Some(&effective_relay_url),
+                    token_provider,
                     None,
                 )
                 .await;
@@ -344,6 +356,7 @@ pub(crate) async fn run_start(
     auto_ack: bool,
     session_name: Option<&str>,
     relay_url: Option<&str>,
+    token_provider: Option<lpm_tunnel::client::TunnelTokenProvider>,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
@@ -437,6 +450,7 @@ pub(crate) async fn run_start(
     let options = lpm_tunnel::client::TunnelOptions {
         relay_url: relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
         token: token.to_string(),
+        token_provider,
         local_target: local_target.clone(),
         live_local_target: None,
         domain: domain.map(|s| s.to_string()),
