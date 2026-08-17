@@ -6,12 +6,14 @@
 //! layer: 24h success TTL, 1h failure backoff (with jitter), and the
 //! coloured notice formatter.
 
+use crate::commands::self_update::{canonical_account_home, try_acquire_self_update_lock};
 use crate::release_channel::ReleaseChannel;
 use crate::release_lookup::{
-    default_cache_path, is_newer_semver, is_stale as base_is_stale, probe_release, read_cache_at,
-    write_cache_at,
+    UpdateCache, default_cache_path, is_newer_semver, is_stale as base_is_stale, probe_release,
+    read_cache_at, write_cache_at,
 };
 use lpm_common::color::Painted;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Don't probe more than once a day on the success path.
@@ -24,43 +26,58 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(60 * 60);
 /// Read the cached update info and return a notice if outdated.
 /// This is instant (no network) — called before the command runs.
 pub fn read_cached_notice() -> Option<String> {
-    if update_checks_disabled() {
-        return None;
-    }
-
-    let path = default_cache_path()?;
-    let cache = read_cache_at(&path)?;
-    let current = crate::build_version::version();
-    let channel = ReleaseChannel::from_installed_version(current);
-    let latest = cache.latest_for(channel);
-    if !latest.is_empty() && latest != current && is_newer_semver(latest, current) {
-        Some(format_notice(current, latest))
-    } else {
-        None
-    }
+    UpdateCheckSnapshot::load().cached_notice()
 }
 
-/// Has enough time passed since the last probe (success OR failure)
-/// that we should fork the background refresh?
-///
-/// The failure-backoff arm is what stops the offline / rate-limited
-/// loop where every `lpm` invocation forked a fresh doomed child.
-pub fn is_stale() -> bool {
-    let path = match default_cache_path() {
-        Some(p) => p,
-        None => return false,
-    };
-    let cache = read_cache_at(&path);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let channel = ReleaseChannel::from_installed_version(crate::build_version::version());
-    base_is_stale(cache.as_ref(), channel, now, SUCCESS_TTL, FAILURE_BACKOFF)
+pub struct UpdateCheckSnapshot {
+    disabled: bool,
+    cache: Option<UpdateCache>,
+    now: u64,
+    channel: ReleaseChannel,
+    current: &'static str,
 }
 
-pub fn should_spawn_background_check() -> bool {
-    !update_checks_disabled() && is_stale()
+impl UpdateCheckSnapshot {
+    pub fn load() -> Self {
+        let disabled = update_checks_disabled();
+        let cache = (!disabled)
+            .then(default_cache_path)
+            .flatten()
+            .and_then(|path| read_cache_at(&path));
+        Self {
+            disabled,
+            cache,
+            now: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            channel: ReleaseChannel::from_installed_version(crate::build_version::version()),
+            current: crate::build_version::version(),
+        }
+    }
+
+    pub fn cached_notice(&self) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        let latest = self.cache.as_ref()?.latest_for(self.channel);
+        if !latest.is_empty() && latest != self.current && is_newer_semver(latest, self.current) {
+            Some(format_notice(self.current, latest))
+        } else {
+            None
+        }
+    }
+
+    pub fn should_spawn_background_check(&self) -> bool {
+        !self.disabled
+            && base_is_stale(
+                self.cache.as_ref(),
+                self.channel,
+                self.now,
+                SUCCESS_TTL,
+                FAILURE_BACKOFF,
+            )
+    }
 }
 
 #[inline]
@@ -73,12 +90,14 @@ fn update_checks_disabled() -> bool {
 /// The parent already checked staleness — this just does the network
 /// call and persists the result (success OR failure).
 pub async fn refresh_cache_now() {
-    let path = match default_cache_path() {
-        Some(p) => p,
-        None => return,
+    let account_home = match canonical_account_home() {
+        Ok(home) => home,
+        Err(_) => return,
+    };
+    let Some(mut refresh) = prepare_background_refresh(&account_home) else {
+        return;
     };
 
-    let mut cache = read_cache_at(&path).unwrap_or_default();
     let channel = ReleaseChannel::from_installed_version(crate::build_version::version());
     // `probe_release` mutates `cache` in-place on every outcome:
     // fresh / not-modified bumps `last_check`; failure bumps
@@ -87,8 +106,25 @@ pub async fn refresh_cache_now() {
     //
     // npm registry is the primary source; GitHub Releases is the
     // fallback. See `release_lookup::probe_release` for cascade rules.
-    let _ = probe_release(channel, &mut cache).await;
-    let _ = write_cache_at(&path, &cache);
+    let _ = probe_release(channel, &mut refresh.cache).await;
+    let _ = write_cache_at(&refresh.path, &refresh.cache);
+}
+
+struct BackgroundRefresh {
+    path: std::path::PathBuf,
+    cache: crate::release_lookup::UpdateCache,
+    _operation_lock: lpm_common::SingleFileExclusiveLockHandle,
+}
+
+fn prepare_background_refresh(account_home: &Path) -> Option<BackgroundRefresh> {
+    let operation_lock = try_acquire_self_update_lock(account_home).ok().flatten()?;
+    let path = account_home.join(".lpm").join("update-check.json");
+    let cache = read_cache_at(&path).unwrap_or_default();
+    Some(BackgroundRefresh {
+        path,
+        cache,
+        _operation_lock: operation_lock,
+    })
 }
 
 fn format_notice(current: &str, latest: &str) -> String {
@@ -178,5 +214,55 @@ mod tests {
         // Direct check of the comparator branch the banner uses.
         assert!(is_newer_semver("99.0.0", crate::build_version::version()));
         assert!(!is_newer_semver(crate::build_version::version(), "99.0.0"));
+    }
+
+    #[test]
+    fn background_refresh_skips_while_self_update_owns_the_operation_lock() {
+        let account_home = tempfile::tempdir().unwrap();
+        let account_home = std::fs::canonicalize(account_home.path()).unwrap();
+        let _self_update_lock =
+            crate::commands::self_update::acquire_self_update_lock(&account_home).unwrap();
+
+        assert!(prepare_background_refresh(&account_home).is_none());
+    }
+
+    #[test]
+    fn background_refresh_preserves_the_other_release_channel_fields() {
+        let account_home = tempfile::tempdir().unwrap();
+        let account_home = std::fs::canonicalize(account_home.path()).unwrap();
+        let cache_path = account_home.join(".lpm").join("update-check.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cache_path,
+            serde_json::to_vec(&serde_json::json!({
+                "latest": "0.74.1",
+                "lastCheck": 1_700_000_000_u64,
+                "nightly": {
+                    "latest": "0.75.0-nightly.20260817.1.abcdef0",
+                    "lastCheck": 1_700_000_100_u64,
+                    "npmEtag": "n1"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut refresh = prepare_background_refresh(&account_home).unwrap();
+        refresh
+            .cache
+            .record_success_for(ReleaseChannel::Stable, "0.74.2".into(), 1_700_000_200);
+        write_cache_at(&refresh.path, &refresh.cache).unwrap();
+        drop(refresh);
+        let persisted = read_cache_at(&cache_path).unwrap();
+        let persisted_json = serde_json::to_value(&persisted).unwrap();
+
+        assert_eq!(
+            persisted.latest_for(ReleaseChannel::Nightly),
+            "0.75.0-nightly.20260817.1.abcdef0"
+        );
+        assert_eq!(
+            persisted_json.pointer("/nightly/npmEtag"),
+            Some(&"n1".into())
+        );
     }
 }

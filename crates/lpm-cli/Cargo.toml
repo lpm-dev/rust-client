@@ -113,6 +113,7 @@ urlencoding = "2"
 
 # Temp directories
 tempfile = "3"
+same-file = "1"
 
 # Phase 32 Phase 6: `lpm patch` — unified diff generation + strict apply.
 diffy = { workspace = true }

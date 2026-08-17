@@ -213,7 +213,11 @@ async fn async_main() -> Result<()> {
     // dispatch — there is nothing to log and nothing to do beyond
     // printing the version line.
     if cli.version_flag {
-        print_version_with_notice();
+        if let Some(expected) = cli.self_update_probe_executable.as_deref() {
+            super::helpers::print_self_update_probe_version(expected)?;
+        } else {
+            print_version_with_notice();
+        }
         return Ok(());
     }
 
@@ -3145,9 +3149,10 @@ async fn async_main() -> Result<()> {
     // on-disk cache is untouched, so the next unrelated command still
     // surfaces the banner.
     let suppress_banner = should_suppress_update_banner(is_self_update_command);
+    let update_check = update_check::UpdateCheckSnapshot::load();
     if !cli.json
         && !suppress_banner
-        && let Some(notice) = update_check::read_cached_notice()
+        && let Some(notice) = update_check.cached_notice()
     {
         eprint!("{notice}");
     }
@@ -3155,7 +3160,7 @@ async fn async_main() -> Result<()> {
     // spawn a detached child process to refresh the update cache
     // if stale. The parent never waits for it — command exit is immediate.
     // The staleness check is sync (file stat + timestamp comparison).
-    if update_check::should_spawn_background_check() {
+    if update_check.should_spawn_background_check() {
         spawn_background_update_check();
     }
 

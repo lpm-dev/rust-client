@@ -838,6 +838,7 @@ pub fn lpm_from_path(project: &TempProject, binary: &Path) -> assert_cmd::Comman
     let mut cmd = assert_cmd::Command::new(binary);
     cmd.current_dir(project.path());
     apply_lpm_env(&mut cmd, project);
+    cmd.env("LPM_TEST_SELF_UPDATE_ACCOUNT_HOME", project.home());
     cmd
 }
 
@@ -877,6 +878,7 @@ pub fn lpm_spawnable_from_path(project: &TempProject, binary: &Path) -> std::pro
     let mut cmd = std::process::Command::new(binary);
     cmd.current_dir(project.path());
     apply_lpm_env(&mut cmd, project);
+    cmd.env("LPM_TEST_SELF_UPDATE_ACCOUNT_HOME", project.home());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd

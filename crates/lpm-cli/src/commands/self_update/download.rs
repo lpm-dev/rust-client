@@ -14,11 +14,13 @@ pub(super) async fn fetch_bounded(
         .content_length()
         .map_or(0, |length| (length as usize).min(max_bytes));
     let mut buffer = Vec::with_capacity(prealloc);
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| LpmError::Network(format!("fetch {url} body read failed: {error}")))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        LpmError::Network(format!(
+            "fetch {} body read failed: {}",
+            safe_remote_label(url),
+            lpm_http::display_error(&error.without_url())
+        ))
+    })? {
         if buffer.len().saturating_add(chunk.len()) > max_bytes {
             return Err(body_exceeded_cap(url, max_bytes));
         }
@@ -39,8 +41,9 @@ async fn fetch_bounded_response(
         .await
         .map_err(|error| {
             LpmError::Network(format!(
-                "release asset fetch failed: {}",
-                lpm_http::display_error(&error)
+                "release asset fetch from {} failed: {}",
+                safe_remote_label(url),
+                lpm_http::display_error(&error.without_url())
             ))
         })?;
 
@@ -50,7 +53,8 @@ async fn fetch_bounded_response(
     }
     if !status.is_success() {
         return Err(LpmError::Network(format!(
-            "fetch {url} returned HTTP {}",
+            "fetch {} returned HTTP {}",
+            safe_remote_label(url),
             status.as_u16()
         )));
     }
@@ -59,7 +63,8 @@ async fn fetch_bounded_response(
         && advertised > max_bytes as u64
     {
         return Err(LpmError::SelfUpdate(format!(
-            "{url} advertises {advertised} bytes; cap of {max_bytes} would be exceeded — refusing the download"
+            "{} advertises {advertised} bytes; cap of {max_bytes} would be exceeded — refusing the download",
+            safe_remote_label(url)
         )));
     }
     Ok(Some(response))
@@ -67,8 +72,13 @@ async fn fetch_bounded_response(
 
 fn body_exceeded_cap(url: &str, max_bytes: usize) -> LpmError {
     LpmError::SelfUpdate(format!(
-        "{url} body exceeded cap of {max_bytes} bytes mid-stream — aborted before the complete download"
+        "{} body exceeded cap of {max_bytes} bytes mid-stream — aborted before the complete download",
+        safe_remote_label(url)
     ))
+}
+
+pub(super) fn safe_remote_label(url: &str) -> String {
+    crate::install_ui::safe_url_origin(url)
 }
 
 #[derive(Debug)]
@@ -111,8 +121,8 @@ pub(super) fn create_staged_binary(
 }
 
 pub(super) fn finish_staged_binary(
-    temporary: &mut tempfile::NamedTempFile,
-) -> Result<(), LpmError> {
+    mut temporary: tempfile::NamedTempFile,
+) -> Result<tempfile::NamedTempFile, LpmError> {
     use std::io::Write as _;
 
     temporary.as_file_mut().flush().map_err(LpmError::Io)?;
@@ -123,6 +133,92 @@ pub(super) fn finish_staged_binary(
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .map_err(LpmError::Io)?;
+    }
+
+    let writable_identity =
+        same_file::Handle::from_file(temporary.as_file().try_clone().map_err(LpmError::Io)?)
+            .map_err(LpmError::Io)?;
+    let read_only = std::fs::File::open(temporary.path()).map_err(LpmError::Io)?;
+    let read_only_identity =
+        same_file::Handle::from_file(read_only.try_clone().map_err(LpmError::Io)?)
+            .map_err(LpmError::Io)?;
+    if writable_identity != read_only_identity {
+        return Err(LpmError::SelfUpdate(
+            "staged self-update binary changed while it was being sealed".to_string(),
+        ));
+    }
+
+    // Linux refuses to execute a file while any process has it open for writing.
+    let (_, path) = temporary.into_parts();
+    Ok(tempfile::NamedTempFile::from_parts(read_only, path))
+}
+
+pub(super) fn ensure_staged_file_unchanged(
+    temporary: &tempfile::NamedTempFile,
+    expected_sha256: &str,
+) -> Result<(), LpmError> {
+    use std::io::{Read as _, Seek as _};
+
+    let metadata = std::fs::symlink_metadata(temporary.path()).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "staged self-update binary changed after verification: {error}"
+        ))
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(LpmError::SelfUpdate(
+            "staged self-update binary changed after verification".to_string(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(LpmError::SelfUpdate(
+                "staged self-update binary changed after verification".to_string(),
+            ));
+        }
+    }
+    let opened =
+        same_file::Handle::from_file(temporary.as_file().try_clone().map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not bind the opened staged self-update binary: {error}"
+            ))
+        })?)
+        .map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not bind the opened staged self-update binary: {error}"
+            ))
+        })?;
+    let named = same_file::Handle::from_path(temporary.path()).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "staged self-update binary changed after verification: {error}"
+        ))
+    })?;
+    if opened != named {
+        return Err(LpmError::SelfUpdate(
+            "staged self-update binary changed after verification".to_string(),
+        ));
+    }
+
+    let mut file = temporary.as_file().try_clone().map_err(LpmError::Io)?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(LpmError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(LpmError::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_sha256 = hex::encode(hasher.finalize());
+    if actual_sha256 != expected_sha256 {
+        return Err(LpmError::SelfUpdate(format!(
+            "staged self-update binary changed after verification: expected SHA-256 {expected_sha256}, found {actual_sha256}"
+        )));
     }
     Ok(())
 }
@@ -141,11 +237,13 @@ pub(super) async fn fetch_asset_to_staged_file(
     let mut temporary = create_staged_binary(current_exe)?;
     let mut hasher = Sha256::new();
     let mut byte_len = 0_usize;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| LpmError::Network(format!("fetch {url} body read failed: {error}")))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        LpmError::Network(format!(
+            "fetch {} body read failed: {}",
+            safe_remote_label(url),
+            lpm_http::display_error(&error.without_url())
+        ))
+    })? {
         if byte_len.saturating_add(chunk.len()) > max_bytes {
             return Err(body_exceeded_cap(url, max_bytes));
         }
@@ -158,7 +256,7 @@ pub(super) async fn fetch_asset_to_staged_file(
         hasher.update(&chunk);
         byte_len += chunk.len();
     }
-    finish_staged_binary(&mut temporary)?;
+    let temporary = finish_staged_binary(temporary)?;
 
     Ok(Some(StagedAsset {
         temporary,
@@ -287,6 +385,32 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_download_errors_do_not_expose_override_query_secrets() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let secret = "release-mirror-secret";
+        let url = format!("http://{address}/asset?token={secret}");
+        let client = reqwest::Client::new();
+
+        let error = fetch_bounded(&client, &url, 1024).await.unwrap_err();
+        server.join().unwrap();
+        let rendered = error.to_string();
+
+        assert!(!rendered.contains(secret), "secret leaked in: {rendered}");
+        assert!(rendered.contains(&format!("http://{address}")));
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "deterministic self-update download memory and latency probe"]
@@ -317,7 +441,7 @@ mod tests {
                 let digest = hex::encode(Sha256::digest(&bytes));
                 let mut temporary = create_staged_binary(&current_exe).unwrap();
                 temporary.as_file_mut().write_all(&bytes).unwrap();
-                finish_staged_binary(&mut temporary).unwrap();
+                let temporary = finish_staged_binary(temporary).unwrap();
                 RetainedProbeAsset::Buffered(bytes, temporary, digest)
             }
             "streaming" => RetainedProbeAsset::Streaming(
