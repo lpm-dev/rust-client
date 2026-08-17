@@ -18,6 +18,7 @@ const RELEASE_TRANSACTION_ID_HEX_BYTES: usize = RELEASE_TRANSACTION_ID_BYTES * 2
 const MAX_RELEASE_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RELEASE_JOURNAL_ENTRIES: usize = 10_000;
 const MAX_RELEASE_ORIGINAL_BYTES: usize = 48 * 1024 * 1024;
+const MAX_RELEASE_UPDATED_BYTES: usize = 48 * 1024 * 1024;
 const MAX_RELEASE_PATH_BYTES: usize = 64 * 1024;
 const MAX_RELEASE_ENCODED_PATH_BYTES: usize = MAX_RELEASE_PATH_BYTES.div_ceil(3) * 4;
 const MAX_RELEASE_ENCODED_MANIFEST_BYTES: usize =
@@ -116,6 +117,40 @@ struct SourceManifest {
     json: serde_json::Value,
 }
 
+struct CappedManifestWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    limit_exceeded: bool,
+}
+
+impl CappedManifestWriter {
+    fn new(initial_capacity: usize, limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(initial_capacity.min(limit)),
+            limit,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for CappedManifestWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized package.json exceeds the manifest limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkspaceManifest {
     name: String,
@@ -171,7 +206,7 @@ struct VersionGitJournal {
     tag: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseApplyCommit {
     schema_version: u32,
@@ -392,19 +427,25 @@ impl ReleasePlan {
             )?;
         }
 
-        manifests
-            .into_iter()
-            .map(|(path, manifest)| {
-                let mut updated_bytes = serde_json::to_vec_pretty(&manifest.json)?;
-                updated_bytes.push(b'\n');
-                validate_manifest_size(&path, &updated_bytes, "serialized package.json")?;
-                Ok(PlannedManifest {
-                    path,
-                    original_bytes: manifest.original_bytes,
-                    updated_bytes,
-                })
-            })
-            .collect()
+        let mut planned = Vec::with_capacity(manifests.len());
+        let mut total_updated_bytes = 0usize;
+        for (path, manifest) in manifests {
+            let remaining_updated_bytes = MAX_RELEASE_UPDATED_BYTES - total_updated_bytes;
+            let updated_bytes = serialize_updated_manifest(
+                &path,
+                &manifest.json,
+                manifest.original_bytes.len(),
+                remaining_updated_bytes,
+            )?;
+            total_updated_bytes =
+                checked_total_updated_bytes(total_updated_bytes, updated_bytes.len())?;
+            planned.push(PlannedManifest {
+                path,
+                original_bytes: manifest.original_bytes,
+                updated_bytes,
+            });
+        }
+        Ok(planned)
     }
 
     fn manifest_draft<'a>(
@@ -425,6 +466,56 @@ impl ReleasePlan {
             }
         }
     }
+}
+
+fn serialize_updated_manifest(
+    path: &Path,
+    manifest: &serde_json::Value,
+    estimated_size: usize,
+    aggregate_remaining: usize,
+) -> Result<Vec<u8>, LpmError> {
+    let manifest_limit = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize;
+    let output_limit = manifest_limit.min(aggregate_remaining);
+    if output_limit == 0 {
+        return Err(updated_manifest_size_error());
+    }
+    let mut writer = CappedManifestWriter::new(estimated_size, output_limit - 1);
+    if let Err(error) = serde_json::to_writer_pretty(&mut writer, manifest) {
+        if writer.limit_exceeded {
+            if output_limit < manifest_limit {
+                return Err(updated_manifest_size_error());
+            }
+            return Err(manifest_size_error(path, "serialized package.json"));
+        }
+        return Err(error.into());
+    }
+    writer.bytes.push(b'\n');
+    Ok(writer.bytes)
+}
+
+fn checked_total_updated_bytes(current: usize, next: usize) -> Result<usize, LpmError> {
+    let total = current
+        .checked_add(next)
+        .ok_or_else(|| LpmError::Script("release updated manifest size overflow".into()))?;
+    if total > MAX_RELEASE_UPDATED_BYTES {
+        return Err(updated_manifest_size_error());
+    }
+    Ok(total)
+}
+
+fn updated_manifest_size_error() -> LpmError {
+    LpmError::Script(format!(
+        "release updated manifests exceed the {} MiB in-memory transaction limit",
+        MAX_RELEASE_UPDATED_BYTES / (1024 * 1024)
+    ))
+}
+
+fn manifest_size_error(path: &Path, description: &str) -> LpmError {
+    LpmError::Script(format!(
+        "{description} for {} exceeds the {}-byte package manifest limit",
+        path.display(),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES
+    ))
 }
 
 mod planning;
@@ -596,6 +687,90 @@ mod tests {
     }
 
     #[test]
+    fn capped_manifest_writer_never_retains_bytes_above_its_limit() {
+        let value = serde_json::json!({ "padding": "x".repeat(1024) });
+        let mut writer = CappedManifestWriter::new(0, 32);
+
+        let error = serde_json::to_writer_pretty(&mut writer, &value).unwrap_err();
+
+        assert!(error.is_io());
+        assert!(writer.limit_exceeded);
+        assert!(writer.bytes.len() <= writer.limit);
+    }
+
+    #[test]
+    fn planned_manifests_reject_aggregate_updated_bytes_above_transaction_budget() {
+        let tmp = TempDir::new().unwrap();
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        let mut packages = Vec::with_capacity(4);
+        let mut source_manifests = BTreeMap::new();
+        for index in 0..4 {
+            let path = tmp.path().join(format!("package-{index}/package.json"));
+            packages.push(PackageRelease {
+                name: format!("package-{index}"),
+                path: path.parent().unwrap().to_path_buf(),
+                manifest_path: path.clone(),
+                old_version: "1.0.0".into(),
+                new_version: "1.0.1".into(),
+                bump: "patch".into(),
+            });
+            source_manifests.insert(
+                path,
+                SourceManifest {
+                    original_bytes: Arc::clone(&original),
+                    json: serde_json::json!({
+                        "name": format!("package-{index}"),
+                        "version": "1.0.0",
+                        "padding": "x".repeat(13 * 1024 * 1024),
+                    }),
+                },
+            );
+        }
+        let plan = ReleasePlan {
+            packages,
+            dependency_updates: Vec::new(),
+            files: Vec::new(),
+            source_manifests,
+        };
+
+        let error = match plan.planned_manifests() {
+            Ok(_) => panic!("aggregate updated manifest bytes were accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("updated manifests exceed"));
+    }
+
+    #[test]
+    fn write_planned_manifests_rejects_aggregate_updated_bytes_before_mutating_files() {
+        let tmp = TempDir::new().unwrap();
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        let mut paths = Vec::with_capacity(4);
+        let mut manifests = Vec::with_capacity(4);
+        for index in 0..4 {
+            let path = tmp.path().join(format!("package-{index}/package.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, original.as_ref()).unwrap();
+            paths.push(path.clone());
+            manifests.push(PlannedManifest {
+                path,
+                original_bytes: Arc::clone(&original),
+                updated_bytes: vec![b' '; 13 * 1024 * 1024],
+            });
+        }
+
+        let error = write_planned_manifests(tmp.path(), &manifests, test_operation()).unwrap_err();
+
+        assert!(error.to_string().contains("updated manifests exceed"));
+        assert!(
+            paths
+                .iter()
+                .all(|path| std::fs::read(path).unwrap() == original.as_ref())
+        );
+        assert!(existing_release_journal_path(tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
     fn write_planned_manifests_rejects_oversized_updated_bytes_before_creating_a_journal() {
         let tmp = TempDir::new().unwrap();
         let manifest_path = tmp.path().join("package.json");
@@ -719,6 +894,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(serialize_release_journal(&journal).unwrap().len(), expected);
+    }
+
+    #[test]
+    fn streamed_release_journal_matches_the_structured_recovery_contract() {
+        let tmp = TempDir::new().unwrap();
+        let manifest_path = tmp.path().join("package.json");
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        std::fs::write(&manifest_path, original.as_ref()).unwrap();
+        let manifests = vec![PlannedManifest {
+            path: manifest_path,
+            original_bytes: original,
+            updated_bytes: br#"{"name":"demo","version":"1.0.1"}"#.to_vec(),
+        }];
+        let root = canonical_workspace_root(tmp.path()).unwrap();
+        let mut resolved = resolve_planned_manifests(&root, &manifests).unwrap();
+        let operation = test_operation();
+        let git = VersionGitTransaction {
+            old_head: "0123456789abcdef".into(),
+            tag: "v1.0.1".into(),
+        };
+
+        let (streamed_bytes, commit) =
+            serialize_planned_release_journal(&resolved, operation.clone(), Some(git.clone()))
+                .unwrap();
+        let streamed: ReleaseApplyJournal = serde_json::from_slice(&streamed_bytes).unwrap();
+        let mut structured =
+            build_release_journal_with_version_git(&mut resolved, operation, Some(git)).unwrap();
+        structured.transaction_id = streamed.transaction_id.clone();
+
+        assert_eq!(
+            streamed_bytes,
+            serialize_release_journal(&structured).unwrap()
+        );
+        assert_eq!(
+            commit,
+            release_commit_for_journal(&streamed, &streamed_bytes)
+        );
     }
 
     #[test]

@@ -100,11 +100,9 @@ pub(super) fn apply_planned_manifests_with(
         LpmError::Script("could not create the release transaction directory".into())
     })?;
     ensure_no_pending_release_transaction_in(&state)?;
-    let mut resolved = resolve_planned_manifests(&canonical_root, manifests)?;
-    let journal = build_release_journal_with_version_git(&mut resolved, operation, version_git)?;
-    let journal_bytes = serialize_release_journal(&journal)?;
-    let commit = release_commit_for_journal(&journal, &journal_bytes);
-    drop(journal);
+    let resolved = resolve_planned_manifests(&canonical_root, manifests)?;
+    let (journal_bytes, commit) =
+        serialize_planned_release_journal(&resolved, operation, version_git)?;
     persist_release_journal_in(&state, &journal_bytes)?;
     let allowed_manifests = resolved
         .iter()
@@ -435,6 +433,7 @@ pub(super) fn resolve_planned_manifests<'a>(
     let root_dir = open_root_directory_nofollow(canonical_root)?;
     let mut serialized_bytes = empty_release_journal_serialized_len();
     let mut total_original_bytes = 0usize;
+    let mut total_updated_bytes = 0usize;
     for manifest in manifests {
         validate_manifest_size(
             &manifest.path,
@@ -446,6 +445,8 @@ pub(super) fn resolve_planned_manifests<'a>(
             &manifest.updated_bytes,
             "updated package.json",
         )?;
+        total_updated_bytes =
+            checked_total_updated_bytes(total_updated_bytes, manifest.updated_bytes.len())?;
         let relative = planned_manifest_relative_path(canonical_root, &manifest.path)?;
         let encoded_path = encode_relative_path(&relative)?;
         total_original_bytes = total_original_bytes
@@ -505,13 +506,83 @@ pub(super) fn validate_manifest_size(
     description: &str,
 ) -> Result<(), LpmError> {
     if bytes.len() as u64 > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
-        return Err(LpmError::Script(format!(
-            "{description} for {} exceeds the {}-byte package manifest limit",
-            path.display(),
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES
-        )));
+        return Err(manifest_size_error(path, description));
     }
     Ok(())
+}
+
+struct StreamingReleaseJournalEntries<'a, 'manifest> {
+    manifests: &'a [ResolvedPlannedManifest<'manifest>],
+}
+
+impl Serialize for StreamingReleaseJournalEntries<'_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use serde::ser::SerializeSeq as _;
+
+        #[derive(Serialize)]
+        struct Entry<'a> {
+            path: &'a str,
+            original_sha256: String,
+            original_base64: String,
+            updated_sha256: String,
+        }
+
+        let mut entries = serializer.serialize_seq(Some(self.manifests.len()))?;
+        for resolved in self.manifests {
+            let manifest = resolved.manifest;
+            entries.serialize_element(&Entry {
+                path: &resolved.encoded_path,
+                original_sha256: sha256_hex(manifest.original_bytes.as_ref()),
+                original_base64: STANDARD.encode(manifest.original_bytes.as_ref()),
+                updated_sha256: sha256_hex(&manifest.updated_bytes),
+            })?;
+        }
+        entries.end()
+    }
+}
+
+#[derive(Serialize)]
+struct StreamingReleaseApplyJournal<'a, 'manifest> {
+    schema_version: u32,
+    transaction_id: &'a str,
+    operation: &'a ReleaseTransactionOperation,
+    state: ReleaseApplyJournalState,
+    path_encoding: &'static str,
+    entries: StreamingReleaseJournalEntries<'a, 'manifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_git: Option<&'a VersionGitJournal>,
+}
+
+pub(super) fn serialize_planned_release_journal(
+    manifests: &[ResolvedPlannedManifest<'_>],
+    operation: ReleaseTransactionOperation,
+    version_git: Option<VersionGitTransaction>,
+) -> Result<(Vec<u8>, ReleaseApplyCommit), LpmError> {
+    let transaction_id = new_release_transaction_id();
+    let version_git = version_git.map(|git| VersionGitJournal {
+        old_head: git.old_head,
+        tag: git.tag,
+    });
+    let journal = StreamingReleaseApplyJournal {
+        schema_version: RELEASE_JOURNAL_SCHEMA_VERSION,
+        transaction_id: &transaction_id,
+        operation: &operation,
+        state: ReleaseApplyJournalState::Applying,
+        path_encoding: release_path_encoding(),
+        entries: StreamingReleaseJournalEntries { manifests },
+        version_git: version_git.as_ref(),
+    };
+    let journal_bytes = serialize_release_journal_value(&journal)?;
+    let commit = release_commit_for_parts(
+        operation,
+        version_git.as_ref().map(|git| git.tag.clone()),
+        &journal_bytes,
+    );
+    Ok((journal_bytes, commit))
 }
 
 #[cfg(test)]
@@ -521,6 +592,7 @@ pub(super) fn build_release_journal(
     build_release_journal_with_version_git(manifests, test_transaction_operation(), None)
 }
 
+#[cfg(test)]
 pub(super) fn build_release_journal_with_version_git(
     manifests: &mut [ResolvedPlannedManifest<'_>],
     operation: ReleaseTransactionOperation,
@@ -616,9 +688,14 @@ pub(super) fn release_journal_size_after_entry(
         .ok_or_else(|| LpmError::Script("release journal size overflow".into()))
 }
 
+#[cfg(test)]
 pub(super) fn serialize_release_journal(
     journal: &ReleaseApplyJournal,
 ) -> Result<Vec<u8>, LpmError> {
+    serialize_release_journal_value(journal)
+}
+
+fn serialize_release_journal_value(journal: &impl Serialize) -> Result<Vec<u8>, LpmError> {
     let bytes = serde_json::to_vec(journal)?;
     if bytes.len() as u64 > MAX_RELEASE_JOURNAL_BYTES {
         return Err(LpmError::Script(format!(
@@ -691,11 +768,23 @@ pub(super) fn release_commit_for_journal(
     journal: &ReleaseApplyJournal,
     journal_bytes: &[u8],
 ) -> ReleaseApplyCommit {
+    release_commit_for_parts(
+        journal.operation.clone(),
+        journal.version_git.as_ref().map(|git| git.tag.clone()),
+        journal_bytes,
+    )
+}
+
+fn release_commit_for_parts(
+    operation: ReleaseTransactionOperation,
+    tag: Option<String>,
+    journal_bytes: &[u8],
+) -> ReleaseApplyCommit {
     ReleaseApplyCommit {
         schema_version: RELEASE_JOURNAL_SCHEMA_VERSION,
         journal_sha256: sha256_hex(journal_bytes),
-        operation: Some(journal.operation.clone()),
-        tag: journal.version_git.as_ref().map(|git| git.tag.clone()),
+        operation: Some(operation),
+        tag,
     }
 }
 
