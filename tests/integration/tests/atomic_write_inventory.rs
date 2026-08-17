@@ -176,8 +176,8 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "swaps complete MCP runtime directories with rollback while holding the MCP cache lock",
     ),
     (
-        "crates/lpm-cli/src/commands/self_update.rs::swap_current_binary",
-        "NamedTempFile exclusively creates the executable sibling; Windows needs a custom running-binary swap",
+        "crates/lpm-cli/src/commands/self_update.rs::install_staged_binary",
+        "receives an exclusively created same-directory NamedTempFile; Windows needs a custom running-binary swap",
     ),
     (
         "crates/lpm-cli/src/commands/skills/managed.rs::write_state",

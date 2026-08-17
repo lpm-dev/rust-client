@@ -16,6 +16,12 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod download;
+
+use self::download::{StagedAsset, fetch_asset_to_staged_file, fetch_bounded};
+#[cfg(test)]
+use self::download::{create_staged_binary, finish_staged_binary};
+
 /// User-facing self-update reuses the banner cache file but with a much
 /// shorter success TTL: a second `lpm self-update` within 10 minutes
 /// short-circuits to the cached version. Long enough to defang
@@ -763,75 +769,6 @@ fn validate_release_provenance(
     Ok(source_commit.to_string())
 }
 
-/// Fetch a bounded-size body from a URL with a 30 s timeout. Returns
-/// `Ok(Some(bytes))` on 200, `Ok(None)` on 404, and `Err` on every
-/// other shape (transport, oversized body, non-success status). The
-/// 404 / non-404 distinction is what lets the caller distinguish
-/// "release predates the integrity gate" from "release exists but
-/// something else is wrong with our download."
-async fn fetch_bounded(
-    client: &reqwest::Client,
-    url: &str,
-    max_bytes: usize,
-) -> Result<Option<Vec<u8>>, LpmError> {
-    let mut resp = client
-        .get(url)
-        .header("User-Agent", "lpm-cli")
-        .send()
-        .await
-        .map_err(|e| {
-            LpmError::Network(format!(
-                "release asset fetch failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
-
-    let status = resp.status();
-    if status.as_u16() == 404 {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(LpmError::Network(format!(
-            "fetch {url} returned HTTP {}",
-            status.as_u16()
-        )));
-    }
-
-    // Reject by advertised Content-Length before any body bytes are
-    // buffered. A hostile or compromised endpoint that sets a truthful
-    // oversized Content-Length is caught here without touching the
-    // socket past the headers.
-    if let Some(advertised) = resp.content_length()
-        && advertised as usize > max_bytes
-    {
-        return Err(LpmError::SelfUpdate(format!(
-            "{url} advertises {advertised} bytes; cap of {max_bytes} would be exceeded — refusing to buffer"
-        )));
-    }
-
-    // Stream chunk-by-chunk so a hostile endpoint that omits or lies on
-    // Content-Length still trips the cap before the whole body lands in
-    // memory. Pre-size the buffer when Content-Length is present and
-    // under the cap; otherwise let the Vec grow.
-    let prealloc = resp
-        .content_length()
-        .map_or(0, |c| (c as usize).min(max_bytes));
-    let mut buf: Vec<u8> = Vec::with_capacity(prealloc);
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| LpmError::Network(format!("fetch {url} body read failed: {e}")))?
-    {
-        if buf.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(LpmError::SelfUpdate(format!(
-                "{url} body exceeded cap of {max_bytes} bytes mid-stream — aborted before full buffer"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(Some(buf))
-}
-
 #[derive(Debug)]
 struct VerifiedReleaseManifest {
     publisher: Option<String>,
@@ -919,9 +856,9 @@ fn verify_release_manifest(
     })
 }
 
-fn verify_release_asset(
+fn verify_release_asset_digest(
     release: &VerifiedReleaseManifest,
-    asset_bytes: &[u8],
+    actual_asset_sha: String,
     asset_basename: &str,
 ) -> Result<AttestationAudit, LpmError> {
     let expected_asset_sha = release.entries.get(asset_basename).ok_or_else(|| {
@@ -929,7 +866,6 @@ fn verify_release_asset(
             "SHA256SUMS.txt does not enumerate `{asset_basename}` for this platform — release pipeline may be missing artifacts"
         ))
     })?;
-    let actual_asset_sha = sha256_hex(asset_bytes);
     if &actual_asset_sha != expected_asset_sha {
         return Err(LpmError::SelfUpdate(format!(
             "downloaded `{asset_basename}` SHA-256 mismatch: signed manifest declares \
@@ -961,15 +897,15 @@ fn verify_release_asset(
 /// around the GitHub Release `published_at`, the manifest's own hash
 /// must match the bundle's in-toto subject digest, and the downloaded
 /// binary's hash must match the manifest line for this platform. Any
-/// failure short-circuits before `swap_current_binary` is reached.
+/// failure short-circuits before `install_staged_binary` is reached.
 ///
 /// Returns the captured attestation audit so the caller can surface it
 /// into `--json` output (or wherever else a structured audit trail
 /// belongs). The audit is also logged via `tracing::info!`.
 async fn run_standalone_update(version: &str) -> Result<AttestationAudit, LpmError> {
-    let assets = verify_and_fetch_for_standalone(version).await?;
     let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
-    swap_current_binary(&current_exe, &assets.asset_bytes)?;
+    let assets = verify_and_stage_for_standalone(version, &current_exe).await?;
+    install_staged_binary(&current_exe, assets.staged_binary)?;
 
     tracing::info!(
         target: "lpm_cli::self_update",
@@ -1008,13 +944,9 @@ fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
     })
 }
 
-/// Verified + bytes-ready state ready to be handed to
-/// [`swap_current_binary`]. Split out so the standalone update flow
-/// can be unit-tested through `verify_and_fetch_for_standalone`
-/// without requiring the swap step (which mutates the running binary).
 #[derive(Debug)]
 struct StandaloneAssets {
-    asset_bytes: Vec<u8>,
+    staged_binary: tempfile::NamedTempFile,
     audit: AttestationAudit,
 }
 
@@ -1079,7 +1011,10 @@ async fn fetch_verified_release_manifest(
     verify_release_manifest(version, &manifest_bytes, &bundle_bytes, published_at)
 }
 
-async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
+async fn verify_and_stage_for_standalone(
+    version: &str,
+    current_exe: &std::path::Path,
+) -> Result<StandaloneAssets, LpmError> {
     let (platform, ext) = detect_platform()?;
     let binary_name = format!("lpm-{platform}{ext}");
     let asset_url = github_release_download_url(version, &binary_name);
@@ -1092,7 +1027,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
         )));
     }
 
-    let asset_vec = fetch_bounded(&client, &asset_url, ASSET_MAX_BYTES)
+    let staged = fetch_asset_to_staged_file(&client, &asset_url, ASSET_MAX_BYTES, current_exe)
         .await?
         .ok_or_else(|| {
             LpmError::SelfUpdate(format!(
@@ -1100,25 +1035,34 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
             ))
         })?;
 
-    let audit = verify_release_asset(&release, &asset_vec, &binary_name)?;
+    let StagedAsset {
+        temporary,
+        byte_len,
+        sha256,
+    } = staged;
+    let audit = verify_release_asset_digest(&release, sha256, &binary_name)?;
 
     install_ui::done_untrusted(&format!(
         "Verified Sigstore attestation for {} ({}, integratedTime {})",
         binary_name,
-        format_bytes(asset_vec.len()),
+        format_bytes(byte_len),
         audit.integrated_time
     ));
 
     Ok(StandaloneAssets {
-        asset_bytes: asset_vec,
+        staged_binary: temporary,
         audit,
     })
 }
 
-/// Atomically swap the running binary at `current_exe` for `new_bytes`.
-///
-/// The temporary file is exclusively created next to `current_exe`, which
-/// keeps the eventual replacement on the same filesystem.
+#[cfg(test)]
+async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
+    let destination = std::env::temp_dir().join("lpm-self-update-test-bin");
+    verify_and_stage_for_standalone(version, &destination).await
+}
+
+/// Atomically swap the running binary at `current_exe` for a verified,
+/// same-directory staged file.
 ///
 /// **Windows EBUSY:** the OS holds an exclusive handle on the running
 /// `current_exe()`, so a direct `rename(new, current_exe)` fails.
@@ -1126,7 +1070,10 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 /// (legal even with a live handle), then `rename(new, current_exe)`,
 /// then best-effort delete the `.old` (OS releases the handle when
 /// this process exits, so the delete will succeed on the next run).
-fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Result<(), LpmError> {
+fn install_staged_binary(
+    current_exe: &std::path::Path,
+    temporary: tempfile::NamedTempFile,
+) -> Result<(), LpmError> {
     let file_name = current_exe.file_name().ok_or_else(|| {
         LpmError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1139,8 +1086,14 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
             "current_exe has no parent directory",
         ))
     })?;
+    if temporary.path().parent() != Some(parent) {
+        return Err(LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "staged self-update binary is not next to current_exe",
+        )));
+    }
 
-    // L20: save a backup copy of the running binary next to itself BEFORE
+    // Save a backup copy of the running binary next to itself before
     // we install the new one, so a user who discovers the new binary is
     // broken can rename `<lpm>.previous` back over `<lpm>` and recover
     // without going to GitHub. The journal file is a parallel marker
@@ -1186,38 +1139,6 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
         }
     }
 
-    let mut prefix = std::ffi::OsString::from(".");
-    prefix.push(file_name);
-    prefix.push(".new-");
-    let suffix = current_exe.extension().map(|extension| {
-        let mut suffix = std::ffi::OsString::from(".");
-        suffix.push(extension);
-        suffix
-    });
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(&prefix);
-    if let Some(suffix) = &suffix {
-        builder.suffix(suffix);
-    }
-    let mut temporary = builder.tempfile_in(parent).map_err(LpmError::Io)?;
-    {
-        use std::io::Write as _;
-        temporary.as_file_mut().write_all(new_bytes).map_err(|e| {
-            LpmError::Io(std::io::Error::new(
-                e.kind(),
-                format!("failed to write temp binary: {e}"),
-            ))
-        })?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(LpmError::Io)?;
-    }
     let tmp_path = temporary.into_temp_path();
 
     #[cfg(windows)]
@@ -1255,6 +1176,19 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
             ))
         })
     }
+}
+
+#[cfg(test)]
+fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Result<(), LpmError> {
+    use std::io::Write as _;
+
+    let mut temporary = create_staged_binary(current_exe)?;
+    temporary
+        .as_file_mut()
+        .write_all(new_bytes)
+        .map_err(LpmError::Io)?;
+    finish_staged_binary(&mut temporary)?;
+    install_staged_binary(current_exe, temporary)
 }
 
 fn copy_executable_atomic(
@@ -2056,16 +1990,29 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         .await;
     }
 
-    /// L34: the staging file lands next to `current_exe` (same FS,
-    /// preserves any extension such as `.exe`) so the rename is
-    /// atomic. Pre-fix `with_extension("tmp")` stripped Windows
-    /// `lpm.exe` to `lpm.tmp`, breaking the rename target.
-    ///
-    /// L20 sidecars (`<file>.previous` + `<file>.update-journal.json`)
-    /// are intentionally left in place after a successful swap so the
-    /// operator can `mv` the backup back over the destination if the
-    /// new binary turns out to be broken — they are recovery state,
-    /// not staging.
+    #[test]
+    fn install_staged_binary_rejects_cross_directory_rename() {
+        use std::io::Write as _;
+
+        let destination_dir = tempdir().unwrap();
+        let staging_dir = tempdir().unwrap();
+        let current = destination_dir.path().join("lpm");
+        let other_destination = staging_dir.path().join("lpm");
+        std::fs::write(&current, b"old").unwrap();
+        let mut temporary = create_staged_binary(&other_destination).unwrap();
+        temporary.as_file_mut().write_all(b"new").unwrap();
+        finish_staged_binary(&mut temporary).unwrap();
+
+        let err = install_staged_binary(&current, temporary)
+            .expect_err("the atomic swap requires one filesystem directory");
+
+        assert!(err.to_string().contains("not next to current_exe"));
+        assert_eq!(std::fs::read(&current).unwrap(), b"old");
+    }
+
+    /// The staging file lands next to `current_exe` and preserves an
+    /// extension such as `.exe`, so the rename stays atomic. Recovery
+    /// sidecars remain after a successful swap by design.
     #[test]
     fn swap_current_binary_replaces_file_atomically() {
         let dir = tempdir().unwrap();
@@ -2093,7 +2040,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         );
     }
 
-    /// L34: extension preservation. `with_extension("tmp")` would have
+    /// Extension preservation: `with_extension("tmp")` would have
     /// turned `lpm.exe` into `lpm.tmp` — when the destination was
     /// `lpm.exe`, the rename target on Windows would have moved a
     /// non-executable file into place. The current staging name is
