@@ -2385,6 +2385,105 @@ fn audit_secrets_detects_stripe_live_key_in_node_modules() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn audit_secrets_scans_symlinked_package_content() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(r#"{"name":"symlinked-secrets","version":"1.0.0"}"#);
+    let package_dir = project
+        .path()
+        .join("node_modules/.pnpm/linked@1.0.0/node_modules/linked");
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{"name":"linked","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package_dir.join("config.js"),
+        "const AWS = 'AKIAIOSFODNN7EXAMPLE';\n",
+    )
+    .unwrap();
+    symlink(&package_dir, project.path().join("node_modules/linked")).unwrap();
+
+    let output = lpm(&project)
+        .args(["audit", "--secrets"])
+        .output()
+        .expect("failed to run lpm audit --secrets");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success() && stderr.contains("linked"),
+        "symlinked installed packages must be scanned\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_secrets_rejects_package_links_outside_approved_roots() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(r#"{"name":"external-secrets","version":"1.0.0"}"#);
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(
+        external.path().join("package.json"),
+        r#"{"name":"external","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        external.path().join("config.js"),
+        "const AWS = 'AKIAIOSFODNN7EXAMPLE';\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+    symlink(
+        external.path(),
+        project.path().join("node_modules/external"),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["audit", "--secrets"])
+        .output()
+        .expect("failed to run lpm audit --secrets");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success() && stderr.contains("outside approved package roots"),
+        "external package links must fail closed\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+#[test]
+fn audit_secrets_scans_nested_transitive_package_content() {
+    let project = TempProject::empty(r#"{"name":"nested-secrets","version":"1.0.0"}"#);
+    seed_node_modules_package(
+        &project,
+        "parent",
+        &[("index.js", "module.exports = {};\n")],
+    );
+    seed_node_modules_package(
+        &project,
+        "parent/node_modules/child",
+        &[("config.js", "const AWS = 'AKIAIOSFODNN7EXAMPLE';\n")],
+    );
+
+    let output = lpm(&project)
+        .args(["audit", "--secrets"])
+        .output()
+        .expect("failed to run lpm audit --secrets");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success() && stderr.contains("child"),
+        "nested installed packages must be scanned\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
 #[test]
 fn audit_secrets_json_envelope_carries_findings_array() {
     let project = TempProject::empty(r#"{"name":"secrets-json","version":"1.0.0"}"#);
