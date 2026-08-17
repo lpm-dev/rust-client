@@ -2,7 +2,7 @@ use super::orchestrator::lpm_package_url;
 use super::output::{
     format_dry_run_files_value, format_lpm_publication_notice,
     format_multi_publish_success_summary, format_publish_retry_detail,
-    format_single_publish_success_summary, publish_result_json,
+    format_single_publish_success_summary, publish_check_json, publish_result_json,
 };
 use super::prepare::{
     MAX_PUBLISH_TARBALL_BYTES, prepare_publish_project_from_manifest, read_publish_manifest,
@@ -371,6 +371,18 @@ fn custom_publish_registry_rejects_embedded_credentials() {
 }
 
 #[test]
+fn custom_publish_registry_rejects_query_and_fragment_components() {
+    for url in [
+        "https://registry.example.test/npm?token=secret",
+        "https://registry.example.test/npm#secret",
+    ] {
+        let error = validate_custom_publish_registry_url(url, "publish.registries")
+            .expect_err("query and fragment components must be rejected");
+        assert!(!error.to_string().contains("secret"), "{url}");
+    }
+}
+
+#[test]
 fn resolve_targets_from_config() {
     let config = lpm_json::PublishConfig {
         registries: vec!["npm".into(), "lpm".into()],
@@ -508,6 +520,35 @@ fn publish_retry_detail_uses_slim_detail_shape() {
     assert_eq!(
         console::strip_ansi_codes(&format_publish_retry_detail(&PublishTarget::Npm)).into_owned(),
         "  Retry: lpm publish --npm"
+    );
+}
+
+#[test]
+fn custom_publish_retry_detail_does_not_expose_registry_path() {
+    let detail = console::strip_ansi_codes(&format_publish_retry_detail(&PublishTarget::Custom(
+        "https://packages.example.test/npm/private-path".into(),
+    )))
+    .into_owned();
+
+    assert!(detail.contains("--publish-registry"));
+    assert!(!detail.contains("private-path"), "{detail}");
+}
+
+#[test]
+fn custom_publish_check_json_exposes_only_registry_origin() {
+    let target = PublishTarget::Custom("https://packages.example.test/npm/private-path".into());
+    let target_names =
+        std::collections::HashMap::from([(target.key(), "custom-package".to_string())]);
+
+    let json = publish_check_json(None, &[target], &target_names);
+
+    assert_eq!(
+        json["targets"][0]["registry"],
+        serde_json::json!("https://packages.example.test")
+    );
+    assert_eq!(
+        json["targets"][0]["name"],
+        serde_json::json!("custom-package")
     );
 }
 

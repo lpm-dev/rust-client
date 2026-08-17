@@ -6,14 +6,14 @@ use std::path::Path;
 
 pub(super) const MAX_PUBLISH_TARBALL_BYTES: usize = 500 * 1024 * 1024;
 
-pub(super) struct PublishManifest {
-    pub(super) package_json_path: std::path::PathBuf,
-    pub(super) package_json_content: String,
-    pub(super) package_json_override: Option<Vec<u8>>,
-    pub(super) pkg_json: serde_json::Value,
-    pub(super) name: String,
-    pub(super) version: String,
-    pub(super) publish_config: Option<lpm_json::PublishConfig>,
+pub(crate) struct PublishManifest {
+    pub(crate) package_json_path: std::path::PathBuf,
+    pub(crate) package_json_content: String,
+    pub(crate) package_json_override: Option<Vec<u8>>,
+    pub(crate) pkg_json: serde_json::Value,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) publish_config: Option<lpm_json::PublishConfig>,
 }
 
 pub(crate) fn prepare_publish_project(
@@ -24,7 +24,7 @@ pub(crate) fn prepare_publish_project(
     prepare_publish_project_from_manifest(project_dir, manifest, scan_secrets)
 }
 
-pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifest, LpmError> {
+pub(crate) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifest, LpmError> {
     let package_json_path = project_dir.join("package.json");
     let content = match lpm_common::read_text_file_capped(
         &package_json_path,
@@ -52,6 +52,16 @@ pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifes
         .and_then(|v| v.as_str())
         .ok_or_else(|| LpmError::Registry("package.json missing \"version\"".into()))?
         .to_string();
+    validate_publish_version(&version).map_err(|error| {
+        LpmError::Registry(format!(
+            "package.json \"version\" must be a valid semantic version (got \"{version}\"): {error}"
+        ))
+    })?;
+    if pkg_json.get("private").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(LpmError::Registry(
+            "package.json is marked as private; remove \"private\": true before publishing".into(),
+        ));
+    }
 
     let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Registry)?;
     let publish_config = lpm_config.and_then(|c| c.publish);
@@ -64,6 +74,62 @@ pub(super) fn read_publish_manifest(project_dir: &Path) -> Result<PublishManifes
         name,
         version,
         publish_config,
+    })
+}
+
+fn validate_publish_version(version: &str) -> Result<lpm_semver::Version, &'static str> {
+    let (without_build, build) = version
+        .split_once('+')
+        .map_or((version, None), |(base, build)| (base, Some(build)));
+    if build.is_some_and(|identifiers| {
+        identifiers.is_empty()
+            || identifiers.contains('+')
+            || !valid_semver_identifiers(identifiers, true)
+    }) {
+        return Err("invalid build metadata");
+    }
+
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|identifiers| {
+        identifiers.is_empty() || !valid_semver_identifiers(identifiers, false)
+    }) {
+        return Err("invalid prerelease identifiers");
+    }
+
+    let mut core_identifiers = core.split('.');
+    let major = core_identifiers.next().ok_or("missing major version")?;
+    let minor = core_identifiers.next().ok_or("missing minor version")?;
+    let patch = core_identifiers.next().ok_or("missing patch version")?;
+    if core_identifiers.next().is_some()
+        || !valid_semver_number(major)
+        || !valid_semver_number(minor)
+        || !valid_semver_number(patch)
+    {
+        return Err("version core must contain three canonical numeric identifiers");
+    }
+
+    lpm_semver::Version::parse(version).map_err(|_| "version number is out of range")
+}
+
+fn valid_semver_number(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier.bytes().all(|byte| byte.is_ascii_digit())
+        && (identifier == "0" || !identifier.starts_with('0'))
+}
+
+fn valid_semver_identifiers(identifiers: &str, allow_numeric_leading_zeroes: bool) -> bool {
+    identifiers.split('.').all(|identifier| {
+        !identifier.is_empty()
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && (allow_numeric_leading_zeroes
+                || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                || valid_semver_number(identifier))
     })
 }
 

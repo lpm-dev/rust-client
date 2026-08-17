@@ -250,6 +250,38 @@ fn release_publish_dry_run_reports_dependency_order() {
 }
 
 #[test]
+fn release_publish_dry_run_reuses_publish_preflight_validation() {
+    let project = workspace_project();
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"core","version":"v1.2.3"}"#,
+    );
+
+    let output = lpm(&project)
+        .args([
+            "release",
+            "publish",
+            "--filter",
+            "core",
+            "--dry-run",
+            "--json",
+            "--publish-registry",
+            "https://registry.example.com",
+        ])
+        .output()
+        .expect("run release publish dry-run with invalid publish metadata");
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("semantic version")),
+        "release publish must share publish preflight validation: {envelope:#}",
+    );
+}
+
+#[test]
 fn release_publish_refuses_stale_internal_ranges_before_publish_starts() {
     let project = stale_workspace_project();
 

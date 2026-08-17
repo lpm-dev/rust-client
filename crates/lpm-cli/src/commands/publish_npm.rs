@@ -36,6 +36,7 @@ pub fn resolve_npm_name(
     if let Some(config) = npm_config
         && let Some(name) = &config.name
     {
+        validate_npm_name(name)?;
         return Ok(name.clone());
     }
 
@@ -55,7 +56,7 @@ pub fn resolve_npm_name(
 }
 
 /// Validate that a package name is valid for npm.
-fn validate_npm_name(name: &str) -> Result<(), LpmError> {
+pub(crate) fn validate_npm_name(name: &str) -> Result<(), LpmError> {
     if name.is_empty() {
         return Err(LpmError::Registry(
             "npm package name cannot be empty".into(),
@@ -67,29 +68,184 @@ fn validate_npm_name(name: &str) -> Result<(), LpmError> {
             name.len()
         )));
     }
-
-    // npm names must be lowercase (except scoped names preserve case in scope)
-    let check_name = if let Some((_scope, pkg)) = name.split_once('/') {
-        pkg
-    } else {
-        name
-    };
-
-    if check_name != check_name.to_lowercase() {
+    if name.starts_with("@lpm.dev/") {
+        return Err(LpmError::Registry(
+            "npm package names cannot use the reserved @lpm.dev/ scope".into(),
+        ));
+    }
+    if matches!(name, "node_modules" | "favicon.ico") {
         return Err(LpmError::Registry(format!(
-            "npm package name must be lowercase: \"{name}\""
+            "npm package name is reserved: \"{name}\""
         )));
     }
 
-    // No spaces or special chars (except - . _ ~)
-    for ch in check_name.chars() {
-        if !ch.is_ascii_alphanumeric() && !"-._~".contains(ch) {
+    let (scope, package_name) = if let Some(scoped) = name.strip_prefix('@') {
+        let Some((scope, package_name)) = scoped.split_once('/') else {
             return Err(LpmError::Registry(format!(
-                "npm package name contains invalid character '{ch}': \"{name}\""
+                "npm scoped package name must contain one slash: \"{name}\""
+            )));
+        };
+        if package_name.contains('/') {
+            return Err(LpmError::Registry(format!(
+                "npm scoped package name must contain one slash: \"{name}\""
             )));
         }
-    }
+        (Some(scope), package_name)
+    } else if name.contains('/') {
+        return Err(LpmError::Registry(format!(
+            "unscoped npm package name must not contain a slash: \"{name}\""
+        )));
+    } else {
+        (None, name)
+    };
 
+    if let Some(scope) = scope {
+        validate_npm_scope(scope, name)?;
+    }
+    validate_npm_package_component(package_name, name, scope.is_some())
+}
+
+fn validate_npm_scope(scope: &str, full_name: &str) -> Result<(), LpmError> {
+    if scope.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "npm package scope cannot be empty: \"{full_name}\""
+        )));
+    }
+    validate_npm_name_case(scope, full_name)?;
+    if !scope.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.' | b'_' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+    }) {
+        return Err(LpmError::Registry(format!(
+            "npm package scope contains characters that are not URL-safe: \"{full_name}\""
+        )));
+    }
+    Ok(())
+}
+
+fn validate_npm_package_component(
+    component: &str,
+    full_name: &str,
+    is_scoped: bool,
+) -> Result<(), LpmError> {
+    if component.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "npm package name cannot be empty: \"{full_name}\""
+        )));
+    }
+    let invalid_leading_character = component
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'.' || !is_scoped && matches!(byte, b'-' | b'_'));
+    if invalid_leading_character {
+        return Err(LpmError::Registry(format!(
+            "npm package name has an invalid leading character: \"{full_name}\""
+        )));
+    }
+    validate_npm_name_case(component, full_name)?;
+    if !component
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return Err(LpmError::Registry(format!(
+            "npm package name contains characters that are invalid for new packages: \"{full_name}\""
+        )));
+    }
+    Ok(())
+}
+
+fn validate_npm_name_case(component: &str, full_name: &str) -> Result<(), LpmError> {
+    if component.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(LpmError::Registry(format!(
+            "npm package name must be lowercase: \"{full_name}\""
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_npm_access(access: &str, source: &str) -> Result<(), LpmError> {
+    if matches!(access, "public" | "restricted") {
+        return Ok(());
+    }
+    Err(LpmError::Registry(format!(
+        "{source} must be \"public\" or \"restricted\" (got \"{access}\")"
+    )))
+}
+
+pub(crate) fn validate_npm_tag(tag: &str) -> Result<(), LpmError> {
+    let characters_are_url_safe = !tag.is_empty()
+        && tag.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.' | b'_' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+                )
+        });
+    if !characters_are_url_safe {
+        return Err(LpmError::Registry(format!(
+            "publish.npm.tag must be a non-empty URL-safe dist-tag (got \"{tag}\")"
+        )));
+    }
+    if lpm_semver::Version::parse(tag).is_ok() || lpm_semver::VersionReq::parse(tag).is_ok() {
+        return Err(LpmError::Registry(format!(
+            "publish.npm.tag must not be a semantic version or range (got \"{tag}\")"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_npm_registry(registry: &str) -> Result<(), LpmError> {
+    validate_npm_registry_setting(registry, "publish.npm.registry")
+}
+
+pub(crate) fn validate_npm_registry_setting(registry: &str, source: &str) -> Result<(), LpmError> {
+    let parsed = reqwest::Url::parse(registry).map_err(|_| {
+        LpmError::Registry(format!(
+            "{source} must be a valid HTTPS URL (got \"remote-url\")"
+        ))
+    })?;
+    let safe_origin = parsed.origin().ascii_serialization();
+    let safe_origin = if safe_origin == "null" {
+        "remote-url"
+    } else {
+        &safe_origin
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LpmError::Registry(format!(
+            "{source} must not contain credentials: \"{safe_origin}\""
+        )));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(LpmError::Registry(format!(
+            "{source} must not contain a query or fragment: \"{safe_origin}\""
+        )));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if parsed.scheme() == "https" || parsed.scheme() == "http" && lpm_common::is_loopback_host(host)
+    {
+        return Ok(());
+    }
+    Err(LpmError::Registry(format!(
+        "{source} requires HTTPS except for loopback development registries (got \"{safe_origin}\")"
+    )))
+}
+
+pub(crate) fn validate_npm_publish_config(
+    npm_config: Option<&NpmPublishConfig>,
+    validate_registry: bool,
+) -> Result<(), LpmError> {
+    let Some(config) = npm_config else {
+        return Ok(());
+    };
+    if let Some(tag) = config.tag.as_deref() {
+        validate_npm_tag(tag)?;
+    }
+    if validate_registry && let Some(registry) = config.registry.as_deref() {
+        validate_npm_registry(registry)?;
+    }
     Ok(())
 }
 
@@ -524,6 +680,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_npm_name_rejects_malformed_scope_and_slash_shapes() {
+        for name in ["@/pkg", "@Scope/pkg", "foo/bar"] {
+            assert!(validate_npm_name(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn validate_npm_name_rejects_reserved_names_and_lpm_scope() {
+        for name in ["node_modules", "favicon.ico", "@lpm.dev/owner.package"] {
+            assert!(validate_npm_name(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn validate_npm_name_matches_new_package_leading_character_rules() {
+        assert!(validate_npm_name("-pkg").is_err());
+        assert!(validate_npm_name("@scope/_pkg").is_ok());
+        assert!(validate_npm_name("@scope/-pkg").is_ok());
+    }
+
+    #[test]
+    fn resolve_npm_name_validates_config_override() {
+        let config = NpmPublishConfig {
+            name: Some("@/pkg".into()),
+            ..Default::default()
+        };
+
+        assert!(resolve_npm_name("valid-name", Some(&config)).is_err());
+    }
+
+    #[test]
     fn validate_npm_name_allows_valid() {
         assert!(validate_npm_name("my-package").is_ok());
         assert!(validate_npm_name("pkg123").is_ok());
@@ -547,6 +734,30 @@ mod tests {
             resolve_npm_access("@scope/pkg", Some(&config)),
             "restricted"
         );
+    }
+
+    #[test]
+    fn validate_npm_access_rejects_unknown_value() {
+        let error = validate_npm_access("private", "publish.npm.access").unwrap_err();
+
+        assert!(error.to_string().contains("publish.npm.access"));
+    }
+
+    #[test]
+    fn validate_npm_tag_matches_npm_package_arg_rules() {
+        assert!(validate_npm_tag("1.2.3").is_err());
+        assert!(validate_npm_tag("bad tag").is_err());
+        assert!(validate_npm_tag("next").is_ok());
+        for tag in ["-canary", "_next", "~beta", "release!", "release(test)"] {
+            assert!(validate_npm_tag(tag).is_ok(), "{tag}");
+        }
+    }
+
+    #[test]
+    fn validate_npm_registry_allows_https_and_loopback_http_only() {
+        assert!(validate_npm_registry("https://registry.example.test/npm").is_ok());
+        assert!(validate_npm_registry("http://127.0.0.1:4873").is_ok());
+        assert!(validate_npm_registry("http://registry.example.test/npm").is_err());
     }
 
     #[test]

@@ -702,6 +702,333 @@ fn publish_check_npm_json_emits_success_object_without_lpm_quality() {
     assert_eq!(envelope.get("quality"), Some(&serde_json::Value::Null));
 }
 
+fn assert_npm_publish_check_rejected(
+    package_json: &str,
+    lpm_json: Option<&str>,
+    expected_error: &str,
+) {
+    let project = TempProject::empty(package_json);
+    project.write_file("index.js", "module.exports = {};");
+    if let Some(lpm_json) = lpm_json {
+        project.write_file("lpm.json", lpm_json);
+    }
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("run npm publish check with invalid configuration");
+
+    assert!(
+        !output.status.success(),
+        "invalid npm publish configuration must fail\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope = parse_json_output(&output.stdout);
+    let error = envelope["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("publish check error must be a string: {envelope:#}"));
+    assert!(
+        error.contains(expected_error),
+        "publish check error must contain {expected_error:?}: {envelope:#}",
+    );
+}
+
+#[test]
+fn publish_check_npm_ignores_unselected_registry_access_config() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "selected-npm-target",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"github":{"access":"stale-value"},"gitlab":{"access":"stale-value"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("run npm publish check with unselected registry settings");
+
+    assert!(
+        output.status.success(),
+        "unselected registry settings must not block explicit npm target\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn publish_check_rejects_non_loopback_http_gitlab_registry() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "@scope/invalid-gitlab-registry",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"gitlab":{"projectId":"7","registry":"http://gitlab.example.test"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--gitlab"])
+        .output()
+        .expect("run GitLab publish check with an insecure registry");
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("publish.gitlab.registry")),
+        "GitLab registry error must identify the invalid setting: {envelope:#}",
+    );
+}
+
+#[test]
+fn publish_check_rejects_blank_gitlab_project_id() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "@scope/blank-gitlab-project",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file("lpm.json", r#"{"publish":{"gitlab":{"projectId":"   "}}}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--gitlab"])
+        .output()
+        .expect("run GitLab publish check with a blank project ID");
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("projectId")),
+        "GitLab project ID error must identify the invalid setting: {envelope:#}",
+    );
+}
+
+#[test]
+fn publish_check_rejects_invalid_package_version() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "invalid-version-pkg",
+  "version": "latest",
+  "main": "index.js"
+}"#,
+        None,
+        "semantic version",
+    );
+}
+
+#[test]
+fn publish_check_rejects_noncanonical_package_versions() {
+    for version in ["v1.2.3", "01.2.3", "1.2.3-alpha.01"] {
+        assert_npm_publish_check_rejected(
+            &format!(
+                r#"{{
+  "name": "noncanonical-version-pkg",
+  "version": "{version}",
+  "main": "index.js"
+}}"#
+            ),
+            None,
+            "semantic version",
+        );
+    }
+}
+
+#[test]
+fn publish_check_accepts_leading_zeroes_in_build_metadata() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "canonical-build-metadata",
+  "version": "1.2.3+001",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("run publish check with canonical build metadata");
+
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn publish_check_rejects_private_package() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "private-package",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js"
+}"#,
+        None,
+        "marked as private",
+    );
+}
+
+#[test]
+fn publish_check_rejects_restricted_unscoped_npm_package() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "unscoped-restricted-package",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+        Some(r#"{"publish":{"npm":{"access":"restricted"}}}"#),
+        "unscoped",
+    );
+}
+
+#[test]
+fn publish_check_requires_explicit_tag_for_prerelease() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "implicit-prerelease-tag",
+  "version": "1.0.0-beta.1",
+  "main": "index.js"
+}"#,
+        None,
+        "explicit publish.npm.tag",
+    );
+}
+
+#[test]
+fn publish_check_accepts_explicit_tag_for_prerelease() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "explicit-prerelease-tag",
+  "version": "1.0.0-beta.1",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file("lpm.json", r#"{"publish":{"npm":{"tag":"beta"}}}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("run prerelease publish check with an explicit tag");
+
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn publish_check_github_ignores_overridden_npm_name_and_access() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "github-overrides-npm-fallbacks",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"npm":{"name":"@/stale","access":"stale","tag":"next"},"github":{"name":"@scope/pkg","access":"public"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--github"])
+        .output()
+        .expect("run GitHub publish check with overridden npm fallbacks");
+
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn publish_check_rejects_invalid_configured_npm_name() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "valid-package-name",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+        Some(r#"{"publish":{"npm":{"name":"@/pkg"}}}"#),
+        "npm package scope cannot be empty",
+    );
+}
+
+#[test]
+fn publish_check_rejects_invalid_npm_access() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "invalid-access-pkg",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+        Some(r#"{"publish":{"npm":{"access":"private"}}}"#),
+        "publish.npm.access",
+    );
+}
+
+#[test]
+fn publish_check_rejects_semver_shaped_npm_tag() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "invalid-tag-pkg",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+        Some(r#"{"publish":{"npm":{"tag":"1.2.3"}}}"#),
+        "publish.npm.tag",
+    );
+}
+
+#[test]
+fn publish_check_rejects_non_loopback_http_npm_registry() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "invalid-registry-pkg",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+        Some(r#"{"publish":{"npm":{"registry":"http://packages.example.test/npm"}}}"#),
+        "publish.npm.registry",
+    );
+}
+
+#[test]
+fn publish_check_rejects_invalid_lpm_package_identity() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/owner.",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--lpm"])
+        .output()
+        .expect("run LPM publish check with an invalid package identity");
+
+    assert!(!output.status.success());
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("invalid package name")),
+        "publish check must reject the invalid LPM identity: {envelope:#}",
+    );
+}
+
 // ─── Mock Registry Publish ───────────────────────────────────────
 
 #[tokio::test]
@@ -1315,7 +1642,7 @@ async fn publish_npm_uses_trusted_publishing_token_exchange() {
     project.write_file(
         "lpm.json",
         &format!(
-            r#"{{"publish":{{"npm":{{"registry":"{}","access":"restricted"}}}}}}"#,
+            r#"{{"publish":{{"npm":{{"registry":"{}","access":"public"}}}}}}"#,
             mock.url()
         ),
     );
@@ -1701,7 +2028,7 @@ async fn publish_npm_json_upload_failure_emits_single_result_document() {
 #[tokio::test]
 async fn publish_npm_provenance_restricted_access_fails_before_registry_contact() {
     let mock = MockRegistry::start().await;
-    let package = "restricted-provenance-pkg";
+    let package = "@scope/restricted-provenance-pkg";
     let project = TempProject::empty(&format!(
         r#"{{
         "name": "{package}",
@@ -1794,7 +2121,7 @@ fn publish_provenance_file_rejects_lpm_target_before_validation() {
 #[tokio::test]
 async fn publish_provenance_file_restricted_access_fails_before_file_validation() {
     let mock = MockRegistry::start().await;
-    let package = "restricted-file-provenance-pkg";
+    let package = "@scope/restricted-file-provenance-pkg";
     let project = TempProject::empty(&format!(
         r#"{{
         "name": "{package}",
@@ -1992,7 +2319,7 @@ fn publish_multi_target_flags_accepted() {
 }
 
 #[test]
-fn publish_custom_registry_dry_run_json_surfaces_registry_url_and_resolved_name() {
+fn publish_custom_registry_dry_run_json_redacts_registry_path() {
     let project = TempProject::empty(
         r#"{
         "name": "custom-publish-pkg",
@@ -2039,7 +2366,10 @@ fn publish_custom_registry_dry_run_json_surfaces_registry_url_and_resolved_name(
         .as_array()
         .expect("targets must be an array");
     assert_eq!(targets.len(), 1, "custom dry-run should resolve one target");
-    assert_eq!(targets[0]["registry"], serde_json::json!(registry_url));
+    assert_eq!(
+        targets[0]["registry"],
+        serde_json::json!("https://packages.example.test")
+    );
     assert_eq!(targets[0]["name"], serde_json::json!("custom-publish-pkg"));
 }
 

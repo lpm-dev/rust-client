@@ -89,15 +89,20 @@ pub(super) fn validate_custom_publish_registry_url(
     url: &str,
     source: &str,
 ) -> Result<(), LpmError> {
-    let safe_url = crate::install_ui::safe_url_origin(url);
     let parsed = reqwest::Url::parse(url).map_err(|_| {
         LpmError::Registry(format!(
-            "{source}: custom publish registry must be an https:// URL, got \"{safe_url}\""
+            "{source}: custom publish registry must be an https:// URL, got \"remote-url\""
         ))
     })?;
+    let safe_url = parsed.origin().ascii_serialization();
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(LpmError::Registry(format!(
             "{source}: custom publish registry URL must not contain credentials: \"{safe_url}\""
+        )));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(LpmError::Registry(format!(
+            "{source}: custom publish registry URL must not contain a query or fragment: \"{safe_url}\""
         )));
     }
     if parsed.scheme() != "https" {
@@ -105,18 +110,15 @@ pub(super) fn validate_custom_publish_registry_url(
             "{source}: refusing non-HTTPS URL \"{safe_url}\" — publish requires HTTPS"
         )));
     }
-    warn_on_unfamiliar_publish_host(url);
+    warn_on_unfamiliar_publish_host(&parsed);
     Ok(())
 }
 
-pub(super) fn warn_on_unfamiliar_publish_host(url: &str) {
-    let host = reqwest::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| url.to_string());
-    if !is_known_publish_host(&host) {
+fn warn_on_unfamiliar_publish_host(url: &reqwest::Url) {
+    let host = url.host_str().unwrap_or_default();
+    if !is_known_publish_host(host) {
         tracing::warn!(
-            target_url = %crate::install_ui::safe_url_origin(url),
+            target_url = %url.origin().ascii_serialization(),
             host = %host,
             "custom publish registry routes to a non-default host; confirm this is intentional",
         );

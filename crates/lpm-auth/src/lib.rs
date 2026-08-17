@@ -705,11 +705,7 @@ fn host_cli_auth_disabled() -> bool {
 fn is_default_gitlab_host(raw: &str) -> bool {
     reqwest::Url::parse(raw)
         .ok()
-        .and_then(|url| {
-            url.host_str()
-                .map(|host| host.eq_ignore_ascii_case("gitlab.com"))
-        })
-        .unwrap_or(false)
+        .is_some_and(|url| url.origin().ascii_serialization() == "https://gitlab.com")
 }
 
 // ─── Custom Registry Token ─────────────────────────────────────────
@@ -3293,6 +3289,23 @@ mod tests {
 
             assert_eq!(
                 get_gitlab_token_for_host("https://gitlab.example.com"),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn gitlab_default_credentials_are_not_used_for_alternate_port() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
+                ("GITLAB_TOKEN", Some("ambient-gitlab-token".into())),
+                ("CI_JOB_TOKEN", None),
+            ]);
+
+            assert_eq!(
+                get_gitlab_token_for_host("https://gitlab.com:8443/api/v4/projects/7/packages/npm",),
                 None
             );
         });
