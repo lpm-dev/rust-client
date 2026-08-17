@@ -125,12 +125,11 @@ pub async fn run(
             for located in &validation.security_issues {
                 let issue = &located.issue;
                 install_ui::warn_untrusted(&format!(
-                    "Skill security: {}: {} — {} at line {} ({})",
+                    "Skill security: {} — {} at line {} ({})",
                     lpm_common::sanitize_terminal_inline(&located.path),
-                    lpm_common::sanitize_terminal_inline(&issue.matched_text),
                     lpm_common::sanitize_terminal_inline(&issue.category),
                     issue.line_number,
-                    lpm_common::sanitize_terminal_inline(&issue.pattern)
+                    lpm_common::sanitize_terminal_inline(&issue.rule_id)
                 ));
             }
             return Err(LpmError::Registry(

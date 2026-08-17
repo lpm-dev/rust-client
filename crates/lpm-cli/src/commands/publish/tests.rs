@@ -26,11 +26,11 @@ fn secret_scan_human_renderer_uses_slim_lines_with_expected_content() {
         matches: vec![SecretMatch {
             pattern_name: "stripe_live_secret".to_string(),
             description: "Stripe live secret key".to_string(),
-            matched_text: "sk_live_********1234".to_string(),
             line: 7,
             severity: "critical".to_string(),
         }],
         files_scanned: 1,
+        limit_exceeded: None,
     };
 
     let lines = format_secret_scan_human(&scan);
@@ -55,7 +55,7 @@ fn secret_scan_human_renderer_uses_slim_lines_with_expected_content() {
     );
     assert!(
         joined.contains("Secret scan found 1 potential leak")
-            && joined.contains("critical sk_live_********1234:7  stripe_live_secret")
+            && joined.contains("critical:7  stripe_live_secret")
             && joined.contains("Publish blocked. Remove secrets before publishing.")
             && joined.contains("use --allow-secrets"),
         "secret scan slim output missing expected detail:\n{joined}"
@@ -68,11 +68,11 @@ fn secret_scan_json_envelope_preserves_machine_fields() {
         matches: vec![SecretMatch {
             pattern_name: "github_pat".to_string(),
             description: "GitHub personal access token".to_string(),
-            matched_text: "ghp_********1234".to_string(),
             line: 3,
             severity: "critical".to_string(),
         }],
         files_scanned: 1,
+        limit_exceeded: None,
     };
 
     let json = secret_scan_json(&scan);
@@ -80,6 +80,7 @@ fn secret_scan_json_envelope_preserves_machine_fields() {
     assert_eq!(json["error"], "secret_scan_failed");
     assert_eq!(json["matches"][0]["pattern"], "github_pat");
     assert_eq!(json["matches"][0]["line"], 3);
+    assert!(json["matches"][0].get("matchedText").is_none());
     assert_eq!(
         json["hint"],
         "Use --allow-secrets to bypass (not recommended)"

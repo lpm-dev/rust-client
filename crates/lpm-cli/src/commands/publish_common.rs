@@ -169,6 +169,9 @@ pub(crate) fn prepare_tarball(
     let mut secret_scan = options
         .scan_secrets
         .then(lpm_security::behavioral::secrets::SecretScanResult::default);
+    let mut secret_scan_budget = options
+        .scan_secrets
+        .then(lpm_security::behavioral::secrets::SecretScanBudget::for_operation);
     {
         let mut builder = tar::Builder::new(&mut tar_data);
 
@@ -241,11 +244,14 @@ pub(crate) fn prepare_tarball(
                 .append_data(&mut header, &tar_path, content.as_ref())
                 .map_err(LpmError::Io)?;
 
-            if let Some(scan) = secret_scan.as_mut() {
-                let mut file_scan = lpm_security::behavioral::secrets::scan_file_content(
-                    content.as_ref(),
-                    &candidate.archive_path,
-                );
+            if let Some((scan, budget)) = secret_scan.as_mut().zip(secret_scan_budget.as_mut()) {
+                let mut file_scan =
+                    lpm_security::behavioral::secrets::scan_file_content_with_budget(
+                        content.as_ref(),
+                        &candidate.archive_path,
+                        budget,
+                    );
+                ensure_publish_secret_scan_complete(&file_scan)?;
                 scan.matches.append(&mut file_scan.matches);
                 scan.files_scanned += file_scan.files_scanned;
             }
@@ -277,6 +283,29 @@ fn is_safe_candidate_file(path: &Path, source_root: &Path) -> Result<bool, LpmEr
     }
     let canonical = path.canonicalize()?;
     Ok(canonical.starts_with(source_root))
+}
+
+fn ensure_publish_secret_scan_complete(
+    scan: &lpm_security::behavioral::secrets::SecretScanResult,
+) -> Result<(), LpmError> {
+    let Some(limit) = scan.limit_exceeded else {
+        return Ok(());
+    };
+    let maximum = match limit {
+        lpm_security::behavioral::secrets::SecretScanLimit::Files => {
+            lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FILES.to_string()
+        }
+        lpm_security::behavioral::secrets::SecretScanLimit::Bytes => format!(
+            "{} MiB",
+            lpm_security::behavioral::secrets::SECRET_SCAN_MAX_BYTES / (1024 * 1024)
+        ),
+        lpm_security::behavioral::secrets::SecretScanLimit::Findings => {
+            lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FINDINGS.to_string()
+        }
+    };
+    Err(LpmError::Registry(format!(
+        "publish secret scan stopped at the {maximum} {limit} limit; the artifact was not published"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1095,8 @@ pub(crate) fn rewrite_tarball_name_for_publish(
     let mut new_tar_data = Vec::new();
     let mut secret_scan =
         scan_secrets.then(lpm_security::behavioral::secrets::SecretScanResult::default);
+    let mut secret_scan_budget =
+        scan_secrets.then(lpm_security::behavioral::secrets::SecretScanBudget::for_operation);
     let mut manifest_rewritten = false;
     {
         let mut archive = tar::Archive::new(tar_data.as_slice());
@@ -1106,10 +1137,13 @@ pub(crate) fn rewrite_tarball_name_for_publish(
                 .append_data(&mut header, &path, content.as_slice())
                 .map_err(LpmError::Io)?;
 
-            if let Some(scan) = secret_scan.as_mut() {
+            if let Some((scan, budget)) = secret_scan.as_mut().zip(secret_scan_budget.as_mut()) {
                 let scan_path = path.strip_prefix("package/").unwrap_or(&path);
                 let mut file_scan =
-                    lpm_security::behavioral::secrets::scan_file_content(&content, scan_path);
+                    lpm_security::behavioral::secrets::scan_file_content_with_budget(
+                        &content, scan_path, budget,
+                    );
+                ensure_publish_secret_scan_complete(&file_scan)?;
                 scan.matches.append(&mut file_scan.matches);
                 scan.files_scanned += file_scan.files_scanned;
             }
@@ -2139,6 +2173,46 @@ mod tests {
             scan.matches
                 .iter()
                 .any(|secret| secret.description.contains("node_modules/foo/index.js"))
+        );
+    }
+
+    #[test]
+    fn publish_secret_scan_rejects_more_than_ten_thousand_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "files": ["index.js"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let secret = format!("sk_{}_{}", "live", "F".repeat(20));
+        let mut content = String::with_capacity((secret.len() + 1) * 10_001);
+        for _ in 0..10_001 {
+            content.push_str(&secret);
+            content.push('\n');
+        }
+        std::fs::write(project.join("index.js"), content).unwrap();
+
+        let error = match prepare_tarball(
+            project,
+            &manifest,
+            TarballOptions {
+                package_json_content: None,
+                scan_secrets: true,
+            },
+        ) {
+            Ok(_) => panic!("publish scan must stop at the finding limit"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("10000 finding limit"),
+            "unexpected publish scan error: {error}"
         );
     }
 
