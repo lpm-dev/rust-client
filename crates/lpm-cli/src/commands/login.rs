@@ -71,25 +71,30 @@ pub async fn run(
     registry_url: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    if client
+    let has_existing_auth = client
         .session()
         .and_then(|session| session.current_source())
-        .is_some()
-        && let Ok(info) = client.whoami().await
-    {
-        let name = info
-            .profile_username
-            .as_deref()
-            .or(info.username.as_deref())
-            .unwrap_or("unknown");
-        if !json_output {
-            install_ui::done_line(crate::install_ui::terminal_line!(
-                "Already logged in as {}. Use {} to log out first.",
-                install_ui::cyan(name),
-                install_ui::dim("lpm logout")
-            ));
+        .is_some();
+    if has_existing_auth {
+        match client.whoami().await {
+            Ok(info) => {
+                let name = info
+                    .profile_username
+                    .as_deref()
+                    .or(info.username.as_deref())
+                    .unwrap_or("unknown");
+                if !json_output {
+                    install_ui::done_line(crate::install_ui::terminal_line!(
+                        "Already logged in as {}. Use {} to log out first.",
+                        install_ui::cyan(name),
+                        install_ui::dim("lpm logout")
+                    ));
+                }
+                return Ok(());
+            }
+            Err(LpmError::AuthRequired | LpmError::SessionExpired) => {}
+            Err(error) => return Err(error),
         }
-        return Ok(());
     }
 
     if !json_output {

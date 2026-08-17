@@ -368,6 +368,72 @@ async fn login_uses_refresh_session_before_starting_browser_flow() {
 }
 
 #[tokio::test]
+async fn login_reports_a_transient_preflight_failure_without_starting_browser_authentication() {
+    let project = TempProject::empty(r#"{"name":"login-transient-preflight","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", "Bearer valid-access"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .expect(4)
+        .mount(mock.server())
+        .await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("valid-access"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+            ..Default::default()
+        }],
+    );
+
+    let mut command = lpm_spawnable(&project);
+    command
+        .args(["--registry", &mock.url(), "--insecure", "login", "--json"])
+        .env("BROWSER", "false")
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0");
+    let mut child = command.spawn().expect("failed to spawn lpm login");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("failed to poll lpm login")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("failed to stop stuck browser login");
+            let output = child
+                .wait_with_output()
+                .expect("failed to collect stuck login output");
+            panic!(
+                "login started browser authentication after a transient preflight failure:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect login output");
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], serde_json::json!("http"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("503"))
+    );
+}
+
+#[tokio::test]
 async fn refresh_only_session_logout_then_startup_does_not_rehydrate_again() {
     let project =
         TempProject::empty(r#"{"name":"auth-refresh-logout-chain-test","version":"1.0.0"}"#);
