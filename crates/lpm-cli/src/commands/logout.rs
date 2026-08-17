@@ -80,7 +80,7 @@ pub async fn run(
     let mut local_cleared = true;
     if targets.clear_lpm {
         record_local_clear(
-            auth::clear_login_state(registry_url),
+            auth::clear_login_state_async(registry_url).await,
             "LPM.dev local credential clearing",
             &mut local_cleared,
             &mut errors,

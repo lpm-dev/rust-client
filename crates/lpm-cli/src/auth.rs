@@ -13,7 +13,7 @@
 pub use lpm_auth::{
     AuthStorageBackend, AuthStorageStatus, ThirdPartyCredentialSource, TokenSource,
     auth_storage_status, check_token_expiry_warnings, clear_all_custom_registries,
-    clear_custom_registry_token, clear_github_token, clear_gitlab_token, clear_login_state,
+    clear_custom_registry_token, clear_github_token, clear_gitlab_token, clear_login_state_async,
     clear_npm_token, clear_rejected_legacy_session_if_current, clear_token_expiry,
     get_custom_registry_token, get_github_token, get_gitlab_token_for_host, get_token,
     has_refresh_token, has_stored_access_token, is_otp_required, list_registry_auth_statuses,

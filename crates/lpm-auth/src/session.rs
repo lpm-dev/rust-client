@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
-use crate::{get_refresh_token, persist_refresh_backed_session_unlocked, session_lock_path};
+use crate::{persist_refresh_backed_session_unlocked, session_lock_path};
 
 /// Where the current effective token came from.
 ///
@@ -375,6 +375,15 @@ impl SessionManager {
         }
     }
 
+    fn load_access_token(&self) -> Result<Option<String>, LpmError> {
+        crate::get_stored_access_token_with_interaction_notice(&self.registry_url, || {
+            self.emit_auth_storage_notice(AuthStorageAccessKind::AccessToken);
+        })
+        .map_err(|error| {
+            LpmError::CredentialStorage(format!("failed to read stored access credential: {error}"))
+        })
+    }
+
     /// The registry URL this session is bound to.
     pub fn registry_url(&self) -> &str {
         &self.registry_url
@@ -677,7 +686,10 @@ impl SessionManager {
                 return Ok(secret);
             }
 
-            let refreshed = self.do_silent_refresh(&current_refresh).await?;
+            let rejected_access = self.load_access_token()?;
+            let refreshed = self
+                .do_silent_refresh(rejected_access.as_deref(), &current_refresh)
+                .await?;
             persist_refresh_backed_session_unlocked(
                 &self.registry_url,
                 &refreshed.token,
@@ -717,22 +729,48 @@ impl SessionManager {
         }
     }
 
-    fn clear_rejected_session_if_current(&self, rejected_refresh: &str) -> Result<(), LpmError> {
-        if get_refresh_token(&self.registry_url).as_deref() != Some(rejected_refresh) {
-            return Ok(());
-        }
+    fn clear_rejected_session_if_current(
+        &self,
+        rejected_access: Option<&str>,
+        rejected_refresh: &str,
+    ) -> Result<(), LpmError> {
+        let result = (|| {
+            let current_access = self.load_access_token()?;
+            let current_refresh =
+                crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
+                    self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken)
+                })
+                .map_err(|error| {
+                    LpmError::CredentialStorage(format!(
+                        "failed to read stored refresh credential: {error}"
+                    ))
+                })?;
 
-        crate::clear_login_state(&self.registry_url).map_err(|error| {
-            LpmError::CredentialStorage(format!("failed to clear rejected session: {error}"))
-        })?;
+            let access_result = if current_access.as_deref() == rejected_access {
+                crate::clear_token_expiry(&self.registry_url);
+                crate::clear_stored_access_token_unlocked(&self.registry_url)
+            } else {
+                Ok(())
+            };
+            let refresh_result = if current_refresh.as_deref() == Some(rejected_refresh) {
+                crate::clear_stored_refresh_token_unlocked(&self.registry_url)
+            } else {
+                Ok(())
+            };
+
+            crate::combine_clear_results(access_result, refresh_result).map_err(|error| {
+                LpmError::CredentialStorage(format!("failed to clear rejected session: {error}"))
+            })
+        })();
         self.clear_cached_session();
-        Ok(())
+        result
     }
 
     /// Perform the HTTP silent-refresh round-trip. Called inside the
     /// single-flight lock; never called directly from outside.
     async fn do_silent_refresh(
         &self,
+        rejected_access: Option<&str>,
         refresh_token: &str,
     ) -> Result<RefreshSessionResponse, LpmError> {
         let device_fingerprint = compute_device_fingerprint();
@@ -763,14 +801,14 @@ impl SessionManager {
         if !resp.status().is_success() {
             tracing::debug!("silent refresh failed: {}", resp.status());
             // A 401 authoritatively rejects the submitted refresh token.
-            // Clear the local session only while that exact token remains
-            // current; a peer may have durably rotated the shared session
-            // while this request was in flight.
+            // Clear each local credential only while the exact value used by
+            // this request remains current; a peer may replace either value
+            // while the request is in flight.
             //
             // 5xx and network errors are transient — keep state
             // intact so the next attempt can recover.
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-                self.clear_rejected_session_if_current(refresh_token)?;
+                self.clear_rejected_session_if_current(rejected_access, refresh_token)?;
             }
             return Err(LpmError::SessionExpired);
         }
@@ -1727,6 +1765,50 @@ mod refresh_http_tests {
         }
     }
 
+    #[derive(Clone)]
+    struct AccessOnlyPeerRotationBeforeUnauthorized {
+        registry_url: String,
+    }
+
+    impl Respond for AccessOnlyPeerRotationBeforeUnauthorized {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            crate::set_token(&self.registry_url, "at-peer")
+                .expect("peer access-token rotation should persist");
+            crate::set_session_access_token_expiry(&self.registry_url, "2099-01-01T00:00:00Z");
+            ResponseTemplate::new(401)
+        }
+    }
+
+    #[derive(Clone)]
+    struct RefreshOnlyPeerRotationBeforeUnauthorized {
+        registry_url: String,
+    }
+
+    impl Respond for RefreshOnlyPeerRotationBeforeUnauthorized {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            crate::set_refresh_token(&self.registry_url, "rt-peer");
+            ResponseTemplate::new(401)
+        }
+    }
+
+    #[derive(Clone)]
+    struct DelayedSuccessfulRefresh {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for DelayedSuccessfulRefresh {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(250))
+                .set_body_json(serde_json::json!({
+                    "token": "at-rotated",
+                    "refreshToken": "rt-rotated",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                }))
+        }
+    }
+
     /// Per-test isolation guard. Each test gets:
     ///
     /// - A unique `HOME` pointing at a fresh tempdir, so the
@@ -2057,6 +2139,100 @@ mod refresh_http_tests {
                 && stored_access.as_deref() == Some("at-peer")
                 && stored_refresh.as_deref() == Some("rt-peer"),
             "a rejection of the old refresh token must preserve newer peer credentials: result={result:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_unauthorized_preserves_access_token_replaced_by_a_peer() {
+        let server = MockServer::start().await;
+        let _isolated = isolate_test_env();
+        let manager = manager_for(&server.uri());
+        crate::set_token(&server.uri(), "at-stale").expect("seed stored access token");
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(AccessOnlyPeerRotationBeforeUnauthorized {
+                registry_url: server.uri(),
+            })
+            .mount(&server)
+            .await;
+
+        let result = manager.refresh_now().await;
+        let stored_access = crate::get_token(&server.uri());
+        let stored_refresh = crate::get_refresh_token(&server.uri());
+
+        assert!(
+            result.is_err()
+                && stored_access.as_deref() == Some("at-peer")
+                && stored_refresh.is_none()
+                && !crate::should_refresh_session_access_token(&server.uri()),
+            "a rejected refresh must preserve a peer-replaced access token while removing only the rejected refresh token: result={result:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_unauthorized_removes_rejected_access_and_preserves_peer_refresh() {
+        let server = MockServer::start().await;
+        let _isolated = isolate_test_env();
+        let manager = manager_for(&server.uri());
+        crate::set_token(&server.uri(), "at-stale").expect("seed stored access token");
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(RefreshOnlyPeerRotationBeforeUnauthorized {
+                registry_url: server.uri(),
+            })
+            .mount(&server)
+            .await;
+
+        let result = manager.refresh_now().await;
+        let stored_access = crate::get_token(&server.uri());
+        let stored_refresh = crate::get_refresh_token(&server.uri());
+
+        assert!(
+            result.is_err()
+                && stored_access.is_none()
+                && stored_refresh.as_deref() == Some("rt-peer"),
+            "a rejected refresh must remove only the rejected access token while preserving a peer-replaced refresh token: result={result:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_state_clear_waits_for_in_flight_refresh_and_removes_its_rotation() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(DelayedSuccessfulRefresh {
+                calls: Arc::clone(&calls),
+            })
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let manager = manager_for(&server.uri());
+        let registry_url = server.uri();
+        let refresh = tokio::spawn(async move { manager.refresh_now().await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while calls.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh request should reach the server");
+
+        crate::clear_login_state_async(&registry_url)
+            .await
+            .expect("credential clear should succeed");
+        refresh
+            .await
+            .expect("refresh task should finish")
+            .expect("refresh should complete before the serialized clear");
+
+        let stored_access = crate::get_token(&registry_url);
+        let stored_refresh = crate::get_refresh_token(&registry_url);
+        assert!(
+            stored_access.is_none() && stored_refresh.is_none(),
+            "logout must be the final writer when it overlaps refresh: stored_access={stored_access:?}, stored_refresh={stored_refresh:?}"
         );
     }
 
