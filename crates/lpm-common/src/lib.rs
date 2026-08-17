@@ -174,15 +174,16 @@ pub fn resolve_lpm_registry_url() -> String {
         Some(v) => v,
         None => return DEFAULT_REGISTRY_URL.to_string(),
     };
+    let safe_url = safe_url_origin(&raw);
     if lpm_registry_url_is_accepted(&raw) {
         tracing::warn!(
-            registry_url = %raw,
+            registry_url = %safe_url,
             "LPM_REGISTRY_URL override honoured — LPM bearer tokens, OIDC tokens, and vault payloads will be sent to this host; confirm it is expected",
         );
         return raw;
     }
     tracing::warn!(
-        registry_url = %raw,
+        registry_url = %safe_url,
         default_url = DEFAULT_REGISTRY_URL,
         "rejecting LPM_REGISTRY_URL override: only https:// (any host) or http:// loopback URLs are accepted; falling back to default",
     );
@@ -218,7 +219,9 @@ pub fn lpm_registry_url_is_accepted(url: &str) -> bool {
         .split('#')
         .next()
         .unwrap_or("");
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.contains('@') {
+        return false;
+    }
     let host = if authority.starts_with('[') {
         match authority.find(']') {
             Some(end) => &authority[..=end],
@@ -234,6 +237,28 @@ pub fn lpm_registry_url_is_accepted(url: &str) -> bool {
         return true;
     }
     is_loopback_host(host)
+}
+
+pub fn safe_url_origin(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "remote-url".to_string();
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return "remote-url".to_string();
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('@')
+        .map_or_else(
+            || rest.split(['/', '?', '#']).next().unwrap_or(""),
+            |(_, host)| host,
+        );
+    if authority.is_empty() {
+        return "remote-url".to_string();
+    }
+    format!("{}://{authority}", scheme.to_ascii_lowercase())
 }
 
 /// Loopback host detection covering the shapes that appear in tests
@@ -548,9 +573,20 @@ mod tests {
         assert!(lpm_registry_url_is_accepted("https://lpm.dev"));
         assert!(lpm_registry_url_is_accepted("https://lpm.example.com"));
         assert!(lpm_registry_url_is_accepted("https://10.0.0.1:8443"));
-        assert!(lpm_registry_url_is_accepted(
+        assert!(!lpm_registry_url_is_accepted(
             "https://user:pass@registry.internal/some/path"
         ));
+    }
+
+    #[test]
+    fn safe_url_origin_removes_credentials_and_url_components() {
+        assert_eq!(
+            safe_url_origin(
+                "https://registry-user:registry-password@example.com/private?token=secret#part"
+            ),
+            "https://example.com"
+        );
+        assert_eq!(safe_url_origin("not a url"), "remote-url");
     }
 
     /// H16: plain HTTP is accepted ONLY for loopback hosts — this is

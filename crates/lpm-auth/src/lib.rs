@@ -549,10 +549,10 @@ pub fn get_gitlab_token() -> Option<String> {
 
 /// Get the token for GitLab Packages at a resolved GitLab host.
 ///
-/// The GitLab CLI token is only used for `gitlab.com`. Self-managed GitLab
-/// instances keep the existing env/keychain/manual-token behavior.
-pub fn get_gitlab_token_for_host(gitlab_host: &str) -> Option<String> {
-    resolve_gitlab_credential_for_host(gitlab_host)
+/// Default-host credentials are used only for `gitlab.com`. Other registry
+/// URLs require a credential stored for that exact URL.
+pub fn get_gitlab_token_for_host(gitlab_registry_url: &str) -> Option<String> {
+    resolve_gitlab_credential_for_host(gitlab_registry_url)
         .map(|credential| credential.with_exposed_token(str::to_owned))
 }
 
@@ -567,17 +567,22 @@ pub fn resolve_gitlab_environment_credential() -> Option<ResolvedThirdPartyCrede
 }
 
 pub fn resolve_gitlab_credential_for_host(
-    gitlab_host: &str,
+    gitlab_registry_url: &str,
 ) -> Option<ResolvedThirdPartyCredential> {
+    if !is_default_gitlab_host(gitlab_registry_url) {
+        return get_custom_registry_token_with_backend(gitlab_registry_url).map(|stored| {
+            ResolvedThirdPartyCredential::new(
+                stored.token,
+                ThirdPartyCredentialSource::Stored(stored.backend),
+            )
+        });
+    }
+
     resolve_gitlab_environment_credential()
         .or_else(|| {
-            if is_default_gitlab_host(gitlab_host) {
-                get_gitlab_cli_token().map(|token| {
-                    ResolvedThirdPartyCredential::new(token, ThirdPartyCredentialSource::GitlabCli)
-                })
-            } else {
-                None
-            }
+            get_gitlab_cli_token().map(|token| {
+                ResolvedThirdPartyCredential::new(token, ThirdPartyCredentialSource::GitlabCli)
+            })
         })
         .or_else(|| {
             get_stored_builtin_token_with_backend(GITLAB_REGISTRY_URL).map(|stored| {
@@ -3269,7 +3274,7 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_ci_job_token_priority_over_stored_fallback_for_self_managed_host() {
+    fn gitlab_ci_job_token_is_not_used_for_self_managed_host() {
         with_temp_home(|_| {
             let _env = LocalEnvGuard::update([
                 ("LPM_FORCE_FILE_AUTH", Some("1".into())),
@@ -3288,14 +3293,14 @@ mod tests {
 
             assert_eq!(
                 get_gitlab_token_for_host("https://gitlab.example.com"),
-                Some("gitlab-ci-token".to_string())
+                None
             );
         });
     }
 
     #[cfg(unix)]
     #[test]
-    fn gitlab_token_for_self_managed_host_skips_glab_cli() {
+    fn gitlab_token_for_self_managed_host_uses_registry_scoped_token() {
         with_temp_home(|_| {
             let bin = tempfile::tempdir().unwrap();
             write_fake_host_command(
@@ -3311,18 +3316,23 @@ mod tests {
                 ("PATH", Some(bin.path().as_os_str().to_owned())),
             ]);
 
+            let registry_url = "https://gitlab.example.com/api/v4/projects/7/packages/npm";
             std::fs::write(
                 credentials_path().expect("credentials path should resolve"),
                 encrypt(
-                    &serde_json::json!({ GITLAB_REGISTRY_URL: "gitlab-file-token" }).to_string(),
+                    &serde_json::json!({
+                        GITLAB_REGISTRY_URL: "default-gitlab-token",
+                        registry_url: "self-managed-token",
+                    })
+                    .to_string(),
                 )
                 .expect("failed to encrypt credentials store"),
             )
             .expect("failed to write encrypted credentials store");
 
             assert_eq!(
-                get_gitlab_token_for_host("https://gitlab.example.com"),
-                Some("gitlab-file-token".to_string())
+                get_gitlab_token_for_host(registry_url),
+                Some("self-managed-token".to_string())
             );
         });
     }

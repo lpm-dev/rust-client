@@ -89,20 +89,24 @@ pub(super) fn validate_custom_publish_registry_url(
     url: &str,
     source: &str,
 ) -> Result<(), LpmError> {
-    if url.starts_with("https://") {
-        warn_on_unfamiliar_publish_host(url);
-        return Ok(());
-    }
-
-    if url.starts_with("http://") {
+    let safe_url = crate::install_ui::safe_url_origin(url);
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        LpmError::Registry(format!(
+            "{source}: custom publish registry must be an https:// URL, got \"{safe_url}\""
+        ))
+    })?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(LpmError::Registry(format!(
-            "{source}: refusing HTTP URL \"{url}\" — publish requires HTTPS"
+            "{source}: custom publish registry URL must not contain credentials: \"{safe_url}\""
         )));
     }
-
-    Err(LpmError::Registry(format!(
-        "{source}: custom publish registry must be an https:// URL, got \"{url}\""
-    )))
+    if parsed.scheme() != "https" {
+        return Err(LpmError::Registry(format!(
+            "{source}: refusing non-HTTPS URL \"{safe_url}\" — publish requires HTTPS"
+        )));
+    }
+    warn_on_unfamiliar_publish_host(url);
+    Ok(())
 }
 
 pub(super) fn warn_on_unfamiliar_publish_host(url: &str) {
@@ -112,7 +116,7 @@ pub(super) fn warn_on_unfamiliar_publish_host(url: &str) {
         .unwrap_or_else(|| url.to_string());
     if !is_known_publish_host(&host) {
         tracing::warn!(
-            target_url = %url,
+            target_url = %crate::install_ui::safe_url_origin(url),
             host = %host,
             "custom publish registry routes to a non-default host; confirm this is intentional",
         );

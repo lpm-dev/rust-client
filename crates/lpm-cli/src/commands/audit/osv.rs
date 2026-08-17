@@ -207,10 +207,11 @@ fn resolve_osv_url(emit_warnings: bool) -> String {
         Some(v) => v,
         None => return OSV_URL_DEFAULT.to_string(),
     };
+    let safe_url = crate::install_ui::safe_url_origin(&raw);
     if osv_override_is_accepted(&raw) {
         if emit_warnings {
             tracing::warn!(
-                override_url = %raw,
+                override_url = %safe_url,
                 "LPM_OSV_URL override honoured — confirm this is expected",
             );
         }
@@ -218,7 +219,7 @@ fn resolve_osv_url(emit_warnings: bool) -> String {
     }
     if emit_warnings {
         tracing::warn!(
-            override_url = %raw,
+            override_url = %safe_url,
             "rejecting LPM_OSV_URL override: plain HTTP non-loopback URL or unsupported scheme; \
              falling back to default — set the override to an https:// URL to use a private mirror",
         );
@@ -235,6 +236,9 @@ pub(super) fn osv_override_is_accepted(url: &str) -> bool {
         Ok(u) => u,
         Err(_) => return false,
     };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
     match parsed.scheme() {
         "https" => true,
         "http" => parsed.host_str().is_some_and(host_is_loopback),

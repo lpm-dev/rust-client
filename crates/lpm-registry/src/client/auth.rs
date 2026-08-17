@@ -68,8 +68,23 @@ pub(super) fn apply_npmrc_auth(
     let Some(a) = auth else {
         return Ok(req);
     };
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        LpmError::Registry(format!(
+            "invalid registry URL '{}'",
+            lpm_common::safe_url_origin(url)
+        ))
+    })?;
+    if parsed.scheme() == "http" && !super::url_gate::is_localhost_url(url) {
+        return Err(LpmError::Registry(format!(
+            "refusing to send registry credentials over cleartext HTTP to {}",
+            lpm_common::safe_url_origin(url)
+        )));
+    }
     let dest = crate::npmrc::OriginKey::from_request_url(url).ok_or_else(|| {
-        LpmError::Registry(format!("invalid URL '{url}' — must be http(s) with a host"))
+        LpmError::Registry(format!(
+            "invalid URL '{}' — must be http(s) with a host",
+            lpm_common::safe_url_origin(url)
+        ))
     })?;
     if !a.matches_destination(&dest) {
         return Err(LpmError::Registry(format!(
