@@ -34,29 +34,9 @@ pub(super) async fn read_capped_body(
     cap: usize,
     context: &str,
 ) -> Result<Vec<u8>, LpmError> {
-    use futures::StreamExt;
-
-    if let Some(declared) = response.content_length()
-        && declared as usize > cap
-    {
-        return Err(LpmError::Registry(format!(
-            "{context}: declared body length {declared} exceeds cap {cap}"
-        )));
-    }
-
-    let mut buf: Vec<u8> = Vec::with_capacity(std::cmp::min(64 * 1024, cap));
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| LpmError::Registry(format!("{context}: body read error: {e}")))?;
-        if buf.len().saturating_add(chunk.len()) > cap {
-            return Err(LpmError::Registry(format!(
-                "{context}: streamed body exceeded cap {cap}"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
+    lpm_http::read_body_capped(response, cap)
+        .await
+        .map_err(|error| LpmError::Registry(format!("{context}: {error}")))
 }
 
 /// Read a metadata-shaped JSON response with the metadata cap.

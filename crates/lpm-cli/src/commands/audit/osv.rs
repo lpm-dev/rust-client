@@ -194,6 +194,8 @@ impl OsvVulnerability {
 const OSV_URL_DEFAULT: &str = "https://api.osv.dev/v1/querybatch";
 const OSV_MAX_QUERIES_PER_REQUEST: usize = 1000;
 const OSV_BATCH_REQUEST_CONCURRENCY: usize = 4;
+const OSV_BATCH_RESPONSE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const OSV_ADVISORY_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Resolve the OSV endpoint, honouring `LPM_OSV_URL` overrides only
 /// when the scheme/host combination matches the same gating contract as
@@ -417,9 +419,10 @@ async fn send_osv_batch_request(
         )));
     }
 
-    let result: OsvBatchResponse = response
-        .json()
+    let body = lpm_http::read_body_capped(response, OSV_BATCH_RESPONSE_MAX_BYTES)
         .await
+        .map_err(|error| LpmError::Network(format!("OSV response {error}")))?;
+    let result: OsvBatchResponse = serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body))
         .map_err(|error| LpmError::Network(format!("OSV parse error: {error}")))?;
 
     if result.results.len() != query_count {
@@ -463,9 +466,10 @@ async fn fetch_osv_advisory(
             response.status().as_u16()
         )));
     }
-    let vuln: OsvVuln = response
-        .json()
+    let body = lpm_http::read_body_capped(response, OSV_ADVISORY_RESPONSE_MAX_BYTES)
         .await
+        .map_err(|error| LpmError::Network(format!("OSV advisory response for {id} {error}")))?;
+    let vuln: OsvVuln = serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body))
         .map_err(|e| LpmError::Network(format!("OSV advisory parse failed for {id}: {e}")))?;
     if vuln.id != id {
         return Err(LpmError::Network(format!(

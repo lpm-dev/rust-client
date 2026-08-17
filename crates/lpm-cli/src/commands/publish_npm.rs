@@ -12,6 +12,8 @@ use lpm_common::LpmError;
 use lpm_runner::lpm_json::NpmPublishConfig;
 use std::time::Duration;
 
+const NPM_PUBLISH_RESPONSE_MAX_BYTES: usize = 10 * 1024 * 1024;
+
 /// Default npm registry URL.
 pub(crate) const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 
@@ -290,7 +292,7 @@ async fn publish_to_npm_impl(
 
     // OTP required? (A4)
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        let body = response_json_or_empty(response).await;
+        let body = response_json_or_empty(response).await?;
         if let Some(challenge) = web_auth::parse_web_auth_challenge_from_body(&body) {
             if !can_handle_interactive_challenge(json_output, yes, runtime) {
                 return Err(LpmError::Registry(
@@ -373,7 +375,7 @@ async fn handle_npm_response(
     start: std::time::Instant,
 ) -> Result<NpmPublishResult, LpmError> {
     let status = response.status();
-    let body = response_json_or_empty(response).await;
+    let body = response_json_or_empty(response).await?;
 
     Ok(handle_npm_response_body(
         status, body, npm_name, version, start,
@@ -429,11 +431,16 @@ fn handle_npm_response_body(
     }
 }
 
-async fn response_json_or_empty(response: reqwest::Response) -> serde_json::Value {
-    response
-        .json()
+async fn response_json_or_empty(
+    response: reqwest::Response,
+) -> Result<serde_json::Value, LpmError> {
+    let body = lpm_http::read_body_capped(response, NPM_PUBLISH_RESPONSE_MAX_BYTES)
         .await
-        .unwrap_or_else(|_| serde_json::json!({}))
+        .map_err(|error| LpmError::Registry(format!("npm publish response {error}")))?;
+    Ok(
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body))
+            .unwrap_or_else(|_| serde_json::json!({})),
+    )
 }
 
 fn can_handle_interactive_challenge(
@@ -608,6 +615,43 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(web_auth::NPM_COMMAND_PUBLISH)
         );
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_rejects_oversized_response_body() {
+        const RESPONSE_CAP: usize = 10 * 1024 * 1024;
+        let server = MockServer::start().await;
+        let mut body = String::with_capacity(RESPONSE_CAP + 32);
+        body.push_str(r#"{"padding":""#);
+        body.extend(std::iter::repeat_n('x', RESPONSE_CAP));
+        body.push_str(r#""}"#);
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_raw(body.into_bytes(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            b"fake-tarball",
+            None,
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .expect_err("oversized npm response must be rejected");
+
+        assert!(error.to_string().contains("exceeds cap"));
     }
 
     #[tokio::test]
