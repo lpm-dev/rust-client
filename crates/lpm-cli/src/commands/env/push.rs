@@ -1,13 +1,15 @@
 use super::prelude::*;
 
 pub(super) async fn vars_push(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     // Route to platform push if --to flag is present
     if args.iter().any(|a| a.starts_with("--to")) {
-        return super::platform::vars_platform_push(&args[1..], project_dir, json_output).await;
+        return super::platform::vars_platform_push(client, &args[1..], project_dir, json_output)
+            .await;
     }
 
     let force = args.contains(&"--force");
@@ -55,9 +57,6 @@ pub(super) async fn vars_push(
         }
     }
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
     if !json_output {
         output::info("pushing vault to cloud...");
     }
@@ -67,23 +66,34 @@ pub(super) async fn vars_push(
 
     let schema_value = super::sync_payload::build_push_schema_value(config.as_ref());
 
-    let push_metadata = lpm_vault::sync::PushMetadata {
-        name: Some(&project_name),
-        schema: schema_value.as_ref(),
-    };
     let expected_version = super::sync_payload::expected_personal_sync_version(project_dir, force);
-
-    let result = lpm_vault::sync::push_raw(
-        &registry_url,
-        &auth_token,
-        &vault_id,
-        &secrets_json,
-        expected_version,
-        force,
-        Some(&push_metadata),
+    let result = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let project_name = project_name.clone();
+            let schema_value = schema_value.clone();
+            let vault_id = vault_id.clone();
+            let secrets_json = secrets_json.clone();
+            async move {
+                let push_metadata = lpm_vault::sync::PushMetadata {
+                    name: Some(&project_name),
+                    schema: schema_value.as_ref(),
+                };
+                lpm_vault::sync::push_raw(
+                    &registry_url,
+                    &auth_token,
+                    &vault_id,
+                    &secrets_json,
+                    expected_version,
+                    force,
+                    Some(&push_metadata),
+                )
+                .await
+            }
+        },
     )
-    .await
-    .map_err(LpmError::Script)?;
+    .await?;
 
     if let Some(version) = result.version {
         lpm_vault::vault_id::write_personal_sync_version(project_dir, version)

@@ -1,3 +1,4 @@
+use super::SyncError;
 use super::http::{read_capped_error_text, sync_http_client_builder, url_path_segment};
 use super::step_up::CLI_STEP_UP_HEADER_NAME;
 
@@ -49,7 +50,7 @@ pub async fn upload_public_key(
     auth_token: &str,
     public_key_b64: &str,
     step_up_proof: Option<&str>,
-) -> Result<UploadPublicKeyResponse, String> {
+) -> Result<UploadPublicKeyResponse, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -68,17 +69,21 @@ pub async fn upload_public_key(
     let response = request.send().await.map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = read_capped_error_text(response).await;
-        return Err(format!("failed to upload public key: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("failed to upload public key: {body}"),
+        ));
     }
 
     // `response.json()` would happily Err if the body isn't JSON. Old
     // servers reliably return JSON; the explicit error keeps the
     // message tight for any future server that 2xxes with HTML.
-    response
+    Ok(response
         .json::<UploadPublicKeyResponse>()
         .await
-        .map_err(|e| format!("parse error: {e}"))
+        .map_err(|e| format!("parse error: {e}"))?)
 }
 
 /// Check if the user's public key is already on the server.
@@ -102,7 +107,7 @@ pub async fn upload_public_key(
 pub async fn get_my_public_key(
     registry_url: &str,
     auth_token: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -119,7 +124,10 @@ pub async fn get_my_public_key(
     let status = response.status();
     if !status.is_success() {
         let body = read_capped_error_text(response).await;
-        return Err(format!("get public key: {status}: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("get public key: {status}: {body}"),
+        ));
     }
 
     let data: serde_json::Value = response
@@ -192,7 +200,7 @@ pub enum PublicKeyRegistrationState {
 pub async fn classify_public_key_state(
     registry_url: &str,
     auth_token: &str,
-) -> Result<PublicKeyRegistrationState, String> {
+) -> Result<PublicKeyRegistrationState, SyncError> {
     let local = load_local_public_key_state()?;
     let server_key = get_my_public_key(registry_url, auth_token).await?;
 
@@ -422,7 +430,7 @@ pub async fn get_org_member_keys(
     registry_url: &str,
     auth_token: &str,
     org_slug: &str,
-) -> Result<Vec<MemberPublicKey>, String> {
+) -> Result<Vec<MemberPublicKey>, SyncError> {
     Ok(
         get_org_member_key_access(registry_url, auth_token, org_slug)
             .await?
@@ -435,7 +443,7 @@ pub async fn get_org_member_key_access(
     registry_url: &str,
     auth_token: &str,
     org_slug: &str,
-) -> Result<OrgMemberKeyAccess, String> {
+) -> Result<OrgMemberKeyAccess, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -453,8 +461,12 @@ pub async fn get_org_member_key_access(
         .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = read_capped_error_text(response).await;
-        return Err(format!("failed to fetch member keys: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("failed to fetch member keys: {body}"),
+        ));
     }
 
     let can_replace_wrapped_keys = match response
@@ -466,7 +478,11 @@ pub async fn get_org_member_key_access(
     {
         Some("allowed") | None => true,
         Some("forbidden") => false,
-        Some(_) => return Err("invalid organization wrapped-key capability header".into()),
+        Some(_) => {
+            return Err(SyncError::from(
+                "invalid organization wrapped-key capability header",
+            ));
+        }
     };
     let members = response
         .json()
@@ -582,7 +598,7 @@ mod tests {
             .await
             .expect_err("401 must propagate as Err, not Ok(None)");
         assert!(
-            err.contains("401"),
+            err.to_string().contains("401"),
             "error must include the HTTP status so the caller can branch: {err}"
         );
     }
@@ -718,7 +734,8 @@ mod tests {
             .await
             .expect_err("403 must propagate as Err");
         assert!(
-            err.contains("step_up_required") || err.contains("Fresh step-up"),
+            err.to_string().contains("step_up_required")
+                || err.to_string().contains("Fresh step-up"),
             "error must surface the server envelope so the CLI can render the actionable hint: {err}"
         );
     }
@@ -837,7 +854,7 @@ mod tests {
         let err = classify_public_key_state(&server.uri(), "token")
             .await
             .expect_err("server 500 must propagate, not be misclassified");
-        assert!(err.contains("500"), "got: {err}");
+        assert!(err.to_string().contains("500"), "got: {err}");
     }
 
     #[cfg(debug_assertions)]

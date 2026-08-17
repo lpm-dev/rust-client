@@ -1,35 +1,40 @@
 use super::prelude::*;
+use lpm_auth::{AuthRequirement, RefreshPolicy};
+use lpm_registry::RegistryClient;
 
-/// Resolve an LPM session bearer for env vault sync sites.
-///
-/// `lpm env` subcommands build their own reqwest client (long timeouts,
-/// custom routing) so they don't get `RegistryClient::execute_with_recovery`
-/// for free. This helper builds a local `SessionManager` (cheap,
-/// local-only — no network) and asks it for a usable bearer.
-///
-/// `bearer_string_for` handles the refresh-only-state path internally:
-/// if the cached access token is missing but a refresh token is on disk,
-/// the silent refresh runs here. Subsequent calls within the same process
-/// see the persisted rotated token, so constructing per-call instead of
-/// threading a shared session is behaviorally equivalent for env's
-/// single-shot usage pattern.
-pub(super) async fn resolve_lpm_bearer(
-    registry_url: &str,
-    json_output: bool,
+async fn resolve_bearer(
+    client: &RegistryClient,
+    requirement: AuthRequirement,
 ) -> Result<String, LpmError> {
-    let session = auth_storage_notice::attach(
-        lpm_auth::SessionManager::new(registry_url, None),
-        json_output,
-    );
-    session
-        .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
+    let session = client.session().ok_or(LpmError::AuthRequired)?;
+    session.bearer_string_for(requirement).await
+}
+
+fn login_required(error: LpmError) -> LpmError {
+    match error {
+        LpmError::AuthRequired | LpmError::SessionExpired => {
+            LpmError::Script("not logged in. Run `lpm login` first".into())
+        }
+        other => other,
+    }
+}
+
+/// Resolve the current LPM bearer for a direct env API client.
+pub(super) async fn resolve_lpm_bearer(client: &RegistryClient) -> Result<String, LpmError> {
+    resolve_bearer(client, AuthRequirement::TokenRequired)
         .await
-        .map_err(|error| match error {
-            LpmError::AuthRequired | LpmError::SessionExpired => {
-                LpmError::Script("not logged in. Run `lpm login` first".into())
-            }
-            other => other,
-        })
+        .map_err(login_required)
+}
+
+async fn resolve_required_bearer(
+    client: &RegistryClient,
+    requirement: AuthRequirement,
+) -> Result<String, LpmError> {
+    match requirement {
+        AuthRequirement::TokenRequired => resolve_lpm_bearer(client).await,
+        AuthRequirement::SessionRequired => resolve_session_bearer(client).await,
+        AuthRequirement::AnonymousAllowed => resolve_bearer(client, requirement).await,
+    }
 }
 
 /// Vault-pairing variant that requires a real interactive login (not
@@ -42,37 +47,100 @@ pub(super) async fn resolve_lpm_bearer(
 ///   `resolve_lpm_bearer`.
 /// - **Has a non-session token** (`LPM_TOKEN` / `--token` / CI /
 ///   legacy stored): the upgrade-to-session message.
-pub(super) async fn resolve_session_bearer(
-    registry_url: &str,
-    json_output: bool,
-) -> Result<String, LpmError> {
-    let session = auth_storage_notice::attach(
-        lpm_auth::SessionManager::new(registry_url, None),
-        json_output,
-    );
-    let has_any_source = session.current_source()?.is_some();
-    session
-        .bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
-        .await
-        .map_err(|error| match error {
-            LpmError::AuthRequired | LpmError::SessionExpired => {
-                if has_any_source {
-                    LpmError::Script(
-                        "your current login uses a legacy token that doesn't support vault pairing.\n  \
-                         Run `lpm logout` then `lpm login` to upgrade to a session-based login."
-                            .into(),
-                    )
-                } else {
-                    LpmError::Script("not logged in. Run `lpm login` first".into())
-                }
+pub(super) async fn resolve_session_bearer(client: &RegistryClient) -> Result<String, LpmError> {
+    let Some(session) = client.session() else {
+        return Err(login_required(LpmError::AuthRequired));
+    };
+    match resolve_bearer(client, AuthRequirement::SessionRequired).await {
+        Ok(bearer) => Ok(bearer),
+        Err(error @ (LpmError::AuthRequired | LpmError::SessionExpired)) => {
+            let has_non_session_source = session
+                .current_source()?
+                .is_some_and(|source| !source.is_session_backed());
+            if has_non_session_source {
+                Err(LpmError::Script(
+                    "your current login uses a legacy token that doesn't support vault pairing.\n  \
+                     Run `lpm logout` then `lpm login` to upgrade to a session-based login."
+                        .into(),
+                ))
+            } else {
+                Err(login_required(error))
             }
-            other => other,
-        })
+        }
+        Err(other) => Err(other),
+    }
 }
 
-/// Get the LPM auth token and registry URL for API calls.
-pub(super) async fn get_platform_auth(json_output: bool) -> Result<(String, String), LpmError> {
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = resolve_lpm_bearer(&registry_url, json_output).await?;
-    Ok((registry_url, auth_token))
+fn sync_error(error: lpm_vault::sync::SyncError) -> LpmError {
+    if error.is_unauthorized() {
+        login_required(LpmError::AuthRequired)
+    } else {
+        LpmError::Script(error.to_string())
+    }
+}
+
+pub(crate) async fn execute_sync_with_bearer<T, F, Fut>(
+    client: &RegistryClient,
+    requirement: AuthRequirement,
+    operation: F,
+) -> Result<T, LpmError>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, lpm_vault::sync::SyncError>>,
+{
+    let session = client
+        .session()
+        .ok_or_else(|| login_required(LpmError::AuthRequired))?;
+    let registry_url = client.base_url().to_owned();
+    let bearer = resolve_required_bearer(client, requirement).await?;
+
+    match operation(registry_url.clone(), bearer).await {
+        Err(error) if error.is_unauthorized() => {
+            let can_refresh = session
+                .current_source()?
+                .is_some_and(|source| source.refresh_policy() == RefreshPolicy::IfRefreshable);
+            if !can_refresh {
+                return Err(sync_error(error));
+            }
+
+            session.refresh_now().await.map_err(login_required)?;
+            let bearer = resolve_required_bearer(client, requirement).await?;
+            operation(registry_url, bearer).await.map_err(sync_error)
+        }
+        result => result.map_err(sync_error),
+    }
+}
+
+pub(crate) async fn execute_lpm_with_bearer<T, F, Fut>(
+    client: &RegistryClient,
+    requirement: AuthRequirement,
+    operation: F,
+) -> Result<T, LpmError>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, LpmError>>,
+{
+    let session = client
+        .session()
+        .ok_or_else(|| login_required(LpmError::AuthRequired))?;
+    let registry_url = client.base_url().to_owned();
+    let bearer = resolve_required_bearer(client, requirement).await?;
+
+    match operation(registry_url.clone(), bearer).await {
+        Err(error @ LpmError::AuthRequired) => {
+            let can_refresh = session
+                .current_source()?
+                .is_some_and(|source| source.refresh_policy() == RefreshPolicy::IfRefreshable);
+            if !can_refresh {
+                return Err(login_required(error));
+            }
+
+            session.refresh_now().await.map_err(login_required)?;
+            let bearer = resolve_required_bearer(client, requirement).await?;
+            operation(registry_url, bearer)
+                .await
+                .map_err(login_required)
+        }
+        result => result.map_err(login_required),
+    }
 }

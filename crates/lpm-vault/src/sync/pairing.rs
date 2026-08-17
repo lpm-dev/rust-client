@@ -1,3 +1,4 @@
+use super::SyncError;
 use super::http::{read_capped_error_text, sync_http_client_builder, url_path_segment};
 
 /// Response from GET /api/vault/pair/:code (pending session).
@@ -20,7 +21,7 @@ pub async fn get_pairing_session(
     registry_url: &str,
     auth_token: &str,
     code: &str,
-) -> Result<PairingSession, String> {
+) -> Result<PairingSession, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -35,14 +36,15 @@ pub async fn get_pairing_session(
         .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = read_capped_error_text(response).await;
-        return Err(format!("pairing error: {body}"));
+        return Err(SyncError::http(status, format!("pairing error: {body}")));
     }
 
-    response
+    Ok(response
         .json()
         .await
-        .map_err(|e| format!("parse error: {e}"))
+        .map_err(|e| format!("parse error: {e}"))?)
 }
 
 /// Stage the protocol-v2 CLI public key before displaying the ECDH-derived SAS.
@@ -51,7 +53,7 @@ pub async fn stage_pairing(
     auth_token: &str,
     code: &str,
     ephemeral_public_key: &str,
-) -> Result<(), String> {
+) -> Result<(), SyncError> {
     post_pairing(
         registry_url,
         auth_token,
@@ -72,7 +74,7 @@ pub async fn approve_pairing(
     code: &str,
     encrypted_wrapping_key: &str,
     ephemeral_public_key: &str,
-) -> Result<(), String> {
+) -> Result<(), SyncError> {
     post_pairing(
         registry_url,
         auth_token,
@@ -94,7 +96,7 @@ pub async fn approve_pairing_legacy(
     code: &str,
     encrypted_wrapping_key: &str,
     ephemeral_public_key: &str,
-) -> Result<(), String> {
+) -> Result<(), SyncError> {
     post_pairing(
         registry_url,
         auth_token,
@@ -114,7 +116,7 @@ async fn post_pairing(
     code: &str,
     body: serde_json::Value,
     operation: &str,
-) -> Result<(), String> {
+) -> Result<(), SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -130,15 +132,19 @@ async fn post_pairing(
         .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = read_capped_error_text(response).await;
-        return Err(format!("{operation} failed: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("{operation} failed: {body}"),
+        ));
     }
 
     Ok(())
 }
 
 /// Revoke all browser pairings for the authenticated user.
-pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), String> {
+pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -155,8 +161,9 @@ pub async fn unpair_all(registry_url: &str, auth_token: &str) -> Result<(), Stri
         .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = read_capped_error_text(response).await;
-        return Err(format!("unpair failed: {body}"));
+        return Err(SyncError::http(status, format!("unpair failed: {body}")));
     }
 
     Ok(())
@@ -206,7 +213,9 @@ mod tests {
 
         let result = get_pairing_session(&server.uri(), "auth-token", "EXPIRED").await;
 
-        assert!(matches!(result, Err(message) if message == "pairing error: pairing expired"));
+        assert!(
+            matches!(result, Err(message) if message.to_string() == "pairing error: pairing expired")
+        );
     }
 
     #[tokio::test]
@@ -279,6 +288,8 @@ mod tests {
 
         let result = unpair_all(&server.uri(), "auth-token").await;
 
-        assert!(matches!(result, Err(message) if message == "unpair failed: vault revoke failed"));
+        assert!(
+            matches!(result, Err(message) if message.to_string() == "unpair failed: vault revoke failed")
+        );
     }
 }

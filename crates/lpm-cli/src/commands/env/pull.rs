@@ -1,6 +1,7 @@
 use super::prelude::*;
 
 pub(super) async fn vars_pull(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -9,12 +10,13 @@ pub(super) async fn vars_pull(
 
     // Route to platform pull if --from flag is present
     if args.iter().any(|a| a.starts_with("--from")) {
-        return super::platform::vars_platform_pull(&args[1..], project_dir, json_output).await;
+        return super::platform::vars_platform_pull(client, &args[1..], project_dir, json_output)
+            .await;
     }
 
     // Route to OIDC pull if --oidc flag is present
     if args.contains(&"--oidc") {
-        return super::oidc::vars_oidc_pull(&args[1..], project_dir, json_output).await;
+        return super::oidc::vars_oidc_pull(client, &args[1..], project_dir, json_output).await;
     }
 
     let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
@@ -28,20 +30,13 @@ pub(super) async fn vars_pull(
 
     // Org pull: different flow with X25519 decryption
     if let Some(org_slug) = org_flag {
-        let registry_url = lpm_common::resolve_lpm_registry_url();
-        let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
         // Classify the sharing-key state before fetching the
         // wrapped vault. RotationRequired refuses silent
         // overwrite and routes the user to
         // `lpm env rotate-sharing-key`; NeedsInitialSet prompts
         // for step-up reauth and registers the local key.
-        let private_key = super::rotation::ensure_sharing_key_ready_for_org_op(
-            &registry_url,
-            &auth_token,
-            "pull",
-        )
-        .await?;
+        let private_key =
+            super::rotation::ensure_sharing_key_ready_for_org_op(client, "pull").await?;
 
         if !json_output {
             output::info_line(crate::install_ui::terminal_line!(
@@ -50,15 +45,24 @@ pub(super) async fn vars_pull(
             ));
         }
 
-        let pulled = lpm_vault::sync::pull_org(
-            &registry_url,
-            &auth_token,
-            org_slug,
-            &vault_id,
-            &private_key,
+        let pulled = super::auth::execute_sync_with_bearer(
+            client,
+            lpm_auth::AuthRequirement::TokenRequired,
+            |registry_url, auth_token| {
+                let vault_id = vault_id.clone();
+                async move {
+                    lpm_vault::sync::pull_org(
+                        &registry_url,
+                        &auth_token,
+                        org_slug,
+                        &vault_id,
+                        &private_key,
+                    )
+                    .await
+                }
+            },
         )
-        .await
-        .map_err(LpmError::Script)?;
+        .await?;
 
         // Same merge logic as personal pull
         let total_keys;
@@ -141,16 +145,19 @@ pub(super) async fn vars_pull(
         }
     }
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
     if !json_output {
         output::info("pulling vault from cloud...");
     }
 
-    let (raw_json, version) = lpm_vault::sync::pull_raw(&registry_url, &auth_token, &vault_id)
-        .await
-        .map_err(LpmError::Script)?;
+    let (raw_json, version) = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            async move { lpm_vault::sync::pull_raw(&registry_url, &auth_token, &vault_id).await }
+        },
+    )
+    .await?;
 
     let remote_envs = super::sync_payload::parse_remote_pull_payload_for_overwrite(&raw_json)
         .map_err(LpmError::Script)?;

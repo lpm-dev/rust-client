@@ -402,6 +402,240 @@ fn doctor_json_reports_unavailable_vault_storage_when_blob_has_no_key_source() {
 }
 
 #[tokio::test]
+async fn env_log_refreshes_a_rejected_stored_access_token_before_reading_audit_events() {
+    let project = TempProject::empty(r#"{"name":"env-log-refresh","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-log-refresh"}"#);
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("rejected-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/vaults/vault-log-refresh/audit"))
+        .and(header("authorization", "Bearer rejected-access-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    mock.with_refresh_expected(
+        "refresh-token",
+        "refreshed-access-token",
+        "rotated-refresh-token",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/vaults/vault-log-refresh/audit"))
+        .and(header("authorization", "Bearer refreshed-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [],
+            "nextCursor": null,
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "log"])
+        .output()
+        .expect("run env log with a refreshable session");
+
+    assert!(
+        output.status.success(),
+        "env log did not recover the rejected access token:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn env_log_does_not_require_whoami_when_the_env_api_accepts_the_session() {
+    let project = TempProject::empty(r#"{"name":"env-log-no-whoami","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"vault-log-no-whoami"}"#);
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("accepted-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/vaults/vault-log-no-whoami/audit"))
+        .and(header("authorization", "Bearer accepted-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [],
+            "nextCursor": null,
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "log"])
+        .output()
+        .expect("run env log without a whoami route");
+
+    assert!(
+        output.status.success(),
+        "env log incorrectly depended on whoami:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn env_log_binds_the_bearer_to_the_explicit_registry_origin() {
+    let project = TempProject::empty(r#"{"name":"env-log-origin","version":"1.0.0"}"#);
+    let selected = MockRegistry::start().await;
+    let conflicting = MockRegistry::start().await;
+    let selected_url = selected.url();
+    let conflicting_url = conflicting.url();
+    project.write_file("lpm.json", r#"{"vault":"vault-log-origin"}"#);
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &selected_url,
+            access_token: Some("selected-origin-token"),
+            ..Default::default()
+        }],
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/vaults/vault-log-origin/audit"))
+        .and(header("authorization", "Bearer selected-origin-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entries": [],
+            "nextCursor": null,
+        })))
+        .expect(1)
+        .mount(selected.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/vaults/vault-log-origin/audit"))
+        .and(header("authorization", "Bearer selected-origin-token"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(conflicting.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &conflicting_url)
+        .args(["--registry", selected_url.as_str(), "--json", "env", "log"])
+        .output()
+        .expect("run env log with an explicit registry");
+
+    assert!(
+        output.status.success(),
+        "env log did not stay bound to the explicit registry:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn env_unpair_refreshes_after_an_authoritative_unauthorized_response() {
+    let project = TempProject::empty(r#"{"name":"env-unpair-refresh","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("rejected-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_revoke_all_pairings_for_status("rejected-access-token", 401, 1)
+        .await;
+    mock.with_refresh_expected(
+        "refresh-token",
+        "refreshed-access-token",
+        "rotated-refresh-token",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_revoke_all_pairings_for("refreshed-access-token")
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "unpair"])
+        .output()
+        .expect("run env unpair with a rejected access token");
+
+    assert!(
+        output.status.success(),
+        "env unpair did not recover after 401:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn env_unpair_does_not_replay_or_refresh_after_a_server_error() {
+    let project = TempProject::empty(r#"{"name":"env-unpair-503","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("accepted-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    let credentials_before = read_credentials(project.home());
+    mock.with_revoke_all_pairings_for_status("accepted-access-token", 503, 1)
+        .await;
+    mock.with_refresh_expected(
+        "refresh-token",
+        "unused-access-token",
+        "unused-refresh-token",
+        "2030-01-02T00:00:00Z",
+        0,
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args(["--json", "env", "unpair"])
+        .output()
+        .expect("run env unpair while the server is unavailable");
+
+    assert!(
+        !output.status.success() && read_credentials(project.home()) == credentials_before,
+        "env unpair retried an ambiguous mutation or changed credentials:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
 async fn env_pair_uppercases_code_and_approves_browser_pairing() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 

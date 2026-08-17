@@ -1,3 +1,4 @@
+use super::SyncError;
 use super::http::{read_verified_response, sync_http_client_builder, url_path_segment};
 use super::personal::{
     PushMetadata, PushResponse, RemoteVault, format_push_error, list_remote_from_url,
@@ -50,7 +51,7 @@ pub async fn list_org_vaults(
     registry_url: &str,
     auth_token: &str,
     org_slug: &str,
-) -> Result<Vec<RemoteVault>, String> {
+) -> Result<Vec<RemoteVault>, SyncError> {
     let url = format!(
         "{registry_url}/api/orgs/{}/vaults",
         url_path_segment(org_slug)
@@ -67,7 +68,7 @@ pub async fn pull_org(
     org_slug: &str,
     vault_id: &str,
     private_key: &[u8; 32],
-) -> Result<PulledOrgVault, String> {
+) -> Result<PulledOrgVault, SyncError> {
     Ok(
         pull_org_with_content_key(registry_url, auth_token, org_slug, vault_id, private_key)
             .await?
@@ -81,7 +82,7 @@ async fn pull_org_with_content_key(
     org_slug: &str,
     vault_id: &str,
     private_key: &[u8; 32],
-) -> Result<DecryptedOrgVault, String> {
+) -> Result<DecryptedOrgVault, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -102,7 +103,7 @@ async fn pull_org_with_content_key(
     let (status, body) = read_verified_response(response, auth_token).await?;
     if !status.is_success() {
         let message = std::str::from_utf8(&body).unwrap_or("");
-        return Err(format!("server error: {message}"));
+        return Err(SyncError::http(status, format!("server error: {message}")));
     }
 
     #[derive(serde::Deserialize)]
@@ -154,7 +155,7 @@ pub async fn push_org(
     auth_token: &str,
     request: OrgPushRequest<'_>,
     private_key: &[u8; 32],
-) -> Result<PushResponse, String> {
+) -> Result<PushResponse, SyncError> {
     let access = get_org_member_key_access(registry_url, auth_token, request.org_slug).await?;
     if access.can_replace_wrapped_keys {
         return push_org_with_member_access(registry_url, auth_token, request, &access.members)
@@ -176,7 +177,8 @@ pub async fn push_org(
         return Err(format!(
             "organization env version changed from {expected_version} to {}; pull and retry",
             current.pulled.version
-        ));
+        )
+        .into());
     }
     let encrypted_blob = crypto::encrypt(&current.content_key, request.secrets_json.as_bytes())?;
     post_org_update(registry_url, auth_token, request, encrypted_blob, None).await
@@ -191,7 +193,7 @@ pub async fn push_org_with_keys(
     secrets_json: &str,
     expected_version: Option<i32>,
     metadata: Option<&PushMetadata<'_>>,
-) -> Result<PushResponse, String> {
+) -> Result<PushResponse, SyncError> {
     let access = get_org_member_key_access(registry_url, auth_token, org_slug).await?;
     if !access.can_replace_wrapped_keys {
         return Err("only organization owners and admins can replace wrapped content keys".into());
@@ -216,7 +218,7 @@ async fn push_org_with_member_access(
     auth_token: &str,
     request: OrgPushRequest<'_>,
     members: &[MemberPublicKey],
-) -> Result<PushResponse, String> {
+) -> Result<PushResponse, SyncError> {
     let members_with_keys = select_members_with_keys(members)?;
 
     let aes_key = crypto::generate_aes_key();
@@ -240,7 +242,7 @@ async fn post_org_update(
     request: OrgPushRequest<'_>,
     encrypted_blob: String,
     wrapped_keys: Option<Vec<WrappedMemberKey>>,
-) -> Result<PushResponse, String> {
+) -> Result<PushResponse, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -276,12 +278,16 @@ async fn post_org_update(
         .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
+    if !status.is_success() {
+        let message = serde_json::from_slice::<PushResponse>(&body).map_or_else(
+            |_| format!("server error: {status}"),
+            |result| format_push_error(&result, status),
+        );
+        return Err(SyncError::http(status, message));
+    }
+
     let result: PushResponse =
         serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
-
-    if !status.is_success() {
-        return Err(format_push_error(&result, status));
-    }
 
     Ok(result)
 }
@@ -500,7 +506,11 @@ mod tests {
             .await
             .expect_err("stale recipient fingerprint must fail closed");
 
-        assert!(error.contains("different local sharing-key fingerprint"));
+        assert!(
+            error
+                .to_string()
+                .contains("different local sharing-key fingerprint")
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -529,7 +539,7 @@ mod tests {
             .expect_err("invalid content-key epoch must fail closed");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "organization env response contains an invalid key/version binding"
         );
     }

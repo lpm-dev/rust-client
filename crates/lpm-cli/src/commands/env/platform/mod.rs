@@ -955,11 +955,79 @@ async fn read_signed_lpm_response(
 }
 
 fn response_error(status: reqwest::StatusCode, body: &[u8], fallback: &str) -> LpmError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return LpmError::AuthRequired;
+    }
     let message = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value["error"].as_str().map(str::to_owned))
         .unwrap_or_else(|| format!("{fallback} (HTTP {status})"));
     LpmError::Script(message)
+}
+
+async fn fetch_connections_with_recovery(
+    registry_client: &lpm_registry::RegistryClient,
+    vault_id: &str,
+    platform: Option<&str>,
+) -> Result<Vec<PlatformConnection>, LpmError> {
+    let vault_id = vault_id.to_owned();
+    let platform = platform.map(str::to_owned);
+    super::auth::execute_lpm_with_bearer(
+        registry_client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            let platform = platform.clone();
+            async move {
+                fetch_connections(&registry_url, &auth_token, &vault_id, platform.as_deref()).await
+            }
+        },
+    )
+    .await
+}
+
+async fn save_platform_connection(
+    registry_url: &str,
+    auth_token: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, LpmError> {
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
+    let response = client
+        .post(format!("{registry_url}/api/vault/platforms/connect"))
+        .bearer_auth(auth_token)
+        .json(body)
+        .timeout(PLATFORM_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to save connection: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
+    let (status, body) = read_platform_response(response).await?;
+    if !status.is_success() {
+        return Err(response_error(status, &body, "connection failed"));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| LpmError::Script(format!("invalid LPM response: {error}")))
+}
+
+async fn record_platform_audit_with_recovery(
+    registry_client: &lpm_registry::RegistryClient,
+    body: serde_json::Value,
+) -> Result<(), LpmError> {
+    super::auth::execute_lpm_with_bearer(
+        registry_client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let body = body.clone();
+            async move { record_platform_audit(&registry_url, &auth_token, body).await }
+        },
+    )
+    .await
 }
 
 fn vercel_api_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -> LpmError {
@@ -1114,6 +1182,7 @@ fn parse_targets(value: Option<&str>) -> Result<Option<Vec<String>>, LpmError> {
 }
 
 pub(super) async fn vars_connect(
+    registry_client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -1307,35 +1376,25 @@ pub(super) async fn vars_connect(
 
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
-    let client = lpm_http::client_builder()
-        .build()
-        .map_err(|error| LpmError::Network(format!("failed to build LPM client: {error}")))?;
-    let response = client
-        .post(format!("{registry_url}/api/vault/platforms/connect"))
-        .bearer_auth(&auth_token)
-        .json(&serde_json::json!({
-            "vaultId": vault_id,
-            "platform": platform,
-            "token": platform_token,
-            "connectionConfig": config,
-            "label": label,
-        }))
-        .timeout(PLATFORM_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| {
-            LpmError::Network(format!(
-                "failed to save connection: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-    let (status, body) = read_platform_response(response).await?;
-    if !status.is_success() {
-        return Err(response_error(status, &body, "connection failed"));
-    }
-    let result: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|error| LpmError::Script(format!("invalid LPM response: {error}")))?;
+    let connection_body = serde_json::json!({
+        "vaultId": vault_id,
+        "platform": platform,
+        "token": platform_token,
+        "connectionConfig": config,
+        "label": label,
+    });
+    let result =
+        super::auth::execute_lpm_with_bearer(
+            registry_client,
+            lpm_auth::AuthRequirement::TokenRequired,
+            |registry_url, auth_token| {
+                let connection_body = connection_body.clone();
+                async move {
+                    save_platform_connection(&registry_url, &auth_token, &connection_body).await
+                }
+            },
+        )
+        .await?;
     if json_output {
         super::response::print_json_value(&super::response::success_envelope(result));
     } else {
@@ -1351,6 +1410,7 @@ pub(super) async fn vars_connect(
 }
 
 pub(super) async fn vars_platform_push(
+    registry_client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -1368,9 +1428,8 @@ pub(super) async fn vars_platform_push(
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
         LpmError::Script("no env project configured. Run `lpm env set` first".into())
     })?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
     let mut connections =
-        fetch_connections(&registry_url, &auth_token, &vault_id, Some(platform)).await?;
+        fetch_connections_with_recovery(registry_client, &vault_id, Some(platform)).await?;
     let connection = connections
         .pop()
         .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
@@ -1518,9 +1577,8 @@ pub(super) async fn vars_platform_push(
         Ok(result) => result,
         Err(error) => {
             if let PlatformApplyError::Tracked { applied, .. } = &error {
-                let _ = record_platform_audit(
-                    &registry_url,
-                    &auth_token,
+                let _ = record_platform_audit_with_recovery(
+                    registry_client,
                     serde_json::json!({
                         "vaultId": vault_id,
                         "platform": platform,
@@ -1536,9 +1594,8 @@ pub(super) async fn vars_platform_push(
             return Err(error.into_error());
         }
     };
-    let audit = record_platform_audit(
-        &registry_url,
-        &auth_token,
+    let audit = record_platform_audit_with_recovery(
+        registry_client,
         serde_json::json!({
             "vaultId": vault_id,
             "platform": platform,
@@ -1577,14 +1634,14 @@ pub(super) async fn vars_platform_push(
 }
 
 pub(super) async fn vars_platform_status(
+    registry_client: &lpm_registry::RegistryClient,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
         LpmError::Script("no env project configured. Run `lpm env set` first".into())
     })?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
-    let connections = fetch_connections(&registry_url, &auth_token, &vault_id, None).await?;
+    let connections = fetch_connections_with_recovery(registry_client, &vault_id, None).await?;
     if connections.is_empty() {
         if json_output {
             super::response::print_json_value(&serde_json::json!({
@@ -1753,6 +1810,7 @@ pub(super) async fn vars_platform_status(
 }
 
 pub(super) async fn vars_platform_pull(
+    registry_client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -1768,9 +1826,8 @@ pub(super) async fn vars_platform_pull(
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
     let mut connections =
-        fetch_connections(&registry_url, &auth_token, &vault_id, Some(platform)).await?;
+        fetch_connections_with_recovery(registry_client, &vault_id, Some(platform)).await?;
     let connection = connections
         .pop()
         .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
@@ -1852,9 +1909,8 @@ pub(super) async fn vars_platform_pull(
     } else {
         lpm_vault::set_env(project_dir, env_name, &pairs).map_err(LpmError::Script)?;
     }
-    let audit = record_platform_audit(
-        &registry_url,
-        &auth_token,
+    let audit = record_platform_audit_with_recovery(
+        registry_client,
         serde_json::json!({
             "vaultId": vault_id,
             "platform": platform,

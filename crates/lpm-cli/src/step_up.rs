@@ -19,6 +19,8 @@
 use lpm_vault::sync::{CliStepUpCredential, discover_cli_step_up_policy, mint_cli_step_up_proof};
 use std::io::IsTerminal;
 
+use lpm_common::LpmError;
+
 use crate::output;
 
 /// Acquire a step-up proof for `scope`, prompting the user
@@ -28,21 +30,27 @@ use crate::output;
 /// `X-LPM-Step-Up-Proof` header on the subsequent sensitive write
 /// (e.g. `lpm_vault::sync::upload_public_key(..., Some(&proof))`).
 pub async fn request_cli_step_up_proof(
-    registry_url: &str,
-    auth_token: &str,
+    client: &lpm_registry::RegistryClient,
     scope: &str,
-) -> Result<String, String> {
+) -> Result<String, LpmError> {
     // Refuse non-interactive callers up-front. Prompting for a password
     // without a TTY would either block on stdin forever or silently
     // accept whatever's piped in — both are worse than a clear refusal.
     if !std::io::stdin().is_terminal() {
-        return Err(format!(
+        return Err(LpmError::Script(format!(
             "step-up reauth is required for `{scope}` but stdin is not a TTY. \
              Run this command from an interactive terminal."
-        ));
+        )));
     }
 
-    let policy = discover_cli_step_up_policy(registry_url, auth_token).await?;
+    let policy = crate::commands::env::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| async move {
+            discover_cli_step_up_policy(&registry_url, &auth_token).await
+        },
+    )
+    .await?;
 
     match policy.method.as_str() {
         "password" => {
@@ -52,14 +60,24 @@ pub async fn request_cli_step_up_proof(
             );
             let password: String = cliclack::password("Password")
                 .interact()
-                .map_err(|e| format!("password prompt failed: {e}"))?;
+                .map_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
 
-            mint_cli_step_up_proof(
-                registry_url,
-                auth_token,
-                scope,
-                &CliStepUpCredential::Password {
-                    password: &password,
+            crate::commands::env::auth::execute_sync_with_bearer(
+                client,
+                lpm_auth::AuthRequirement::TokenRequired,
+                |registry_url, auth_token| {
+                    let password = password.clone();
+                    async move {
+                        mint_cli_step_up_proof(
+                            &registry_url,
+                            &auth_token,
+                            scope,
+                            &CliStepUpCredential::Password {
+                                password: &password,
+                            },
+                        )
+                        .await
+                    }
                 },
             )
             .await
@@ -77,7 +95,7 @@ pub async fn request_cli_step_up_proof(
             );
             let password: String = cliclack::password("Password")
                 .interact()
-                .map_err(|e| format!("password prompt failed: {e}"))?;
+                .map_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
             let code: String = cliclack::input("Authenticator code (6 digits)")
                 .validate(|input: &String| {
                     if input.chars().all(|c| c.is_ascii_digit()) && input.len() == 6 {
@@ -87,30 +105,41 @@ pub async fn request_cli_step_up_proof(
                     }
                 })
                 .interact()
-                .map_err(|e| format!("totp prompt failed: {e}"))?;
+                .map_err(|e| LpmError::Script(format!("totp prompt failed: {e}")))?;
 
-            mint_cli_step_up_proof(
-                registry_url,
-                auth_token,
-                scope,
-                &CliStepUpCredential::Totp {
-                    password: &password,
-                    code: &code,
+            crate::commands::env::auth::execute_sync_with_bearer(
+                client,
+                lpm_auth::AuthRequirement::TokenRequired,
+                |registry_url, auth_token| {
+                    let password = password.clone();
+                    let code = code.clone();
+                    async move {
+                        mint_cli_step_up_proof(
+                            &registry_url,
+                            &auth_token,
+                            scope,
+                            &CliStepUpCredential::Totp {
+                                password: &password,
+                                code: &code,
+                            },
+                        )
+                        .await
+                    }
                 },
             )
             .await
         }
         "unavailable" => {
             let reason = policy.reason.as_deref().unwrap_or("unknown");
-            Err(format!(
+            Err(LpmError::Script(format!(
                 "step-up reauth is unavailable for this account: {reason}. \
                  Set an account password or enroll an authenticator in the dashboard \
                  (Settings → Security) and retry."
-            ))
+            )))
         }
-        other => Err(format!(
+        other => Err(LpmError::Script(format!(
             "server returned unknown step-up method `{other}` — your CLI may be too old; \
              try upgrading with `lpm upgrade`"
-        )),
+        ))),
     }
 }

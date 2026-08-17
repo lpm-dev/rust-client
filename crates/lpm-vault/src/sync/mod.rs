@@ -19,6 +19,43 @@ mod personal;
 mod public_key;
 mod step_up;
 
+/// Error returned by authenticated env API operations.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    /// The server returned a non-success HTTP response.
+    #[error("{message}")]
+    Http { status: u16, message: String },
+    /// Request construction, transport, parsing, or local processing failed.
+    #[error("{0}")]
+    Other(String),
+}
+
+impl SyncError {
+    /// Return whether the server rejected the bearer credential.
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Http { status: 401, .. })
+    }
+
+    pub(crate) fn http(status: reqwest::StatusCode, message: String) -> Self {
+        Self::Http {
+            status: status.as_u16(),
+            message,
+        }
+    }
+}
+
+impl From<String> for SyncError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<&str> for SyncError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.to_owned())
+    }
+}
+
 pub use audit::{AuditEntry, AuditResponse, get_audit_log};
 pub use ci::{CiPullResponse, ci_pull, upload_escrow_key};
 pub use org::{

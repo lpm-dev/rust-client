@@ -1,12 +1,13 @@
 use super::prelude::*;
 
 pub(super) async fn env_rotate_key(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     if let Some(org_slug) = parse_rotate_key_org(args)? {
-        return env_rotate_org_key(&org_slug, project_dir, json_output).await;
+        return env_rotate_org_key(client, &org_slug, project_dir, json_output).await;
     }
 
     lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
@@ -14,30 +15,44 @@ pub(super) async fn env_rotate_key(
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
-    let (raw_json, current_version) =
-        lpm_vault::sync::pull_raw_for_rotation(&registry_url, &auth_token, &vault_id)
-            .await
-            .map_err(LpmError::Script)?;
+    let (raw_json, current_version) = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            async move {
+                lpm_vault::sync::pull_raw_for_rotation(&registry_url, &auth_token, &vault_id).await
+            }
+        },
+    )
+    .await?;
     let environment_names = validate_rotation_payload(&raw_json).map_err(LpmError::Script)?;
 
     if !json_output {
         output::info("rotating vault encryption key...");
     }
 
-    let result = lpm_vault::sync::push_raw(
-        &registry_url,
-        &auth_token,
-        &vault_id,
-        &raw_json,
-        Some(current_version),
-        false,
-        None,
+    let result = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            let raw_json = raw_json.clone();
+            async move {
+                lpm_vault::sync::push_raw(
+                    &registry_url,
+                    &auth_token,
+                    &vault_id,
+                    &raw_json,
+                    Some(current_version),
+                    false,
+                    None,
+                )
+                .await
+            }
+        },
     )
-    .await
-    .map_err(LpmError::Script)?;
+    .await?;
 
     let version = result
         .version
@@ -95,6 +110,7 @@ fn parse_rotate_key_org(args: &[&str]) -> Result<Option<String>, LpmError> {
 }
 
 async fn env_rotate_org_key(
+    client: &lpm_registry::RegistryClient,
     org_slug: &str,
     project_dir: &std::path::Path,
     json_output: bool,
@@ -103,23 +119,26 @@ async fn env_rotate_org_key(
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-    let private_key = ensure_sharing_key_ready_for_org_op(
-        &registry_url,
-        &auth_token,
-        "rotate the organization content key",
+    let private_key =
+        ensure_sharing_key_ready_for_org_op(client, "rotate the organization content key").await?;
+    let pulled = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            async move {
+                lpm_vault::sync::pull_org(
+                    &registry_url,
+                    &auth_token,
+                    org_slug,
+                    &vault_id,
+                    &private_key,
+                )
+                .await
+            }
+        },
     )
     .await?;
-    let pulled = lpm_vault::sync::pull_org(
-        &registry_url,
-        &auth_token,
-        org_slug,
-        &vault_id,
-        &private_key,
-    )
-    .await
-    .map_err(LpmError::Script)?;
     let environment_names =
         validate_rotation_payload(&pulled.raw_json).map_err(LpmError::Script)?;
     let expected_content_key_version =
@@ -131,17 +150,27 @@ async fn env_rotate_org_key(
         output::info("rotating organization env encryption key...");
     }
 
-    let result = lpm_vault::sync::push_org_with_keys(
-        &registry_url,
-        &auth_token,
-        org_slug,
-        &vault_id,
-        &pulled.raw_json,
-        Some(pulled.version),
-        None,
+    let result = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            let raw_json = pulled.raw_json.clone();
+            async move {
+                lpm_vault::sync::push_org_with_keys(
+                    &registry_url,
+                    &auth_token,
+                    org_slug,
+                    &vault_id,
+                    &raw_json,
+                    Some(pulled.version),
+                    None,
+                )
+                .await
+            }
+        },
     )
-    .await
-    .map_err(LpmError::Script)?;
+    .await?;
     let version = result
         .version
         .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
@@ -241,14 +270,18 @@ fn validate_rotation_payload(raw_json: &str) -> Result<Vec<String>, String> {
 ///     silently overwrite here; the server gate relies on the client
 ///     side to hold this contract.
 pub(super) async fn ensure_sharing_key_ready_for_org_op(
-    registry_url: &str,
-    auth_token: &str,
+    client: &lpm_registry::RegistryClient,
     op_label: &str,
 ) -> Result<[u8; 32], LpmError> {
     use lpm_vault::sync::PublicKeyRegistrationState;
-    let state = lpm_vault::sync::classify_public_key_state(registry_url, auth_token)
-        .await
-        .map_err(LpmError::Script)?;
+    let state = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| async move {
+            lpm_vault::sync::classify_public_key_state(&registry_url, &auth_token).await
+        },
+    )
+    .await?;
 
     match state {
         PublicKeyRegistrationState::Matches(local) => Ok(local.private_key),
@@ -258,21 +291,26 @@ pub(super) async fn ensure_sharing_key_ready_for_org_op(
                  before continuing with `{op_label}`. You'll be prompted to confirm your \
                  password (and authenticator code, if enrolled) to authorize the write."
             ));
-            let proof = crate::step_up::request_cli_step_up_proof(
-                registry_url,
-                auth_token,
-                "vault:public-key:set",
+            let proof =
+                crate::step_up::request_cli_step_up_proof(client, "vault:public-key:set").await?;
+            super::auth::execute_sync_with_bearer(
+                client,
+                lpm_auth::AuthRequirement::TokenRequired,
+                |registry_url, auth_token| {
+                    let public_key = local.public_key_b64.clone();
+                    let proof = proof.clone();
+                    async move {
+                        lpm_vault::sync::upload_public_key(
+                            &registry_url,
+                            &auth_token,
+                            &public_key,
+                            Some(&proof),
+                        )
+                        .await
+                    }
+                },
             )
-            .await
-            .map_err(LpmError::Script)?;
-            lpm_vault::sync::upload_public_key(
-                registry_url,
-                auth_token,
-                &local.public_key_b64,
-                Some(&proof),
-            )
-            .await
-            .map_err(LpmError::Script)?;
+            .await?;
             Ok(local.private_key)
         }
         PublicKeyRegistrationState::RotationRequired { .. } => Err(LpmError::Script(format!(
@@ -291,6 +329,7 @@ pub(super) async fn ensure_sharing_key_ready_for_org_op(
 /// Rotate the user's X25519 sharing keypair, with crash recovery and
 /// explicit reauth before the server-side public key is replaced.
 pub(super) async fn env_rotate_sharing_key(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     json_output: bool,
 ) -> Result<(), LpmError> {
@@ -309,18 +348,20 @@ pub(super) async fn env_rotate_sharing_key(
         ));
     }
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
     // Crash recovery — if a pending key exists and matches the server,
     // the previous run committed the server side but didn't promote
     // locally. Promote and return; no second rotation needed.
     if let Some(pending) =
         lpm_vault::sync::read_pending_x25519_keypair().map_err(LpmError::Script)?
     {
-        let server_key = lpm_vault::sync::get_my_public_key(&registry_url, &auth_token)
-            .await
-            .map_err(LpmError::Script)?;
+        let server_key = super::auth::execute_sync_with_bearer(
+            client,
+            lpm_auth::AuthRequirement::TokenRequired,
+            |registry_url, auth_token| async move {
+                lpm_vault::sync::get_my_public_key(&registry_url, &auth_token).await
+            },
+        )
+        .await?;
         if server_key.as_deref() == Some(&pending.public_key_b64) {
             lpm_vault::sync::promote_pending_x25519_keypair().map_err(LpmError::Script)?;
             if json_output {
@@ -379,22 +420,28 @@ pub(super) async fn env_rotate_sharing_key(
     // Acquire the step-up proof BEFORE generating the pending
     // key — a credential refusal must not leave a stale pending file
     // on disk.
-    let proof = crate::step_up::request_cli_step_up_proof(
-        &registry_url,
-        &auth_token,
-        "vault:public-key:rotate",
-    )
-    .await
-    .map_err(LpmError::Script)?;
+    let proof =
+        crate::step_up::request_cli_step_up_proof(client, "vault:public-key:rotate").await?;
 
     let pending = lpm_vault::sync::create_pending_x25519_keypair().map_err(LpmError::Script)?;
 
     output::info("uploading new sharing key...");
-    let response = lpm_vault::sync::upload_public_key(
-        &registry_url,
-        &auth_token,
-        &pending.public_key_b64,
-        Some(&proof),
+    let response = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let public_key = pending.public_key_b64.clone();
+            let proof = proof.clone();
+            async move {
+                lpm_vault::sync::upload_public_key(
+                    &registry_url,
+                    &auth_token,
+                    &public_key,
+                    Some(&proof),
+                )
+                .await
+            }
+        },
     )
     .await;
 
@@ -404,7 +451,7 @@ pub(super) async fn env_rotate_sharing_key(
             // Server-side write failed — discard the pending so the
             // next attempt starts from a clean slate.
             let _ = lpm_vault::sync::discard_pending_x25519_keypair();
-            return Err(LpmError::Script(e));
+            return Err(LpmError::Script(e.to_string()));
         }
     };
 
