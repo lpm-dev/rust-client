@@ -436,6 +436,27 @@ pub fn clear_login_state(registry_url: &str) -> Result<(), String> {
     result
 }
 
+/// Clear a server-rejected legacy session only if its access credential is
+/// still current and no refresh credential has appeared in the meantime.
+pub fn clear_rejected_legacy_session_if_current(
+    registry_url: &str,
+    rejected_access_token: &str,
+) -> Result<bool, String> {
+    let lock_path = session_lock_path(registry_url)?;
+    lpm_common::paths::with_exclusive_lock(lock_path, || {
+        let access_is_current =
+            get_stored_access_token(registry_url).as_deref() == Some(rejected_access_token);
+        let refresh_is_present = get_refresh_token(registry_url).is_some();
+        if !access_is_current || refresh_is_present {
+            return Ok(false);
+        }
+
+        clear_login_state(registry_url).map_err(lpm_common::LpmError::Registry)?;
+        Ok(true)
+    })
+    .map_err(|error| error.to_string())
+}
+
 // ─── npm Token ─────────────────────────────────────────────────────
 
 /// npm registry URL used for keychain scoping.

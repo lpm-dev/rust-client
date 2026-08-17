@@ -28,8 +28,7 @@ pub async fn run_rotate(
     otp: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    require_locally_managed_auth(client)?;
-    let had_refresh_token = crate::auth::has_refresh_token(registry_url);
+    let rejected_access_token = locally_managed_bearer(client)?;
     let otp = otp.map(OtpCode::parse).transpose()?;
 
     if !json_output {
@@ -51,9 +50,7 @@ pub async fn run_rotate(
             rotate_once(client, &url, Some(&prompted_otp)).await?
         }
         Err(LpmError::AuthRequired) => {
-            if !had_refresh_token {
-                clear_rejected_local_session(registry_url)?;
-            }
+            clear_rejected_local_session_if_current(registry_url, &rejected_access_token)?;
             return Err(LpmError::AuthRequired);
         }
         result => result?,
@@ -114,13 +111,11 @@ pub async fn run_rotate(
     Ok(())
 }
 
-fn require_locally_managed_auth(client: &RegistryClient) -> Result<(), LpmError> {
-    let source = client
-        .session()
-        .and_then(|session| session.current_source())
-        .ok_or(LpmError::AuthRequired)?;
+fn locally_managed_bearer(client: &RegistryClient) -> Result<String, LpmError> {
+    let session = client.session().ok_or(LpmError::AuthRequired)?;
+    let source = session.current_source().ok_or(LpmError::AuthRequired)?;
     if source.is_locally_managed() {
-        return Ok(());
+        return session.current_bearer_lazy().ok_or(LpmError::AuthRequired);
     }
 
     Err(LpmError::UnsupportedAuthSource {
@@ -129,8 +124,12 @@ fn require_locally_managed_auth(client: &RegistryClient) -> Result<(), LpmError>
     })
 }
 
-fn clear_rejected_local_session(registry_url: &str) -> Result<(), LpmError> {
-    crate::auth::clear_login_state(registry_url)
+fn clear_rejected_local_session_if_current(
+    registry_url: &str,
+    rejected_access_token: &str,
+) -> Result<(), LpmError> {
+    crate::auth::clear_rejected_legacy_session_if_current(registry_url, rejected_access_token)
+        .map(|_| ())
         .map_err(|error| LpmError::Registry(format!("failed to clear rejected token: {error}")))
 }
 
