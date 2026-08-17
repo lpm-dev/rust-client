@@ -3531,6 +3531,7 @@ version = "0.74.1"
 dependencies = [
  "reqwest",
  "syn 2.0.117",
+ "tokio",
 ]
 
 [[package]]

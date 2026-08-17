@@ -57,6 +57,8 @@ const GITHUB_RELEASE_DOWNLOAD_URL_DEFAULT: &str =
     "https://github.com/lpm-dev/rust-client/releases/download/v{tag}/{file}";
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RELEASE_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const RELEASE_ERROR_BODY_MAX_BYTES: usize = 16 * 1024;
 
 /// Resolve the npm registry endpoint. Honours
 /// `LPM_NPM_REGISTRY_URL_OVERRIDE` so tests (and users behind a private
@@ -529,6 +531,25 @@ fn github_token_for_url(url: &str) -> Option<String> {
     github_token()
 }
 
+async fn parse_release_json(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<serde_json::Value, LookupError> {
+    let body = lpm_http::read_body_capped(response, RELEASE_RESPONSE_MAX_BYTES)
+        .await
+        .map_err(|error| LookupError::MalformedResponse(format!("{context} {error}")))?;
+    serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body))
+        .map_err(|error| LookupError::MalformedResponse(format!("{context} not JSON: {error}")))
+}
+
+async fn release_error_excerpt(response: reqwest::Response) -> String {
+    lpm_http::read_body_capped(response, RELEASE_ERROR_BODY_MAX_BYTES)
+        .await
+        .ok()
+        .map(|body| String::from_utf8_lossy(&body).chars().take(200).collect())
+        .unwrap_or_default()
+}
+
 /// Which release source we're probing. Drives both the etag slot in
 /// the cache and the version-extraction shape of the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -751,9 +772,7 @@ async fn probe_one(
     }
 
     if !status.is_success() {
-        // Best-effort body excerpt for diagnostics; ignore body errors.
-        let body = resp.text().await.unwrap_or_default();
-        let excerpt: String = body.chars().take(200).collect();
+        let excerpt = release_error_excerpt(resp).await;
         cache.set_last_failure_check_for(channel, now);
         return Err(LookupError::HttpStatus {
             status: status.as_u16(),
@@ -769,13 +788,11 @@ async fn probe_one(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let body: serde_json::Value = match resp.json().await {
+    let body = match parse_release_json(resp, "release response body").await {
         Ok(v) => v,
-        Err(e) => {
+        Err(error) => {
             cache.set_last_failure_check_for(channel, now);
-            return Err(LookupError::MalformedResponse(format!(
-                "body not JSON: {e}"
-            )));
+            return Err(error);
         }
     };
 
@@ -887,17 +904,14 @@ pub async fn fetch_github_release_published_at(
     }
 
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        let excerpt: String = body.chars().take(200).collect();
+        let excerpt = release_error_excerpt(resp).await;
         return Err(LookupError::HttpStatus {
             status: status.as_u16(),
             body_excerpt: excerpt,
         });
     }
 
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        LookupError::MalformedResponse(format!("release-by-tag body not JSON: {e}"))
-    })?;
+    let body = parse_release_json(resp, "release-by-tag body").await?;
 
     let published_at_str = body
         .get("published_at")
@@ -2038,6 +2052,33 @@ mod tests {
                 .await
                 .expect("must parse");
             assert_eq!(parsed.to_rfc3339(), "2026-05-10T12:34:56+00:00");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_published_at_rejects_oversized_body() {
+        const RESPONSE_CAP: usize = 4 * 1024 * 1024;
+        let server = wiremock::MockServer::start().await;
+        let mut body = String::with_capacity(RESPONSE_CAP + 128);
+        body.push_str(r#"{"published_at":"2026-05-10T12:34:56Z","padding":""#);
+        body.extend(std::iter::repeat_n('x', RESPONSE_CAP));
+        body.push_str(r#""}"#);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(body.into_bytes(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let template = format!("{}/releases/tags/v{{tag}}", server.uri());
+        with_release_by_tag_override(&template, async {
+            let error = fetch_github_release_published_at("0.42.0")
+                .await
+                .expect_err("oversized release response must be rejected");
+            assert!(error.to_string().contains("exceeds cap"));
         })
         .await;
     }
