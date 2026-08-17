@@ -264,8 +264,11 @@ pub async fn run(
         "{}/api/registry/-/token/replace-project",
         registry_url.trim_end_matches('/')
     );
-    let response = match client.post_json_raw_status(&url, &body).await {
+    let response = match client.post_json_raw_status_with_recovery(&url, &body).await {
         Ok(response) => response,
+        Err(error @ (LpmError::AuthRequired | LpmError::SessionExpired)) => {
+            return Err(rollback_files(error, rollback));
+        }
         Err(error) => {
             return Err(pending_recovery_error(format!(
                 "the setup-token replacement response was not received: {error}"

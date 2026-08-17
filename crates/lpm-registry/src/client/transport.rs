@@ -25,25 +25,54 @@ impl RegistryClient {
         self.send_with_retry(req).await
     }
 
-    /// POST JSON with auth and an optional MFA code.
+    /// POST JSON with auth and an optional MFA code, refreshing once when a
+    /// plain bearer rejection is safe to retry.
     ///
-    /// A 401 response is returned to the caller so it can distinguish an OTP
-    /// challenge from an invalid bearer. Other status and retry behavior is
-    /// identical to [`Self::post_json_raw`].
-    pub async fn post_json_raw_with_otp(
+    /// Valid OTP challenges remain command errors and never trigger refresh.
+    pub async fn post_json_with_otp_recovery(
         &self,
         url: &str,
         body: &serde_json::Value,
         otp: Option<&str>,
-    ) -> Result<reqwest::Response, LpmError> {
-        let mut req = self.http.for_url(url).await?.post(url).json(body);
-        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
-            req = req.bearer_auth(bearer);
-        }
-        if let Some(otp) = otp {
-            req = req.header("x-otp", otp);
-        }
-        self.send_with_retry_preserving_unauthorized(req).await
+        command: &'static str,
+        operation: &'static str,
+    ) -> Result<serde_json::Value, LpmError> {
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let mut request = self.http.for_url(url).await?.post(url).json(body);
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
+                request = request.bearer_auth(bearer);
+            }
+            if let Some(otp) = otp {
+                request = request.header("x-otp", otp);
+            }
+            let response = self.send_once_preserving_status(request).await?;
+            let status = response.status();
+            let parsed = parse_capped_api_json::<serde_json::Value>(
+                response,
+                &format!("{operation} response"),
+            )
+            .await;
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                if let Ok(body) = &parsed {
+                    match body.get("code").and_then(serde_json::Value::as_str) {
+                        Some("OTP_REQUIRED") => return Err(LpmError::OtpRequired { command }),
+                        Some("OTP_INVALID") => return Err(LpmError::OtpInvalid { command }),
+                        _ => {}
+                    }
+                }
+                return Err(LpmError::AuthRequired);
+            }
+            let parsed = parsed?;
+            if !status.is_success() {
+                let error = parsed
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown error");
+                return Err(LpmError::Registry(format!("{operation} failed: {error}")));
+            }
+            Ok(parsed)
+        })
+        .await
     }
 
     /// POST JSON once and preserve every HTTP status for the caller.
@@ -57,11 +86,18 @@ impl RegistryClient {
         url: &str,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
-        self.validate_base_url()?;
         let mut request = self.http.for_url(url).await?.post(url).json(body);
         if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             request = request.bearer_auth(bearer);
         }
+        self.send_once_preserving_status(request).await
+    }
+
+    async fn send_once_preserving_status(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.validate_base_url()?;
         let request = request
             .build()
             .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
@@ -71,6 +107,23 @@ impl RegistryClient {
             .execute(request)
             .await
             .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+    }
+
+    /// POST JSON once, refresh on a bearer 401, then retry the operation once.
+    /// Every non-401 HTTP status remains available to the caller.
+    pub async fn post_json_raw_status_with_recovery(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let response = self.post_json_raw_status(url, body).await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(LpmError::AuthRequired);
+            }
+            Ok(response)
+        })
+        .await
     }
 
     /// Build a GET request with auth headers (defaults to `AuthRequired`
@@ -426,31 +479,10 @@ impl RegistryClient {
         self.send_request_with_retry(request, None).await
     }
 
-    async fn send_with_retry_preserving_unauthorized(
-        &self,
-        request_builder: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, LpmError> {
-        self.validate_base_url()?;
-        let request = request_builder
-            .build()
-            .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
-        self.send_request_with_retry_mode(request, None, true).await
-    }
-
     pub(super) async fn send_request_with_retry(
         &self,
         request: reqwest::Request,
         client_override: Option<reqwest::Client>,
-    ) -> Result<reqwest::Response, LpmError> {
-        self.send_request_with_retry_mode(request, client_override, false)
-            .await
-    }
-
-    async fn send_request_with_retry_mode(
-        &self,
-        request: reqwest::Request,
-        client_override: Option<reqwest::Client>,
-        preserve_unauthorized: bool,
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
 
@@ -473,7 +505,6 @@ impl RegistryClient {
                         200..=299 | 304 => return Ok(response),
 
                         // Non-retryable errors — fail immediately
-                        401 if preserve_unauthorized => return Ok(response),
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
                             let body = read_capped_error_text(response).await;
