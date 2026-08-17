@@ -1,5 +1,4 @@
 use crate::install_ui;
-use lpm_auth::TokenSource;
 use lpm_common::LpmError;
 use lpm_registry::{RegistryClient, parse_capped_api_json};
 use secrecy::{ExposeSecret, SecretString};
@@ -29,7 +28,8 @@ pub async fn run_rotate(
     otp: Option<String>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let auth_source = require_locally_managed_auth(client)?;
+    require_locally_managed_auth(client)?;
+    let had_refresh_token = crate::auth::has_refresh_token(registry_url);
     let otp = otp.map(OtpCode::parse).transpose()?;
 
     if !json_output {
@@ -51,7 +51,9 @@ pub async fn run_rotate(
             rotate_once(client, &url, Some(&prompted_otp)).await?
         }
         Err(LpmError::AuthRequired) => {
-            clear_rejected_legacy_token(registry_url, auth_source)?;
+            if !had_refresh_token {
+                clear_rejected_local_session(registry_url)?;
+            }
             return Err(LpmError::AuthRequired);
         }
         result => result?,
@@ -112,13 +114,13 @@ pub async fn run_rotate(
     Ok(())
 }
 
-fn require_locally_managed_auth(client: &RegistryClient) -> Result<TokenSource, LpmError> {
+fn require_locally_managed_auth(client: &RegistryClient) -> Result<(), LpmError> {
     let source = client
         .session()
         .and_then(|session| session.current_source())
         .ok_or(LpmError::AuthRequired)?;
     if source.is_locally_managed() {
-        return Ok(source);
+        return Ok(());
     }
 
     Err(LpmError::UnsupportedAuthSource {
@@ -127,14 +129,7 @@ fn require_locally_managed_auth(client: &RegistryClient) -> Result<TokenSource, 
     })
 }
 
-fn clear_rejected_legacy_token(
-    registry_url: &str,
-    auth_source: TokenSource,
-) -> Result<(), LpmError> {
-    if auth_source != TokenSource::StoredLegacy {
-        return Ok(());
-    }
-
+fn clear_rejected_local_session(registry_url: &str) -> Result<(), LpmError> {
     crate::auth::clear_login_state(registry_url)
         .map_err(|error| LpmError::Registry(format!("failed to clear rejected token: {error}")))
 }
