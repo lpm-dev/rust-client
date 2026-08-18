@@ -1462,10 +1462,12 @@ pub fn should_refresh_session_access_token(registry: &str) -> bool {
 /// Returns true if the local session-expiry metadata exists but cannot be read
 /// as a complete metadata map. Missing metadata is not corruption.
 pub fn session_metadata_corrupted() -> bool {
-    let Some(path) = token_expiry_path() else {
-        return false;
-    };
-    read_token_expiries_checked_from(&path).is_err()
+    session_metadata_corruption_error().is_some()
+}
+
+fn session_metadata_corruption_error() -> Option<String> {
+    let path = token_expiry_path()?;
+    read_token_expiries_checked_from(&path).err()
 }
 
 /// Remove a token expiry reminder (called on logout).

@@ -677,6 +677,12 @@ impl SessionManager {
             LpmError::CredentialStorage(format!("failed to resolve session lock: {error}"))
         })?;
         let secret = lpm_common::paths::with_exclusive_lock_async(lock_path, async {
+            if let Some(error) = crate::session_metadata_corruption_error() {
+                return Err(LpmError::CredentialStorage(format!(
+                    "cannot refresh while session metadata is corrupt: {error}"
+                )));
+            }
+
             let current_refresh = self.load_refresh_token()?;
             let current_access = self.load_access_token()?;
 
