@@ -368,6 +368,76 @@ async fn login_uses_refresh_session_before_starting_browser_flow() {
 }
 
 #[tokio::test]
+async fn login_starts_browser_flow_when_only_access_credential_is_valid() {
+    let project =
+        TempProject::empty(r#"{"name":"login-access-only-upgrade-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    mock.with_authenticated_whoami("valid-access", "testuser", "test@example.com")
+        .await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("valid-access"),
+            refresh_token: None,
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let mut command = lpm_spawnable(&project);
+    command
+        .args(["--registry", &mock.url(), "--insecure", "login", "--json"])
+        .env("BROWSER", "false");
+    let mut child = command.spawn().expect("failed to spawn lpm login");
+    let browser_flow_marker = project.home().join(".lpm/device-id");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("failed to poll lpm login") {
+            let output = child
+                .wait_with_output()
+                .expect("failed to collect early login output");
+            panic!(
+                "access-only login exited instead of starting a refresh-backed browser session ({status}):\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        if browser_flow_marker.exists() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("stop login after preflight timeout");
+            let output = child
+                .wait_with_output()
+                .expect("collect timed-out login output");
+            panic!(
+                "login did not start its refresh-backed browser flow:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        child.try_wait().expect("poll browser login").is_none(),
+        "login must wait for a browser exchange when no refresh credential exists"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("read preflight requests")
+            .is_empty(),
+        "an access-only credential must not be accepted as a durable login session"
+    );
+    child.kill().expect("stop browser login after assertion");
+    child.wait().expect("reap browser login process");
+}
+
+#[tokio::test]
 async fn login_reports_a_transient_preflight_failure_without_starting_browser_authentication() {
     let project = TempProject::empty(r#"{"name":"login-transient-preflight","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -385,8 +455,8 @@ async fn login_reports_a_transient_preflight_failure_without_starting_browser_au
         &[SessionSeed {
             registry_url: &mock.url(),
             access_token: Some("valid-access"),
+            refresh_token: Some("valid-refresh"),
             session_access_expires_at: Some("2099-01-01T00:00:00Z"),
-            ..Default::default()
         }],
     );
 
