@@ -256,6 +256,44 @@ async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
 }
 
 #[tokio::test]
+async fn logout_revoke_reports_when_stored_session_presence_cannot_be_determined() {
+    let project = TempProject::empty(r#"{"name":"logout-presence-failure","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    std::fs::create_dir_all(credentials_path(project.home()))
+        .expect("create unreadable credential store shape");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--revoke"])
+        .output()
+        .expect("run logout --revoke with unreadable session presence");
+
+    assert!(
+        !output.status.success(),
+        "logout must fail when stored session presence is unknown"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert!(
+        json["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error
+                    .as_str()
+                    .is_some_and(|message| message.contains("stored session presence"))
+            })),
+        "logout must report why remote revocation could not be selected: {json}"
+    );
+    assert_eq!(json["pairings_revoked"], false);
+    assert_eq!(json["server_revoked"], false);
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "logout must not guess which credential to revoke when presence is unknown"
+    );
+}
+
+#[tokio::test]
 async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
