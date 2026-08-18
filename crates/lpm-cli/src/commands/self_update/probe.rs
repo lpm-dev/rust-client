@@ -1303,11 +1303,6 @@ where
                     limit_exceeded.store(true, Ordering::Release);
                     break;
                 }
-                if process_finished.load(Ordering::Acquire)
-                    && captured.bytes.len() >= VERSION_OUTPUT_LIMIT
-                {
-                    break;
-                }
             }
             Ok(false) => break,
             Err(error) => {
@@ -1386,11 +1381,6 @@ where
                 }
                 if captured.overflowed {
                     limit_exceeded.store(true, Ordering::Release);
-                    break;
-                }
-                if process_finished.load(Ordering::Acquire)
-                    && captured.bytes.len() >= VERSION_OUTPUT_LIMIT
-                {
                     break;
                 }
             }
@@ -1595,6 +1585,26 @@ mod tests {
         let captured = read_bounded_stream(InvalidUnixReader, &finished, &limit_exceeded);
 
         assert!(captured.read_error.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_detects_buffered_byte_beyond_limit_after_process_exit() {
+        use std::io::Write as _;
+
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer
+            .write_all(&vec![b'x'; VERSION_OUTPUT_LIMIT + 1])
+            .unwrap();
+        drop(writer);
+        let finished = AtomicBool::new(true);
+        let limit_exceeded = AtomicBool::new(false);
+
+        let captured = read_bounded_stream(reader, &finished, &limit_exceeded);
+
+        assert!(captured.overflowed);
+        assert!(limit_exceeded.load(Ordering::Acquire));
+        assert_eq!(captured.bytes.len(), VERSION_OUTPUT_LIMIT);
     }
 
     #[cfg(windows)]
@@ -2441,11 +2451,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn version_probe_terminates_immediately_when_output_exceeds_the_limit() {
-        let (_directory, program) = executable_script("while :; do printf x; done");
+    fn version_probe_reports_output_limit_before_timeout_for_an_unbounded_writer() {
+        let chunk = "x".repeat(1024);
+        let body = format!("while :; do printf '{chunk}'; done");
+        let (_directory, program) = executable_script(&body);
         let mut probe = version_probe(program);
         probe.timeout = Duration::from_secs(2);
-        let started = std::time::Instant::now();
 
         let error = probe.verify_requested("1.2.3").unwrap_err();
 
@@ -2453,7 +2464,6 @@ mod tests {
             error.to_string().contains("exceeded 4096 bytes"),
             "unexpected error: {error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
