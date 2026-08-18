@@ -217,11 +217,11 @@ impl RegistryClient {
     /// 0. **Proactive pass.** If posture allows recovery AND the
     ///    session source is refresh-eligible AND we already know the
     ///    cached state needs help (empty-secret placeholder OR local
-    ///    expiry metadata says past TTL), attempt a silent refresh
-    ///    BEFORE the first request. Refresh failure here is
-    ///    best-effort — the request still runs and may succeed
-    ///    (e.g., when the server clock skew lets the access token
-    ///    work despite local metadata claiming otherwise).
+    ///    expiry metadata says past TTL), attempt a silent refresh before the
+    ///    first request. Network and server failures here are best-effort
+    ///    because the existing access token may still work. Credential-storage
+    ///    failures are returned because continuing could use partially
+    ///    persisted rotated state.
     /// 1. Run `op()` once. Closure reads bearer via `current_bearer`,
     ///    which sees any rotated token from the proactive pass.
     /// 2. If it returns `LpmError::AuthRequired` AND the posture
@@ -271,10 +271,10 @@ impl RegistryClient {
             let needs_proactive = !session.has_token()?
                 || lpm_auth::is_session_access_token_expired(session.registry_url())
                 || lpm_auth::session_metadata_corrupted();
-            if needs_proactive {
-                // Best-effort: ignore errors. The reactive pass below
-                // catches a doomed refresh via the eventual 401.
-                let _ = session.refresh_now().await;
+            if needs_proactive
+                && let Err(error @ LpmError::CredentialStorage(_)) = session.refresh_now().await
+            {
+                return Err(error);
             }
         }
 
