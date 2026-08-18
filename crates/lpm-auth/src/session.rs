@@ -1786,7 +1786,8 @@ mod refresh_http_tests {
 
     impl Respond for RefreshOnlyPeerRotationBeforeUnauthorized {
         fn respond(&self, _request: &Request) -> ResponseTemplate {
-            crate::set_refresh_token(&self.registry_url, "rt-peer");
+            crate::set_refresh_token(&self.registry_url, "rt-peer")
+                .expect("peer refresh-token rotation should persist");
             ResponseTemplate::new(401)
         }
     }
