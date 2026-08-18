@@ -40,6 +40,8 @@ pub(super) enum CredentialAuthority {
     Active {
         backend: CredentialBackend,
         credential_digest: String,
+        #[serde(default = "legacy_keychain_cleanup_is_pending")]
+        stale_file_cleanup_pending: bool,
     },
     Revoked,
 }
@@ -49,6 +51,15 @@ impl CredentialAuthority {
         Self::Active {
             backend,
             credential_digest: token_digest(token),
+            stale_file_cleanup_pending: false,
+        }
+    }
+
+    pub(super) fn keychain_cleanup_pending(token: &str) -> Self {
+        Self::Active {
+            backend: CredentialBackend::Keychain,
+            credential_digest: token_digest(token),
+            stale_file_cleanup_pending: true,
         }
     }
 
@@ -67,6 +78,21 @@ impl CredentialAuthority {
             Self::Revoked => false,
         }
     }
+
+    pub(super) fn has_pending_keychain_cleanup(&self) -> bool {
+        matches!(
+            self,
+            Self::Active {
+                backend: CredentialBackend::Keychain,
+                stale_file_cleanup_pending: true,
+                ..
+            }
+        )
+    }
+}
+
+fn legacy_keychain_cleanup_is_pending() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -177,4 +203,19 @@ fn authority_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 pub(super) fn path_for_test() -> Result<PathBuf, String> {
     authority_path()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_authority_without_cleanup_field_defaults_to_pending_cleanup() {
+        let authority: CredentialAuthority = serde_json::from_str(
+            r#"{"state":"active","backend":"keychain","credential_digest":"digest"}"#,
+        )
+        .expect("legacy authority record should remain readable");
+
+        assert!(authority.has_pending_keychain_cleanup());
+    }
 }
