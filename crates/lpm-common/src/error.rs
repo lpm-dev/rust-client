@@ -322,6 +322,15 @@ pub enum LpmError {
     )]
     AuthRequired,
 
+    #[error("credential storage error: {0}")]
+    #[diagnostic(
+        code(lpm::credential_storage),
+        help(
+            "Check access to your OS keychain and the files under ~/.lpm. If an encrypted credential file is corrupted, back it up before replacing it, then run `lpm login`."
+        )
+    )]
+    CredentialStorage(String),
+
     #[error("LPM does not support user commands through sudo")]
     #[diagnostic(
         code(lpm::sudo_not_supported),
@@ -712,6 +721,7 @@ impl LpmError {
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
+            LpmError::CredentialStorage(_) => "credential_storage",
             LpmError::SudoNotSupported => "sudo_not_supported",
             LpmError::SessionExpired => "session_expired",
             LpmError::UnsupportedAuthSource { .. } => "unsupported_auth_source",
@@ -893,6 +903,7 @@ mod tests {
                 message: "x".into(),
             },
             LpmError::AuthRequired,
+            LpmError::CredentialStorage("x".into()),
             LpmError::SessionExpired,
             LpmError::UnsupportedAuthSource {
                 command: "lpm token-rotate",
@@ -1056,6 +1067,10 @@ mod tests {
     #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(
+            LpmError::CredentialStorage("x".into()).error_code(),
+            "credential_storage"
+        );
         assert_eq!(
             LpmError::SudoNotSupported.error_code(),
             "sudo_not_supported"

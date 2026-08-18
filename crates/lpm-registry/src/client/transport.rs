@@ -19,7 +19,7 @@ impl RegistryClient {
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, LpmError> {
         let mut req = self.http.for_url(url).await?.post(url).json(body);
-        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             req = req.bearer_auth(bearer);
         }
         self.send_with_retry(req).await
@@ -37,7 +37,7 @@ impl RegistryClient {
         otp: Option<&str>,
     ) -> Result<reqwest::Response, LpmError> {
         let mut req = self.http.for_url(url).await?.post(url).json(body);
-        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             req = req.bearer_auth(bearer);
         }
         if let Some(otp) = otp {
@@ -59,7 +59,7 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
         let mut request = self.http.for_url(url).await?.post(url).json(body);
-        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+        if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
             request = request.bearer_auth(bearer);
         }
         let request = request
@@ -97,7 +97,7 @@ impl RegistryClient {
         posture: AuthPosture,
     ) -> Result<reqwest::RequestBuilder, LpmError> {
         let mut req = self.http.for_url(url).await?.get(url);
-        if let Some(bearer) = self.current_bearer(posture) {
+        if let Some(bearer) = self.current_bearer(posture)? {
             req = req.bearer_auth(bearer);
         }
         Ok(req)
@@ -136,24 +136,25 @@ impl RegistryClient {
     /// **Never returns `Some("")`.** Empty tokens are filtered so
     /// downstream `bearer_auth(empty)` calls cannot produce
     /// `Authorization: Bearer ` (empty value) headers.
-    pub(super) fn current_bearer(&self, posture: AuthPosture) -> Option<String> {
+    pub(super) fn current_bearer(&self, posture: AuthPosture) -> Result<Option<String>, LpmError> {
         if !posture.attaches_bearer() {
-            return None;
+            return Ok(None);
         }
         // Use the lazy variant so keychain classification fires on the
         // first actual network request, not at process startup. Warm /
         // offline / fully-cached runs skip the ~50 ms macOS Keychain IPC
         // entirely because this method is never reached.
         if let Some(session) = &self.session
-            && let Some(b) = session.current_bearer_lazy()
+            && let Some(b) = session.current_bearer_lazy()?
             && !b.is_empty()
         {
-            return Some(b);
+            return Ok(Some(b));
         }
-        self.token
+        Ok(self
+            .token
             .as_ref()
             .map(|s| s.expose_secret().to_string())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty()))
     }
 
     /// Execute an HTTP-bearing operation, handling lazy refresh on 401
@@ -201,7 +202,7 @@ impl RegistryClient {
         // Proactive pass.
         if posture.allows_recovery()
             && let Some(session) = &self.session
-            && let Some(source) = session.current_source()
+            && let Some(source) = session.current_source()?
             && source.refresh_policy() == RefreshPolicy::IfRefreshable
         {
             // Three triggers, all "we already know the cache can't be
@@ -214,7 +215,7 @@ impl RegistryClient {
             // Fresh-login case is preserved: login.rs writes valid
             // expiry metadata on success, so the metadata-missing
             // path stays optimistic (no refresh fired).
-            let needs_proactive = !session.has_token()
+            let needs_proactive = !session.has_token()?
                 || lpm_auth::is_session_access_token_expired(session.registry_url())
                 || lpm_auth::session_metadata_corrupted();
             if needs_proactive {
@@ -230,7 +231,7 @@ impl RegistryClient {
                 let Some(session) = &self.session else {
                     return Err(LpmError::AuthRequired);
                 };
-                let Some(source) = session.current_source() else {
+                let Some(source) = session.current_source()? else {
                     return Err(LpmError::AuthRequired);
                 };
                 if source.refresh_policy() != RefreshPolicy::IfRefreshable {

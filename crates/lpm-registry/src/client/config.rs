@@ -293,24 +293,25 @@ impl RegistryClient {
     }
 
     /// Return whether this client can attach or recover a bearer for `posture`.
-    pub fn has_bearer_for_posture(&self, posture: AuthPosture) -> bool {
+    pub fn has_bearer_for_posture(&self, posture: AuthPosture) -> Result<bool, LpmError> {
         if !posture.attaches_bearer() {
-            return false;
+            return Ok(false);
         }
         if let Some(session) = &self.session {
-            if session.has_token() {
-                return true;
+            if session.has_token()? {
+                return Ok(true);
             }
             if session
-                .current_source()
+                .current_source()?
                 .is_some_and(|source| source.refresh_policy() == RefreshPolicy::IfRefreshable)
             {
-                return true;
+                return Ok(true);
             }
         }
-        self.token
+        Ok(self
+            .token
             .as_ref()
-            .is_some_and(|secret| !secret.expose_secret().is_empty())
+            .is_some_and(|secret| !secret.expose_secret().is_empty()))
     }
 
     /// Get the configured direct-npm registry URL (default

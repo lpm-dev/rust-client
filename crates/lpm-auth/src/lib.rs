@@ -191,6 +191,13 @@ struct StoredToken {
     backend: AuthStorageBackend,
 }
 
+#[derive(Debug)]
+enum EncryptedFileCredentialProbe {
+    Found(String),
+    NotFound,
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredCredentialPresence {
     Present,
@@ -346,9 +353,9 @@ fn get_stored_access_token(registry_url: &str) -> Option<String> {
 pub(crate) fn get_stored_access_token_with_interaction_notice(
     registry_url: &str,
     notice: impl FnOnce(),
-) -> Option<String> {
-    get_stored_credential_with_backend(registry_url, CredentialKind::Access, notice)
-        .map(|stored| stored.token)
+) -> Result<Option<String>, String> {
+    get_stored_credential_with_backend_result(registry_url, CredentialKind::Access, notice)
+        .map(|stored| stored.map(|credential| credential.token))
 }
 
 /// Check whether a non-empty access token is stored for the given registry.
@@ -449,10 +456,19 @@ fn with_credential_store_lock<T>(
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let lock_path = session_lock_path("lpm-auth://credential-store")?;
-    lpm_common::paths::with_exclusive_lock(lock_path, || {
-        operation().map_err(lpm_common::LpmError::Registry)
-    })
-    .map_err(|error| error.to_string())
+    match lpm_common::paths::with_exclusive_lock(lock_path, || {
+        operation().map_err(lpm_common::LpmError::CredentialStorage)
+    }) {
+        Ok(value) => Ok(value),
+        Err(error) => Err(credential_storage_error_message(error)),
+    }
+}
+
+fn credential_storage_error_message(error: lpm_common::LpmError) -> String {
+    match error {
+        lpm_common::LpmError::CredentialStorage(message) => message,
+        other => format!("credential storage lock failed: {other}"),
+    }
 }
 
 fn combine_credential_results<const N: usize>(
@@ -547,10 +563,10 @@ pub fn clear_rejected_legacy_session_if_current(
             return Ok(false);
         }
 
-        clear_login_state(registry_url).map_err(lpm_common::LpmError::Registry)?;
+        clear_login_state(registry_url).map_err(lpm_common::LpmError::CredentialStorage)?;
         Ok(true)
     })
-    .map_err(|error| error.to_string())
+    .map_err(credential_storage_error_message)
 }
 
 // ─── npm Token ─────────────────────────────────────────────────────
@@ -811,7 +827,7 @@ fn get_stored_credential_with_backend_unlocked(
         },
         notice,
         || get_password_from_keychain_account(&account),
-        || get_token_from_file(&file_key),
+        || probe_token_from_file(&file_key),
     )?;
 
     if authority.is_none()
@@ -848,7 +864,7 @@ fn resolve_stored_credential_from_backends(
     keychain_probe: impl FnOnce() -> KeychainCredentialProbe,
     notice: impl FnOnce(),
     interactive_retry: impl FnOnce() -> Option<String>,
-    file_lookup: impl FnOnce() -> Option<String>,
+    file_lookup: impl FnOnce() -> EncryptedFileCredentialProbe,
 ) -> Result<Option<StoredToken>, String> {
     if matches!(authority, Some(CredentialAuthority::Revoked)) {
         return Ok(None);
@@ -857,16 +873,24 @@ fn resolve_stored_credential_from_backends(
     if authority.and_then(CredentialAuthority::backend)
         == Some(CredentialBackend::EncryptedFileFallback)
     {
-        let token = file_lookup().filter(|token| !token.is_empty());
-        return match token {
-            Some(token) if authority.is_some_and(|record| record.matches_token(&token)) => {
+        return match file_lookup() {
+            EncryptedFileCredentialProbe::Found(token)
+                if authority.is_some_and(|record| record.matches_token(&token)) =>
+            {
                 Ok(Some(StoredToken {
                     token,
                     backend: AuthStorageBackend::EncryptedFileFallback,
                 }))
             }
-            Some(_) => Err("encrypted credential does not match its authority record".to_owned()),
-            None => Err("authoritative encrypted credential is unavailable".to_owned()),
+            EncryptedFileCredentialProbe::Found(_) => {
+                Err("encrypted credential does not match its authority record".to_owned())
+            }
+            EncryptedFileCredentialProbe::NotFound => {
+                Err("authoritative encrypted credential is unavailable".to_owned())
+            }
+            EncryptedFileCredentialProbe::Unavailable(error) => Err(format!(
+                "authoritative encrypted credential storage is unavailable: {error}"
+            )),
         };
     }
 
@@ -882,14 +906,20 @@ fn resolve_stored_credential_from_backends(
                 return Err("keychain credential does not match its authority record".to_owned());
             }
 
-            if file_lookup()
-                .filter(|file_token| !file_token.is_empty())
-                .is_some_and(|file_token| file_token != token)
-            {
-                return Err(
-                    "legacy keychain and encrypted credentials disagree; refusing destructive migration"
-                        .to_owned(),
-                );
+            match file_lookup() {
+                EncryptedFileCredentialProbe::Found(file_token) if file_token != token => {
+                    return Err(
+                        "legacy keychain and encrypted credentials disagree; refusing destructive migration"
+                            .to_owned(),
+                    );
+                }
+                EncryptedFileCredentialProbe::Unavailable(error) => {
+                    return Err(format!(
+                        "encrypted credential storage is unavailable during legacy migration: {error}"
+                    ));
+                }
+                EncryptedFileCredentialProbe::Found(_) | EncryptedFileCredentialProbe::NotFound => {
+                }
             }
             Ok(Some(StoredToken {
                 token,
@@ -899,12 +929,16 @@ fn resolve_stored_credential_from_backends(
         KeychainCredentialResolution::Found(_) | KeychainCredentialResolution::NotFound
             if authority.is_none() =>
         {
-            Ok(file_lookup()
-                .filter(|token| !token.is_empty())
-                .map(|token| StoredToken {
+            match file_lookup() {
+                EncryptedFileCredentialProbe::Found(token) => Ok(Some(StoredToken {
                     token,
                     backend: AuthStorageBackend::EncryptedFileFallback,
-                }))
+                })),
+                EncryptedFileCredentialProbe::NotFound => Ok(None),
+                EncryptedFileCredentialProbe::Unavailable(error) => Err(format!(
+                    "encrypted credential storage is unavailable: {error}"
+                )),
+            }
         }
         KeychainCredentialResolution::Found(_) | KeychainCredentialResolution::NotFound => {
             Err("authoritative keychain credential is unavailable".to_owned())
@@ -1569,12 +1603,16 @@ pub async fn store_refresh_backed_session(
 ) -> Result<AuthStorageStatus, lpm_common::LpmError> {
     validate_refresh_backed_session(access_token, refresh_token, expires_at)
         .map_err(lpm_common::LpmError::Registry)?;
-    let lock_path = session_lock_path(registry).map_err(lpm_common::LpmError::Registry)?;
+    let lock_path = session_lock_path(registry).map_err(|error| {
+        lpm_common::LpmError::CredentialStorage(format!("failed to resolve session lock: {error}"))
+    })?;
 
     lpm_common::paths::with_exclusive_lock_async(lock_path, async {
         persist_refresh_backed_session_unlocked(registry, access_token, refresh_token, expires_at)
             .map_err(|error| {
-                lpm_common::LpmError::Registry(format!("failed to store refresh session: {error}"))
+                lpm_common::LpmError::CredentialStorage(format!(
+                    "failed to store refresh session: {error}"
+                ))
             })
     })
     .await
@@ -1604,9 +1642,9 @@ pub fn get_refresh_token(registry: &str) -> Option<String> {
 pub(crate) fn get_refresh_token_with_interaction_notice(
     registry: &str,
     notice: impl FnOnce(),
-) -> Option<String> {
-    get_stored_credential_with_backend(registry, CredentialKind::Refresh, notice)
-        .map(|stored| stored.token)
+) -> Result<Option<String>, String> {
+    get_stored_credential_with_backend_result(registry, CredentialKind::Refresh, notice)
+        .map(|stored| stored.map(|credential| credential.token))
 }
 
 /// Check whether a refresh token is stored for the given registry.
@@ -2347,34 +2385,62 @@ fn decrypt(encoded: &str) -> Result<String, String> {
     String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))
 }
 
-fn get_token_from_file(registry_url: &str) -> Option<String> {
-    let path = credentials_path().ok()?;
-    if !path.exists() {
-        return None;
-    }
-
+fn probe_token_from_file(registry_url: &str) -> EncryptedFileCredentialProbe {
+    let path = match credentials_path() {
+        Ok(path) => path,
+        Err(error) => return EncryptedFileCredentialProbe::Unavailable(error),
+    };
     let content =
-        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()?;
+        match lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                return EncryptedFileCredentialProbe::NotFound;
+            }
+            Err(error) => {
+                return EncryptedFileCredentialProbe::Unavailable(format!("read error: {error}"));
+            }
+        };
     let encrypted = content.trim();
     if encrypted.is_empty() {
-        return None;
+        return EncryptedFileCredentialProbe::Unavailable("credential store is empty".to_owned());
     }
 
-    // Try to decrypt. This may fail if the file was written by the JS CLI
-    // (different IV size / key derivation). That's fine — the keychain is
-    // the primary interop path between JS and Rust CLIs.
-    let json_str = match decrypt(encrypted) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!("encrypted file decrypt failed (possibly JS CLI format): {e}");
-            return None;
+    let json = match decrypt(encrypted) {
+        Ok(json) => json,
+        Err(error) => {
+            return EncryptedFileCredentialProbe::Unavailable(format!("decrypt error: {error}"));
         }
     };
-    let store: serde_json::Value = serde_json::from_str(&json_str).ok()?;
-    store
-        .get(registry_url)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    let store = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json) {
+        Ok(store) => store,
+        Err(error) => {
+            return EncryptedFileCredentialProbe::Unavailable(format!("JSON error: {error}"));
+        }
+    };
+    match store.get(registry_url) {
+        Some(serde_json::Value::String(token)) if !token.is_empty() => {
+            EncryptedFileCredentialProbe::Found(token.clone())
+        }
+        None => EncryptedFileCredentialProbe::NotFound,
+        Some(serde_json::Value::String(_)) => EncryptedFileCredentialProbe::Unavailable(
+            "credential entry is an empty string".to_owned(),
+        ),
+        Some(_) => {
+            EncryptedFileCredentialProbe::Unavailable("credential entry is not a string".to_owned())
+        }
+    }
+}
+
+#[cfg(test)]
+fn get_token_from_file(registry_url: &str) -> Option<String> {
+    match probe_token_from_file(registry_url) {
+        EncryptedFileCredentialProbe::Found(token) => Some(token),
+        EncryptedFileCredentialProbe::NotFound => None,
+        EncryptedFileCredentialProbe::Unavailable(error) => {
+            tracing::debug!("encrypted credential read failed: {error}");
+            None
+        }
+    }
 }
 
 fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
@@ -2387,7 +2453,7 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
                 .map_err(|e| format!("read error: {e}"))?;
         let encrypted = content.trim();
         if encrypted.is_empty() {
-            serde_json::json!({})
+            return Err("credential store is empty".to_owned());
         } else {
             let decrypted = decrypt(encrypted)?;
             serde_json::from_str(&decrypted).map_err(|error| format!("json error: {error}"))?
@@ -2396,8 +2462,13 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
         serde_json::json!({})
     };
 
-    // Update
-    store[registry_url] = serde_json::Value::String(token.to_string());
+    let object = store
+        .as_object_mut()
+        .ok_or_else(|| "credential store JSON must be an object".to_owned())?;
+    object.insert(
+        registry_url.to_owned(),
+        serde_json::Value::String(token.to_owned()),
+    );
 
     // Encrypt and write
     let json_str = serde_json::to_string(&store).map_err(|e| format!("json error: {e}"))?;
@@ -2444,7 +2515,7 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
         .map_err(|e| format!("read error: {e}"))?;
     let encrypted = content.trim();
     if encrypted.is_empty() {
-        return Ok(());
+        return Err("credential store is empty".to_owned());
     }
 
     let json_str = decrypt(encrypted)?;
@@ -2453,12 +2524,14 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
 
     let removed = store
         .as_object_mut()
-        .is_some_and(|object| object.remove(registry_url).is_some());
+        .ok_or_else(|| "credential store JSON must be an object".to_owned())?
+        .remove(registry_url)
+        .is_some();
     if !removed {
         return Ok(());
     }
 
-    if store.as_object().is_none_or(|o| o.is_empty()) {
+    if store.as_object().is_some_and(serde_json::Map::is_empty) {
         // No more tokens — remove the file
         std::fs::remove_file(&path).map_err(|e| format!("remove error: {e}"))?;
     } else {
@@ -2630,6 +2703,45 @@ mod tests {
     }
 
     #[test]
+    fn credential_update_preserves_empty_encrypted_store() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            std::fs::write(&path, b"").expect("write empty credential store");
+
+            let result = set_token_in_file("https://registry.example", "replacement-token");
+            let after = std::fs::read(&path).expect("read credential store after failed update");
+
+            assert!(
+                result.is_err() && after.is_empty(),
+                "an empty credential store must fail closed without changing its bytes: result={result:?}, after={after:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn credential_update_preserves_encrypted_null_store() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            let original = encrypt("null").expect("encrypt null credential store");
+            std::fs::write(&path, &original).expect("write null credential store");
+
+            let result = set_token_in_file("https://registry.example", "replacement-token");
+            let after = std::fs::read_to_string(&path).expect("read credential store after update");
+
+            assert!(
+                result.is_err() && after == original,
+                "a null credential store must fail closed without changing its bytes: result={result:?}"
+            );
+        });
+    }
+
+    #[test]
     fn credential_clear_preserves_store_with_invalid_json() {
         with_temp_home(|_| {
             let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
@@ -2687,7 +2799,7 @@ mod tests {
                 || KeychainCredentialProbe::Found("older-keychain-token".to_owned()),
                 || {},
                 || None,
-                || get_token_from_file(registry),
+                || probe_token_from_file(registry),
             );
 
             assert!(
@@ -2701,6 +2813,81 @@ mod tests {
             assert_eq!(
                 credential_authority::read(registry, CredentialKind::Access).unwrap(),
                 None
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_migration_refuses_keychain_when_encrypted_store_is_corrupt() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            std::fs::write(&path, b"not-valid-ciphertext")
+                .expect("write corrupted credential store");
+
+            let resolved = resolve_stored_credential_from_backends(
+                None,
+                || KeychainCredentialProbe::Found("older-keychain-token".to_owned()),
+                || {},
+                || None,
+                || probe_token_from_file(registry),
+            );
+
+            assert!(
+                resolved.is_err(),
+                "a corrupt encrypted store must not be treated as proof that an older keychain credential is authoritative: {resolved:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_migration_refuses_keychain_when_encrypted_store_is_empty() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            std::fs::write(&path, b"").expect("write empty credential store");
+
+            let resolved = resolve_stored_credential_from_backends(
+                None,
+                || KeychainCredentialProbe::Found("older-keychain-token".to_owned()),
+                || {},
+                || None,
+                || probe_token_from_file(registry),
+            );
+
+            assert!(
+                resolved.is_err(),
+                "an empty encrypted store must not be treated as proof that an older keychain credential is authoritative: {resolved:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_migration_refuses_keychain_when_encrypted_entry_is_empty() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            let encoded = encrypt(&serde_json::json!({ (registry): "" }).to_string())
+                .expect("encrypt invalid credential store");
+            std::fs::write(&path, encoded).expect("write invalid credential store");
+
+            let resolved = resolve_stored_credential_from_backends(
+                None,
+                || KeychainCredentialProbe::Found("older-keychain-token".to_owned()),
+                || {},
+                || None,
+                || probe_token_from_file(registry),
+            );
+
+            assert!(
+                resolved.is_err(),
+                "an empty encrypted credential must not authorize migration of an older keychain credential: {resolved:?}"
             );
         });
     }
@@ -2764,7 +2951,7 @@ mod tests {
                 || KeychainCredentialProbe::Found("legacy-keychain-token".to_owned()),
                 || {},
                 || None,
-                || None,
+                || EncryptedFileCredentialProbe::NotFound,
             )
             .unwrap()
             .unwrap();
@@ -2797,7 +2984,7 @@ mod tests {
                 || KeychainCredentialProbe::Failed,
                 || {},
                 || None,
-                || get_token_from_file(registry),
+                || probe_token_from_file(registry),
             );
 
             assert!(resolved.is_err());
@@ -2865,7 +3052,7 @@ mod tests {
                 || KeychainCredentialProbe::Found("rejected-keychain-token".to_owned()),
                 || {},
                 || None,
-                || None,
+                || EncryptedFileCredentialProbe::NotFound,
             )
             .unwrap();
             assert!(
@@ -2922,7 +3109,7 @@ mod tests {
             || KeychainCredentialProbe::Failed,
             || {},
             || None,
-            || None,
+            || EncryptedFileCredentialProbe::NotFound,
         );
 
         assert!(
@@ -2993,7 +3180,7 @@ mod tests {
                 || KeychainCredentialProbe::Found("matching-token".to_owned()),
                 || {},
                 || None,
-                || get_token_from_file(registry),
+                || probe_token_from_file(registry),
             )
             .unwrap()
             .unwrap();
@@ -3033,7 +3220,7 @@ mod tests {
                 || KeychainCredentialProbe::Found("stale-keychain-token".to_owned()),
                 || {},
                 || None,
-                || get_token_from_file(registry),
+                || probe_token_from_file(registry),
             )
             .unwrap()
             .unwrap();
@@ -3241,7 +3428,7 @@ mod tests {
             || None,
             || {
                 file_lookups.set(file_lookups.get() + 1);
-                Some("stale-file-token".to_owned())
+                EncryptedFileCredentialProbe::Found("stale-file-token".to_owned())
             },
         );
 
@@ -3263,7 +3450,7 @@ mod tests {
             },
             || {},
             || None,
-            || Some("new-file-token".to_owned()),
+            || EncryptedFileCredentialProbe::Found("new-file-token".to_owned()),
         )
         .unwrap()
         .unwrap();
@@ -3653,6 +3840,51 @@ mod tests {
             assert!(
                 result.is_err(),
                 "a credential-store read failure must make logout fail"
+            );
+        });
+    }
+
+    #[test]
+    fn clear_token_reports_an_empty_file_store_instead_of_claiming_success() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let credentials = home.join(".lpm").join(".credentials");
+            std::fs::create_dir_all(
+                credentials
+                    .parent()
+                    .expect("credentials parent should exist"),
+            )
+            .expect("create credentials directory");
+            std::fs::write(&credentials, b"").expect("write empty credential store");
+
+            let result = clear_token("https://registry.example.test");
+
+            assert!(
+                result.is_err(),
+                "an empty credential store must make logout fail closed"
+            );
+        });
+    }
+
+    #[test]
+    fn clear_token_reports_a_non_object_file_store_instead_of_claiming_success() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let credentials = home.join(".lpm").join(".credentials");
+            std::fs::create_dir_all(
+                credentials
+                    .parent()
+                    .expect("credentials parent should exist"),
+            )
+            .expect("create credentials directory");
+            let encoded = encrypt("[]").expect("encrypt non-object credential store");
+            std::fs::write(&credentials, encoded).expect("write non-object credential store");
+
+            let result = clear_token("https://registry.example.test");
+
+            assert!(
+                result.is_err(),
+                "a non-object credential store must make logout fail closed"
             );
         });
     }

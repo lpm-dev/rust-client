@@ -1,10 +1,10 @@
 use super::whoami_ui;
 use crate::{auth, install_ui};
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError};
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, client::AuthPosture};
 
 pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
-    if !json_output && !has_local_whoami_auth(client.base_url()) {
+    if !json_output && !client.has_bearer_for_posture(AuthPosture::AuthRequired)? {
         whoami_ui::phase_line(crate::install_ui::terminal_line!(
             "Not logged in to {}.",
             install_ui::url(client.base_url())
@@ -29,7 +29,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         .email
         .as_deref()
         .or(user.username.as_deref().filter(|u| u.contains('@')));
-    let storage_status = active_auth_storage_status(client);
+    let storage_status = active_auth_storage_status(client)?;
 
     if json_output {
         let json = serde_json::json!({
@@ -234,21 +234,19 @@ fn build_registries_json(lpm_storage: auth::AuthStorageStatus) -> Vec<serde_json
     regs
 }
 
-fn has_local_whoami_auth(registry_url: &str) -> bool {
-    auth::get_token(registry_url).is_some() || auth::has_refresh_token(registry_url)
-}
-
-fn active_auth_storage_status(client: &RegistryClient) -> auth::AuthStorageStatus {
+fn active_auth_storage_status(
+    client: &RegistryClient,
+) -> Result<auth::AuthStorageStatus, LpmError> {
     let Some(session) = client.session() else {
-        return auth::AuthStorageStatus::none();
+        return Ok(auth::AuthStorageStatus::none());
     };
 
-    match session.current_source() {
+    Ok(match session.current_source()? {
         Some(auth::TokenSource::StoredSession | auth::TokenSource::StoredLegacy) => {
             auth::auth_storage_status(session.registry_url())
         }
         _ => auth::AuthStorageStatus::none(),
-    }
+    })
 }
 
 fn login_command_for_registry(registry_url: &str) -> String {
@@ -311,13 +309,19 @@ mod tests {
     }
 
     #[test]
-    fn whoami_local_auth_state_counts_refresh_token() {
+    fn whoami_client_auth_state_counts_refresh_token() {
         let (_home, _env) = scoped_home_dir();
         let registry = "https://whoami-refresh.test";
 
         auth::set_refresh_token(registry, "refresh-token").unwrap();
+        let session = std::sync::Arc::new(lpm_auth::SessionManager::new(registry, None));
+        let client = RegistryClient::new().with_session(session);
 
-        assert!(has_local_whoami_auth(registry));
+        assert!(
+            client
+                .has_bearer_for_posture(AuthPosture::AuthRequired)
+                .unwrap()
+        );
     }
 
     #[test]

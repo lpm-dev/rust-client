@@ -675,18 +675,21 @@ pub(super) async fn resolve_tunnel_bearer(
         .bearer_string_for(auth_requirement)
         .await
         .map(Some)
-        .map_err(|_| {
-            if auth_requirement == lpm_auth::AuthRequirement::TokenRequired {
-                lpm_common::LpmError::Tunnel(
-                    "authentication required for tunnel. Run `lpm login` first.".into(),
-                )
-            } else {
-                lpm_common::LpmError::Tunnel(
-                    "tunnel requires a refresh-backed `lpm login` session.\n  \
-                     `--token` / `LPM_TOKEN` / CI tokens are not accepted."
-                        .into(),
-                )
+        .map_err(|error| match error {
+            lpm_common::LpmError::AuthRequired | lpm_common::LpmError::SessionExpired => {
+                if auth_requirement == lpm_auth::AuthRequirement::TokenRequired {
+                    lpm_common::LpmError::Tunnel(
+                        "authentication required for tunnel. Run `lpm login` first.".into(),
+                    )
+                } else {
+                    lpm_common::LpmError::Tunnel(
+                        "tunnel requires a refresh-backed `lpm login` session.\n  \
+                         `--token` / `LPM_TOKEN` / CI tokens are not accepted."
+                            .into(),
+                    )
+                }
             }
+            other => other,
         })
 }
 

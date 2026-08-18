@@ -33,12 +33,16 @@ fn auth_posture_allows_recovery_only_for_auth_or_session() {
 fn current_bearer_returns_none_for_anonymous_postures_even_with_token() {
     let client = RegistryClient::new().with_token("real-token");
     assert!(
-        client.current_bearer(AuthPosture::AnonymousOnly).is_none(),
+        client
+            .current_bearer(AuthPosture::AnonymousOnly)
+            .unwrap()
+            .is_none(),
         "AnonymousOnly must never attach a bearer"
     );
     assert!(
         client
             .current_bearer(AuthPosture::AnonymousPreferred)
+            .unwrap()
             .is_none(),
         "AnonymousPreferred must never attach a bearer"
     );
@@ -48,11 +52,11 @@ fn current_bearer_returns_none_for_anonymous_postures_even_with_token() {
 fn current_bearer_returns_token_for_auth_required_when_set() {
     let client = RegistryClient::new().with_token("real-token");
     assert_eq!(
-        client.current_bearer(AuthPosture::AuthRequired),
+        client.current_bearer(AuthPosture::AuthRequired).unwrap(),
         Some("real-token".to_string())
     );
     assert_eq!(
-        client.current_bearer(AuthPosture::SessionRequired),
+        client.current_bearer(AuthPosture::SessionRequired).unwrap(),
         Some("real-token".to_string())
     );
 }
@@ -62,24 +66,49 @@ fn current_bearer_filters_empty_token() {
     // Empty bearer must never be sent — `current_bearer` returns
     // None even if `with_token("")` was called.
     let client = RegistryClient::new().with_token("");
-    assert!(client.current_bearer(AuthPosture::AuthRequired).is_none());
+    assert!(
+        client
+            .current_bearer(AuthPosture::AuthRequired)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
 fn has_bearer_for_posture_honors_auth_posture_and_direct_token() {
     let client = RegistryClient::new().with_token("real-token");
 
-    assert!(!client.has_bearer_for_posture(AuthPosture::AnonymousOnly));
-    assert!(!client.has_bearer_for_posture(AuthPosture::AnonymousPreferred));
-    assert!(client.has_bearer_for_posture(AuthPosture::AuthRequired));
-    assert!(client.has_bearer_for_posture(AuthPosture::SessionRequired));
+    assert!(
+        !client
+            .has_bearer_for_posture(AuthPosture::AnonymousOnly)
+            .unwrap()
+    );
+    assert!(
+        !client
+            .has_bearer_for_posture(AuthPosture::AnonymousPreferred)
+            .unwrap()
+    );
+    assert!(
+        client
+            .has_bearer_for_posture(AuthPosture::AuthRequired)
+            .unwrap()
+    );
+    assert!(
+        client
+            .has_bearer_for_posture(AuthPosture::SessionRequired)
+            .unwrap()
+    );
 }
 
 #[test]
 fn has_bearer_for_posture_filters_empty_direct_token() {
     let client = RegistryClient::new().with_token("");
 
-    assert!(!client.has_bearer_for_posture(AuthPosture::AuthRequired));
+    assert!(
+        !client
+            .has_bearer_for_posture(AuthPosture::AuthRequired)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -90,7 +119,11 @@ fn has_bearer_for_posture_detects_attached_session_token() {
     ));
     let client = RegistryClient::new().with_session(session);
 
-    assert!(client.has_bearer_for_posture(AuthPosture::AuthRequired));
+    assert!(
+        client
+            .has_bearer_for_posture(AuthPosture::AuthRequired)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -104,7 +137,7 @@ fn clone_with_static_token_detaches_the_attached_session() {
     let isolated = client.clone_with_static_token("displaced-token");
 
     assert_eq!(
-        isolated.current_bearer(AuthPosture::AuthRequired),
+        isolated.current_bearer(AuthPosture::AuthRequired).unwrap(),
         Some("displaced-token".to_string())
     );
 }
@@ -126,6 +159,7 @@ fn clone_anonymous_drops_session_and_direct_token_credentials() {
     assert!(
         anonymous
             .current_bearer(AuthPosture::AuthRequired)
+            .unwrap()
             .is_none()
     );
 }
@@ -142,7 +176,9 @@ fn clone_with_session_only_drops_the_direct_token_fallback() {
 
     assert!(isolated.token.is_none());
     assert_eq!(
-        isolated.current_bearer(AuthPosture::SessionRequired),
+        isolated
+            .current_bearer(AuthPosture::SessionRequired)
+            .unwrap(),
         Some("stored-session-token".to_string())
     );
 }
@@ -158,7 +194,7 @@ fn token_override_replaces_attached_session_bearer() {
         .with_token_override("oidc-token");
 
     assert_eq!(
-        client.current_bearer(AuthPosture::AuthRequired),
+        client.current_bearer(AuthPosture::AuthRequired).unwrap(),
         Some("oidc-token".to_string())
     );
 }

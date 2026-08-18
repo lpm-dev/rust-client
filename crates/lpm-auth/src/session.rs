@@ -312,23 +312,24 @@ impl SessionManager {
     /// synchronous blocking, which is the cost we're amortizing away from
     /// startup — running it here instead of at `new()` ensures it fires at
     /// most once, and only when a read actually depends on the answer.
-    fn ensure_classified(&self) {
+    fn ensure_classified(&self) -> Result<(), LpmError> {
         if self.classified.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         // Serialize the actual keychain call so parallel readers don't both
         // hit secure storage. Short-held.
         let _guard = self.classify_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.classified.load(Ordering::Acquire) {
-            return; // peer finished while we waited.
+            return Ok(());
         }
         if let Some(resolved) = classify_keychain_sources(&self.registry_url, |kind| {
             self.emit_auth_storage_notice(kind);
-        }) && let Ok(mut guard) = self.cached.write()
+        })? && let Ok(mut guard) = self.cached.write()
         {
             *guard = Some(resolved);
         }
         self.classified.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn mark_refresh_available(&self) {
@@ -357,7 +358,12 @@ impl SessionManager {
     fn load_refresh_token(&self) -> Result<String, LpmError> {
         match crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
             self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
-        }) {
+        })
+        .map_err(|error| {
+            LpmError::CredentialStorage(format!(
+                "failed to read stored refresh credential: {error}"
+            ))
+        })? {
             Some(refresh_token) => {
                 self.mark_refresh_available();
                 Ok(refresh_token)
@@ -381,12 +387,13 @@ impl SessionManager {
     /// Triggers lazy keychain classification on first call. Callers that
     /// specifically want "cached-only, no work" semantics should use
     /// [`Self::current_source_peek`].
-    pub fn current_source(&self) -> Option<TokenSource> {
-        self.ensure_classified();
-        self.cached
+    pub fn current_source(&self) -> Result<Option<TokenSource>, LpmError> {
+        self.ensure_classified()?;
+        Ok(self
+            .cached
             .read()
             .ok()
-            .and_then(|g| g.as_ref().map(|c| c.source))
+            .and_then(|g| g.as_ref().map(|c| c.source)))
     }
 
     /// Cached-only variant of [`Self::current_source`]. Returns whatever
@@ -435,21 +442,24 @@ impl SessionManager {
         // after a refresh, so a fresh login has no expiry record and we trust
         // the cache. The first 401 in that path is handled by
         // `execute_with_recovery` for `RegistryClient` callers.
-        if let Ok(Some(secret)) = self.token_for(requirement).await {
-            let needs_proactive_refresh = self
-                .current_source()
-                .is_some_and(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
-                && crate::is_session_access_token_expired(&self.registry_url);
+        match self.token_for(requirement).await {
+            Ok(Some(secret)) => {
+                let needs_proactive_refresh = self
+                    .current_source()?
+                    .is_some_and(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
+                    && crate::is_session_access_token_expired(&self.registry_url);
 
-            if !needs_proactive_refresh {
-                return Ok(secret.expose_secret().to_string());
+                if !needs_proactive_refresh {
+                    return Ok(secret.expose_secret().to_string());
+                }
             }
-            // Fall through to refresh path below.
+            Ok(None) | Err(LpmError::AuthRequired | LpmError::SessionExpired) => {}
+            Err(error) => return Err(error),
         }
 
         // Refresh-only state OR known-expired access token: do the
         // silent exchange and return the rotated bearer.
-        if let Some(source) = self.current_source()
+        if let Some(source) = self.current_source()?
             && source.refresh_policy() == RefreshPolicy::IfRefreshable
             && (requirement == AuthRequirement::TokenRequired
                 || requirement == AuthRequirement::SessionRequired
@@ -511,13 +521,14 @@ impl SessionManager {
     /// `RegistryClient::current_bearer` to get the live bearer without
     /// paying keychain cost at startup. Returns `None` if no token source
     /// is available (env, flag, or keychain).
-    pub fn current_bearer_lazy(&self) -> Option<String> {
-        self.ensure_classified();
-        self.cached
+    pub fn current_bearer_lazy(&self) -> Result<Option<String>, LpmError> {
+        self.ensure_classified()?;
+        Ok(self
+            .cached
             .read()
             .ok()
             .and_then(|g| g.as_ref().map(|c| c.secret.expose_secret().to_string()))
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty()))
     }
 
     /// Whether a non-empty token is currently cached.
@@ -525,13 +536,14 @@ impl SessionManager {
     /// Triggers lazy keychain classification. Callers that need the "is it
     /// available right now, without touching the keychain" answer should use
     /// [`Self::has_token_peek`].
-    pub fn has_token(&self) -> bool {
-        self.ensure_classified();
-        self.cached
+    pub fn has_token(&self) -> Result<bool, LpmError> {
+        self.ensure_classified()?;
+        Ok(self
+            .cached
             .read()
             .ok()
             .and_then(|g| g.as_ref().map(|c| !c.secret.expose_secret().is_empty()))
-            .unwrap_or(false)
+            .unwrap_or(false))
     }
 
     /// Cached-only variant of [`Self::has_token`]. Returns whether a
@@ -559,7 +571,7 @@ impl SessionManager {
         // entry point, so this is where deferred keychain classification
         // fires. First call pays the macOS Keychain IPC; subsequent calls
         // are cache hits.
-        self.ensure_classified();
+        self.ensure_classified()?;
         let cached = self.cached.read().ok().and_then(|g| g.clone());
 
         match requirement {
@@ -630,7 +642,7 @@ impl SessionManager {
     /// rejects the refresh.
     pub async fn refresh_now(&self) -> Result<SecretString, LpmError> {
         // Source must be refresh-eligible.
-        let source = self.current_source().ok_or(LpmError::SessionExpired)?;
+        let source = self.current_source()?.ok_or(LpmError::SessionExpired)?;
         if source.refresh_policy() != RefreshPolicy::IfRefreshable {
             return Err(LpmError::SessionExpired);
         }
@@ -650,7 +662,9 @@ impl SessionManager {
         }
 
         let refresh_before_process_lock = self.load_refresh_token()?;
-        let lock_path = session_lock_path(&self.registry_url).map_err(LpmError::Registry)?;
+        let lock_path = session_lock_path(&self.registry_url).map_err(|error| {
+            LpmError::CredentialStorage(format!("failed to resolve session lock: {error}"))
+        })?;
         let secret = lpm_common::paths::with_exclusive_lock_async(lock_path, async {
             let current_refresh = self.load_refresh_token()?;
 
@@ -671,7 +685,7 @@ impl SessionManager {
                 &refreshed.expires_at,
             )
             .map_err(|error| {
-                LpmError::Registry(format!("failed to persist refreshed session: {error}"))
+                LpmError::CredentialStorage(format!("failed to persist refreshed session: {error}"))
             })?;
 
             let secret = SecretString::from(refreshed.token);
@@ -709,7 +723,7 @@ impl SessionManager {
         }
 
         crate::clear_login_state(&self.registry_url).map_err(|error| {
-            LpmError::Registry(format!("failed to clear rejected session: {error}"))
+            LpmError::CredentialStorage(format!("failed to clear rejected session: {error}"))
         })?;
         self.clear_cached_session();
         Ok(())
@@ -819,15 +833,18 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
 fn classify_keychain_sources(
     registry_url: &str,
     mut notice: impl FnMut(AuthStorageAccessKind),
-) -> Option<CachedToken> {
+) -> Result<Option<CachedToken>, LpmError> {
     if let Some(tok) = crate::get_stored_access_token_with_interaction_notice(registry_url, || {
         notice(AuthStorageAccessKind::AccessToken);
-    }) {
-        return Some(CachedToken {
+    })
+    .map_err(|error| {
+        LpmError::CredentialStorage(format!("failed to read stored access credential: {error}"))
+    })? {
+        return Ok(Some(CachedToken {
             secret: SecretString::from(tok),
             source: TokenSource::StoredSession,
             refresh_state: RefreshState::Unchecked,
-        });
+        }));
     }
 
     // Refresh-token-only recovery: if the access token was wiped (keychain
@@ -845,16 +862,19 @@ fn classify_keychain_sources(
     if crate::get_refresh_token_with_interaction_notice(registry_url, || {
         notice(AuthStorageAccessKind::RefreshToken);
     })
+    .map_err(|error| {
+        LpmError::CredentialStorage(format!("failed to read stored refresh credential: {error}"))
+    })?
     .is_some()
     {
-        return Some(CachedToken {
+        return Ok(Some(CachedToken {
             secret: SecretString::from(String::new()),
             source: TokenSource::StoredSession,
             refresh_state: RefreshState::Available,
-        });
+        }));
     }
 
-    None
+    Ok(None)
 }
 
 /// Heuristic: a token in `LPM_TOKEN` was minted by CI when the
@@ -1137,6 +1157,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_required_reports_credential_authority_failure_instead_of_auth_required() {
+        let (_home, _env) = token_classify_isolate();
+        let authority_path = crate::credential_authority::path_for_test()
+            .expect("credential authority path should resolve");
+        std::fs::create_dir_all(
+            authority_path
+                .parent()
+                .expect("credential authority path should have parent"),
+        )
+        .expect("create credential authority directory");
+        std::fs::write(&authority_path, b"not-json")
+            .expect("write corrupt credential authority store");
+        let mgr = SessionManager::new("https://authority-failure.invalid", None);
+
+        let result = mgr.token_for(AuthRequirement::TokenRequired).await;
+
+        let error = result.expect_err("credential authority failure must remain an error");
+        assert_eq!(
+            error.error_code(),
+            "credential_storage",
+            "credential authority failure must retain its local-storage classification: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_required_reports_refresh_storage_failure_instead_of_session_expired() {
+        let (_home, _env) = token_classify_isolate();
+        let authority_path = crate::credential_authority::path_for_test()
+            .expect("credential authority path should resolve");
+        std::fs::create_dir_all(
+            authority_path
+                .parent()
+                .expect("credential authority path should have parent"),
+        )
+        .expect("create credential authority directory");
+        std::fs::write(&authority_path, b"not-json")
+            .expect("write corrupt credential authority store");
+        let mgr = manager_with(TokenSource::StoredSession, "stored-access");
+        mgr.cached
+            .write()
+            .expect("cached session lock should be available")
+            .as_mut()
+            .expect("cached session should exist")
+            .refresh_state = RefreshState::Unchecked;
+
+        let result = mgr.token_for(AuthRequirement::SessionRequired).await;
+
+        let error = result.expect_err("refresh storage failure must remain an error");
+        assert_eq!(
+            error.error_code(),
+            "credential_storage",
+            "refresh storage failure must retain its local-storage classification: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn session_required_errs_for_explicit_flag() {
         let mgr = manager_with(TokenSource::ExplicitFlag, "explicit-tok");
         let res = mgr.token_for(AuthRequirement::SessionRequired).await;
@@ -1238,17 +1314,24 @@ mod tests {
     #[test]
     fn current_source_observable() {
         let mgr = manager_with(TokenSource::StoredSession, "tok");
-        assert_eq!(mgr.current_source(), Some(TokenSource::StoredSession));
+        assert_eq!(
+            mgr.current_source().unwrap(),
+            Some(TokenSource::StoredSession)
+        );
 
         let empty = manager_empty();
-        assert_eq!(empty.current_source(), None);
+        assert_eq!(empty.current_source().unwrap(), None);
     }
 
     #[test]
     fn has_token_reflects_cache() {
-        assert!(manager_with(TokenSource::StoredSession, "tok").has_token());
-        assert!(!manager_with(TokenSource::EnvVar, "").has_token());
-        assert!(!manager_empty().has_token());
+        assert!(
+            manager_with(TokenSource::StoredSession, "tok")
+                .has_token()
+                .unwrap()
+        );
+        assert!(!manager_with(TokenSource::EnvVar, "").has_token().unwrap());
+        assert!(!manager_empty().has_token().unwrap());
     }
 
     /// Lazy keychain classification helper.
@@ -1347,8 +1430,14 @@ mod tests {
                 captured.lock().unwrap().push(kind);
             });
 
-        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
-        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            mgr.current_bearer_lazy().unwrap().as_deref(),
+            Some("stored-access")
+        );
+        assert_eq!(
+            mgr.current_bearer_lazy().unwrap().as_deref(),
+            Some("stored-access")
+        );
         assert_eq!(
             notices.lock().unwrap().as_slice(),
             &[],
@@ -1369,7 +1458,7 @@ mod tests {
                 captured.lock().unwrap().push(kind);
             });
 
-        assert_eq!(mgr.current_bearer_lazy(), None);
+        assert_eq!(mgr.current_bearer_lazy().unwrap(), None);
         assert_eq!(
             notices.lock().unwrap().as_slice(),
             &[],
@@ -1391,7 +1480,10 @@ mod tests {
                 captured.lock().unwrap().push(kind);
             });
 
-        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            mgr.current_bearer_lazy().unwrap().as_deref(),
+            Some("stored-access")
+        );
         let first = mgr
             .token_for(AuthRequirement::SessionRequired)
             .await
@@ -1417,7 +1509,10 @@ mod tests {
         crate::set_token(registry, "stored-access").expect("access token should store");
 
         let mgr = SessionManager::new(registry, None);
-        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            mgr.current_bearer_lazy().unwrap().as_deref(),
+            Some("stored-access")
+        );
         assert_eq!(
             mgr.cached_source_and_refresh_state(),
             Some((TokenSource::StoredSession, RefreshState::Unchecked)),
@@ -1441,7 +1536,10 @@ mod tests {
         crate::set_refresh_token(registry, "stored-refresh").unwrap();
 
         let mgr = SessionManager::new(registry, None);
-        assert_eq!(mgr.current_bearer_lazy().as_deref(), Some("stored-access"));
+        assert_eq!(
+            mgr.current_bearer_lazy().unwrap().as_deref(),
+            Some("stored-access")
+        );
         assert_eq!(
             mgr.cached_source_and_refresh_state(),
             Some((TokenSource::StoredSession, RefreshState::Unchecked))
@@ -1538,12 +1636,12 @@ mod tests {
         // the post-classification state instead.
         let mgr = manager_with(TokenSource::StoredSession, "");
         assert_eq!(
-            mgr.current_source(),
+            mgr.current_source().unwrap(),
             Some(TokenSource::StoredSession),
             "refresh-only state must observably be StoredSession so refresh_now can proceed"
         );
         assert!(
-            !mgr.has_token(),
+            !mgr.has_token().unwrap(),
             "refresh-only state must not surface a usable bearer until refresh succeeds"
         );
         // Anonymous-allowed lookups return None (no bearer to enrich
@@ -1980,7 +2078,7 @@ mod refresh_http_tests {
         // Pre-fix invariant: cache holds the stale "at-stale" bearer
         // before the refresh attempt.
         assert!(
-            mgr.has_token(),
+            mgr.has_token().unwrap(),
             "cache should hold the stale bearer pre-call"
         );
 
@@ -1991,11 +2089,11 @@ mod refresh_http_tests {
         // Cached access token AND its in-memory cache are both wiped, so the
         // next request goes out anonymous instead of replaying a dead bearer.
         assert!(
-            !mgr.has_token(),
+            !mgr.has_token().unwrap(),
             "in-memory cache must be cleared after authoritative refresh failure"
         );
         assert_eq!(
-            mgr.current_source(),
+            mgr.current_source().unwrap(),
             None,
             "source must be cleared after authoritative refresh failure"
         );
@@ -2023,10 +2121,13 @@ mod refresh_http_tests {
         // above: only authoritative rejections clear state.
         assert!(crate::get_refresh_token(&server.uri()).is_some());
         assert!(
-            mgr.has_token(),
+            mgr.has_token().unwrap(),
             "transient 5xx must leave the cached bearer in place"
         );
-        assert_eq!(mgr.current_source(), Some(TokenSource::StoredSession));
+        assert_eq!(
+            mgr.current_source().unwrap(),
+            Some(TokenSource::StoredSession)
+        );
     }
 
     #[tokio::test]

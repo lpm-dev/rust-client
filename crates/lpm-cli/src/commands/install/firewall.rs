@@ -80,7 +80,7 @@ impl NpmFirewallPreflightClient {
     async fn for_mode(&self, mode: NpmFirewallMode) -> Result<Arc<RegistryClient>, LpmError> {
         let posture = mode.auth_posture();
         if !mode.is_enabled()
-            || self.base.has_bearer_for_posture(posture)
+            || self.base.has_bearer_for_posture(posture)?
             || !crate::oidc::registry_exchange_jwt_available()
         {
             return Ok(Arc::clone(&self.base));

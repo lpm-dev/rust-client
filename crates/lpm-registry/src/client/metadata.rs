@@ -404,7 +404,7 @@ impl RegistryClient {
     ) -> Result<reqwest::RequestBuilder, LpmError> {
         if let Some(client) = self.worker_metadata_http3_client_for(url).await? {
             let mut req = client.get(url);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
                 req = req.bearer_auth(bearer);
             }
             return Ok(Self::apply_http3_request_version(req));
@@ -783,7 +783,7 @@ impl RegistryClient {
                 .await?
                 .header("Accept", "application/x-ndjson")
                 .json(&body);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
                 req = req.bearer_auth(bearer);
             }
             let req = self.apply_worker_metadata_http_version(req, &url);
