@@ -160,7 +160,7 @@ pub(crate) async fn publish_current_project(
     }
     let metadata =
         npm_stage::fetch_package_metadata(auth.token(), &npm_name, registry.url()).await?;
-    enforce_stage_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
+    publish_npm::enforce_npm_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
     let artifact = if let Some(artifact) = file_artifact {
         artifact
     } else {
@@ -435,60 +435,6 @@ fn resolve_stage_tag(
     ("latest".to_string(), false)
 }
 
-fn enforce_stage_version_policy(
-    metadata: &serde_json::Value,
-    npm_name: &str,
-    version: &str,
-    tag_explicit: bool,
-) -> Result<(), LpmError> {
-    let versions = metadata
-        .get("versions")
-        .and_then(|value| value.as_object())
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
-                "npm metadata for {npm_name} is missing published versions"
-            ))
-        })?;
-
-    if versions.contains_key(version) {
-        return Err(LpmError::Registry(format!(
-            "version {version} already exists on npm for {npm_name}"
-        )));
-    }
-
-    let current = lpm_semver::Version::parse(version)?;
-    if current.is_prerelease() && !tag_explicit {
-        return Err(LpmError::Registry(
-            "You must specify a tag using --tag when staging a prerelease version.".into(),
-        ));
-    }
-
-    if tag_explicit {
-        return Ok(());
-    }
-
-    let highest = versions
-        .iter()
-        .filter(|(_, data)| {
-            !data
-                .get("deprecated")
-                .is_some_and(|value| value.is_string())
-        })
-        .filter_map(|(published_version, _)| lpm_semver::Version::parse(published_version).ok())
-        .filter(|published_version| !published_version.is_prerelease())
-        .max();
-
-    if let Some(highest) = highest
-        && highest >= current
-    {
-        return Err(LpmError::Registry(format!(
-            "Cannot implicitly apply the \"latest\" tag because previously published version {highest} is higher than the new version {version}. You must specify a tag using --tag."
-        )));
-    }
-
-    Ok(())
-}
-
 fn print_stage_item(item: &serde_json::Value) {
     let id = item
         .get("id")
@@ -540,7 +486,7 @@ mod tests {
     #[test]
     fn enforce_stage_version_policy_blocks_duplicate_published_version() {
         let metadata = serde_json::json!({ "versions": { "1.0.0": {} } });
-        let err = enforce_stage_version_policy(&metadata, "pkg", "1.0.0", false)
+        let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.0.0", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"));
@@ -549,7 +495,7 @@ mod tests {
     #[test]
     fn enforce_stage_version_policy_requires_explicit_tag_for_prerelease() {
         let metadata = serde_json::json!({ "versions": { "1.0.0": {} } });
-        let err = enforce_stage_version_policy(&metadata, "pkg", "1.1.0-beta.1", false)
+        let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.1.0-beta.1", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--tag"));
@@ -558,7 +504,7 @@ mod tests {
     #[test]
     fn enforce_stage_version_policy_blocks_implicit_latest_for_lower_version() {
         let metadata = serde_json::json!({ "versions": { "2.0.0": {} } });
-        let err = enforce_stage_version_policy(&metadata, "pkg", "1.9.0", false)
+        let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.9.0", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("latest"));
@@ -567,6 +513,6 @@ mod tests {
     #[test]
     fn enforce_stage_version_policy_allows_lower_version_with_explicit_tag() {
         let metadata = serde_json::json!({ "versions": { "2.0.0": {} } });
-        assert!(enforce_stage_version_policy(&metadata, "pkg", "1.9.0", true).is_ok());
+        assert!(publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.9.0", true).is_ok());
     }
 }

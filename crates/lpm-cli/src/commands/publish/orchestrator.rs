@@ -721,6 +721,17 @@ pub async fn run(
                         )));
                     }
                     let npm_tag = publish_npm::resolve_npm_tag(npm_config);
+                    let npm_tag_explicit = npm_config
+                        .and_then(|config| config.tag.as_deref())
+                        .is_some();
+                    publish_npm::preflight_npm_publish_version(
+                        &token,
+                        npm_name_str,
+                        &version,
+                        npm_tag_explicit,
+                        &registry_url,
+                    )
+                    .await?;
 
                     // OTP preemption
                     let registry_key_for_otp = match target {

@@ -13,6 +13,7 @@ use lpm_runner::lpm_json::NpmPublishConfig;
 use std::time::Duration;
 
 const NPM_PUBLISH_RESPONSE_MAX_BYTES: usize = 10 * 1024 * 1024;
+const NPM_METADATA_RESPONSE_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// Default npm registry URL.
 pub(crate) const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
@@ -290,6 +291,122 @@ pub fn resolve_npm_tag(npm_config: Option<&NpmPublishConfig>) -> String {
         .and_then(|c| c.tag.as_deref())
         .unwrap_or("latest")
         .to_string()
+}
+
+pub(crate) async fn preflight_npm_publish_version(
+    token: &str,
+    npm_name: &str,
+    version: &str,
+    tag_explicit: bool,
+    registry_url: &str,
+) -> Result<(), LpmError> {
+    let current = lpm_semver::Version::parse(version)?;
+    if current.is_prerelease() && !tag_explicit {
+        return Err(LpmError::Registry(
+            "You must specify a tag when publishing a prerelease version. Set publish.npm.tag, or use --tag with `lpm stage publish`.".into(),
+        ));
+    }
+
+    assert!(
+        !token.starts_with("lpm_"),
+        "SECURITY: LPM token must never be sent to an npm-compatible registry"
+    );
+    let client = lpm_http::client_builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
+        .build()
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to create npm metadata client: {error}"))
+        })?;
+    let encoded_name = urlencoding::encode(npm_name);
+    let url = format!("{}/{encoded_name}", registry_url.trim_end_matches('/'));
+    let response = web_auth::add_npm_web_auth_headers(
+        client
+            .get(url)
+            .header("accept", "application/vnd.npm.install-v1+json"),
+        web_auth::NPM_COMMAND_PUBLISH,
+    )
+    .bearer_auth(token)
+    .send()
+    .await
+    .map_err(|error| {
+        LpmError::Registry(format!(
+            "npm metadata preflight failed: {}",
+            lpm_http::display_error(&error)
+        ))
+    })?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    let body = lpm_http::read_body_capped(response, NPM_METADATA_RESPONSE_MAX_BYTES)
+        .await
+        .map_err(|error| LpmError::Registry(format!("npm metadata preflight {error}")))?;
+    if !status.is_success() {
+        return Err(LpmError::Registry(format!(
+            "npm metadata preflight failed with HTTP {status}"
+        )));
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body)).map_err(|error| {
+            LpmError::Registry(format!(
+                "npm metadata preflight returned invalid JSON: {error}"
+            ))
+        })?;
+    enforce_npm_version_policy(&metadata, npm_name, version, tag_explicit)
+}
+
+pub(crate) fn enforce_npm_version_policy(
+    metadata: &serde_json::Value,
+    npm_name: &str,
+    version: &str,
+    tag_explicit: bool,
+) -> Result<(), LpmError> {
+    let versions = metadata
+        .get("versions")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "npm metadata for {npm_name} is missing published versions"
+            ))
+        })?;
+
+    if versions.contains_key(version) {
+        return Err(LpmError::Registry(format!(
+            "version {version} already exists on npm for {npm_name}"
+        )));
+    }
+
+    let current = lpm_semver::Version::parse(version)?;
+    if current.is_prerelease() && !tag_explicit {
+        return Err(LpmError::Registry(
+            "You must specify a tag when publishing a prerelease version. Set publish.npm.tag, or use --tag with `lpm stage publish`.".into(),
+        ));
+    }
+    if tag_explicit {
+        return Ok(());
+    }
+
+    let highest = versions
+        .iter()
+        .filter(|(_, data)| {
+            !data
+                .get("deprecated")
+                .is_some_and(serde_json::Value::is_string)
+        })
+        .filter_map(|(published_version, _)| lpm_semver::Version::parse(published_version).ok())
+        .filter(|published_version| !published_version.is_prerelease())
+        .max();
+
+    if let Some(highest) = highest
+        && highest >= current
+    {
+        return Err(LpmError::Registry(format!(
+            "Cannot implicitly apply the \"latest\" tag because previously published version {highest} is higher than the new version {version}. Set publish.npm.tag, or use --tag with `lpm stage publish`."
+        )));
+    }
+
+    Ok(())
 }
 
 /// Publish a package to the npm registry.
