@@ -11,38 +11,14 @@
 use lpm_security::behavioral::PackageAnalysis;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Current cache format version. Bump when the cache structure changes.
 /// v2: added `dependencies` field to CacheEntry for dependency edge graph.
-/// v3: added `cached_at_unix_secs` for the M14 advisory-corpus freshness gate.
+/// v3: added a per-entry timestamp that newer readers ignore because advisory
+/// freshness is enforced independently of source-analysis reuse.
 const CACHE_VERSION: u32 = 3;
-
-/// M14: max age of a cache entry before it's treated as a miss, in
-/// seconds. The audit cache currently has no signal that lets it
-/// invalidate when the advisory corpus (OSV) ships a new CVE for an
-/// already-scanned package; a 24-hour TTL bounds the freshness gap
-/// without forcing a re-scan on every install.
-///
-/// 24 hours is the same cadence operators set their `lpm audit`
-/// cron jobs at; a TTL longer than that defeats the purpose, a TTL
-/// shorter than that re-scans every install for no benefit. Tuneable
-/// via `LPM_AUDIT_CACHE_MAX_AGE_SECS` for tests and high-frequency
-/// operators.
-const AUDIT_CACHE_ENTRY_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-
-fn audit_cache_max_age_secs() -> u64 {
-    std::env::var("LPM_AUDIT_CACHE_MAX_AGE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(AUDIT_CACHE_ENTRY_MAX_AGE_SECS)
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
 
 /// Project audit cache, stored at `.lpm/audit-cache.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,15 +43,6 @@ pub struct CacheEntry {
     /// Used by `lpm query` for `>` combinator traversal without re-parsing the lockfile.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<(String, String)>,
-    /// M14: unix seconds at which this entry was last refreshed.
-    /// Entries older than [`AUDIT_CACHE_ENTRY_MAX_AGE_SECS`] are
-    /// treated as misses so a post-publication CVE from the
-    /// advisory corpus surfaces within a day.
-    /// `#[serde(default)]` keeps v2 caches readable; a missing
-    /// field is treated as age `0` (epoch), which triggers a
-    /// guaranteed miss on the first read after upgrade.
-    #[serde(default)]
-    pub cached_at_unix_secs: u64,
 }
 
 impl ProjectAuditCache {
@@ -123,13 +90,22 @@ impl ProjectAuditCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json)
+        lpm_common::write_file_atomic_with(&path, lpm_common::AtomicWriteOptions::new(), |file| {
+            let mut writer = CappedWriter::new(
+                file,
+                lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+                "audit cache exceeds the state-file size limit",
+            );
+            serde_json::to_writer_pretty(&mut writer, self).map_err(|error| {
+                io::Error::new(
+                    error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData),
+                    error,
+                )
+            })
+        })
     }
 
-    /// Look up a cached entry. Returns the analysis if the integrity
-    /// matches AND the cached entry is within the advisory-corpus
-    /// freshness window.
+    /// Look up a cached entry. Returns the analysis if the integrity matches.
     ///
     /// M61: cache hits REQUIRE matching integrity on both sides. The
     /// pre-fix degraded mode (any side missing integrity → "trust the
@@ -138,38 +114,18 @@ impl ProjectAuditCache {
     /// were scrubbed of SRI. Any arm with `None` on either side
     /// returns `None` (cache miss).
     ///
-    /// M14: the cache previously had no signal that lets a fresh CVE
-    /// publication invalidate stale "no findings" verdicts for an
-    /// already-scanned (name, version, integrity) tuple. The
-    /// `cached_at_unix_secs` field on each entry gives a hard 24-hour
-    /// TTL — entries past the cap collapse to `None` so the next
-    /// `lpm audit` re-runs the behavioral analyzer (which is what
-    /// surfaces post-publication CVEs from the advisory corpus).
     pub fn get(&self, path: &str, integrity: Option<&str>) -> Option<&PackageAnalysis> {
         let entry = self.entries.get(path)?;
 
-        // M61 integrity gate first — a stale cache that fails the
-        // integrity check shouldn't waste time on the TTL check.
         match (integrity, &entry.integrity) {
             (Some(new), Some(cached)) if new == cached => {}
             _ => return None,
         }
 
-        // M14 freshness gate. An entry written more than
-        // `audit_cache_max_age_secs()` ago collapses to miss; the
-        // caller re-runs analysis and re-stamps the entry.
-        let now = now_unix_secs();
-        let max_age = audit_cache_max_age_secs();
-        if now.saturating_sub(entry.cached_at_unix_secs) > max_age {
-            return None;
-        }
-
         Some(&entry.analysis)
     }
 
-    /// Insert or update a cache entry. The `cached_at_unix_secs`
-    /// field is stamped here so every fresh write re-establishes the
-    /// M14 freshness window.
+    /// Insert or update a cache entry.
     pub fn insert(
         &mut self,
         path: String,
@@ -187,9 +143,42 @@ impl ProjectAuditCache {
                 integrity,
                 analysis,
                 dependencies,
-                cached_at_unix_secs: now_unix_secs(),
             },
         );
+    }
+}
+
+struct CappedWriter<'a> {
+    inner: &'a mut std::fs::File,
+    remaining: u64,
+    limit_error: &'static str,
+}
+
+impl<'a> CappedWriter<'a> {
+    fn new(inner: &'a mut std::fs::File, limit: u64, limit_error: &'static str) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit_error,
+        }
+    }
+}
+
+impl Write for CappedWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let length = u64::try_from(buffer.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "write buffer length overflow")
+        })?;
+        if length > self.remaining {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, self.limit_error));
+        }
+        let written = self.inner.write(buffer)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -313,9 +302,8 @@ mod tests {
         assert!(cache.get("node_modules/react", None).is_none());
     }
 
-    /// M14: an entry stamped now is within the TTL — cache hit.
     #[test]
-    fn get_returns_entry_when_cached_age_under_ttl() {
+    fn matching_integrity_reuses_analysis_despite_legacy_timestamp() {
         let mut cache = ProjectAuditCache::new("npm");
         cache.insert(
             "node_modules/react".into(),
@@ -325,101 +313,72 @@ mod tests {
             empty_analysis(),
             vec![],
         );
-        // insert() stamps cached_at_unix_secs to now, so the entry is
-        // within TTL and the lookup hits.
+        let mut serialized = serde_json::to_value(cache).unwrap();
+        serialized["entries"]["node_modules/react"]["cachedAtUnixSecs"] = 0.into();
+        let cache: ProjectAuditCache = serde_json::from_value(serialized).unwrap();
+
         assert!(
             cache
                 .get("node_modules/react", Some("sha512-cachehash"))
                 .is_some(),
-            "fresh cache entry must hit"
+            "advisory freshness must not expire integrity-keyed source analysis"
         );
     }
 
-    /// M14: an entry stamped at unix epoch (i.e. older than any TTL
-    /// reasonable) collapses to miss — the next `lpm audit` re-runs
-    /// behavioral analysis and re-stamps the entry, surfacing any
-    /// post-publication CVEs that landed in the corpus.
+    #[cfg(unix)]
     #[test]
-    fn get_returns_none_when_cached_entry_is_stale() {
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.entries.insert(
-            "node_modules/react".into(),
-            CacheEntry {
-                name: "react".into(),
-                version: "18.0.0".into(),
-                integrity: Some("sha512-cachehash".into()),
-                analysis: empty_analysis(),
-                dependencies: vec![],
-                // 0 = unix epoch; guaranteed to be past any TTL.
-                cached_at_unix_secs: 0,
-            },
-        );
-        assert!(
-            cache
-                .get("node_modules/react", Some("sha512-cachehash"))
-                .is_none(),
-            "stale cache entry must collapse to miss (M14 freshness gate)"
+    fn write_replaces_destination_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"sentinel").unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let cache_path = cache_path(project.path());
+        symlink(outside.path(), &cache_path).unwrap();
+
+        ProjectAuditCache::new("npm").write(project.path()).unwrap();
+
+        assert_eq!(
+            (
+                std::fs::read(outside.path()).unwrap(),
+                std::fs::symlink_metadata(cache_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+            ),
+            (b"sentinel".to_vec(), false),
+            "cache replacement must not follow a destination symlink"
         );
     }
 
-    /// M14: entries written by an older lpm release (no
-    /// `cached_at_unix_secs` field) deserialize with the serde
-    /// default of `0`, which the freshness gate treats as stale.
-    /// First read after upgrade re-runs analysis once for each
-    /// entry, then subsequent reads hit the cache normally.
     #[test]
-    fn get_returns_none_for_legacy_entry_without_cached_at_field() {
-        let mut cache = ProjectAuditCache::new("npm");
-        // Simulate a v2-shape entry (serde_json::from_str path that
-        // wouldn't have populated the new field) by overwriting the
-        // field to 0 after insert().
-        cache.insert(
-            "node_modules/legacy".into(),
-            "legacy".into(),
+    fn oversized_write_preserves_previous_readable_cache() {
+        let project = tempfile::tempdir().unwrap();
+        let previous = ProjectAuditCache::new("npm");
+        previous.write(project.path()).unwrap();
+        let cache_path = cache_path(project.path());
+        let previous_bytes = std::fs::read(&cache_path).unwrap();
+
+        let mut oversized = ProjectAuditCache::new("npm");
+        let mut analysis = empty_analysis();
+        analysis.analyzed_at = "x".repeat(lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize);
+        oversized.insert(
+            "node_modules/oversized".into(),
+            "oversized".into(),
             "1.0.0".into(),
-            Some("sha512-legacy".into()),
-            empty_analysis(),
-            vec![],
-        );
-        cache
-            .entries
-            .get_mut("node_modules/legacy")
-            .unwrap()
-            .cached_at_unix_secs = 0;
-        assert!(
-            cache
-                .get("node_modules/legacy", Some("sha512-legacy"))
-                .is_none(),
-            "legacy entry missing the freshness field must collapse to miss after upgrade"
-        );
-    }
-
-    /// M14: `LPM_AUDIT_CACHE_MAX_AGE_SECS` env override lets tests
-    /// and high-frequency operators tighten the gate.
-    #[test]
-    fn freshness_gate_honours_env_override() {
-        let _g = crate::test_env::ScopedEnv::set([("LPM_AUDIT_CACHE_MAX_AGE_SECS", "1".into())]);
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
             Some("sha512-cachehash".into()),
-            empty_analysis(),
+            analysis,
             vec![],
         );
-        // Backdate the entry by 10 seconds — past the 1-second env-overridden TTL.
-        let now = now_unix_secs();
-        cache
-            .entries
-            .get_mut("node_modules/react")
-            .unwrap()
-            .cached_at_unix_secs = now.saturating_sub(10);
-        assert!(
-            cache
-                .get("node_modules/react", Some("sha512-cachehash"))
-                .is_none(),
-            "env-overridden 1s TTL must invalidate a 10s-old entry"
+
+        let result = oversized.write(project.path());
+        let previous_preserved = std::fs::read(cache_path).unwrap() == previous_bytes;
+
+        assert_eq!(
+            (result.is_err(), previous_preserved),
+            (true, true),
+            "an over-cap cache must fail before replacing the prior cache"
         );
     }
 }
