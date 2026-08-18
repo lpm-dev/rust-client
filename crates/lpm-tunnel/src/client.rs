@@ -3021,14 +3021,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refreshed_bearer_rejected_again_stops_without_a_second_refresh() {
+    async fn refreshed_bearer_rejected_again_without_response_body_stops_without_a_second_refresh()
+    {
         let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_address = relay_listener.local_addr().unwrap();
         let seen_tokens = Arc::new(Mutex::new(Vec::new()));
         let relay_tokens = Arc::clone(&seen_tokens);
         let relay = tokio::spawn(async move {
-            for _ in 0..2 {
-                let rejection = br#"{"error":"invalid access token","code":"auth_failed"}"#;
+            for attempt in 0..2 {
+                let rejection: &[u8] = if attempt == 0 {
+                    br#"{"error":"invalid access token","code":"auth_failed"}"#
+                } else {
+                    b""
+                };
                 let token = reject_next_tunnel_request(&relay_listener, rejection).await;
                 relay_tokens.lock().unwrap().push(token);
             }
@@ -3045,7 +3050,14 @@ mod tests {
             .unwrap_err();
         relay.await.unwrap();
 
-        assert!(error.to_string().contains("auth_failed"));
+        assert!(
+            matches!(
+                &error,
+                LpmError::Tunnel(message)
+                    if message == "relay rejected connection: relay rejected connection"
+            ),
+            "unexpected second relay rejection: {error}"
+        );
         assert_eq!(refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             *seen_tokens.lock().unwrap(),
