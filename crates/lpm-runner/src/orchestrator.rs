@@ -2894,14 +2894,18 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
                 }
             }
             let pid_deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while !pid_path.exists() && std::time::Instant::now() < pid_deadline {
+            let pid = loop {
+                if let Ok(content) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = content.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < pid_deadline,
+                    "service PID file was not populated before the deadline"
+                );
                 std::thread::sleep(Duration::from_millis(10));
-            }
-            let pid = std::fs::read_to_string(&pid_path)
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap();
+            };
             command_tx
                 .send(OrchestratorCommand::StopService(0))
                 .unwrap();
