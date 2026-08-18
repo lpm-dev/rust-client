@@ -746,35 +746,16 @@ impl SessionManager {
         rejected_access: Option<&str>,
         rejected_refresh: &str,
     ) -> Result<(), LpmError> {
-        let result = (|| {
-            let current_access = self.load_access_token()?;
-            let current_refresh =
-                crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
-                    self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken)
-                })
-                .map_err(|error| {
-                    LpmError::CredentialStorage(format!(
-                        "failed to read stored refresh credential: {error}"
-                    ))
-                })?;
-
-            let access_result = if current_access.as_deref() == rejected_access {
-                let expiry_result = crate::clear_token_expiry_checked(&self.registry_url);
-                let access_result = crate::clear_stored_access_token_unlocked(&self.registry_url);
-                crate::combine_clear_results(access_result, expiry_result)
-            } else {
-                Ok(())
-            };
-            let refresh_result = if current_refresh.as_deref() == Some(rejected_refresh) {
-                crate::clear_stored_refresh_token_unlocked(&self.registry_url)
-            } else {
-                Ok(())
-            };
-
-            crate::combine_clear_results(access_result, refresh_result).map_err(|error| {
-                LpmError::CredentialStorage(format!("failed to clear rejected session: {error}"))
-            })
-        })();
+        let result = crate::clear_rejected_refresh_session_if_current(
+            &self.registry_url,
+            rejected_access,
+            rejected_refresh,
+            || self.emit_auth_storage_notice(AuthStorageAccessKind::AccessToken),
+            || self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken),
+        )
+        .map_err(|error| {
+            LpmError::CredentialStorage(format!("failed to clear rejected session: {error}"))
+        });
         self.clear_cached_session();
         result
     }
@@ -2268,6 +2249,89 @@ mod refresh_http_tests {
                 && stored_refresh.is_none()
                 && !crate::should_refresh_session_access_token(&server.uri()),
             "a rejected refresh must preserve a peer-replaced access token while removing only the rejected refresh token: result={result:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_refresh_cleanup_preserves_access_replaced_after_comparison() {
+        let tempdir = tempfile::tempdir().expect("create test home tempdir");
+        let contention_marker = tempdir.path().join("metadata-lock-contention");
+        let _env = crate::test_env::ScopedEnv::set([
+            ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_FORCE_FILE_AUTH", "1".into()),
+            ("LPM_TEST_FAST_SCRYPT", "1".into()),
+            (
+                "LPM_TEST_LOCK_CONTENTION_MARKER",
+                contention_marker.as_os_str().to_owned(),
+            ),
+        ]);
+        let registry = "https://registry.example";
+        let manager = manager_for(registry);
+        crate::set_token(registry, "rejected-access").expect("seed rejected access token");
+        crate::set_refresh_token(registry, "rejected-refresh")
+            .expect("seed rejected refresh token");
+
+        let metadata_lock_path = crate::token_expiry_lock_path().unwrap();
+        let metadata_lock_for_holder = metadata_lock_path.clone();
+        let (metadata_locked_tx, metadata_locked_rx) = std::sync::mpsc::channel();
+        let (release_metadata_tx, release_metadata_rx) = std::sync::mpsc::channel();
+        let metadata_holder = std::thread::spawn(move || {
+            lpm_common::paths::with_exclusive_lock(metadata_lock_for_holder, || {
+                metadata_locked_tx.send(()).unwrap();
+                release_metadata_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+            .unwrap();
+        });
+        metadata_locked_rx.recv().unwrap();
+
+        let (invalidation_tx, invalidation_rx) = std::sync::mpsc::channel();
+        let invalidator =
+            std::thread::spawn(move || {
+                invalidation_tx
+                    .send(manager.clear_rejected_session_if_current(
+                        Some("rejected-access"),
+                        "rejected-refresh",
+                    ))
+                    .unwrap();
+            });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !contention_marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&contention_marker).unwrap(),
+            metadata_lock_path.to_string_lossy(),
+        );
+
+        let (replacement_tx, replacement_rx) = std::sync::mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            replacement_tx
+                .send(crate::set_token(registry, "replacement-access"))
+                .unwrap();
+        });
+        let replacement_finished_early =
+            match replacement_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(result) => {
+                    result.unwrap();
+                    true
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                Err(error) => panic!("replacement writer disconnected: {error}"),
+            };
+
+        release_metadata_tx.send(()).unwrap();
+        metadata_holder.join().unwrap();
+        invalidation_rx.recv().unwrap().unwrap();
+        invalidator.join().unwrap();
+        if !replacement_finished_early {
+            replacement_rx.recv().unwrap().unwrap();
+        }
+        replacement.join().unwrap();
+
+        assert_eq!(
+            crate::get_stored_access_token(registry).as_deref(),
+            Some("replacement-access")
         );
     }
 

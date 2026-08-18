@@ -539,27 +539,78 @@ fn combine_clear_results(
 }
 
 pub(crate) fn clear_stored_access_token_unlocked(registry_url: &str) -> Result<(), String> {
+    with_credential_store_lock(|| clear_stored_access_token_under_store_lock(registry_url))
+}
+
+fn clear_stored_access_token_under_store_lock(registry_url: &str) -> Result<(), String> {
     #[cfg(test)]
     {
-        clear_stored_credential(registry_url, CredentialKind::Access, || Ok(()))
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || Ok(()))
     }
 
     #[cfg(not(test))]
     {
-        clear_token(registry_url)
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || {
+            clear_token_from_keychain(registry_url)
+        })
     }
 }
 
 pub(crate) fn clear_stored_refresh_token_unlocked(registry_url: &str) -> Result<(), String> {
+    with_credential_store_lock(|| clear_stored_refresh_token_under_store_lock(registry_url))
+}
+
+fn clear_stored_refresh_token_under_store_lock(registry_url: &str) -> Result<(), String> {
     #[cfg(test)]
     {
-        clear_stored_credential(registry_url, CredentialKind::Refresh, || Ok(()))
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || Ok(()))
     }
 
     #[cfg(not(test))]
     {
-        clear_refresh_token(registry_url)
+        let account = scoped_refresh_account(registry_url);
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || {
+            clear_password_from_keychain_account(&account)
+        })
     }
+}
+
+pub(crate) fn clear_rejected_refresh_session_if_current(
+    registry_url: &str,
+    rejected_access: Option<&str>,
+    rejected_refresh: &str,
+    access_notice: impl FnOnce(),
+    refresh_notice: impl FnOnce(),
+) -> Result<(), String> {
+    with_credential_store_lock(|| {
+        let current_access = get_stored_credential_with_backend_unlocked(
+            registry_url,
+            CredentialKind::Access,
+            access_notice,
+        )?
+        .map(|credential| credential.token);
+        let current_refresh = get_stored_credential_with_backend_unlocked(
+            registry_url,
+            CredentialKind::Refresh,
+            refresh_notice,
+        )?
+        .map(|credential| credential.token);
+
+        let access_result = if current_access.as_deref() == rejected_access {
+            let expiry_result = clear_token_expiry_checked(registry_url);
+            let access_result = clear_stored_access_token_under_store_lock(registry_url);
+            combine_clear_results(access_result, expiry_result)
+        } else {
+            Ok(())
+        };
+        let refresh_result = if current_refresh.as_deref() == Some(rejected_refresh) {
+            clear_stored_refresh_token_under_store_lock(registry_url)
+        } else {
+            Ok(())
+        };
+
+        combine_clear_results(access_result, refresh_result)
+    })
 }
 
 pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), String> {
