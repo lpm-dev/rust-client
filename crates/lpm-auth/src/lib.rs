@@ -1708,7 +1708,8 @@ pub(crate) fn session_lock_path(registry_url: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn validate_refresh_backed_session(
+/// Validate the credentials and expiry required for a refresh-backed session.
+pub fn validate_refresh_backed_session(
     access_token: &str,
     refresh_token: &str,
     expires_at: &str,
@@ -1716,8 +1717,12 @@ fn validate_refresh_backed_session(
     if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
         return Err("session response contained an empty credential".to_string());
     }
-    chrono::DateTime::parse_from_rfc3339(expires_at)
-        .map_err(|error| format!("invalid session access-token expiry: {error}"))?;
+    let expiry = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map_err(|error| format!("invalid session access-token expiry: {error}"))?
+        .with_timezone(&chrono::Utc);
+    if expiry <= chrono::Utc::now() {
+        return Err("session access-token expiry is not in the future".to_string());
+    }
     Ok(())
 }
 
