@@ -331,6 +331,13 @@ mod tests {
         (format!("http://{address}/asset"), server)
     }
 
+    async fn join_server<T: Send + 'static>(server: std::thread::JoinHandle<T>) -> T {
+        tokio::task::spawn_blocking(move || server.join())
+            .await
+            .expect("server join task failed")
+            .expect("server thread panicked")
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn staged_asset_download_hashes_to_disk_without_retaining_the_body() {
         let (url, server) = spawn_fixed_body_server(2 * 1024 * 1024);
@@ -342,7 +349,7 @@ mod tests {
             .await
             .unwrap()
             .expect("asset must exist");
-        server.join().unwrap().unwrap();
+        join_server(server).await.unwrap();
 
         assert_eq!(staged.byte_len, 2 * 1024 * 1024);
         assert_eq!(
@@ -367,7 +374,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn staged_asset_download_removes_partial_file_when_stream_exceeds_cap() {
-        let (url, server) = spawn_fixed_body_server_with_length(2 * 1024 * 1024, None);
+        let (url, server) = spawn_fixed_body_server_with_length(64 * 1024 * 1024, None);
         let client = super::super::release_http_client().unwrap();
         let destination_dir = tempdir().unwrap();
         let current_exe = destination_dir.path().join("lpm");
@@ -375,7 +382,7 @@ mod tests {
         let error = fetch_asset_to_staged_file(&client, &url, 1024 * 1024, &current_exe)
             .await
             .expect_err("a close-delimited body must still obey the cap");
-        server.join().unwrap().unwrap();
+        join_server(server).await.unwrap();
 
         assert!(error.to_string().contains("mid-stream"), "error: {error}");
         assert_eq!(
@@ -404,7 +411,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         let error = fetch_bounded(&client, &url, 1024).await.unwrap_err();
-        server.join().unwrap();
+        join_server(server).await;
         let rendered = error.to_string();
 
         assert!(!rendered.contains(secret), "secret leaked in: {rendered}");
@@ -477,7 +484,7 @@ mod tests {
         }
         std::hint::black_box(&retained);
         let peak_after = peak_rss_bytes();
-        server.join().unwrap().unwrap();
+        join_server(server).await.unwrap();
         let peak_delta = peak_after.saturating_sub(peak_before);
 
         eprintln!(
