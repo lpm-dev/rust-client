@@ -217,9 +217,9 @@ pub async fn run(
                 login_result.map_err(|e| LpmError::Registry(format!("swift login failed: {e}")))?;
 
             if !login_status.success() {
-                install_ui::warn(
-                    "Token login failed — you may need to run: swift package-registry login manually",
-                );
+                return Err(LpmError::Registry(format!(
+                    "swift package-registry login failed with status {login_status}"
+                )));
             } else if !json_output {
                 install_ui::done("Authentication configured");
             }

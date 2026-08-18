@@ -418,6 +418,34 @@ async fn swift_registry_propagates_a_stored_session_refresh_failure() {
 }
 
 #[tokio::test]
+async fn swift_registry_fails_when_swiftpm_rejects_the_resolved_bearer() {
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url().replacen("http://", "https://", 1);
+    let project = TempProject::empty(r#"{"name":"swift-auth","version":"1.0.0"}"#);
+    let mut command = lpm(&project);
+    configure_fake_swift(&mut command, &project, &[], 0);
+    command.env("LPM_TEST_SWIFT_LOGIN_EXIT_CODE", "1");
+
+    let output = command
+        .args([
+            "--registry",
+            &registry_url,
+            "--token",
+            "rejected-swift-token",
+            "swift-registry",
+        ])
+        .output()
+        .expect("run swift-registry with a bearer rejected by SwiftPM");
+
+    assert!(!output.status.success());
+    assert!(
+        combined_output(&output).contains("swift package-registry login failed"),
+        "swift-registry hid the failed authentication step:\n{}",
+        combined_output(&output)
+    );
+}
+
+#[tokio::test]
 async fn swift_install_yes_selects_first_eligible_target_without_prompting() {
     let mock = MockRegistry::start().await;
     let cert = mount_swift_package(&mock).await;

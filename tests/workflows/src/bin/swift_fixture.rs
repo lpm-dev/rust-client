@@ -60,6 +60,11 @@ fn main() {
                 )
                 .expect("write Swift login arguments");
             }
+            let exit_code = std::env::var("LPM_TEST_SWIFT_LOGIN_EXIT_CODE")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            std::process::exit(exit_code);
         }
         _ => std::process::exit(64),
     }
