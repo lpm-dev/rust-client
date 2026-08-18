@@ -8,7 +8,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry};
 
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
     use chrono::SecondsFormat;
@@ -45,6 +45,32 @@ fn write_minimal_lockfile_with_source(
              [[packages]]\nname = \"{name}\"\nversion = \"{version}\"\n\
              source = \"{source}\"\n",
         ),
+    );
+}
+
+#[test]
+fn outdated_rejects_invalid_lpm_dependency_names() {
+    let invalid_name = "@lpm.dev/invalid name";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"invalid-outdated","version":"1.0.0","dependencies":{{"{invalid_name}":"^1.0.0"}}}}"#
+    ));
+
+    let out = lpm(&project)
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated with invalid dependency name");
+    assert!(
+        !out.status.success(),
+        "invalid dependency must fail outdated"
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON failure envelope");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains(invalid_name)),
+        "error must name the invalid dependency: {envelope}",
     );
 }
 
@@ -178,6 +204,75 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     assert_eq!(entry["latest"], serde_json::json!("9.9.9"));
     assert_eq!(entry["section"], serde_json::json!("dependencies"));
     assert_eq!(entry["outdated"], serde_json::json!(true));
+}
+
+#[tokio::test]
+async fn outdated_resolves_npm_aliases_through_their_canonical_package() {
+    let project = TempProject::empty(
+        r#"{"name":"alias-outdated","version":"1.0.0","dependencies":{"strip-ansi-cjs":"npm:strip-ansi@^6.0.0"}}"#,
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile
+        .root_aliases
+        .insert("strip-ansi-cjs".to_string(), "strip-ansi".to_string());
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "strip-ansi".to_string(),
+        version: "6.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[("strip-ansi-cjs", "strip-ansi", "6.0.0")],
+    );
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write alias lockfile");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "strip-ansi",
+        "6.1.0",
+        &[
+            (
+                "6.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("strip-ansi", "6.0.0")),
+            ),
+            (
+                "6.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("strip-ansi", "6.1.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for npm alias");
+    assert!(
+        out.status.success(),
+        "alias lookup must succeed; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(
+        envelope["packages"][0],
+        serde_json::json!({
+            "name": "strip-ansi-cjs",
+            "current": "6.0.0",
+            "wanted": "6.1.0",
+            "wanted_range": "npm:strip-ansi@^6.0.0",
+            "latest": "6.1.0",
+            "section": "dependencies",
+            "outdated": true,
+        }),
+    );
 }
 
 #[tokio::test]

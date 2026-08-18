@@ -1,4 +1,5 @@
 use crate::install_ui;
+use crate::manifest_dependency::ManifestDependencySpec;
 use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
 use crate::prompt::prompt_err;
 #[cfg(test)]
@@ -8,8 +9,7 @@ use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::PackageMetadata;
 use lpm_registry::RegistryClient;
-use lpm_resolver::specifier::Specifier;
-use lpm_semver::Version;
+use lpm_semver::{Version, VersionReq};
 use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -84,51 +84,6 @@ enum TargetKind {
 enum MetadataLookup {
     Lpm(PackageName),
     Npm(NpmMetadataSource),
-}
-
-#[derive(Debug, Clone)]
-enum ManifestDependencySpec {
-    Plain,
-    NpmAlias { target: String },
-}
-
-impl ManifestDependencySpec {
-    fn from_manifest_value(name: &str, value: &str) -> Result<(Self, String), LpmError> {
-        if value.trim_start().starts_with("npm:") {
-            return match Specifier::parse(value) {
-                Ok(Specifier::NpmAlias { target, range }) => Ok((Self::NpmAlias { target }, range)),
-                Ok(_) => Err(LpmError::Script(format!(
-                    "dependency `{name}` uses invalid npm alias spec `{value}`"
-                ))),
-                Err(err) => Err(LpmError::Script(format!(
-                    "dependency `{name}` uses invalid npm alias spec `{value}`: {err}"
-                ))),
-            };
-        }
-
-        Ok((Self::Plain, value.to_string()))
-    }
-
-    fn render_new_value(&self, new_range: &str) -> String {
-        match self {
-            Self::Plain => new_range.to_string(),
-            Self::NpmAlias { target } => format!("npm:{target}@{new_range}"),
-        }
-    }
-}
-
-fn dependency_lookup_name(
-    manifest_name: &str,
-    manifest_spec: &ManifestDependencySpec,
-    lockfile: Option<&lpm_lockfile::Lockfile>,
-) -> String {
-    match manifest_spec {
-        ManifestDependencySpec::NpmAlias { target } => target.clone(),
-        ManifestDependencySpec::Plain => lockfile
-            .and_then(|lf| lf.root_aliases.get(manifest_name))
-            .cloned()
-            .unwrap_or_else(|| manifest_name.to_string()),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -224,20 +179,23 @@ pub async fn run(
     for (name, manifest_value, is_dev) in all_deps {
         let (manifest_spec, range) =
             ManifestDependencySpec::from_manifest_value(&name, &manifest_value)?;
-        let lookup_name = dependency_lookup_name(&name, &manifest_spec, lockfile.as_ref());
+        let lookup_name = manifest_spec.lookup_name(&name, lockfile.as_ref());
 
         if lookup_name.starts_with("@lpm.dev/") {
-            if let Ok(pkg_name) = PackageName::parse(&lookup_name) {
-                upgradeable_deps.push(UpgradeDependency {
-                    name,
-                    lookup_name,
-                    range,
-                    manifest_value,
-                    is_dev,
-                    lookup: MetadataLookup::Lpm(pkg_name),
-                    manifest_spec,
-                });
-            }
+            let pkg_name = PackageName::parse(&lookup_name).map_err(|error| {
+                LpmError::Script(format!(
+                    "invalid LPM dependency name `{name}` (registry name `{lookup_name}`): {error}"
+                ))
+            })?;
+            upgradeable_deps.push(UpgradeDependency {
+                name,
+                lookup_name,
+                range,
+                manifest_value,
+                is_dev,
+                lookup: MetadataLookup::Lpm(pkg_name),
+                manifest_spec,
+            });
             continue;
         }
 
@@ -281,7 +239,7 @@ pub async fn run(
     let fetch_results = futures::future::join_all(fetch_futures).await;
 
     let mut candidates: Vec<EnrichedCandidate> = Vec::new();
-    let mut fetch_errors: usize = 0;
+    let mut fetch_failures = Vec::new();
 
     for (dep, metadata_result) in fetch_results {
         let metadata = match metadata_result {
@@ -293,7 +251,7 @@ pub async fn run(
                     dep.lookup_name,
                     e
                 );
-                fetch_errors += 1;
+                fetch_failures.push(format!("{}: {e}", dep.name));
                 continue;
             }
         };
@@ -346,8 +304,13 @@ pub async fn run(
         match mode {
             ResolvedMode::NonInteractive => {
                 // Today's behavior: single candidate per dep
-                let (target_version, new_range) =
-                    compute_upgrade(&dep.range, &latest, &available_versions, major);
+                let (target_version, new_range) = compute_upgrade(
+                    &dep.range,
+                    installed_ver,
+                    &latest,
+                    &available_versions,
+                    major,
+                );
                 let target_version = match target_version {
                     Some(v) => v,
                     None => continue,
@@ -388,10 +351,20 @@ pub async fn run(
             }
             ResolvedMode::Interactive => {
                 // Dual-row mode: compute within-major AND absolute-latest.
-                let (within_target, within_range) =
-                    compute_upgrade(&dep.range, &latest, &available_versions, false);
-                let (abs_target, abs_range) =
-                    compute_upgrade(&dep.range, &latest, &available_versions, true);
+                let (within_target, within_range) = compute_upgrade(
+                    &dep.range,
+                    installed_ver,
+                    &latest,
+                    &available_versions,
+                    false,
+                );
+                let (abs_target, abs_range) = compute_upgrade(
+                    &dep.range,
+                    installed_ver,
+                    &latest,
+                    &available_versions,
+                    true,
+                );
 
                 let from =
                     installed_ver.map_or_else(|| version_from_range(&dep.range), str::to_string);
@@ -456,30 +429,23 @@ pub async fn run(
         }
     }
 
+    if !fetch_failures.is_empty() {
+        return Err(LpmError::Registry(format!(
+            "could not determine upgrade status for {} package(s): {}",
+            fetch_failures.len(),
+            fetch_failures.join("; ")
+        )));
+    }
+    let fetch_errors = 0;
+
     // Sort for deterministic output
     candidates.sort_by(|a, b| {
         a.name.cmp(&b.name).then(a.to.cmp(&b.to)) // within-major first since it's lower
     });
 
-    // Warn about fetch errors
-    if fetch_errors > 0 && !json_output {
-        install_ui::warn_untrusted(&format!(
-            "Could not check {} package(s) (network errors)",
-            fetch_errors
-        ));
-    }
-
     if candidates.is_empty() {
         if json_output {
-            let mut json = serde_json::json!({
-                "success": true,
-                "dry_run": dry_run,
-                "upgraded": 0,
-                "packages": [],
-                "fetch_errors": fetch_errors,
-            });
-            attach_skipped_private(&mut json, &skipped_private);
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            emit_upgrade_json(&[], dry_run, fetch_errors, &skipped_private)?;
         } else {
             let message = if requested_packages.is_empty() {
                 "All checked package.json dependencies are up to date"
@@ -513,20 +479,8 @@ pub async fn run(
     // ── Display + dry-run gate ──────────────────────────────────────
 
     if json_output {
-        let pkgs: Vec<serde_json::Value> = deduped.iter().map(candidate_to_json).collect();
-        let mut json = serde_json::json!({
-            "success": true,
-            "dry_run": dry_run,
-            "upgraded": deduped.len(),
-            "packages": pkgs,
-            "fetch_errors": fetch_errors,
-        });
-        attach_skipped_private(&mut json, &skipped_private);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json).unwrap_or_default()
-        );
         if dry_run {
+            emit_upgrade_json(&deduped, true, fetch_errors, &skipped_private)?;
             return Ok(());
         }
     } else {
@@ -627,7 +581,8 @@ pub async fn run(
                     remove_optional_file(&lockfile_binary_path)?;
                 }
 
-                let install_result = crate::commands::install::run_with_options(
+                let lpm_root = lpm_common::LpmRoot::from_env()?;
+                let install_result = crate::commands::install::run_with_options_with_lpm_root(
                     client,
                     project_dir,
                     json_output,
@@ -659,6 +614,9 @@ pub async fn run(
                     false, // audit_after_install: internal pipeline never runs audit
                     false, // timing: upgrade does not expose install's --timing flag
                     &[],
+                    !json_output,
+                    false,
+                    lpm_root,
                 )
                 .await;
                 if let Err(error) = install_result {
@@ -678,7 +636,9 @@ pub async fn run(
 
     install_result?;
 
-    if !json_output {
+    if json_output {
+        emit_upgrade_json(&deduped, false, fetch_errors, &skipped_private)?;
+    } else {
         install_ui::done("Updated package.json, lpm.lock, node_modules");
         install_ui::done_untrusted(&format!(
             "Done · upgraded {} {} in {}",
@@ -717,6 +677,28 @@ async fn fetch_metadata(
             client.get_npm_package_metadata_proxy_only(name).await
         }
     }
+}
+
+fn emit_upgrade_json(
+    candidates: &[EnrichedCandidate],
+    dry_run: bool,
+    fetch_errors: usize,
+    skipped_private: &[String],
+) -> Result<(), LpmError> {
+    let packages: Vec<_> = candidates.iter().map(candidate_to_json).collect();
+    let mut json = serde_json::json!({
+        "success": true,
+        "dry_run": dry_run,
+        "upgraded": candidates.len(),
+        "packages": packages,
+        "fetch_errors": fetch_errors,
+    });
+    attach_skipped_private(&mut json, skipped_private);
+    let encoded = serde_json::to_string_pretty(&json).map_err(|error| {
+        LpmError::Script(format!("failed to serialize upgrade result: {error}"))
+    })?;
+    println!("{encoded}");
+    Ok(())
 }
 
 fn attach_skipped_private(json: &mut serde_json::Value, skipped_private: &[String]) {
@@ -1025,34 +1007,41 @@ fn filter_requested_deps(
 /// In major mode, uses the absolute latest.
 fn compute_upgrade(
     current_range: &str,
+    installed_version: Option<&str>,
     latest: &str,
     available_versions: &[String],
     major: bool,
 ) -> (Option<String>, String) {
-    let prefix = if current_range.starts_with('^') {
-        "^"
-    } else if current_range.starts_with('~') {
-        "~"
-    } else {
-        ""
-    };
+    let simple_range = simple_version_range(current_range);
 
     if major {
+        let prefix = simple_range.map_or("", |(prefix, _)| prefix);
         let new_range = format!("{prefix}{latest}");
         return (Some(latest.to_string()), new_range);
     }
 
-    let range_body = current_range.trim_start_matches(['^', '~']);
-    let current_major = range_body
-        .split('.')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok());
+    let current_major = installed_version
+        .and_then(|version| Version::parse(version).ok())
+        .map(|version| version.major())
+        .or_else(|| {
+            let requirement = VersionReq::parse(current_range).ok()?;
+            available_versions
+                .iter()
+                .filter_map(|version| Version::parse(version).ok())
+                .filter(|version| !version.is_prerelease() && requirement.matches(version))
+                .max()
+                .map(|version| version.major())
+        })
+        .or_else(|| {
+            simple_range
+                .and_then(|(_, version)| Version::parse(version).ok())
+                .map(|version| version.major())
+        });
 
     let current_major = match current_major {
         Some(m) => m,
         None => {
-            let new_range = format!("{prefix}{latest}");
-            return (Some(latest.to_string()), new_range);
+            return (Some(latest.to_string()), current_range.to_string());
         }
     };
 
@@ -1069,9 +1058,24 @@ fn compute_upgrade(
     lpm_semver::sort_versions(&mut same_major_versions);
     let best = same_major_versions.last().unwrap();
     let best_str = best.to_string();
-    let new_range = format!("{prefix}{best_str}");
+    let new_range = simple_range.map_or_else(
+        || current_range.to_string(),
+        |(prefix, _)| format!("{prefix}{best_str}"),
+    );
 
     (Some(best_str), new_range)
+}
+
+fn simple_version_range(range: &str) -> Option<(&str, &str)> {
+    let trimmed = range.trim();
+    let (prefix, version) = if let Some(version) = trimmed.strip_prefix('^') {
+        ("^", version)
+    } else if let Some(version) = trimmed.strip_prefix('~') {
+        ("~", version)
+    } else {
+        ("", trimmed)
+    };
+    Version::parse(version).ok().map(|_| (prefix, version))
 }
 
 /// Extract a best-effort version string from a range like `"^1.2.0"`.
@@ -1165,7 +1169,7 @@ mod tests {
     #[test]
     fn default_mode_stays_within_major() {
         let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
-        let (target, new_range) = compute_upgrade("^1.2.0", "2.0.0", &available, false);
+        let (target, new_range) = compute_upgrade("^1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
         assert_eq!(new_range, "^1.5.0");
     }
@@ -1173,7 +1177,7 @@ mod tests {
     #[test]
     fn major_mode_jumps_to_latest() {
         let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
-        let (target, new_range) = compute_upgrade("^1.2.0", "2.0.0", &available, true);
+        let (target, new_range) = compute_upgrade("^1.2.0", None, "2.0.0", &available, true);
         assert_eq!(target, Some("2.0.0".to_string()));
         assert_eq!(new_range, "^2.0.0");
     }
@@ -1181,7 +1185,7 @@ mod tests {
     #[test]
     fn default_mode_same_major_as_latest() {
         let available = vec!["2.0.0".into(), "2.1.0".into(), "2.3.0".into()];
-        let (target, new_range) = compute_upgrade("^2.0.0", "2.3.0", &available, false);
+        let (target, new_range) = compute_upgrade("^2.0.0", None, "2.3.0", &available, false);
         assert_eq!(target, Some("2.3.0".to_string()));
         assert_eq!(new_range, "^2.3.0");
     }
@@ -1189,7 +1193,7 @@ mod tests {
     #[test]
     fn default_mode_tilde_prefix_preserved() {
         let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
-        let (target, new_range) = compute_upgrade("~1.2.0", "2.0.0", &available, false);
+        let (target, new_range) = compute_upgrade("~1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
         assert_eq!(new_range, "~1.5.0");
     }
@@ -1197,7 +1201,7 @@ mod tests {
     #[test]
     fn default_mode_no_prefix() {
         let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
-        let (target, new_range) = compute_upgrade("1.2.0", "2.0.0", &available, false);
+        let (target, new_range) = compute_upgrade("1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
         assert_eq!(new_range, "1.5.0");
     }
@@ -1210,8 +1214,20 @@ mod tests {
             "1.5.0".into(),
             "2.0.0".into(),
         ];
-        let (target, _) = compute_upgrade("^1.2.0", "2.0.0", &available, false);
+        let (target, _) = compute_upgrade("^1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
+    }
+
+    #[test]
+    fn default_mode_keeps_complex_ranges_within_the_current_major() {
+        let available = vec!["1.9.0".into(), "1.9.1".into(), "2.0.0".into()];
+
+        let result = compute_upgrade(">=1.0.0 <2.0.0", Some("1.9.0"), "2.0.0", &available, false);
+
+        assert_eq!(
+            result,
+            (Some("1.9.1".to_string()), ">=1.0.0 <2.0.0".to_string())
+        );
     }
 
     // ── resolve_mode ────────────────────────────────────────────────

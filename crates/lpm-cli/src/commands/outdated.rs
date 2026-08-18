@@ -1,4 +1,5 @@
 use crate::install_ui;
+use crate::manifest_dependency::ManifestDependencySpec;
 use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
@@ -98,11 +99,16 @@ pub async fn run(
     let mut skipped_private: BTreeSet<String> = BTreeSet::new();
 
     for dep in dep_entries {
-        let metadata = if dep.name.starts_with("@lpm.dev/") {
-            let pkg_name = match PackageName::parse(&dep.name) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
+        let (manifest_spec, version_range) =
+            ManifestDependencySpec::from_manifest_value(&dep.name, &dep.range)?;
+        let lookup_name = manifest_spec.lookup_name(&dep.name, lockfile.as_ref());
+        let metadata = if lookup_name.starts_with("@lpm.dev/") {
+            let pkg_name = PackageName::parse(&lookup_name).map_err(|error| {
+                LpmError::Script(format!(
+                    "invalid LPM dependency name `{}` (registry name `{lookup_name}`): {error}",
+                    dep.name
+                ))
+            })?;
             client.get_package_metadata(&pkg_name).await
         } else if include_npm {
             // Only query metadata endpoints that the lockfile already
@@ -110,12 +116,14 @@ pub async fn run(
             // configured LPM registry worker. Unknown/custom sources are
             // skipped so private package names are not disclosed to a new
             // service.
-            match lockfile_npm_metadata_source(lockfile.as_ref(), &dep.name, client) {
+            match lockfile_npm_metadata_source(lockfile.as_ref(), &lookup_name, client) {
                 Some(NpmMetadataSource::PublicNpm) => {
-                    client.get_npm_package_metadata(&dep.name).await
+                    client.get_npm_package_metadata(&lookup_name).await
                 }
                 Some(NpmMetadataSource::ConfiguredRegistry) => {
-                    client.get_npm_package_metadata_proxy_only(&dep.name).await
+                    client
+                        .get_npm_package_metadata_proxy_only(&lookup_name)
+                        .await
                 }
                 None => {
                     skipped_private.insert(dep.name.clone());
@@ -128,9 +136,11 @@ pub async fn run(
 
         match metadata {
             Ok(metadata) => {
-                let installed = lockfile
-                    .as_ref()
-                    .and_then(|lf| lf.find_package(&dep.name).map(|p| p.version.clone()));
+                let installed = lockfile.as_ref().and_then(|lockfile| {
+                    lockfile
+                        .find_package(&lookup_name)
+                        .map(|package| package.version.clone())
+                });
                 let latest = crate::release_age_selection::latest_allowed_version(
                     &metadata,
                     &release_age_policy,
@@ -144,7 +154,7 @@ pub async fn run(
                 });
                 let wanted = crate::release_age_selection::resolve_version_spec_with_policy(
                     &metadata,
-                    &dep.range,
+                    &version_range,
                     &release_age_policy,
                 )
                 .ok();
