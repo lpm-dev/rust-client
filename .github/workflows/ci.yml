@@ -59,8 +59,11 @@ jobs:
           key: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-lint-${{ env.RUST_TOOLCHAIN }}-
 
+      - name: Test bounded APT helper
+        run: bash scripts/ci/test-install-apt-packages.sh
+
       - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Check standalone Linux keyring consumers
         run: |
@@ -156,8 +159,7 @@ jobs:
 
       - name: Install musl build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools=1.2.4-2
+          bash scripts/ci/install-apt-packages.sh musl-tools=1.2.4-2
           test "$(dpkg-query -W -f='${Version}' musl-tools)" = "1.2.4-2"
 
       - name: Build musl CLI
@@ -219,7 +221,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-http3-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Check HTTP/3 feature graph
         run: cargo check --locked -p lpm-registry --all-features
@@ -249,7 +251,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Install nextest
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
@@ -365,7 +367,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-full-nextest-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Install nextest
         uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
@@ -539,7 +541,7 @@ jobs:
 
       - name: Install Linux keyring build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Install Node 22
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -608,16 +610,13 @@ jobs:
           key: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-realworld-${{ env.RUST_TOOLCHAIN }}-
 
-      - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+      - name: Install Linux build dependencies
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev jq
 
       - name: Install Node 22
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build lpm-rs (release)
         run: cargo build --locked --release -p lpm-cli
@@ -669,16 +668,13 @@ jobs:
           key: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-topnpm-${{ env.RUST_TOOLCHAIN }}-
 
-      - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+      - name: Install Linux build dependencies
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev jq
 
       - name: Install Node 22
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "22"
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build lpm-rs (release)
         run: cargo build --locked --release -p lpm-cli

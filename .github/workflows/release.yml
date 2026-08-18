@@ -289,7 +289,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-release-verify-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install Linux keyring build deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -435,8 +435,7 @@ jobs:
       - name: Install musl build tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools=1.2.4-2
+          bash scripts/ci/install-apt-packages.sh musl-tools=1.2.4-2
           test "$(dpkg-query -W -f='${Version}' musl-tools)" = "1.2.4-2"
           echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
           echo 'CC_x86_64_unknown_linux_musl=musl-gcc' >> "$GITHUB_ENV"
