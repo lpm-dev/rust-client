@@ -583,6 +583,30 @@ fn missing_publication_status_remains_absent_from_lpm_publish_result_json() {
 }
 
 #[test]
+fn rejected_quarantined_and_unpublished_statuses_are_terminal_rejections() {
+    for status in [
+        LpmPublicationStatus::Rejected,
+        LpmPublicationStatus::Quarantined,
+        LpmPublicationStatus::Unpublished,
+    ] {
+        assert!(status.is_terminal_rejection(), "{}", status.as_str());
+    }
+}
+
+#[test]
+fn pending_and_unknown_publication_statuses_are_not_terminal_rejections() {
+    for status in [
+        LpmPublicationStatus::Active,
+        LpmPublicationStatus::PendingReview,
+        LpmPublicationStatus::Processing,
+        LpmPublicationStatus::ManualReview,
+        LpmPublicationStatus::Other("future_status".to_string()),
+    ] {
+        assert!(!status.is_terminal_rejection(), "{}", status.as_str());
+    }
+}
+
+#[test]
 fn unrelated_publish_result_does_not_gain_lpm_publication_status() {
     let result = PublishResult {
         target: "npm".into(),

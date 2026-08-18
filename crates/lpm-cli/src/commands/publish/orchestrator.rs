@@ -977,18 +977,23 @@ pub async fn run(
                 install_ui::phase("Waiting for LPM.dev Registry publication");
             }
             let timeout = publication_wait_timeout.unwrap_or(DEFAULT_PUBLICATION_WAIT_TIMEOUT);
-            let wait_result = if result.publication_status == Some(LpmPublicationStatus::Active) {
-                PublicationWaitResult::active()
-                    .with_current_latest_version(result.current_latest_version.clone())
-            } else {
-                wait_for_lpm_publication_with_oidc(
-                    client,
-                    lpm_name,
-                    &version,
-                    timeout,
-                    oidc_token_for_wait.as_ref(),
-                )
-                .await
+            let wait_result = match result.publication_status.clone() {
+                Some(LpmPublicationStatus::Active) => PublicationWaitResult::active()
+                    .with_current_latest_version(result.current_latest_version.clone()),
+                Some(status) if status.is_terminal_rejection() => {
+                    PublicationWaitResult::terminal(status)
+                        .with_current_latest_version(result.current_latest_version.clone())
+                }
+                _ => {
+                    wait_for_lpm_publication_with_oidc(
+                        client,
+                        lpm_name,
+                        &version,
+                        timeout,
+                        oidc_token_for_wait.as_ref(),
+                    )
+                    .await
+                }
             };
             if let Some(status) = wait_result.status.clone() {
                 result.publication_status = Some(status);
@@ -1009,13 +1014,17 @@ pub async fn run(
 
     // Final summary after every target has had a chance to publish.
     let any_failed = results.iter().any(|r| !r.success);
-    let any_wait_failed = results.iter().any(|result| {
+    let any_publication_failed = results.iter().any(|result| {
         result
-            .publication_wait
+            .publication_status
             .as_ref()
-            .is_some_and(|wait| !wait.success)
+            .is_some_and(LpmPublicationStatus::is_terminal_rejection)
+            || result
+                .publication_wait
+                .as_ref()
+                .is_some_and(|wait| !wait.success)
     });
-    let command_failed = any_failed || any_wait_failed;
+    let command_failed = any_failed || any_publication_failed;
     let succeeded = results.iter().filter(|r| r.success).count();
     let lpm_publication_status = results
         .iter()
@@ -1039,14 +1048,14 @@ pub async fn run(
                 install_ui::detail_line(format_publish_retry_detail(target));
             }
         }
-    } else if !any_wait_failed && targets.len() > 1 {
+    } else if !any_publication_failed && targets.len() > 1 {
         let elapsed = install_ui::format_duration(publish_started.elapsed());
         install_ui::done_line(format_multi_publish_success_summary(
             targets.len(),
             &elapsed,
             lpm_publication_status,
         ));
-    } else if !any_wait_failed && !any_failed {
+    } else if !any_publication_failed && !any_failed {
         let target = &targets[0];
         let key = target.key();
         let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());

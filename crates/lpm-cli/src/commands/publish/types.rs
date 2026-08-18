@@ -94,6 +94,10 @@ impl LpmPublicationStatus {
             Self::Other(value) => value,
         }
     }
+
+    pub(super) fn is_terminal_rejection(&self) -> bool {
+        matches!(self, Self::Rejected | Self::Quarantined | Self::Unpublished)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
