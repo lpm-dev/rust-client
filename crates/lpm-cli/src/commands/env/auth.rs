@@ -144,3 +144,84 @@ where
         result => result.map_err(login_required),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn wrong_step_up_credential_is_not_retried_as_a_stale_bearer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "rotated-access",
+                "refreshToken": "rotated-refresh",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid credentials",
+                "code": "wrong_credential",
+            })))
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().expect("create isolated home");
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
+            ("LPM_TOKEN", None),
+        ]);
+        lpm_auth::store_refresh_backed_session(
+            &server.uri(),
+            "valid-access",
+            "valid-refresh",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .expect("store refresh-backed session");
+        let session = Arc::new(lpm_auth::SessionManager::new(server.uri(), None));
+        let client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_session(session);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_sync_with_bearer(&client, AuthRequirement::TokenRequired, {
+            let calls = Arc::clone(&calls);
+            move |registry_url, auth_token| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    lpm_vault::sync::mint_cli_step_up_proof(
+                        &registry_url,
+                        &auth_token,
+                        "vault:public-key:set",
+                        &lpm_vault::sync::CliStepUpCredential::Password {
+                            password: "wrong-password",
+                        },
+                    )
+                    .await
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            result
+                .expect_err("wrong credential must remain an error")
+                .to_string()
+                .contains("wrong_credential")
+        );
+    }
+}

@@ -128,10 +128,19 @@ pub async fn mint_cli_step_up_proof(
     let status = response.status();
     if !status.is_success() {
         let body = read_capped_error_text(response).await;
-        return Err(SyncError::http(
-            status,
-            format!("step-up mint: {status}: {body}"),
-        ));
+        let message = format!("step-up mint: {status}: {body}");
+        let rejects_submitted_credential = status == reqwest::StatusCode::UNAUTHORIZED
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("code").and_then(serde_json::Value::as_str)
+                        == Some("wrong_credential")
+                });
+        return Err(if rejects_submitted_credential {
+            SyncError::credential_rejected(status, message)
+        } else {
+            SyncError::http(status, message)
+        });
     }
 
     let parsed = response
