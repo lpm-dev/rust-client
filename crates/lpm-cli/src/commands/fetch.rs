@@ -6,7 +6,7 @@ use crate::install_ui;
 use futures::{StreamExt, TryStreamExt};
 use lpm_common::{LpmError, LpmRoot};
 use lpm_lockfile::{LockedPackage, Source};
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, RouteTable};
 use lpm_store::PackageStore;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -163,6 +163,10 @@ pub async fn run(
         }
     }
 
+    let route_table = RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    emit_route_warnings(&route_table, json_output);
+
     let lpm_root = LpmRoot::from_env()?;
     let store = PackageStore::from_root(&lpm_root);
     let store_v2 = v2_store_for_fetch(&lpm_root)?;
@@ -198,12 +202,30 @@ pub async fn run(
 
     let work = coalesce_fetch_targets(targets);
     let concurrency = max_concurrent_downloads();
-    let client = Arc::new(client.clone_with_config());
+    let eager_package_names = work
+        .iter()
+        .filter_map(|work| match &work.source {
+            FetchSource::Registry { .. } => work.targets.first().map(|target| target.name.clone()),
+            FetchSource::RemoteTarball { .. } | FetchSource::GitHub { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let eager_origins = route_table.effective_registry_origins(
+        &eager_package_names,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
+    let client = Arc::new(
+        client
+            .clone_with_config()
+            .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?,
+    );
+    let route_table = Arc::new(route_table);
     let store = Arc::new(store);
     let fetched: Vec<Vec<FetchPackageResult>> = futures::stream::iter(work)
         .map(|work| {
             fetch_artifact(
                 Arc::clone(&client),
+                Arc::clone(&route_table),
                 Arc::clone(&store),
                 store_v2.clone(),
                 work,
@@ -304,6 +326,7 @@ fn coalesce_fetch_targets(targets: Vec<FetchTarget>) -> Vec<FetchWork> {
 
 async fn fetch_artifact(
     client: Arc<RegistryClient>,
+    route_table: Arc<RouteTable>,
     store: Arc<PackageStore>,
     store_v2: Option<Arc<lpm_store::v2::Store>>,
     work: FetchWork,
@@ -324,13 +347,27 @@ async fn fetch_artifact(
             .collect());
     }
 
+    let routing_name = targets
+        .first()
+        .map(|target| target.name.as_str())
+        .ok_or_else(|| LpmError::Registry("fetch artifact has no target packages".to_string()))?;
     let downloaded = match &source {
         FetchSource::GitHub { url } => {
             crate::commands::install::download_github_archive_to_file(url, Some(&integrity)).await?
         }
-        FetchSource::Registry { .. } | FetchSource::RemoteTarball { .. } => {
+        FetchSource::Registry { .. } => {
             client
-                .download_tarball_to_file_with_integrity(source.url(), &integrity)
+                .download_tarball_routed_with_integrity(
+                    &route_table,
+                    routing_name,
+                    source.url(),
+                    &integrity,
+                )
+                .await?
+        }
+        FetchSource::RemoteTarball { .. } => {
+            client
+                .download_tarball_to_file_with_auth_and_integrity(source.url(), None, &integrity)
                 .await?
         }
     };
@@ -377,6 +414,26 @@ async fn fetch_artifact(
             )
         })
         .collect())
+}
+
+fn emit_route_warnings(route_table: &RouteTable, json_output: bool) {
+    if !json_output {
+        for warning in route_table.npmrc_warnings() {
+            crate::output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        }
+    }
+    if let Some(tagged) = route_table.tls_overrides().strict_ssl.as_ref()
+        && !tagged.value
+    {
+        crate::output::warn(&format!(
+            "strict-ssl=false in {}:{} — TLS certificate verification is DISABLED for this fetch across ALL registries. This is a security risk.",
+            lpm_common::sanitize_terminal_inline(&tagged.source),
+            tagged.line
+        ));
+    }
+    for warning in route_table.npmrc_security_warnings() {
+        crate::output::warn(&lpm_common::sanitize_terminal_inline(warning));
+    }
 }
 
 fn classify_package(

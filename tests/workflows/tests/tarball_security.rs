@@ -349,6 +349,118 @@ async fn explicit_tarball_dependency_is_not_bound_to_registry_metadata() {
     );
 }
 
+#[tokio::test]
+async fn explicit_tarball_install_never_sends_the_lpm_bearer() {
+    let server = MockServer::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "anonymous-tarball-pkg",
+            "version": "1.0.0",
+        }),
+        &[],
+    );
+    let integrity = compute_integrity(&tarball);
+    let tarball_path = "/anonymous-tarball-pkg-1.0.0.tgz";
+    Mock::given(method("GET"))
+        .and(path(tarball_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "anonymous-tarball-source",
+  "version": "1.0.0",
+  "dependencies": {{
+    "anonymous-tarball-pkg": "{}/anonymous-tarball-pkg-1.0.0.tgz#{}"
+  }}
+}}"#,
+        server.uri(),
+        integrity,
+    ));
+
+    let first = lpm(&project)
+        .args([
+            "--token",
+            "lpm-session-secret",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install explicit tarball from the manifest");
+    assert!(
+        first.status.success(),
+        "manifest tarball install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    for (index, request) in requests.iter().enumerate() {
+        assert!(
+            request.headers.get("Authorization").is_none(),
+            "explicit tarball request #{index} disclosed an Authorization header"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_tarball_install_without_declared_integrity_is_anonymous() {
+    let server = MockServer::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": "anonymous-tofu-pkg",
+            "version": "1.0.0",
+        }),
+        &[],
+    );
+    let tarball_path = "/anonymous-tofu-pkg-1.0.0.tgz";
+    Mock::given(method("GET"))
+        .and(path(tarball_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "anonymous-tofu-source",
+  "version": "1.0.0",
+  "dependencies": {{
+    "anonymous-tofu-pkg": "{}{tarball_path}"
+  }}
+}}"#,
+        server.uri(),
+    ));
+
+    let output = lpm(&project)
+        .args([
+            "--token",
+            "lpm-session-secret",
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install trust-on-first-use tarball");
+    assert!(
+        output.status.success(),
+        "TOFU tarball install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("Authorization").is_none(),
+        "trust-on-first-use tarball request disclosed an Authorization header"
+    );
+}
+
 /// **Path traversal entries must be rejected.**
 ///
 /// Tarball includes a regular file whose path resolves above the

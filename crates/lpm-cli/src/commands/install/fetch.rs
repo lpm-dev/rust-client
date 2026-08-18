@@ -3472,10 +3472,10 @@ pub(super) async fn fetch_and_store_tarball_url(
         download_github_archive_to_file(url, p.integrity.as_deref()).await?
     } else if let Some(expected_integrity) = p.integrity.as_deref() {
         client
-            .download_tarball_to_file_with_integrity(url, expected_integrity)
+            .download_tarball_to_file_with_auth_and_integrity(url, None, expected_integrity)
             .await?
     } else {
-        client.download_tarball_to_file(url).await?
+        client.download_tarball_to_file_with_auth(url, None).await?
     };
     let download_ms = download_start.elapsed().as_millis();
 

@@ -1380,6 +1380,42 @@ async fn routed_lpm_tarball_download_keeps_lpm_bearer() {
 }
 
 #[tokio::test]
+async fn routed_lpm_tarball_download_refuses_the_configured_npm_origin() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let lpm_server = MockServer::start().await;
+    let npm_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/lpm-tarball.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"wrong-origin"))
+        .mount(&npm_server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_base_url(lpm_server.uri())
+        .with_npm_registry_url(npm_server.uri())
+        .with_token("LPM-SESSION-BEARER");
+    let route_table = crate::route::RouteTable::from_mode_only(crate::route::RouteMode::Direct);
+    let url = format!("{}/lpm-tarball.tgz", npm_server.uri());
+
+    let error = client
+        .download_tarball_routed(&route_table, "@lpm.dev/acme.pkg", &url)
+        .await
+        .expect_err("LPM tarballs must stay on the configured LPM origin");
+
+    assert!(error.to_string().contains("configured LPM registry"));
+    assert!(
+        npm_server
+            .received_requests()
+            .await
+            .expect("received requests")
+            .is_empty(),
+        "the origin gate must run before attaching the LPM bearer"
+    );
+}
+
+#[tokio::test]
 async fn managed_lpm_file_spool_download_sends_accounting_marker() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

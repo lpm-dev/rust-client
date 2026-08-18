@@ -49,6 +49,31 @@ fn project_with_lockfile(lockfile: &str) -> TempProject {
     project
 }
 
+fn project_with_single_fetch_artifact(
+    name: &str,
+    version: &str,
+    source: String,
+    integrity: String,
+    tarball: Option<String>,
+) -> TempProject {
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("greedy-fusion");
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        source: Some(source),
+        integrity: Some(integrity),
+        tarball,
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(name, name, version)]);
+    let project = TempProject::empty(r#"{"name":"fetch-auth","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.lock",
+        &lockfile.to_toml().expect("serialize fetch lockfile"),
+    );
+    project
+}
+
 fn package_object_dir(project: &TempProject, name: &str, version: &str) -> std::path::PathBuf {
     let integrity = compute_integrity(&make_tarball(name, version));
     lpm_store::v2::StoreV2Paths::at(project.store_dir().join("v2"))
@@ -198,6 +223,191 @@ async fn fetch_reads_lockfile_without_manifest_and_enables_offline_frozen_instal
         "offline frozen install should consume fetch-warmed store:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&offline.stdout),
         String::from_utf8_lossy(&offline.stderr)
+    );
+}
+
+#[tokio::test]
+async fn fetch_public_registry_tarball_never_sends_the_lpm_bearer() {
+    let mock = MockRegistry::start().await;
+    let name = "public-fetch-package";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let tarball_url = mock.tarball_url(name, version);
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(name, version)))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = project_with_single_fetch_artifact(
+        name,
+        version,
+        format!("registry+{}", mock.url()),
+        compute_integrity(&tarball),
+        Some(tarball_url),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--token", "lpm-session-secret", "fetch"])
+        .output()
+        .expect("fetch public registry tarball");
+    assert!(
+        output.status.success(),
+        "public fetch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    let tarball_request = requests
+        .iter()
+        .find(|request| request.url.path() == MockRegistry::tarball_path(name, version))
+        .expect("fetch must request the tarball");
+    assert!(
+        tarball_request.headers.get("Authorization").is_none(),
+        "a public registry tarball request disclosed the LPM bearer"
+    );
+}
+
+#[tokio::test]
+async fn fetch_remote_tarball_ignores_lpm_and_matching_npmrc_bearers() {
+    let server = MockServer::start().await;
+    let name = "remote-fetch-package";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let tarball_path = "/remote-fetch-package-1.0.0.tgz";
+    Mock::given(method("GET"))
+        .and(path(tarball_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let server_uri = server.uri();
+    let tarball_url = format!("{server_uri}{tarball_path}");
+    let project = project_with_single_fetch_artifact(
+        name,
+        version,
+        format!("tarball+{tarball_url}"),
+        compute_integrity(&tarball),
+        None,
+    );
+    let host = server_uri.trim_start_matches("http://");
+    project.write_private_file(
+        ".npmrc",
+        &format!("//{host}/:_authToken=remote-origin-secret\n"),
+    );
+
+    let output = lpm(&project)
+        .args(["--token", "lpm-session-secret", "fetch"])
+        .output()
+        .expect("fetch remote tarball");
+    assert!(
+        output.status.success(),
+        "remote fetch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("Authorization").is_none(),
+        "a remote tarball request disclosed an Authorization header"
+    );
+}
+
+#[tokio::test]
+async fn fetch_lpm_registry_tarball_keeps_the_lpm_bearer() {
+    let mock = MockRegistry::start().await;
+    let name = "@lpm.dev/private-fetch-package";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let tarball_url = format!("{}/private-fetch-package-1.0.0.tgz", mock.url());
+    Mock::given(method("GET"))
+        .and(path("/private-fetch-package-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = project_with_single_fetch_artifact(
+        name,
+        version,
+        format!("registry+{}", mock.url()),
+        compute_integrity(&tarball),
+        Some(tarball_url),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--token", "lpm-session-secret", "fetch"])
+        .output()
+        .expect("fetch private LPM registry tarball");
+    assert!(
+        output.status.success(),
+        "private LPM fetch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .headers
+            .get("Authorization")
+            .is_some_and(|value| value.as_bytes() == b"Bearer lpm-session-secret"),
+        "a private LPM tarball request did not carry the LPM bearer"
+    );
+}
+
+#[tokio::test]
+async fn fetch_custom_registry_tarball_uses_its_npmrc_bearer() {
+    let server = MockServer::start().await;
+    let name = "custom-fetch-package";
+    let version = "1.0.0";
+    let tarball = make_tarball(name, version);
+    let tarball_path = "/custom-fetch-package/-/custom-fetch-package-1.0.0.tgz";
+    Mock::given(method("GET"))
+        .and(path(tarball_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tarball_url = format!("{}{tarball_path}", server.uri());
+    let project = project_with_single_fetch_artifact(
+        name,
+        version,
+        format!("registry+{}", server.uri()),
+        compute_integrity(&tarball),
+        Some(tarball_url),
+    );
+    let host = server.uri().trim_start_matches("http://").to_string();
+    project.write_private_file(
+        ".npmrc",
+        &format!(
+            "registry={}/\n//{host}/:_authToken=custom-registry-secret\n",
+            server.uri()
+        ),
+    );
+
+    let output = lpm(&project)
+        .env_remove("LPM_NPM_ROUTE")
+        .args(["--token", "lpm-session-secret", "fetch"])
+        .output()
+        .expect("fetch custom registry tarball");
+    assert!(
+        output.status.success(),
+        "custom fetch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .headers
+            .get("Authorization")
+            .is_some_and(|value| value.as_bytes() == b"Bearer custom-registry-secret")
     );
 }
 
