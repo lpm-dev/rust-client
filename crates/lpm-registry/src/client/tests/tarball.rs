@@ -44,11 +44,11 @@ impl Drop for ScopedAuthEnv {
     }
 }
 
-fn auth_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+async fn auth_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .unwrap()
+        .await
 }
 
 #[tokio::test]
@@ -56,7 +56,7 @@ async fn authenticated_tarball_download_refreshes_rejected_stored_session() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let _lock = auth_env_lock();
+    let _lock = auth_env_lock().await;
     let home = tempfile::tempdir().unwrap();
     let _env = ScopedAuthEnv::file_backed(home.path());
     let server = MockServer::start().await;
