@@ -17,31 +17,44 @@ pub(crate) fn run(
     tag_prefix: &str,
     message: &str,
 ) -> Result<(), LpmError> {
-    if git_tag_version && !dry_run {
-        ensure_clean_git(project_dir)?;
-    }
+    let operation = || {
+        if git_tag_version && !dry_run {
+            ensure_clean_git(project_dir)?;
+        }
 
-    let plan = release_plan::plan_single_package(project_dir, bump)?;
-    let planned = plan.planned_manifests()?;
+        let plan = release_plan::plan_single_package(project_dir, bump)?;
+        let planned = plan.planned_manifests()?;
+        let package = plan
+            .packages
+            .first()
+            .ok_or_else(|| LpmError::Script("version plan contained no package".into()))?;
+        let tag = format!("{tag_prefix}{}", package.new_version);
+        let commit_message = format_message(message, &package.new_version);
+
+        if git_tag_version && !dry_run {
+            ensure_tag_available(project_dir, &tag)?;
+        }
+
+        if !dry_run {
+            release_plan::write_planned_manifests(&planned)?;
+            if git_tag_version {
+                git(project_dir, ["add", "package.json"])?;
+                git(project_dir, ["commit", "-m", commit_message.as_str()])?;
+                git(project_dir, ["tag", "--", tag.as_str()])?;
+            }
+        }
+
+        Ok((plan, tag, commit_message))
+    };
+    let (plan, tag, commit_message) = if dry_run {
+        operation()?
+    } else {
+        lpm_common::with_exclusive_lock(lpm_common::project_install_lock(project_dir), operation)?
+    };
     let package = plan
         .packages
         .first()
         .ok_or_else(|| LpmError::Script("version plan contained no package".into()))?;
-    let tag = format!("{tag_prefix}{}", package.new_version);
-    let commit_message = format_message(message, &package.new_version);
-
-    if git_tag_version && !dry_run {
-        ensure_tag_available(project_dir, &tag)?;
-    }
-
-    if !dry_run {
-        release_plan::write_planned_manifests(&planned)?;
-        if git_tag_version {
-            git(project_dir, ["add", "package.json"])?;
-            git(project_dir, ["commit", "-m", commit_message.as_str()])?;
-            git(project_dir, ["tag", "--", tag.as_str()])?;
-        }
-    }
 
     if json_output {
         let json = serde_json::json!({
@@ -122,6 +135,11 @@ fn ensure_clean_git(project_dir: &Path) -> Result<(), LpmError> {
     let output = Command::new("git")
         .arg("status")
         .arg("--porcelain")
+        .arg("--untracked-files=all")
+        .arg("--")
+        .arg(":(top,exclude,glob)**/.lpm/.install.lock")
+        .arg(":(top,exclude,glob)**/.lpm/.install.lock.writer-intent")
+        .arg(":(top,exclude,glob)**/.lpm/.install.lock.writer-queue")
         .current_dir(project_dir)
         .output()
         .map_err(LpmError::Io)?;

@@ -1,7 +1,9 @@
 mod support;
 
 use support::assertions::parse_json_output;
-use support::{TempProject, lpm};
+use support::{
+    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, wait_for_lock_contention,
+};
 
 fn workspace_project() -> TempProject {
     let project = TempProject::empty(
@@ -199,6 +201,41 @@ fn release_apply_updates_selected_package_and_internal_dependents() {
         read_package_json(&project, "packages/app/package.json")["dependencies"]["core"],
         "^2.0.0"
     );
+}
+
+#[test]
+fn release_apply_plans_after_acquiring_the_workspace_transaction_lock() {
+    let project = workspace_project();
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path)
+        .expect("hold the workspace transaction lock");
+    let marker_path = project.home().join("release-apply-lock-contention");
+    let mut command = lpm_spawnable(&project);
+    command
+        .current_dir(project.path().join("packages/core"))
+        .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
+        .args([
+            "release", "apply", "--filter", "core", "--bump", "major", "--json",
+        ]);
+    let mut child = command.spawn().expect("spawn contending release apply");
+
+    wait_for_lock_contention(&mut child, &marker_path, &lock_path);
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"core","version":"1.2.3","description":"edit made while waiting"}"#,
+    );
+    drop(transaction_lock);
+
+    let output = child.wait_with_output().expect("finish release apply");
+    assert!(
+        output.status.success(),
+        "release apply failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let core = read_package_json(&project, "packages/core/package.json");
+    assert_eq!(core["version"], "2.0.0");
+    assert_eq!(core["description"], "edit made while waiting");
 }
 
 #[test]

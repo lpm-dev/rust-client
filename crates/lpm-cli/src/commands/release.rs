@@ -62,11 +62,18 @@ pub(crate) fn apply(
     dry_run: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let plan = build_plan(project_dir, selection, bump)?;
-    if !dry_run {
-        let planned = plan.planned_manifests()?;
-        release_plan::write_planned_manifests(&planned)?;
-    }
+    let plan = if dry_run {
+        build_plan(project_dir, selection, bump)?
+    } else {
+        let workspace = discover_release_workspace(project_dir)?;
+        let lock_path = lpm_common::project_install_lock(&workspace.root);
+        lpm_common::with_exclusive_lock(lock_path, || {
+            let plan = build_plan_for_workspace(&workspace, selection, bump)?;
+            let planned = plan.planned_manifests()?;
+            release_plan::write_planned_manifests(&planned)?;
+            Ok(plan)
+        })?
+    };
     emit_plan(&plan, dry_run, json_output)
 }
 
@@ -244,12 +251,21 @@ fn build_plan(
     selection: &ReleaseSelection,
     bump: Option<&VersionBump>,
 ) -> Result<ReleasePlan, LpmError> {
-    let (workspace, graph, selected) = resolve_workspace_selection(project_dir, selection)?;
+    let workspace = discover_release_workspace(project_dir)?;
+    build_plan_for_workspace(&workspace, selection, bump)
+}
+
+fn build_plan_for_workspace(
+    workspace: &lpm_workspace::Workspace,
+    selection: &ReleaseSelection,
+    bump: Option<&VersionBump>,
+) -> Result<ReleasePlan, LpmError> {
+    let (graph, selected) = resolve_workspace_selection_for(workspace, selection)?;
     let selected = release_plan::ensure_unique_selection(&selected);
     let change_bumps = release_plan::load_change_bumps(&workspace.root)?;
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
     let sorted = release_plan::sorted_selected_indices(&graph, &selected_set)?;
-    release_plan::plan_workspace(&workspace, &sorted, &change_bumps, bump)
+    release_plan::plan_workspace(workspace, &sorted, &change_bumps, bump)
 }
 
 fn resolve_workspace_selection(
@@ -263,12 +279,25 @@ fn resolve_workspace_selection(
     ),
     LpmError,
 > {
+    let workspace = discover_release_workspace(project_dir)?;
+    let (graph, selected) = resolve_workspace_selection_for(&workspace, selection)?;
+    Ok((workspace, graph, selected))
+}
+
+fn discover_release_workspace(project_dir: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|error| LpmError::Workspace(error.to_string()))?
         .ok_or_else(|| {
             LpmError::Script("no workspace found. `lpm release` requires a monorepo.".into())
         })?;
-    let graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
+    Ok(workspace)
+}
+
+fn resolve_workspace_selection_for(
+    workspace: &lpm_workspace::Workspace,
+    selection: &ReleaseSelection,
+) -> Result<(lpm_task::graph::WorkspaceGraph, Vec<usize>), LpmError> {
+    let graph = lpm_task::graph::WorkspaceGraph::from_workspace(workspace);
     let selected_set: HashSet<usize> = if selection.all {
         (0..graph.len()).collect()
     } else if selection.affected
@@ -297,7 +326,7 @@ fn resolve_workspace_selection(
             "no workspace packages matched the release selection (--fail-if-no-match)".into(),
         ));
     }
-    Ok((workspace, graph, selected_set.into_iter().collect()))
+    Ok((graph, selected_set.into_iter().collect()))
 }
 
 fn emit_plan(plan: &ReleasePlan, dry_run: bool, json_output: bool) -> Result<(), LpmError> {
