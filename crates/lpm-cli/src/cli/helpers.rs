@@ -43,6 +43,43 @@ pub(super) fn print_version_with_notice() {
     }
 }
 
+pub(super) fn print_self_update_probe_version(
+    expected_executable: &std::path::Path,
+) -> Result<(), lpm_common::LpmError> {
+    let current = std::env::current_exe().map_err(|error| {
+        lpm_common::LpmError::SelfUpdate(format!(
+            "could not resolve the running executable during self-update preflight: {error}"
+        ))
+    })?;
+    let current = canonicalize_self_update_probe_executable(current)?;
+    let expected = std::fs::canonicalize(expected_executable).map_err(|error| {
+        lpm_common::LpmError::SelfUpdate(format!(
+            "could not resolve the expected self-update executable {}: {error}",
+            expected_executable.display()
+        ))
+    })?;
+    if current != expected {
+        return Err(lpm_common::LpmError::SelfUpdate(format!(
+            "the public LPM launcher resolves to {}, but self-update was started by {}",
+            current.display(),
+            expected.display()
+        )));
+    }
+    println!("lpm {}", crate::build_version::version());
+    println!("self-update-executable-ok");
+    Ok(())
+}
+
+fn canonicalize_self_update_probe_executable(
+    current: std::path::PathBuf,
+) -> Result<std::path::PathBuf, lpm_common::LpmError> {
+    std::fs::canonicalize(&current).map_err(|error| {
+        lpm_common::LpmError::SelfUpdate(format!(
+            "could not resolve the running executable during self-update preflight: {error}"
+        ))
+    })
+}
+
 pub(super) fn argv_requests_top_level_version<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -844,6 +881,13 @@ mod tests {
         // a writer abstraction, but the smoke test catches obvious
         // breakage.
         print_version_with_notice();
+    }
+
+    #[test]
+    fn self_update_probe_rejects_an_executable_that_cannot_be_canonicalized() {
+        let missing = tempfile::tempdir().unwrap().path().join("missing-lpm");
+
+        assert!(canonicalize_self_update_probe_executable(missing).is_err());
     }
 
     #[test]

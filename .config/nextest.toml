@@ -8,6 +8,7 @@
 # Run these tests serially to avoid the race.
 keychain-serial = { max-threads = 1 }
 verdaccio = { max-threads = 4 }
+self-update-processes = { max-threads = 4 }
 
 [profile.audit]
 default-filter = "test(install_realworld_nextjs_fixture_succeeds_through_verdaccio)"
@@ -19,3 +20,7 @@ test-group = "keychain-serial"
 [[profile.default.overrides]]
 filter = "package(lpm-workflows) & binary_id(/install_real_registry/)"
 test-group = "verdaccio"
+
+[[profile.default.overrides]]
+filter = "package(lpm-workflows) & binary_id(/self_update/)"
+test-group = "self-update-processes"

@@ -3403,6 +3403,7 @@ dependencies = [
  "rayon",
  "rcgen",
  "reqwest",
+ "same-file",
  "scrypt",
  "secrecy",
  "serde",

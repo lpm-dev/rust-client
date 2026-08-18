@@ -1,9 +1,8 @@
 use crate::install_ui;
 use crate::release_channel::ReleaseChannel;
 use crate::release_lookup::{
-    FetchOutcome, LookupError, clear_cache_at, default_cache_path,
-    fetch_github_release_published_at, github_release_download_url, is_newer_semver, probe_release,
-    read_cache_at, write_cache_at,
+    FetchOutcome, LookupError, fetch_github_release_published_at, github_release_download_url,
+    is_newer_semver, operating_system_home_dir, probe_release, read_cache_at, write_cache_at,
 };
 use crate::sigstore_verify::{
     IdentityExpectations, VerifiedProvenance, VerifyError, VerifyOptions,
@@ -13,14 +12,23 @@ use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod cargo_metadata;
 mod download;
+mod probe;
+#[cfg(windows)]
+mod windows_trust;
 
-use self::download::{StagedAsset, fetch_asset_to_staged_file, fetch_bounded};
+use self::download::{
+    StagedAsset, ensure_staged_file_unchanged, fetch_asset_to_staged_file, fetch_bounded,
+    safe_remote_label,
+};
 #[cfg(test)]
 use self::download::{create_staged_binary, finish_staged_binary};
+use self::probe::{BoundUpdateCommand, VersionProbe};
 
 /// User-facing self-update reuses the banner cache file but with a much
 /// shorter success TTL: a second `lpm self-update` within 10 minutes
@@ -50,12 +58,20 @@ pub async fn run(
     refresh: bool,
     requested_channel: Option<ReleaseChannel>,
 ) -> Result<(), LpmError> {
+    let started = Instant::now();
+    let account_home = canonical_account_home()?;
+    let _operation_lock = try_acquire_self_update_lock(&account_home)?.ok_or_else(|| {
+        LpmError::SelfUpdate(
+            "another self-update operation is already running; wait for it to finish and retry"
+                .to_string(),
+        )
+    })?;
     let current = crate::build_version::version();
     let channel = ReleaseChannel::from_installed_version(current);
     let target_channel = requested_channel.unwrap_or(channel);
     let channel_changed = channel != target_channel;
 
-    let cache_path = default_cache_path();
+    let cache_path = Some(account_home.join(".lpm").join("update-check.json"));
     let mut cache = cache_path
         .as_deref()
         .and_then(read_cache_at)
@@ -150,8 +166,9 @@ pub async fn run(
                 "channel": channel.as_str(),
                 "target_channel": target_channel.as_str(),
                 "channel_changed": channel_changed,
+                "duration_ms": started.elapsed().as_millis() as u64,
             });
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            println!("{}", serde_json::to_string_pretty(&json)?);
         } else if latest == current {
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Done · already on {} version {}",
@@ -169,40 +186,126 @@ pub async fn run(
         return Ok(());
     }
 
-    let method = detect_install_method();
+    let working_dir = std::env::current_dir().map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve the working directory before self-update: {error}"
+        ))
+    })?;
+    let project_root = active_project_root(&working_dir, &account_home)?;
+    let environment_exclusion_root =
+        environment_exclusion_root(&working_dir, &project_root, &account_home)?;
+    let current_executable = canonical_current_executable()?;
+    if project_root
+        .as_deref()
+        .is_some_and(|root| current_executable.starts_with(root))
+    {
+        return Err(LpmError::SelfUpdate(
+            "self-update must be run from a global LPM installation, not a project-local executable"
+                .to_string(),
+        ));
+    }
+    let install_roots = InstallRoots::from_environment(
+        environment_exclusion_root.as_deref(),
+        &account_home,
+        &current_executable,
+    );
+    #[cfg(windows)]
+    let _installation_lock =
+        windows_trust::try_acquire_installation_lock(&current_executable)?.ok_or_else(|| {
+            LpmError::SelfUpdate(
+                "another self-update is already mutating this LPM installation; wait for it to finish and retry"
+                    .to_string(),
+            )
+        })?;
+    let method =
+        detect_install_method_from_path_with_roots(Some(&current_executable), &install_roots)?;
     method.ensure_channel_supported(target_channel)?;
+    let cargo_install_root = if method == InstallMethod::Cargo {
+        Some(cargo_install_root(&current_executable)?)
+    } else {
+        None
+    };
     let cargo_source_commit = if method == InstallMethod::Cargo {
         let client = release_http_client()?;
         Some(
-            fetch_verified_release_manifest(&client, &latest)
+            fetch_verified_release_manifest(&client, &latest, !json_output)
                 .await?
                 .source_commit,
         )
     } else {
         None
     };
-    let update_command = method.command(&latest, cargo_source_commit.as_deref())?;
+    let external_update_command = method.external_update_command_with_root(
+        &latest,
+        cargo_source_commit.as_deref(),
+        cargo_install_root.as_deref(),
+    )?;
+    let sanitized_path = sanitized_path_for_method(&method, environment_exclusion_root.as_deref())?;
+    let bound_update_command = external_update_command
+        .as_ref()
+        .map(|command| {
+            let sanitized_path = sanitized_path.as_deref().ok_or_else(|| {
+                LpmError::SelfUpdate("package-manager update has no sanitized PATH".to_string())
+            })?;
+            BoundUpdateCommand::bind(
+                command.program,
+                &command.args,
+                sanitized_path,
+                project_root.as_deref(),
+                environment_exclusion_root.as_deref(),
+                &account_home,
+                &current_executable,
+            )
+        })
+        .transpose()?;
+    let version_probe = if method == InstallMethod::Standalone {
+        None
+    } else {
+        Some(VersionProbe::bind_and_preflight(
+            method == InstallMethod::Cargo,
+            current,
+            &current_executable,
+            &working_dir,
+            sanitized_path.as_deref().ok_or_else(|| {
+                LpmError::SelfUpdate("package-manager probe has no sanitized PATH".to_string())
+            })?,
+            project_root.as_deref(),
+            &account_home,
+        )?)
+    };
+    if let (Some(command), Some(probe)) = (&bound_update_command, &version_probe) {
+        command.ensure_owns_launcher(probe, &method)?;
+    }
 
-    // For non-Standalone channels the JSON contract is plan-only: emit
-    // the update command, return without invoking the channel's
-    // installer (the operator is expected to run it themselves so they
-    // can pipe / observe / sandbox it). Standalone is the one channel
-    // LPM can run AND attribute end-to-end, so its `--json` path runs
-    // the install and emits the captured Sigstore audit alongside.
+    // Package-manager JSON is plan-only, but a successful plan is still
+    // bound to the launcher and verified owning manager before emission.
     if json_output && !matches!(method, InstallMethod::Standalone) {
+        let command = external_update_command.as_ref().ok_or_else(|| {
+            LpmError::SelfUpdate("package-manager plan has no update command".to_string())
+        })?;
+        let bound_command = bound_update_command.as_ref().ok_or_else(|| {
+            LpmError::SelfUpdate("package-manager plan has no bound update command".to_string())
+        })?;
         let json = serde_json::json!({
             "success": true,
             "current": current,
             "latest": latest,
             "up_to_date": false,
             "install_method": method.name(),
-            "update_command": update_command,
+            "update_command": bound_command.render_verified_plan()?,
+            "update_shell": command.shell(),
+            "update_program": bound_command.verified_program_utf8()?,
+            "update_args": bound_command.args_utf8()?,
+            "applied": false,
+            "launcher_verified": true,
+            "manager_target_verified": true,
             "cache_hit": cache_hit,
             "channel": channel.as_str(),
             "target_channel": target_channel.as_str(),
             "channel_changed": channel_changed,
+            "duration_ms": started.elapsed().as_millis() as u64,
         });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
 
@@ -212,56 +315,87 @@ pub async fn run(
             install_ui::dim("install method"),
             method.name().cyan()
         );
-        install_ui::phase("Update command");
-        eprintln!("    {}", install_ui::yellow(&update_command));
+        if let Some(command) = bound_update_command.as_ref() {
+            install_ui::phase(if cfg!(windows) {
+                "PowerShell update command"
+            } else {
+                "POSIX shell update command"
+            });
+            if let Ok(update_command) = command.render_verified_plan() {
+                eprintln!("    {}", install_ui::yellow(&update_command));
+            } else {
+                eprintln!(
+                    "    {}",
+                    install_ui::dim(
+                        "exact command contains a non-UTF-8 path and cannot be rendered safely"
+                    )
+                );
+            }
+        } else {
+            install_ui::phase("Built-in signed updater");
+            eprintln!(
+                "    {}",
+                install_ui::dim("Sigstore verification and atomic replacement are enforced")
+            );
+        }
     }
 
     let mut standalone_audit: Option<AttestationAudit> = None;
     match method {
-        InstallMethod::Npm => {
-            let pinned = format!("@lpm-registry/cli@{latest}");
-            run_shell_update("npm", &["install", "-g", &pinned])?;
-        }
-        InstallMethod::Homebrew => run_shell_update("brew", &["upgrade", "lpm"])?,
-        InstallMethod::Cargo => {
-            let source_commit = cargo_source_commit.as_deref().ok_or_else(|| {
-                LpmError::SelfUpdate(
-                    "Cargo update has no verified release source commit".to_string(),
-                )
+        InstallMethod::Npm
+        | InstallMethod::Pnpm
+        | InstallMethod::Bun
+        | InstallMethod::Yarn
+        | InstallMethod::Volta
+        | InstallMethod::Homebrew
+        | InstallMethod::Cargo => {
+            let command = bound_update_command.as_ref().ok_or_else(|| {
+                LpmError::SelfUpdate(format!(
+                    "{} update has no package-manager command",
+                    method.name()
+                ))
             })?;
-            let args = cargo_install_args(source_commit);
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            run_shell_update("cargo", &arg_refs)?;
+            command.run()?;
+            version_probe
+                .as_ref()
+                .ok_or_else(|| {
+                    LpmError::SelfUpdate("package-manager update has no version probe".to_string())
+                })?
+                .verify_requested(&latest)?;
         }
         InstallMethod::Standalone => {
-            standalone_audit = Some(run_standalone_update(&latest).await?);
+            standalone_audit =
+                Some(run_standalone_update(&latest, &current_executable, !json_output).await?);
         }
     }
 
     // Post-upgrade cache stamp policy:
     // - Standalone: we downloaded the exact tag → safe to stamp.
-    // - Cargo: installed from the attested source commit → safe to stamp.
-    // - Npm: now `@{latest}`-pinned → safe to stamp.
-    // - Homebrew: `brew upgrade lpm` is channel-latest, not tag-pinned;
-    //   we can't prove which version actually landed. Clear the cache
-    //   instead so the next invocation re-probes from scratch rather
-    //   than asserting a possibly-wrong "latest".
+    // - Cargo and npm-registry managers install a pinned source/version.
+    // Every package-manager path is stamped only after the bound public
+    // launcher reports this exact version.
     if let Some(p) = cache_path.as_deref() {
         match method {
-            InstallMethod::Standalone | InstallMethod::Cargo | InstallMethod::Npm => {
+            InstallMethod::Standalone
+            | InstallMethod::Cargo
+            | InstallMethod::Npm
+            | InstallMethod::Pnpm
+            | InstallMethod::Bun
+            | InstallMethod::Yarn
+            | InstallMethod::Volta
+            | InstallMethod::Homebrew => {
                 cache.record_success_for(target_channel, latest.clone(), now);
                 let _ = write_cache_at(p, &cache);
-            }
-            InstallMethod::Homebrew => {
-                clear_cache_at(p);
             }
         }
     }
 
     if json_output {
-        let audit = standalone_audit
-            .as_ref()
-            .expect("json_output && Standalone implies audit was captured");
+        let audit = standalone_audit.as_ref().ok_or_else(|| {
+            LpmError::SelfUpdate(
+                "standalone self-update completed without an attestation audit".to_string(),
+            )
+        })?;
         let json = serde_json::json!({
             "success": true,
             "current": current,
@@ -272,10 +406,12 @@ pub async fn run(
             "channel": channel.as_str(),
             "target_channel": target_channel.as_str(),
             "channel_changed": channel_changed,
+            "applied": true,
             "verified": true,
             "attestation": audit_json(audit),
+            "duration_ms": started.elapsed().as_millis() as u64,
         });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
         install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · LPM updated to {}",
@@ -284,6 +420,17 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn sanitized_path_for_method(
+    method: &InstallMethod,
+    environment_exclusion_root: Option<&Path>,
+) -> Result<Option<OsString>, LpmError> {
+    if method == &InstallMethod::Standalone {
+        Ok(None)
+    } else {
+        probe::sanitized_current_path(environment_exclusion_root).map(Some)
+    }
 }
 
 fn should_install_update(
@@ -326,46 +473,564 @@ fn lookup_error_to_lpm(e: LookupError) -> LpmError {
 #[derive(Debug, PartialEq, Eq)]
 enum InstallMethod {
     Npm,
+    Pnpm,
+    Bun,
+    Yarn,
+    Volta,
     Homebrew,
     Cargo,
     Standalone,
+}
+
+#[derive(Default)]
+struct InstallRoots {
+    cargo: Vec<PathBuf>,
+    npm: Vec<PathBuf>,
+    pnpm: Vec<PathBuf>,
+    bun: Vec<PathBuf>,
+    yarn: Vec<PathBuf>,
+    volta: Vec<PathBuf>,
+    bun_config_errors: Vec<String>,
+    yarn_config_errors: Vec<String>,
+}
+
+impl InstallRoots {
+    fn from_environment(
+        excluded_root: Option<&Path>,
+        account_home: &Path,
+        current_executable: &Path,
+    ) -> Self {
+        let mut roots = Self {
+            cargo: paths_from_environment(
+                &["CARGO_HOME", "CARGO_INSTALL_ROOT"],
+                excluded_root,
+                current_executable,
+            ),
+            npm: paths_from_environment(
+                &[
+                    "NPM_CONFIG_PREFIX",
+                    "npm_config_prefix",
+                    "NPM_CONFIG_GLOBAL_DIR",
+                    "npm_config_global_dir",
+                    "NPM_CONFIG_GLOBAL_BIN_DIR",
+                    "npm_config_global_bin_dir",
+                ],
+                excluded_root,
+                current_executable,
+            ),
+            pnpm: paths_from_environment(&["PNPM_HOME"], excluded_root, current_executable),
+            bun: paths_from_environment(
+                &[
+                    "BUN_INSTALL",
+                    "BUN_INSTALL_GLOBAL_DIR",
+                    "BUN_INSTALL_GLOBAL_BIN_DIR",
+                ],
+                excluded_root,
+                current_executable,
+            ),
+            yarn: paths_from_environment(
+                &["YARN_GLOBAL_FOLDER"],
+                excluded_root,
+                current_executable,
+            ),
+            volta: paths_from_environment(&["VOLTA_HOME"], excluded_root, current_executable),
+            bun_config_errors: Vec::new(),
+            yarn_config_errors: Vec::new(),
+        };
+        let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| trusted_config_path(path, excluded_root, account_home));
+        roots.load_user_config(Some(account_home), xdg_config.as_deref(), excluded_root);
+        roots
+    }
+
+    fn load_user_config(
+        &mut self,
+        home: Option<&Path>,
+        xdg_config: Option<&Path>,
+        excluded_root: Option<&Path>,
+    ) {
+        let Some(home) = home else {
+            return;
+        };
+        let mut bun_configs = vec![home.join(".bunfig.toml")];
+        if let Some(xdg_config) = xdg_config {
+            bun_configs.push(xdg_config.join(".bunfig.toml"));
+            bun_configs.push(xdg_config.join("bun").join("bunfig.toml"));
+        }
+        for config in bun_configs {
+            match read_bun_global_roots(&config, home, excluded_root) {
+                Ok(roots) => self.bun.extend(roots),
+                Err(error) => self.bun_config_errors.push(error.to_string()),
+            }
+        }
+        match read_yarn_global_roots(&home.join(".yarnrc"), home, excluded_root) {
+            Ok(roots) => self.yarn.extend(roots),
+            Err(error) => self.yarn_config_errors.push(error.to_string()),
+        }
+        deduplicate_paths(&mut self.bun);
+        deduplicate_paths(&mut self.yarn);
+    }
+}
+
+const MANAGER_CONFIG_LIMIT: u64 = 64 * 1024;
+
+fn trusted_config_path(path: &Path, excluded_root: Option<&Path>, account_home: &Path) -> bool {
+    path.is_absolute()
+        && path_resolves_within(path, account_home).unwrap_or(false)
+        && excluded_root.is_none_or(|root| !path_resolves_within(path, root).unwrap_or(true))
+}
+
+#[derive(serde::Deserialize)]
+struct BunConfigFile {
+    install: Option<BunInstallConfig>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BunInstallConfig {
+    global_dir: Option<String>,
+    global_bin_dir: Option<String>,
+}
+
+fn read_bun_global_roots(
+    config: &Path,
+    home: &Path,
+    excluded_root: Option<&Path>,
+) -> Result<Vec<PathBuf>, LpmError> {
+    let Some(content) = read_manager_config(config, home, excluded_root, "Bun")? else {
+        return Ok(Vec::new());
+    };
+    let parsed = toml::from_str::<BunConfigFile>(&content).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not parse Bun configuration {}: {error}",
+            config.display()
+        ))
+    })?;
+    let Some(install) = parsed.install else {
+        return Ok(Vec::new());
+    };
+    Ok([install.global_dir, install.global_bin_dir]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| configured_absolute_path(&value, home, excluded_root))
+        .collect())
+}
+
+fn read_yarn_global_roots(
+    config: &Path,
+    home: &Path,
+    excluded_root: Option<&Path>,
+) -> Result<Vec<PathBuf>, LpmError> {
+    let Some(content) = read_manager_config(config, home, excluded_root, "Yarn")? else {
+        return Ok(Vec::new());
+    };
+    let mut roots = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("--global-folder") {
+            continue;
+        }
+        let fields = shlex::split(trimmed).ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "could not parse Yarn global-folder setting in {}",
+                config.display()
+            ))
+        })?;
+        let value = match fields.as_slice() {
+            [flag, value] if flag == "--global-folder" => Some(value.as_str()),
+            [setting] => setting.strip_prefix("--global-folder="),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "invalid Yarn global-folder setting in {}",
+                config.display()
+            ))
+        })?;
+        if let Some(root) = configured_absolute_path(value, home, excluded_root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+fn read_manager_config(
+    config: &Path,
+    home: &Path,
+    excluded_root: Option<&Path>,
+    manager: &str,
+) -> Result<Option<String>, LpmError> {
+    let metadata = match std::fs::symlink_metadata(config) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LpmError::SelfUpdate(format!(
+                "could not inspect {manager} configuration {}: {error}",
+                config.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || !trusted_config_path(config, excluded_root, home)
+        || !manager_config_path_is_private(config, home)
+    {
+        return Err(LpmError::SelfUpdate(format!(
+            "{manager} configuration is not a real private file in the account home: {}",
+            config.display()
+        )));
+    }
+    let file = open_unfollowed_file(config).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not open {manager} configuration {} safely: {error}",
+            config.display()
+        ))
+    })?;
+    let opened_identity = same_file::Handle::from_file(file.try_clone().map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not bind opened {manager} configuration {}: {error}",
+            config.display()
+        ))
+    })?)
+    .map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not bind opened {manager} configuration {}: {error}",
+            config.display()
+        ))
+    })?;
+    if !path_matches_opened_identity(config, &opened_identity) {
+        return Err(LpmError::SelfUpdate(format!(
+            "{manager} configuration changed while it was being opened: {}",
+            config.display()
+        )));
+    }
+    let (content, opened_metadata) =
+        lpm_common::read_text_file_capped_from_open_file(file, config, MANAGER_CONFIG_LIMIT)
+            .map_err(|error| {
+                LpmError::SelfUpdate(format!(
+                    "could not read bounded {manager} configuration {}: {error}",
+                    config.display()
+                ))
+            })?;
+    if !opened_manager_config_is_private(&opened_metadata)
+        || !manager_config_path_is_private(config, home)
+        || !path_matches_opened_identity(config, &opened_identity)
+    {
+        return Err(LpmError::SelfUpdate(format!(
+            "{manager} configuration is not a real private file in the account home: {}",
+            config.display()
+        )));
+    }
+    Ok(Some(content))
+}
+
+fn path_matches_opened_identity(path: &Path, opened: &same_file::Handle) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    same_file::Handle::from_path(path).is_ok_and(|current| &current == opened)
+}
+
+#[cfg(unix)]
+fn open_unfollowed_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_unfollowed_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_unfollowed_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn manager_config_path_is_private(path: &Path, home: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    for ancestor in path.ancestors() {
+        let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != effective_uid
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return false;
+        }
+        if ancestor == home {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn manager_config_path_is_private(path: &Path, home: &Path) -> bool {
+    windows_trust::path_is_private_to_account(path, home)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn manager_config_path_is_private(path: &Path, home: &Path) -> bool {
+    path.starts_with(home)
+}
+
+#[cfg(unix)]
+fn opened_manager_config_is_private(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    metadata.is_file()
+        && metadata.uid() == effective_uid
+        && metadata.permissions().mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn opened_manager_config_is_private(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+fn configured_absolute_path(
+    value: &str,
+    home: &Path,
+    excluded_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let path = if value == "~" {
+        home.to_path_buf()
+    } else if let Some(relative) = value.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        PathBuf::from(value)
+    };
+    (path.is_absolute()
+        && path.parent().and_then(Path::parent).is_some()
+        && resolve_for_containment(&path).is_ok()
+        && excluded_root.is_none_or(|root| !path_resolves_within(&path, root).unwrap_or(true)))
+    .then_some(path)
+}
+
+fn deduplicate_paths(paths: &mut Vec<PathBuf>) {
+    paths.sort_unstable();
+    paths.dedup();
+}
+
+fn paths_from_environment(
+    names: &[&str],
+    excluded_root: Option<&Path>,
+    current_executable: &Path,
+) -> Vec<PathBuf> {
+    let Ok(current_executable) = resolve_for_containment(current_executable) else {
+        return Vec::new();
+    };
+    let resolved_excluded_root = match excluded_root.map(resolve_for_containment).transpose() {
+        Ok(root) => root,
+        Err(()) => return Vec::new(),
+    };
+    names
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| path.parent().and_then(Path::parent).is_some())
+        .filter(|path| {
+            resolve_for_containment(path).is_ok_and(|path| {
+                resolved_excluded_root
+                    .as_ref()
+                    .is_none_or(|root| !path.starts_with(root))
+                    && current_executable.starts_with(path)
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExternalUpdateCommand {
+    program: &'static str,
+    args: Vec<OsString>,
+}
+
+impl ExternalUpdateCommand {
+    fn new(program: &'static str, args: impl IntoIterator<Item = OsString>) -> Self {
+        Self {
+            program,
+            args: args.into_iter().collect(),
+        }
+    }
+
+    fn shell(&self) -> &'static str {
+        if cfg!(windows) { "powershell" } else { "posix" }
+    }
+
+    #[cfg(test)]
+    fn render(&self) -> Result<String, LpmError> {
+        render_update_invocation(OsStr::new(self.program), &self.args)
+    }
+}
+
+fn utf8_update_args(args: &[OsString]) -> Result<Vec<&str>, LpmError> {
+    args.iter()
+        .map(|argument| {
+            argument.to_str().ok_or_else(|| {
+                LpmError::SelfUpdate(
+                    "cannot emit a runnable self-update plan containing a non-UTF-8 argument"
+                        .to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn render_update_invocation(program: &OsStr, args: &[OsString]) -> Result<String, LpmError> {
+    let program_utf8 = program.to_str().ok_or_else(|| {
+        LpmError::SelfUpdate(
+            "cannot emit a runnable self-update plan containing a non-UTF-8 program path"
+                .to_string(),
+        )
+    })?;
+    let args_utf8 = utf8_update_args(args)?;
+    #[cfg(windows)]
+    {
+        Ok(render_powershell_invocation(program_utf8, &args_utf8))
+    }
+    #[cfg(not(windows))]
+    {
+        let args_len = args.iter().map(|arg| arg.len() + 3).sum::<usize>();
+        let mut rendered = String::with_capacity(program_utf8.len() + args_len + 2);
+        render_shell_argument(program, &mut rendered);
+        for argument in args_utf8 {
+            rendered.push(' ');
+            render_shell_argument(OsStr::new(argument), &mut rendered);
+        }
+        Ok(rendered)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn render_powershell_literal(value: &str, rendered: &mut String) {
+    rendered.push('\'');
+    rendered.push_str(&value.replace('\'', "''"));
+    rendered.push('\'');
+}
+
+#[cfg(any(windows, test))]
+fn render_powershell_invocation(program: &str, args: &[&str]) -> String {
+    let args_len = args.iter().map(|arg| arg.len() + 3).sum::<usize>();
+    let mut rendered = String::with_capacity(program.len() + args_len + 4);
+    rendered.push_str("& ");
+    render_powershell_literal(program, &mut rendered);
+    for argument in args {
+        rendered.push(' ');
+        render_powershell_literal(argument, &mut rendered);
+    }
+    rendered
 }
 
 impl InstallMethod {
     fn name(&self) -> &'static str {
         match self {
             InstallMethod::Npm => "npm",
+            InstallMethod::Pnpm => "pnpm",
+            InstallMethod::Bun => "bun",
+            InstallMethod::Yarn => "yarn",
+            InstallMethod::Volta => "volta",
             InstallMethod::Homebrew => "homebrew",
             InstallMethod::Cargo => "cargo",
             InstallMethod::Standalone => "standalone",
         }
     }
 
+    #[cfg(test)]
     fn command(
         &self,
         version: &str,
         cargo_source_commit: Option<&str>,
     ) -> Result<String, LpmError> {
-        Ok(match self {
-            InstallMethod::Npm => format!("npm install -g @lpm-registry/cli@{version}"),
-            InstallMethod::Homebrew => "brew upgrade lpm".into(),
+        match self.external_update_command_with_root(version, cargo_source_commit, None)? {
+            Some(command) => command.render(),
+            None => Err(LpmError::SelfUpdate(
+                "standalone self-update uses the built-in signed updater and has no equivalent shell command"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn external_update_command_with_root(
+        &self,
+        version: &str,
+        cargo_source_commit: Option<&str>,
+        cargo_install_root: Option<&Path>,
+    ) -> Result<Option<ExternalUpdateCommand>, LpmError> {
+        let package = || format!("@lpm-registry/cli@{version}");
+        Ok(Some(match self {
+            InstallMethod::Npm => {
+                ExternalUpdateCommand::new("npm", ["install".into(), "-g".into(), package().into()])
+            }
+            InstallMethod::Pnpm => ExternalUpdateCommand::new(
+                "pnpm",
+                ["add".into(), "--global".into(), package().into()],
+            ),
+            InstallMethod::Bun => ExternalUpdateCommand::new(
+                "bun",
+                ["add".into(), "--global".into(), package().into()],
+            ),
+            InstallMethod::Yarn => ExternalUpdateCommand::new(
+                "yarn",
+                ["global".into(), "add".into(), package().into()],
+            ),
+            InstallMethod::Volta => {
+                ExternalUpdateCommand::new("volta", ["install".into(), package().into()])
+            }
+            InstallMethod::Homebrew => {
+                ExternalUpdateCommand::new("brew", ["upgrade".into(), "lpm".into()])
+            }
             InstallMethod::Cargo => {
                 let source_commit = cargo_source_commit.ok_or_else(|| {
                     LpmError::SelfUpdate(
                         "Cargo update has no verified release source commit".to_string(),
                     )
                 })?;
-                format!(
-                    "cargo install --git https://github.com/lpm-dev/rust-client --rev {source_commit} lpm-cli --force --locked"
+                ExternalUpdateCommand::new(
+                    "cargo",
+                    cargo_install_args(source_commit, cargo_install_root),
                 )
             }
-            InstallMethod::Standalone => standalone_command(version),
-        })
+            InstallMethod::Standalone => return Ok(None),
+        }))
     }
 
     fn ensure_channel_supported(&self, channel: ReleaseChannel) -> Result<(), LpmError> {
         if channel != ReleaseChannel::Nightly
-            || matches!(self, InstallMethod::Npm | InstallMethod::Standalone)
+            || self.is_registry_package_manager()
+            || self == &InstallMethod::Standalone
         {
             return Ok(());
         }
@@ -375,58 +1040,273 @@ impl InstallMethod {
             self.name()
         )))
     }
-}
 
-/// Equivalent shell command for the Standalone upgrade path. The
-/// wrapper does an in-place download of the version-pinned release
-/// asset for the current binary's path — `install.sh` is the install
-/// helper for new users, not what `lpm self-update` actually runs.
-///
-/// On unsupported platforms or when the current exe path is unknown,
-/// fall back to the GitHub Releases page so the user has somewhere to
-/// land manually.
-fn standalone_command(version: &str) -> String {
-    let Ok((platform, ext)) = detect_platform() else {
-        return format!("https://github.com/lpm-dev/rust-client/releases/tag/v{version}");
-    };
-    let exe = std::env::current_exe()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    standalone_command_for(version, platform, ext, exe.as_deref())
-}
-
-/// Pure helper for [`standalone_command`]. Split out so both per-OS
-/// shapes (POSIX `curl` + `chmod` vs Windows PowerShell
-/// `Invoke-WebRequest`) can be tested without depending on the host
-/// the test happens to run on. The Rust updater itself only `chmod`s
-/// on Unix (the `chmod +x` step is `#[cfg(unix)]`), and `chmod` is a
-/// no-op on Windows — so emitting it unconditionally would hand
-/// Windows users a broken command.
-fn standalone_command_for(version: &str, platform: &str, ext: &str, exe: Option<&str>) -> String {
-    let url = format!(
-        "https://github.com/lpm-dev/rust-client/releases/download/v{version}/lpm-{platform}{ext}"
-    );
-    let is_windows = platform.starts_with("win32");
-    let exe = exe.map_or_else(
-        || {
-            if is_windows {
-                "%USERPROFILE%\\.lpm\\bin\\lpm.exe".to_string()
-            } else {
-                "/usr/local/bin/lpm".to_string()
-            }
-        },
-        str::to_string,
-    );
-    if is_windows {
-        // PowerShell. No chmod — Windows uses the .exe extension to
-        // mark executables, not a permission bit.
-        format!("Invoke-WebRequest -Uri {url} -OutFile {exe}")
-    } else {
-        format!("curl -fsSL {url} -o {exe} && chmod +x {exe}")
+    fn is_registry_package_manager(&self) -> bool {
+        matches!(
+            self,
+            InstallMethod::Npm
+                | InstallMethod::Pnpm
+                | InstallMethod::Bun
+                | InstallMethod::Yarn
+                | InstallMethod::Volta
+        )
     }
 }
 
-fn detect_install_method() -> InstallMethod {
+#[cfg(unix)]
+fn render_shell_argument(argument: &OsStr, rendered: &mut String) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = argument.as_bytes();
+    if !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(byte))
+    {
+        rendered.push_str(&String::from_utf8_lossy(bytes));
+        return;
+    }
+    if std::str::from_utf8(bytes).is_err() {
+        rendered.push_str("$'");
+        for byte in bytes {
+            if byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(byte) {
+                rendered.push(char::from(*byte));
+            } else if *byte == b'\'' {
+                rendered.push_str("\\'");
+            } else if *byte == b'\\' {
+                rendered.push_str("\\\\");
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(rendered, "\\x{byte:02x}");
+            }
+        }
+        rendered.push('\'');
+        return;
+    }
+    rendered.push('\'');
+    for byte in bytes {
+        if *byte == b'\'' {
+            rendered.push_str("'\"'\"'");
+        } else {
+            rendered.push(char::from(*byte));
+        }
+    }
+    rendered.push('\'');
+}
+
+#[cfg(not(any(unix, windows)))]
+fn render_shell_argument(argument: &OsStr, rendered: &mut String) {
+    rendered.push_str(&argument.to_string_lossy());
+}
+
+fn canonical_current_executable() -> Result<PathBuf, LpmError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve the running executable for self-update: {error}"
+        ))
+    })?;
+    std::fs::canonicalize(&executable).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve the running executable for self-update: {error}"
+        ))
+    })
+}
+
+pub(crate) fn canonical_account_home() -> Result<PathBuf, LpmError> {
+    let home = operating_system_home_dir().ok_or_else(|| {
+        LpmError::SelfUpdate("could not resolve the operating-system account home".to_string())
+    })?;
+    std::fs::canonicalize(&home).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve the operating-system account home {}: {error}",
+            home.display()
+        ))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_self_update_lock(
+    account_home: &Path,
+) -> Result<lpm_common::SingleFileExclusiveLockHandle, LpmError> {
+    let lock_file = open_self_update_operation_lock(account_home)?;
+    lpm_common::acquire_single_file_exclusive_lock_from_file(lock_file)
+}
+
+pub(crate) fn try_acquire_self_update_lock(
+    account_home: &Path,
+) -> Result<Option<lpm_common::SingleFileExclusiveLockHandle>, LpmError> {
+    let lock_file = open_self_update_operation_lock(account_home)?;
+    lpm_common::try_acquire_single_file_exclusive_lock_from_file(lock_file)
+}
+
+fn open_self_update_operation_lock(account_home: &Path) -> Result<std::fs::File, LpmError> {
+    let lpm_dir = account_home.join(".lpm");
+    ensure_self_update_directory(&lpm_dir)?;
+    let resolved_lpm_dir = std::fs::canonicalize(&lpm_dir)?;
+    if resolved_lpm_dir.parent() != Some(account_home) {
+        return Err(LpmError::SelfUpdate(format!(
+            "LPM state directory escapes the account home: {}",
+            lpm_dir.display()
+        )));
+    }
+
+    let state_dir = resolved_lpm_dir.join("self-update");
+    ensure_self_update_directory(&state_dir)?;
+    let resolved_state = std::fs::canonicalize(&state_dir)?;
+    if resolved_state.parent() != Some(resolved_lpm_dir.as_path()) {
+        return Err(LpmError::SelfUpdate(format!(
+            "self-update state path escapes the LPM state directory: {}",
+            state_dir.display()
+        )));
+    }
+    let lock_path = resolved_state.join("operation.lock");
+    let lock_file = open_self_update_lock_file(&lock_path)?;
+    #[cfg(windows)]
+    {
+        let opened_identity = same_file::Handle::from_file(lock_file.try_clone()?)?;
+        if !windows_trust::path_is_private_to_account(&lock_path, account_home)
+            || !path_matches_opened_identity(&lock_path, &opened_identity)
+        {
+            return Err(LpmError::SelfUpdate(
+                "self-update operation lock is not a private account file".to_string(),
+            ));
+        }
+    }
+    Ok(lock_file)
+}
+
+fn ensure_self_update_directory(path: &Path) -> Result<(), LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(LpmError::SelfUpdate(format!(
+                "self-update state path is not a real directory: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = std::fs::DirBuilder::new();
+                if let Err(error) = builder.mode(0o700).create(path)
+                    && error.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(error.into());
+                }
+            }
+            #[cfg(not(unix))]
+            if let Err(error) = std::fs::create_dir(path)
+                && error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(error.into());
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(LpmError::SelfUpdate(format!(
+                    "self-update state path is not a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_self_update_lock_file(path: &Path) -> Result<std::fs::File, LpmError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_self_update_lock_file(path: &Path) -> Result<std::fs::File, LpmError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_self_update_lock_file(path: &Path) -> Result<std::fs::File, LpmError> {
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?)
+}
+
+fn active_project_root(
+    working_dir: &Path,
+    account_home: &Path,
+) -> Result<Option<PathBuf>, LpmError> {
+    let root = lpm_workspace::find_workspace_root(working_dir)
+        .ok()
+        .flatten()
+        .or_else(|| lpm_workspace::find_project_root(working_dir));
+    let root = if let Some(root) = root {
+        Some(std::fs::canonicalize(&root).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not resolve active project root {}: {error}",
+                root.display()
+            ))
+        })?)
+    } else {
+        None
+    };
+    Ok(project_root_distinct_from_home(root, Some(account_home)))
+}
+
+fn project_root_distinct_from_home(root: Option<PathBuf>, home: Option<&Path>) -> Option<PathBuf> {
+    root.filter(|root| home != Some(root.as_path()))
+}
+
+fn environment_exclusion_root(
+    working_dir: &Path,
+    project_root: &Option<PathBuf>,
+    account_home: &Path,
+) -> Result<Option<PathBuf>, LpmError> {
+    if project_root.is_some() {
+        return Ok(project_root.clone());
+    }
+    let working_dir = std::fs::canonicalize(working_dir).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve active working directory {}: {error}",
+            working_dir.display()
+        ))
+    })?;
+    Ok(fallback_containment_root(working_dir, Some(account_home)))
+}
+
+fn fallback_containment_root(working_dir: PathBuf, home: Option<&Path>) -> Option<PathBuf> {
+    (home != Some(working_dir.as_path())).then_some(working_dir)
+}
+
+#[cfg(test)]
+fn detect_install_method() -> Result<InstallMethod, LpmError> {
     let exe = std::env::current_exe().ok();
     // Resolve symlinks so `/usr/local/bin/lpm → ~/.volta/bin/lpm` (or
     // any version-manager shim) classifies as the underlying channel,
@@ -437,40 +1317,348 @@ fn detect_install_method() -> InstallMethod {
         .as_ref()
         .and_then(|p| std::fs::canonicalize(p).ok())
         .or(exe);
-    detect_install_method_from_path(resolved.as_deref())
+    detect_install_method_from_path_with_roots(resolved.as_deref(), &InstallRoots::default())
 }
 
 /// Pure helper for [`detect_install_method`]. Split out so the
 /// per-shim classification can be unit-tested with synthetic paths
 /// without depending on whatever package manager happens to own the
 /// running binary.
-fn detect_install_method_from_path(exe: Option<&std::path::Path>) -> InstallMethod {
+#[cfg(test)]
+fn detect_install_method_from_path(exe: Option<&Path>) -> InstallMethod {
+    detect_install_method_from_path_with_roots(exe, &InstallRoots::default()).unwrap()
+}
+
+fn detect_install_method_from_path_with_roots(
+    exe: Option<&Path>,
+    roots: &InstallRoots,
+) -> Result<InstallMethod, LpmError> {
     let Some(path) = exe else {
-        return InstallMethod::Standalone;
+        return Ok(InstallMethod::Standalone);
     };
     let components: Vec<&str> = path
         .components()
         .filter_map(|c| c.as_os_str().to_str())
         .collect();
-    let has = |name: &str| components.contains(&name);
+    let has = |name: &str| {
+        components
+            .iter()
+            .any(|component| component.eq_ignore_ascii_case(name))
+    };
+    if has_component_sequence(&components, &["Cellar", "lpm"]) {
+        return Ok(InstallMethod::Homebrew);
+    }
+    match cargo_install_ownership(path) {
+        CargoInstallOwnership::Owned => return Ok(InstallMethod::Cargo),
+        CargoInstallOwnership::Invalid(error) => {
+            return Err(LpmError::SelfUpdate(format!(
+                "invalid Cargo install metadata for {}: {error}",
+                path.display()
+            )));
+        }
+        CargoInstallOwnership::NotOwned => {
+            return Err(LpmError::SelfUpdate(format!(
+                "Cargo install metadata exists but does not claim the active LPM executable {}; refusing destructive standalone replacement",
+                path.display()
+            )));
+        }
+        CargoInstallOwnership::Absent => {
+            if has_component_sequence(&components, &[".cargo", "bin"])
+                || path_is_under_any_root(path, &roots.cargo)
+            {
+                return Err(LpmError::SelfUpdate(format!(
+                    "cannot verify ownership of Cargo-shaped LPM executable {}; refusing destructive standalone replacement",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let has_manager_roots = [
+        &roots.volta,
+        &roots.pnpm,
+        &roots.bun,
+        &roots.yarn,
+        &roots.npm,
+    ]
+    .into_iter()
+    .any(|roots| !roots.is_empty());
+    let resolved_path = has_manager_roots
+        .then(|| resolve_for_containment(path))
+        .and_then(Result::ok);
+    let is_under_any_root = |roots: &[PathBuf]| {
+        resolved_path
+            .as_deref()
+            .is_some_and(|path| path_is_under_any_resolved_root(path, roots))
+    };
+    if is_under_any_root(&roots.volta)
+        || has_component_sequence(&components, &[".volta", "tools", "image", "packages"])
+        || has_component_sequence(&components, &["volta", "tools", "image", "packages"])
+    {
+        return Ok(InstallMethod::Volta);
+    }
+    if is_under_any_root(&roots.pnpm)
+        || (has(".pnpm") && has("node_modules"))
+        || has_component_sequence(&components, &["pnpm", "global"])
+    {
+        return Ok(InstallMethod::Pnpm);
+    }
+    if is_under_any_root(&roots.bun)
+        || has_component_sequence(&components, &[".bun", "install", "global"])
+    {
+        return Ok(InstallMethod::Bun);
+    }
+    if is_under_any_root(&roots.yarn)
+        || has_component_sequence(&components, &[".config", "yarn", "global"])
+        || has_component_sequence(&components, &[".yarn", "global"])
+    {
+        return Ok(InstallMethod::Yarn);
+    }
+    if is_under_any_root(&roots.npm) || is_npm_managed(&components) {
+        return Ok(InstallMethod::Npm);
+    }
+    if has(".pnpm-store") || has_component_sequence(&components, &["pnpm", "store"]) {
+        return Err(LpmError::SelfUpdate(format!(
+            "active LPM executable {} is inside a pnpm store, not a global install target; refusing destructive standalone replacement",
+            path.display()
+        )));
+    }
+    if has("node_modules") {
+        let config_errors = roots
+            .bun_config_errors
+            .iter()
+            .chain(&roots.yarn_config_errors)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !config_errors.is_empty() {
+            return Err(LpmError::SelfUpdate(format!(
+                "cannot determine which package manager owns the active LPM executable {} because manager configuration is invalid: {}",
+                path.display(),
+                config_errors.join("; ")
+            )));
+        }
+        return Err(LpmError::SelfUpdate(format!(
+            "cannot determine which package manager owns the active LPM executable {}; configure the global package-manager prefix or reinstall LPM globally",
+            path.display()
+        )));
+    }
+    Ok(InstallMethod::Standalone)
+}
 
-    // Homebrew first. After canonicalize, `Cellar` is the unique
-    // component on every Homebrew-managed binary regardless of
-    // `/opt/homebrew` vs `/usr/local` prefix on macOS, and Linuxbrew
-    // also routes through `/home/linuxbrew/.linuxbrew/Cellar/...`.
-    // `homebrew` is kept as a fallback signal for the rare cases where
-    // canonicalize fails and we end up testing the bin-shim path
-    // (`/opt/homebrew/bin/lpm`) directly.
-    if has("Cellar") || has("homebrew") || has("linuxbrew") {
-        return InstallMethod::Homebrew;
+fn has_component_sequence(components: &[&str], expected: &[&str]) -> bool {
+    components.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
+fn path_is_under_any_resolved_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| resolve_for_containment(root).is_ok_and(|root| path.starts_with(root)))
+}
+
+fn path_is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
+        return false;
     }
-    if has(".cargo") {
-        return InstallMethod::Cargo;
+    resolve_for_containment(path).is_ok_and(|path| path_is_under_any_resolved_root(&path, roots))
+}
+
+fn path_resolves_within(candidate: &Path, root: &Path) -> Result<bool, ()> {
+    Ok(resolve_for_containment(candidate)?.starts_with(resolve_for_containment(root)?))
+}
+
+fn resolve_for_containment(path: &Path) -> Result<PathBuf, ()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(());
     }
-    if is_npm_managed(&components) {
-        return InstallMethod::Npm;
+    let mut unresolved = Vec::<OsString>::new();
+    let mut ancestor = path;
+    loop {
+        if let Ok(mut resolved) = std::fs::canonicalize(ancestor) {
+            for component in unresolved.iter().rev() {
+                resolved.push(component);
+            }
+            return Ok(resolved);
+        }
+        unresolved.push(ancestor.file_name().ok_or(())?.to_owned());
+        ancestor = ancestor.parent().ok_or(())?;
     }
-    InstallMethod::Standalone
+}
+
+enum CargoInstallOwnership {
+    Owned,
+    NotOwned,
+    Absent,
+    Invalid(String),
+}
+
+enum CargoMetadataOwnership {
+    Owned,
+    NotOwned,
+    Absent,
+    Invalid(String),
+}
+
+fn cargo_install_ownership(executable: &Path) -> CargoInstallOwnership {
+    let Some(bin_dir) = executable.parent() else {
+        return CargoInstallOwnership::Absent;
+    };
+    let is_bin_dir = bin_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"));
+    if !is_bin_dir {
+        return CargoInstallOwnership::Absent;
+    }
+
+    let Some(root) = bin_dir.parent() else {
+        return CargoInstallOwnership::Absent;
+    };
+    match cargo_metadata_ownership(root, executable) {
+        CargoMetadataOwnership::Owned => CargoInstallOwnership::Owned,
+        CargoMetadataOwnership::NotOwned => CargoInstallOwnership::NotOwned,
+        CargoMetadataOwnership::Absent => CargoInstallOwnership::Absent,
+        CargoMetadataOwnership::Invalid(error) => CargoInstallOwnership::Invalid(error),
+    }
+}
+
+const CARGO_INSTALL_METADATA_LIMIT: u64 = 4 * 1024 * 1024;
+
+fn cargo_metadata_ownership(root: &Path, executable: &Path) -> CargoMetadataOwnership {
+    let Some(binary_name) = executable.file_stem().and_then(OsStr::to_str) else {
+        return CargoMetadataOwnership::NotOwned;
+    };
+    let modern_path = root.join(".crates2.json");
+    match read_cargo_metadata(&modern_path) {
+        Ok(Some(content)) => {
+            let owned = match cargo_metadata::modern_claims_binary(&content, binary_name) {
+                Ok(owned) => owned,
+                Err(error) => return CargoMetadataOwnership::Invalid(error),
+            };
+            return if owned {
+                CargoMetadataOwnership::Owned
+            } else {
+                CargoMetadataOwnership::NotOwned
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return CargoMetadataOwnership::Invalid(error),
+    }
+
+    let legacy_path = root.join(".crates.toml");
+    match read_cargo_metadata(&legacy_path) {
+        Ok(Some(content)) => {
+            let owned = match cargo_metadata::legacy_claims_binary(&content, binary_name) {
+                Ok(owned) => owned,
+                Err(error) => return CargoMetadataOwnership::Invalid(error),
+            };
+            if owned {
+                CargoMetadataOwnership::Owned
+            } else {
+                CargoMetadataOwnership::NotOwned
+            }
+        }
+        Ok(None) => CargoMetadataOwnership::Absent,
+        Err(error) => CargoMetadataOwnership::Invalid(error),
+    }
+}
+
+fn read_cargo_metadata(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || !cargo_metadata_path_is_trusted(path)
+    {
+        return Err(format!(
+            "Cargo install metadata is not a real trusted file: {}",
+            path.display()
+        ));
+    }
+    let file = open_unfollowed_file(path)
+        .map_err(|error| format!("could not open {} safely: {error}", path.display()))?;
+    let opened_identity = same_file::Handle::from_file(
+        file.try_clone()
+            .map_err(|error| format!("could not bind {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
+    if !path_matches_opened_identity(path, &opened_identity) {
+        return Err(format!(
+            "Cargo install metadata changed while it was being opened: {}",
+            path.display()
+        ));
+    }
+    let (content, opened_metadata) =
+        lpm_common::read_text_file_capped_from_open_file(file, path, CARGO_INSTALL_METADATA_LIMIT)
+            .map_err(|error| error.to_string())?;
+    if !opened_cargo_metadata_is_trusted(&opened_metadata)
+        || !cargo_metadata_path_is_trusted(path)
+        || !path_matches_opened_identity(path, &opened_identity)
+    {
+        return Err(format!(
+            "Cargo install metadata is not a stable trusted file: {}",
+            path.display()
+        ));
+    }
+    Ok(Some(content))
+}
+
+#[cfg(unix)]
+fn cargo_metadata_path_is_trusted(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    path.ancestors().all(|ancestor| {
+        std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+            let owner = metadata.uid();
+            !metadata.file_type().is_symlink()
+                && (owner == 0 || owner == effective_uid)
+                && metadata.permissions().mode() & 0o022 == 0
+        })
+    })
+}
+
+#[cfg(windows)]
+fn cargo_metadata_path_is_trusted(path: &Path) -> bool {
+    canonical_account_home().is_ok_and(|home| {
+        windows_trust::path_is_trusted_install_location(path, &home)
+            || windows_trust::path_has_trusted_dacl_to_root(path)
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn cargo_metadata_path_is_trusted(path: &Path) -> bool {
+    path.ancestors().all(|ancestor| {
+        std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| !metadata.file_type().is_symlink())
+    })
+}
+
+#[cfg(unix)]
+fn opened_cargo_metadata_is_trusted(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    let owner = metadata.uid();
+    metadata.is_file()
+        && (owner == 0 || owner == effective_uid)
+        && metadata.permissions().mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn opened_cargo_metadata_is_trusted(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 /// Path-component (not substring) match against npm-ecosystem install
@@ -478,36 +1666,31 @@ fn detect_install_method_from_path(exe: Option<&std::path::Path>) -> InstallMeth
 /// `"npm"` anywhere in it (e.g. `/Users/npmtest/...` false-positived as
 /// npm-installed) and missed Volta / fnm / asdf / pnpm-global entirely.
 fn is_npm_managed(components: &[&str]) -> bool {
-    let has = |name: &str| components.contains(&name);
+    let has = |name: &str| {
+        components
+            .iter()
+            .any(|component| component.eq_ignore_ascii_case(name))
+    };
 
-    // The reliable signal: every `npm install -g` and `npx` install
-    // routes through a `node_modules` directory.
-    if has("node_modules") {
+    if has_component_sequence(components, &["lib", "node_modules"])
+        || has_component_sequence(components, &["npm", "node_modules"])
+    {
         return true;
     }
 
     // Version manager and alternative install roots. Component-level
     // exact match avoids the substring trap.
     const SHIMS: &[&str] = &[
-        ".npm",   // npm cache root (`~/.npm`)
-        ".nvm",   // nvm install root (`~/.nvm`)
-        ".volta", // Volta install root (`~/.volta`)
-        ".fnm",   // fnm install root (`~/.fnm`)
-        ".asdf",  // asdf install root (`~/.asdf`)
-        ".n",     // `n` install root with custom `N_PREFIX=~/.n`
-        "nvm",    // nvm shared-install variants
-        "volta",  // Volta shared-install variants
-        "fnm",    // fnm shared-install variants
-        "asdf",   // asdf shared-install variants
+        ".npm",  // npm cache root (`~/.npm`)
+        ".nvm",  // nvm install root (`~/.nvm`)
+        ".fnm",  // fnm install root (`~/.fnm`)
+        ".asdf", // asdf install root (`~/.asdf`)
+        ".n",    // `n` install root with custom `N_PREFIX=~/.n`
+        "nvm",   // nvm shared-install variants
+        "fnm",   // fnm shared-install variants
+        "asdf",  // asdf shared-install variants
     ];
     if SHIMS.iter().any(|s| has(s)) {
-        return true;
-    }
-
-    // pnpm global installs have BOTH `pnpm` AND `global` as components.
-    // Requiring both avoids matching pnpm's content-addressable store
-    // (e.g. `~/.pnpm-store/...`), which is not a global-install root.
-    if has("pnpm") && has("global") {
         return true;
     }
 
@@ -525,34 +1708,40 @@ fn is_npm_managed(components: &[&str]) -> bool {
     false
 }
 
-/// Run an external command for package-manager-based upgrades.
-fn run_shell_update(cmd: &str, args: &[&str]) -> Result<(), LpmError> {
-    let status = Command::new(cmd)
-        .args(args)
-        .status()
-        .map_err(|e| LpmError::Script(format!("failed to run {cmd}: {e}")))?;
-
-    if !status.success() {
-        return Err(LpmError::Script(format!(
-            "{cmd} exited with code {}",
-            status.code().unwrap_or(-1)
-        )));
-    }
-
-    Ok(())
+fn cargo_install_root(executable: &Path) -> Result<PathBuf, LpmError> {
+    cargo_install_root_from_executable(executable).ok_or_else(|| {
+        LpmError::SelfUpdate(format!(
+            "Cargo-managed executable is not under an install-root bin directory: {}",
+            executable.display()
+        ))
+    })
 }
 
-fn cargo_install_args(source_commit: &str) -> Vec<String> {
-    vec![
-        "install".to_string(),
-        "--git".to_string(),
-        "https://github.com/lpm-dev/rust-client".to_string(),
-        "--rev".to_string(),
-        source_commit.to_string(),
-        "lpm-cli".to_string(),
-        "--force".to_string(),
-        "--locked".to_string(),
-    ]
+fn cargo_install_root_from_executable(executable: &Path) -> Option<PathBuf> {
+    let bin_dir = executable.parent()?;
+    let is_bin_dir = bin_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin"));
+    is_bin_dir
+        .then(|| bin_dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+fn cargo_install_args(source_commit: &str, install_root: Option<&Path>) -> Vec<OsString> {
+    let mut args = vec![
+        "install".into(),
+        "--git".into(),
+        "https://github.com/lpm-dev/rust-client".into(),
+        "--rev".into(),
+        source_commit.into(),
+    ];
+    if let Some(root) = install_root {
+        args.push("--root".into());
+        args.push(root.as_os_str().to_owned());
+    }
+    args.extend(["lpm-cli".into(), "--force".into(), "--locked".into()]);
+    args
 }
 
 /// `SHA256SUMS.txt` size cap (4 KiB). The real manifest is ~600 B
@@ -902,10 +2091,26 @@ fn verify_release_asset_digest(
 /// Returns the captured attestation audit so the caller can surface it
 /// into `--json` output (or wherever else a structured audit trail
 /// belongs). The audit is also logged via `tracing::info!`.
-async fn run_standalone_update(version: &str) -> Result<AttestationAudit, LpmError> {
-    let current_exe = std::env::current_exe().map_err(LpmError::Io)?;
-    let assets = verify_and_stage_for_standalone(version, &current_exe).await?;
-    install_staged_binary(&current_exe, assets.staged_binary)?;
+async fn run_standalone_update(
+    version: &str,
+    current_executable: &Path,
+    human_output: bool,
+) -> Result<AttestationAudit, LpmError> {
+    validate_standalone_install_location(current_executable)?;
+    let assets = verify_and_stage_for_standalone(version, current_executable, human_output).await?;
+    VersionProbe::verify_staged(
+        &assets.staged_binary.temporary,
+        &assets.staged_binary.sha256,
+        version,
+    )?;
+    ensure_staged_file_unchanged(
+        &assets.staged_binary.temporary,
+        &assets.staged_binary.sha256,
+    )?;
+    let StagedAsset {
+        temporary, sha256, ..
+    } = assets.staged_binary;
+    install_staged_binary(current_executable, temporary, &sha256)?;
 
     tracing::info!(
         target: "lpm_cli::self_update",
@@ -946,7 +2151,7 @@ fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
 
 #[derive(Debug)]
 struct StandaloneAssets {
-    staged_binary: tempfile::NamedTempFile,
+    staged_binary: StagedAsset,
     audit: AttestationAudit,
 }
 
@@ -960,11 +2165,14 @@ fn release_http_client() -> Result<reqwest::Client, LpmError> {
 async fn fetch_verified_release_manifest(
     client: &reqwest::Client,
     version: &str,
+    human_output: bool,
 ) -> Result<VerifiedReleaseManifest, LpmError> {
     let manifest_url = github_release_download_url(version, "SHA256SUMS.txt");
     let bundle_url = github_release_download_url(version, "SHA256SUMS.txt.sigstore");
 
-    install_ui::phase_untrusted(&format!("Fetching signed checksums for v{version}"));
+    if human_output {
+        install_ui::phase_untrusted(&format!("Fetching signed checksums for v{version}"));
+    }
 
     let manifest = async {
         fetch_bounded(client, &manifest_url, MANIFEST_MAX_BYTES)
@@ -1007,20 +2215,23 @@ async fn fetch_verified_release_manifest(
 
     let (manifest_bytes, bundle_bytes, published_at) =
         tokio::try_join!(manifest, bundle, release_metadata)?;
-    install_ui::phase("Verifying Sigstore attestation");
+    if human_output {
+        install_ui::phase("Verifying Sigstore attestation");
+    }
     verify_release_manifest(version, &manifest_bytes, &bundle_bytes, published_at)
 }
 
 async fn verify_and_stage_for_standalone(
     version: &str,
     current_exe: &std::path::Path,
+    human_output: bool,
 ) -> Result<StandaloneAssets, LpmError> {
     let (platform, ext) = detect_platform()?;
     let binary_name = format!("lpm-{platform}{ext}");
     let asset_url = github_release_download_url(version, &binary_name);
 
     let client = release_http_client()?;
-    let release = fetch_verified_release_manifest(&client, version).await?;
+    let release = fetch_verified_release_manifest(&client, version, human_output).await?;
     if !release.entries.contains_key(&binary_name) {
         return Err(LpmError::SelfUpdate(format!(
             "SHA256SUMS.txt does not enumerate `{binary_name}` for this platform — release pipeline may be missing artifacts"
@@ -1031,26 +2242,24 @@ async fn verify_and_stage_for_standalone(
         .await?
         .ok_or_else(|| {
             LpmError::SelfUpdate(format!(
-                "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {asset_url} — release-pipeline bug"
+                "release v{version} advertises `{binary_name}` in SHA256SUMS.txt but the asset is missing at {} — release-pipeline bug",
+                safe_remote_label(&asset_url)
             ))
         })?;
 
-    let StagedAsset {
-        temporary,
-        byte_len,
-        sha256,
-    } = staged;
-    let audit = verify_release_asset_digest(&release, sha256, &binary_name)?;
+    let audit = verify_release_asset_digest(&release, staged.sha256.clone(), &binary_name)?;
 
-    install_ui::done_untrusted(&format!(
-        "Verified Sigstore attestation for {} ({}, integratedTime {})",
-        binary_name,
-        format_bytes(byte_len),
-        audit.integrated_time
-    ));
+    if human_output {
+        install_ui::done_untrusted(&format!(
+            "Verified Sigstore attestation for {} ({}, integratedTime {})",
+            binary_name,
+            format_bytes(staged.byte_len),
+            audit.integrated_time
+        ));
+    }
 
     Ok(StandaloneAssets {
-        staged_binary: temporary,
+        staged_binary: staged,
         audit,
     })
 }
@@ -1058,7 +2267,7 @@ async fn verify_and_stage_for_standalone(
 #[cfg(test)]
 async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAssets, LpmError> {
     let destination = std::env::temp_dir().join("lpm-self-update-test-bin");
-    verify_and_stage_for_standalone(version, &destination).await
+    verify_and_stage_for_standalone(version, &destination, false).await
 }
 
 /// Atomically swap the running binary at `current_exe` for a verified,
@@ -1073,7 +2282,10 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 fn install_staged_binary(
     current_exe: &std::path::Path,
     temporary: tempfile::NamedTempFile,
+    expected_sha256: &str,
 ) -> Result<(), LpmError> {
+    validate_standalone_install_location(current_exe)?;
+    ensure_staged_file_unchanged(&temporary, expected_sha256)?;
     let file_name = current_exe.file_name().ok_or_else(|| {
         LpmError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1178,6 +2390,71 @@ fn install_staged_binary(
     }
 }
 
+#[cfg(unix)]
+fn validate_standalone_install_location(current_executable: &Path) -> Result<(), LpmError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let parent = current_executable.parent().ok_or_else(|| {
+        LpmError::SelfUpdate("standalone install path has no parent directory".to_string())
+    })?;
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not resolve the standalone install directory: {error}"
+        ))
+    })?;
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    for ancestor in parent.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not inspect the standalone install directory {}: {error}",
+                ancestor.display()
+            ))
+        })?;
+        let owner = metadata.uid();
+        let mode = metadata.permissions().mode();
+        let protected_shared_directory = owner == 0 && mode & 0o1000 != 0;
+        if metadata.file_type().is_symlink()
+            || (owner != 0 && owner != effective_uid)
+            || (mode & 0o022 != 0 && !protected_shared_directory)
+        {
+            return Err(LpmError::SelfUpdate(format!(
+                "refusing standalone self-update through shared-writable install directory {}",
+                ancestor.display()
+            )));
+        }
+    }
+    let metadata = std::fs::metadata(current_executable).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not inspect the running standalone executable: {error}"
+        ))
+    })?;
+    let owner = metadata.uid();
+    if (owner != 0 && owner != effective_uid) || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(LpmError::SelfUpdate(
+            "refusing standalone self-update of a shared-writable executable".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_standalone_install_location(current_executable: &Path) -> Result<(), LpmError> {
+    let account_home = canonical_account_home()?;
+    if !windows_trust::path_is_trusted_install_location(current_executable, &account_home) {
+        return Err(LpmError::SelfUpdate(
+            "refusing standalone self-update through an untrusted Windows install location"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_standalone_install_location(_current_executable: &Path) -> Result<(), LpmError> {
+    Ok(())
+}
+
 #[cfg(test)]
 fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Result<(), LpmError> {
     use std::io::Write as _;
@@ -1187,8 +2464,8 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
         .as_file_mut()
         .write_all(new_bytes)
         .map_err(LpmError::Io)?;
-    finish_staged_binary(&mut temporary)?;
-    install_staged_binary(current_exe, temporary)
+    let temporary = finish_staged_binary(temporary)?;
+    install_staged_binary(current_exe, temporary, &sha256_hex(new_bytes))
 }
 
 fn copy_executable_atomic(
@@ -1289,10 +2566,24 @@ mod tests {
     use crate::release_lookup::{self, UpdateCache};
     use tempfile::tempdir;
 
+    fn cargo_metadata_test_root() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap()
+    }
+
     #[test]
     fn install_method_name_not_empty() {
-        let method = detect_install_method();
+        let method = detect_install_method().unwrap();
         assert!(!method.name().is_empty());
+    }
+
+    #[test]
+    fn standalone_update_does_not_require_or_scan_path() {
+        let _environment = crate::test_env::ScopedEnv::update([("PATH", None)]);
+
+        assert_eq!(
+            sanitized_path_for_method(&InstallMethod::Standalone, None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2001,12 +3292,59 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         std::fs::write(&current, b"old").unwrap();
         let mut temporary = create_staged_binary(&other_destination).unwrap();
         temporary.as_file_mut().write_all(b"new").unwrap();
-        finish_staged_binary(&mut temporary).unwrap();
+        let temporary = finish_staged_binary(temporary).unwrap();
 
-        let err = install_staged_binary(&current, temporary)
+        let err = install_staged_binary(&current, temporary, &sha256_hex(b"new"))
             .expect_err("the atomic swap requires one filesystem directory");
 
         assert!(err.to_string().contains("not next to current_exe"));
+        assert_eq!(std::fs::read(&current).unwrap(), b"old");
+    }
+
+    #[test]
+    fn install_staged_binary_rejects_a_replaced_staging_path() {
+        use std::io::Write as _;
+
+        let directory = tempdir().unwrap();
+        let current = directory.path().join("lpm");
+        std::fs::write(&current, b"old").unwrap();
+        let mut temporary = create_staged_binary(&current).unwrap();
+        temporary.as_file_mut().write_all(b"verified").unwrap();
+        let temporary = finish_staged_binary(temporary).unwrap();
+        let staged_path = temporary.path().to_path_buf();
+        let displaced = directory.path().join("displaced-staged-binary");
+        std::fs::rename(&staged_path, &displaced).unwrap();
+        std::fs::write(&staged_path, b"replacement").unwrap();
+
+        let error = install_staged_binary(&current, temporary, &sha256_hex(b"verified"))
+            .expect_err("the installed path must still name the opened staged file");
+
+        assert!(
+            error
+                .to_string()
+                .contains("staged self-update binary changed")
+        );
+        assert_eq!(std::fs::read(&current).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_staged_binary_rejects_a_shared_writable_install_directory() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let current = directory.path().join("lpm");
+        std::fs::write(&current, b"old").unwrap();
+        let mut temporary = create_staged_binary(&current).unwrap();
+        temporary.as_file_mut().write_all(b"new").unwrap();
+        let temporary = finish_staged_binary(temporary).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = install_staged_binary(&current, temporary, &sha256_hex(b"new"))
+            .expect_err("shared-writable install directories must fail closed");
+
+        assert!(error.to_string().contains("shared-writable"));
         assert_eq!(std::fs::read(&current).unwrap(), b"old");
     }
 
@@ -2094,10 +3432,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                 "/home/linuxbrew/.linuxbrew/Cellar/lpm/0.37.0/bin/lpm",
                 InstallMethod::Homebrew,
             ),
-            // Homebrew bin-shim fallback (pre-canonicalize path)
-            ("/opt/homebrew/bin/lpm", InstallMethod::Homebrew),
-            // Cargo
-            ("/Users/x/.cargo/bin/lpm", InstallMethod::Cargo),
             // Direct npm install
             (
                 "/usr/local/lib/node_modules/@lpm-registry/cli/lpm-bin",
@@ -2114,7 +3448,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             ),
             (
                 "/Users/x/.volta/tools/image/packages/@lpm-registry/cli/bin/lpm",
-                InstallMethod::Npm,
+                InstallMethod::Volta,
             ),
             ("/Users/x/.fnm/aliases/default/bin/lpm", InstallMethod::Npm),
             (
@@ -2137,7 +3471,15 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             // pnpm global (requires BOTH `pnpm` and `global` segments)
             (
                 "/Users/x/.local/share/pnpm/global/5/node_modules/@lpm-registry/cli/lpm-bin",
-                InstallMethod::Npm,
+                InstallMethod::Pnpm,
+            ),
+            (
+                "/Users/x/.bun/install/global/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Bun,
+            ),
+            (
+                "/Users/x/.config/yarn/global/node_modules/@lpm-registry/cli/lpm-bin",
+                InstallMethod::Yarn,
             ),
             // Standalone — no shim, no node_modules
             ("/Users/x/.lpm/bin/lpm", InstallMethod::Standalone),
@@ -2168,6 +3510,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         );
     }
 
+    #[test]
+    fn unrelated_homebrew_directory_is_not_treated_as_a_formula_install() {
+        for executable in [
+            Path::new("/Users/x/projects/homebrew/bin/lpm"),
+            Path::new("/Users/x/projects/Cellar/other/bin/lpm"),
+        ] {
+            assert_eq!(
+                detect_install_method_from_path(Some(executable)),
+                InstallMethod::Standalone,
+                "path {}",
+                executable.display()
+            );
+        }
+    }
+
     /// Bare `n` component without `versions` must NOT classify as
     /// Npm. The `n` version manager's directory layout always has
     /// both segments, so a stray folder named `n` (project source,
@@ -2190,13 +3547,150 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     /// and routing the upgrade through `npm install -g` would corrupt
     /// the store.
     #[test]
-    fn detect_install_method_pnpm_store_alone_is_not_global_install() {
+    fn detect_install_method_refuses_a_pnpm_store_entry() {
         use std::path::Path;
         let p = Path::new("/Users/x/.pnpm-store/v3/files/aa/bb/lpm-bin");
+        let error = detect_install_method_from_path_with_roots(Some(p), &InstallRoots::default())
+            .expect_err("a pnpm store entry must not be overwritten as standalone");
+
+        assert!(error.to_string().contains("pnpm store"));
+    }
+
+    #[test]
+    fn custom_node_modules_layout_is_not_assumed_to_be_npm_owned() {
+        let executable = Path::new("/opt/custom-global/node_modules/@lpm-registry/cli/lpm-rs");
+        let error =
+            detect_install_method_from_path_with_roots(Some(executable), &InstallRoots::default())
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot determine which package manager")
+        );
+    }
+
+    #[test]
+    fn malformed_project_metadata_does_not_block_project_containment_discovery() {
+        let project = tempdir().unwrap();
+        let account = tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{").unwrap();
+
         assert_eq!(
-            detect_install_method_from_path(Some(p)),
-            InstallMethod::Standalone,
-            "pnpm store without `global` segment is not an install root"
+            active_project_root(project.path(), account.path()).unwrap(),
+            Some(std::fs::canonicalize(project.path()).unwrap())
+        );
+    }
+
+    #[test]
+    fn unrecognized_working_directory_is_not_treated_as_a_project() {
+        let directory = tempdir().unwrap();
+        let account = tempdir().unwrap();
+
+        assert_eq!(
+            active_project_root(directory.path(), account.path()).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_update_lock_rejects_a_symlinked_parent_without_writing_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let account = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let account_path = std::fs::canonicalize(account.path()).unwrap();
+        symlink(outside.path(), account_path.join(".lpm")).unwrap();
+
+        assert!(acquire_self_update_lock(&account_path).is_err());
+        assert!(!outside.path().join("self-update").exists());
+    }
+
+    #[test]
+    fn concurrent_self_update_refuses_to_wait_for_the_active_operation() {
+        let account = tempdir().unwrap();
+        let account_path = std::fs::canonicalize(account.path()).unwrap();
+        let _held = acquire_self_update_lock(&account_path).unwrap();
+
+        assert!(
+            try_acquire_self_update_lock(&account_path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode self-update lock contention latency probe"]
+    fn self_update_lock_contention_probe_reports_fail_fast_latency() {
+        const ATTEMPTS: usize = 10_000;
+
+        let account = tempdir().unwrap();
+        let account_path = std::fs::canonicalize(account.path()).unwrap();
+        let _held = acquire_self_update_lock(&account_path).unwrap();
+        let started = Instant::now();
+        for _ in 0..ATTEMPTS {
+            assert!(
+                try_acquire_self_update_lock(&account_path)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "self_update_lock_contention attempts={ATTEMPTS} elapsed_us={} per_attempt_ns={}",
+            elapsed.as_micros(),
+            elapsed.as_nanos() / ATTEMPTS as u128
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn self_update_lock_rejects_an_everyone_writable_lock_file() {
+        let account = tempdir().unwrap();
+        let account_path = std::fs::canonicalize(account.path()).unwrap();
+        drop(acquire_self_update_lock(&account_path).unwrap());
+        let lock_path = account_path
+            .join(".lpm")
+            .join("self-update")
+            .join("operation.lock");
+        let status = std::process::Command::new("icacls")
+            .arg(&lock_path)
+            .args(["/grant", "*S-1-1-0:F"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let Err(error) = try_acquire_self_update_lock(&account_path) else {
+            panic!("an Everyone-writable operation lock must fail closed");
+        };
+
+        assert!(error.to_string().contains("not a private account file"));
+    }
+
+    #[test]
+    fn home_directory_without_project_metadata_is_not_treated_as_a_project() {
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\example"
+        } else {
+            "/home/example"
+        });
+
+        assert_eq!(fallback_containment_root(home.clone(), Some(&home)), None);
+    }
+
+    #[test]
+    fn home_directory_project_metadata_does_not_capture_global_runtime_installs() {
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\example"
+        } else {
+            "/home/example"
+        });
+
+        assert_eq!(
+            project_root_distinct_from_home(Some(home.clone()), Some(&home)),
+            None
         );
     }
 
@@ -2208,6 +3702,444 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             detect_install_method_from_path(None),
             InstallMethod::Standalone
         );
+    }
+
+    #[test]
+    fn configured_manager_roots_classify_nondefault_install_layouts() {
+        let base = tempdir().unwrap();
+        let cases = [
+            ("pnpm-root", InstallMethod::Pnpm),
+            ("bun-root", InstallMethod::Bun),
+            ("yarn-root", InstallMethod::Yarn),
+            ("volta-root", InstallMethod::Volta),
+        ];
+        for (directory, expected) in cases {
+            let root = base.path().join(directory);
+            let executable = root
+                .join("custom")
+                .join("packages")
+                .join("lpm")
+                .join(if cfg!(windows) { "lpm.exe" } else { "lpm" });
+            std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            std::fs::write(&executable, b"").unwrap();
+            let roots = match expected {
+                InstallMethod::Pnpm => InstallRoots {
+                    pnpm: vec![root],
+                    ..InstallRoots::default()
+                },
+                InstallMethod::Bun => InstallRoots {
+                    bun: vec![root],
+                    ..InstallRoots::default()
+                },
+                InstallMethod::Yarn => InstallRoots {
+                    yarn: vec![root],
+                    ..InstallRoots::default()
+                },
+                InstallMethod::Volta => InstallRoots {
+                    volta: vec![root],
+                    ..InstallRoots::default()
+                },
+                _ => unreachable!(),
+            };
+
+            assert_eq!(
+                detect_install_method_from_path_with_roots(Some(&executable), &roots).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn bun_user_config_global_directories_classify_custom_install_layouts() {
+        let home = tempdir().unwrap();
+        let global_dir = home.path().join("custom bun global");
+        let global_bin = home.path().join("custom bun bin");
+        std::fs::write(
+            home.path().join(".bunfig.toml"),
+            format!(
+                "[install]\nglobalDir = {:?}\nglobalBinDir = {:?}\n",
+                global_dir.to_string_lossy(),
+                global_bin.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let executable = global_dir.join("packages").join("lpm");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"").unwrap();
+        let mut roots = InstallRoots::default();
+
+        roots.load_user_config(Some(home.path()), None, None);
+
+        assert_eq!(
+            detect_install_method_from_path_with_roots(Some(&executable), &roots).unwrap(),
+            InstallMethod::Bun
+        );
+        assert!(roots.bun.contains(&global_bin));
+    }
+
+    #[test]
+    fn yarn_classic_user_config_classifies_a_custom_global_folder() {
+        let home = tempdir().unwrap();
+        let global = home.path().join("custom yarn global");
+        std::fs::write(
+            home.path().join(".yarnrc"),
+            format!("--global-folder {:?}\n", global.to_string_lossy()),
+        )
+        .unwrap();
+        let executable = global.join("node_modules").join("lpm").join("lpm");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"").unwrap();
+        let mut roots = InstallRoots::default();
+
+        roots.load_user_config(Some(home.path()), None, None);
+
+        assert_eq!(
+            detect_install_method_from_path_with_roots(Some(&executable), &roots).unwrap(),
+            InstallMethod::Yarn
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bun_config_symlink_outside_the_account_home_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let configured_root = home.path().join("bun-global");
+        let outside_config = outside.path().join("bunfig.toml");
+        std::fs::write(
+            &outside_config,
+            format!(
+                "[install]\nglobalDir = {:?}\n",
+                configured_root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        symlink(&outside_config, home.path().join(".bunfig.toml")).unwrap();
+
+        let error = read_bun_global_roots(&home.path().join(".bunfig.toml"), home.path(), None)
+            .expect_err("a manager config symlink must not be followed");
+
+        assert!(error.to_string().contains("real private file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn yarn_config_symlink_outside_the_account_home_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let configured_root = home.path().join("yarn-global");
+        let outside_config = outside.path().join("yarnrc");
+        std::fs::write(
+            &outside_config,
+            format!("--global-folder {:?}\n", configured_root.to_string_lossy()),
+        )
+        .unwrap();
+        symlink(&outside_config, home.path().join(".yarnrc")).unwrap();
+
+        let error = read_yarn_global_roots(&home.path().join(".yarnrc"), home.path(), None)
+            .expect_err("a manager config symlink must not be followed");
+
+        assert!(error.to_string().contains("real private file"));
+    }
+
+    #[test]
+    fn bun_user_config_accepts_an_external_root_that_owns_the_running_executable() {
+        let home = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let executable = external.path().join("install").join("global").join("lpm");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"").unwrap();
+        std::fs::write(
+            home.path().join(".bunfig.toml"),
+            format!(
+                "[install]\nglobalDir = {:?}\n",
+                external.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let roots =
+            read_bun_global_roots(&home.path().join(".bunfig.toml"), home.path(), None).unwrap();
+
+        assert_eq!(roots, vec![external.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn yarn_user_config_accepts_an_external_global_root() {
+        let home = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".yarnrc"),
+            format!("--global-folder {:?}\n", external.path().to_string_lossy()),
+        )
+        .unwrap();
+
+        let roots =
+            read_yarn_global_roots(&home.path().join(".yarnrc"), home.path(), None).unwrap();
+
+        assert_eq!(roots, vec![external.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn oversized_bun_config_does_not_block_an_unrelated_npm_install() {
+        let home = tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".bunfig.toml"),
+            vec![b' '; MANAGER_CONFIG_LIMIT as usize + 1],
+        )
+        .unwrap();
+        let executable = home
+            .path()
+            .join("lib")
+            .join("node_modules")
+            .join("@lpm-registry")
+            .join("cli")
+            .join("lpm-rs");
+        let mut roots = InstallRoots::default();
+
+        roots.load_user_config(Some(home.path()), None, None);
+
+        assert_eq!(
+            detect_install_method_from_path_with_roots(Some(&executable), &roots).unwrap(),
+            InstallMethod::Npm
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode install-root containment latency probe"]
+    fn install_root_containment_probe_reports_repeated_resolution_cost() {
+        let attempts = std::env::var("LPM_INSTALL_ROOT_BENCH_ATTEMPTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        let mode = std::env::var("LPM_INSTALL_ROOT_BENCH_MODE")
+            .unwrap_or_else(|_| "resolved-once".to_string());
+        let base = tempdir().unwrap();
+        let managed_root = base.path().join("managed");
+        let target = managed_root.join("bin").join("lpm");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let mut groups = Vec::with_capacity(6);
+        for index in 0..5 {
+            let root = base.path().join(format!("unrelated-{index}"));
+            std::fs::create_dir(&root).unwrap();
+            groups.push(vec![root]);
+        }
+        groups.push(vec![managed_root]);
+
+        let started = Instant::now();
+        for _ in 0..attempts {
+            let found = match mode.as_str() {
+                "fixture" => true,
+                "repeated" => groups
+                    .iter()
+                    .any(|roots| path_is_under_any_root(&target, roots)),
+                "resolved-once" => {
+                    let resolved = resolve_for_containment(&target).unwrap();
+                    groups
+                        .iter()
+                        .any(|roots| path_is_under_any_resolved_root(&resolved, roots))
+                }
+                other => panic!("unknown LPM_INSTALL_ROOT_BENCH_MODE `{other}`"),
+            };
+            assert!(found);
+        }
+
+        eprintln!(
+            "install_root_containment mode={mode} attempts={attempts} elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+
+    #[test]
+    fn unrelated_volta_and_yarn_directory_names_do_not_claim_ownership() {
+        for path in [
+            Path::new("/srv/projects/volta/bin/lpm"),
+            Path::new("/srv/projects/yarn/global/bin/lpm"),
+        ] {
+            assert_eq!(
+                detect_install_method_from_path(Some(path)),
+                InstallMethod::Standalone,
+                "unrelated path {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn detect_install_method_custom_cargo_root_uses_install_metadata() {
+        let root = cargo_metadata_test_root();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join(if cfg!(windows) {
+            "lpm-rs.exe"
+        } else {
+            "lpm-rs"
+        });
+        std::fs::write(&binary, b"").unwrap();
+        let metadata = serde_json::json!({
+            "installs": {
+                "lpm-cli 0.74.1 (registry+https://github.com/rust-lang/crates.io-index)": {
+                    "bins": [binary.file_stem().unwrap().to_string_lossy()]
+                }
+            }
+        });
+        std::fs::write(
+            root.path().join(".crates2.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_install_method_from_path(Some(&binary)).name(),
+            "cargo"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_metadata_symlink_cannot_claim_the_active_executable() {
+        use std::os::unix::fs::symlink;
+
+        let working_dir = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&working_dir).unwrap();
+        let external = tempfile::tempdir_in(&working_dir).unwrap();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join("lpm-rs");
+        std::fs::write(&binary, b"").unwrap();
+        let external_metadata = external.path().join("cargo-metadata.json");
+        std::fs::write(
+            &external_metadata,
+            br#"{"installs":{"lpm-cli 0.74.1":{"bins":["lpm-rs"]}}}"#,
+        )
+        .unwrap();
+        symlink(&external_metadata, root.path().join(".crates2.json")).unwrap();
+
+        let error =
+            detect_install_method_from_path_with_roots(Some(&binary), &InstallRoots::default())
+                .expect_err("symlinked Cargo ownership metadata must fail closed");
+
+        assert!(error.to_string().contains("invalid Cargo install metadata"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_writable_cargo_metadata_cannot_claim_the_active_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let working_dir = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&working_dir).unwrap();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join("lpm-rs");
+        std::fs::write(&binary, b"").unwrap();
+        let metadata = root.path().join(".crates2.json");
+        std::fs::write(
+            &metadata,
+            br#"{"installs":{"lpm-cli 0.74.1":{"bins":["lpm-rs"]}}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let error =
+            detect_install_method_from_path_with_roots(Some(&binary), &InstallRoots::default())
+                .expect_err("shared-writable Cargo ownership metadata must fail closed");
+
+        assert!(error.to_string().contains("invalid Cargo install metadata"));
+    }
+
+    #[test]
+    fn cargo_bin_directory_without_matching_metadata_does_not_claim_ownership() {
+        let root = tempdir().unwrap();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join(if cfg!(windows) {
+            "lpm-rs.exe"
+        } else {
+            "lpm-rs"
+        });
+        std::fs::write(&binary, b"").unwrap();
+
+        assert_eq!(
+            detect_install_method_from_path(Some(&binary)),
+            InstallMethod::Standalone
+        );
+    }
+
+    #[test]
+    fn empty_cargo_metadata_refuses_destructive_standalone_fallback() {
+        let root = cargo_metadata_test_root();
+        std::fs::write(root.path().join(".crates2.json"), br#"{"installs":{}}"#).unwrap();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join(if cfg!(windows) {
+            "lpm-rs.exe"
+        } else {
+            "lpm-rs"
+        });
+        std::fs::write(&binary, b"").unwrap();
+
+        let error =
+            detect_install_method_from_path_with_roots(Some(&binary), &InstallRoots::default())
+                .expect_err("a Cargo root that does not own LPM must fail closed");
+
+        assert!(error.to_string().contains("does not claim"));
+    }
+
+    #[test]
+    fn conventional_cargo_path_without_metadata_refuses_standalone_fallback() {
+        let path = Path::new("/Users/x/.cargo/bin/lpm");
+
+        let error =
+            detect_install_method_from_path_with_roots(Some(path), &InstallRoots::default())
+                .expect_err("a conventional Cargo path without metadata must fail closed");
+
+        assert!(error.to_string().contains("Cargo-shaped"));
+    }
+
+    #[test]
+    fn malformed_cargo_metadata_fails_closed_for_a_cargo_shaped_path() {
+        let root = cargo_metadata_test_root();
+        std::fs::write(root.path().join(".crates2.json"), b"{").unwrap();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join(if cfg!(windows) {
+            "lpm-rs.exe"
+        } else {
+            "lpm-rs"
+        });
+        std::fs::write(&binary, b"").unwrap();
+
+        let error =
+            detect_install_method_from_path_with_roots(Some(&binary), &InstallRoots::default())
+                .unwrap_err();
+
+        assert!(error.to_string().contains("invalid Cargo install metadata"));
+    }
+
+    #[test]
+    fn oversized_cargo_metadata_fails_closed_for_a_cargo_shaped_path() {
+        let root = cargo_metadata_test_root();
+        let metadata = vec![b' '; CARGO_INSTALL_METADATA_LIMIT as usize + 1];
+        std::fs::write(root.path().join(".crates2.json"), metadata).unwrap();
+        let bin_dir = root.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = bin_dir.join(if cfg!(windows) {
+            "lpm-rs.exe"
+        } else {
+            "lpm-rs"
+        });
+        std::fs::write(&binary, b"").unwrap();
+
+        let error =
+            detect_install_method_from_path_with_roots(Some(&binary), &InstallRoots::default())
+                .unwrap_err();
+
+        assert!(error.to_string().contains("invalid Cargo install metadata"));
     }
 
     #[test]
@@ -2264,12 +4196,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     }
 
     #[test]
-    fn nightly_channel_is_limited_to_npm_and_standalone_installs() {
-        assert!(
-            InstallMethod::Npm
-                .ensure_channel_supported(ReleaseChannel::Nightly)
-                .is_ok()
-        );
+    fn nightly_channel_is_limited_to_registry_managers_and_standalone_installs() {
+        for method in [
+            InstallMethod::Npm,
+            InstallMethod::Pnpm,
+            InstallMethod::Bun,
+            InstallMethod::Yarn,
+            InstallMethod::Volta,
+        ] {
+            assert!(
+                method
+                    .ensure_channel_supported(ReleaseChannel::Nightly)
+                    .is_ok(),
+                "method {method:?}"
+            );
+        }
         assert!(
             InstallMethod::Standalone
                 .ensure_channel_supported(ReleaseChannel::Nightly)
@@ -2320,12 +4261,92 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[test]
     fn cargo_install_arguments_use_verified_source_commit_instead_of_tag() {
         let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
-        let args = cargo_install_args(source_commit);
+        let args = cargo_install_args(source_commit, None);
         assert!(
             args.windows(2).any(|pair| pair == ["--rev", source_commit]),
             "Cargo arguments do not bind the verified commit: {args:?}"
         );
         assert!(!args.iter().any(|arg| arg == "--tag"));
+    }
+
+    #[test]
+    fn cargo_install_arguments_preserve_the_detected_install_root() {
+        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+        let root = Path::new("/opt/custom-cargo");
+        let args = cargo_install_args(source_commit, Some(root));
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--root", "/opt/custom-cargo"]),
+            "Cargo arguments must update the root that owns the running binary: {args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_install_root_uses_the_already_resolved_executable() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("lpm-rs");
+        std::fs::write(&executable, b"").unwrap();
+        let shim_dir = tempdir().unwrap();
+        let shim = shim_dir.path().join("lpm");
+        symlink(&executable, &shim).unwrap();
+        let resolved = std::fs::canonicalize(shim).unwrap();
+
+        assert_eq!(
+            cargo_install_root(&resolved).unwrap(),
+            std::fs::canonicalize(root.path()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_update_plan_shell_quotes_a_root_with_spaces_and_metacharacters() {
+        let command = InstallMethod::Cargo
+            .external_update_command_with_root(
+                "0.75.0",
+                Some("1e98fb8efbcc00f620678fc8091b512ed503768f"),
+                Some(Path::new("/opt/Cargo Root;echo owned")),
+            )
+            .unwrap()
+            .unwrap()
+            .render()
+            .unwrap();
+
+        assert!(command.contains("--root '/opt/Cargo Root;echo owned'"));
+    }
+
+    #[test]
+    fn powershell_update_plan_quotes_unicode_spaces_and_metacharacters() {
+        let command = render_powershell_invocation(
+            "cargo",
+            &["install", "C:\\Cargo Root Ω;Write-Output owned's"],
+        );
+
+        assert_eq!(
+            command,
+            "& 'cargo' 'install' 'C:\\Cargo Root Ω;Write-Output owned''s'"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_update_preserves_a_non_utf8_install_root_as_an_os_argument() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let root = PathBuf::from(OsString::from_vec(b"/opt/cargo-\xff".to_vec()));
+        let args = cargo_install_args("1e98fb8efbcc00f620678fc8091b512ed503768f", Some(&root));
+        let root_index = args.iter().position(|arg| arg == "--root").unwrap() + 1;
+        assert_eq!(args[root_index].as_bytes(), root.as_os_str().as_bytes());
+
+        let error = ExternalUpdateCommand::new("cargo", args)
+            .render()
+            .unwrap_err();
+        assert!(error.to_string().contains("non-UTF-8 argument"));
     }
 
     #[test]
@@ -2336,121 +4357,13 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         );
     }
 
-    /// The standalone `update_command` must reflect the literal action
-    /// the wrapper performs: a version-pinned download of the release
-    /// asset, replacing the running binary in place. `install.sh` is
-    /// the install helper for new users, not what self-update runs —
-    /// it does its own `releases/latest` lookup and writes to
-    /// `~/.lpm/bin/`. Locking the wrong contract previously masked
-    /// this divergence.
     #[test]
-    fn install_method_command_standalone_pins_resolved_version() {
-        let cmd = InstallMethod::Standalone.command("0.25.0", None).unwrap();
-        // Must NOT use install.sh (which re-resolves latest itself).
-        assert!(
-            !cmd.contains("install.sh"),
-            "standalone command must not delegate to install.sh: {cmd}"
-        );
-        // Must pin the exact version the wrapper resolved.
-        assert!(
-            cmd.contains("v0.25.0"),
-            "standalone command must include resolved version: {cmd}"
-        );
-        // Must point at GitHub Releases — either the tag page (fallback
-        // when platform detection fails) or the direct download URL.
-        assert!(
-            cmd.contains("github.com/lpm-dev/rust-client/releases/"),
-            "standalone command must reference GitHub Releases: {cmd}"
-        );
-    }
+    fn standalone_update_does_not_expose_an_unverified_equivalent_command() {
+        let error = InstallMethod::Standalone
+            .command("0.25.0", None)
+            .expect_err("the verified built-in updater has no shell-command equivalent");
 
-    /// POSIX hosts (darwin / linux) get a `curl … && chmod +x …`
-    /// command. Driven through the pure helper so the assertion holds
-    /// even when CI runs on a different platform than the inputs.
-    #[test]
-    fn standalone_command_for_posix_uses_curl_and_chmod() {
-        for (platform, ext) in [
-            ("darwin-arm64", ""),
-            ("darwin-x64", ""),
-            ("linux-x64", ""),
-            ("linux-x64-musl", ""),
-            ("linux-arm64", ""),
-        ] {
-            let cmd = standalone_command_for("0.25.0", platform, ext, Some("/usr/local/bin/lpm"));
-            assert!(
-                cmd.starts_with("curl "),
-                "{platform}: must start with curl: {cmd}"
-            );
-            assert!(
-                cmd.contains(&format!("/releases/download/v0.25.0/lpm-{platform}{ext}")),
-                "{platform}: must include direct download URL: {cmd}"
-            );
-            assert!(cmd.contains("chmod +x"), "{platform}: must chmod +x: {cmd}");
-            assert!(
-                cmd.contains("/usr/local/bin/lpm"),
-                "{platform}: must target the supplied exe path: {cmd}"
-            );
-            assert!(
-                !cmd.contains("Invoke-WebRequest"),
-                "{platform}: must not be PowerShell-shaped: {cmd}"
-            );
-        }
-    }
-
-    /// Windows gets a PowerShell `Invoke-WebRequest`. No `chmod` — the
-    /// Rust updater itself only `chmod`s under `#[cfg(unix)]`, and
-    /// Windows uses the `.exe` extension instead of a permission bit.
-    #[test]
-    fn standalone_command_for_windows_uses_invoke_webrequest_no_chmod() {
-        let cmd = standalone_command_for(
-            "0.25.0",
-            "win32-x64",
-            ".exe",
-            Some("C:\\Users\\me\\.lpm\\bin\\lpm.exe"),
-        );
-        assert!(
-            cmd.starts_with("Invoke-WebRequest "),
-            "must start with Invoke-WebRequest: {cmd}"
-        );
-        assert!(
-            cmd.contains("/releases/download/v0.25.0/lpm-win32-x64.exe"),
-            "must include direct .exe URL: {cmd}"
-        );
-        assert!(
-            cmd.contains("C:\\Users\\me\\.lpm\\bin\\lpm.exe"),
-            "must target the supplied exe path: {cmd}"
-        );
-        assert!(
-            !cmd.contains("chmod"),
-            "must not emit chmod on Windows: {cmd}"
-        );
-        assert!(!cmd.contains("curl "), "must not be POSIX-shaped: {cmd}");
-    }
-
-    /// Default exe paths kick in only when `current_exe()` is unknown.
-    /// The Unix fallback is `/usr/local/bin/lpm`; the Windows fallback
-    /// is `%USERPROFILE%\.lpm\bin\lpm.exe`.
-    #[test]
-    fn standalone_command_default_exe_paths_per_platform() {
-        let posix = standalone_command_for("0.25.0", "darwin-arm64", "", None);
-        assert!(posix.contains("/usr/local/bin/lpm"), "{posix}");
-        let win = standalone_command_for("0.25.0", "win32-x64", ".exe", None);
-        assert!(win.contains("%USERPROFILE%\\.lpm\\bin\\lpm.exe"), "{win}");
-    }
-
-    /// The `standalone_command()` dispatcher consults host
-    /// `detect_platform()` / `current_exe()`. On every supported host
-    /// it must pin the version and include the direct download URL —
-    /// the per-OS shape (curl vs Invoke-WebRequest) is covered by the
-    /// pure-helper tests above.
-    #[test]
-    fn standalone_command_dispatcher_returns_pinned_command() {
-        let cmd = standalone_command("0.25.0");
-        assert!(cmd.contains("v0.25.0"), "must pin version: {cmd}");
-        assert!(
-            cmd.contains("/releases/download/v0.25.0/lpm-"),
-            "must include direct download URL: {cmd}"
-        );
+        assert!(error.to_string().contains("built-in signed updater"));
     }
 
     #[test]
@@ -2535,17 +4448,19 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         assert!(matches!(err, LpmError::Network(_)), "got {err:?}");
     }
 
-    /// Cache stamp/clear policy is the load-bearing decision in this
-    /// patch. Encode the user-facing contract directly: after a
-    /// successful Standalone/Cargo/Npm upgrade the cache's `latest`
-    /// must match the version we just installed; after a successful
-    /// Homebrew upgrade the cache file must NOT exist.
+    /// Once an exact version has been verified, every installation
+    /// channel records the same cache contract.
     #[test]
     fn post_upgrade_cache_policy_pinning_channels_stamp() {
         for method in [
             InstallMethod::Standalone,
             InstallMethod::Cargo,
             InstallMethod::Npm,
+            InstallMethod::Pnpm,
+            InstallMethod::Bun,
+            InstallMethod::Yarn,
+            InstallMethod::Volta,
+            InstallMethod::Homebrew,
         ] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("update-check.json");
@@ -2564,27 +4479,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             let loaded = read_cache_at(&path).unwrap();
             assert_eq!(loaded.latest, "0.25.0", "method {method:?}");
         }
-    }
-
-    #[test]
-    fn post_upgrade_cache_policy_homebrew_clears() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("update-check.json");
-        write_cache_at(
-            &path,
-            &UpdateCache {
-                latest: "0.25.0".into(),
-                last_check: 1_700_000_000,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(path.exists());
-        clear_cache_at(&path);
-        assert!(
-            !path.exists(),
-            "Homebrew upgrade must clear cache, not stamp"
-        );
     }
 
     /// `--refresh` is supposed to bypass the in-process cache hit

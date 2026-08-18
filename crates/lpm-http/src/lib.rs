@@ -175,6 +175,10 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     async fn response_from_raw(raw_response: Vec<u8>) -> reqwest::Response {
+        response_from_raw_at_path(raw_response, "/").await
+    }
+
+    async fn response_from_raw_at_path(raw_response: Vec<u8>, path: &str) -> reqwest::Response {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -190,7 +194,7 @@ mod tests {
             socket.shutdown().await.expect("close response");
         });
 
-        reqwest::get(format!("http://{address}/"))
+        reqwest::get(format!("http://{address}{path}"))
             .await
             .expect("request test server")
     }
@@ -228,5 +232,20 @@ mod tests {
             read_body_capped(response, 32).await,
             Err(ResponseBodyError::StreamedTooLarge { cap: 32 })
         ));
+    }
+
+    #[tokio::test]
+    async fn body_read_error_does_not_expose_request_query() {
+        let response = response_from_raw_at_path(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nx".to_vec(),
+            "/release?token=should-not-appear",
+        )
+        .await;
+
+        let error = read_body_capped(response, 32)
+            .await
+            .expect_err("truncated body must fail");
+
+        assert!(!error.to_string().contains("should-not-appear"));
     }
 }

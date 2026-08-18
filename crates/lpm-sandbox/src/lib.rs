@@ -902,6 +902,36 @@ pub fn release_sandbox_tracker(_pid: u32) {
     windows::release_sandbox_tracker_entry(_pid);
 }
 
+/// Spawn a command in an OS process-tree container without applying
+/// filesystem, network, or integrity-level restrictions.
+///
+/// Unix starts the child in a new process group. Windows starts it
+/// suspended, attaches a kill-on-close Job Object, and resumes it only
+/// after attachment succeeds. Callers must pair normal completion with
+/// [`release_sandbox_tracker`] and timeout cleanup with
+/// [`terminate_sandbox_tree`].
+pub fn spawn_tracked_command(
+    command: &mut std::process::Command,
+) -> Result<std::process::Child, SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        return windows::spawn_tracked_command(command);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        command.spawn().map_err(|error| SandboxError::SpawnFailed {
+            reason: error.to_string(),
+        })
+    }
+}
+
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].
 ///
 /// Centralized so unsupported platforms share consistent wording and

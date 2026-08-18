@@ -87,6 +87,22 @@ fn capital_v_sets_version_flag_with_no_subcommand() {
 }
 
 #[test]
+fn self_update_executable_probe_parses_with_the_version_flag() {
+    let cli = Cli::try_parse_from([
+        "lpm",
+        "-V",
+        "--self-update-probe-executable",
+        "/opt/lpm/bin/lpm-rs",
+    ])
+    .unwrap();
+    assert!(cli.version_flag);
+    assert_eq!(
+        cli.self_update_probe_executable.as_deref(),
+        Some(std::path::Path::new("/opt/lpm/bin/lpm-rs"))
+    );
+}
+
+#[test]
 fn lowercase_v_sets_version_flag_with_no_subcommand() {
     let cli = Cli::try_parse_from(["lpm", "-v"]).unwrap();
     assert!(cli.version_flag, "-v must set version flag");

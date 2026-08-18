@@ -400,18 +400,84 @@ fn format_reset_hint(reset_at: u64) -> String {
 // Cache I/O — path-injectable for tests
 // ---------------------------------------------------------------------
 
-/// Default cache path: `~/.lpm/update-check.json`. `None` only when
-/// `dirs::home_dir()` itself returns `None` (extremely rare).
+#[cfg(unix)]
+pub(crate) fn operating_system_home_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    #[cfg(debug_assertions)]
+    if let Some(home) = std::env::var_os("LPM_TEST_SELF_UPDATE_ACCOUNT_HOME") {
+        let home = PathBuf::from(home);
+        if home.is_absolute() {
+            return Some(home);
+        }
+    }
+
+    let mut buffer_len = 16 * 1024;
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; buffer_len];
+        // SAFETY: `entry` and `buffer` are writable for their supplied sizes.
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && buffer_len < 1024 * 1024 {
+            buffer_len *= 2;
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: successful lookup points `result` to `entry` for this scope.
+        let directory = unsafe { (*result).pw_dir };
+        if directory.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is non-null and NUL-terminated on successful lookup.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(directory) }.to_bytes();
+        return Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn operating_system_home_dir() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(home) = std::env::var_os("LPM_TEST_SELF_UPDATE_ACCOUNT_HOME") {
+        let home = PathBuf::from(home);
+        if home.is_absolute() {
+            return Some(home);
+        }
+    }
+    dirs::home_dir()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn operating_system_home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+/// Default cache path in the operating-system account home.
 pub fn default_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join("update-check.json"))
+    let home = operating_system_home_dir()?;
+    std::fs::canonicalize(home)
+        .ok()
+        .map(|home| home.join(".lpm").join("update-check.json"))
 }
 
 /// Read-only cache load. Returns `None` if the file is missing or
 /// malformed; both states are equivalent to "no cached data" for
 /// staleness logic. Backwards-compatible with the legacy
 /// `{latest, lastCheck}` JSON that pre-refactor `update_check.rs` wrote.
+const UPDATE_CACHE_SIZE_CAP_BYTES: u64 = 64 * 1024;
+
 pub fn read_cache_at(path: &Path) -> Option<UpdateCache> {
-    let bytes = lpm_common::read_capped_state_file(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    let bytes = lpm_common::read_capped_state_file(path, UPDATE_CACHE_SIZE_CAP_BYTES)
         .ok()
         .flatten()?;
     serde_json::from_slice(&bytes).ok()
@@ -431,6 +497,7 @@ pub fn write_cache_at(path: &Path, cache: &UpdateCache) -> std::io::Result<()> {
 
 /// Best-effort cache delete. Used after a successful upgrade through a
 /// channel where the post-upgrade version is unknown (Homebrew).
+#[cfg(test)]
 pub fn clear_cache_at(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
@@ -730,7 +797,7 @@ async fn probe_one(
         Err(e) => {
             cache.set_last_failure_check_for(channel, now);
             return Err(LookupError::Transport(
-                lpm_http::display_error(&e).to_string(),
+                lpm_http::display_error(&e.without_url()).to_string(),
             ));
         }
     };
@@ -875,10 +942,9 @@ pub async fn fetch_github_release_published_at(
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| LookupError::Transport(lpm_http::display_error(&e).to_string()))?;
+    let resp = req.send().await.map_err(|e| {
+        LookupError::Transport(lpm_http::display_error(&e.without_url()).to_string())
+    })?;
 
     let status = resp.status();
 
@@ -986,6 +1052,38 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("update-check.json");
         assert!(read_cache_at(&path).is_none());
+    }
+
+    #[test]
+    fn update_cache_rejects_input_larger_than_its_small_state_contract() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        let mut content = br#"{"latest":"99.0.0"}"#.to_vec();
+        content.resize(64 * 1024 + 1, b' ');
+        std::fs::write(&path, content).unwrap();
+
+        assert!(read_cache_at(&path).is_none());
+    }
+
+    #[test]
+    fn default_cache_path_uses_the_operating_system_account_home() {
+        let account_home = tempdir().unwrap();
+        let redirected_home = tempdir().unwrap();
+        let _environment = crate::test_env::ScopedEnv::set([
+            (
+                "LPM_TEST_SELF_UPDATE_ACCOUNT_HOME",
+                account_home.path().as_os_str().to_owned(),
+            ),
+            ("HOME", redirected_home.path().as_os_str().to_owned()),
+        ]);
+
+        assert_eq!(
+            default_cache_path().unwrap(),
+            std::fs::canonicalize(account_home.path())
+                .unwrap()
+                .join(".lpm")
+                .join("update-check.json")
+        );
     }
 
     #[test]

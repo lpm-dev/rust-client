@@ -365,7 +365,10 @@ impl Sandbox for WindowsSandbox {
         // side channel for an opaque kernel handle, so we hold it
         // in the parent process's address space until at-exit
         // cleanup releases it.
-        let job = match create_kill_on_close_job_and_attach(proc_handle) {
+        let job = match create_kill_on_close_job_and_attach(
+            proc_handle,
+            JobLimitProfile::LifecycleSandbox,
+        ) {
             Ok(j) => j,
             Err(e) => {
                 let _ = unsafe { TerminateProcess(proc_handle, 1) };
@@ -426,6 +429,38 @@ impl Sandbox for WindowsSandbox {
             },
         }
     }
+}
+
+pub(crate) fn spawn_tracked_command(command: &mut Command) -> Result<Child, SandboxError> {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP);
+
+    let child = command.spawn().map_err(|error| SandboxError::SpawnFailed {
+        reason: format!("CreateProcessW failed: {error}"),
+    })?;
+    let process_handle = child.as_raw_handle() as HANDLE;
+    let job = match create_kill_on_close_job_and_attach(
+        process_handle,
+        JobLimitProfile::TreeTrackingOnly,
+    ) {
+        Ok(job) => job,
+        Err(error) => {
+            // SAFETY: the handle belongs to the suspended child returned by
+            // CreateProcessW and remains valid while `child` is alive.
+            let _ = unsafe { TerminateProcess(process_handle, 1) };
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = resume_process(process_handle) {
+        // SAFETY: the process is still suspended and the handle remains valid.
+        let _ = unsafe { TerminateProcess(process_handle, 1) };
+        drop(job);
+        return Err(error);
+    }
+
+    register_job_for_child(child.id(), job);
+    Ok(child)
 }
 
 // ── Allow-set rendering ──────────────────────────────────────────────
@@ -763,17 +798,6 @@ fn labelled_cache_insert(path: PathBuf, identity: DirectoryIdentity) {
 fn reset_labelled_roots_cache_for_tests() {
     let mut cache = LABELED_ROOTS.lock().unwrap_or_else(|p| p.into_inner());
     cache.clear();
-}
-
-/// Test-only: drop every tracker entry. Tests inspecting JOB_TRACKER
-/// state directly (e.g. idempotency pins for `release_sandbox_tracker_entry`
-/// / `terminate_sandbox_tree`) call this first so prior tests in the
-/// same binary can't bleed entries forward. Mirrors
-/// `reset_labelled_roots_cache_for_tests` above.
-#[cfg(test)]
-fn reset_job_tracker_for_tests() {
-    let mut table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
-    table.clear();
 }
 
 /// Build the SDDL-derived security descriptor for the Low IL
@@ -1146,8 +1170,25 @@ impl Drop for LocalSid {
 /// outlive the child — closing the handle terminates every member
 /// process, which is exactly what we want on the parent's drop /
 /// timeout-kill paths.
+#[derive(Clone, Copy)]
+enum JobLimitProfile {
+    LifecycleSandbox,
+    TreeTrackingOnly,
+}
+
+fn configure_job_limits(info: &mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION, profile: JobLimitProfile) {
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if matches!(profile, JobLimitProfile::LifecycleSandbox) {
+        info.BasicLimitInformation.LimitFlags |=
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.BasicLimitInformation.ActiveProcessLimit = 512;
+        info.ProcessMemoryLimit = 2 * 1024 * 1024 * 1024;
+    }
+}
+
 fn create_kill_on_close_job_and_attach(
     process_handle: HANDLE,
+    profile: JobLimitProfile,
 ) -> Result<OwnedHandle, SandboxError> {
     // SAFETY: `CreateJobObjectW(NULL, NULL)` is the documented form
     // for an unnamed Job Object; we own the returned handle.
@@ -1170,11 +1211,7 @@ fn create_kill_on_close_job_and_attach(
     //     legitimately reach into the GiB range so going much
     //     lower breaks legitimate scripts.
     //   KILL_ON_JOB_CLOSE — preserved from the prior contract.
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-    info.BasicLimitInformation.ActiveProcessLimit = 512;
-    info.ProcessMemoryLimit = 2 * 1024 * 1024 * 1024;
+    configure_job_limits(&mut info, profile);
     // SAFETY: documented call pattern; size matches the struct.
     let ok = unsafe {
         SetInformationJobObject(
@@ -2725,40 +2762,207 @@ mod tests {
     // document themselves as "Idempotent: missing entries are silent
     // no-ops." These tests pin that contract — calling either on a
     // PID that was never registered must not panic and must leave the
-    // tracker untouched. Both reset the tracker first so a prior
-    // test's residual entries can't bleed in (matches the
-    // `reset_labelled_roots_cache_for_tests` discipline). They
-    // deliberately do NOT pin behavior on duplicate-PID re-register —
+    // tracker untouched. They deliberately do NOT pin behavior on
+    // duplicate-PID re-register —
     // that case is unreachable in the current call graph (kernel
     // PID-reuse is blocked while the parent holds a process handle),
     // so locking it as a contract would over-specify.
 
     #[test]
     fn release_sandbox_tracker_entry_on_unknown_pid_is_noop() {
-        reset_job_tracker_for_tests();
         // PID chosen so it cannot collide with a real Windows PID
         // (kernel PIDs are multiples of 4 and the high bit is never
         // set in user-mode space).
         release_sandbox_tracker_entry(0xFFFF_FFFE);
         let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
-            table.is_empty(),
-            "release on unknown PID must not insert an entry; tracker had {} entries",
-            table.len()
+            !table.contains_key(&0xFFFF_FFFE),
+            "release on unknown PID must not insert an entry"
         );
     }
 
     #[test]
     fn terminate_sandbox_tree_on_unknown_pid_is_noop() {
-        reset_job_tracker_for_tests();
         // No registration before this — the call must short-circuit
         // before any TerminateJobObject syscall.
         terminate_sandbox_tree(0xFFFF_FFFD);
         let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
-            table.is_empty(),
-            "terminate on unknown PID must not insert an entry; tracker had {} entries",
-            table.len()
+            !table.contains_key(&0xFFFF_FFFD),
+            "terminate on unknown PID must not insert an entry"
         );
+    }
+
+    #[test]
+    fn tracked_commands_use_kill_on_close_without_lifecycle_resource_caps() {
+        // SAFETY: the Windows information struct accepts the all-zero initial state.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+
+        configure_job_limits(&mut info, JobLimitProfile::TreeTrackingOnly);
+
+        assert_eq!(
+            info.BasicLimitInformation.LimitFlags,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        );
+        assert_eq!(info.BasicLimitInformation.ActiveProcessLimit, 0);
+        assert_eq!(info.ProcessMemoryLimit, 0);
+    }
+
+    #[test]
+    fn lifecycle_jobs_retain_process_and_memory_caps() {
+        // SAFETY: the Windows information struct accepts the all-zero initial state.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+
+        configure_job_limits(&mut info, JobLimitProfile::LifecycleSandbox);
+
+        assert_ne!(
+            info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            0
+        );
+        assert_ne!(
+            info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            0
+        );
+        assert_eq!(info.BasicLimitInformation.ActiveProcessLimit, 512);
+        assert_eq!(info.ProcessMemoryLimit, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tracked_command_is_attached_before_resume_and_terminated_as_a_job() {
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_tracked_command(&mut command).expect("spawn tracked command");
+        let pid = child.id();
+        {
+            let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(table.contains_key(&pid));
+        }
+
+        terminate_sandbox_tree(pid);
+        let status = child.wait().expect("reap terminated tracked command");
+        assert!(!status.success());
+        let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!table.contains_key(&pid));
+    }
+
+    #[test]
+    fn normally_exited_tracked_command_releases_its_job_entry() {
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/S", "/C", "exit /b 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_tracked_command(&mut command).expect("spawn tracked command");
+        let pid = child.id();
+
+        let status = child.wait().expect("wait for tracked command");
+        assert!(status.success());
+        {
+            let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(table.contains_key(&pid));
+        }
+
+        release_sandbox_tracker_entry(pid);
+        let table = JOB_TRACKER.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!table.contains_key(&pid));
+    }
+
+    fn tracked_descendant_fixture(exit_root: bool) -> (tempfile::TempDir, PathBuf, Command) {
+        let directory = tempfile::tempdir().expect("create tracked descendant fixture");
+        let pid_file = directory.path().join("descendant.pid");
+        let script = directory.path().join("spawn-descendant.ps1");
+        let escaped_pid_file = pid_file.to_string_lossy().replace('\'', "''");
+        let root_action = if exit_root {
+            "exit 0"
+        } else {
+            "Start-Sleep -Seconds 30"
+        };
+        std::fs::write(
+            &script,
+            format!(
+                "$ErrorActionPreference = 'Stop'\n$ping = Join-Path $env:SystemRoot 'System32\\PING.EXE'\n$child = Start-Process -FilePath $ping -ArgumentList @('-n','30','127.0.0.1') -PassThru\nSet-Content -LiteralPath '{escaped_pid_file}' -Value $child.Id -NoNewline\n{root_action}\n"
+            ),
+        )
+        .expect("write tracked descendant fixture");
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        (directory, pid_file, command)
+    }
+
+    fn wait_for_descendant_pid(pid_file: &std::path::Path, root: &mut Child) -> u32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(value) = std::fs::read_to_string(pid_file)
+                && let Ok(pid) = value.parse()
+            {
+                return pid;
+            }
+            if std::time::Instant::now() >= deadline {
+                let root_status = root.try_wait().expect("inspect tracked root status");
+                let pid_contents = std::fs::read_to_string(pid_file);
+                panic!(
+                    "tracked descendant did not publish its PID; root status: \
+                     {root_status:?}; PID file: {pid_contents:?}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn windows_process_exists(pid: u32) -> bool {
+        let output = Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("query Windows process table");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    }
+
+    fn assert_process_exits(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while windows_process_exists(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tracked descendant {pid} remained alive"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn terminating_a_tracked_job_kills_its_descendant() {
+        let (_directory, pid_file, mut command) = tracked_descendant_fixture(false);
+        let mut root = spawn_tracked_command(&mut command).expect("spawn tracked root");
+        let descendant = wait_for_descendant_pid(&pid_file, &mut root);
+
+        terminate_sandbox_tree(root.id());
+        let status = root.wait().expect("reap terminated tracked root");
+
+        assert!(!status.success());
+        assert_process_exits(descendant);
+    }
+
+    #[test]
+    fn releasing_a_normally_exited_job_kills_its_surviving_descendant() {
+        let (_directory, pid_file, mut command) = tracked_descendant_fixture(true);
+        let mut root = spawn_tracked_command(&mut command).expect("spawn tracked root");
+        let root_pid = root.id();
+        let descendant = wait_for_descendant_pid(&pid_file, &mut root);
+        let status = root.wait().expect("wait for normally exited root");
+        assert!(status.success());
+        assert!(windows_process_exists(descendant));
+
+        release_sandbox_tracker_entry(root_pid);
+
+        assert_process_exits(descendant);
     }
 }
