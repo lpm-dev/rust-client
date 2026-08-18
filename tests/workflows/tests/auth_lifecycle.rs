@@ -511,7 +511,7 @@ async fn refresh_only_session_logout_all_clears_everything_and_does_not_rehydrat
 }
 
 #[tokio::test]
-async fn invalid_access_token_entry_with_valid_refresh_token_recovers_and_normalizes_store() {
+async fn invalid_access_token_entry_reports_failure_and_preserves_credential_store() {
     let project =
         TempProject::empty(r#"{"name":"auth-corrupt-access-refresh-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -521,19 +521,15 @@ async fn invalid_access_token_entry_with_valid_refresh_token_recovers_and_normal
         "access-from-refresh",
         "refresh-rotated-token",
         "2030-01-01T00:00:00Z",
-        1,
+        0,
     )
     .await;
-    mock.with_authenticated_whoami("access-from-refresh", "testuser", "test@example.com")
-        .await;
 
-    write_credentials_store(
-        project.home(),
-        &serde_json::json!({
-            mock.url(): { "corrupt": true },
-            format!("refresh:{}", mock.url()): "refresh-valid-token",
-        }),
-    );
+    let original_credentials = serde_json::json!({
+        mock.url(): { "corrupt": true },
+        format!("refresh:{}", mock.url()): "refresh-valid-token",
+    });
+    write_credentials_store(project.home(), &original_credentials);
 
     let first_whoami = lpm_with_registry(&project, &mock.url())
         .args(["whoami", "--json"])
@@ -541,38 +537,21 @@ async fn invalid_access_token_entry_with_valid_refresh_token_recovers_and_normal
         .expect("failed to run whoami with invalid access token entry");
 
     assert!(
-        first_whoami.status.success(),
-        "whoami failed to recover from invalid access token entry:\nstdout: {}\nstderr: {}",
+        !first_whoami.status.success(),
+        "whoami accepted an invalid access token entry:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&first_whoami.stdout),
         String::from_utf8_lossy(&first_whoami.stderr),
     );
 
     let first_json = parse_json_output(&first_whoami.stdout);
-    assert_eq!(first_json["success"], true);
-    assert_eq!(first_json["username"], "testuser");
-
-    let credentials = read_credentials(project.home());
-    assert_eq!(credentials[&mock.url()], "access-from-refresh");
-    assert_eq!(
-        credentials[&format!("refresh:{}", mock.url())],
-        "refresh-rotated-token"
-    );
-
-    let second_whoami = lpm_with_registry(&project, &mock.url())
-        .args(["whoami", "--json"])
-        .output()
-        .expect("failed to run second whoami after access-token normalization");
-
+    assert_eq!(first_json["success"], false);
+    assert_eq!(first_json["error_code"], "credential_storage");
     assert!(
-        second_whoami.status.success(),
-        "second whoami failed after normalization:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&second_whoami.stdout),
-        String::from_utf8_lossy(&second_whoami.stderr),
+        first_json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("credential entry is not a string"))
     );
-
-    let second_json = parse_json_output(&second_whoami.stdout);
-    assert_eq!(second_json["success"], true);
-    assert_eq!(second_json["username"], "testuser");
+    assert_eq!(read_credentials(project.home()), original_credentials);
 }
 
 #[tokio::test]
