@@ -2,15 +2,17 @@ use crate::install_ui;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use lpm_common::{DEFAULT_REGISTRY_URL, LpmRoot, format_bytes};
+use lpm_common::{LpmError, LpmRoot, format_bytes};
 use reqwest::StatusCode;
 use reqwest::blocking::{Body, Client};
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH};
+use reqwest::header::CONTENT_LENGTH;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
+use std::future::Future;
 use std::io::{IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -29,11 +31,22 @@ static REMOTE_CACHE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
 pub struct RemoteCacheClient {
     base_url: String,
-    token: String,
+    auth: RemoteCacheAuth,
     team: Option<String>,
     signature_key: Option<String>,
     read_only: bool,
     env_policy: lpm_runner::lpm_json::RemoteCacheEnvConfig,
+}
+
+#[derive(Clone)]
+enum RemoteCacheAuth {
+    Static(String),
+    Session(Arc<lpm_auth::SessionManager>),
+}
+
+enum RemoteCacheRequestError {
+    Unauthorized,
+    Message(String),
 }
 
 pub struct CacheStatus {
@@ -54,8 +67,9 @@ pub struct RemoteStatus {
 
 pub fn client_from_config(
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Option<RemoteCacheClient> {
-    match resolve_client(lpm_config) {
+    match resolve_client(lpm_config, session) {
         Ok(client) => client,
         Err(reason) => {
             warn_once(&reason);
@@ -117,7 +131,10 @@ pub fn try_store(
     }
 }
 
-pub fn status_for_project(project_dir: &Path) -> CacheStatus {
+pub fn status_for_project(
+    project_dir: &Path,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+) -> CacheStatus {
     let root = LpmRoot::from_env().ok();
     let local_path = root
         .as_ref()
@@ -126,7 +143,7 @@ pub fn status_for_project(project_dir: &Path) -> CacheStatus {
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
         .ok()
         .flatten();
-    let remote = remote_status(lpm_config.as_ref());
+    let remote = remote_status(lpm_config.as_ref(), session);
 
     CacheStatus {
         local_path,
@@ -246,7 +263,81 @@ fn cache_status_label(label: &'static str) -> install_ui::TerminalFragment {
     install_ui::dim(&format!("{label:<8}"))
 }
 
+impl RemoteCacheAuth {
+    fn bearer_in_blocking_context(&self) -> Result<String, String> {
+        match self {
+            Self::Static(token) => Ok(token.clone()),
+            Self::Session(session) => block_on_session(
+                session.bearer_string_for(lpm_auth::AuthRequirement::TokenRequired),
+            )
+            .map_err(session_bearer_error),
+        }
+    }
+
+    fn refresh_after_rejection_in_blocking_context(&self) -> Result<Option<String>, String> {
+        match self {
+            Self::Static(_) => Ok(None),
+            Self::Session(session) => block_on_session(session.refresh_now())
+                .map(|secret| {
+                    use secrecy::ExposeSecret;
+                    Some(secret.expose_secret().to_string())
+                })
+                .map_err(|error| format!("remote cache session refresh failed: {error}")),
+        }
+    }
+}
+
+fn block_on_session<T>(future: impl Future<Output = Result<T, LpmError>>) -> Result<T, LpmError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(future),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                LpmError::Network(format!("failed to initialize auth runtime: {error}"))
+            })?
+            .block_on(future),
+    }
+}
+
+fn session_bearer_error(error: LpmError) -> String {
+    match error {
+        LpmError::AuthRequired | LpmError::SessionExpired => {
+            "remote cache is enabled but no token was found; set LPM_REMOTE_CACHE_TOKEN or run lpm login"
+                .to_string()
+        }
+        error => format!("remote cache session unavailable: {error}"),
+    }
+}
+
+impl RemoteCacheRequestError {
+    fn into_message(self, unauthorized_message: &str) -> String {
+        match self {
+            Self::Unauthorized => unauthorized_message.to_string(),
+            Self::Message(message) => message,
+        }
+    }
+}
+
 impl RemoteCacheClient {
+    fn send_authenticated<T>(
+        &self,
+        unauthorized_message: &str,
+        mut send: impl FnMut(&str) -> Result<T, RemoteCacheRequestError>,
+    ) -> Result<T, String> {
+        let bearer = self.auth.bearer_in_blocking_context()?;
+        match send(&bearer) {
+            Ok(value) => Ok(value),
+            Err(RemoteCacheRequestError::Unauthorized) => {
+                let Some(rotated) = self.auth.refresh_after_rejection_in_blocking_context()? else {
+                    return Err(unauthorized_message.to_string());
+                };
+                send(&rotated).map_err(|error| error.into_message(unauthorized_message))
+            }
+            Err(error) => Err(error.into_message(unauthorized_message)),
+        }
+    }
+
     fn restore(
         &self,
         key: &str,
@@ -266,21 +357,32 @@ impl RemoteCacheClient {
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
         let client = blocking_http_client()?;
         let url = self.artifact_url(key)?;
-        let mut response = client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .send()
-            .map_err(|e| {
-                format!(
-                    "remote cache lookup failed: {}",
-                    lpm_http::display_error(&e)
-                )
-            })?;
+        let mut response = self.send_authenticated(
+            "remote cache authorization failed; continuing without it",
+            |bearer| {
+                let response =
+                    client
+                        .get(url.clone())
+                        .bearer_auth(bearer)
+                        .send()
+                        .map_err(|error| {
+                            RemoteCacheRequestError::Message(format!(
+                                "remote cache lookup failed: {}",
+                                lpm_http::display_error(&error)
+                            ))
+                        })?;
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    Err(RemoteCacheRequestError::Unauthorized)
+                } else {
+                    Ok(response)
+                }
+            },
+        )?;
 
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            StatusCode::FORBIDDEN => {
                 return Err("remote cache authorization failed; continuing without it".into());
             }
             status => {
@@ -419,54 +521,63 @@ impl RemoteCacheClient {
             .try_clone()
             .map_err(|e| format!("failed to retain remote cache artifact for hashing: {e}"))?;
         let digests = hash_artifact(hash_file, self.signature_key.as_deref())?;
-        let mut body_file = artifact
-            .as_file()
-            .try_clone()
-            .map_err(|e| format!("failed to retain remote cache artifact for upload: {e}"))?;
-        body_file
-            .rewind()
-            .map_err(|e| format!("failed to rewind remote cache artifact for upload: {e}"))?;
         let url = self.artifact_url(key)?;
+        let response = self.send_authenticated(
+            "remote cache upload was not authorized; continuing without it",
+            |bearer| {
+                let mut body_file = artifact.as_file().try_clone().map_err(|error| {
+                    RemoteCacheRequestError::Message(format!(
+                        "failed to retain remote cache artifact for upload: {error}"
+                    ))
+                })?;
+                body_file.rewind().map_err(|error| {
+                    RemoteCacheRequestError::Message(format!(
+                        "failed to rewind remote cache artifact for upload: {error}"
+                    ))
+                })?;
+                let mut request = client
+                    .put(url.clone())
+                    .bearer_auth(bearer)
+                    .header(CONTENT_LENGTH, artifact_len.to_string())
+                    .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
+                    .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
+                    .header(
+                        ARTIFACT_CLIENT_CI_HEADER,
+                        if is_ci_environment() { "1" } else { "0" },
+                    )
+                    .header(
+                        ARTIFACT_CLIENT_INTERACTIVE_HEADER,
+                        if std::io::stdout().is_terminal() {
+                            "1"
+                        } else {
+                            "0"
+                        },
+                    )
+                    .body(Body::new(body_file));
 
-        let mut request = client
-            .put(url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(CONTENT_LENGTH, artifact_len.to_string())
-            .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
-            .header(ARTIFACT_SHA_HEADER, digests.sha256_hex)
-            .header(
-                ARTIFACT_CLIENT_CI_HEADER,
-                if is_ci_environment() { "1" } else { "0" },
-            )
-            .header(
-                ARTIFACT_CLIENT_INTERACTIVE_HEADER,
-                if std::io::stdout().is_terminal() {
-                    "1"
+                if let Some(tag) = digests.hmac_tag.as_deref() {
+                    request = request.header(ARTIFACT_TAG_HEADER, tag);
+                }
+
+                let response = request.send().map_err(|error| {
+                    RemoteCacheRequestError::Message(format!(
+                        "remote cache upload failed: {}",
+                        lpm_http::display_error(&error)
+                    ))
+                })?;
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    Err(RemoteCacheRequestError::Unauthorized)
                 } else {
-                    "0"
-                },
-            )
-            .body(Body::new(body_file));
-
-        if let Some(tag) = digests.hmac_tag {
-            request = request.header(ARTIFACT_TAG_HEADER, tag);
-        }
-
-        let response = request.send().map_err(|e| {
-            format!(
-                "remote cache upload failed: {}",
-                lpm_http::display_error(&e)
-            )
-        })?;
+                    Ok(response)
+                }
+            },
+        )?;
 
         if response.status().is_success() {
             return Ok(());
         }
 
-        if matches!(
-            response.status(),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ) {
+        if response.status() == StatusCode::FORBIDDEN {
             return Err("remote cache upload was not authorized; continuing without it".into());
         }
 
@@ -502,29 +613,38 @@ struct ArtifactDigests {
 
 fn resolve_client(
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<Option<RemoteCacheClient>, String> {
     if !remote_cache_requested(lpm_config) {
         return Ok(None);
     }
 
     let config = lpm_config.and_then(|cfg| cfg.remote_cache.as_ref());
-    let base_url = resolve_base_url(config.and_then(|cfg| cfg.url.as_deref()))?;
-    let cache_matches_registry = cache_origin_matches_registry(&base_url);
-    let token = match std::env::var("LPM_REMOTE_CACHE_TOKEN")
+    let active_registry = session.as_ref().map(|session| session.registry_url());
+    let base_url = resolve_base_url(config.and_then(|cfg| cfg.url.as_deref()), active_registry)?;
+    let cache_matches_registry = cache_origin_matches_registry(&base_url, active_registry);
+    let auth = match std::env::var("LPM_REMOTE_CACHE_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
     {
-        Some(token) => token,
+        Some(token) => RemoteCacheAuth::Static(token),
         // The ambient registry login token (keychain / LPM_TOKEN) is only sent
         // when the cache lives on the LPM registry origin. A cache URL from a
         // checked-in lpm.json that points elsewhere must carry its own
         // LPM_REMOTE_CACHE_TOKEN, so a hostile config can't redirect the
         // registry credential to an attacker-controlled host.
         None if cache_matches_registry => {
-            lpm_auth::get_token(registry_origin_for_auth(&base_url).as_str()).ok_or_else(|| {
-                "remote cache is enabled but no token was found; set LPM_REMOTE_CACHE_TOKEN or run lpm login"
-                    .to_string()
-            })?
+            let registry_origin = registry_origin_for_auth(&base_url)
+                .ok_or_else(|| "invalid remote cache origin".to_string())?;
+            let session = session
+                .filter(|session| {
+                    registry_origin_for_auth(session.registry_url())
+                        .is_some_and(|origin| origin.eq_ignore_ascii_case(&registry_origin))
+                })
+                .unwrap_or_else(|| {
+                    Arc::new(lpm_auth::SessionManager::new(registry_origin.clone(), None))
+                });
+            RemoteCacheAuth::Session(session)
         }
         None => {
             return Err(
@@ -533,7 +653,6 @@ fn resolve_client(
             );
         }
     };
-
     let signature_key = std::env::var("LPM_REMOTE_CACHE_SIGNATURE_KEY")
         .ok()
         .filter(|key| !key.is_empty());
@@ -551,7 +670,7 @@ fn resolve_client(
 
     Ok(Some(RemoteCacheClient {
         base_url,
-        token,
+        auth,
         team: std::env::var("LPM_REMOTE_CACHE_TEAM")
             .ok()
             .filter(|team| !team.trim().is_empty())
@@ -563,7 +682,10 @@ fn resolve_client(
     }))
 }
 
-fn remote_status(lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>) -> RemoteStatus {
+fn remote_status(
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+) -> RemoteStatus {
     let configured = remote_cache_requested(lpm_config);
     if !configured {
         return RemoteStatus {
@@ -577,7 +699,7 @@ fn remote_status(lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>) -> Re
         };
     }
 
-    let client = match resolve_client(lpm_config) {
+    let client = match resolve_client(lpm_config, session) {
         Ok(Some(client)) => client,
         Ok(None) => {
             return RemoteStatus {
@@ -641,15 +763,24 @@ impl RemoteCacheClient {
     fn fetch_status_blocking(&self) -> Result<FetchedRemoteStatus, String> {
         let client = blocking_http_client()?;
         let url = self.status_url()?;
-        let response = client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.token))
-            .send()
-            .map_err(|e| {
-                format!(
-                    "remote cache status failed: {}",
-                    lpm_http::display_error(&e)
-                )
+        let response =
+            self.send_authenticated("remote cache status returned HTTP 401", |bearer| {
+                let response =
+                    client
+                        .get(url.clone())
+                        .bearer_auth(bearer)
+                        .send()
+                        .map_err(|error| {
+                            RemoteCacheRequestError::Message(format!(
+                                "remote cache status failed: {}",
+                                lpm_http::display_error(&error)
+                            ))
+                        })?;
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    Err(RemoteCacheRequestError::Unauthorized)
+                } else {
+                    Ok(response)
+                }
             })?;
 
         if !response.status().is_success() {
@@ -703,12 +834,16 @@ fn remote_cache_requested(lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfi
         .is_some_and(|remote| remote.enabled)
 }
 
-fn resolve_base_url(config_url: Option<&str>) -> Result<String, String> {
+fn resolve_base_url(
+    config_url: Option<&str>,
+    active_registry: Option<&str>,
+) -> Result<String, String> {
     let raw = std::env::var("LPM_REMOTE_CACHE_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())
         .or_else(|| config_url.map(ToOwned::to_owned))
-        .unwrap_or_else(|| format!("{}/v8", lpm_common::resolve_lpm_registry_url()));
+        .or_else(|| active_registry.map(ToOwned::to_owned))
+        .unwrap_or_else(lpm_common::resolve_lpm_registry_url);
 
     let trimmed = raw.trim().trim_end_matches('/');
     let with_v8 = if trimmed.ends_with("/v8") {
@@ -728,24 +863,26 @@ fn resolve_base_url(config_url: Option<&str>) -> Result<String, String> {
     }
 }
 
-fn cache_origin_matches_registry(base_url: &str) -> bool {
-    let cache_origin = registry_origin_for_auth(base_url);
-    let registry_origin = registry_origin_for_auth(&lpm_common::resolve_lpm_registry_url());
-    cache_origin.eq_ignore_ascii_case(&registry_origin)
+fn cache_origin_matches_registry(base_url: &str, active_registry: Option<&str>) -> bool {
+    let Some(cache_origin) = registry_origin_for_auth(base_url) else {
+        return false;
+    };
+    let resolved_registry;
+    let registry = match active_registry {
+        Some(registry) => registry,
+        None => {
+            resolved_registry = lpm_common::resolve_lpm_registry_url();
+            &resolved_registry
+        }
+    };
+    registry_origin_for_auth(registry)
+        .is_some_and(|registry_origin| cache_origin.eq_ignore_ascii_case(&registry_origin))
 }
 
-fn registry_origin_for_auth(base_url: &str) -> String {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| {
-            let host = url.host_str()?;
-            let port = url
-                .port()
-                .map(|port| format!(":{port}"))
-                .unwrap_or_default();
-            Some(format!("{}://{host}{port}", url.scheme()))
-        })
-        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string())
+fn registry_origin_for_auth(base_url: &str) -> Option<String> {
+    let origin = reqwest::Url::parse(base_url).ok()?.origin();
+    let serialized = origin.ascii_serialization();
+    (serialized != "null").then_some(serialized)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -974,6 +1111,14 @@ fn warn_once(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_active_registry_never_authorizes_a_remote_cache_origin() {
+        assert!(!cache_origin_matches_registry(
+            "https://lpm.dev/v8",
+            Some("not a URL"),
+        ));
+    }
 
     #[test]
     fn hmac_tag_roundtrips_with_expected_key() {

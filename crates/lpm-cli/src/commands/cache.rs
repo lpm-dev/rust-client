@@ -25,6 +25,7 @@ use lpm_common::{
     LpmError, LpmRoot, format_bytes, try_acquire_exclusive_lock, with_exclusive_lock,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 const RECENT_STORE_ACTIVITY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
@@ -49,6 +50,7 @@ pub async fn run(
     subcategory: Option<&str>,
     json_output: bool,
     prune_flags: PruneFlags<'_>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
 
@@ -56,7 +58,7 @@ pub async fn run(
         "clean" | "clear" => run_clean(&root, subcategory, json_output),
         "path" => run_path(&root, subcategory, json_output),
         "prune" => super::cache_prune::run(&root, json_output, prune_flags).await,
-        "status" => run_status(json_output),
+        "status" => run_status(json_output, session),
         other => Err(LpmError::Registry(format!(
             "unknown cache action '{other}'. Use: clean [metadata|tasks|dlx|mcp], path [metadata|tasks|dlx|mcp], status, prune [--apply] [--max-age <dur>] [--project <path>]"
         ))),
@@ -251,9 +253,12 @@ fn run_path(root: &LpmRoot, subcategory: Option<&str>, json_output: bool) -> Res
     Ok(())
 }
 
-fn run_status(json_output: bool) -> Result<(), LpmError> {
+fn run_status(
+    json_output: bool,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+) -> Result<(), LpmError> {
     let cwd = std::env::current_dir()?;
-    let status = super::remote_cache::status_for_project(&cwd);
+    let status = super::remote_cache::status_for_project(&cwd, session);
     if json_output {
         println!(
             "{}",
@@ -435,7 +440,7 @@ mod tests {
 
         // Drive the command via its public surface.
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", None, true, PruneFlags::default())
+        run("clean", None, true, PruneFlags::default(), None)
             .await
             .unwrap();
 
@@ -460,7 +465,7 @@ mod tests {
         populate(&root.cache_mcp().join("runtime"), &["package.json"]);
 
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", Some("metadata"), true, PruneFlags::default())
+        run("clean", Some("metadata"), true, PruneFlags::default(), None)
             .await
             .unwrap();
 
@@ -488,7 +493,7 @@ mod tests {
         held_rx.recv().unwrap();
 
         let _env = scoped_lpm_home(tmp.path());
-        let error = run("clean", Some("mcp"), true, PruneFlags::default())
+        let error = run("clean", Some("mcp"), true, PruneFlags::default(), None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("in use"));
@@ -509,7 +514,7 @@ mod tests {
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
 
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", None, true, PruneFlags::default())
+        run("clean", None, true, PruneFlags::default(), None)
             .await
             .unwrap();
 
@@ -550,7 +555,7 @@ mod tests {
         // Human-readable path triggers the notice; JSON path deliberately
         // does not (see emit_clean_json callers). This test exercises the
         // human branch.
-        run("clean", None, false, PruneFlags::default())
+        run("clean", None, false, PruneFlags::default(), None)
             .await
             .unwrap();
 
@@ -568,7 +573,7 @@ mod tests {
         populate(&root.cache_metadata(), &["a.json"]);
 
         let _env = scoped_lpm_home(tmp.path());
-        run("clean", None, false, PruneFlags::default())
+        run("clean", None, false, PruneFlags::default(), None)
             .await
             .unwrap();
         // Capture marker mtime; second run must not rewrite it.
@@ -578,7 +583,7 @@ mod tests {
             .unwrap();
 
         populate(&root.cache_metadata(), &["a.json"]);
-        run("clean", None, false, PruneFlags::default())
+        run("clean", None, false, PruneFlags::default(), None)
             .await
             .unwrap();
 
@@ -596,19 +601,19 @@ mod tests {
         // We can't easily capture stdout from inside a tokio test without
         // pulling in a redirect harness; we assert success + sane behavior
         // and trust the emit_* helpers. The JSON path is deterministic.
-        run("path", None, true, PruneFlags::default())
+        run("path", None, true, PruneFlags::default(), None)
             .await
             .unwrap();
-        run("path", Some("metadata"), true, PruneFlags::default())
+        run("path", Some("metadata"), true, PruneFlags::default(), None)
             .await
             .unwrap();
-        run("path", Some("tasks"), true, PruneFlags::default())
+        run("path", Some("tasks"), true, PruneFlags::default(), None)
             .await
             .unwrap();
-        run("path", Some("dlx"), true, PruneFlags::default())
+        run("path", Some("dlx"), true, PruneFlags::default(), None)
             .await
             .unwrap();
-        run("path", Some("mcp"), true, PruneFlags::default())
+        run("path", Some("mcp"), true, PruneFlags::default(), None)
             .await
             .unwrap();
     }
@@ -617,7 +622,7 @@ mod tests {
     async fn unknown_action_errors() {
         let tmp = TempDir::new().unwrap();
         let _env = scoped_lpm_home(tmp.path());
-        let err = run("bogus", None, true, PruneFlags::default())
+        let err = run("bogus", None, true, PruneFlags::default(), None)
             .await
             .unwrap_err();
         let msg = format!("{err}");

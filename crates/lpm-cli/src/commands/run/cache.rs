@@ -101,6 +101,11 @@ pub(super) struct CacheStoreRequest<'a> {
     pub(super) stderr: &'a str,
 }
 
+enum RemoteCacheResolution {
+    Resolve(Option<Arc<lpm_auth::SessionManager>>),
+    Omit,
+}
+
 pub(super) type WorkspaceDependencyIdentities =
     HashMap<String, Option<Vec<TaskDependencyIdentity>>>;
 
@@ -184,6 +189,7 @@ pub(super) fn build_cache_context(
         extra_args,
         bin_hint,
         lpm_config,
+        RemoteCacheResolution::Resolve(None),
     )
 }
 
@@ -200,6 +206,7 @@ fn build_task_context(
     extra_args: &[String],
     bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    remote_cache: RemoteCacheResolution,
 ) -> Result<Option<CacheContext>, LpmError> {
     if let Some(provided_config) = lpm_config {
         let current_config =
@@ -307,7 +314,12 @@ fn build_task_context(
         command,
         env_vars,
         inherited_env,
-        remote_cache: crate::commands::remote_cache::client_from_config(config_ref),
+        remote_cache: match remote_cache {
+            RemoteCacheResolution::Resolve(session) => {
+                crate::commands::remote_cache::client_from_config(config_ref, session)
+            }
+            RemoteCacheResolution::Omit => None,
+        },
         workspace_validation: workspace_contract.map(|contract| contract.validation.clone()),
         input_validation: cache_snapshot.validation,
         dependencies: dependency_identities.to_vec(),
@@ -327,6 +339,7 @@ pub(super) fn prepare_cache_context_with_config(
     extra_args: &[String],
     bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<Option<CacheContext>, LpmError> {
     build_task_context(
         project_dir,
@@ -337,6 +350,7 @@ pub(super) fn prepare_cache_context_with_config(
         extra_args,
         bin_hint,
         lpm_config,
+        RemoteCacheResolution::Resolve(session),
     )
 }
 
@@ -488,6 +502,7 @@ fn store_cache_with_context(
         request.extra_args,
         request.bin_hint,
         None,
+        RemoteCacheResolution::Omit,
     )? {
         Some(current) => current,
         None => return Ok(false),

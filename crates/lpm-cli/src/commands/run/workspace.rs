@@ -389,6 +389,7 @@ pub async fn run_workspace(
     workspace_concurrency: Option<NonZeroUsize>,
     stream: bool,
     json_output: bool,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
     reject_direct_hidden_scripts(scripts)?;
 
@@ -600,6 +601,7 @@ pub async fn run_workspace(
                 member_task_plan,
                 &workspace_dependency_identities,
                 &initially_failed_tasks,
+                session.clone(),
             )?;
             if !no_cache {
                 completed_task_identities[idx] = Some(required_cache_identities(
@@ -624,6 +626,7 @@ pub async fn run_workspace(
                         let args_owned: Vec<String> = extra_args.to_vec();
                         let mode_owned = env_mode.map(|s| s.to_string());
                         let workspace_contract = workspace_contract.clone();
+                        let session = session.clone();
                         let member_runtime_hint = Arc::clone(&member_runtime_hints[idx]);
                         let required_task_identities = required_task_identities[idx].clone();
                         let member_task_plan = member_task_plans[idx]
@@ -660,6 +663,7 @@ pub async fn run_workspace(
                                 member_task_plan.as_ref(),
                                 &workspace_dependency_identities,
                                 &initially_failed_tasks,
+                                session,
                             )?;
                             let identities = if !no_cache {
                                 Some(required_cache_identities(
@@ -747,6 +751,7 @@ fn run_workspace_package(
     member_task_plan: &WorkspaceMemberTaskPlan,
     workspace_dependency_identities: &WorkspaceDependencyIdentities,
     initially_failed_tasks: &HashSet<String>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
     let member_task_config = &member_task_plan.config;
     let scripts = &member_task_plan.requested_tasks;
@@ -810,6 +815,7 @@ fn run_workspace_package(
             bin_hint,
             Some(&member_task_config.package_scripts),
             initially_failed_tasks,
+            session,
         )
     } else {
         let topo_order: Vec<String> = member_task_plan
@@ -833,6 +839,7 @@ fn run_workspace_package(
             bin_hint,
             Some(&member_task_config.package_scripts),
             initially_failed_tasks,
+            session,
         )
     }
 }

@@ -64,6 +64,7 @@ pub(super) fn run_tasks_parallel(
     bin_hint: &ManagedRuntimeHint,
     pkg_scripts: Option<&HashMap<String, String>>,
     initially_failed_tasks: &HashSet<String>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
@@ -174,6 +175,7 @@ pub(super) fn run_tasks_parallel(
                     extra_args,
                     bin_hint,
                     lpm_config,
+                    session.clone(),
                 )?,
                 None => None,
             };
@@ -331,6 +333,7 @@ pub(super) fn run_tasks_parallel(
                         let config_clone = config_arc.clone();
                         let pkg_scripts_clone = pkg_scripts_arc.clone();
                         let workspace_contract = workspace_contract.clone();
+                        let session = session.clone();
                         let is_stream = stream;
                         let color = chunk_colors[ci].clone();
                         let dependency_identities = if no_cache {
@@ -376,6 +379,7 @@ pub(super) fn run_tasks_parallel(
                                     &args,
                                     &hint_clone,
                                     config_clone.as_deref(),
+                                    session,
                                 )?,
                                 None => None,
                             };
