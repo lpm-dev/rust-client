@@ -549,6 +549,27 @@ fn principal_fingerprint_anon_when_no_auth_no_identity() {
 }
 
 #[test]
+fn npmrc_auth_refuses_cleartext_non_loopback_destination() {
+    let url = "http://registry.example.test/package";
+    let auth = bearer_for("http://registry.example.test", "secret-token");
+    let request = reqwest::Client::new().get(url);
+
+    assert!(
+        apply_npmrc_auth(request, url, Some(&auth)).is_err(),
+        "credentials must not be attached to cleartext non-loopback requests"
+    );
+}
+
+#[test]
+fn npmrc_auth_allows_cleartext_loopback_destination() {
+    let url = "http://127.0.0.1:4873/package";
+    let auth = bearer_for("http://127.0.0.1:4873", "local-token");
+    let request = reqwest::Client::new().get(url);
+
+    assert!(apply_npmrc_auth(request, url, Some(&auth)).is_ok());
+}
+
+#[test]
 fn principal_fingerprint_changes_with_identity_alone() {
     // Same auth (none), different identity hash → different fingerprint.
     // Re-issued client cert must invalidate cache cleanly.

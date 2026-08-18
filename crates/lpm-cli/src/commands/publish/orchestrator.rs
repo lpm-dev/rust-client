@@ -756,14 +756,10 @@ pub async fn run(
                             let gitlab_host = gl_cfg
                                 .and_then(|c| c.registry.as_deref())
                                 .unwrap_or("https://gitlab.com");
-                            // A project lpm.json can override the GitLab host while still
-                            // naming `gitlab` as a publish target. Warn before the
-                            // GitLab token is sent to a non-default host.
                             if gitlab_host.trim_end_matches('/') != "https://gitlab.com" {
                                 tracing::warn!(
-                                    target_url = %gitlab_host,
-                                    "publish.gitlab.registry overridden — GitLab token will be sent to a non-default host; \
-                                     confirm this is intentional",
+                                    target_url = %crate::install_ui::safe_url_origin(gitlab_host),
+                                    "publish.gitlab.registry overridden — an exact registry-scoped token is required",
                                 );
                             }
                             let url = format!(
@@ -771,13 +767,15 @@ pub async fn run(
                                 gitlab_host.trim_end_matches('/'),
                                 urlencoding::encode(project_id)
                             );
+                            let token = auth::get_gitlab_token_for_host(&url).ok_or_else(|| {
+                                LpmError::Registry(format!(
+                                    "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --login-registry {} --token <token>`.",
+                                    crate::install_ui::safe_url_origin(&url)
+                                ))
+                            })?;
                             (
                                 url,
-                                auth::get_gitlab_token_for_host(gitlab_host).ok_or_else(|| {
-                                    LpmError::Registry(
-                                        "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --gitlab --token <token>` or set GITLAB_TOKEN/CI_JOB_TOKEN.".into(),
-                                    )
-                                })?,
+                                token,
                                 "GitLab Packages",
                                 None,
                             )

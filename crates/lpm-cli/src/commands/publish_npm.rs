@@ -118,7 +118,7 @@ pub fn resolve_npm_registry(npm_config: Option<&NpmPublishConfig>) -> String {
         .to_string();
     if resolved.trim_end_matches('/') != NPM_REGISTRY_URL.trim_end_matches('/') {
         tracing::warn!(
-            target_url = %resolved,
+            target_url = %crate::install_ui::safe_url_origin(&resolved),
             default_url = NPM_REGISTRY_URL,
             "publish.npm.registry overridden; registry-scoped auth is required for non-default npm registries",
         );
@@ -228,7 +228,8 @@ async fn publish_to_npm_impl(
 
     if !lpm_common::lpm_registry_url_is_accepted(registry_url) && !runtime.allow_http {
         return Err(LpmError::Registry(format!(
-            "refusing to publish to {registry_url} — credentials require HTTPS or HTTP loopback"
+            "refusing to publish to {} — credentials require HTTPS or HTTP loopback",
+            crate::install_ui::safe_url_origin(registry_url)
         )));
     }
 
