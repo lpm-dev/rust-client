@@ -34,7 +34,7 @@ mod trust_root;
 pub use self::bundle::{
     IdentityExpectations, VerifiedProvenance, VerifyOptions, verify_sigstore_bundle,
 };
-pub(crate) use self::bundle::{extract_in_toto_subject_digest, extract_npm_subject_sha512};
+pub(crate) use self::bundle::{extract_npm_subject_sha512, extract_subject_digest_from_statement};
 pub use self::chain::verify_cert_chain;
 pub(crate) use self::dsse::pae;
 pub use self::dsse::verify_dsse;
