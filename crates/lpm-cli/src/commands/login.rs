@@ -71,10 +71,10 @@ pub async fn run(
     registry_url: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let has_existing_auth = client
-        .session()
-        .and_then(|session| session.current_source())
-        .is_some();
+    let has_existing_auth = match client.session() {
+        Some(session) => session.current_source()?.is_some(),
+        None => false,
+    };
     if has_existing_auth {
         match client.whoami().await {
             Ok(info) => {
