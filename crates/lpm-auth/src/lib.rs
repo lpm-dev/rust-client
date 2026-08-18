@@ -32,6 +32,7 @@ use aes_gcm::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use credential_authority::{CredentialAuthority, CredentialBackend, CredentialKind};
@@ -548,8 +549,8 @@ pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), Strin
 
     let access_result = clear_stored_access_token_unlocked(registry_url);
     let refresh_result = clear_stored_refresh_token_unlocked(registry_url);
-    clear_token_expiry(registry_url);
-    combine_clear_results(access_result, refresh_result)
+    let expiry_result = clear_token_expiry_checked(registry_url);
+    combine_credential_results([access_result, refresh_result, expiry_result])
 }
 
 /// Clear all local login state for a registry.
@@ -592,8 +593,9 @@ pub fn clear_rejected_legacy_session_if_current(
             return Ok(false);
         }
 
-        clear_token_expiry(registry_url);
-        clear_stored_access_token_unlocked(registry_url)
+        let expiry_result = clear_token_expiry_checked(registry_url);
+        let access_result = clear_stored_access_token_unlocked(registry_url);
+        combine_credential_results([access_result, expiry_result])
             .map_err(lpm_common::LpmError::CredentialStorage)?;
         Ok(true)
     })
@@ -1333,38 +1335,82 @@ fn token_expiry_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".lpm").join(".token-expiry.json"))
 }
 
+fn token_expiry_lock_path() -> Result<std::path::PathBuf, String> {
+    token_expiry_path()
+        .map(|path| path.with_file_name(".token-expiry.lock"))
+        .ok_or_else(|| "could not determine token-expiry lock path".to_string())
+}
+
+fn read_token_expiries_checked_from(path: &Path) -> Result<HashMap<String, TokenExpiry>, String> {
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(HashMap::new()),
+            Err(error) => return Err(format!("token-expiry metadata read error: {error}")),
+        };
+
+    serde_json::from_str(&content)
+        .map_err(|error| format!("token-expiry metadata JSON error: {error}"))
+}
+
+fn read_token_expiries_checked() -> Result<HashMap<String, TokenExpiry>, String> {
+    let path = token_expiry_path().ok_or("could not determine token-expiry path")?;
+    read_token_expiries_checked_from(&path)
+}
+
+fn write_token_expiries_checked(
+    path: &Path,
+    expiries: &HashMap<String, TokenExpiry>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("mkdir error: {error}"))?;
+    }
+    let json =
+        serde_json::to_string_pretty(expiries).map_err(|error| format!("json error: {error}"))?;
+    lpm_common::write_file_atomic_with_options(
+        path,
+        json,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
+    )
+    .map_err(|error| format!("write error: {error}"))
+}
+
+fn mutate_token_expiries(
+    mutation: impl FnOnce(&mut HashMap<String, TokenExpiry>) -> bool,
+) -> Result<(), String> {
+    let path = token_expiry_path().ok_or("could not determine token-expiry path")?;
+    let lock_path = token_expiry_lock_path()?;
+    lpm_common::paths::with_exclusive_lock(lock_path, || {
+        let mut expiries = read_token_expiries_checked_from(&path)
+            .map_err(lpm_common::LpmError::CredentialStorage)?;
+        if mutation(&mut expiries) {
+            write_token_expiries_checked(&path, &expiries)
+                .map_err(lpm_common::LpmError::CredentialStorage)?;
+        }
+        Ok(())
+    })
+    .map_err(credential_storage_error_message)
+}
+
 /// Read stored token expiry data.
 pub fn read_token_expiries() -> std::collections::HashMap<String, TokenExpiry> {
-    let Some(path) = token_expiry_path() else {
-        return std::collections::HashMap::new();
-    };
-    let Ok(content) =
-        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-    else {
-        return std::collections::HashMap::new();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
+    read_token_expiries_checked().unwrap_or_default()
 }
 
 /// Store a token expiry reminder.
 pub fn set_token_expiry(registry: &str, expires: &str) {
-    let mut expiries = read_token_expiries();
-    // Preserve existing fields (e.g., otp_required) when updating expiry
-    let entry = expiries.entry(registry.to_string()).or_default();
-    entry.expires = expires.to_string();
-    entry.reminded_7d = false;
-    entry.reminded_1d = false;
-    entry.session_access_expires_at = None;
-
-    if let Some(path) = token_expiry_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&expiries)
-            && std::fs::write(&path, json).is_ok()
-        {
-            restrict_credential_metadata_perms(&path);
-        }
+    if let Err(error) = mutate_token_expiries(|expiries| {
+        let entry = expiries.entry(registry.to_string()).or_default();
+        entry.expires = expires.to_string();
+        entry.reminded_7d = false;
+        entry.reminded_1d = false;
+        entry.session_access_expires_at = None;
+        true
+    }) {
+        tracing::warn!("failed to store token expiry: {error}");
     }
 }
 
@@ -1379,30 +1425,14 @@ pub(crate) fn set_session_access_token_expiry_checked(
     registry: &str,
     expires_at: &str,
 ) -> Result<(), String> {
-    let mut expiries = read_token_expiries();
-    let entry = expiries.entry(registry.to_string()).or_default();
-    entry.session_access_expires_at = Some(expires_at.to_string());
-    // Session access tokens are auto-refreshed and should not show long-lived token warnings.
-    entry.expires.clear();
-    entry.reminded_7d = false;
-    entry.reminded_1d = false;
-
-    let path = token_expiry_path().ok_or("could not determine token-expiry path")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("mkdir error: {error}"))?;
-    }
-    let json =
-        serde_json::to_string_pretty(&expiries).map_err(|error| format!("json error: {error}"))?;
-    std::fs::write(&path, json).map_err(|error| format!("write error: {error}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("permissions error: {error}"))?;
-    }
-
-    Ok(())
+    mutate_token_expiries(|expiries| {
+        let entry = expiries.entry(registry.to_string()).or_default();
+        entry.session_access_expires_at = Some(expires_at.to_string());
+        entry.expires.clear();
+        entry.reminded_7d = false;
+        entry.reminded_1d = false;
+        true
+    })
 }
 
 fn session_access_token_expiry(registry: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1429,40 +1459,24 @@ pub fn should_refresh_session_access_token(registry: &str) -> bool {
         .is_none_or(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5))
 }
 
-/// Returns true if the local session-expiry metadata file exists on disk but
-/// is unparseable (corrupted, partial write, hand-edited, version mismatch).
-/// Used by `RegistryClient::execute_with_recovery`'s proactive pass to
-/// trigger a silent refresh — when we can't trust the cached access-token
-/// validity, we ask the server.
-///
-/// Returns `false` when the file is missing or empty (fresh login
-/// optimism: don't refresh just because no metadata has been written
-/// yet — login itself writes the metadata).
+/// Returns true if the local session-expiry metadata exists but cannot be read
+/// as a complete metadata map. Missing metadata is not corruption.
 pub fn session_metadata_corrupted() -> bool {
     let Some(path) = token_expiry_path() else {
         return false;
     };
-    let content =
-        match lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => return false,
-            Err(_) => return true,
-        };
-    if content.trim().is_empty() {
-        return false;
-    }
-    serde_json::from_str::<std::collections::HashMap<String, TokenExpiry>>(&content).is_err()
+    read_token_expiries_checked_from(&path).is_err()
 }
 
 /// Remove a token expiry reminder (called on logout).
 pub fn clear_token_expiry(registry: &str) {
-    let mut expiries = read_token_expiries();
-    if expiries.remove(registry).is_some()
-        && let Some(path) = token_expiry_path()
-        && let Ok(json) = serde_json::to_string_pretty(&expiries)
-    {
-        let _ = std::fs::write(&path, json);
+    if let Err(error) = clear_token_expiry_checked(registry) {
+        tracing::warn!("failed to clear token expiry: {error}");
     }
+}
+
+pub(crate) fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
+    mutate_token_expiries(|expiries| expiries.remove(registry).is_some())
 }
 
 /// Check token expiries and return warnings for tokens expiring soon.
@@ -1528,17 +1542,12 @@ pub fn is_otp_required(registry: &str) -> bool {
 
 /// Set the OTP/2FA preference for a registry.
 pub fn set_otp_required(registry: &str, required: bool) {
-    let mut expiries = read_token_expiries();
-    let entry = expiries.entry(registry.to_string()).or_default();
-    entry.otp_required = required;
-
-    if let Some(path) = token_expiry_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&expiries) {
-            let _ = std::fs::write(&path, json);
-        }
+    if let Err(error) = mutate_token_expiries(|expiries| {
+        let entry = expiries.entry(registry.to_string()).or_default();
+        entry.otp_required = required;
+        true
+    }) {
+        tracing::warn!("failed to store OTP requirement: {error}");
     }
 }
 
@@ -3855,6 +3864,77 @@ mod tests {
             assert!(get_token_from_file(&format!("refresh:{registry}")).is_none());
             assert!(!read_token_expiries().contains_key(registry));
             assert!(!legacy_marker.exists());
+        });
+    }
+
+    #[test]
+    fn clear_login_state_reports_corrupt_expiry_metadata_without_claiming_success() {
+        with_temp_home(|home| {
+            let registry = "https://registry.example";
+            let path = home.join(".lpm").join(".token-expiry.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"not-json").unwrap();
+
+            let result = clear_login_state(registry);
+
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"not-json");
+        });
+    }
+
+    #[test]
+    fn token_expiry_mutation_waits_for_shared_metadata_lock() {
+        with_temp_home(|_| {
+            let lock_path = token_expiry_lock_path().unwrap();
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                lpm_common::paths::with_exclusive_lock(lock_path, || {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, lpm_common::LpmError>(())
+                })
+                .unwrap();
+            });
+            locked_rx.recv().unwrap();
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let result = set_session_access_token_expiry_checked(
+                    "https://registry.example",
+                    "2099-01-01T00:00:00Z",
+                );
+                done_tx.send(result).unwrap();
+            });
+
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "metadata mutation bypassed the shared expiry lock"
+            );
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            assert!(done_rx.recv().unwrap().is_ok());
+            writer.join().unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_otp_required_tightens_existing_metadata_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        with_temp_home(|home| {
+            let path = home.join(".lpm").join(".token-expiry.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+            set_otp_required("https://registry.example", true);
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
         });
     }
 

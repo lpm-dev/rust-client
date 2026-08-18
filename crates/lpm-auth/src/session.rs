@@ -440,23 +440,17 @@ impl SessionManager {
     ) -> Result<String, LpmError> {
         // Fast path: cache hit + token still locally believed valid.
         //
-        // If the source is refresh-eligible AND the local expiry metadata
-        // says the token is already past its TTL, fall through to the
-        // refresh path before returning — callers that build their own HTTP
-        // client (env sync, swift registry, tunnel handshake) do not get
-        // `RegistryClient::execute_with_recovery`'s 401-retry, so a
-        // known-stale bearer would surface as a hard auth failure.
-        //
-        // No-metadata case stays optimistic — the metadata is only populated
-        // after a refresh, so a fresh login has no expiry record and we trust
-        // the cache. The first 401 in that path is handled by
-        // `execute_with_recovery` for `RegistryClient` callers.
+        // Refresh-backed sessions with missing, malformed, or nearly expired
+        // metadata must rotate before use. Callers that build their own HTTP
+        // client do not get `RegistryClient::execute_with_recovery`'s
+        // 401-retry, and older clients may have persisted credentials without
+        // their matching expiry metadata.
         match self.token_for(requirement).await {
             Ok(Some(secret)) => {
                 let needs_proactive_refresh = self
                     .current_source()?
                     .is_some_and(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
-                    && crate::is_session_access_token_expired(&self.registry_url);
+                    && crate::should_refresh_session_access_token(&self.registry_url);
 
                 if !needs_proactive_refresh {
                     return Ok(secret.expose_secret().to_string());
@@ -466,8 +460,8 @@ impl SessionManager {
             Err(error) => return Err(error),
         }
 
-        // Refresh-only state OR known-expired access token: do the
-        // silent exchange and return the rotated bearer.
+        // Refresh-only or locally uncertain access state: do the silent
+        // exchange and return the rotated bearer.
         if let Some(source) = self.current_source()?
             && source.refresh_policy() == RefreshPolicy::IfRefreshable
             && (requirement == AuthRequirement::TokenRequired
@@ -714,13 +708,14 @@ impl SessionManager {
     /// Clear the local stored session state (access + refresh + expiry
     /// metadata) and drop the in-memory cache. Used when the server
     /// authoritatively rejects the session.
-    pub fn clear_session(&self) {
-        match crate::clear_login_state(&self.registry_url) {
-            Ok(()) => self.clear_cached_session(),
-            Err(error) => {
-                tracing::warn!("failed to clear rejected local session state: {error}");
-            }
-        }
+    pub fn clear_session(&self) -> Result<(), LpmError> {
+        crate::clear_login_state(&self.registry_url).map_err(|error| {
+            LpmError::CredentialStorage(format!(
+                "failed to clear rejected local session state: {error}"
+            ))
+        })?;
+        self.clear_cached_session();
+        Ok(())
     }
 
     fn clear_cached_session(&self) {
@@ -747,8 +742,9 @@ impl SessionManager {
                 })?;
 
             let access_result = if current_access.as_deref() == rejected_access {
-                crate::clear_token_expiry(&self.registry_url);
-                crate::clear_stored_access_token_unlocked(&self.registry_url)
+                let expiry_result = crate::clear_token_expiry_checked(&self.registry_url);
+                let access_result = crate::clear_stored_access_token_unlocked(&self.registry_url);
+                crate::combine_clear_results(access_result, expiry_result)
             } else {
                 Ok(())
             };
@@ -1635,6 +1631,7 @@ mod tests {
         let registry = "https://stored-session.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
         crate::set_refresh_token(registry, "stored-refresh").unwrap();
+        crate::set_session_access_token_expiry(registry, "2099-01-01T00:00:00Z");
         let mgr = SessionManager::new(registry, None);
 
         assert_eq!(mgr.current_source_peek(), Some(TokenSource::EnvVar));
@@ -2385,27 +2382,28 @@ mod refresh_http_tests {
         // Mock's `.expect(1)` verifies the refresh happened.
     }
 
-    /// Counterpart: when no expiry metadata is recorded (fresh login, no
-    /// expiry record yet), the cached bearer is trusted — we don't refresh
-    /// proactively without evidence.
     #[tokio::test]
-    async fn bearer_string_for_does_not_refresh_when_no_expiry_metadata() {
+    async fn bearer_string_for_refreshes_when_expiry_metadata_is_missing() {
         let server = MockServer::start().await;
-        // No mock for `/api/cli/refresh` — would panic if called.
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let _isolated = isolate_test_env();
         let mgr = manager_for(&server.uri());
-        // Explicitly clear any expiry metadata so the optimistic path
-        // is exercised.
         crate::clear_token_expiry(&server.uri());
 
         let bearer = mgr
             .bearer_string_for(AuthRequirement::TokenRequired)
             .await
-            .expect("optimistic path returns cached bearer");
-        assert_eq!(
-            bearer, "at-stale",
-            "no metadata = no refresh; the cached bearer is returned as-is"
-        );
+            .expect("missing metadata should refresh the stored session");
+        assert_eq!(bearer, "at-rotated");
     }
 }
