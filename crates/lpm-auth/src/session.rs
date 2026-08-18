@@ -726,13 +726,13 @@ impl SessionManager {
     /// metadata) and drop the in-memory cache. Used when the server
     /// authoritatively rejects the session.
     pub fn clear_session(&self) -> Result<(), LpmError> {
-        crate::clear_login_state(&self.registry_url).map_err(|error| {
+        let result = crate::clear_login_state(&self.registry_url).map_err(|error| {
             LpmError::CredentialStorage(format!(
                 "failed to clear rejected local session state: {error}"
             ))
-        })?;
+        });
         self.clear_cached_session();
-        Ok(())
+        result
     }
 
     fn clear_cached_session(&self) {
@@ -1516,6 +1516,28 @@ mod tests {
 
     fn token_classify_isolate() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         token_classify_isolate_with_lpm_token(None, CiTokenTestEnv::Cleared)
+    }
+
+    #[test]
+    fn clear_session_drops_cached_bearer_when_expiry_metadata_is_corrupt() {
+        let (home, _env) = token_classify_isolate();
+        let registry = "https://rejected-session.invalid";
+        crate::set_token(registry, "rejected-access").expect("access token should store");
+        crate::set_refresh_token(registry, "rejected-refresh").expect("refresh token should store");
+
+        let manager = SessionManager::new(registry, None);
+        assert_eq!(
+            manager.current_bearer_lazy().unwrap().as_deref(),
+            Some("rejected-access")
+        );
+
+        let metadata_path = home.path().join(".lpm").join(".token-expiry.json");
+        std::fs::write(&metadata_path, b"not-json").expect("corrupt expiry metadata");
+
+        assert!(manager.clear_session().is_err());
+        assert_eq!(crate::get_stored_access_token(registry), None);
+        assert_eq!(crate::get_refresh_token(registry), None);
+        assert_eq!(manager.current_bearer_lazy().unwrap(), None);
     }
 
     #[test]
