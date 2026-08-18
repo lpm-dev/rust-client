@@ -1555,7 +1555,7 @@ async fn audit_fix_does_not_fetch_remediation_metadata_for_clean_direct_dependen
 }
 
 #[tokio::test]
-async fn audit_fix_skips_source_ambiguous_installed_lockfile_instances() {
+async fn audit_fix_fails_when_vulnerable_direct_dependency_has_ambiguous_source() {
     let project = TempProject::empty(
         r#"{"name":"audit-fix-source-ambiguity","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
     );
@@ -1595,8 +1595,14 @@ async fn audit_fix_skips_source_ambiguous_installed_lockfile_instances() {
     let requests_before = mock.server().received_requests().await.unwrap().len();
 
     let out = run_audit_json(&project, &mock, &["fix", "--dry-run"]);
-    assert!(out.status.success());
+    assert!(
+        !out.status.success(),
+        "audit fix must fail when a vulnerable direct dependency cannot be resolved safely\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["success"], false, "{envelope:#}");
     assert_eq!(envelope["planned"], 0, "{envelope:#}");
     assert!(
         envelope["skipped"][0]["reason"]

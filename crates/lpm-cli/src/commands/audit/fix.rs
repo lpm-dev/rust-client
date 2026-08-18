@@ -258,7 +258,7 @@ async fn run_fix_inner(
             json_output,
             started_at.elapsed(),
         );
-        return Ok(());
+        return audit_fix_completion(&skipped);
     }
 
     let project_dirs = [project_dir.to_path_buf()];
@@ -336,7 +336,15 @@ async fn run_fix_inner(
         json_output,
         started_at.elapsed(),
     );
-    Ok(())
+    audit_fix_completion(&skipped)
+}
+
+fn audit_fix_completion(skipped: &[AuditFixSkipped]) -> Result<(), LpmError> {
+    if skipped.is_empty() {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(1))
+    }
 }
 
 fn select_installed_direct_locked_package<'a>(
@@ -769,7 +777,7 @@ fn emit_audit_fix_report(
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
+                "success": skipped.is_empty(),
                 "dry_run": dry_run,
                 "fixed": if dry_run { 0 } else { fixes.len() },
                 "planned": fixes.len(),
@@ -818,7 +826,7 @@ fn emit_audit_fix_report(
     }
     if !skipped.is_empty() {
         install_ui::warn_untrusted(&format!(
-            "{} vulnerable direct {} could not be fixed automatically",
+            "{} direct {} could not be evaluated or fixed automatically",
             skipped.len(),
             install_ui::packages_word(skipped.len()),
         ));
