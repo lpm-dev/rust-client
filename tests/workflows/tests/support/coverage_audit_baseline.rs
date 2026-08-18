@@ -2042,7 +2042,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/release.rs",
-            "crates/lpm-cli/src/release_plan.rs",
+            "crates/lpm-cli/src/release_plan/mod.rs",
             "tests/workflows/tests/release.rs",
         ],
     },
@@ -2056,7 +2056,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         json_contract: JsonContractStatus::Covered,
         references: &[
             "crates/lpm-cli/src/commands/release.rs",
-            "crates/lpm-cli/src/release_plan.rs",
+            "crates/lpm-cli/src/release_plan/mod.rs",
             "tests/workflows/tests/release.rs",
         ],
     },

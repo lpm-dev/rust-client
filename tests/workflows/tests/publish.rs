@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use support::assertions::parse_json_output;
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -68,6 +68,19 @@ fn snapshot_project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
                     .strip_prefix(root)
                     .expect("project entry must remain below root")
                     .to_path_buf();
+                if matches!(
+                    relative.to_str(),
+                    Some(
+                        ".lpm/.install.lock"
+                            | ".lpm/.install.lock.writer-intent"
+                            | ".lpm/.install.lock.writer-queue"
+                            | ".lpm/.publish.lock"
+                            | ".lpm/.publish.lock.writer-intent"
+                            | ".lpm/.publish.lock.writer-queue"
+                    )
+                ) {
+                    continue;
+                }
                 snapshot.insert(relative, std::fs::read(path).expect("read project file"));
             }
         }
@@ -1083,6 +1096,79 @@ async fn publish_to_mock_registry_succeeds() {
             && !combined.contains("Publishing as")
             && !combined.contains("Uploading..."),
         "publish human output should not include old chatter, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn publish_releases_the_install_lock_before_uploading() {
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(3))
+                .set_body_json(serde_json::json!({
+                    "success": true,
+                    "message": "Package published"
+                })),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.lock-free-upload",
+        "version": "1.0.0",
+        "description": "Publish lock lifetime fixture",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.args(["publish", "--yes", "--token", "test-token-123", "--lpm"]);
+    let mut child = command.spawn().expect("spawn delayed publish");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let upload_started = mock
+            .server()
+            .received_requests()
+            .await
+            .expect("read mock requests")
+            .iter()
+            .any(|request| request.method.as_str() == "PUT");
+        if upload_started {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("inspect delayed publish") {
+            panic!("publish exited with {status} before uploading");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("publish did not begin uploading within 10 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let install_lock = lpm_common::project_install_lock(project.path());
+    let available_during_upload = lpm_common::try_acquire_exclusive_lock(&install_lock)
+        .expect("probe install lock")
+        .is_some();
+    let output = child.wait_with_output().expect("finish delayed publish");
+    assert!(
+        output.status.success(),
+        "delayed publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        available_during_upload,
+        "the project install lock must not cover network upload time"
     );
 }
 

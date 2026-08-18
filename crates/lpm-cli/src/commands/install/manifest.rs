@@ -1108,8 +1108,7 @@ pub async fn run_add_packages(
     // this block. The lock surface is the OUTER transaction; the
     // inner install pipeline runs under the assumption that the
     // caller has serialized the snapshot+commit window.
-    let project_lock = lpm_common::project_install_lock(project_dir);
-    lpm_common::with_exclusive_lock_async(project_lock, async {
+    workspace_lockfile::with_project_install_lock(project_dir, async {
         // 1. Snapshot the install state surface. Manifest is required (must
         // exist by precondition); lockfile + binary lockfile are optional
         // (absent on a fresh project); install-hash is invalidate-only

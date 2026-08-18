@@ -42,6 +42,8 @@ lpm-tunnel = { workspace = true }
 lpm-inspect = { workspace = true }
 lpm-dashboard = { workspace = true }
 lpm-migrate = { workspace = true }
+cap-fs-ext = { workspace = true }
+cap-std = "4.0.2"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 cvss = { workspace = true }
@@ -166,9 +168,12 @@ windows = { version = "0.62.2", features = [
 ] }
 windows-future = "0.3.2"
 windows-sys = { version = "0.60", features = [
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Pipes",

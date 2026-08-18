@@ -28,6 +28,7 @@ use crate::commands::{npm_auth, publish_common, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, sigstore};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
+use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -41,6 +42,251 @@ struct NpmFilePreflightInput<'a> {
     tarball_data: &'a std::sync::Arc<Vec<u8>>,
     rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
     json_output: bool,
+}
+
+pub(crate) struct PreparedPublish {
+    publish_started: std::time::Instant,
+    dry_run: bool,
+    check_only: bool,
+    wait_for_publication: bool,
+    otp: Option<String>,
+    yes: bool,
+    json_output: bool,
+    targets: Vec<PublishTarget>,
+    targets_lpm: bool,
+    publication_wait_timeout: Option<std::time::Duration>,
+    target_names: HashMap<String, String>,
+    has_skills: bool,
+    local_skills_digest: Option<String>,
+    pkg_json: serde_json::Value,
+    name: String,
+    version: String,
+    publish_config: Option<lpm_runner::lpm_json::PublishConfig>,
+    readme: Option<String>,
+    tarball_data: std::sync::Arc<Vec<u8>>,
+    tarball_files: Vec<publish_common::TarballFile>,
+    tarball_size: usize,
+    lpm_config: Option<serde_json::Value>,
+    detected_ecosystem: String,
+    swift_manifest: Option<serde_json::Value>,
+    provenance_request: ProvenanceRequest,
+    rewritten_tarballs: HashMap<String, publish_common::RewrittenTarball>,
+    version_data: serde_json::Value,
+    precomputed_npm_artifacts: HashMap<String, NpmTargetArtifact>,
+    quality_result: Option<crate::quality::QualityResult>,
+}
+
+pub(crate) struct PublishExecutionReport {
+    pub(crate) success: bool,
+    pub(crate) results: Vec<serde_json::Value>,
+    json_output: bool,
+    any_upload_failed: bool,
+    any_publication_failed: bool,
+}
+
+impl PublishExecutionReport {
+    fn successful(json_output: bool) -> Self {
+        Self {
+            success: true,
+            results: Vec::new(),
+            json_output,
+            any_upload_failed: false,
+            any_publication_failed: false,
+        }
+    }
+
+    fn into_command_result(self) -> Result<(), LpmError> {
+        if self.success {
+            return Ok(());
+        }
+        if self.json_output {
+            Err(LpmError::ExitCode(1))
+        } else if self.any_upload_failed {
+            Err(LpmError::Registry(
+                "one or more publish targets failed".into(),
+            ))
+        } else if self.any_publication_failed {
+            Err(LpmError::Registry(
+                "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPublishTarget {
+    target: PublishTarget,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublishIntent {
+    package_name: String,
+    package_version: String,
+    package_manifest_fingerprint: [u8; 32],
+    projected_manifest_fingerprint: [u8; 32],
+    publish_config_fingerprint: [u8; 32],
+    targets: Vec<ResolvedPublishTarget>,
+}
+
+impl PublishIntent {
+    pub(crate) fn package_name(&self) -> &str {
+        &self.package_name
+    }
+
+    pub(crate) fn package_version(&self) -> &str {
+        &self.package_version
+    }
+
+    pub(crate) fn resolved_targets(&self) -> impl Iterator<Item = (&PublishTarget, &str)> {
+        self.targets
+            .iter()
+            .map(|target| (&target.target, target.name.as_str()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_publish_intent(
+    project_dir: &Path,
+    workspace: &lpm_workspace::Workspace,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+) -> Result<PublishIntent, LpmError> {
+    let manifest = read_publish_manifest(project_dir)?;
+    publish_intent_from_manifest(
+        &manifest,
+        workspace,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_intent_from_manifest(
+    manifest: &super::prepare::PublishManifest,
+    workspace: &lpm_workspace::Workspace,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+) -> Result<PublishIntent, LpmError> {
+    let (targets, target_names) = resolve_publish_targets(
+        manifest,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )?;
+    let mut resolved_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let key = target.key();
+        let name = target_names.get(&key).cloned().ok_or_else(|| {
+            LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+        })?;
+        resolved_targets.push(ResolvedPublishTarget { target, name });
+    }
+    let publish_config = serde_json::to_vec(&manifest.publish_config).map_err(|error| {
+        LpmError::Registry(format!("failed to fingerprint publish config: {error}"))
+    })?;
+    let projected_manifest_fingerprint = projected_manifest_fingerprint(manifest, workspace)?;
+    Ok(PublishIntent {
+        package_name: manifest.name.clone(),
+        package_version: manifest.version.clone(),
+        package_manifest_fingerprint: Sha256::digest(manifest.package_json_content.as_bytes())
+            .into(),
+        projected_manifest_fingerprint,
+        publish_config_fingerprint: Sha256::digest(&publish_config).into(),
+        targets: resolved_targets,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_publish_intent(
+    project_dir: &Path,
+    manifest: &super::prepare::PublishManifest,
+    workspace: &lpm_workspace::Workspace,
+    expected: &PublishIntent,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+) -> Result<(), LpmError> {
+    let actual = publish_intent_from_manifest(
+        manifest,
+        workspace,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )?;
+    if actual != *expected {
+        let subject = if actual.package_manifest_fingerprint
+            == expected.package_manifest_fingerprint
+            && actual.projected_manifest_fingerprint != expected.projected_manifest_fingerprint
+        {
+            "workspace or catalog dependency projection"
+        } else {
+            "publish inputs"
+        };
+        return Err(LpmError::Registry(format!(
+            "{subject} for {} changed after release publish preflight; retry the command",
+            project_dir.display(),
+        )));
+    }
+    Ok(())
+}
+
+fn projected_manifest_fingerprint(
+    manifest: &super::prepare::PublishManifest,
+    workspace: &lpm_workspace::Workspace,
+) -> Result<[u8; 32], LpmError> {
+    let source = manifest.package_json_content.as_bytes();
+    let projected = publish_common::rewrite_workspace_deps_in_package_json(source, workspace)?;
+    Ok(match projected {
+        Some(bytes) => Sha256::digest(bytes).into(),
+        None => Sha256::digest(source).into(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_publish_targets(
+    manifest: &super::prepare::PublishManifest,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+) -> Result<(Vec<PublishTarget>, HashMap<String, String>), LpmError> {
+    let targets = resolve_targets(
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+        manifest.publish_config.as_ref(),
+    )?;
+    const MAX_REGISTRIES: usize = 5;
+    if targets.len() > MAX_REGISTRIES {
+        return Err(LpmError::Registry(format!(
+            "too many target registries ({}, max {MAX_REGISTRIES})",
+            targets.len()
+        )));
+    }
+    let target_names = resolve_target_names(manifest, &targets)?;
+    Ok((targets, target_names))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -65,28 +311,223 @@ pub async fn run(
     no_provenance: bool,
     provenance_file: Option<&Path>,
 ) -> Result<(), LpmError> {
-    let publish_started = std::time::Instant::now();
+    let project_dir = project_dir.canonicalize().map_err(LpmError::Io)?;
+    let transaction_root = lpm_workspace::find_workspace_root(&project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    let transaction_root = transaction_root.unwrap_or_else(|| project_dir.clone());
+    let prepare = async {
+        ensure_publish_transaction_root_unchanged(&project_dir, &transaction_root)?;
+        if dry_run || check_only {
+            crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
+        } else if crate::release_plan::has_release_transaction(&transaction_root)? {
+            let workspace = lpm_workspace::discover_workspace(&transaction_root)
+                .map_err(|error| LpmError::Workspace(error.to_string()))?;
+            let allowed_manifests = workspace.map_or_else(
+                || vec![transaction_root.join("package.json")],
+                |workspace| {
+                    crate::commands::release::release_workspace_manifest_paths(&workspace, true)
+                },
+            );
+            crate::release_plan::recover_pending_release_transaction(
+                &transaction_root,
+                &allowed_manifests,
+            )?;
+        }
+        prepare_with_workspace_lock_held(
+            &project_dir,
+            dry_run,
+            check_only,
+            wait_for_publication,
+            wait_timeout_seconds,
+            otp,
+            yes,
+            json_output,
+            min_score,
+            allow_secrets,
+            cli_npm,
+            cli_lpm,
+            cli_github,
+            cli_gitlab,
+            cli_registry,
+            provenance_flag,
+            no_provenance,
+            provenance_file,
+        )
+        .await
+    };
+    let install_lock = lpm_common::project_install_lock(&transaction_root);
+    let prepared = if dry_run || check_only {
+        lpm_common::with_shared_lock_async(install_lock, prepare).await?
+    } else {
+        lpm_common::with_exclusive_lock_async(install_lock, prepare).await?
+    };
+    if check_only {
+        return execute_prepared(client, prepared).await;
+    }
+    let publish_lock = lpm_common::project_publish_lock(&transaction_root);
+    lpm_common::with_exclusive_lock_async(publish_lock, execute_prepared(client, prepared)).await
+}
 
-    let mut publish_manifest = read_publish_manifest(project_dir)?;
+fn ensure_publish_transaction_root_unchanged(
+    project_dir: &Path,
+    expected_root: &Path,
+) -> Result<(), LpmError> {
+    let current_root = lpm_workspace::find_workspace_root(project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?
+        .unwrap_or_else(|| project_dir.to_path_buf())
+        .canonicalize()
+        .map_err(LpmError::Io)?;
+    if current_root != expected_root {
+        return Err(LpmError::Registry(format!(
+            "publish project scope changed while waiting for the transaction lock ({} -> {}); retry the command",
+            expected_root.display(),
+            current_root.display()
+        )));
+    }
+    Ok(())
+}
 
-    // Resolve target registries
-    let targets = resolve_targets(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_with_workspace_lock_held(
+    project_dir: &Path,
+    dry_run: bool,
+    check_only: bool,
+    wait_for_publication: bool,
+    wait_timeout_seconds: Option<u64>,
+    otp: Option<&str>,
+    yes: bool,
+    json_output: bool,
+    min_score: Option<u32>,
+    allow_secrets: bool,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+    provenance_flag: bool,
+    no_provenance: bool,
+    provenance_file: Option<&Path>,
+) -> Result<PreparedPublish, LpmError> {
+    let publish_manifest = read_publish_manifest(project_dir)?;
+    let workspace = super::prepare::discover_workspace_for_publish(project_dir, &publish_manifest)?;
+    prepare_publish_manifest_with_workspace_lock_held(
+        project_dir,
+        publish_manifest,
+        workspace.as_ref(),
+        dry_run,
+        check_only,
+        wait_for_publication,
+        wait_timeout_seconds,
+        otp,
+        yes,
+        json_output,
+        min_score,
+        allow_secrets,
         cli_npm,
         cli_lpm,
         cli_github,
         cli_gitlab,
         cli_registry,
-        publish_manifest.publish_config.as_ref(),
-    )?;
+        provenance_flag,
+        no_provenance,
+        provenance_file,
+    )
+    .await
+}
 
-    // Cap registry fan-out so one publish command cannot spray tokens too broadly.
-    const MAX_REGISTRIES: usize = 5;
-    if targets.len() > MAX_REGISTRIES {
-        return Err(LpmError::Registry(format!(
-            "too many target registries ({}, max {MAX_REGISTRIES})",
-            targets.len()
-        )));
-    }
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_intent_with_workspace_lock_held(
+    project_dir: &Path,
+    workspace: &lpm_workspace::Workspace,
+    intent: &PublishIntent,
+    dry_run: bool,
+    check_only: bool,
+    wait_for_publication: bool,
+    wait_timeout_seconds: Option<u64>,
+    otp: Option<&str>,
+    yes: bool,
+    json_output: bool,
+    min_score: Option<u32>,
+    allow_secrets: bool,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+    provenance_flag: bool,
+    no_provenance: bool,
+    provenance_file: Option<&Path>,
+) -> Result<PreparedPublish, LpmError> {
+    let publish_manifest = read_publish_manifest(project_dir)?;
+    validate_publish_intent(
+        project_dir,
+        &publish_manifest,
+        workspace,
+        intent,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )?;
+    prepare_publish_manifest_with_workspace_lock_held(
+        project_dir,
+        publish_manifest,
+        Some(workspace),
+        dry_run,
+        check_only,
+        wait_for_publication,
+        wait_timeout_seconds,
+        otp,
+        yes,
+        json_output,
+        min_score,
+        allow_secrets,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+        provenance_flag,
+        no_provenance,
+        provenance_file,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_publish_manifest_with_workspace_lock_held(
+    project_dir: &Path,
+    publish_manifest: super::prepare::PublishManifest,
+    workspace: Option<&lpm_workspace::Workspace>,
+    dry_run: bool,
+    check_only: bool,
+    wait_for_publication: bool,
+    wait_timeout_seconds: Option<u64>,
+    otp: Option<&str>,
+    yes: bool,
+    json_output: bool,
+    min_score: Option<u32>,
+    allow_secrets: bool,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+    provenance_flag: bool,
+    no_provenance: bool,
+    provenance_file: Option<&Path>,
+) -> Result<PreparedPublish, LpmError> {
+    let publish_started = std::time::Instant::now();
+    let mut publish_manifest = publish_manifest;
+    let (targets, target_names) = resolve_publish_targets(
+        &publish_manifest,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )?;
 
     let targets_lpm = targets.contains(&PublishTarget::Lpm);
     if wait_for_publication && !targets_lpm {
@@ -100,8 +541,6 @@ pub async fn run(
             std::time::Duration::from_secs,
         )
     });
-    let target_names = resolve_target_names(&publish_manifest, &targets)?;
-
     // Publisher-authored skills must be validated and included in a restrictive
     // package.json `files` list before the publish tarball is created.
     let skills_dir = project_dir.join(".lpm").join("skills");
@@ -163,14 +602,20 @@ pub async fn run(
         tarball_files,
         secret_scan,
         tarball_size,
+        lpm_config,
         detected_ecosystem,
         swift_manifest,
-    } = prepare_publish_project_from_manifest(project_dir, publish_manifest, !allow_secrets)?;
-    let publish_config = publish_config.as_ref();
+    } = prepare_publish_project_from_manifest(
+        project_dir,
+        publish_manifest,
+        workspace,
+        !allow_secrets,
+    )?;
+    let publish_config_ref = publish_config.as_ref();
 
-    let npm_config = publish_config.and_then(|p| p.npm.as_ref());
-    let github_config = publish_config.and_then(|p| p.github.as_ref());
-    let gitlab_config = publish_config.and_then(|p| p.gitlab.as_ref());
+    let npm_config = publish_config_ref.and_then(|p| p.npm.as_ref());
+    let github_config = publish_config_ref.and_then(|p| p.github.as_ref());
+    let gitlab_config = publish_config_ref.and_then(|p| p.gitlab.as_ref());
 
     let provenance_request = resolve_provenance_request(
         project_dir,
@@ -212,19 +657,18 @@ pub async fn run(
     )?;
     let version_data =
         build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
-    let mut precomputed_npm_artifacts =
-        precompute_file_provenance_artifacts(NpmFilePreflightInput {
-            provenance_request: &provenance_request,
-            targets: &targets,
-            target_names: &target_names,
-            package_json_name: &name,
-            version: &version,
-            version_data: &version_data,
-            tarball_data: &tarball_data,
-            rewritten_tarballs: &rewritten_tarballs,
-            json_output,
-        })
-        .await?;
+    let precomputed_npm_artifacts = precompute_file_provenance_artifacts(NpmFilePreflightInput {
+        provenance_request: &provenance_request,
+        targets: &targets,
+        target_names: &target_names,
+        package_json_name: &name,
+        version: &version,
+        version_data: &version_data,
+        tarball_data: &tarball_data,
+        rewritten_tarballs: &rewritten_tarballs,
+        json_output,
+    })
+    .await?;
 
     let mut final_secret_scans = Vec::with_capacity(targets.len());
     if !allow_secrets {
@@ -257,6 +701,100 @@ pub async fn run(
     } else {
         None
     };
+
+    let local_skills_digest = has_skills
+        .then(|| author::compute_digest(&skills_dir))
+        .transpose()?;
+
+    Ok(PreparedPublish {
+        publish_started,
+        dry_run,
+        check_only,
+        wait_for_publication,
+        otp: otp.map(str::to_owned),
+        yes,
+        json_output,
+        targets,
+        targets_lpm,
+        publication_wait_timeout,
+        target_names,
+        has_skills,
+        local_skills_digest,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+        readme,
+        tarball_data,
+        tarball_files,
+        tarball_size,
+        lpm_config,
+        detected_ecosystem,
+        swift_manifest,
+        provenance_request,
+        rewritten_tarballs,
+        version_data,
+        precomputed_npm_artifacts,
+        quality_result,
+    })
+}
+
+pub(crate) async fn execute_prepared(
+    client: &RegistryClient,
+    prepared: PreparedPublish,
+) -> Result<(), LpmError> {
+    execute_prepared_inner(client, prepared, true)
+        .await?
+        .into_command_result()
+}
+
+pub(crate) async fn execute_prepared_for_release(
+    client: &RegistryClient,
+    prepared: PreparedPublish,
+) -> Result<PublishExecutionReport, LpmError> {
+    execute_prepared_inner(client, prepared, false).await
+}
+
+async fn execute_prepared_inner(
+    client: &RegistryClient,
+    prepared: PreparedPublish,
+    emit_summary: bool,
+) -> Result<PublishExecutionReport, LpmError> {
+    let PreparedPublish {
+        publish_started,
+        dry_run,
+        check_only,
+        wait_for_publication,
+        otp,
+        yes,
+        json_output,
+        targets,
+        targets_lpm,
+        publication_wait_timeout,
+        target_names,
+        has_skills,
+        local_skills_digest,
+        pkg_json,
+        name,
+        version,
+        publish_config,
+        readme,
+        tarball_data,
+        tarball_files,
+        tarball_size,
+        lpm_config,
+        detected_ecosystem,
+        swift_manifest,
+        provenance_request,
+        rewritten_tarballs,
+        version_data,
+        mut precomputed_npm_artifacts,
+        quality_result,
+    } = prepared;
+    let publish_config = publish_config.as_ref();
+    let npm_config = publish_config.and_then(|config| config.npm.as_ref());
+    let github_config = publish_config.and_then(|config| config.github.as_ref());
+    let gitlab_config = publish_config.and_then(|config| config.gitlab.as_ref());
 
     // OIDC auto-exchange is limited to LPM publishes, real publish, and dry-run.
     //
@@ -339,9 +877,8 @@ pub async fn run(
         if let Some(prev) = prev
             && !prev.skills.is_empty()
         {
-            let local_digest = author::compute_digest(&skills_dir)?;
             let published_digest = compute_published_skills_digest(&prev.skills);
-            if local_digest == published_digest && !json_output {
+            if local_skills_digest.as_deref() == Some(published_digest.as_str()) && !json_output {
                 install_ui::warn(
                     "Skills are identical to the previously published version — consider updating them",
                 );
@@ -351,11 +888,11 @@ pub async fn run(
 
     // Check-only and dry-run modes stop before publishing.
     if check_only {
-        if json_output {
+        if emit_summary && json_output {
             let json = publish_check_json(quality_result.as_ref(), &targets, &target_names);
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
-        return Ok(());
+        return Ok(PublishExecutionReport::successful(json_output));
     }
 
     if dry_run {
@@ -372,7 +909,7 @@ pub async fn run(
                     ))
                 })?;
         }
-        if json_output {
+        if emit_summary && json_output {
             let json = serde_json::json!({
                 "success": true,
                 "dry_run": true,
@@ -388,7 +925,7 @@ pub async fn run(
                 }).collect::<Vec<_>>(),
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
+        } else if emit_summary {
             let eco = detected_ecosystem.clone();
 
             let summary = DryRunSummary {
@@ -404,7 +941,7 @@ pub async fn run(
             };
             print_dry_run_summary(&summary);
         }
-        return Ok(());
+        return Ok(PublishExecutionReport::successful(json_output));
     }
 
     // Prompt before a real human-facing publish unless explicitly confirmed.
@@ -433,7 +970,7 @@ pub async fn run(
 
             if !confirm {
                 install_ui::skipped("Publish cancelled");
-                return Ok(());
+                return Ok(PublishExecutionReport::successful(json_output));
             }
         }
     }
@@ -516,7 +1053,6 @@ pub async fn run(
                     };
                     let response = publish_to_lpm(
                         client,
-                        project_dir,
                         lpm_name,
                         &version,
                         &readme,
@@ -524,7 +1060,8 @@ pub async fn run(
                         &tarball_files,
                         &lpm_version_data,
                         &quality_result,
-                        otp,
+                        &lpm_config,
+                        otp.as_deref(),
                         json_output,
                         &detected_ecosystem,
                         &swift_manifest,
@@ -946,13 +1483,13 @@ pub async fn run(
         .find(|result| result.target == "lpm" && result.success)
         .and_then(|result| result.publication_status.as_ref());
 
-    if json_output {
+    if emit_summary && json_output {
         let json = serde_json::json!({
             "success": !command_failed,
             "results": results.iter().map(publish_result_json).collect::<Vec<_>>(),
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else if targets.len() > 1 && any_failed {
+    } else if emit_summary && targets.len() > 1 && any_failed {
         install_ui::warn_line(format_multi_publish_partial_summary(
             succeeded,
             targets.len(),
@@ -963,14 +1500,14 @@ pub async fn run(
                 install_ui::detail_line(format_publish_retry_detail(target));
             }
         }
-    } else if !any_publication_failed && targets.len() > 1 {
+    } else if emit_summary && !any_publication_failed && targets.len() > 1 {
         let elapsed = install_ui::format_duration(publish_started.elapsed());
         install_ui::done_line(format_multi_publish_success_summary(
             targets.len(),
             &elapsed,
             lpm_publication_status,
         ));
-    } else if !any_publication_failed && !any_failed {
+    } else if emit_summary && !any_publication_failed && !any_failed {
         let target = &targets[0];
         let key = target.key();
         let published_name = target_names.get(&key).map_or(name.as_str(), |s| s.as_str());
@@ -983,22 +1520,13 @@ pub async fn run(
         ));
     }
 
-    if command_failed {
-        if json_output {
-            Err(LpmError::ExitCode(1))
-        } else if any_failed {
-            Err(LpmError::Registry(
-                "one or more publish targets failed".into(),
-            ))
-        } else {
-            Err(LpmError::Registry(
-                "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again"
-                    .into(),
-            ))
-        }
-    } else {
-        Ok(())
-    }
+    Ok(PublishExecutionReport {
+        success: !command_failed,
+        results: results.iter().map(publish_result_json).collect(),
+        json_output,
+        any_upload_failed: any_failed,
+        any_publication_failed,
+    })
 }
 
 fn prepare_rewritten_target_tarballs(

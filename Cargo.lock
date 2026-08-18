@@ -3334,6 +3334,8 @@ dependencies = [
  "axum",
  "base64",
  "block2",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "clap",
  "clap_complete",

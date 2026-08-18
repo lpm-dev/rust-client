@@ -76,6 +76,66 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     Ok(None)
 }
 
+/// Find the applicable workspace root without reading or retaining member manifests.
+pub fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+    let mut current = start_dir.to_path_buf();
+
+    loop {
+        match read_workspace_root(&current) {
+            Ok((root_package, pnpm_workspace)) => {
+                let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+                if !globs.is_empty() && start_belongs_to_workspace(start_dir, &current, &globs)? {
+                    return Ok(Some(current));
+                }
+            }
+            Err(WorkspaceError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+fn start_belongs_to_workspace(
+    start: &Path,
+    root: &Path,
+    globs: &[String],
+) -> Result<bool, WorkspaceError> {
+    if start == root {
+        return Ok(true);
+    }
+    let mut current = Some(start);
+    while let Some(directory) = current {
+        if directory == root {
+            return Ok(true);
+        }
+        if directory.join("package.json").is_file() {
+            let relative = directory.strip_prefix(root).map_err(|_| {
+                WorkspaceError::Parse(format!(
+                    "workspace candidate {} is outside {}",
+                    directory.display(),
+                    root.display()
+                ))
+            })?;
+            let mut included = false;
+            let mut excluded = false;
+            for raw in globs {
+                if let Some(raw) = raw.strip_prefix('!') {
+                    excluded |=
+                        WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
+                } else {
+                    included |=
+                        WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
+                }
+            }
+            return Ok(included && !excluded);
+        }
+        current = directory.parent();
+    }
+    Ok(false)
+}
+
 fn validate_unique_package_names(
     root: &Path,
     root_package: &PackageJson,
@@ -855,6 +915,40 @@ mod tests {
         assert_eq!(ws.root, dir.path());
         assert_eq!(ws.members.len(), 1);
         assert_eq!(ws.members[0].package.name.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn find_workspace_root_does_not_parse_unrelated_member_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        let app = dir.path().join("packages/app");
+        let broken = dir.path().join("packages/broken");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&broken).unwrap();
+        create_package_json(&app, r#"{"name":"app"}"#);
+        fs::write(broken.join("package.json"), "{ invalid").unwrap();
+
+        let root = find_workspace_root(&app).unwrap();
+
+        assert_eq!(root.as_deref(), Some(dir.path()));
+        assert!(discover_workspace(&app).is_err());
+    }
+
+    #[test]
+    fn find_workspace_root_does_not_attach_an_unlisted_nested_package() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        let local = dir.path().join("tools/local-project");
+        fs::create_dir_all(&local).unwrap();
+        create_package_json(&local, r#"{"name":"local-project"}"#);
+
+        assert!(find_workspace_root(&local).unwrap().is_none());
     }
 
     #[test]

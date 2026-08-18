@@ -589,28 +589,50 @@ fn collect_required_manifest_path(
 
 fn is_npm_strict_exclusion(path: &str) -> bool {
     let mut segment_count = 0;
-    let mut file_name = None;
+    let mut file_name: Option<&str> = None;
+    let mut parent_name: Option<&str> = None;
     for segment in path
         .split(['/', '\\'])
         .filter(|segment| !segment.is_empty())
     {
-        if matches!(segment, ".git" | "node_modules") {
+        if [".git", "node_modules"]
+            .iter()
+            .any(|excluded| segment.eq_ignore_ascii_case(excluded))
+        {
+            return true;
+        }
+        if file_name.is_some_and(|previous| previous.eq_ignore_ascii_case(".lpm"))
+            && segment.eq_ignore_ascii_case("release-apply")
+        {
             return true;
         }
         segment_count += 1;
+        parent_name = file_name;
         file_name = Some(segment);
     }
     let Some(file_name) = file_name else {
         return false;
     };
-    if matches!(file_name, ".npmrc" | ".npmignore" | ".gitignore") {
+    if [".npmrc", ".npmignore", ".gitignore"]
+        .iter()
+        .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
+    {
+        return true;
+    }
+    if lpm_common::atomic_write::is_atomic_temp_name(file_name) {
+        return true;
+    }
+    if parent_name.is_some_and(|parent| parent.eq_ignore_ascii_case(".lpm"))
+        && PROJECT_LOCK_FILES
+            .iter()
+            .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
+    {
         return true;
     }
     segment_count == 1
-        && matches!(
-            file_name,
-            "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "bun.lock" | "bun.lockb"
-        )
+        && ROOT_LOCK_FILES
+            .iter()
+            .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
 }
 
 fn collect_dir_files(
@@ -688,6 +710,29 @@ const IGNORE_FILES: &[&str] = &[
     ".pgpass",
 ];
 
+const PROJECT_LOCK_FILES: &[&str] = &[
+    ".install.lock",
+    ".install.lock.writer-intent",
+    ".install.lock.writer-queue",
+    ".publish.lock",
+    ".publish.lock.writer-intent",
+    ".publish.lock.writer-queue",
+];
+
+const ROOT_LOCK_FILES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+];
+
+fn contains_ascii_case_insensitive(values: &[&str], value: &str) -> bool {
+    values
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
 fn collect_all_files(
     project_root: &Path,
     canonical_root: &Path,
@@ -717,7 +762,8 @@ fn collect_all_files(
                 return true;
             }
             let name = entry.file_name().to_string_lossy();
-            !(IGNORE_DIRS.contains(&name.as_ref()) || entry.depth() == 1 && name == ".lpm")
+            !(contains_ascii_case_insensitive(IGNORE_DIRS, &name)
+                || entry.depth() == 1 && name.eq_ignore_ascii_case(".lpm"))
         });
     if let Some(ignore_file) = ignore_file {
         walker.add_custom_ignore_filename(ignore_file);
@@ -737,7 +783,7 @@ fn collect_all_files(
         if !file_type.is_file() || !is_safe_entry(path, canonical_root) {
             continue;
         }
-        if IGNORE_FILES.contains(&entry.file_name().to_string_lossy().as_ref()) {
+        if contains_ascii_case_insensitive(IGNORE_FILES, &entry.file_name().to_string_lossy()) {
             continue;
         }
         if let Ok(relative) = path.strip_prefix(project_root) {
@@ -1307,8 +1353,7 @@ pub(crate) fn rewrite_workspace_deps_in_package_json(
     package_json_content: &[u8],
     workspace: &lpm_workspace::Workspace,
 ) -> Result<Option<Vec<u8>>, LpmError> {
-    let content_str = String::from_utf8_lossy(package_json_content);
-    if !content_str.contains("\"workspace:") && !content_str.contains("\"catalog:") {
+    if !package_json_requires_workspace_projection(package_json_content) {
         return Ok(None);
     }
 
@@ -1363,6 +1408,15 @@ pub(crate) fn rewrite_workspace_deps_in_package_json(
             "failed to serialize rewritten package.json: {error}"
         ))
     })
+}
+
+pub(crate) fn package_json_requires_workspace_projection(content: &[u8]) -> bool {
+    const WORKSPACE: &[u8] = b"\"workspace:";
+    const CATALOG: &[u8] = b"\"catalog:";
+    content
+        .windows(WORKSPACE.len())
+        .any(|bytes| bytes == WORKSPACE)
+        || content.windows(CATALOG.len()).any(|bytes| bytes == CATALOG)
 }
 
 /// Rewrite `workspace:` and `catalog:` protocol references in the tarball's `package.json`.
@@ -2176,6 +2230,92 @@ mod tests {
                 .iter()
                 .all(|path| !path.starts_with(".lpm/skills/owner.dependency/"))
         );
+    }
+
+    #[test]
+    fn explicit_publish_excludes_release_recovery_state_and_atomic_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".lpm/release-apply")).unwrap();
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::write(
+            project.join(".lpm/release-apply/journal.json"),
+            r#"{"original_base64":"private-manifest-backup"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".lpm-AAAAAAAAAAAAAAAA"),
+            "stale manifest replacement",
+        )
+        .unwrap();
+        for lock in [
+            ".install.lock",
+            ".install.lock.writer-intent",
+            ".install.lock.writer-queue",
+            ".publish.lock",
+            ".publish.lock.writer-intent",
+            ".publish.lock.writer-queue",
+        ] {
+            std::fs::write(project.join(".lpm").join(lock), "internal lock").unwrap();
+        }
+        std::fs::write(project.join(".lpm/certs/public.pem"), "publishable fixture").unwrap();
+        let pkg_json: serde_json::Value = serde_json::from_str(
+            r#"{
+  "name": "@lpm.dev/test.pkg",
+  "version": "1.0.0",
+  "files": [".lpm/**/*", ".lpm-AAAAAAAAAAAAAAAA"]
+}"#,
+        )
+        .unwrap();
+
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path == ".lpm/certs/public.pem")
+        );
+        assert!(files.iter().all(|file| {
+            file.path != ".lpm/release-apply/journal.json"
+                && file.path != ".lpm-AAAAAAAAAAAAAAAA"
+                && !file.path.contains(".install.lock")
+                && !file.path.contains(".publish.lock")
+        }));
+    }
+
+    #[test]
+    fn strict_publish_exclusion_matches_release_state_case_insensitively() {
+        assert!(is_npm_strict_exclusion(".LPM/ReLeAsE-ApPlY/journal.json"));
+        assert!(is_npm_strict_exclusion(".GIT/config"));
+        assert!(is_npm_strict_exclusion("NODE_MODULES/package.json"));
+        assert!(is_npm_strict_exclusion(".NPMRC"));
+        assert!(is_npm_strict_exclusion("PACKAGE-LOCK.JSON"));
+    }
+
+    #[test]
+    fn implicit_publish_excludes_sensitive_names_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(project.join(".ENV"), "TOKEN=secret").unwrap();
+        std::fs::create_dir(project.join(".GIT")).unwrap();
+        std::fs::write(project.join(".GIT/config"), "secret").unwrap();
+        std::fs::create_dir(project.join("NODE_MODULES")).unwrap();
+        std::fs::write(project.join("NODE_MODULES/package.json"), "secret").unwrap();
+
+        let pkg_json: serde_json::Value =
+            serde_json::from_str(r#"{"name":"demo","version":"1.0.0"}"#).unwrap();
+        let (_, files) = create_tarball(project, &pkg_json).unwrap();
+
+        assert!(files.iter().all(|file| {
+            !file.path.eq_ignore_ascii_case(".env")
+                && !file.path.to_ascii_lowercase().starts_with(".git/")
+                && !file.path.to_ascii_lowercase().starts_with("node_modules/")
+        }));
     }
 
     #[test]

@@ -193,7 +193,7 @@ fn real_publish_preparation_persists_and_packs_authored_skills() {
         ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap(),
         "the restrictive files array should be updated before tarball creation"
     );
-    let prepared = prepare_publish_project_from_manifest(project, manifest, true).unwrap();
+    let prepared = prepare_publish_project_from_manifest(project, manifest, None, true).unwrap();
 
     assert!(
         prepared
@@ -233,7 +233,7 @@ fn read_only_publish_preparation_packs_effective_manifest_without_writing_it() {
 
     let mut manifest = read_publish_manifest(project).unwrap();
     assert!(ensure_lpm_in_files(&mut manifest, ManifestWriteMode::ReadOnly).unwrap());
-    let prepared = prepare_publish_project_from_manifest(project, manifest, true).unwrap();
+    let prepared = prepare_publish_project_from_manifest(project, manifest, None, true).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(project.join("package.json")).unwrap(),

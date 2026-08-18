@@ -139,8 +139,7 @@ pub(crate) async fn run_recursive_workspace_install(
         None
     };
 
-    let workspace_lock = lpm_common::project_install_lock(&workspace_root);
-    lpm_common::with_exclusive_lock_async(workspace_lock, async {
+    workspace_lockfile::with_project_install_lock(&workspace_root, async {
         let workspace = discover_recursive_workspace(cwd)?;
         if workspace.root != workspace_root {
             return Err(LpmError::Script(format!(
