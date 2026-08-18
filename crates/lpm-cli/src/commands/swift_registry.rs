@@ -35,15 +35,50 @@ async fn run_swift_login(
     package_dir: Option<&Path>,
     output: SwiftLoginOutput,
 ) -> Result<std::process::ExitStatus, LpmError> {
+    use std::io::Write;
+
+    let mut token_file = tempfile::Builder::new()
+        .prefix("lpm-swift-token-")
+        .tempfile()
+        .map_err(|error| {
+            LpmError::CredentialStorage(format!(
+                "failed to create the temporary SwiftPM token file: {error}"
+            ))
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        token_file
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                LpmError::CredentialStorage(format!(
+                    "failed to restrict the temporary SwiftPM token file: {error}"
+                ))
+            })?;
+    }
+    token_file.write_all(token.as_bytes()).map_err(|error| {
+        LpmError::CredentialStorage(format!(
+            "failed to write the temporary SwiftPM token file: {error}"
+        ))
+    })?;
+    token_file.flush().map_err(|error| {
+        LpmError::CredentialStorage(format!(
+            "failed to flush the temporary SwiftPM token file: {error}"
+        ))
+    })?;
+
     let mut command = tokio::process::Command::new("swift");
-    command.args([
-        "package-registry",
-        "login",
-        swift_registry_url,
-        "--token",
-        token,
-        "--no-confirm",
-    ]);
+    command
+        .args([
+            "package-registry",
+            "login",
+            swift_registry_url,
+            "--token-file",
+        ])
+        .arg(token_file.path())
+        .arg("--no-confirm");
     if let Some(package_dir) = package_dir {
         command.current_dir(package_dir);
     }
@@ -59,10 +94,20 @@ async fn run_swift_login(
                 .stderr(std::process::Stdio::null());
         }
     }
-    command
-        .status()
-        .await
-        .map_err(|error| LpmError::Registry(format!("swift login failed: {error}")))
+    let status = command.status().await;
+    let cleanup = token_file.close();
+    match (status, cleanup) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(command_error), Ok(())) => Err(LpmError::Registry(format!(
+            "swift login failed: {command_error}"
+        ))),
+        (Ok(_), Err(cleanup_error)) => Err(LpmError::CredentialStorage(format!(
+            "failed to remove the temporary SwiftPM token file: {cleanup_error}"
+        ))),
+        (Err(command_error), Err(cleanup_error)) => Err(LpmError::CredentialStorage(format!(
+            "swift login failed: {command_error}; the temporary token file also could not be removed: {cleanup_error}"
+        ))),
+    }
 }
 
 async fn configure_swift_authentication(
@@ -79,19 +124,20 @@ async fn configure_swift_authentication(
     if show_progress {
         install_ui::phase("Configuring authentication");
     }
-    tracing::warn!(
-        target: "lpm_cli::swift_registry",
-        "swift package-registry login passes the LPM bearer via `--token <value>` in process argv — token is briefly observable to same-host processes via `ps`. SPM has no stdin/env/config alternative; accepted trade-off documented in code."
-    );
-
-    let first_status = run_swift_login(swift_registry_url, &token, package_dir, output).await?;
+    let can_refresh = session
+        .current_source()?
+        .is_some_and(|source| source.refresh_policy() == lpm_auth::RefreshPolicy::IfRefreshable);
+    let first_output = if can_refresh {
+        SwiftLoginOutput::Suppress
+    } else {
+        output
+    };
+    let first_status =
+        run_swift_login(swift_registry_url, &token, package_dir, first_output).await?;
     if first_status.success() {
         return Ok(SwiftAuthenticationOutcome::Configured);
     }
 
-    let can_refresh = session
-        .current_source()?
-        .is_some_and(|source| source.refresh_policy() == lpm_auth::RefreshPolicy::IfRefreshable);
     if can_refresh {
         session.refresh_now().await?;
         let refreshed = session
@@ -159,7 +205,7 @@ fn setup_action(repaired: bool) -> &'static str {
 ///
 /// Steps:
 /// 1. swift package-registry set --scope lpmdev <registry_url>/api/swift-registry
-/// 2. swift package-registry login --token <lpm_token> (HTTPS only)
+/// 2. swift package-registry login --token-file <temporary_file> (HTTPS only)
 /// 3. Download signing certificate to ~/.swiftpm/security/trusted-root-certs/lpm.der
 pub async fn run(
     session: &lpm_auth::SessionManager,
@@ -436,28 +482,28 @@ pub async fn ensure_configured(
         if !json_output {
             install_ui::done_line(scope_set_message(&swift_registry_url));
         }
+    }
 
-        if is_https {
-            let discovered_session;
-            let session = match session {
-                Some(session) => session,
-                None => {
-                    discovered_session = auth_storage_notice::attach(
-                        lpm_auth::SessionManager::new(registry_url, None),
-                        json_output,
-                    );
-                    &discovered_session
-                }
-            };
-            configure_swift_authentication(
-                session,
-                &swift_registry_url,
-                Some(package_dir),
-                SwiftLoginOutput::Suppress,
-                false,
-            )
-            .await?;
-        }
+    if is_https {
+        let discovered_session;
+        let session = match session {
+            Some(session) => session,
+            None => {
+                discovered_session = auth_storage_notice::attach(
+                    lpm_auth::SessionManager::new(registry_url, None),
+                    json_output,
+                );
+                &discovered_session
+            }
+        };
+        configure_swift_authentication(
+            session,
+            &swift_registry_url,
+            Some(package_dir),
+            SwiftLoginOutput::Suppress,
+            false,
+        )
+        .await?;
     }
 
     let certificate = install_signing_certificate(&swift_registry_url, json_output, false).await?;
@@ -981,11 +1027,21 @@ if [ "$1" = "package-registry" ] && [ "$2" = "set" ]; then
 fi
 if [ "$1" = "package-registry" ] && [ "$2" = "login" ]; then
   shift 2
+  if [ -n "$LPM_TEST_SWIFT_LOGIN_OUTPUT_MODES" ]; then
+    if [ /dev/fd/1 -ef /dev/null ]; then stdout_mode="null"; else stdout_mode="live"; fi
+    if [ /dev/fd/2 -ef /dev/null ]; then stderr_mode="null"; else stderr_mode="live"; fi
+    printf '%s/%s\n' "$stdout_mode" "$stderr_mode" >> "$LPM_TEST_SWIFT_LOGIN_OUTPUT_MODES"
+  fi
   token=""
   while [ "$#" -gt 0 ]; do
     if [ "$1" = "--token" ]; then
       shift
       token="$1"
+      break
+    fi
+    if [ "$1" = "--token-file" ]; then
+      shift
+      token="$(cat "$1")"
       break
     fi
     shift
@@ -1014,6 +1070,7 @@ exit 64
     #[cfg(unix)]
     #[tokio::test]
     async fn swift_registry_retries_rejected_stored_session_after_refresh() {
+        let _lock = home_env_lock().lock().await;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/cli/refresh"))
@@ -1063,7 +1120,74 @@ exit 64
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn refresh_retry_suppresses_the_speculative_swiftpm_failure_output() {
+        let _lock = home_env_lock().lock().await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "rotated-access",
+                "refreshToken": "rotated-refresh",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let home = TempDir::new().expect("create isolated home");
+        let login_tokens = home.path().join("swift-login-tokens");
+        let output_modes = home.path().join("swift-login-output-modes");
+        let path = fake_swift_path(home.path());
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+            ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
+            (
+                "LPM_TEST_SWIFT_LOGIN_TOKENS",
+                Some(login_tokens.as_os_str().to_owned()),
+            ),
+            (
+                "LPM_TEST_SWIFT_LOGIN_OUTPUT_MODES",
+                Some(output_modes.as_os_str().to_owned()),
+            ),
+            (
+                "LPM_TEST_SWIFT_REJECT_TOKEN",
+                Some("rejected-access".into()),
+            ),
+            ("LPM_TOKEN", None),
+        ]);
+        lpm_auth::store_refresh_backed_session(
+            &server.uri(),
+            "rejected-access",
+            "valid-refresh",
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .expect("store refresh-backed session");
+        let session = lpm_auth::SessionManager::new(server.uri(), None);
+
+        let outcome = configure_swift_authentication(
+            &session,
+            "https://registry.example/api/swift-registry",
+            None,
+            SwiftLoginOutput::Inherit,
+            false,
+        )
+        .await
+        .expect("SwiftPM login must recover after refreshing the LPM session");
+
+        assert!(outcome == SwiftAuthenticationOutcome::Configured);
+        assert_eq!(
+            fs::read_to_string(output_modes).expect("read Swift login output modes"),
+            "null/null\nlive/live\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn automatic_setup_reports_swiftpm_login_failure() {
+        let _lock = home_env_lock().lock().await;
         let server = MockServer::start().await;
         let home = TempDir::new().expect("create isolated home");
         let package = TempDir::new().expect("create Swift package directory");
@@ -1095,6 +1219,39 @@ exit 64
                 .to_string()
                 .contains("swift package-registry login failed"),
             "unexpected automatic setup error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn automatic_setup_authenticates_when_the_registry_scope_already_matches() {
+        let _lock = home_env_lock().lock().await;
+        let server = MockServer::start().await;
+        let registry_url = server.uri().replacen("http://", "https://", 1);
+        let home = TempDir::new().expect("create isolated home");
+        let package = TempDir::new().expect("create Swift package directory");
+        write_matching_package_scope(package.path(), &registry_url);
+        let login_tokens = home.path().join("swift-login-tokens");
+        let path = fake_swift_path(home.path());
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            (
+                "LPM_TEST_SWIFT_LOGIN_TOKENS",
+                Some(login_tokens.as_os_str().to_owned()),
+            ),
+            ("LPM_TEST_SWIFT_REJECT_TOKEN", Some(String::new().into())),
+            ("LPM_TOKEN", None),
+        ]);
+        let session =
+            lpm_auth::SessionManager::new(&registry_url, Some("matching-scope-access".to_string()));
+
+        let _ = ensure_configured(Some(&session), &registry_url, package.path(), true).await;
+
+        assert_eq!(
+            fs::read_to_string(login_tokens)
+                .expect("matching scope must not suppress SwiftPM authentication"),
+            "matching-scope-access\n"
         );
     }
 

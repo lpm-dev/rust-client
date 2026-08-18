@@ -60,6 +60,38 @@ fn main() {
                 )
                 .expect("write Swift login arguments");
             }
+            let token_file = remaining
+                .windows(2)
+                .find(|pair| pair[0] == "--token-file")
+                .map(|pair| std::path::PathBuf::from(&pair[1]));
+            if let Ok(path) = std::env::var("LPM_TEST_SWIFT_LOGIN_TOKEN_PATH") {
+                let token = if let Some(token_file) = token_file.as_deref() {
+                    std::fs::read_to_string(token_file).expect("read Swift login token file")
+                } else {
+                    remaining
+                        .windows(2)
+                        .find(|pair| pair[0] == "--token")
+                        .map(|pair| pair[1].clone())
+                        .unwrap_or_default()
+                };
+                std::fs::write(path, token).expect("write captured Swift login token");
+            }
+            #[cfg(unix)]
+            if let Ok(path) = std::env::var("LPM_TEST_SWIFT_LOGIN_TOKEN_MODE_PATH") {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mode = token_file
+                    .as_deref()
+                    .map(|token_file| {
+                        std::fs::metadata(token_file)
+                            .expect("read Swift login token file metadata")
+                            .permissions()
+                            .mode()
+                            & 0o777
+                    })
+                    .map_or_else(|| "argv".to_string(), |mode| format!("{mode:o}"));
+                std::fs::write(path, mode).expect("write Swift login token file mode");
+            }
             let exit_code = std::env::var("LPM_TEST_SWIFT_LOGIN_EXIT_CODE")
                 .ok()
                 .and_then(|value| value.parse::<i32>().ok())

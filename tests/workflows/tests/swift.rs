@@ -342,14 +342,22 @@ async fn swift_registry_json_output() {
 }
 
 #[tokio::test]
-async fn swift_registry_passes_the_global_explicit_bearer_to_swiftpm() {
+async fn swift_registry_passes_the_global_explicit_bearer_through_a_temporary_file() {
     let mock = MockRegistry::start().await;
     let registry_url = mock.url().replacen("http://", "https://", 1);
     let project = TempProject::empty(r#"{"name":"swift-auth","version":"1.0.0"}"#);
     let login_args_path = project.path().join("swift-login-args.json");
+    let login_token_path = project.path().join("swift-login-token");
+    let login_token_mode_path = project.path().join("swift-login-token-mode");
     let mut command = lpm(&project);
     configure_fake_swift(&mut command, &project, &[], 0);
     configure_fake_swift_login_capture(&mut command, &login_args_path);
+    command
+        .env("LPM_TEST_SWIFT_LOGIN_TOKEN_PATH", &login_token_path)
+        .env(
+            "LPM_TEST_SWIFT_LOGIN_TOKEN_MODE_PATH",
+            &login_token_mode_path,
+        );
 
     let output = command
         .args([
@@ -370,14 +378,21 @@ async fn swift_registry_passes_the_global_explicit_bearer_to_swiftpm() {
             )
         }))
         .expect("Swift login arguments must be JSON");
+    assert_eq!(login_args[0], format!("{registry_url}/api/swift-registry"));
+    assert_eq!(login_args[1], "--token-file");
+    assert_eq!(login_args[3], "--no-confirm");
     assert_eq!(
-        login_args,
-        [
-            format!("{registry_url}/api/swift-registry"),
-            "--token".to_string(),
-            "explicit-swift-token".to_string(),
-            "--no-confirm".to_string(),
-        ]
+        std::fs::read_to_string(login_token_path).expect("read captured Swift login token"),
+        "explicit-swift-token"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_to_string(login_token_mode_path).expect("read Swift login token file mode"),
+        "600"
+    );
+    assert!(
+        !std::path::Path::new(&login_args[2]).exists(),
+        "temporary Swift login token file must be removed after SwiftPM exits"
     );
 }
 
