@@ -596,6 +596,31 @@ async fn query_osv_batch_returns_err_on_non_success_http() {
 }
 
 #[tokio::test]
+async fn query_osv_batch_rejects_oversized_response_body() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const RESPONSE_CAP: usize = 32 * 1024 * 1024;
+    let server = MockServer::start().await;
+    let mut body = String::with_capacity(RESPONSE_CAP + 128);
+    body.push_str(r#"{"results":[{"vulns":[]}],"padding":""#);
+    body.extend(std::iter::repeat_n('x', RESPONSE_CAP));
+    body.push_str(r#""}"#);
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let error = query_osv_batch(&[("react".to_string(), "1.0.0".to_string())], &server.uri())
+        .await
+        .expect_err("oversized OSV body must fail before JSON decoding");
+
+    assert!(error.to_string().contains("exceeds cap"));
+}
+
+#[tokio::test]
 async fn query_osv_batch_splits_requests_at_osv_query_limit() {
     use wiremock::matchers::{body_json, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
