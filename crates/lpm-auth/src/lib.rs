@@ -1146,16 +1146,25 @@ pub fn set_custom_registry_token_with_backend(
     registry_url: &str,
     token: &str,
 ) -> Result<AuthStorageBackend, String> {
-    let backend = set_token_with_backend(registry_url, token)?;
-    track_custom_registry(registry_url);
-    Ok(backend)
+    with_custom_registry_tracking_lock(|| {
+        let path = custom_registries_path()
+            .ok_or_else(|| "could not determine custom registry tracking path".to_string())?;
+        let mut registries = read_custom_registries_checked_from(&path)?;
+        if !registries.iter().any(|registry| registry == registry_url) {
+            registries.push(registry_url.to_string());
+            write_custom_registries_checked(&path, &registries)?;
+        }
+
+        set_token_with_backend(registry_url, token)
+    })
 }
 
 /// Clear stored custom registry token and remove from tracking.
 pub fn clear_custom_registry_token(registry_url: &str) -> Result<(), String> {
-    clear_login_state(registry_url)?;
-    untrack_custom_registry(registry_url);
-    Ok(())
+    with_custom_registry_tracking_lock(|| {
+        clear_login_state(registry_url)?;
+        untrack_custom_registry_under_lock(registry_url).map(|_| ())
+    })
 }
 
 /// Path to the JSON file tracking custom registry URLs.
@@ -1163,33 +1172,60 @@ fn custom_registries_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".lpm").join(".custom-registries.json"))
 }
 
-/// Apply 0o600 to a credential-adjacent file on Unix, best-effort.
-///
-/// On non-Unix filesystems (network mounts, exFAT, some Docker
-/// volumes) `set_permissions` can silently no-op. We can't make
-/// non-Unix targets honor the mode bits, but we can ensure every
-/// Unix write site that touches credential metadata gets the
-/// restrictive mode applied uniformly, and surface failures via
-/// `tracing::warn` instead of `let _ = …` silence. Information in
-/// `.custom-registries.json` (registry URLs) and `.token-expiry.json`
-/// (expiry timestamps, OTP-required flag) is not raw secret material
-/// but does enumerate which third-party registries the user has
-/// tokens for — useful reconnaissance for an attacker planning
-/// credential theft on a shared host.
-#[cfg(unix)]
-fn restrict_credential_metadata_perms(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-        tracing::warn!(
-            path = %path.display(),
-            error = %e,
-            "failed to set 0o600 on credential metadata file",
-        );
-    }
+fn custom_registries_lock_path() -> Result<PathBuf, String> {
+    custom_registries_path()
+        .map(|path| path.with_file_name(".custom-registries.lock"))
+        .ok_or_else(|| "could not determine custom registry tracking lock path".to_string())
 }
 
-#[cfg(not(unix))]
-fn restrict_credential_metadata_perms(_path: &Path) {}
+fn with_custom_registry_tracking_lock<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let lock_path = custom_registries_lock_path()?;
+    lpm_common::paths::with_exclusive_lock(lock_path, || {
+        operation().map_err(lpm_common::LpmError::CredentialStorage)
+    })
+    .map_err(credential_storage_error_message)
+}
+
+fn read_custom_registries_checked_from(path: &Path) -> Result<Vec<String>, String> {
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!("custom registry tracking read error: {error}"));
+            }
+        };
+    serde_json::from_str(&content)
+        .map_err(|error| format!("custom registry tracking JSON error: {error}"))
+}
+
+fn write_custom_registries_checked(path: &Path, registries: &[String]) -> Result<(), String> {
+    if registries.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("custom registry tracking remove error: {error}")),
+        };
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("custom registry tracking mkdir error: {error}"))?;
+    }
+    let json = serde_json::to_string(registries)
+        .map_err(|error| format!("custom registry tracking JSON error: {error}"))?;
+    lpm_common::write_file_atomic_with_options(
+        path,
+        json,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
+    )
+    .map_err(|error| format!("custom registry tracking write error: {error}"))
+}
 
 fn is_builtin_registry_url(registry_url: &str) -> bool {
     matches!(
@@ -1199,10 +1235,6 @@ fn is_builtin_registry_url(registry_url: &str) -> bool {
 }
 
 fn discover_file_backed_custom_registries() -> Vec<String> {
-    if !force_file_auth() {
-        return Vec::new();
-    }
-
     let Some(path) = credentials_path().ok() else {
         return Vec::new();
     };
@@ -1242,12 +1274,12 @@ fn discover_file_backed_custom_registries() -> Vec<String> {
         .collect()
 }
 
-fn enumerate_custom_registries() -> Vec<String> {
+fn enumerate_custom_registries(tracked: &[String]) -> Vec<String> {
     use std::collections::BTreeSet;
 
     let mut registries = BTreeSet::new();
-    for registry_url in list_custom_registries() {
-        registries.insert(registry_url);
+    for registry_url in tracked {
+        registries.insert(registry_url.clone());
     }
     for registry_url in discover_file_backed_custom_registries() {
         registries.insert(registry_url);
@@ -1259,85 +1291,72 @@ fn enumerate_custom_registries() -> Vec<String> {
 /// Read tracked custom registry URLs.
 pub fn list_custom_registries() -> Vec<String> {
     let Some(path) = custom_registries_path() else {
+        tracing::warn!("failed to resolve custom registry tracking path");
         return Vec::new();
     };
-    let Ok(content) =
-        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-    else {
-        return Vec::new();
-    };
-    serde_json::from_str(&content).unwrap_or_default()
-}
-
-/// Add a custom registry URL to the tracking file.
-fn track_custom_registry(registry_url: &str) {
-    let mut registries = list_custom_registries();
-    if !registries.iter().any(|r| r == registry_url) {
-        registries.push(registry_url.to_string());
-        if let Some(path) = custom_registries_path() {
-            // Ensure ~/.lpm/ exists (may not on a clean machine if keychain was used first)
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if std::fs::write(
-                &path,
-                serde_json::to_string(&registries).unwrap_or_default(),
-            )
-            .is_ok()
-            {
-                restrict_credential_metadata_perms(&path);
-            }
-        }
-    }
+    let result = read_custom_registries_checked_from(&path);
+    result.unwrap_or_else(|error| {
+        tracing::warn!("failed to read custom registry tracking: {error}");
+        Vec::new()
+    })
 }
 
 /// Remove a custom registry URL from the tracking file.
-fn untrack_custom_registry(registry_url: &str) {
-    let mut registries = list_custom_registries();
-    registries.retain(|r| r != registry_url);
-    if let Some(path) = custom_registries_path() {
-        if registries.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else if std::fs::write(
-            &path,
-            serde_json::to_string(&registries).unwrap_or_default(),
-        )
-        .is_ok()
-        {
-            restrict_credential_metadata_perms(&path);
-        }
+fn untrack_custom_registry_under_lock(registry_url: &str) -> Result<bool, String> {
+    let path = custom_registries_path()
+        .ok_or_else(|| "could not determine custom registry tracking path".to_string())?;
+    let mut registries = read_custom_registries_checked_from(&path)?;
+    let original_len = registries.len();
+    registries.retain(|registry| registry != registry_url);
+    if registries.len() == original_len {
+        return Ok(false);
     }
+    write_custom_registries_checked(&path, &registries)?;
+    Ok(true)
+}
+
+#[derive(Debug)]
+pub struct ClearAllCustomRegistriesResult {
+    pub registries: Vec<(String, Result<(), String>)>,
+    pub tracking_cleanup: Result<(), String>,
 }
 
 /// Clear all stored custom registry tokens.
 ///
 /// Only removes successfully cleared entries from the tracking file.
 /// Failed deletions remain tracked so they can be retried.
-pub fn clear_all_custom_registries() -> Vec<(String, Result<(), String>)> {
-    let registries = enumerate_custom_registries();
-    let mut results = Vec::new();
-    let mut remaining = Vec::new();
+pub fn clear_all_custom_registries() -> ClearAllCustomRegistriesResult {
+    match with_custom_registry_tracking_lock(|| {
+        let path = custom_registries_path()
+            .ok_or_else(|| "could not determine custom registry tracking path".to_string())?;
+        let tracked = read_custom_registries_checked_from(&path);
+        let registries = enumerate_custom_registries(tracked.as_deref().unwrap_or_default());
+        let mut results = Vec::with_capacity(registries.len());
+        let mut remaining = Vec::new();
 
-    for url in &registries {
-        let result = clear_login_state(url);
-        if result.is_err() {
-            remaining.push(url.clone());
+        for url in &registries {
+            let result = clear_login_state(url);
+            if result.is_err() {
+                remaining.push(url.clone());
+            }
+            results.push((url.clone(), result));
         }
-        results.push((url.clone(), result));
-    }
 
-    // Rewrite tracking file: keep only entries that failed to clear
-    if let Some(path) = custom_registries_path() {
-        if remaining.is_empty() {
-            let _ = std::fs::remove_file(&path);
-        } else if std::fs::write(&path, serde_json::to_string(&remaining).unwrap_or_default())
-            .is_ok()
-        {
-            restrict_credential_metadata_perms(&path);
-        }
+        let tracking_cleanup = match tracked {
+            Ok(_) => write_custom_registries_checked(&path, &remaining),
+            Err(error) => Err(error),
+        };
+        Ok(ClearAllCustomRegistriesResult {
+            registries: results,
+            tracking_cleanup,
+        })
+    }) {
+        Ok(result) => result,
+        Err(error) => ClearAllCustomRegistriesResult {
+            registries: Vec::new(),
+            tracking_cleanup: Err(error),
+        },
     }
-
-    results
 }
 
 // ─── Registry Enumeration (B4) ─────────────────────────────────────
@@ -5020,20 +5039,186 @@ mod tests {
     }
 
     #[test]
-    fn list_custom_registries_returns_empty_when_no_file() {
-        // The function reads from a fixed path (~/.lpm/.custom-registries.json).
-        // On CI or clean machines with no custom registries, it should return empty.
-        let result = list_custom_registries();
-        // We can't control the real file, but we can verify it doesn't panic
-        // and returns a Vec (possibly empty, possibly with entries from prior tests).
-        assert!(
-            result.len() < 1000,
-            "should return reasonable number of entries"
-        );
+    fn custom_registry_login_fails_when_credential_cannot_be_tracked() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let registry = "https://packages.login-tracking-failure.example/npm";
+            let tracking_path = home.join(".lpm").join(".custom-registries.json");
+            std::fs::create_dir_all(&tracking_path)
+                .expect("failed to replace tracking file with a directory");
+
+            let result = set_custom_registry_token(registry, "custom-token");
+
+            assert!(
+                result.is_err(),
+                "login must not report success when its credential cannot be tracked"
+            );
+            assert!(
+                get_token_from_file(registry).is_none(),
+                "tracking failure must not leave an untracked credential"
+            );
+        });
     }
 
     #[test]
-    fn clear_all_custom_registries_discovers_file_entries_when_tracking_file_is_malformed() {
+    fn custom_registry_login_keeps_tracking_when_credential_storage_fails_with_existing_state() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let registry = "https://packages.partial-login.example/npm";
+            set_token_in_file(registry, "existing-token")
+                .expect("seed existing custom-registry credential");
+            std::fs::create_dir_all(
+                credential_authority::path_for_test()
+                    .expect("credential authority path should resolve"),
+            )
+            .expect("replace credential authority file with a directory");
+
+            let result = set_custom_registry_token(registry, "replacement-token");
+
+            assert!(
+                result.is_err(),
+                "login must report the credential storage failure"
+            );
+            assert_eq!(
+                list_custom_registries(),
+                vec![registry.to_string()],
+                "a failed credential update must remain enumerable for logout cleanup"
+            );
+            assert_eq!(
+                get_token_from_file(registry).as_deref(),
+                Some("existing-token")
+            );
+        });
+    }
+
+    #[test]
+    fn custom_registry_login_waits_for_tracking_mutation_lock() {
+        with_temp_home(|_| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let lock_path =
+                custom_registries_lock_path().expect("tracking lock path should resolve");
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                lpm_common::paths::with_exclusive_lock(lock_path, || {
+                    locked_tx.send(()).expect("signal held tracking lock");
+                    release_rx.recv().expect("wait to release tracking lock");
+                    Ok::<_, lpm_common::LpmError>(())
+                })
+                .expect("hold tracking lock");
+            });
+            locked_rx.recv().expect("wait for held tracking lock");
+
+            let registry = "https://packages.concurrent-login.example/npm";
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                done_tx
+                    .send(set_custom_registry_token(registry, "custom-token"))
+                    .expect("send login result");
+            });
+
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "custom-registry login bypassed the tracking mutation lock"
+            );
+            release_tx.send(()).expect("release tracking lock");
+            holder.join().expect("tracking lock holder panicked");
+            assert!(
+                done_rx.recv().expect("receive login result").is_ok(),
+                "custom-registry login failed after the tracking lock was released"
+            );
+            writer
+                .join()
+                .expect("custom-registry login thread panicked");
+            assert_eq!(list_custom_registries(), vec![registry.to_string()]);
+            assert_eq!(
+                get_token_from_file(registry).as_deref(),
+                Some("custom-token")
+            );
+        });
+    }
+
+    #[test]
+    fn targeted_custom_registry_logout_reports_tracking_cleanup_failure() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let registry = "https://packages.targeted-tracking-failure.example/npm";
+            set_token_in_file(registry, "custom-token")
+                .expect("failed to seed custom registry token");
+            let tracking_path = home.join(".lpm").join(".custom-registries.json");
+            std::fs::create_dir_all(&tracking_path)
+                .expect("failed to replace tracking file with a directory");
+
+            let result = clear_custom_registry_token(registry);
+
+            assert!(
+                result.is_err(),
+                "targeted logout must report incomplete tracking cleanup"
+            );
+            assert!(
+                get_token_from_file(registry).is_none(),
+                "targeted logout should still remove the credential before reporting tracking failure"
+            );
+        });
+    }
+
+    #[test]
+    fn bulk_custom_registry_logout_reports_tracking_cleanup_failure() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let registry = "https://packages.bulk-tracking-failure.example/npm";
+            set_token_in_file(registry, "custom-token")
+                .expect("failed to seed custom registry token");
+            let tracking_path = home.join(".lpm").join(".custom-registries.json");
+            std::fs::create_dir_all(&tracking_path)
+                .expect("failed to replace tracking file with a directory");
+
+            let result = clear_all_custom_registries();
+
+            assert!(
+                result.tracking_cleanup.is_err(),
+                "bulk logout must report incomplete tracking cleanup"
+            );
+            assert_eq!(result.registries.len(), 1);
+            assert!(result.registries[0].1.is_ok());
+            assert!(get_token_from_file(registry).is_none());
+        });
+    }
+
+    #[test]
+    fn bulk_custom_registry_logout_discovers_legacy_untracked_file_credentials() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", None)]);
+            let registry = "https://packages.legacy-untracked.example/npm";
+            set_token_in_file(registry, "legacy-token")
+                .expect("seed legacy untracked custom-registry credential");
+            assert!(!home.join(".lpm/.custom-registries.json").exists());
+
+            let result = clear_all_custom_registries();
+
+            assert_eq!(result.registries.len(), 1);
+            assert_eq!(result.registries[0].0, registry);
+            assert!(result.registries[0].1.is_ok());
+            assert!(result.tracking_cleanup.is_ok());
+            assert!(get_token_from_file(registry).is_none());
+        });
+    }
+
+    #[test]
+    fn list_custom_registries_does_not_create_state_when_tracking_file_is_missing() {
+        with_temp_home(|home| {
+            assert!(list_custom_registries().is_empty());
+            assert!(
+                !home.join(".lpm").exists(),
+                "reading absent custom-registry tracking must not create lock state"
+            );
+        });
+    }
+
+    #[test]
+    fn clear_all_custom_registries_reports_malformed_tracking_after_clearing_discovered_entries() {
         with_temp_home(|home| {
             let custom_registry = "https://packages.example.internal/npm";
 
@@ -5048,15 +5233,16 @@ mod tests {
             std::fs::write(&tracking_path, "{not valid json")
                 .expect("failed to write malformed tracking file");
 
-            let results = clear_all_custom_registries();
+            let result = clear_all_custom_registries();
 
             assert_eq!(
-                results.len(),
+                result.registries.len(),
                 1,
                 "only custom registry entries should be cleared"
             );
-            assert_eq!(results[0].0, custom_registry);
-            assert!(results[0].1.is_ok());
+            assert_eq!(result.registries[0].0, custom_registry);
+            assert!(result.registries[0].1.is_ok());
+            assert!(result.tracking_cleanup.is_err());
 
             assert_eq!(
                 get_token_from_file(NPM_REGISTRY_URL),
@@ -5067,42 +5253,21 @@ mod tests {
                 "malformed tracking should not strand file-backed custom registry tokens"
             );
             assert!(
-                !tracking_path.exists(),
-                "tracking file should be removed once malformed custom-registry state is normalized"
+                tracking_path.exists(),
+                "malformed tracking data must be preserved for inspection"
             );
         });
     }
 
-    /// Defensive perms on every credential-adjacent file: `restrict_credential_metadata_perms`
-    /// applies 0o600 so a shared host can't read which third-party
-    /// registries the user has tokens for.
     #[cfg(unix)]
     #[test]
-    fn restrict_credential_metadata_perms_applies_0o600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("creds.json");
-        std::fs::write(&path, b"{}").unwrap();
-        // Start with permissive perms to prove the helper tightens them.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        restrict_credential_metadata_perms(&path);
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
-    }
-
-    /// End-to-end: `track_custom_registry` writes the tracking file
-    /// with 0o600 directly — proves the perm helper is wired through
-    /// the public write path, not just available as a utility.
-    #[cfg(unix)]
-    #[test]
-    fn track_custom_registry_writes_tracking_file_with_0o600() {
+    fn custom_registry_login_writes_tracking_file_with_0o600() {
         use std::os::unix::fs::PermissionsExt;
 
         with_temp_home(|home| {
-            track_custom_registry("https://registry.example.com");
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            set_custom_registry_token("https://registry.example.com", "custom-token")
+                .expect("custom registry login should succeed");
             let path = home.join(".lpm").join(".custom-registries.json");
             assert!(path.exists(), "tracking file should be written");
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
