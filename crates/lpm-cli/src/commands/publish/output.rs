@@ -80,7 +80,7 @@ pub(super) fn publish_check_json(
                 .map(|target| {
                     let key = target.key();
                     serde_json::json!({
-                        "registry": key,
+                        "registry": target.output_key(),
                         "name": target_names.get(&key),
                     })
                 })
@@ -128,11 +128,14 @@ pub(super) fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
         "package",
         install_ui::yellow(&format!("{}@{}", summary.name, summary.version)),
     );
-    for (registry_key, target_name) in summary.target_names {
-        publish_detail(
-            &format!("{registry_key} name"),
-            install_ui::yellow(target_name),
-        );
+    for target in summary.targets {
+        let key = target.key();
+        if let Some(target_name) = summary.target_names.get(&key) {
+            publish_detail(
+                &format!("{} name", target.output_key()),
+                install_ui::yellow(target_name),
+            );
+        }
     }
     publish_detail(
         "files",
@@ -155,7 +158,7 @@ pub(super) fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
     let target_keys = summary
         .targets
         .iter()
-        .map(PublishTarget::key)
+        .map(PublishTarget::output_key)
         .collect::<Vec<_>>();
     publish_detail("targets", install_ui::yellow(&target_keys.join(", ")));
     install_ui::detail("");

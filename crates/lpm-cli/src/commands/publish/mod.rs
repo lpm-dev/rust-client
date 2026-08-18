@@ -14,8 +14,11 @@ mod version_data;
 mod wait;
 
 pub(crate) use npm_artifact::prepare_npm_target_artifact;
+pub(crate) use orchestrator::resolve_target_names;
 pub use orchestrator::run;
-pub(crate) use prepare::{prepare_publish_project, validate_publish_tarball_size};
+pub(crate) use prepare::{
+    PublishManifest, prepare_publish_project, read_publish_manifest, validate_publish_tarball_size,
+};
 pub(crate) use provenance::{
     ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
 };

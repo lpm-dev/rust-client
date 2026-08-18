@@ -100,20 +100,7 @@ pub async fn run(
             std::time::Duration::from_secs,
         )
     });
-    if targets_lpm {
-        let lpm_name = publish_manifest
-            .publish_config
-            .as_ref()
-            .and_then(|config| config.lpm.as_ref())
-            .and_then(|config| config.name.as_deref())
-            .unwrap_or(&publish_manifest.name);
-        if !lpm_name.starts_with("@lpm.dev/") {
-            return Err(LpmError::Registry(format!(
-                "LPM registry requires @lpm.dev/ prefix (got \"{lpm_name}\"). \
-						 Set publish.lpm.name in lpm.json."
-            )));
-        }
-    }
+    let target_names = resolve_target_names(&publish_manifest, &targets)?;
 
     // Publisher-authored skills must be validated and included in a restrictive
     // package.json `files` list before the publish tarball is created.
@@ -181,79 +168,9 @@ pub async fn run(
     } = prepare_publish_project_from_manifest(project_dir, publish_manifest, !allow_secrets)?;
     let publish_config = publish_config.as_ref();
 
-    let targets_gitlab = targets.iter().any(|t| matches!(t, PublishTarget::GitLab));
-
-    // GitLab Packages requires projectId in lpm.json
-    if targets_gitlab {
-        let gl_config = publish_config.and_then(|p| p.gitlab.as_ref());
-        if gl_config.and_then(|c| c.project_id.as_deref()).is_none() {
-            return Err(LpmError::Registry(
-                "GitLab Packages requires publish.gitlab.projectId in lpm.json".into(),
-            ));
-        }
-    }
-
-    // Resolve the package name used by each target.
-    // Each registry can have its own name override in lpm.json.
-    // package.json `name` is the fallback when no config override exists.
-    let lpm_config = publish_config.and_then(|p| p.lpm.as_ref());
     let npm_config = publish_config.and_then(|p| p.npm.as_ref());
     let github_config = publish_config.and_then(|p| p.github.as_ref());
     let gitlab_config = publish_config.and_then(|p| p.gitlab.as_ref());
-
-    let mut target_names: HashMap<String, String> = HashMap::new();
-    for target in &targets {
-        let resolved = match target {
-            PublishTarget::Lpm => {
-                // LPM: config override → package.json name. Must be @lpm.dev/.
-                let lpm_name = lpm_config
-                    .and_then(|c| c.name.clone())
-                    .unwrap_or_else(|| name.to_string());
-                if !lpm_name.starts_with("@lpm.dev/") {
-                    return Err(LpmError::Registry(format!(
-                        "LPM registry requires @lpm.dev/ prefix (got \"{lpm_name}\"). \
-						 Set publish.lpm.name in lpm.json."
-                    )));
-                }
-                lpm_name
-            }
-            PublishTarget::Npm => {
-                // npm: config override → package.json name. Reject @lpm.dev/.
-                npm_config
-                    .and_then(|c| c.name.clone())
-                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
-            }
-            PublishTarget::GitHub => {
-                // GitHub: config override → npm config → package.json. Must be scoped.
-                let gh_name = github_config
-                    .and_then(|c| c.name.clone())
-                    .or_else(|| npm_config.and_then(|c| c.name.clone()))
-                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?;
-                if !gh_name.starts_with('@') {
-                    return Err(LpmError::Registry(
-                        "GitHub Packages requires scoped package names (@owner/package). \
-						 Set publish.github.name in lpm.json."
-                            .into(),
-                    ));
-                }
-                gh_name
-            }
-            PublishTarget::GitLab => {
-                // GitLab: config override → npm config → package.json.
-                gitlab_config
-                    .and_then(|c| c.name.clone())
-                    .or_else(|| npm_config.and_then(|c| c.name.clone()))
-                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
-            }
-            PublishTarget::Custom(_) => {
-                // Custom: npm config → package.json.
-                npm_config
-                    .and_then(|c| c.name.clone())
-                    .map_or_else(|| publish_npm::resolve_npm_name(&name, None), Ok)?
-            }
-        };
-        target_names.insert(target.key(), resolved);
-    }
 
     let provenance_request = resolve_provenance_request(
         project_dir,
@@ -275,15 +192,8 @@ pub async fn run(
             let npm_name_str = target_names.get(&target.key()).ok_or_else(|| {
                 LpmError::Registry(format!("no name resolved for {}", target.display_name()))
             })?;
-            let npm_access = match target {
-                PublishTarget::GitHub => github_config
-                    .and_then(|c| c.access.clone())
-                    .unwrap_or_else(|| publish_npm::resolve_npm_access(npm_name_str, npm_config)),
-                PublishTarget::GitLab => gitlab_config
-                    .and_then(|c| c.access.clone())
-                    .unwrap_or_else(|| publish_npm::resolve_npm_access(npm_name_str, npm_config)),
-                _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
-            };
+            let (npm_access, _) =
+                resolve_npm_target_access(target, npm_config, github_config, gitlab_config);
             if npm_access != "public" {
                 return Err(LpmError::Registry(format!(
                     "npm provenance requires public access for {npm_name_str}. \
@@ -474,7 +384,7 @@ pub async fn run(
                 "targets": targets.iter().map(|t| {
                     let key = t.key();
                     let name = target_names.get(&key);
-                    serde_json::json!({"registry": key, "name": name})
+                    serde_json::json!({"registry": t.output_key(), "name": name})
                 }).collect::<Vec<_>>(),
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -782,8 +692,9 @@ pub async fn run(
                         PublishTarget::Custom(url) => (
                             url.clone(),
                             auth::get_custom_registry_token(url).ok_or_else(|| {
+                                let safe_origin = crate::install_ui::safe_url_origin(url);
                                 LpmError::Registry(format!(
-                                    "no token found for {url}. Run `lpm login --login-registry {url} --token <token>`."
+                                    "no token found for {safe_origin}. Run `lpm login --login-registry <configured-registry-url> --token <token>`."
                                 ))
                             })?,
                             "custom",
@@ -797,19 +708,12 @@ pub async fn run(
                     }
 
                     // Per-target access
-                    let npm_access = match target {
-                        PublishTarget::GitHub => github_config
-                            .and_then(|c| c.access.clone())
-                            .unwrap_or_else(|| {
-                                publish_npm::resolve_npm_access(npm_name_str, npm_config)
-                            }),
-                        PublishTarget::GitLab => gitlab_config
-                            .and_then(|c| c.access.clone())
-                            .unwrap_or_else(|| {
-                                publish_npm::resolve_npm_access(npm_name_str, npm_config)
-                            }),
-                        _ => publish_npm::resolve_npm_access(npm_name_str, npm_config),
-                    };
+                    let (npm_access, _) = resolve_npm_target_access(
+                        target,
+                        npm_config,
+                        github_config,
+                        gitlab_config,
+                    );
                     if provenance_context.is_some() && npm_access != "public" {
                         return Err(LpmError::Registry(format!(
                             "npm provenance requires public access for {npm_name_str}. \
@@ -865,7 +769,7 @@ pub async fn run(
                         &target_artifact.version_data,
                         &target_artifact.tarball_data,
                         target_artifact.provenance_attachment.as_ref(),
-                        &npm_access,
+                        npm_access,
                         &npm_tag,
                         &registry_url,
                         otp_preempt,
@@ -878,7 +782,7 @@ pub async fn run(
                         print_upload_details(
                             npm_name_str,
                             &version,
-                            visibility_from_access(&npm_access),
+                            visibility_from_access(npm_access),
                             &npm_tag,
                         );
                     }
@@ -923,7 +827,7 @@ pub async fn run(
                     }
 
                     Ok(PublishResult {
-                        target: target.key(),
+                        target: target.output_key(),
                         success: npm_result.success,
                         error: npm_result.error,
                         auth: auth_source,
@@ -950,7 +854,7 @@ pub async fn run(
                             ));
                         }
                         results.push(PublishResult {
-                            target: target.key(),
+                            target: target.output_key(),
                             success: false,
                             error: Some(e.to_string()),
                             auth: None,
@@ -1211,6 +1115,162 @@ fn is_npm_compatible_target(target: &PublishTarget) -> bool {
             | PublishTarget::GitLab
             | PublishTarget::Custom(_)
     )
+}
+
+pub(crate) fn resolve_target_names(
+    manifest: &super::prepare::PublishManifest,
+    targets: &[PublishTarget],
+) -> Result<HashMap<String, String>, LpmError> {
+    let publish_config = manifest.publish_config.as_ref();
+    let lpm_config = publish_config.and_then(|config| config.lpm.as_ref());
+    let npm_config = publish_config.and_then(|config| config.npm.as_ref());
+    let github_config = publish_config.and_then(|config| config.github.as_ref());
+    let gitlab_config = publish_config.and_then(|config| config.gitlab.as_ref());
+
+    if targets.contains(&PublishTarget::GitLab) {
+        let project_id = gitlab_config
+            .and_then(|config| config.project_id.as_deref())
+            .ok_or_else(|| {
+                LpmError::Registry(
+                    "GitLab Packages requires publish.gitlab.projectId in lpm.json".into(),
+                )
+            })?;
+        if project_id.trim().is_empty() || project_id.trim() != project_id {
+            return Err(LpmError::Registry(
+                "publish.gitlab.projectId must be a non-empty value without surrounding whitespace"
+                    .into(),
+            ));
+        }
+        if let Some(registry) = gitlab_config.and_then(|config| config.registry.as_deref()) {
+            publish_npm::validate_npm_registry_setting(registry, "publish.gitlab.registry")?;
+        }
+    }
+
+    if targets.iter().any(is_npm_compatible_target) {
+        publish_npm::validate_npm_publish_config(
+            npm_config,
+            targets.contains(&PublishTarget::Npm),
+        )?;
+        if npm_config
+            .and_then(|config| config.tag.as_deref())
+            .is_none()
+            && lpm_semver::Version::parse(&manifest.version)?.is_prerelease()
+        {
+            return Err(LpmError::Registry(
+                "prerelease publishing requires an explicit publish.npm.tag".into(),
+            ));
+        }
+    }
+
+    let mut target_names = HashMap::with_capacity(targets.len());
+    for target in targets {
+        let resolved = match target {
+            PublishTarget::Lpm => lpm_config
+                .and_then(|config| config.name.clone())
+                .unwrap_or_else(|| manifest.name.clone()),
+            PublishTarget::Npm => publish_npm::resolve_npm_name(&manifest.name, npm_config)?,
+            PublishTarget::GitHub => {
+                let name = github_config
+                    .and_then(|config| config.name.clone())
+                    .or_else(|| npm_config.and_then(|config| config.name.clone()))
+                    .map_or_else(|| publish_npm::resolve_npm_name(&manifest.name, None), Ok)?;
+                if !name.starts_with('@') {
+                    return Err(LpmError::Registry(
+                        "GitHub Packages requires scoped package names (@owner/package). \
+						 Set publish.github.name in lpm.json."
+                            .into(),
+                    ));
+                }
+                name
+            }
+            PublishTarget::GitLab => gitlab_config
+                .and_then(|config| config.name.clone())
+                .or_else(|| npm_config.and_then(|config| config.name.clone()))
+                .map_or_else(|| publish_npm::resolve_npm_name(&manifest.name, None), Ok)?,
+            PublishTarget::Custom(_) => npm_config
+                .and_then(|config| config.name.clone())
+                .map_or_else(|| publish_npm::resolve_npm_name(&manifest.name, None), Ok)?,
+        };
+        if matches!(target, PublishTarget::Lpm) {
+            validate_lpm_publish_name(&resolved)?;
+        } else {
+            publish_npm::validate_npm_name(&resolved)?;
+            let (access, source) =
+                resolve_npm_target_access(target, npm_config, github_config, gitlab_config);
+            publish_npm::validate_npm_access(access, source)?;
+            if matches!(target, PublishTarget::Npm)
+                && access == "restricted"
+                && !resolved.starts_with('@')
+            {
+                return Err(LpmError::Registry(
+                    "npm cannot restrict access to an unscoped package".into(),
+                ));
+            }
+        }
+        target_names.insert(target.key(), resolved);
+    }
+    Ok(target_names)
+}
+
+fn resolve_npm_target_access<'a>(
+    target: &PublishTarget,
+    npm_config: Option<&'a lpm_runner::lpm_json::NpmPublishConfig>,
+    github_config: Option<&'a lpm_runner::lpm_json::GithubPublishConfig>,
+    gitlab_config: Option<&'a lpm_runner::lpm_json::GitlabPublishConfig>,
+) -> (&'a str, &'static str) {
+    match target {
+        PublishTarget::GitHub => github_config
+            .and_then(|config| config.access.as_deref())
+            .map_or_else(
+                || npm_publish_access(npm_config),
+                |access| (access, "publish.github.access"),
+            ),
+        PublishTarget::GitLab => gitlab_config
+            .and_then(|config| config.access.as_deref())
+            .map_or_else(
+                || npm_publish_access(npm_config),
+                |access| (access, "publish.gitlab.access"),
+            ),
+        PublishTarget::Npm | PublishTarget::Custom(_) => npm_publish_access(npm_config),
+        PublishTarget::Lpm => ("public", "publish.npm.access"),
+    }
+}
+
+fn npm_publish_access(
+    npm_config: Option<&lpm_runner::lpm_json::NpmPublishConfig>,
+) -> (&str, &'static str) {
+    npm_config
+        .and_then(|config| config.access.as_deref())
+        .map_or(("public", "publish.npm.access"), |access| {
+            (access, "publish.npm.access")
+        })
+}
+
+fn validate_lpm_publish_name(name: &str) -> Result<(), LpmError> {
+    let Some(identity) = name.strip_prefix("@lpm.dev/") else {
+        return Err(LpmError::InvalidPackageName(format!(
+            "LPM publish name must use the exact lowercase @lpm.dev/owner.package format: {name}"
+        )));
+    };
+    let Some((owner, package)) = identity.split_once('.') else {
+        return Err(LpmError::InvalidPackageName(format!(
+            "LPM publish name must use the exact lowercase @lpm.dev/owner.package format: {name}"
+        )));
+    };
+    let owner_is_canonical = !owner.is_empty()
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let package_is_canonical = !package.is_empty()
+        && package
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if !owner_is_canonical || !package_is_canonical {
+        return Err(LpmError::InvalidPackageName(format!(
+            "LPM publish name must use the exact lowercase @lpm.dev/owner.package format: {name}"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn lpm_package_url(name: &str) -> Option<String> {

@@ -1,11 +1,10 @@
-use crate::commands::{publish, publish_npm};
+use crate::commands::publish;
 use crate::install_ui;
 use crate::output;
 use crate::release_plan::{self, ReleasePlan};
 use crate::workspace_select;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
-use lpm_runner::lpm_json;
 use lpm_semver::VersionBump;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -172,22 +171,10 @@ async fn publish_member_preflight(
     idx: usize,
     options: &ReleasePublishOptions,
 ) -> Result<PublishMember, LpmError> {
-    let manifest_path = member.path.join("package.json");
-    let name = member
-        .package
-        .name
-        .as_deref()
-        .ok_or_else(|| LpmError::Script(format!("{} is missing `name`", manifest_path.display())))?
-        .to_string();
-    let version = member
-        .package
-        .version
-        .as_deref()
-        .ok_or_else(|| {
-            LpmError::Script(format!("{} is missing `version`", manifest_path.display()))
-        })?
-        .to_string();
-    let target_names = resolved_publish_target_names(&member.path, &name, options)?;
+    let manifest = publish::read_publish_manifest(&member.path)?;
+    let name = manifest.name.clone();
+    let version = manifest.version.clone();
+    let target_names = resolved_publish_target_names(&manifest, options)?;
     let mut checked_targets = 0usize;
     let mut existing_targets = Vec::new();
 
@@ -230,78 +217,23 @@ async fn publish_member_preflight(
 }
 
 fn resolved_publish_target_names(
-    project_dir: &Path,
-    package_name: &str,
+    manifest: &publish::PublishManifest,
     options: &ReleasePublishOptions,
 ) -> Result<Vec<(publish::PublishTarget, String)>, LpmError> {
-    let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Registry)?;
-    let publish_config = lpm_config.and_then(|config| config.publish);
     let targets = publish::resolve_targets(
         options.npm,
         options.lpm,
         options.github,
         options.gitlab,
         options.publish_registry.as_deref(),
-        publish_config.as_ref(),
+        manifest.publish_config.as_ref(),
     )?;
-    let targets_gitlab = targets
-        .iter()
-        .any(|target| matches!(target, publish::PublishTarget::GitLab));
-    if targets_gitlab {
-        let gl_config = publish_config.as_ref().and_then(|p| p.gitlab.as_ref());
-        if gl_config
-            .and_then(|config| config.project_id.as_deref())
-            .is_none()
-        {
-            return Err(LpmError::Registry(
-                "GitLab Packages requires publish.gitlab.projectId in lpm.json".into(),
-            ));
-        }
-    }
-
-    let publish_config = publish_config.as_ref();
-    let lpm_config = publish_config.and_then(|p| p.lpm.as_ref());
-    let npm_config = publish_config.and_then(|p| p.npm.as_ref());
-    let github_config = publish_config.and_then(|p| p.github.as_ref());
-    let gitlab_config = publish_config.and_then(|p| p.gitlab.as_ref());
+    let mut names = publish::resolve_target_names(manifest, &targets)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in targets {
-        let resolved = match &target {
-            publish::PublishTarget::Lpm => {
-                let lpm_name = lpm_config
-                    .and_then(|config| config.name.clone())
-                    .unwrap_or_else(|| package_name.to_string());
-                if !lpm_name.starts_with("@lpm.dev/") {
-                    return Err(LpmError::Registry(format!(
-                        "LPM registry requires @lpm.dev/ prefix (got \"{lpm_name}\"). Set publish.lpm.name in lpm.json."
-                    )));
-                }
-                lpm_name
-            }
-            publish::PublishTarget::Npm => npm_config
-                .and_then(|config| config.name.clone())
-                .map_or_else(|| publish_npm::resolve_npm_name(package_name, None), Ok)?,
-            publish::PublishTarget::GitHub => {
-                let gh_name = github_config
-                    .and_then(|config| config.name.clone())
-                    .or_else(|| npm_config.and_then(|config| config.name.clone()))
-                    .map_or_else(|| publish_npm::resolve_npm_name(package_name, None), Ok)?;
-                if !gh_name.starts_with('@') {
-                    return Err(LpmError::Registry(
-                        "GitHub Packages requires scoped package names (@owner/package). Set publish.github.name in lpm.json."
-                            .into(),
-                    ));
-                }
-                gh_name
-            }
-            publish::PublishTarget::GitLab => gitlab_config
-                .and_then(|config| config.name.clone())
-                .or_else(|| npm_config.and_then(|config| config.name.clone()))
-                .map_or_else(|| publish_npm::resolve_npm_name(package_name, None), Ok)?,
-            publish::PublishTarget::Custom(_) => npm_config
-                .and_then(|config| config.name.clone())
-                .map_or_else(|| publish_npm::resolve_npm_name(package_name, None), Ok)?,
-        };
+        let resolved = names.remove(&target.key()).ok_or_else(|| {
+            LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+        })?;
         out.push((target, resolved));
     }
     Ok(out)

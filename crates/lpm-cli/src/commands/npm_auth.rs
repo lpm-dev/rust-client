@@ -86,7 +86,7 @@ pub(crate) async fn resolve_publish_auth_with_policy(
         }
 
         tracing::warn!(
-            registry_url = %registry_url,
+            registry_url = %crate::install_ui::safe_url_origin(registry_url),
             default_url = NPM_REGISTRY_URL,
             "npm Trusted Publishing is only attempted for registry.npmjs.org; using npm token auth",
         );
@@ -130,9 +130,9 @@ pub(crate) fn missing_npm_token_error() -> LpmError {
 }
 
 fn missing_custom_registry_token_error(registry_url: &str) -> LpmError {
-    let registry = normalized_registry_url(registry_url);
+    let registry = crate::install_ui::safe_url_origin(registry_url);
     LpmError::Registry(format!(
-        "no registry-scoped token found for {registry}. Run `lpm login --login-registry {registry} --token <token>`. Generic NPM_TOKEN and `lpm login --npm` credentials are only used for {NPM_REGISTRY_URL}."
+        "no registry-scoped token found for {registry}. Run `lpm login --login-registry <configured-registry-url> --token <token>`. Generic NPM_TOKEN and `lpm login --npm` credentials are only used for {NPM_REGISTRY_URL}."
     ))
 }
 
@@ -419,5 +419,15 @@ mod tests {
                 && message.contains("lpm login --login-registry"),
             "error should direct users to scoped registry auth, got: {message}"
         );
+    }
+
+    #[test]
+    fn missing_custom_registry_token_error_redacts_path_components() {
+        let error =
+            missing_custom_registry_token_error("https://registry.example.test/npm/path-secret");
+        let message = error.to_string();
+
+        assert!(message.contains("https://registry.example.test"));
+        assert!(!message.contains("path-secret"));
     }
 }

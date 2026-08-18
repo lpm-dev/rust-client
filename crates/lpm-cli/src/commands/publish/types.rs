@@ -26,7 +26,7 @@ impl PublishTarget {
         }
     }
 
-    /// Key for JSON output.
+    /// Exact key used for internal target identity and lookup.
     pub fn key(&self) -> String {
         match self {
             Self::Lpm => "lpm".into(),
@@ -37,6 +37,14 @@ impl PublishTarget {
         }
     }
 
+    /// Registry identifier safe for human and JSON output.
+    pub fn output_key(&self) -> String {
+        match self {
+            Self::Custom(url) => crate::install_ui::safe_url_origin(url),
+            _ => self.key(),
+        }
+    }
+
     /// CLI flag to retry a failed publish for this target.
     pub fn retry_flag(&self) -> String {
         match self {
@@ -44,7 +52,7 @@ impl PublishTarget {
             Self::Npm => "--npm".into(),
             Self::GitHub => "--github".into(),
             Self::GitLab => "--gitlab".into(),
-            Self::Custom(url) => format!("--publish-registry {url}"),
+            Self::Custom(_) => "--publish-registry REGISTRY_URL".into(),
         }
     }
 }

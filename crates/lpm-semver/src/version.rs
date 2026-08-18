@@ -67,7 +67,8 @@ pub struct Version {
 impl Version {
     /// Parse a version string.
     ///
-    /// Accepts standard semver (`1.2.3`) and npm loose formats (`v1.2.3`, `1.2`).
+    /// Accepts standard semver (`1.2.3`) and npm's optional `v` prefix (`v1.2.3`).
+    /// Partial versions such as `1.2` are ranges, not exact versions, and are rejected.
     pub fn parse(input: &str) -> Result<Self, LpmError> {
         let inner = node_semver::Version::parse(input)
             .map_err(|e| LpmError::InvalidVersion(format!("{input}: {e}")))?;
