@@ -1489,7 +1489,8 @@ pub fn clear_token_expiry(registry: &str) {
     }
 }
 
-pub(crate) fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
+/// Remove token-expiry metadata and report storage failures to the caller.
+pub fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
     mutate_token_expiries(|expiries| expiries.remove(registry).is_some())
 }
 

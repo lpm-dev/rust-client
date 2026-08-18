@@ -532,3 +532,35 @@ async fn targeted_logout_json_reports_failure_when_its_credential_store_cannot_b
     assert_eq!(json["success"], false);
     assert_eq!(json["local_cleared"], false);
 }
+
+#[tokio::test]
+async fn targeted_logout_reports_corrupt_expiry_metadata_as_a_local_clear_failure() {
+    let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: "https://registry.npmjs.org",
+            access_token: Some("npm-token"),
+            refresh_token: None,
+            session_access_expires_at: None,
+        }],
+    );
+    let metadata_path = project.home().join(".lpm").join(".token-expiry.json");
+    std::fs::write(&metadata_path, b"not-json").expect("write corrupt expiry metadata");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--npm"])
+        .output()
+        .expect("run targeted npm logout with corrupt expiry metadata");
+
+    assert!(
+        !output.status.success(),
+        "logout must not claim complete local clearing when expiry metadata remains"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["local_cleared"], false);
+    assert_eq!(std::fs::read(metadata_path).unwrap(), b"not-json");
+}

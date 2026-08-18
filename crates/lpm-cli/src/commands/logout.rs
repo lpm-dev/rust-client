@@ -117,44 +117,59 @@ pub async fn run(
         }
     }
     if targets.npm {
-        let cleared = record_local_clear(
+        let credential_cleared = record_local_clear(
             auth::clear_npm_token(),
             "npm local credential clearing",
             &mut local_cleared,
             &mut errors,
         );
-        if cleared && !json_output {
+        let metadata_cleared = record_local_clear(
+            auth::clear_token_expiry_checked("npmjs.org"),
+            "npm local expiry metadata clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        if credential_cleared && metadata_cleared && !json_output {
             output::success("Logged out from npmjs.org");
         }
-        auth::clear_token_expiry("npmjs.org");
     }
     if targets.github {
-        let cleared = record_local_clear(
+        let credential_cleared = record_local_clear(
             auth::clear_github_token(),
             "GitHub Packages local credential clearing",
             &mut local_cleared,
             &mut errors,
         );
-        if cleared && !json_output {
+        let metadata_cleared = record_local_clear(
+            auth::clear_token_expiry_checked("github.com"),
+            "GitHub Packages local expiry metadata clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        if credential_cleared && metadata_cleared && !json_output {
             output::success(
                 "Logged out from GitHub Packages fallback token (GitHub CLI auth is managed by gh)",
             );
         }
-        auth::clear_token_expiry("github.com");
     }
     if targets.gitlab {
-        let cleared = record_local_clear(
+        let credential_cleared = record_local_clear(
             auth::clear_gitlab_token(),
             "GitLab Packages local credential clearing",
             &mut local_cleared,
             &mut errors,
         );
-        if cleared && !json_output {
+        let metadata_cleared = record_local_clear(
+            auth::clear_token_expiry_checked("gitlab.com"),
+            "GitLab Packages local expiry metadata clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        if credential_cleared && metadata_cleared && !json_output {
             output::success(
                 "Logged out from GitLab Packages fallback token (GitLab CLI auth is managed by glab)",
             );
         }
-        auth::clear_token_expiry("gitlab.com");
     }
     if let Some(url) = targets.custom_registry {
         let cleared = record_local_clear(
