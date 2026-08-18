@@ -21,6 +21,11 @@ pub(crate) fn run_publish_secret_scan<'a>(
     let mut scanned_artifact = false;
     for secret_scan in secret_scans {
         scanned_artifact = true;
+        if let Some(limit) = secret_scan.limit_exceeded {
+            return Err(LpmError::Registry(format!(
+                "publish secret scan stopped at the {limit} limit; the artifact was not published"
+            )));
+        }
         if secret_scan.has_secrets() {
             if json_output {
                 println!("{}", secret_scan_json(secret_scan));
@@ -108,14 +113,15 @@ pub(super) fn format_secret_match(
     } else {
         install_ui::field("")
     };
+    let pattern_name = lpm_common::sanitize_terminal_inline(&secret_match.pattern_name);
+    let description = lpm_common::sanitize_terminal_inline(&secret_match.description);
 
     crate::install_ui::terminal_line!(
-        "  {} {}{}  {}  {}",
+        "  {}{}  {}  {}",
         format_secret_severity(&secret_match.severity),
-        install_ui::red(&secret_match.matched_text),
         location,
-        install_ui::cyan(&secret_match.pattern_name),
-        &secret_match.description
+        install_ui::cyan(&pattern_name),
+        &description
     )
 }
 
@@ -123,6 +129,6 @@ pub(super) fn format_secret_severity(severity: &str) -> install_ui::TerminalFrag
     match severity {
         "critical" => install_ui::red("critical"),
         "high" => install_ui::yellow("high"),
-        _ => install_ui::dim(severity),
+        _ => install_ui::dim(&lpm_common::sanitize_terminal_inline(severity)),
     }
 }

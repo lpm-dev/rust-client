@@ -20,8 +20,6 @@ pub struct SecretMatch {
     pub pattern_name: String,
     /// Human-readable description (e.g., "Stripe live secret key").
     pub description: String,
-    /// The matched text (truncated for display — first 8 + last 4 chars).
-    pub matched_text: String,
     /// Line number where the match was found (1-based).
     pub line: usize,
     /// Severity: "critical" (live keys), "high" (test keys), "medium" (generic patterns).
@@ -36,6 +34,9 @@ pub struct SecretScanResult {
     pub matches: Vec<SecretMatch>,
     /// Number of files scanned.
     pub files_scanned: usize,
+    /// Resource limit that stopped the scan before completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_exceeded: Option<SecretScanLimit>,
 }
 
 impl SecretScanResult {
@@ -57,6 +58,101 @@ impl SecretScanResult {
     pub fn merge(&mut self, other: &SecretScanResult) {
         self.matches.extend(other.matches.iter().cloned());
         self.files_scanned += other.files_scanned;
+        if self.limit_exceeded.is_none() {
+            self.limit_exceeded = other.limit_exceeded;
+        }
+    }
+}
+
+/// Resource whose operation-wide secret scan budget was exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretScanLimit {
+    Files,
+    Bytes,
+    Findings,
+}
+
+impl std::fmt::Display for SecretScanLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Files => "file",
+            Self::Bytes => "byte",
+            Self::Findings => "finding",
+        })
+    }
+}
+
+/// Maximum files inspected by one secret-scan operation.
+pub const SECRET_SCAN_MAX_FILES: usize = 250_000;
+/// Maximum source bytes inspected by one secret-scan operation.
+pub const SECRET_SCAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum findings retained by one secret-scan operation.
+pub const SECRET_SCAN_MAX_FINDINGS: usize = 10_000;
+
+/// Shared resource budget for one complete audit or publish operation.
+#[derive(Debug, Clone)]
+pub struct SecretScanBudget {
+    remaining_files: usize,
+    remaining_bytes: u64,
+    remaining_findings: usize,
+    exceeded: Option<SecretScanLimit>,
+}
+
+impl SecretScanBudget {
+    /// Create the aggregate budget for one audit or publish operation.
+    pub const fn for_operation() -> Self {
+        Self {
+            remaining_files: SECRET_SCAN_MAX_FILES,
+            remaining_bytes: SECRET_SCAN_MAX_BYTES,
+            remaining_findings: SECRET_SCAN_MAX_FINDINGS,
+            exceeded: None,
+        }
+    }
+
+    #[cfg(test)]
+    const fn new(files: usize, bytes: u64, findings: usize) -> Self {
+        Self {
+            remaining_files: files,
+            remaining_bytes: bytes,
+            remaining_findings: findings,
+            exceeded: None,
+        }
+    }
+
+    /// Return the first resource limit that stopped the scan.
+    pub const fn exceeded(&self) -> Option<SecretScanLimit> {
+        self.exceeded
+    }
+
+    fn consume_file(&mut self) -> bool {
+        if self.remaining_files == 0 {
+            self.exceeded = Some(SecretScanLimit::Files);
+            return false;
+        }
+        self.remaining_files -= 1;
+        true
+    }
+
+    fn consume_bytes(&mut self, bytes: usize) -> bool {
+        let Ok(bytes) = u64::try_from(bytes) else {
+            self.exceeded = Some(SecretScanLimit::Bytes);
+            return false;
+        };
+        if bytes > self.remaining_bytes {
+            self.exceeded = Some(SecretScanLimit::Bytes);
+            return false;
+        }
+        self.remaining_bytes -= bytes;
+        true
+    }
+
+    fn consume_findings(&mut self, findings: usize) {
+        self.remaining_findings -= findings;
+    }
+
+    fn exceed_findings(&mut self) {
+        self.exceeded = Some(SecretScanLimit::Findings);
     }
 }
 
@@ -250,29 +346,9 @@ fn secret_regex_set() -> &'static RegexSet {
 ///
 /// Returns matches with line numbers. The `content` should be the raw file content
 /// (NOT comment-stripped — secrets can appear in comments too, and we want to catch them).
+/// At most [`SECRET_SCAN_MAX_FINDINGS`] matches are retained.
 pub fn scan_content(content: &str, file_path: &str) -> Vec<SecretMatch> {
-    let set = secret_regex_set();
-    let mut matches = Vec::new();
-
-    // Check each line for pattern matches
-    for (line_idx, line) in content.lines().enumerate() {
-        for pattern_idx in set.matches(line).into_iter() {
-            let (_, name, desc, severity) = SECRET_PATTERNS[pattern_idx];
-
-            // Extract the matched text for display (truncated)
-            let matched_text = truncate_secret(line.trim());
-
-            matches.push(SecretMatch {
-                pattern_name: name.to_string(),
-                description: format!("{desc} in {file_path}"),
-                matched_text,
-                line: line_idx + 1,
-                severity: severity.to_string(),
-            });
-        }
-    }
-
-    matches
+    scan_content_bounded(content, file_path, SECRET_SCAN_MAX_FINDINGS).0
 }
 
 /// Check if a filename is a blocked .env or credentials file.
@@ -289,15 +365,49 @@ pub fn is_blocked_file(filename: &str) -> bool {
 /// [`scan_directory`]. Publishing callers already enforce artifact size limits,
 /// so selected text files are scanned regardless of size.
 pub fn scan_file_content(content: &[u8], file_path: &str) -> SecretScanResult {
+    let mut budget = SecretScanBudget::for_operation();
+    scan_file_content_with_budget(content, file_path, &mut budget)
+}
+
+/// Scan one prepared package file while charging an operation-wide budget.
+pub fn scan_file_content_with_budget(
+    content: &[u8],
+    file_path: &str,
+    budget: &mut SecretScanBudget,
+) -> SecretScanResult {
     let mut result = SecretScanResult::default();
+    if let Some(limit) = budget.exceeded() {
+        result.limit_exceeded = Some(limit);
+        return result;
+    }
+    if !budget.consume_file() {
+        result.limit_exceeded = budget.exceeded();
+        return result;
+    }
+
+    scan_file_content_after_file_charge(content, file_path, budget)
+}
+
+fn scan_file_content_after_file_charge(
+    content: &[u8],
+    file_path: &str,
+    budget: &mut SecretScanBudget,
+) -> SecretScanResult {
+    let mut result = SecretScanResult::default();
+
     if is_blocked_file(file_path) {
+        if budget.remaining_findings == 0 {
+            budget.exceed_findings();
+            result.limit_exceeded = budget.exceeded();
+            return result;
+        }
         result.matches.push(SecretMatch {
             pattern_name: "blocked_file".to_string(),
             description: format!("'{file_path}' should not be included in a published package"),
-            matched_text: file_path.to_string(),
             line: 0,
             severity: "critical".to_string(),
         });
+        budget.consume_findings(1);
         result.files_scanned = 1;
         return result;
     }
@@ -305,12 +415,22 @@ pub fn scan_file_content(content: &[u8], file_path: &str) -> SecretScanResult {
     if !is_scannable_file(file_path) {
         return result;
     }
+    if !budget.consume_bytes(content.len()) {
+        result.limit_exceeded = budget.exceeded();
+        return result;
+    }
 
     let Ok(content) = std::str::from_utf8(content) else {
         return result;
     };
-    result.matches = scan_content(content, file_path);
+    let (matches, exceeded) = scan_content_bounded(content, file_path, budget.remaining_findings);
+    budget.consume_findings(matches.len());
+    result.matches = matches;
     result.files_scanned = 1;
+    if exceeded {
+        budget.exceed_findings();
+        result.limit_exceeded = budget.exceeded();
+    }
     result
 }
 
@@ -356,27 +476,26 @@ fn is_scannable_file(file_path: &str) -> bool {
         || file_path.ends_with(".npmrc")
 }
 
-/// Truncate a secret value for safe display: show first 8 and last 4 chars.
-fn truncate_secret(value: &str) -> String {
-    let char_count = value.chars().count();
-    if char_count > 20 {
-        let start: String = value.chars().take(8).collect();
-        let end: String = value.chars().skip(char_count - 4).collect();
-        format!("{start}...{end}")
-    } else if char_count > 12 {
-        let start: String = value.chars().take(6).collect();
-        format!("{start}...")
-    } else {
-        "••••••••".to_string()
-    }
-}
-
 /// Scan all files in a directory for secrets and blocked files.
 ///
 /// Walks the directory tree, skipping node_modules and hidden directories.
 /// Returns a combined result with all matches.
 pub fn scan_directory(dir: &std::path::Path) -> SecretScanResult {
+    let mut budget = SecretScanBudget::for_operation();
+    scan_directory_with_budget(dir, &mut budget)
+}
+
+/// Scan a package directory while charging work to a command-wide budget.
+pub fn scan_directory_with_budget(
+    dir: &std::path::Path,
+    budget: &mut SecretScanBudget,
+) -> SecretScanResult {
     let mut result = SecretScanResult::default();
+
+    if let Some(limit) = budget.exceeded() {
+        result.limit_exceeded = Some(limit);
+        return result;
+    }
 
     let walker = ignore::WalkBuilder::new(dir)
         .hidden(false) // We DO want to check hidden files like .env
@@ -392,7 +511,10 @@ pub fn scan_directory(dir: &std::path::Path) -> SecretScanResult {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-
+        if !budget.consume_file() {
+            result.limit_exceeded = budget.exceeded();
+            return result;
+        }
         let path = entry.path();
         let rel_path = path
             .strip_prefix(dir)
@@ -400,35 +522,51 @@ pub fn scan_directory(dir: &std::path::Path) -> SecretScanResult {
             .to_string_lossy()
             .to_string();
 
-        if is_blocked_file(&rel_path) {
-            let mut file_scan = scan_file_content(&[], &rel_path);
-            result.matches.append(&mut file_scan.matches);
-            result.files_scanned += file_scan.files_scanned;
-            continue;
-        }
-
-        if !is_scannable_file(&rel_path) {
-            continue;
-        }
-
-        if path
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() > MAX_SCANNABLE_FILE_BYTES as u64)
-        {
-            continue;
-        }
-
-        if let Ok(content) = std::fs::read(path) {
-            if content.len() > MAX_SCANNABLE_FILE_BYTES {
+        let content = if is_blocked_file(&rel_path) || !is_scannable_file(&rel_path) {
+            Vec::new()
+        } else {
+            let Ok(content) = lpm_common::read_file_capped(path, MAX_SCANNABLE_FILE_BYTES as u64)
+            else {
                 continue;
-            }
-            let mut file_scan = scan_file_content(&content, &rel_path);
-            result.matches.append(&mut file_scan.matches);
-            result.files_scanned += file_scan.files_scanned;
+            };
+            content
+        };
+        let mut file_scan = scan_file_content_after_file_charge(&content, &rel_path, budget);
+        result.matches.append(&mut file_scan.matches);
+        result.files_scanned += file_scan.files_scanned;
+        if file_scan.limit_exceeded.is_some() {
+            result.limit_exceeded = file_scan.limit_exceeded;
+            return result;
         }
     }
 
     result
+}
+
+fn scan_content_bounded(
+    content: &str,
+    file_path: &str,
+    maximum_findings: usize,
+) -> (Vec<SecretMatch>, bool) {
+    let set = secret_regex_set();
+    let mut matches = Vec::with_capacity(maximum_findings.min(16));
+
+    for (line_index, line) in content.lines().enumerate() {
+        for pattern_index in set.matches(line).into_iter() {
+            if matches.len() == maximum_findings {
+                return (matches, true);
+            }
+            let (_, name, description, severity) = SECRET_PATTERNS[pattern_index];
+            matches.push(SecretMatch {
+                pattern_name: name.to_string(),
+                description: format!("{description} in {file_path}"),
+                line: line_index + 1,
+                severity: severity.to_string(),
+            });
+        }
+    }
+
+    (matches, false)
 }
 
 #[cfg(test)]
@@ -649,25 +787,77 @@ mod tests {
     }
 
     #[test]
-    fn truncate_long_secret() {
-        let value = format!("sk_live_{}", "F".repeat(20));
-        let truncated = truncate_secret(&value);
-        assert!(truncated.contains("sk_live_"), "should show prefix");
-        assert!(truncated.contains("..."), "should have ellipsis");
+    fn scan_directory_does_not_retain_more_than_ten_thousand_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = format!("sk_{}_{}", "live", "F".repeat(20));
+        let mut content = String::with_capacity((secret.len() + 1) * 10_001);
+        for _ in 0..10_001 {
+            content.push_str(&secret);
+            content.push('\n');
+        }
+        std::fs::write(dir.path().join("secrets.js"), content).unwrap();
+
+        let result = scan_directory(dir.path());
+
+        assert!(
+            result.matches.len() <= 10_000,
+            "secret scanning must cap retained findings, got {}",
+            result.matches.len()
+        );
+        assert_eq!(result.limit_exceeded, Some(SecretScanLimit::Findings));
     }
 
     #[test]
-    fn truncate_short_value() {
-        let truncated = truncate_secret("short");
-        assert_eq!(truncated, "••••••••");
+    fn detected_secret_metadata_does_not_retain_credential_fragments() {
+        let secret = format!("sk_{}_{}", "live", "F".repeat(20));
+
+        let matches = scan_content(&secret, "config.js");
+        let serialized = serde_json::to_string(&matches).unwrap();
+
+        assert!(!serialized.contains(&secret));
     }
 
     #[test]
-    fn truncate_non_ascii_secret_without_panicking() {
+    fn non_ascii_secret_is_redacted_without_panicking() {
         let matches = scan_content("password: 'Contraseña',", "messages.js");
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].matched_text, "password...ña',");
+    }
+
+    #[test]
+    fn shared_file_budget_stops_before_scanning_another_file() {
+        let mut budget = SecretScanBudget::new(1, 1024, 10);
+        let first = scan_file_content_with_budget(b"module.exports = {};", "first.js", &mut budget);
+        assert_eq!(first.limit_exceeded, None);
+
+        let second =
+            scan_file_content_with_budget(b"module.exports = {};", "second.js", &mut budget);
+
+        assert_eq!(second.limit_exceeded, Some(SecretScanLimit::Files));
+        assert_eq!(second.files_scanned, 0);
+    }
+
+    #[test]
+    fn shared_byte_budget_rejects_content_before_matching() {
+        let mut budget = SecretScanBudget::new(1, 3, 10);
+
+        let result = scan_file_content_with_budget(b"four", "config.js", &mut budget);
+
+        assert_eq!(result.limit_exceeded, Some(SecretScanLimit::Bytes));
+        assert_eq!(result.files_scanned, 0);
+    }
+
+    #[test]
+    fn shared_finding_budget_stops_at_the_configured_limit() {
+        let mut budget = SecretScanBudget::new(1, 1024, 1);
+        let first = format!("sk_{}_{}", "live", "A".repeat(20));
+        let second = format!("sk_{}_{}", "test", "B".repeat(20));
+        let content = format!("{first}\n{second}\n");
+
+        let result = scan_file_content_with_budget(content.as_bytes(), "config.js", &mut budget);
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.limit_exceeded, Some(SecretScanLimit::Findings));
     }
 
     #[test]
@@ -693,21 +883,21 @@ mod tests {
             matches: vec![SecretMatch {
                 pattern_name: "test".into(),
                 description: "test".into(),
-                matched_text: "test".into(),
                 line: 1,
                 severity: "high".into(),
             }],
             files_scanned: 1,
+            limit_exceeded: None,
         };
         let b = SecretScanResult {
             matches: vec![SecretMatch {
                 pattern_name: "test2".into(),
                 description: "test2".into(),
-                matched_text: "test2".into(),
                 line: 5,
                 severity: "critical".into(),
             }],
             files_scanned: 2,
+            limit_exceeded: None,
         };
         a.merge(&b);
         assert_eq!(a.matches.len(), 2);
