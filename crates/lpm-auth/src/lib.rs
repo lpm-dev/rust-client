@@ -1620,6 +1620,7 @@ pub(crate) fn persist_refresh_backed_session_unlocked(
     expires_at: &str,
 ) -> Result<AuthStorageStatus, String> {
     validate_refresh_backed_session(access_token, refresh_token, expires_at)?;
+    read_token_expiries_checked()?;
 
     // The replacement refresh token is the recovery credential after the
     // server consumes its predecessor, so it must become durable first.
@@ -3829,6 +3830,31 @@ mod tests {
                 "http://localhost:3000"
             ));
             assert!(!is_session_access_token_expired("http://localhost:3000"));
+        });
+    }
+
+    #[test]
+    fn failed_refresh_session_persistence_leaves_no_partial_credentials() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
+            ]);
+            let registry = "https://registry.example";
+            let metadata_path = home.join(".lpm").join(".token-expiry.json");
+            std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+            std::fs::write(&metadata_path, b"not-json").unwrap();
+
+            let result = persist_refresh_backed_session_unlocked(
+                registry,
+                "new-access",
+                "new-refresh",
+                "2099-01-01T00:00:00Z",
+            );
+
+            assert!(result.is_err(), "corrupt metadata must reject the session");
+            assert_eq!(get_stored_access_token(registry), None);
+            assert_eq!(get_refresh_token(registry), None);
         });
     }
 

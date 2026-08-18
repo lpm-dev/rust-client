@@ -455,6 +455,13 @@ impl SessionManager {
                 if !needs_proactive_refresh {
                     return Ok(secret.expose_secret().to_string());
                 }
+                match self.load_refresh_token() {
+                    Ok(_) => {}
+                    Err(LpmError::SessionExpired) => {
+                        return Ok(secret.expose_secret().to_string());
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             Ok(None) | Err(LpmError::AuthRequired | LpmError::SessionExpired) => {}
             Err(error) => return Err(error),
@@ -665,14 +672,18 @@ impl SessionManager {
         }
 
         let refresh_before_process_lock = self.load_refresh_token()?;
+        let access_before_process_lock = self.load_access_token()?;
         let lock_path = session_lock_path(&self.registry_url).map_err(|error| {
             LpmError::CredentialStorage(format!("failed to resolve session lock: {error}"))
         })?;
         let secret = lpm_common::paths::with_exclusive_lock_async(lock_path, async {
             let current_refresh = self.load_refresh_token()?;
+            let current_access = self.load_access_token()?;
 
             if current_refresh != refresh_before_process_lock
-                && let Some(peer_access) = crate::get_stored_access_token(&self.registry_url)
+                && current_access != access_before_process_lock
+                && !crate::should_refresh_session_access_token(&self.registry_url)
+                && let Some(peer_access) = current_access
                 && !peer_access.is_empty()
             {
                 let secret = SecretString::from(peer_access);
@@ -1568,6 +1579,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_required_uses_valid_legacy_access_without_refresh_metadata() {
+        let _env = token_classify_isolate();
+        let registry = "https://legacy-access.invalid";
+        crate::set_token(registry, "valid-legacy-access").expect("access token should store");
+        let manager = SessionManager::new(registry, None);
+
+        let bearer = manager
+            .bearer_string_for(AuthRequirement::TokenRequired)
+            .await
+            .expect("an access-only stored credential remains a valid bearer");
+
+        assert_eq!(bearer, "valid-legacy-access");
+    }
+
+    #[tokio::test]
     async fn session_required_confirms_refresh_for_stored_access_bearer() {
         let _env = token_classify_isolate();
         let registry = "https://confirm-refresh.invalid";
@@ -1987,6 +2013,73 @@ mod refresh_http_tests {
             "both managers must reuse one durable rotation: result_a={result_a:?}, result_b={result_b:?}, stored_access={stored_access:?}, stored_refresh={stored_refresh:?}, calls={}",
             calls.load(AtomicOrdering::SeqCst),
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_does_not_accept_partial_peer_rotation_as_complete() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tempdir = tempfile::tempdir().expect("create test home tempdir");
+        let contention_marker = tempdir.path().join("session-lock-contention");
+        let _env = crate::test_env::ScopedEnv::set([
+            ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_FORCE_FILE_AUTH", "1".into()),
+            ("LPM_TEST_FAST_SCRYPT", "1".into()),
+            (
+                "LPM_TEST_LOCK_CONTENTION_MARKER",
+                contention_marker.as_os_str().to_owned(),
+            ),
+        ]);
+        let manager = manager_for(&server.uri());
+        crate::set_token(&server.uri(), "at-stale").expect("seed stored access token");
+
+        let lock_path = crate::session_lock_path(&server.uri()).unwrap();
+        let lock_path_for_holder = lock_path.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            lpm_common::paths::with_exclusive_lock(lock_path_for_holder, || {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, LpmError>(())
+            })
+            .unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let refresh = tokio::spawn(async move { manager.refresh_now().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !contention_marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("refresh must reach the held session lock");
+        assert_eq!(
+            std::fs::read_to_string(&contention_marker).unwrap(),
+            lock_path.to_string_lossy(),
+        );
+
+        crate::set_refresh_token(&server.uri(), "rt-peer")
+            .expect("simulate durable refresh half of peer rotation");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let bearer = refresh
+            .await
+            .expect("refresh task must finish")
+            .expect("partial peer state must be recovered");
+        assert_eq!(bearer.expose_secret(), "at-rotated");
     }
 
     #[tokio::test]
