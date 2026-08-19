@@ -1,6 +1,8 @@
 use crate::{auth, install_ui};
+use lpm_auth::AuthRequirement;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
+use std::sync::Arc;
 
 const MAX_CLI_EXCHANGE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_CALLBACKS: usize = 16;
@@ -74,12 +76,22 @@ pub async fn run(
     registry_url: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let has_existing_auth = match client.session() {
-        Some(session) => session.current_source()?.is_some(),
-        None => false,
+    let existing_session_client = match client.session() {
+        Some(session) => {
+            let stored_session = Arc::new(session.stored_session_only());
+            match stored_session
+                .bearer_string_for(AuthRequirement::SessionRequired)
+                .await
+            {
+                Ok(_) => Some(client.clone_with_session_only(stored_session)),
+                Err(LpmError::AuthRequired | LpmError::SessionExpired) => None,
+                Err(error) => return Err(error),
+            }
+        }
+        None => None,
     };
-    if has_existing_auth {
-        match client.whoami().await {
+    if let Some(existing_session_client) = existing_session_client {
+        match existing_session_client.whoami().await {
             Ok(info) => {
                 let name = info
                     .profile_username
