@@ -3,7 +3,7 @@
 mod support;
 
 #[cfg(unix)]
-use std::process::{Child, Stdio};
+use std::process::{Child, Output, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -104,6 +104,15 @@ fn dev_proxy_routes_an_ipv6_child_and_preserves_its_base_path() {
 const http = require('http');
 const port = Number(process.env.PORT);
 const server = http.createServer((request, response) => {
+  if (request.url === '/app/shutdown') {
+    response.end('shutdown-ok', () => {
+      server.close(() => {
+        clearTimeout(safetyTimer);
+        process.exit(0);
+      });
+    });
+    return;
+  }
   if (request.url !== '/app/health') {
     response.statusCode = 404;
     response.end(request.url);
@@ -111,10 +120,11 @@ const server = http.createServer((request, response) => {
   }
   response.end('ipv6-ok');
 });
-server.listen({ port, host: '::1', ipv6Only: true }, () => {
-  console.log(`Local: http://[::1]:${port}/app/`);
-  setTimeout(() => server.close(() => process.exit(0)), 8000);
-});
+const safetyTimer = setTimeout(() => process.exit(1), 30000);
+server.listen(
+  { port, host: '::1', ipv6Only: true },
+  () => console.log(`Local: http://[::1]:${port}/app/`)
+);
 "#,
     );
     project.write_file(
@@ -129,14 +139,16 @@ server.listen({ port, host: '::1', ipv6Only: true }, () => {
         }"#,
     );
 
-    let mut proxy = lpm_spawnable(&project)
-        .args(["proxy", "start", "--tls-port", "0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn lpm proxy start");
-    wait_for_proxy_running(&project, &mut proxy);
+    let mut proxy = KillOnDropChild::new(
+        lpm_spawnable(&project)
+            .args(["proxy", "start", "--tls-port", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn lpm proxy start"),
+    );
+    wait_for_proxy_running(&project, proxy.child_mut());
 
     let mut dev_command = lpm_spawnable(&project);
     dev_command
@@ -144,9 +156,10 @@ server.listen({ port, host: '::1', ipv6Only: true }, () => {
         .env("LPM_CERT_TEST_TRUST_STORE_DIR", trust_store_dir(&project))
         .stdin(Stdio::null());
     let dev = dev_command.spawn().expect("spawn lpm dev");
-
     let (_route, dev) = wait_for_proxy_route_or_dev_exit(&project, "ipv6.localhost", dev);
+    let mut dev = KillOnDropChild::new(dev);
     assert_proxy_tls_path_routes_to_service(&project, "ipv6.localhost", "/health", "ipv6-ok");
+    shutdown_ipv6_fixture(&project, "ipv6.localhost");
 
     let output = dev.wait_with_output().expect("wait for lpm dev to finish");
     assert!(
@@ -157,7 +170,38 @@ server.listen({ port, host: '::1', ipv6Only: true }, () => {
     );
 
     wait_for_proxy_route_absent(&project, "ipv6.localhost");
-    stop_proxy(&project, &mut proxy);
+    stop_proxy(&project, proxy.child_mut());
+}
+
+#[cfg(unix)]
+struct KillOnDropChild(Option<Child>);
+
+#[cfg(unix)]
+impl KillOnDropChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child should be available")
+    }
+
+    fn wait_with_output(&mut self) -> std::io::Result<Output> {
+        self.0
+            .take()
+            .expect("child should be available")
+            .wait_with_output()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -896,6 +940,28 @@ fn assert_proxy_tls_path_routes_to_service(
 
     panic!(
         "TLS proxy route {host} did not return 200; last_status={last_status:?} last_error={last_error:?}"
+    );
+}
+
+#[cfg(unix)]
+fn shutdown_ipv6_fixture(project: &TempProject, host: &str) {
+    let route = wait_for_proxy_route(project, host);
+    let upstream_port = route["upstreamPort"]
+        .as_u64()
+        .expect("proxy route should expose an upstream port");
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build fixture shutdown client");
+    let response = client
+        .get(format!("http://127.0.0.1:{upstream_port}/app/shutdown"))
+        .send()
+        .expect("request IPv6 fixture shutdown");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "IPv6 fixture shutdown should succeed"
     );
 }
 
