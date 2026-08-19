@@ -70,6 +70,7 @@ mod tool_pin_validation;
 pub mod triage_advisor_session;
 mod trust_snapshot;
 mod tsc_status;
+mod tunnel_session_auth;
 mod typosquat_guard;
 mod update_check;
 pub mod upgrade_engine;

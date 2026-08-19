@@ -1539,9 +1539,13 @@ pub async fn run(
         let (forwarding_controller, forwarding_admission) =
             lpm_tunnel::client::forwarding_admission_barrier();
         multi_tunnel_forwarding_controller = Some(forwarding_controller);
+        let relay_url = tunnel_relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned);
+        let token_provider =
+            crate::tunnel_session_auth::refresh_backed_provider(client, &relay_url)?;
         let options = lpm_tunnel::client::TunnelOptions {
-            relay_url: tunnel_relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
+            relay_url,
             token: token.to_string(),
+            token_provider,
             local_target: LocalTarget::loopback(LocalScheme::Http, port),
             live_local_target: None,
             domain: tunnel_domain.map(|s| s.to_string()),
@@ -2296,7 +2300,10 @@ pub async fn run(
                     .to_string();
                 let tunnel_project_dir = project_dir.to_path_buf();
                 let tunnel_domain = tunnel_domain.map(str::to_string);
-                let tunnel_relay_url = tunnel_relay_url.map(str::to_string);
+                let tunnel_relay_url =
+                    tunnel_relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned);
+                let tunnel_token_provider =
+                    crate::tunnel_session_auth::refresh_backed_provider(client, &tunnel_relay_url)?;
                 let tunnel_target = child_target.clone();
                 let (shutdown_boundary, shutdown_rx, tunnel_completion) =
                     TunnelShutdownBoundary::new();
@@ -2323,7 +2330,8 @@ pub async fn run(
                         inspect_port,
                         false,
                         None,
-                        tunnel_relay_url.as_deref(),
+                        Some(&tunnel_relay_url),
+                        tunnel_token_provider,
                         Some(shutdown_rx),
                     )
                     .await;

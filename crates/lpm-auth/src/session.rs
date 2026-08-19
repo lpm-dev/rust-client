@@ -799,7 +799,8 @@ impl SessionManager {
             })?;
 
         if !resp.status().is_success() {
-            tracing::debug!("silent refresh failed: {}", resp.status());
+            let status = resp.status();
+            tracing::debug!("silent refresh failed: {status}");
             // A 401 authoritatively rejects the submitted refresh token.
             // Clear each local credential only while the exact value used by
             // this request remains current; a peer may replace either value
@@ -807,10 +808,14 @@ impl SessionManager {
             //
             // 5xx and network errors are transient — keep state
             // intact so the next attempt can recover.
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.clear_rejected_session_if_current(rejected_access, refresh_token)?;
+                return Err(LpmError::SessionExpired);
             }
-            return Err(LpmError::SessionExpired);
+            return Err(LpmError::Http {
+                status: status.as_u16(),
+                message: "silent refresh failed".to_string(),
+            });
         }
 
         let data = parse_capped_refresh_response(resp).await?;
@@ -2281,7 +2286,7 @@ mod refresh_http_tests {
     }
 
     #[tokio::test]
-    async fn refresh_500_keeps_refresh_token() {
+    async fn refresh_500_is_transient_and_keeps_session() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/cli/refresh"))
@@ -2292,7 +2297,7 @@ mod refresh_http_tests {
         let _isolated = isolate_test_env();
         let mgr = manager_for(&server.uri());
         let res = mgr.refresh_now().await;
-        assert!(matches!(res, Err(LpmError::SessionExpired)));
+        assert!(matches!(res, Err(LpmError::Http { status: 500, .. })));
         // 5xx is transient — we keep ALL local state so the next
         // attempt can recover. Counterpart to the 401 wipe assertion
         // above: only authoritative rejections clear state.
