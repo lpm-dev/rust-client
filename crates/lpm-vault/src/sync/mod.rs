@@ -25,6 +25,10 @@ pub enum SyncError {
     /// The server returned a non-success HTTP response.
     #[error("{message}")]
     Http { status: u16, message: String },
+    /// The server accepted the bearer but rejected a credential submitted by
+    /// the operation itself.
+    #[error("{message}")]
+    CredentialRejected { status: u16, message: String },
     /// Request construction, transport, parsing, or local processing failed.
     #[error("{0}")]
     Other(String),
@@ -38,6 +42,13 @@ impl SyncError {
 
     pub(crate) fn http(status: reqwest::StatusCode, message: String) -> Self {
         Self::Http {
+            status: status.as_u16(),
+            message,
+        }
+    }
+
+    pub(crate) fn credential_rejected(status: reqwest::StatusCode, message: String) -> Self {
+        Self::CredentialRejected {
             status: status.as_u16(),
             message,
         }
