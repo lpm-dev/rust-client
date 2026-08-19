@@ -264,6 +264,223 @@ async fn token_rotate_with_otp_sends_the_header_on_the_first_request() {
 }
 
 #[tokio::test]
+async fn token_rotate_refreshes_rejected_stored_session_and_retries_once() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-refresh","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("rejected-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("authorization", "Bearer rejected-access-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    mock.with_refresh_expected(
+        "refresh-token",
+        "refreshed-access-token",
+        "rotated-refresh-token",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_token_rotate(
+        "refreshed-access-token",
+        "manually-rotated-access-token",
+        "2032-01-03T04:05:06Z",
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run lpm token-rotate with a refreshable session");
+
+    assert!(
+        output.status.success(),
+        "token rotation did not recover from the rejected access token:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let credentials = read_credentials(project.home());
+    assert_eq!(
+        credentials[registry_url.as_str()],
+        "manually-rotated-access-token"
+    );
+    assert_eq!(
+        credentials[format!("refresh:{registry_url}")],
+        "rotated-refresh-token"
+    );
+}
+
+#[tokio::test]
+async fn token_rotate_does_not_replay_an_ambiguous_server_failure() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-ambiguous","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("authorization", "Bearer stored-fallback-token"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "response outcome unavailable",
+        })))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run token rotation with an ambiguous response");
+
+    let rotation_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("record token rotation requests")
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/registry/-/token/rotate")
+        .count();
+    assert_eq!(
+        rotation_requests, 1,
+        "a mutation without an idempotency key must be submitted only once"
+    );
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+}
+
+#[tokio::test]
+async fn token_rotate_preserves_session_after_transient_refresh_failure() {
+    let project =
+        TempProject::empty(r#"{"name":"token-rotate-refresh-failure","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("rejected-access-token"),
+            refresh_token: Some("stored-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let credentials_before = read_credentials(project.home());
+    let expiry_before = read_expiry_metadata(project.home());
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("authorization", "Bearer rejected-access-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "temporarily unavailable",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run token rotation with transient refresh failure");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+    assert_eq!(read_expiry_metadata(project.home()), expiry_before);
+}
+
+#[tokio::test]
+async fn token_rotate_rejects_an_empty_replacement_without_changing_credentials() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-empty","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "",
+            "expiresAt": "2032-01-03T04:05:06Z",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run token rotation with an empty replacement");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+}
+
+#[tokio::test]
+async fn token_rotate_rejects_an_invalid_expiry_without_changing_credentials() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-expiry","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "replacement-token",
+            "expiresAt": "not-a-timestamp",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run token rotation with an invalid expiry");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+}
+
+#[tokio::test]
+async fn token_rotate_rejects_a_missing_expiry_without_changing_credentials() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-expiry","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "replacement-token",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run token rotation with a missing expiry");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+}
+
+#[tokio::test]
 async fn token_rotate_json_reports_otp_required_without_changing_credentials() {
     let project = TempProject::empty(r#"{"name":"token-rotate-otp","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -297,6 +514,42 @@ async fn token_rotate_json_reports_otp_required_without_changing_credentials() {
       }
     }
     "#);
+}
+
+#[tokio::test]
+async fn token_rotate_otp_challenge_does_not_refresh_a_valid_session() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-otp","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-must-not-run"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let credentials_before = read_credentials(project.home());
+    mount_otp_error(&mock, "session-access-token", None, "OTP_REQUIRED").await;
+    mock.with_refresh_expected(
+        "refresh-must-not-run",
+        "unused-access-token",
+        "unused-refresh-token",
+        "2030-01-02T00:00:00Z",
+        0,
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run challenged token rotation");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "otp_required");
 }
 
 #[tokio::test]

@@ -1,8 +1,11 @@
 mod support;
 
 use sha2::{Digest, Sha256};
+use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 const FIRST_TOKEN_ID: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -118,6 +121,56 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
         "token name must derive from the package name, got body:\n{}",
         serde_json::to_string_pretty(&body).unwrap()
     );
+}
+
+#[tokio::test]
+async fn setup_local_refreshes_rejected_stored_session_and_retries_once() {
+    let project = TempProject::empty(r#"{"name":"setup-refresh","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("rejected-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_npmrc_token_replace(30, "2030-01-02T03:04:05Z", 1)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/replace-project"))
+        .and(header("authorization", "Bearer rejected-access-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        })))
+        .expect(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    mock.with_refresh_expected(
+        "refresh-token",
+        "refreshed-access-token",
+        "rotated-refresh-token",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["setup", "local", "--json"])
+        .output()
+        .expect("failed to run lpm setup local with a refreshable session");
+
+    assert!(
+        output.status.success(),
+        "setup local did not recover from the rejected access token:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(project.read_file(".npmrc").contains("_authToken=lpm_"));
 }
 
 #[tokio::test]

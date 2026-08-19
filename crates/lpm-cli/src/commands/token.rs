@@ -1,9 +1,33 @@
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_registry::{RegistryClient, parse_capped_api_json};
+use lpm_registry::RegistryClient;
 use secrecy::{ExposeSecret, SecretString};
 
 const COMMAND: &str = "lpm token-rotate";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenRotationResponse {
+    token: String,
+    expires_at: String,
+}
+
+impl TokenRotationResponse {
+    fn parse(body: serde_json::Value) -> Result<Self, LpmError> {
+        let response: Self = serde_json::from_value(body).map_err(|error| {
+            LpmError::Registry(format!("invalid token rotation response: {error}"))
+        })?;
+        if response.token.trim().is_empty()
+            || chrono::DateTime::parse_from_rfc3339(&response.expires_at).is_err()
+        {
+            return Err(LpmError::Registry(
+                "invalid token rotation response: expected a non-empty token and RFC 3339 expiry"
+                    .to_string(),
+            ));
+        }
+        Ok(response)
+    }
+}
 
 struct OtpCode(SecretString);
 
@@ -53,59 +77,57 @@ pub async fn run_rotate(
             clear_rejected_local_session_if_current(registry_url, &rejected_access_token)?;
             return Err(LpmError::AuthRequired);
         }
+        Err(LpmError::SessionExpired) => {
+            let rejected_legacy =
+                clear_rejected_local_session_if_current(registry_url, &rejected_access_token)?;
+            return Err(if rejected_legacy {
+                LpmError::AuthRequired
+            } else {
+                LpmError::SessionExpired
+            });
+        }
         result => result?,
     };
+    let rotated = TokenRotationResponse::parse(body)?;
 
-    if let Some(new_token) = body.get("token").and_then(|t| t.as_str()) {
-        // Store the new token
-        let storage_backend = crate::auth::set_token_with_backend(registry_url, new_token)
-            .map_err(|e| LpmError::CredentialStorage(format!("failed to store new token: {e}")))?;
-        let storage_status = crate::auth::AuthStorageStatus::from_backend(storage_backend);
+    let storage_backend = crate::auth::set_token_with_backend(registry_url, &rotated.token)
+        .map_err(|e| LpmError::CredentialStorage(format!("failed to store new token: {e}")))?;
+    let storage_status = crate::auth::AuthStorageStatus::from_backend(storage_backend);
 
-        // Store token expiry metadata.
-        if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
-            let date_part = expires.split('T').next().unwrap_or(expires);
-            crate::auth::set_token_expiry(registry_url, date_part);
-        }
+    let date_part = rotated
+        .expires_at
+        .split('T')
+        .next()
+        .unwrap_or(&rotated.expires_at);
+    crate::auth::set_token_expiry(registry_url, date_part);
 
-        if json_output {
-            let json = serde_json::json!({
-                "success": true,
-                "rotated": true,
-                "expires_at": body.get("expiresAt"),
-                "storage_backend": storage_status.backend_json_value(),
-                "storage_degraded": storage_status.degraded,
-            });
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            install_ui::done("Old token invalidated");
-            install_ui::done("New token stored");
-            if let Some(label) = storage_status.human_label() {
-                install_ui::detail_untrusted(&format!("secure storage backend: {label}"));
-            }
-            if storage_status.degraded {
-                install_ui::warn(
-                    "Encrypted file fallback is active; unlock or repair the OS keychain and rotate again to use keychain storage.",
-                );
-            }
-            install_ui::done("Done · session token rotated successfully");
-            if let Some(expires) = body.get("expiresAt").and_then(|e| e.as_str()) {
-                install_ui::detail_line(crate::install_ui::terminal_line!(
-                    "  {} {}",
-                    install_ui::dim("Expires:"),
-                    install_ui::dim(expires)
-                ));
-            }
-            eprintln!();
-        }
+    if json_output {
+        let json = serde_json::json!({
+            "success": true,
+            "rotated": true,
+            "expires_at": rotated.expires_at,
+            "storage_backend": storage_status.backend_json_value(),
+            "storage_degraded": storage_status.degraded,
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        let error = body
-            .get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("unknown error");
-        return Err(LpmError::Registry(format!(
-            "token rotation failed: {error}"
-        )));
+        install_ui::done("Old token invalidated");
+        install_ui::done("New token stored");
+        if let Some(label) = storage_status.human_label() {
+            install_ui::detail_untrusted(&format!("secure storage backend: {label}"));
+        }
+        if storage_status.degraded {
+            install_ui::warn(
+                "Encrypted file fallback is active; unlock or repair the OS keychain and rotate again to use keychain storage.",
+            );
+        }
+        install_ui::done("Done · session token rotated successfully");
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "  {} {}",
+            install_ui::dim("Expires:"),
+            install_ui::dim(&rotated.expires_at)
+        ));
+        eprintln!();
     }
 
     Ok(())
@@ -127,9 +149,8 @@ fn locally_managed_bearer(client: &RegistryClient) -> Result<String, LpmError> {
 fn clear_rejected_local_session_if_current(
     registry_url: &str,
     rejected_access_token: &str,
-) -> Result<(), LpmError> {
+) -> Result<bool, LpmError> {
     crate::auth::clear_rejected_legacy_session_if_current(registry_url, rejected_access_token)
-        .map(|_| ())
         .map_err(|error| {
             LpmError::CredentialStorage(format!("failed to clear rejected token: {error}"))
         })
@@ -140,33 +161,15 @@ async fn rotate_once(
     url: &str,
     otp: Option<&OtpCode>,
 ) -> Result<serde_json::Value, LpmError> {
-    let response = client
-        .post_json_raw_with_otp(url, &serde_json::json!({}), otp.map(OtpCode::expose))
-        .await?;
-    let status = response.status();
-    let body =
-        parse_capped_api_json::<serde_json::Value>(response, "token rotation response").await;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        if let Ok(body) = &body {
-            match body.get("code").and_then(serde_json::Value::as_str) {
-                Some("OTP_REQUIRED") => return Err(LpmError::OtpRequired { command: COMMAND }),
-                Some("OTP_INVALID") => return Err(LpmError::OtpInvalid { command: COMMAND }),
-                _ => {}
-            }
-        }
-        return Err(LpmError::AuthRequired);
-    }
-    let body = body?;
-    if !status.is_success() {
-        let error = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown error");
-        return Err(LpmError::Registry(format!(
-            "token rotation failed: {error}"
-        )));
-    }
-    Ok(body)
+    client
+        .post_json_with_otp_recovery(
+            url,
+            &serde_json::json!({}),
+            otp.map(OtpCode::expose),
+            COMMAND,
+            "token rotation",
+        )
+        .await
 }
 
 fn prompt_otp() -> Result<OtpCode, LpmError> {
