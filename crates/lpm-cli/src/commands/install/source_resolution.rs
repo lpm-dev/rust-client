@@ -1110,10 +1110,14 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         let downloaded = match declared_integrity.as_deref() {
             Some(expected) => {
                 client
-                    .download_tarball_to_file_with_integrity(&url, expected)
+                    .download_tarball_to_file_with_auth_and_integrity(&url, None, expected)
                     .await?
             }
-            None => client.download_tarball_to_file(&url).await?,
+            None => {
+                client
+                    .download_tarball_to_file_with_auth(&url, None)
+                    .await?
+            }
         };
         let computed_sri = downloaded.sri.clone();
         let store_sri = computed_sri.clone();

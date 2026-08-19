@@ -154,6 +154,17 @@ impl RegistryClient {
             .await
     }
 
+    /// Download a tarball with route-scoped npm auth and verify its SRI.
+    pub async fn download_tarball_to_file_with_auth_and_integrity(
+        &self,
+        url: &str,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+        expected_integrity: &str,
+    ) -> Result<DownloadedTarball, LpmError> {
+        let downloaded = self.download_tarball_to_file_with_auth(url, auth).await?;
+        verify_downloaded_tarball_integrity(downloaded, expected_integrity).await
+    }
+
     pub(super) async fn download_tarball_to_file_with_auth_and_limit(
         &self,
         url: &str,
@@ -427,7 +438,7 @@ impl RegistryClient {
                 self.download_tarball_to_file_with_auth(url, auth).await
             }
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
-                self.ensure_configured_tarball_origin(url)?;
+                self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_to_file(url).await
             }
             crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
@@ -435,6 +446,18 @@ impl RegistryClient {
                 self.download_tarball_to_file_with_auth(url, None).await
             }
         }
+    }
+
+    /// Download a registry tarball with route-appropriate auth and verify its SRI.
+    pub async fn download_tarball_routed_with_integrity(
+        &self,
+        route_table: &crate::route::RouteTable,
+        name: &str,
+        url: &str,
+        expected_integrity: &str,
+    ) -> Result<DownloadedTarball, LpmError> {
+        let downloaded = self.download_tarball_routed(route_table, name, url).await?;
+        verify_downloaded_tarball_integrity(downloaded, expected_integrity).await
     }
 
     /// Download a routed install tarball and mark only LPM-origin requests as managed.
@@ -447,11 +470,7 @@ impl RegistryClient {
     ) -> Result<DownloadedTarball, LpmError> {
         match route_table.route_for_package(name) {
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
-                if !self.is_base_url_origin(url) {
-                    return Err(LpmError::Registry(format!(
-                        "managed LPM tarball URL refused because its origin does not match the configured LPM registry: {url}"
-                    )));
-                }
+                self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_to_file_with_limit_and_accounting(
                     url,
                     MAX_COMPRESSED_TARBALL_SIZE,
@@ -460,6 +479,17 @@ impl RegistryClient {
                 .await
             }
             _ => self.download_tarball_routed(route_table, name, url).await,
+        }
+    }
+
+    fn ensure_lpm_tarball_origin(&self, url: &str) -> Result<(), LpmError> {
+        if self.is_base_url_origin(url) {
+            Ok(())
+        } else {
+            Err(LpmError::Registry(format!(
+                "LPM tarball URL refused because its origin does not match the configured LPM registry: {}",
+                lpm_common::safe_url_origin(url)
+            )))
         }
     }
 
@@ -502,7 +532,7 @@ impl RegistryClient {
                 self.download_tarball_streaming_with_auth(url, auth).await
             }
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
-                self.ensure_configured_tarball_origin(url)?;
+                self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_streaming(url).await
             }
             crate::route::UpstreamRoute::LpmWorker | crate::route::UpstreamRoute::NpmDirect => {
@@ -522,11 +552,7 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, LpmError> {
         match route_table.route_for_package(name) {
             crate::route::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
-                if !self.is_base_url_origin(url) {
-                    return Err(LpmError::Registry(format!(
-                        "managed LPM tarball URL refused because its origin does not match the configured LPM registry: {url}"
-                    )));
-                }
+                self.ensure_lpm_tarball_origin(url)?;
                 self.download_tarball_streaming_with_accounting(url, Some(accounting))
                     .await
             }
@@ -628,21 +654,28 @@ impl RegistryClient {
         url: &str,
         expected_integrity: &str,
     ) -> Result<DownloadedTarball, LpmError> {
-        use lpm_common::integrity::Integrity;
-
         let downloaded = self.download_tarball_to_file(url).await?;
-        let expected = Integrity::parse(expected_integrity)?;
-        let path = downloaded.file.path().to_path_buf();
-        let expected_for_verification = expected.clone();
-        tokio::task::spawn_blocking(move || expected_for_verification.verify_file(&path))
-            .await
-            .map_err(|error| {
-                LpmError::Registry(format!("tarball integrity task panicked: {error}"))
-            })??;
-        let mut downloaded = downloaded;
-        downloaded.sri = expected.to_string();
-        Ok(downloaded)
+        verify_downloaded_tarball_integrity(downloaded, expected_integrity).await
     }
+}
+
+async fn verify_downloaded_tarball_integrity(
+    downloaded: DownloadedTarball,
+    expected_integrity: &str,
+) -> Result<DownloadedTarball, LpmError> {
+    use lpm_common::integrity::Integrity;
+
+    let expected = Integrity::parse(expected_integrity)?;
+    let path = downloaded.file.path().to_path_buf();
+    let expected_for_verification = expected.clone();
+    tokio::task::spawn_blocking(move || expected_for_verification.verify_file(&path))
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("tarball integrity task panicked: {error}"))
+        })??;
+    let mut downloaded = downloaded;
+    downloaded.sri = expected.to_string();
+    Ok(downloaded)
 }
 
 pub(super) fn write_tarball_chunk(
