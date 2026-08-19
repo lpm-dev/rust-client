@@ -946,8 +946,12 @@ fn is_ci_token_env() -> bool {
 /// random value so login still proceeds. The server treats this as
 /// "new device" and the user re-pairs.
 pub fn compute_device_fingerprint() -> String {
+    compute_device_fingerprint_after_initial_read(|| {})
+}
+
+fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce()) -> String {
     use rand::RngCore;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn device_id_path() -> Option<PathBuf> {
         dirs::home_dir().map(|h| h.join(".lpm").join("device-id"))
@@ -959,6 +963,43 @@ pub fn compute_device_fingerprint() -> String {
         hex::encode(bytes)
     }
 
+    fn parse_device_id(contents: &str) -> Option<String> {
+        let trimmed = contents.trim();
+        (trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| trimmed.to_string())
+    }
+
+    fn read_device_id(path: &Path) -> Option<String> {
+        lpm_common::read_text_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .ok()
+            .and_then(|contents| parse_device_id(&contents))
+    }
+
+    #[cfg(unix)]
+    fn open_device_id_lock(path: &Path) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn open_device_id_lock(path: &Path) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+    }
+
     let Some(path) = device_id_path() else {
         tracing::warn!(
             "no $HOME — using process-local device fingerprint (server will treat each run as a new device)"
@@ -966,17 +1007,19 @@ pub fn compute_device_fingerprint() -> String {
         return generate_random_id();
     };
 
-    if let Ok(buf) = lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    if let Ok(contents) =
+        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
     {
-        let trimmed = buf.trim();
-        if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-            return trimmed.to_string();
+        if let Some(id) = parse_device_id(&contents) {
+            return id;
         }
         tracing::warn!(
             path = %path.display(),
             "device-id file is malformed — regenerating"
         );
     }
+
+    after_initial_read();
 
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -988,48 +1031,58 @@ pub fn compute_device_fingerprint() -> String {
         return generate_random_id();
     }
 
-    let id = generate_random_id();
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
-    match open_opts.open(&path) {
-        Ok(mut f) => {
-            use std::io::Write as _;
-            if let Err(e) = f.write_all(id.as_bytes()) {
-                tracing::warn!(
-                    path = %path.display(),
-                    "failed to persist device-id ({e}) — using one-shot fingerprint for this run"
-                );
-            }
-            // `OpenOptions::mode()` only applies on file creation, so
-            // a regenerate over a pre-existing 0o644 file keeps the
-            // old perms. Force 0o600 unconditionally on the just-
-            // written handle.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "failed to chmod device-id to 0o600 ({e})"
-                    );
-                }
-            }
-        }
+    let lock_path = path.with_file_name("device-id.lock");
+    let lock_file = match open_device_id_lock(&lock_path) {
+        Ok(file) => file,
         Err(e) => {
             tracing::warn!(
-                path = %path.display(),
-                "failed to open device-id for write ({e}) — using one-shot fingerprint for this run"
+                path = %lock_path.display(),
+                "failed to open device-id lock ({e}) — using process-local fingerprint"
             );
+            return generate_random_id();
+        }
+    };
+    let _lock = match lpm_common::paths::acquire_single_file_exclusive_lock_from_file(lock_file) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::warn!(
+                path = %lock_path.display(),
+                "failed to lock device-id ({e}) — using process-local fingerprint"
+            );
+            return generate_random_id();
+        }
+    };
+
+    if let Some(id) = read_device_id(&path) {
+        return id;
+    }
+
+    let id = generate_random_id();
+    if let Err(e) = lpm_common::write_file_atomic_with_options(
+        &path,
+        id.as_bytes(),
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
+    ) {
+        tracing::warn!(
+            path = %path.display(),
+            "failed to persist device-id ({e}) — using one-shot fingerprint for this run"
+        );
+        return id;
+    }
+
+    match read_device_id(&path) {
+        Some(persisted) => persisted,
+        None => {
+            tracing::warn!(
+                path = %path.display(),
+                "failed to read persisted device-id — using one-shot fingerprint for this run"
+            );
+            id
         }
     }
-    id
 }
 
 /// Drop tokens whose secret value is the empty string. Empty bearer
@@ -1063,6 +1116,45 @@ mod tests {
             first.chars().all(|c| c.is_ascii_hexdigit()),
             "fingerprint should be lowercase hex"
         );
+    }
+
+    #[test]
+    fn device_fingerprint_returns_same_id_when_initialization_races() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                compute_device_fingerprint_after_initial_read(move || {
+                    first_barrier.wait();
+                })
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second = scope.spawn(move || {
+                compute_device_fingerprint_after_initial_read(move || {
+                    second_barrier.wait();
+                })
+            });
+            (
+                first.join().expect("first initializer"),
+                second.join().expect("second initializer"),
+            )
+        });
+
+        assert_eq!(first, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(tmp.path().join(".lpm/device-id.lock"))
+                .expect("device-id lock metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     /// Two distinct HOMEs (≈ two distinct installs) produce distinct
