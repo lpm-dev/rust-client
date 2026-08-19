@@ -1776,6 +1776,7 @@ async fn async_main() -> Result<()> {
                     max_age: max_age.as_deref(),
                     project: project.as_deref(),
                 },
+                client.session().cloned(),
             )
             .await
         }
@@ -2092,6 +2093,7 @@ async fn async_main() -> Result<()> {
                     workspace_concurrency,
                     stream,
                     cli.json,
+                    client.session().cloned(),
                 )
                 .await
             } else {
@@ -2106,6 +2108,7 @@ async fn async_main() -> Result<()> {
                     stream,
                     no_cache,
                     cli.json,
+                    client.session().cloned(),
                 )
                 .await
             }
@@ -3136,7 +3139,13 @@ async fn async_main() -> Result<()> {
         Commands::InternalTsTransform(_) => unreachable!("handled before async command dispatch"),
         Commands::External(args) => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::run::run_external_shortcut(&cwd, &args, cli.json).await
+            commands::run::run_external_shortcut(
+                &cwd,
+                &args,
+                cli.json,
+                client.session().cloned(),
+            )
+            .await
         }
     }
     }

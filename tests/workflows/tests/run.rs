@@ -6,8 +6,10 @@
 mod support;
 
 use std::sync::{Arc, Mutex};
+use support::auth_state::{SessionSeed, seed_sessions};
+use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_spawnable, lpm_spawnable_from_path, write_repeated_file};
-use wiremock::matchers::{method, path_regex};
+use wiremock::matchers::{header, method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 #[test]
@@ -2492,6 +2494,238 @@ async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
         combined.contains("remote-build-output") && combined.contains("cache"),
         "remote hit should replay cached output and mention cache, got:\n{combined}",
     );
+}
+
+#[tokio::test]
+async fn run_local_cache_hit_does_not_refresh_an_expired_remote_session() {
+    let registry = MockRegistry::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(registry.server(), state).await;
+    let project = remote_cache_project(registry.server(), "");
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("local-hit-access"),
+            refresh_token: Some("local-hit-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let first = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["run", "build"])
+        .output()
+        .expect("populate the local task cache");
+    assert!(
+        first.status.success(),
+        "initial run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    registry.server().reset().await;
+    registry
+        .with_refresh_expected(
+            "local-hit-refresh",
+            "unused-rotated-access",
+            "unused-rotated-refresh",
+            "2099-01-01T00:00:00Z",
+            0,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(registry.server())
+        .await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("local-hit-access"),
+            refresh_token: Some("local-hit-refresh"),
+            session_access_expires_at: Some("2000-01-01T00:00:00Z"),
+        }],
+    );
+    remove_project_file(&project, "executed-marker");
+
+    let second = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["run", "build"])
+        .output()
+        .expect("restore the task from the local cache");
+    assert!(
+        second.status.success(),
+        "local cache hit should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        !project.file_exists("executed-marker"),
+        "a local cache hit must not re-run the script",
+    );
+    registry.server().verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_restore_refreshes_an_expired_same_origin_session() {
+    let registry = MockRegistry::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(registry.server(), state.clone()).await;
+    let project = remote_cache_project(registry.server(), "");
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("restore-initial-access"),
+            refresh_token: Some("restore-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let first = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["run", "build"])
+        .output()
+        .expect("populate the remote task cache");
+    assert!(first.status.success());
+
+    registry.server().reset().await;
+    registry
+        .with_refresh_expected(
+            "restore-refresh",
+            "restore-rotated-access",
+            "restore-rotated-refresh",
+            "2099-01-01T00:00:00Z",
+            1,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .and(header("authorization", "Bearer restore-initial-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(0)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .and(header("authorization", "Bearer restore-rotated-access"))
+        .respond_with(RemoteCacheGetResponder { state })
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(registry.server())
+        .await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("restore-initial-access"),
+            refresh_token: Some("restore-refresh"),
+            session_access_expires_at: Some("2000-01-01T00:00:00Z"),
+        }],
+    );
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["run", "build"])
+        .output()
+        .expect("restore from the remote task cache");
+    assert!(
+        second.status.success(),
+        "remote restore should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "remote-hit");
+    assert!(!project.file_exists("executed-marker"));
+    registry.server().verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_upload_rebuilds_the_body_after_reactive_session_refresh() {
+    let registry = MockRegistry::start().await;
+    let state = RemoteCacheState::default();
+    registry
+        .with_refresh_expected(
+            "upload-refresh",
+            "upload-rotated-access",
+            "upload-rotated-refresh",
+            "2099-01-01T00:00:00Z",
+            1,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .and(header("authorization", "Bearer upload-stale-access"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .and(header("authorization", "Bearer upload-stale-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .and(header("authorization", "Bearer upload-rotated-access"))
+        .respond_with(RemoteCachePutResponder {
+            state: state.clone(),
+        })
+        .expect(1)
+        .mount(registry.server())
+        .await;
+
+    let project = remote_cache_project(registry.server(), "");
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("upload-stale-access"),
+            refresh_token: Some("upload-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["run", "build"])
+        .output()
+        .expect("upload a task artifact with a refreshed session");
+    assert!(
+        output.status.success(),
+        "remote upload should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .as_ref()
+            .is_some_and(|artifact| !artifact.is_empty()),
+        "the retried upload must resend the complete artifact body",
+    );
+    registry.server().verify().await;
 }
 
 #[tokio::test]

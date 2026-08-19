@@ -10,6 +10,7 @@ use lpm_common::{LpmError, LpmRoot, ResolutionFailureKind};
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::io::{IsTerminal, Write as _};
 use std::path::Path;
+use std::sync::Arc;
 
 fn script_command_for_display(
     project_dir: &Path,
@@ -65,6 +66,7 @@ pub async fn run(
     env_mode: Option<&str>,
     no_cache: bool,
     bin_hint: &ManagedRuntimeHint,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
     // Read lpm.json once so the cache lookup and task predicate share the same config.
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
@@ -81,6 +83,7 @@ pub async fn run(
             extra_args,
             bin_hint,
             lpm_config.as_ref(),
+            session,
         )?
     };
     let caching_enabled = cache_context.is_some();

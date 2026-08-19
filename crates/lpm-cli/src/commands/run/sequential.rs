@@ -13,6 +13,7 @@ use lpm_common::LpmError;
 use lpm_runner::bin_path::ManagedRuntimeHint;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_tasks_sequential(
@@ -30,6 +31,7 @@ pub(super) fn run_tasks_sequential(
     bin_hint: &ManagedRuntimeHint,
     pkg_scripts: Option<&HashMap<String, String>>,
     initially_failed_tasks: &HashSet<String>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
@@ -101,6 +103,7 @@ pub(super) fn run_tasks_sequential(
                 extra_args,
                 bin_hint,
                 lpm_config,
+                session.clone(),
             )?,
             None => None,
         };

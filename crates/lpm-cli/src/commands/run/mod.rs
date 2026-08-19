@@ -10,6 +10,7 @@ mod workspace;
 use lpm_common::LpmError;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::install_ui;
 
@@ -42,6 +43,7 @@ pub async fn run_multi(
     stream: bool,
     no_cache: bool,
     json_output: bool,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
     let bin_hint = prepare_runtime(project_dir, json_output).await?;
 
@@ -109,6 +111,7 @@ pub async fn run_multi(
             env_mode,
             no_cache,
             &bin_hint,
+            session,
         )
         .await;
     }
@@ -133,6 +136,7 @@ pub async fn run_multi(
             &bin_hint,
             pkg_scripts.as_ref(),
             &initially_failed_tasks,
+            session,
         )
     } else {
         // Sequential: run tasks in topological order (deps before dependents)
@@ -152,6 +156,7 @@ pub async fn run_multi(
             &bin_hint,
             pkg_scripts.as_ref(),
             &initially_failed_tasks,
+            session,
         )
     }?;
     report.into_result()
@@ -163,6 +168,7 @@ pub async fn run_external_shortcut(
     project_dir: &Path,
     args: &[String],
     json_output: bool,
+    session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
     let Some(command_name) = args.first() else {
         return Ok(());
@@ -180,6 +186,7 @@ pub async fn run_external_shortcut(
             false,
             false,
             json_output,
+            session,
         )
         .await;
     }

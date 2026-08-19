@@ -5,8 +5,10 @@
 
 mod support;
 
+use support::auth_state::{SessionSeed, seed_sessions};
+use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cache_root(project: &TempProject) -> std::path::PathBuf {
@@ -102,6 +104,255 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
     assert_eq!(envelope["remote"]["status"], serde_json::json!("enabled"));
     assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(1024));
     assert_eq!(envelope["remote"]["limit_bytes"], serde_json::json!(2048));
+}
+
+#[tokio::test]
+async fn cache_status_refreshes_an_expired_same_origin_session_before_request() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_refresh_expected(
+            "expired-cache-refresh",
+            "rotated-cache-access",
+            "rotated-cache-refresh",
+            "2099-01-01T00:00:00Z",
+            1,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .and(header("authorization", "Bearer expired-cache-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(0)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .and(header("authorization", "Bearer rotated-cache-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-refresh","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            registry.url(),
+        ),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("expired-cache-access"),
+            refresh_token: Some("expired-cache-refresh"),
+            session_access_expires_at: Some("2000-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("run cache status with an expired stored session");
+    assert!(
+        output.status.success(),
+        "cache status should stay best-effort:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache status must emit valid JSON");
+    assert_eq!(envelope["remote"]["status"], "enabled");
+    assert!(envelope["remote"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn cache_status_uses_cli_registry_for_the_default_remote_cache_origin() {
+    let registry = MockRegistry::start().await;
+    let registry_url = format!("{}/", registry.url());
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .and(header("authorization", "Bearer cli-registry-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-cli-registry","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "remoteCache": {
+                "enabled": true
+            }
+        }"#,
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("cli-registry-access"),
+            refresh_token: Some("cli-registry-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .args(["--registry", &registry_url, "--json", "cache", "status"])
+        .output()
+        .expect("run cache status with a CLI-selected registry");
+    assert!(
+        output.status.success(),
+        "cache status should stay best-effort:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache status must emit valid JSON");
+    assert_eq!(envelope["remote"]["status"], "enabled");
+    assert!(envelope["remote"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn cache_status_refreshes_and_retries_a_rejected_same_origin_session() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_refresh_expected(
+            "rejected-cache-refresh",
+            "accepted-cache-access",
+            "accepted-cache-refresh",
+            "2099-01-01T00:00:00Z",
+            1,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .and(header("authorization", "Bearer rejected-cache-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .and(header("authorization", "Bearer accepted-cache-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": 1024,
+            "limitBytes": 2048
+        })))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-retry","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            registry.url(),
+        ),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("rejected-cache-access"),
+            refresh_token: Some("rejected-cache-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("run cache status with a rejected stored session");
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache status must emit valid JSON");
+    assert_eq!(envelope["remote"]["status"], "enabled");
+    assert!(envelope["remote"]["error"].is_null());
+}
+
+#[tokio::test]
+async fn cache_status_never_refreshes_a_rejected_cache_specific_token() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_refresh_expected(
+            "stored-refresh-must-not-run",
+            "unused-access",
+            "unused-refresh",
+            "2099-01-01T00:00:00Z",
+            0,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .and(header("authorization", "Bearer cache-specific-token"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-static","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            registry.url(),
+        ),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("stored-access-must-not-run"),
+            refresh_token: Some("stored-refresh-must-not-run"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", registry.url())
+        .env("LPM_REMOTE_CACHE_TOKEN", "cache-specific-token")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("run cache status with a cache-specific token");
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache status must emit valid JSON");
+    assert!(
+        envelope["remote"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("HTTP 401"))
+    );
 }
 
 #[tokio::test]

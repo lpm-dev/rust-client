@@ -18,6 +18,7 @@ use lpm_lockfile::{LOCKFILE_NAME, LockfilePatch};
 use lpm_migrate::backup::{self, MigrationBackup};
 use lpm_registry::RegistryClient;
 use std::path::Path;
+use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -416,7 +417,7 @@ pub async fn run(
 
     // Step N: Verify build+test (optional)
     if !skip_verify {
-        run_verification(cwd, json).await?;
+        run_verification(cwd, json, client.session().cloned()).await?;
     }
 
     // CI template (optional)
@@ -608,7 +609,11 @@ fn render_migration_failure_with_rollback(
 /// Returns `Err` if any script fails — the migration lockfile is valid but the
 /// project does not build/test cleanly, so the user should investigate before
 /// committing. Use `--skip-verify` to bypass.
-async fn run_verification(cwd: &Path, json: bool) -> Result<(), LpmError> {
+async fn run_verification(
+    cwd: &Path,
+    json: bool,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+) -> Result<(), LpmError> {
     if !json {
         install_ui::phase("Verifying migration");
     }
@@ -645,7 +650,7 @@ async fn run_verification(cwd: &Path, json: bool) -> Result<(), LpmError> {
 
     // Run build if it exists
     if has_build {
-        match super::run::run(cwd, "build", &[], None, false, &bin_hint).await {
+        match super::run::run(cwd, "build", &[], None, false, &bin_hint, session.clone()).await {
             Ok(()) => {
                 if !json {
                     install_ui::done("build script passed");
@@ -662,7 +667,7 @@ async fn run_verification(cwd: &Path, json: bool) -> Result<(), LpmError> {
 
     // Run test if it exists
     if has_test {
-        match super::run::run(cwd, "test", &[], None, false, &bin_hint).await {
+        match super::run::run(cwd, "test", &[], None, false, &bin_hint, session).await {
             Ok(()) => {
                 if !json {
                     install_ui::done("test script passed");
