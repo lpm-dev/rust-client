@@ -419,7 +419,7 @@ fn set_credential_with_keychain_writer_unlocked(
     credential_authority::set(
         registry,
         kind,
-        CredentialAuthority::active(CredentialBackend::Keychain, token),
+        CredentialAuthority::keychain_cleanup_pending(token),
     )
     .map_err(|error| format!("failed to record intended keychain authority: {error}"))?;
 
@@ -428,6 +428,16 @@ fn set_credential_with_keychain_writer_unlocked(
             clear_token_from_file(&file_key).map_err(|error| {
                 format!(
                     "keychain credential stored but stale encrypted fallback could not be removed: {error}"
+                )
+            })?;
+            credential_authority::set(
+                registry,
+                kind,
+                CredentialAuthority::active(CredentialBackend::Keychain, token),
+            )
+            .map_err(|error| {
+                format!(
+                    "keychain credential stored but cleanup completion could not be recorded: {error}"
                 )
             })?;
             Ok(AuthStorageBackend::Keychain)
@@ -960,32 +970,60 @@ fn get_stored_credential_with_backend_unlocked(
         || probe_token_from_file(&file_key),
     )?;
 
-    if authority.is_none()
-        && let Some(credential) = &resolved
-    {
-        promote_legacy_credential_authority_unlocked(registry, kind, credential)?;
+    if let Some(credential) = &resolved {
+        reconcile_credential_authority_unlocked(registry, kind, authority.as_ref(), credential)?;
     }
 
     Ok(resolved)
 }
 
-fn promote_legacy_credential_authority_unlocked(
+fn reconcile_credential_authority_unlocked(
+    registry: &str,
+    kind: CredentialKind,
+    authority: Option<&CredentialAuthority>,
+    credential: &StoredToken,
+) -> Result<(), String> {
+    reconcile_credential_authority_with_cleanup(registry, kind, authority, credential, || {
+        clear_token_from_file(&kind.file_key(registry))
+    })
+}
+
+fn reconcile_credential_authority_with_cleanup(
+    registry: &str,
+    kind: CredentialKind,
+    authority: Option<&CredentialAuthority>,
+    credential: &StoredToken,
+    clear_stale_file: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if authority.is_some_and(|record| !record.has_pending_keychain_cleanup()) {
+        return Ok(());
+    }
+    promote_legacy_credential_authority_with_cleanup(registry, kind, credential, clear_stale_file)
+}
+
+fn promote_legacy_credential_authority_with_cleanup(
     registry: &str,
     kind: CredentialKind,
     credential: &StoredToken,
+    clear_stale_file: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     let backend = match credential.backend {
         AuthStorageBackend::Keychain => CredentialBackend::Keychain,
         AuthStorageBackend::EncryptedFileFallback => CredentialBackend::EncryptedFileFallback,
     };
+    if credential.backend == AuthStorageBackend::Keychain {
+        credential_authority::set(
+            registry,
+            kind,
+            CredentialAuthority::keychain_cleanup_pending(&credential.token),
+        )?;
+        clear_stale_file()?;
+    }
     credential_authority::set(
         registry,
         kind,
         CredentialAuthority::active(backend, &credential.token),
     )?;
-    if credential.backend == AuthStorageBackend::Keychain {
-        clear_token_from_file(&kind.file_key(registry))?;
-    }
     Ok(())
 }
 
@@ -2954,6 +2992,149 @@ mod tests {
     }
 
     #[test]
+    fn keychain_write_cleanup_failure_retries_cleanup_on_later_read() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let path = credentials_path().expect("credentials path should resolve");
+            std::fs::create_dir_all(path.parent().expect("credentials path should have parent"))
+                .expect("create credential directory");
+            std::fs::write(&path, b"not-valid-ciphertext")
+                .expect("write corrupted credential store");
+
+            set_credential_with_keychain_writer_unlocked(
+                registry,
+                CredentialKind::Access,
+                "new-keychain-token",
+                || Ok(()),
+            )
+            .expect_err("stale fallback cleanup failure must be observable");
+            let authority = credential_authority::read(registry, CredentialKind::Access)
+                .expect("credential authority should remain readable");
+            let cleanup_retried = std::cell::Cell::new(false);
+            let credential = StoredToken {
+                token: "new-keychain-token".to_string(),
+                backend: AuthStorageBackend::Keychain,
+            };
+
+            reconcile_credential_authority_with_cleanup(
+                registry,
+                CredentialKind::Access,
+                authority.as_ref(),
+                &credential,
+                || {
+                    cleanup_retried.set(true);
+                    Ok(())
+                },
+            )
+            .expect("later Keychain read should retry cleanup");
+
+            assert!(cleanup_retried.get());
+        });
+    }
+
+    #[test]
+    fn failed_legacy_keychain_cleanup_records_pending_keychain_authority() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            let credential = StoredToken {
+                token: "matching-token".to_string(),
+                backend: AuthStorageBackend::Keychain,
+            };
+
+            let result = promote_legacy_credential_authority_with_cleanup(
+                registry,
+                CredentialKind::Access,
+                &credential,
+                || Err("injected stale fallback cleanup failure".to_string()),
+            );
+
+            assert!(result.is_err());
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access)
+                    .expect("credential authority should remain readable"),
+                Some(CredentialAuthority::keychain_cleanup_pending(
+                    "matching-token"
+                )),
+                "failed cleanup must preserve Keychain authority and remain eligible for retry"
+            );
+        });
+    }
+
+    #[test]
+    fn pending_legacy_keychain_cleanup_retries_until_duplicate_is_removed() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            set_token_in_file(registry, "matching-token").unwrap();
+            let credential = StoredToken {
+                token: "matching-token".to_string(),
+                backend: AuthStorageBackend::Keychain,
+            };
+
+            promote_legacy_credential_authority_with_cleanup(
+                registry,
+                CredentialKind::Access,
+                &credential,
+                || Err("injected stale fallback cleanup failure".to_string()),
+            )
+            .expect_err("injected cleanup failure must be observable");
+            let authority = credential_authority::read(registry, CredentialKind::Access)
+                .expect("credential authority should remain readable");
+            reconcile_credential_authority_with_cleanup(
+                registry,
+                CredentialKind::Access,
+                authority.as_ref(),
+                &credential,
+                || clear_token_from_file(registry),
+            )
+            .expect("cleanup retry should complete migration");
+
+            assert_eq!(get_token_from_file(registry), None);
+            assert_eq!(
+                credential_authority::read(registry, CredentialKind::Access).unwrap(),
+                Some(CredentialAuthority::active(
+                    CredentialBackend::Keychain,
+                    "matching-token"
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn failed_legacy_keychain_cleanup_does_not_activate_retained_file_credential() {
+        with_temp_home(|_| {
+            let registry = "https://registry.example";
+            set_token_in_file(registry, "matching-token").unwrap();
+            let credential = StoredToken {
+                token: "matching-token".to_string(),
+                backend: AuthStorageBackend::Keychain,
+            };
+
+            promote_legacy_credential_authority_with_cleanup(
+                registry,
+                CredentialKind::Access,
+                &credential,
+                || Err("injected stale fallback cleanup failure".to_string()),
+            )
+            .expect_err("injected cleanup failure must be observable");
+            let authority = credential_authority::read(registry, CredentialKind::Access)
+                .expect("credential authority should remain readable");
+
+            let resolved = resolve_stored_credential_from_backends(
+                authority.as_ref(),
+                || KeychainCredentialProbe::NotFound,
+                || {},
+                || None,
+                || probe_token_from_file(registry),
+            );
+
+            assert!(
+                resolved.is_err(),
+                "a retained encrypted duplicate must not become authoritative after a later keychain miss: {resolved:?}"
+            );
+        });
+    }
+
+    #[test]
     fn divergent_legacy_backend_credentials_are_not_resolved_as_authoritative() {
         with_temp_home(|_| {
             let registry = "https://registry.example";
@@ -3070,8 +3251,7 @@ mod tests {
                 || {
                     authority_was_durable.set(
                         credential_authority::read(registry, CredentialKind::Access).unwrap()
-                            == Some(CredentialAuthority::active(
-                                CredentialBackend::Keychain,
+                            == Some(CredentialAuthority::keychain_cleanup_pending(
                                 "new-keychain-token",
                             )),
                     );
@@ -3121,9 +3301,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-            promote_legacy_credential_authority_unlocked(
+            reconcile_credential_authority_unlocked(
                 registry,
                 CredentialKind::Access,
+                None,
                 &credential,
             )
             .unwrap();
@@ -3427,9 +3608,10 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            promote_legacy_credential_authority_unlocked(
+            reconcile_credential_authority_unlocked(
                 registry,
                 CredentialKind::Access,
+                None,
                 &credential,
             )
             .unwrap();
