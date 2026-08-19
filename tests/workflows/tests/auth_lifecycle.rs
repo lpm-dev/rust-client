@@ -1386,7 +1386,7 @@ async fn logout_npm_and_github_clear_both_targets_and_preserve_gitlab_state() {
 }
 
 #[tokio::test]
-async fn logout_all_normalizes_malformed_custom_registry_tracking_and_clears_file_backed_tokens() {
+async fn logout_all_reports_malformed_custom_registry_tracking_after_clearing_discovered_tokens() {
     let project = TempProject::empty(
         r#"{"name":"auth-logout-all-malformed-custom-tracking-test","version":"1.0.0"}"#,
     );
@@ -1419,15 +1419,28 @@ async fn logout_all_normalizes_malformed_custom_registry_tracking_and_clears_fil
     mark_recent_token_validation(project.home());
 
     let logout = lpm_with_registry(&project, &mock.url())
-        .args(["logout", "--all"])
+        .args(["--json", "logout", "--all"])
         .output()
         .expect("failed to run lpm logout --all with malformed custom tracking");
 
     assert!(
-        logout.status.success(),
-        "logout --all should recover from malformed custom registry tracking:\nstdout: {}\nstderr: {}",
+        !logout.status.success(),
+        "logout --all must report malformed custom registry tracking:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&logout.stdout),
         String::from_utf8_lossy(&logout.stderr),
+    );
+    let envelope = parse_json_output(&logout.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["local_cleared"], serde_json::json!(false));
+    assert!(
+        envelope["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| {
+                error
+                    .as_str()
+                    .is_some_and(|error| error.contains("custom registry tracking"))
+            })),
+        "logout error must identify custom registry tracking cleanup: {envelope}"
     );
 
     assert!(
@@ -1440,8 +1453,8 @@ async fn logout_all_normalizes_malformed_custom_registry_tracking_and_clears_fil
         }
     );
     assert!(
-        !custom_registries_path(project.home()).exists(),
-        "logout --all should remove malformed custom-registry tracking after normalizing file-backed state"
+        custom_registries_path(project.home()).exists(),
+        "logout --all must preserve malformed custom-registry tracking for inspection"
     );
 
     let whoami = lpm_with_registry(&project, &mock.url())

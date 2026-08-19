@@ -186,7 +186,8 @@ pub async fn run(
         }
     }
     if targets.all_custom_registries {
-        for (url, result) in auth::clear_all_custom_registries() {
+        let result = auth::clear_all_custom_registries();
+        for (url, result) in result.registries {
             let operation = format!("custom registry {url} local credential clearing");
             let cleared = record_local_clear(result, &operation, &mut local_cleared, &mut errors);
             if cleared && !json_output {
@@ -196,6 +197,12 @@ pub async fn run(
                 ));
             }
         }
+        record_local_clear(
+            result.tracking_cleanup,
+            "custom registry tracking cleanup",
+            &mut local_cleared,
+            &mut errors,
+        );
     }
 
     let success = errors.is_empty() && local_cleared;
