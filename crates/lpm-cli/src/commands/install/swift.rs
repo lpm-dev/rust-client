@@ -6,6 +6,7 @@ pub(super) struct SwiftInstallOptions<'a> {
     pub(super) json_output: bool,
     pub(super) audit_after_install: bool,
     pub(super) registry_url: &'a str,
+    pub(super) session: Option<&'a lpm_auth::SessionManager>,
 }
 
 /// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.
@@ -81,6 +82,7 @@ pub(super) async fn run_swift_install_spm(
         json_output,
         audit_after_install,
         registry_url,
+        session,
     } = options;
 
     let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
@@ -153,6 +155,7 @@ pub(super) async fn run_swift_install_spm(
     let registry_setup = if !edit.already_exists {
         // Auto-configure registry scope if needed
         let setup = crate::commands::swift_registry::ensure_configured(
+            session,
             registry_url,
             manifest_dir,
             json_output,
@@ -238,6 +241,7 @@ pub(super) async fn run_swift_install_xcode(
         json_output,
         audit_after_install,
         registry_url,
+        session,
         ..
     } = options;
 
@@ -300,6 +304,7 @@ pub(super) async fn run_swift_install_xcode(
         // Auto-configure registry scope if needed
         let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
         let setup = crate::commands::swift_registry::ensure_configured(
+            session,
             registry_url,
             wrapper_dir,
             json_output,

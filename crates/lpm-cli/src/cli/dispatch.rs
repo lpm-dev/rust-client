@@ -341,15 +341,25 @@ async fn async_main() -> Result<()> {
         .token
         .clone()
         .filter(|t| std::env::var("LPM_TOKEN").ok().as_deref() != Some(t.as_str()));
+    let session_registry_url = match &command {
+        Commands::Setup(args) => match &args.action {
+            SetupAction::Ci {
+                registry: Some(registry),
+                ..
+            } => registry.as_str(),
+            _ => registry_url,
+        },
+        _ => registry_url,
+    };
     let session_manager =
-        lpm_auth::SessionManager::new(registry_url.to_string(), explicit_flag_token);
+        lpm_auth::SessionManager::new(session_registry_url.to_string(), explicit_flag_token);
     let session_manager = auth_storage_notice::attach(session_manager, cli.json);
     let session = std::sync::Arc::new(session_manager);
     let unattended_mcp_serve =
         matches!(&command, Commands::Mcp(args) if args.action.as_str() == "serve");
 
     let mut client = lpm_registry::RegistryClient::new()
-        .with_base_url(registry_url.to_string())
+        .with_base_url(session_registry_url.to_string())
         .with_insecure(cli.insecure);
     if !unattended_mcp_serve {
         client = client.with_session(session.clone());
@@ -1631,7 +1641,15 @@ async fn async_main() -> Result<()> {
                 match target {
                     commands::setup::CiSetupTarget::Npmrc => {
                         let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
-                        commands::setup::run(&client, effective_registry, &cwd, cli.json, oidc).await
+                        commands::setup::run(
+                            &client,
+                            &session,
+                            effective_registry,
+                            &cwd,
+                            cli.json,
+                            oidc,
+                        )
+                        .await
                     }
                     commands::setup::CiSetupTarget::Workflow(platform) => {
                         commands::setup::run_ci_platform(
@@ -1983,7 +2001,7 @@ async fn async_main() -> Result<()> {
             let registry_args::SwiftRegistryArgs {
                 force,
             } = args;
-            commands::swift_registry::run(registry_url, cli.json, force).await
+            commands::swift_registry::run(&session, registry_url, cli.json, force).await
         },
         Commands::Mcp(args) => {
             let security_args::McpArgs {

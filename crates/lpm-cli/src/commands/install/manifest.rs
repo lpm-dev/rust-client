@@ -1066,6 +1066,7 @@ pub async fn run_add_packages(
                         json_output,
                         audit_after_install,
                         registry_url: client.base_url(),
+                        session: client.session().map(|session| session.as_ref()),
                     },
                 )
                 .await?;
@@ -1442,6 +1443,7 @@ pub async fn run_install_filtered_add(
                         json_output,
                         audit_after_install,
                         registry_url: client.base_url(),
+                        session: client.session().map(|session| session.as_ref()),
                     },
                 )
                 .await?;

@@ -1,4 +1,4 @@
-use crate::{auth_storage_notice, install_ui, oidc};
+use crate::{install_ui, oidc};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -85,23 +85,22 @@ pub(crate) fn validate_ci_flags(
 }
 
 async fn resolve_lpm_bearer(
+    session: &lpm_auth::SessionManager,
     registry_url: &str,
-    json_output: bool,
 ) -> Result<ResolvedSetupBearer, LpmError> {
-    let session = auth_storage_notice::attach(
-        lpm_auth::SessionManager::new(registry_url, None),
-        json_output,
-    );
-    let token = session
+    let token = match session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
-        .map_err(|error| match error {
-            LpmError::AuthRequired | LpmError::SessionExpired => LpmError::Script(
+    {
+        Ok(token) => token,
+        Err(LpmError::AuthRequired | LpmError::SessionExpired) => {
+            return Err(LpmError::Script(
                 "no usable bearer is available. Set LPM_TOKEN for this command, or run `lpm login` and retry. LPM CLI can consume LPM_TOKEN directly; `setup ci npmrc` writes a protected literal token for npm-compatible clients."
                     .into(),
-            ),
-            other => other,
-        })?;
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let source = session.current_source()?;
     let storage = match source {
         Some(lpm_auth::TokenSource::StoredSession | lpm_auth::TokenSource::StoredLegacy) => {
@@ -148,6 +147,7 @@ fn setup_storage_status(token: &ResolvedSetupBearer) -> lpm_auth::AuthStorageSta
 /// - `--registry` / `-r`: Override the registry URL.
 pub async fn run(
     client: &RegistryClient,
+    session: &lpm_auth::SessionManager,
     registry_url: &str,
     project_dir: &Path,
     json_output: bool,
@@ -163,7 +163,7 @@ pub async fn run(
                 ))
             })?
     } else {
-        resolve_lpm_bearer(registry_url, json_output).await?
+        resolve_lpm_bearer(session, registry_url).await?
     };
 
     let storage_status = setup_storage_status(&token);

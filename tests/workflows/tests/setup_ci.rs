@@ -16,6 +16,8 @@ mod support;
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 // ─── default scoped config ────────────────────────────────────────────
 
@@ -102,6 +104,100 @@ fn setup_ci_writes_literal_env_bearer_and_preserves_unrelated_config() {
             .auth_for_url("https://lpm.example.test/api/registry/@lpm.dev/pkg")
             .is_some(),
         "generated literal bearer must resolve for the scoped registry origin"
+    );
+}
+
+#[test]
+fn setup_ci_writes_the_global_explicit_bearer() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let registry_url = "https://lpm.example.test";
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            registry_url,
+            "--token",
+            "explicit-setup-token",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci with a global explicit token");
+
+    assert!(
+        output.status.success(),
+        "setup ci ignored the global explicit token:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        project.read_file(".npmrc").contains("explicit-setup-token"),
+        "the generated npmrc must contain the explicit bearer"
+    );
+}
+
+#[test]
+fn setup_ci_command_registry_override_uses_its_stored_session() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let registry_url = "https://setup-command.example.test";
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url,
+            access_token: Some("command-registry-token"),
+            refresh_token: None,
+            session_access_expires_at: None,
+        }],
+    );
+
+    let output = lpm(&project)
+        .args(["setup", "ci", "npmrc", "--registry", registry_url])
+        .output()
+        .expect("run setup ci with a command registry override");
+
+    assert!(
+        output.status.success(),
+        "setup ci did not use the command registry session:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let npmrc = project.read_file(".npmrc");
+    assert!(npmrc.contains("command-registry-token"));
+    assert!(npmrc.contains(registry_url));
+}
+
+#[tokio::test]
+async fn setup_ci_propagates_a_stored_session_refresh_failure() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("expired-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2000-01-01T00:00:00Z"),
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci during a refresh outage");
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists(".npmrc"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("HTTP 503"),
+        "setup ci hid the refresh failure:\n{}",
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
