@@ -1,6 +1,6 @@
 {
   "name": "@lpm-registry/cli-linux-x64-musl",
-  "version": "0.74.1",
+  "version": "0.75.0",
   "description": "LPM CLI native binary for Linux x64 (musl)",
   "repository": {
     "type": "git",
