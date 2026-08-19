@@ -1,56 +1,5 @@
 use super::*;
 
-struct ScopedAuthEnv {
-    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl ScopedAuthEnv {
-    fn file_backed(home: &std::path::Path) -> Self {
-        let values = [
-            ("HOME", Some(home.as_os_str().to_owned())),
-            ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
-            ("LPM_FORCE_FILE_AUTH", Some(std::ffi::OsString::from("1"))),
-            ("LPM_TEST_FAST_SCRYPT", Some(std::ffi::OsString::from("1"))),
-            ("LPM_TOKEN", None),
-        ];
-        let previous = values
-            .iter()
-            .map(|(key, _)| (*key, std::env::var_os(key)))
-            .collect();
-        for (key, value) in values {
-            // SAFETY: this test holds `auth_env_lock` for the guard's lifetime.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-        Self { previous }
-    }
-}
-
-impl Drop for ScopedAuthEnv {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.iter().rev() {
-            // SAFETY: this test holds `auth_env_lock` until after the guard drops.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-}
-
-async fn auth_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
 #[tokio::test]
 async fn authenticated_tarball_download_refreshes_rejected_stored_session() {
     use wiremock::matchers::{header, method, path};

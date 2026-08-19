@@ -498,6 +498,23 @@ impl RegistryClient {
         Ok(response)
     }
 
+    async fn send_worker_metadata_get(
+        &self,
+        url: &str,
+        accept: Option<&str>,
+        cache_validator: Option<&CacheValidator>,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let mut request = self.build_worker_metadata_get(url).await?;
+            if let Some(accept) = accept {
+                request = request.header("Accept", accept);
+            }
+            let request = Self::apply_cached_etag(request, cache_validator);
+            self.send_package_metadata_request(request).await
+        })
+        .await
+    }
+
     pub(super) fn worker_metadata_http3_should_fallback(error: &LpmError) -> bool {
         matches!(error, LpmError::Network(_))
     }
@@ -1066,12 +1083,10 @@ impl RegistryClient {
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
 
-        let req = Self::apply_cached_etag(
-            self.build_worker_metadata_get(&proxy_url).await?,
-            cache_validator.as_ref(),
-        );
-
-        match self.send_package_metadata_request(req).await {
+        match self
+            .send_worker_metadata_get(&proxy_url, None, cache_validator.as_ref())
+            .await
+        {
             Ok(mut response) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                     if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
@@ -1079,9 +1094,7 @@ impl RegistryClient {
                         return finish!(Ok(meta));
                     }
                     response = self
-                        .send_package_metadata_request(
-                            self.build_worker_metadata_get(&proxy_url).await?,
-                        )
+                        .send_worker_metadata_get(&proxy_url, None, None)
                         .await?;
                 }
 
@@ -1524,25 +1537,21 @@ impl RegistryClient {
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
-        let req = Self::apply_cached_etag(
-            self.build_worker_metadata_get(&proxy_url)
-                .await?
-                .header("Accept", "application/json"),
-            cache_validator.as_ref(),
-        );
-
-        match self.send_package_metadata_request(req).await {
+        match self
+            .send_worker_metadata_get(
+                &proxy_url,
+                Some("application/json"),
+                cache_validator.as_ref(),
+            )
+            .await
+        {
             Ok(mut response) if response.status() == reqwest::StatusCode::NOT_MODIFIED => {
                 if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
                     tracing::debug!("metadata cache revalidated (full proxy 304): npm:{name}");
                     return finish!(Ok(metadata));
                 }
                 response = self
-                    .send_package_metadata_request(
-                        self.build_worker_metadata_get(&proxy_url)
-                            .await?
-                            .header("Accept", "application/json"),
-                    )
+                    .send_worker_metadata_get(&proxy_url, Some("application/json"), None)
                     .await
                     .inspect_err(|_error| {
                         crate::timing::record_rpc(rpc_start.elapsed());
@@ -1762,15 +1771,10 @@ impl RegistryClient {
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
         let cache_validator = self.read_cache_validator(&cache_key);
-        let mut req = self.build_worker_metadata_get(&proxy_url).await?;
-        if let Some(etag) = cache_validator
-            .as_ref()
-            .and_then(|validator| validator.etag.as_deref())
+        let mut response = match self
+            .send_worker_metadata_get(&proxy_url, None, cache_validator.as_ref())
+            .await
         {
-            req = req.header("If-None-Match", etag);
-        }
-
-        let mut response = match self.send_package_metadata_request(req).await {
             Ok(response) => response,
             Err(err) => return finish!(Err(err)),
         };
@@ -1779,10 +1783,7 @@ impl RegistryClient {
                 tracing::debug!("metadata cache revalidated (proxy-only 304): npm:{name}");
                 return finish!(Ok(meta));
             }
-            response = match self
-                .send_package_metadata_request(self.build_worker_metadata_get(&proxy_url).await?)
-                .await
-            {
+            response = match self.send_worker_metadata_get(&proxy_url, None, None).await {
                 Ok(response) => response,
                 Err(err) => return finish!(Err(err)),
             };
@@ -2007,14 +2008,14 @@ impl RegistryClient {
             }};
         }
 
-        let req = Self::apply_cached_etag(
-            self.build_worker_metadata_get(&proxy_url)
-                .await?
-                .header("Accept", "application/json"),
-            cache_validator.as_ref(),
-        );
-
-        match self.send_package_metadata_request(req).await {
+        match self
+            .send_worker_metadata_get(
+                &proxy_url,
+                Some("application/json"),
+                cache_validator.as_ref(),
+            )
+            .await
+        {
             Ok(mut response) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                     if let Some(metadata) = self
@@ -2025,11 +2026,7 @@ impl RegistryClient {
                         return finish!(Ok(metadata));
                     }
                     response = self
-                        .send_package_metadata_request(
-                            self.build_worker_metadata_get(&proxy_url)
-                                .await?
-                                .header("Accept", "application/json"),
-                        )
+                        .send_worker_metadata_get(&proxy_url, Some("application/json"), None)
                         .await?;
                 }
 

@@ -19,6 +19,45 @@ fn test_metadata_json_version(name: &str, version: &str) -> String {
     .to_string()
 }
 
+async fn refreshable_metadata_client(
+    worker: &wiremock::MockServer,
+    npm: &wiremock::MockServer,
+    cache_dir: &std::path::Path,
+) -> RegistryClient {
+    lpm_auth::store_refresh_backed_session(
+        &worker.uri(),
+        "stale-metadata-access",
+        "valid-metadata-refresh",
+        "2099-01-01T00:00:00Z",
+    )
+    .await
+    .expect("store refresh-backed metadata session");
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(worker.uri(), None));
+    let mut client = RegistryClient::new()
+        .with_base_url(worker.uri())
+        .with_npm_registry_url(npm.uri())
+        .with_session(session)
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(cache_dir.to_path_buf());
+    client
+}
+
+async fn mount_metadata_refresh(worker: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("POST"))
+        .and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "rotated-metadata-access",
+            "refreshToken": "rotated-metadata-refresh",
+            "expiresAt": "2099-01-01T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(worker)
+        .await;
+}
+
 #[tokio::test]
 #[ignore = "requires network + auth — run with --ignored"]
 async fn fetch_package_metadata() {
@@ -281,6 +320,201 @@ async fn npm_proxy_metadata_sends_bearer_when_token_is_available() {
         saw_authorization.load(Ordering::SeqCst),
         "npm metadata proxy requests must attach LPM bearer auth when available"
     );
+}
+
+#[tokio::test]
+async fn npm_proxy_metadata_refreshes_rejected_stored_session_before_direct_fallback() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("create auth home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let package = "refresh-abbreviated-metadata";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer stale-metadata-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    mount_metadata_refresh(&worker).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer rotated-metadata-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(package)))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(package)))
+        .expect(0)
+        .mount(&npm)
+        .await;
+
+    let cache = tempfile::tempdir().expect("create metadata cache");
+    let client = refreshable_metadata_client(&worker, &npm, cache.path()).await;
+    let metadata = client
+        .get_npm_package_metadata(package)
+        .await
+        .expect("Worker metadata should refresh and retry before direct npm fallback");
+
+    assert_eq!(metadata.name, package);
+    worker.verify().await;
+    npm.verify().await;
+}
+
+#[tokio::test]
+async fn npm_proxy_full_metadata_refreshes_rejected_stored_session_before_direct_fallback() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("create auth home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let package = "refresh-full-metadata";
+    let body = test_metadata_json_version(package, "1.0.0");
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer stale-metadata-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    mount_metadata_refresh(&worker).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer rotated-metadata-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(0)
+        .mount(&npm)
+        .await;
+
+    let cache = tempfile::tempdir().expect("create metadata cache");
+    let client = refreshable_metadata_client(&worker, &npm, cache.path()).await;
+    let metadata = client
+        .get_npm_package_metadata_full(package)
+        .await
+        .expect("full Worker metadata should refresh and retry before direct npm fallback");
+
+    assert_eq!(metadata.name, package);
+    worker.verify().await;
+    npm.verify().await;
+}
+
+#[tokio::test]
+async fn npm_proxy_only_metadata_refreshes_rejected_stored_session() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("create auth home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let package = "refresh-proxy-only-metadata";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer stale-metadata-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    mount_metadata_refresh(&worker).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer rotated-metadata-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(package)))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(package)))
+        .expect(0)
+        .mount(&npm)
+        .await;
+
+    let cache = tempfile::tempdir().expect("create metadata cache");
+    let client = refreshable_metadata_client(&worker, &npm, cache.path()).await;
+    let metadata = client
+        .get_npm_package_metadata_proxy_only(package)
+        .await
+        .expect("proxy-only Worker metadata should refresh and retry");
+
+    assert_eq!(metadata.name, package);
+    worker.verify().await;
+    npm.verify().await;
+}
+
+#[tokio::test]
+async fn npm_proxy_release_times_refreshes_rejected_stored_session_before_direct_fallback() {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("create auth home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let package = "refresh-release-times";
+    let release_times = serde_json::json!({
+        "name": package,
+        "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+    });
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(query_param("release_times", "1"))
+        .and(header("authorization", "Bearer stale-metadata-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    mount_metadata_refresh(&worker).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(query_param("release_times", "1"))
+        .and(header("authorization", "Bearer rotated-metadata-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times.clone()))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(release_times))
+        .expect(0)
+        .mount(&npm)
+        .await;
+
+    let cache = tempfile::tempdir().expect("create metadata cache");
+    let client = refreshable_metadata_client(&worker, &npm, cache.path()).await;
+    let metadata = client
+        .get_npm_release_times_routed_full(package, crate::UpstreamRoute::LpmWorker)
+        .await
+        .expect("Worker release times should refresh and retry before direct npm fallback");
+
+    assert_eq!(metadata.name.as_deref(), Some(package));
+    assert_eq!(
+        metadata.time.get("1.0.0").map(String::as_str),
+        Some("2025-01-01T00:00:00.000Z")
+    );
+    worker.verify().await;
+    npm.verify().await;
 }
 
 #[tokio::test]
