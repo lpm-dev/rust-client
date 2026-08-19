@@ -1,5 +1,112 @@
 use super::*;
 
+struct ScopedAuthEnv {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl ScopedAuthEnv {
+    fn file_backed(home: &std::path::Path) -> Self {
+        let values = [
+            ("HOME", Some(home.as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.join(".lpm").into_os_string())),
+            ("LPM_FORCE_FILE_AUTH", Some(std::ffi::OsString::from("1"))),
+            ("LPM_TEST_FAST_SCRYPT", Some(std::ffi::OsString::from("1"))),
+            ("LPM_TOKEN", None),
+        ];
+        let previous = values
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in values {
+            // SAFETY: this test holds `auth_env_lock` for the guard's lifetime.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedAuthEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.iter().rev() {
+            // SAFETY: this test holds `auth_env_lock` until after the guard drops.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+async fn auth_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
+#[tokio::test]
+async fn authenticated_tarball_download_refreshes_rejected_stored_session() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/private.tgz"))
+        .and(header("authorization", "Bearer stale-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "rotated-access",
+            "refreshToken": "rotated-refresh",
+            "expiresAt": "2099-01-01T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/private.tgz"))
+        .and(header("authorization", "Bearer rotated-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"private-package"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    lpm_auth::store_refresh_backed_session(
+        &server.uri(),
+        "stale-access",
+        "valid-refresh",
+        "2099-01-01T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let session = std::sync::Arc::new(lpm_auth::SessionManager::new(server.uri(), None));
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_session(session);
+
+    let bytes = client
+        .download_tarball(&format!("{}/private.tgz", server.uri()))
+        .await
+        .expect("a rejected stored session should refresh before tarball retry");
+
+    assert_eq!(bytes, b"private-package");
+}
+
 #[tokio::test]
 async fn download_tarball_allows_https() {
     // We can't actually download, but we can verify HTTPS URLs pass validation.

@@ -74,6 +74,24 @@ pub async fn reserve_compressed_tarball_spool(
 }
 
 impl RegistryClient {
+    async fn send_lpm_tarball_with_recovery(
+        &self,
+        url: &str,
+        accounting: Option<ManagedInstallAccounting>,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let mut request = self.build_get(url).await?;
+            if accounting.is_some() {
+                request = request.header(
+                    MANAGED_INSTALL_ACCOUNTING_HEADER,
+                    MANAGED_INSTALL_ACCOUNTING_VERSION,
+                );
+            }
+            self.send_with_retry(request).await
+        })
+        .await
+    }
+
     /// Download a tarball as raw bytes.
     ///
     /// The URL comes from `VersionMetadata.dist.tarball`.
@@ -88,7 +106,7 @@ impl RegistryClient {
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let response = self.send_with_retry(self.build_get(url).await?).await?;
+        let response = self.send_lpm_tarball_with_recovery(url, None).await?;
 
         let bytes = response
             .bytes()
@@ -260,14 +278,7 @@ impl RegistryClient {
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let mut request = self.build_get(url).await?;
-        if accounting.is_some() {
-            request = request.header(
-                MANAGED_INSTALL_ACCOUNTING_HEADER,
-                MANAGED_INSTALL_ACCOUNTING_VERSION,
-            );
-        }
-        let mut response = self.send_with_retry(request).await?;
+        let mut response = self.send_lpm_tarball_with_recovery(url, accounting).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > max_compressed_size
@@ -378,14 +389,7 @@ impl RegistryClient {
     ) -> Result<reqwest::Response, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let mut request = self.build_get(url).await?;
-        if accounting.is_some() {
-            request = request.header(
-                MANAGED_INSTALL_ACCOUNTING_HEADER,
-                MANAGED_INSTALL_ACCOUNTING_VERSION,
-            );
-        }
-        let response = self.send_with_retry(request).await?;
+        let response = self.send_lpm_tarball_with_recovery(url, accounting).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > MAX_COMPRESSED_TARBALL_SIZE
