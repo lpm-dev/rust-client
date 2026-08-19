@@ -23,8 +23,32 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let environment_credential_active =
         targets.clear_lpm && std::env::var("LPM_TOKEN").is_ok_and(|token| !token.is_empty());
-    let had_access = targets.clear_lpm && auth::has_stored_access_token(registry_url);
-    let had_refresh = targets.clear_lpm && auth::has_refresh_token(registry_url);
+    let mut errors = Vec::with_capacity(5);
+    let mut lpm_session_presence_known = true;
+    let had_access = if targets.clear_lpm {
+        match auth::has_stored_access_token_checked(registry_url) {
+            Ok(present) => present,
+            Err(error) => {
+                lpm_session_presence_known = false;
+                errors.push(bounded_error("stored session presence", &error));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let had_refresh = if targets.clear_lpm {
+        match auth::has_refresh_token_checked(registry_url) {
+            Ok(present) => present,
+            Err(error) => {
+                lpm_session_presence_known = false;
+                errors.push(bounded_error("stored session presence", &error));
+                false
+            }
+        }
+    } else {
+        false
+    };
     let had_lpm_session = had_access || had_refresh;
 
     if had_lpm_session && !json_output {
@@ -36,9 +60,8 @@ pub async fn run(
 
     let mut pairings_revoked = false;
     let mut server_revoked = false;
-    let mut errors = Vec::with_capacity(3);
 
-    if targets.clear_lpm && revoke && had_lpm_session {
+    if targets.clear_lpm && revoke && had_lpm_session && lpm_session_presence_known {
         let stored_session = Arc::new(session.stored_session_only());
         match stored_session
             .bearer_string_for(AuthRequirement::SessionRequired)
@@ -94,44 +117,59 @@ pub async fn run(
         }
     }
     if targets.npm {
-        let cleared = record_local_clear(
+        let credential_cleared = record_local_clear(
             auth::clear_npm_token(),
             "npm local credential clearing",
             &mut local_cleared,
             &mut errors,
         );
-        if cleared && !json_output {
+        let metadata_cleared = record_local_clear(
+            auth::clear_token_expiry_checked("npmjs.org"),
+            "npm local expiry metadata clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        if credential_cleared && metadata_cleared && !json_output {
             output::success("Logged out from npmjs.org");
         }
-        auth::clear_token_expiry("npmjs.org");
     }
     if targets.github {
-        let cleared = record_local_clear(
+        let credential_cleared = record_local_clear(
             auth::clear_github_token(),
             "GitHub Packages local credential clearing",
             &mut local_cleared,
             &mut errors,
         );
-        if cleared && !json_output {
+        let metadata_cleared = record_local_clear(
+            auth::clear_token_expiry_checked("github.com"),
+            "GitHub Packages local expiry metadata clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        if credential_cleared && metadata_cleared && !json_output {
             output::success(
                 "Logged out from GitHub Packages fallback token (GitHub CLI auth is managed by gh)",
             );
         }
-        auth::clear_token_expiry("github.com");
     }
     if targets.gitlab {
-        let cleared = record_local_clear(
+        let credential_cleared = record_local_clear(
             auth::clear_gitlab_token(),
             "GitLab Packages local credential clearing",
             &mut local_cleared,
             &mut errors,
         );
-        if cleared && !json_output {
+        let metadata_cleared = record_local_clear(
+            auth::clear_token_expiry_checked("gitlab.com"),
+            "GitLab Packages local expiry metadata clearing",
+            &mut local_cleared,
+            &mut errors,
+        );
+        if credential_cleared && metadata_cleared && !json_output {
             output::success(
                 "Logged out from GitLab Packages fallback token (GitLab CLI auth is managed by glab)",
             );
         }
-        auth::clear_token_expiry("gitlab.com");
     }
     if let Some(url) = targets.custom_registry {
         let cleared = record_local_clear(
@@ -171,7 +209,11 @@ pub async fn run(
         errors,
         lpm_requested: targets.clear_lpm,
     };
-    emit_result(result, json_output, !had_lpm_session);
+    emit_result(
+        result,
+        json_output,
+        lpm_session_presence_known && !had_lpm_session,
+    );
 
     if success {
         Ok(())

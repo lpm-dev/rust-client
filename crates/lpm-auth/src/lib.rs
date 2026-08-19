@@ -364,7 +364,19 @@ pub(crate) fn get_stored_access_token_with_interaction_notice(
 /// Unlike [`get_token`], this ignores `LPM_TOKEN` and reports only local
 /// secure-storage state.
 pub fn has_stored_access_token(registry_url: &str) -> bool {
-    get_stored_access_token(registry_url).is_some()
+    match has_stored_access_token_checked(registry_url) {
+        Ok(present) => present,
+        Err(error) => {
+            tracing::warn!("stored access credential presence unavailable: {error}");
+            false
+        }
+    }
+}
+
+/// Check for a stored access token without hiding secure-storage failures.
+pub fn has_stored_access_token_checked(registry_url: &str) -> Result<bool, String> {
+    get_stored_credential_with_backend_result(registry_url, CredentialKind::Access, || {})
+        .map(|credential| credential.is_some())
 }
 
 /// Store a token for a given registry URL.
@@ -1477,7 +1489,8 @@ pub fn clear_token_expiry(registry: &str) {
     }
 }
 
-pub(crate) fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
+/// Remove token-expiry metadata and report storage failures to the caller.
+pub fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
     mutate_token_expiries(|expiries| expiries.remove(registry).is_some())
 }
 
@@ -1692,8 +1705,19 @@ pub(crate) fn get_refresh_token_with_interaction_notice(
 
 /// Check whether a refresh token is stored for the given registry.
 pub fn has_refresh_token(registry: &str) -> bool {
-    stored_credential_presence(registry, CredentialKind::Refresh)
-        == StoredCredentialPresence::Present
+    match has_refresh_token_checked(registry) {
+        Ok(present) => present,
+        Err(error) => {
+            tracing::warn!("stored refresh credential presence unavailable: {error}");
+            false
+        }
+    }
+}
+
+/// Check for a stored refresh token without hiding secure-storage failures.
+pub fn has_refresh_token_checked(registry: &str) -> Result<bool, String> {
+    get_stored_credential_with_backend_result(registry, CredentialKind::Refresh, || {})
+        .map(|credential| credential.is_some())
 }
 
 /// Clear the stored refresh token for a registry.
