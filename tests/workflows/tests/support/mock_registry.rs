@@ -854,6 +854,23 @@ impl MockRegistry {
         self
     }
 
+    /// Mount a `/api/registry/-/whoami` error for a specific bearer token.
+    pub async fn with_authenticated_whoami_error(
+        &self,
+        bearer_token: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/whoami"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount a successful `/api/cli/refresh` response for a specific refresh token.
     pub async fn with_refresh(
         &self,

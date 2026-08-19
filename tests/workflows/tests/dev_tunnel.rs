@@ -278,7 +278,7 @@ fn tunnel_bare_domain_error_suggests_the_supported_positional_domain() {
             registry_url: lpm_common::DEFAULT_REGISTRY_URL,
             access_token: Some("workflow-access-token"),
             refresh_token: Some("workflow-refresh-token"),
-            ..Default::default()
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
         }],
     );
 

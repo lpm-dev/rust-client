@@ -155,7 +155,7 @@ async fn logout_revoke_uses_the_stored_session_when_lpm_token_is_active() {
             registry_url: &mock.url(),
             access_token: Some("stored-access"),
             refresh_token: Some("stored-refresh"),
-            session_access_expires_at: None,
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
 
@@ -195,8 +195,6 @@ async fn logout_revoke_uses_the_stored_session_when_lpm_token_is_active() {
 async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
     let project = TempProject::empty(r#"{"name":"logout-stale-access","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_revoke_all_pairings_for_status("stale-access", 401, 1)
-        .await;
     mock.with_refresh_expected(
         "stored-refresh",
         "rotated-access",
@@ -249,12 +247,11 @@ async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
     assert_eq!(
         paths,
         vec![
-            "/api/vault/pair/revoke-all",
             "/api/cli/refresh",
             "/api/vault/pair/revoke-all",
             "/api/cli/revoke",
         ],
-        "a stale bearer must trigger one refresh before ordered revocation retries"
+        "missing expiry metadata must trigger one refresh before ordered revocation"
     );
 }
 
@@ -271,7 +268,7 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
             registry_url: &mock.url(),
             access_token: Some("access-primary"),
             refresh_token: Some("refresh-primary"),
-            session_access_expires_at: None,
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
 
@@ -373,7 +370,7 @@ async fn logout_all_revoke_remote_failure_still_clears_every_local_registry_cred
                 registry_url: &mock.url(),
                 access_token: Some("access-primary"),
                 refresh_token: Some("refresh-primary"),
-                session_access_expires_at: None,
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
             },
             SessionSeed {
                 registry_url: "https://registry.npmjs.org",

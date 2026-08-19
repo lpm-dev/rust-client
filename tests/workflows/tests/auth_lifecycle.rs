@@ -694,7 +694,7 @@ async fn invalid_access_token_entry_reports_failure_and_preserves_credential_sto
 }
 
 #[tokio::test]
-async fn malformed_session_expiry_metadata_triggers_refresh_and_rewrites_valid_expiry_state() {
+async fn malformed_session_expiry_metadata_blocks_refresh_and_preserves_session_state() {
     let project =
         TempProject::empty(r#"{"name":"auth-corrupt-expiry-refresh-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -704,10 +704,10 @@ async fn malformed_session_expiry_metadata_triggers_refresh_and_rewrites_valid_e
         "access-from-refresh",
         "refresh-rotated-token",
         "2030-01-01T00:00:00Z",
-        1,
+        0,
     )
     .await;
-    mock.with_authenticated_whoami("access-from-refresh", "testuser", "test@example.com")
+    mock.with_authenticated_whoami_error("stale-access-token", 401, 1)
         .await;
 
     seed_sessions(
@@ -728,44 +728,33 @@ async fn malformed_session_expiry_metadata_triggers_refresh_and_rewrites_valid_e
         .expect("failed to run whoami with malformed session expiry metadata");
 
     assert!(
-        first_whoami.status.success(),
-        "whoami failed to self-heal malformed session expiry metadata:\nstdout: {}\nstderr: {}",
+        !first_whoami.status.success(),
+        "whoami replaced malformed session expiry metadata:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&first_whoami.stdout),
         String::from_utf8_lossy(&first_whoami.stderr),
     );
 
     let first_json = parse_json_output(&first_whoami.stdout);
-    assert_eq!(first_json["success"], true);
-    assert_eq!(first_json["username"], "testuser");
+    assert_eq!(first_json["success"], false);
+    assert_eq!(first_json["error_code"], "credential_storage");
+    assert!(
+        first_json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("token-expiry metadata JSON error"))
+    );
 
     let credentials = read_credentials(project.home());
-    assert_eq!(credentials[&mock.url()], "access-from-refresh");
+    assert_eq!(credentials[&mock.url()], "stale-access-token");
     assert_eq!(
         credentials[&format!("refresh:{}", mock.url())],
-        "refresh-rotated-token"
+        "refresh-valid-token"
     );
 
-    let expiry = read_expiry_metadata(project.home());
     assert_eq!(
-        expiry[&mock.url()]["session_access_expires_at"],
-        "2030-01-01T00:00:00Z"
+        std::fs::read_to_string(token_expiry_path(project.home()))
+            .expect("failed to read preserved token expiry metadata"),
+        "{not valid json"
     );
-
-    let second_whoami = lpm_with_registry(&project, &mock.url())
-        .args(["whoami", "--json"])
-        .output()
-        .expect("failed to rerun whoami after expiry metadata normalization");
-
-    assert!(
-        second_whoami.status.success(),
-        "second whoami failed after expiry metadata normalization:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&second_whoami.stdout),
-        String::from_utf8_lossy(&second_whoami.stderr),
-    );
-
-    let second_json = parse_json_output(&second_whoami.stdout);
-    assert_eq!(second_json["success"], true);
-    assert_eq!(second_json["username"], "testuser");
 }
 
 #[tokio::test]
