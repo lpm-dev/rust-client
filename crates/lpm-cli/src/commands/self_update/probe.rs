@@ -2455,10 +2455,10 @@ mod tests {
         let chunk = "x".repeat(1024);
         let body = format!("while :; do printf '{chunk}'; done");
         let (_directory, program) = executable_script(&body);
-        let mut probe = version_probe(program);
-        probe.timeout = Duration::from_secs(2);
 
-        let error = probe.verify_requested("1.2.3").unwrap_err();
+        let error = version_probe(program)
+            .verify_requested("1.2.3")
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("exceeded 4096 bytes"),

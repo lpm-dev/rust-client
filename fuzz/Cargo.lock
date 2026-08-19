@@ -491,7 +491,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lpm-common"
-version = "0.74.1"
+version = "0.75.0"
 dependencies = [
  "base64",
  "chrono",
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-extractor"
-version = "0.74.1"
+version = "0.75.0"
 dependencies = [
  "blake3",
  "flate2",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-semver"
-version = "0.74.1"
+version = "0.75.0"
 dependencies = [
  "lpm-common",
  "node-semver",

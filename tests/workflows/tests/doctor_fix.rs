@@ -501,7 +501,7 @@ async fn doctor_all_fix_routes_plugin_updates_through_the_managed_updater() {
         .and(path("/repos/biomejs/biome/releases"))
         .and(query_param("per_page", "20"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            { "tag_name": "@biomejs/biome@2.5.7" }
+            { "tag_name": "@biomejs/biome@2.5.9" }
         ])))
         .expect(1)
         .mount(&server)
@@ -510,11 +510,11 @@ async fn doctor_all_fix_routes_plugin_updates_through_the_managed_updater() {
     let project = TempProject::empty(r#"{"name":"doctor-plugin","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
-    seed_verified_plugin(&project, "biome", "2.5.7");
+    seed_verified_plugin(&project, "biome", "2.5.9");
     let cache_path = plugin_version_cache(&project);
     std::fs::create_dir_all(cache_path.parent().expect("plugin cache directory"))
         .expect("create plugin cache directory");
-    std::fs::write(&cache_path, r#"{"versions":{"biome":"2.5.8"}}"#)
+    std::fs::write(&cache_path, r#"{"versions":{"biome":"2.5.10"}}"#)
         .expect("seed newer approved plugin version");
 
     let output = lpm_doctor_offline(&project)
@@ -536,7 +536,7 @@ async fn doctor_all_fix_routes_plugin_updates_through_the_managed_updater() {
         envelope["fixes_applied"].as_array().is_some_and(|fixes| {
             fixes
                 .iter()
-                .any(|fix| fix == "updated plugin biome to 2.5.7")
+                .any(|fix| fix == "updated plugin biome to 2.5.9")
         }),
         "doctor must report the managed plugin update: {envelope:#}"
     );
@@ -544,7 +544,7 @@ async fn doctor_all_fix_routes_plugin_updates_through_the_managed_updater() {
         &std::fs::read(cache_path).expect("read updated plugin version cache"),
     )
     .expect("plugin version cache must remain valid JSON");
-    assert_eq!(cache["versions"]["biome"], "2.5.7");
+    assert_eq!(cache["versions"]["biome"], "2.5.9");
 }
 
 #[test]
@@ -558,7 +558,7 @@ fn doctor_all_fix_keeps_formatter_output_out_of_the_json_document() {
         "#!/bin/sh\nif [ \"$2\" = \"--check\" ]; then\n  echo 'Formatter would have printed fixture.js' >&2\n  exit 1\nfi\necho 'formatter stdout must stay captured'\nprintf 'applied' > \"{}\"\n",
         marker.display()
     );
-    seed_verified_plugin_with_binary(&project, "biome", "2.5.7", formatter.as_bytes());
+    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", formatter.as_bytes());
 
     let output = lpm_doctor_offline(&project)
         .args(["--json", "doctor", "--all", "--fix", "--yes"])
