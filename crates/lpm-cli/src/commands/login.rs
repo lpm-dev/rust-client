@@ -66,28 +66,35 @@ async fn read_capped_exchange_body(mut response: reqwest::Response) -> Result<Ve
 /// 3. User authenticates in browser
 /// 4. Browser posts a short-lived exchange code to the loopback callback
 /// 5. Redeem the PKCE-bound code, verify the token, and store the session
-pub async fn run(registry_url: &str, json_output: bool) -> Result<(), LpmError> {
-    // Check if already logged in
-    if let Some(existing) = auth::get_token(registry_url) {
-        let client = lpm_registry::RegistryClient::new()
-            .with_base_url(registry_url.to_string())
-            .with_token(existing);
-        if let Ok(info) = client.whoami().await {
-            let name = info
-                .profile_username
-                .as_deref()
-                .or(info.username.as_deref())
-                .unwrap_or("unknown");
-            if !json_output {
-                install_ui::done_line(crate::install_ui::terminal_line!(
-                    "Already logged in as {}. Use {} to log out first.",
-                    install_ui::cyan(name),
-                    install_ui::dim("lpm logout")
-                ));
+pub async fn run(
+    client: &RegistryClient,
+    registry_url: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let has_existing_auth = match client.session() {
+        Some(session) => session.current_source()?.is_some(),
+        None => false,
+    };
+    if has_existing_auth {
+        match client.whoami().await {
+            Ok(info) => {
+                let name = info
+                    .profile_username
+                    .as_deref()
+                    .or(info.username.as_deref())
+                    .unwrap_or("unknown");
+                if !json_output {
+                    install_ui::done_line(crate::install_ui::terminal_line!(
+                        "Already logged in as {}. Use {} to log out first.",
+                        install_ui::cyan(name),
+                        install_ui::dim("lpm logout")
+                    ));
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(LpmError::AuthRequired | LpmError::SessionExpired) => {}
+            Err(error) => return Err(error),
         }
-        // Token is invalid — proceed with login
     }
 
     if !json_output {

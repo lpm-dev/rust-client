@@ -1578,7 +1578,7 @@ async fn async_main() -> Result<()> {
                     .registry
                     .as_deref()
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-                commands::login::run(registry, cli.json).await
+                commands::login::run(&client, registry, cli.json).await
             }
         }
         Commands::Logout(args) => {
