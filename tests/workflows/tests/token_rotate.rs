@@ -7,9 +7,31 @@ use support::auth_state::{
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 const VALID_OTP: &str = "123456";
+
+struct ReplaceSessionThenReject {
+    home: std::path::PathBuf,
+    registry_url: String,
+}
+
+impl Respond for ReplaceSessionThenReject {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        seed_sessions(
+            &self.home,
+            &[SessionSeed {
+                registry_url: &self.registry_url,
+                access_token: Some("peer-access-token"),
+                refresh_token: Some("peer-refresh-token"),
+                session_access_expires_at: Some("2032-01-03T04:05:06Z"),
+            }],
+        );
+        ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        }))
+    }
+}
 
 async fn mount_external_token_rotation(mock: &MockRegistry, bearer_token: &str) {
     Mock::given(method("POST"))
@@ -409,6 +431,45 @@ async fn token_rotate_unknown_unauthorized_response_remains_an_auth_failure() {
         .unwrap_or_else(|error| panic!("auth failure must be JSON: {error}\n{stdout}"));
     assert_eq!(envelope["error_code"], serde_json::json!("auth_required"));
     assert!(!stdout.contains("stored-fallback-token"));
+}
+
+#[tokio::test]
+async fn token_rotate_rejection_preserves_a_session_replaced_while_the_request_is_in_flight() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-race","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    seed_stored_fallback(&project, &registry_url);
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("authorization", "Bearer stored-fallback-token"))
+        .respond_with(ReplaceSessionThenReject {
+            home: project.home().to_path_buf(),
+            registry_url: registry_url.clone(),
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run unauthorized lpm token-rotate");
+
+    assert!(!output.status.success());
+    let credentials = read_credentials(project.home());
+    assert_eq!(
+        credentials[registry_url.as_str()],
+        serde_json::json!("peer-access-token")
+    );
+    assert_eq!(
+        credentials[format!("refresh:{registry_url}")],
+        serde_json::json!("peer-refresh-token")
+    );
+    assert_eq!(
+        read_expiry_metadata(project.home())[registry_url.as_str()]["session_access_expires_at"],
+        serde_json::json!("2032-01-03T04:05:06Z")
+    );
 }
 
 #[tokio::test]

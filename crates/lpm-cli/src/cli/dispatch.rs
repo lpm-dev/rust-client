@@ -54,7 +54,7 @@ pub(crate) fn run() -> Result<()> {
     // when the manifest/lockfile mtimes are unchanged.
     if let Some(fast_lane) = install_state::argv_qualifies_for_fast_lane() {
         if let Err(error) = privilege::ensure_user_invocation_allowed() {
-            exit_with_lpm_error(&error, fast_lane.json, lpm_common::DEFAULT_REGISTRY_URL);
+            exit_with_lpm_error(&error, fast_lane.json);
         }
 
         let Ok(cwd) = std::env::current_dir() else {
@@ -111,11 +111,7 @@ pub(crate) fn run() -> Result<()> {
                     }
                     Ok(FastLaneAdmission::NeedsInstallPipeline) => {}
                     Err(error) => {
-                        exit_with_lpm_error(
-                            &error,
-                            fast_lane.json,
-                            lpm_common::DEFAULT_REGISTRY_URL,
-                        );
+                        exit_with_lpm_error(&error, fast_lane.json);
                     }
                 }
             }
@@ -234,11 +230,7 @@ async fn async_main() -> Result<()> {
     };
 
     if let Err(error) = privilege::ensure_command_allowed(&command) {
-        let registry_url = cli
-            .registry
-            .as_deref()
-            .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-        exit_with_lpm_error(&error, cli.json, registry_url);
+        exit_with_lpm_error(&error, cli.json);
     }
 
     let privileged_helper_result = match &command {
@@ -256,11 +248,7 @@ async fn async_main() -> Result<()> {
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let registry_url = cli
-                    .registry
-                    .as_deref()
-                    .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-                exit_with_lpm_error(&error, cli.json, registry_url);
+                exit_with_lpm_error(&error, cli.json);
             }
         }
     }
@@ -332,11 +320,11 @@ async fn async_main() -> Result<()> {
         argv_has_setup_ci_registry_flag(std::env::args_os()),
     ) {
         Ok(target) => target,
-        Err(error) => exit_with_lpm_error(&error, cli.json, registry_url),
+        Err(error) => exit_with_lpm_error(&error, cli.json),
     };
 
     if let Err(error) = provenance_fetch::EnforceMode::validate_from_env() {
-        exit_with_lpm_error(&error, cli.json, registry_url);
+        exit_with_lpm_error(&error, cli.json);
     }
 
     // lazy auth. Build the SessionManager from purely local
@@ -475,7 +463,7 @@ async fn async_main() -> Result<()> {
                 // alongside a non-zero exit, breaking the
                 // `--json contract` exactly when the user most needs to
                 // parse the failure (corrupt / newer WAL, etc.).
-                exit_with_lpm_error(&e, cli.json, registry_url);
+                exit_with_lpm_error(&e, cli.json);
             }
         }
     }
@@ -3165,7 +3153,7 @@ async fn async_main() -> Result<()> {
     }
 
     if let Err(e) = &result {
-        exit_with_lpm_error(e, cli.json, registry_url);
+        exit_with_lpm_error(e, cli.json);
     }
 
     Ok(())
