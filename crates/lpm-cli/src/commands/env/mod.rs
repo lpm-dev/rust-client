@@ -1,6 +1,6 @@
 //! `lpm env` command dispatcher and domain modules.
 
-mod auth;
+pub(crate) mod auth;
 mod ci;
 mod github;
 mod inventory;
@@ -17,7 +17,7 @@ mod schema;
 mod sync_payload;
 
 mod prelude {
-    pub(super) use crate::{auth_storage_notice, install_ui, output};
+    pub(super) use crate::{install_ui, output};
     pub(super) use futures::StreamExt;
     pub(super) use lpm_common::LpmError;
     pub(super) use lpm_common::color::Painted;
@@ -39,7 +39,7 @@ use lpm_registry::RegistryClient;
 /// (trailing_var_arg), so this function re-parses raw argv to dispatch
 /// on the subcommand.
 pub async fn run(
-    _client: &RegistryClient,
+    client: &RegistryClient,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
@@ -62,22 +62,24 @@ pub async fn run(
         "delete" => local::env_delete(&args[1..], project_dir, json_output)?,
         "import" => local::env_import(&args[1..], project_dir, json_output)?,
         "export" => local::env_export(&args[1..], project_dir, json_output)?,
-        "push" => return push::vars_push(&args, project_dir, json_output).await,
-        "pull" => return pull::vars_pull(&args, project_dir, json_output).await,
-        "log" => return remote::env_log(project_dir, json_output).await,
-        "share" => return remote::env_share(&args, project_dir, json_output).await,
+        "push" => return push::vars_push(client, &args, project_dir, json_output).await,
+        "pull" => return pull::vars_pull(client, &args, project_dir, json_output).await,
+        "log" => return remote::env_log(client, project_dir, json_output).await,
+        "share" => return remote::env_share(client, &args, project_dir, json_output).await,
         "rotate-key" => {
-            return rotation::env_rotate_key(&args[1..], project_dir, json_output).await;
+            return rotation::env_rotate_key(client, &args[1..], project_dir, json_output).await;
         }
-        "rotate-sharing-key" => return rotation::env_rotate_sharing_key(&args, json_output).await,
+        "rotate-sharing-key" => {
+            return rotation::env_rotate_sharing_key(client, &args, json_output).await;
+        }
         "list-remote" | "ls-remote" => {
             let org_flag = args
                 .iter()
                 .position(|a| *a == "--org")
                 .and_then(|i| args.get(i + 1).copied());
-            return remote::vars_list_remote(org_flag, json_output).await;
+            return remote::vars_list_remote(client, org_flag, json_output).await;
         }
-        "diff" => return remote::vars_diff(&args[1..], project_dir, json_output).await,
+        "diff" => return remote::vars_diff(client, &args[1..], project_dir, json_output).await,
         "validate" => {
             let strict = args.contains(&"--strict");
             return schema::vars_validate(project_dir, strict, json_output);
@@ -88,11 +90,13 @@ pub async fn run(
         }
         "print" => return schema::vars_print(&args[1..], project_dir),
         "check" => return schema::vars_check(project_dir, json_output),
-        "connect" => return platform::vars_connect(&args[1..], project_dir, json_output).await,
-        "oidc" => return oidc::vars_oidc(&args[1..], project_dir, json_output).await,
-        "status" => return platform::vars_platform_status(project_dir, json_output).await,
-        "pair" => return pairing::env_pair(&args[1..], json_output).await,
-        "unpair" => return pairing::env_unpair(json_output).await,
+        "connect" => {
+            return platform::vars_connect(client, &args[1..], project_dir, json_output).await;
+        }
+        "oidc" => return oidc::vars_oidc(client, &args[1..], project_dir, json_output).await,
+        "status" => return platform::vars_platform_status(client, project_dir, json_output).await,
+        "pair" => return pairing::env_pair(client, &args[1..], json_output).await,
+        "unpair" => return pairing::env_unpair(client, json_output).await,
         "init" => {
             let force = args.contains(&"--force");
             return inventory::vars_init(project_dir, force, json_output);

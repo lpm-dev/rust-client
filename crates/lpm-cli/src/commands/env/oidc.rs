@@ -82,6 +82,7 @@ fn policy_id_from_response(result: &serde_json::Value) -> Result<String, LpmErro
 
 /// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production [--events=push,workflow_dispatch] [--allow-forks]`
 pub(super) async fn vars_oidc(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -104,8 +105,8 @@ pub(super) async fn vars_oidc(
             print_oidc_allow_help();
             Ok(())
         }
-        "allow" => vars_oidc_allow(&args[1..], project_dir, json_output).await,
-        "list" => vars_oidc_list(project_dir, json_output).await,
+        "allow" => vars_oidc_allow(client, &args[1..], project_dir, json_output).await,
+        "list" => vars_oidc_list(client, project_dir, json_output).await,
         unknown => Err(LpmError::Script(format!(
             "unknown oidc action: '{unknown}'. Available: allow, list"
         ))),
@@ -134,6 +135,7 @@ This command replaces the policy's complete allowlists. Run `lpm env oidc list` 
 
 /// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production`
 pub(super) async fn vars_oidc_allow(
+    registry_client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -301,11 +303,6 @@ pub(super) async fn vars_oidc_allow(
 
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
-
-    let client = lpm_http::client_builder()
-        .build()
-        .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let mut policy_body = serde_json::json!({
         "vaultId": vault_id,
         "provider": provider,
@@ -319,37 +316,39 @@ pub(super) async fn vars_oidc_allow(
     if let Some(repository_id) = &repository_id {
         policy_body["repositoryId"] = serde_json::Value::String(repository_id.clone());
     }
-    let response = client
-        .post(format!("{registry_url}/api/vault/oidc/policies"))
-        .bearer_auth(&auth_token)
-        .json(&policy_body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|error| {
-            LpmError::Network(format!(
-                "failed to reach server: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-
-    if !response.status().is_success() {
-        let body: serde_json::Value =
-            super::response::parse_capped_platform_json_or_unknown(response).await;
-        return Err(LpmError::Script(
-            body["error"].as_str().unwrap_or("failed").to_string(),
-        ));
-    }
-
-    let result: serde_json::Value = super::response::parse_capped_platform_json(response).await?;
+    let result = super::auth::execute_lpm_with_bearer(
+        registry_client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let policy_body = policy_body.clone();
+            async move { create_oidc_policy(&registry_url, &auth_token, &policy_body).await }
+        },
+    )
+    .await?;
     let policy_id = policy_id_from_response(&result)?;
 
     let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key()
         .map_err(|error| oidc_escrow_setup_error("retrieving the local wrapping key", &error))?;
     let wrapping_key_hex = hex::encode(wrapping_key);
-    lpm_vault::sync::upload_escrow_key(&registry_url, &auth_token, &vault_id, &wrapping_key_hex)
-        .await
-        .map_err(|error| oidc_escrow_setup_error("uploading the wrapping key", &error))?;
+    super::auth::execute_sync_with_bearer(
+        registry_client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            let wrapping_key_hex = wrapping_key_hex.clone();
+            async move {
+                lpm_vault::sync::upload_escrow_key(
+                    &registry_url,
+                    &auth_token,
+                    &vault_id,
+                    &wrapping_key_hex,
+                )
+                .await
+            }
+        },
+    )
+    .await
+    .map_err(|error| oidc_escrow_setup_error("uploading the wrapping key", &error.to_string()))?;
 
     if json_output {
         println!(
@@ -475,23 +474,35 @@ fn oidc_escrow_setup_error(step: &str, error: &str) -> LpmError {
     ))
 }
 
-/// `lpm env oidc list`
-pub(super) async fn vars_oidc_list(
-    project_dir: &std::path::Path,
-    json_output: bool,
-) -> Result<(), LpmError> {
-    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
-        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-    let (registry_url, auth_token) = super::auth::get_platform_auth(json_output).await?;
+async fn parse_authenticated_oidc_response(
+    response: reqwest::Response,
+) -> Result<serde_json::Value, LpmError> {
+    let status = response.status();
+    if !status.is_success() {
+        let body: serde_json::Value =
+            super::response::parse_capped_platform_json_or_unknown(response).await;
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(LpmError::AuthRequired);
+        }
+        return Err(LpmError::Script(
+            body["error"].as_str().unwrap_or("failed").to_string(),
+        ));
+    }
+    super::response::parse_capped_platform_json(response).await
+}
 
+async fn create_oidc_policy(
+    registry_url: &str,
+    auth_token: &str,
+    policy_body: &serde_json::Value,
+) -> Result<serde_json::Value, LpmError> {
     let client = lpm_http::client_builder()
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let response = client
-        .get(format!(
-            "{registry_url}/api/vault/oidc/policies?vaultId={vault_id}"
-        ))
-        .bearer_auth(&auth_token)
+        .post(format!("{registry_url}/api/vault/oidc/policies"))
+        .bearer_auth(auth_token)
+        .json(policy_body)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -501,16 +512,51 @@ pub(super) async fn vars_oidc_list(
                 lpm_http::display_error(&error)
             ))
         })?;
+    parse_authenticated_oidc_response(response).await
+}
 
-    if !response.status().is_success() {
-        let body: serde_json::Value =
-            super::response::parse_capped_platform_json_or_unknown(response).await;
-        return Err(LpmError::Script(
-            body["error"].as_str().unwrap_or("failed").to_string(),
-        ));
-    }
+async fn list_oidc_policies(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+) -> Result<serde_json::Value, LpmError> {
+    let client = lpm_http::client_builder()
+        .build()
+        .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
+    let response = client
+        .get(format!(
+            "{registry_url}/api/vault/oidc/policies?vaultId={vault_id}"
+        ))
+        .bearer_auth(auth_token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "failed to reach server: {}",
+                lpm_http::display_error(&error)
+            ))
+        })?;
+    parse_authenticated_oidc_response(response).await
+}
 
-    let result: serde_json::Value = super::response::parse_capped_platform_json(response).await?;
+/// `lpm env oidc list`
+pub(super) async fn vars_oidc_list(
+    registry_client: &lpm_registry::RegistryClient,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
+        .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
+    let result = super::auth::execute_lpm_with_bearer(
+        registry_client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            async move { list_oidc_policies(&registry_url, &auth_token, &vault_id).await }
+        },
+    )
+    .await?;
     let policies = result["policies"]
         .as_array()
         .ok_or_else(|| LpmError::Script("invalid OIDC policy list response".into()))?;
@@ -610,13 +656,14 @@ fn policy_id_from_response_for_list(policy: &serde_json::Value) -> Result<String
 ///
 /// Exchange CI OIDC token for a short-lived LPM token, then pull vault secrets.
 pub(super) async fn vars_oidc_pull(
+    registry_client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let vault_id = resolve_oidc_pull_vault_id(project_dir)?;
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
+    let registry_url = registry_client.base_url().to_owned();
 
     let mut env_mode: Option<&str> = None;
     let mut output_file: Option<&str> = None;

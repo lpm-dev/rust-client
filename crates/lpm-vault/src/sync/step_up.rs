@@ -1,3 +1,4 @@
+use super::SyncError;
 use super::http::{read_capped_error_text, sync_http_client_builder};
 
 /// HTTP header the server expects the CLI step-up proof JWT in. Mirrors
@@ -44,7 +45,7 @@ pub enum CliStepUpCredential<'a> {
 pub async fn discover_cli_step_up_policy(
     registry_url: &str,
     auth_token: &str,
-) -> Result<CliStepUpPolicy, String> {
+) -> Result<CliStepUpPolicy, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -61,13 +62,16 @@ pub async fn discover_cli_step_up_policy(
     let status = response.status();
     if !status.is_success() {
         let body = read_capped_error_text(response).await;
-        return Err(format!("step-up policy: {status}: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("step-up policy: {status}: {body}"),
+        ));
     }
 
-    response
+    Ok(response
         .json::<CliStepUpPolicy>()
         .await
-        .map_err(|e| format!("parse error: {e}"))
+        .map_err(|e| format!("parse error: {e}"))?)
 }
 
 /// Successful mint response from `POST /api/auth/cli-step-up`.
@@ -92,7 +96,7 @@ pub async fn mint_cli_step_up_proof(
     auth_token: &str,
     scope: &str,
     credential: &CliStepUpCredential<'_>,
-) -> Result<String, String> {
+) -> Result<String, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -124,7 +128,10 @@ pub async fn mint_cli_step_up_proof(
     let status = response.status();
     if !status.is_success() {
         let body = read_capped_error_text(response).await;
-        return Err(format!("step-up mint: {status}: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("step-up mint: {status}: {body}"),
+        ));
     }
 
     let parsed = response
@@ -132,11 +139,13 @@ pub async fn mint_cli_step_up_proof(
         .await
         .map_err(|e| format!("parse error: {e}"))?;
     if parsed.ok != Some(true) {
-        return Err("step-up mint: server returned ok=false on 2xx response (unexpected)".into());
+        return Err(SyncError::from(
+            "step-up mint: server returned ok=false on 2xx response (unexpected)",
+        ));
     }
     parsed
         .proof
-        .ok_or_else(|| "step-up mint: server response missing proof".into())
+        .ok_or_else(|| SyncError::from("step-up mint: server response missing proof"))
 }
 
 #[cfg(test)]
@@ -203,7 +212,7 @@ mod tests {
         let err = discover_cli_step_up_policy(&server.uri(), "token")
             .await
             .expect_err("401 must propagate");
-        assert!(err.contains("401"), "got: {err}");
+        assert!(err.to_string().contains("401"), "got: {err}");
     }
 
     #[tokio::test]
@@ -330,9 +339,10 @@ mod tests {
         )
         .await
         .expect_err("401 must propagate");
-        assert!(err.contains("401"), "got: {err}");
+        assert!(err.to_string().contains("401"), "got: {err}");
         assert!(
-            err.contains("wrong_credential") || err.contains("Incorrect password"),
+            err.to_string().contains("wrong_credential")
+                || err.to_string().contains("Incorrect password"),
             "error envelope should be preserved so CLI can render it: {err}"
         );
     }

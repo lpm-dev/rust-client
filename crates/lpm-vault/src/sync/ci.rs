@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::SyncError;
 use super::http::{read_capped_error_text, sync_http_client_builder, url_path_segment};
 
 /// Response from the CI pull endpoint (server-side decrypted secrets).
@@ -66,7 +67,7 @@ pub async fn upload_escrow_key(
     auth_token: &str,
     vault_id: &str,
     wrapping_key_hex: &str,
-) -> Result<(), String> {
+) -> Result<(), SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -87,14 +88,18 @@ pub async fn upload_escrow_key(
         .map_err(super::http::network_error)?;
 
     if !response.status().is_success() {
+        let status = response.status();
         let body = read_capped_error_text(response).await;
         // Try to extract error message from JSON
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
             && let Some(err) = json["error"].as_str()
         {
-            return Err(err.to_string());
+            return Err(SyncError::http(status, err.to_string()));
         }
-        return Err(format!("escrow upload failed: {body}"));
+        return Err(SyncError::http(
+            status,
+            format!("escrow upload failed: {body}"),
+        ));
     }
 
     Ok(())

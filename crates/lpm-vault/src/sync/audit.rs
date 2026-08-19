@@ -1,3 +1,4 @@
+use super::SyncError;
 use super::http::{sync_http_client_builder, url_path_segment};
 
 /// Response from audit log endpoint.
@@ -26,7 +27,7 @@ pub async fn get_audit_log(
     auth_token: &str,
     vault_id: &str,
     cursor: Option<&str>,
-) -> Result<AuditResponse, String> {
+) -> Result<AuditResponse, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -52,9 +53,10 @@ pub async fn get_audit_log(
         .map_err(|e| format!("response parse error: {e}"))?;
 
     if !status.is_success() {
-        return Err(result
+        let message = result
             .error
-            .unwrap_or_else(|| format!("server error: {status}")));
+            .unwrap_or_else(|| format!("server error: {status}"));
+        return Err(SyncError::http(status, message));
     }
 
     Ok(result)

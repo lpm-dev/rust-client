@@ -220,19 +220,17 @@ fn prompt_pair_confirmation() -> Result<(), LpmError> {
     }
 }
 
-pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), LpmError> {
+pub(super) async fn env_pair(
+    client: &lpm_registry::RegistryClient,
+    args: &[&str],
+    json_output: bool,
+) -> Result<(), LpmError> {
     let parsed = parse_pair_args(args)?;
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    // Vault pairing requires a refresh-backed session. The
-    // `SessionRequired` posture rejects `LPM_TOKEN`/`--token`/
-    // CI/legacy tokens with the same message the old
-    // `has_refresh_token` check produced.
-    let auth_token = super::auth::resolve_session_bearer(&registry_url, json_output).await?;
+    super::auth::resolve_session_bearer(client).await?;
 
-    // Refuse a non-interactive pair without --yes BEFORE touching
-    // the registry — a curl-piped-to-sh phishing payload should not
-    // even leak the social-engineered code into server access logs.
+    // Refuse a non-interactive pair without --yes before sending the
+    // social-engineered pairing code to the registry.
     if !parsed.yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
@@ -247,9 +245,18 @@ pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), Lpm
 
     output::info("fetching pairing session...");
 
-    let session = lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &parsed.code)
-        .await
-        .map_err(LpmError::Script)?;
+    let session =
+        super::auth::execute_sync_with_bearer(
+            client,
+            lpm_auth::AuthRequirement::SessionRequired,
+            |registry_url, auth_token| {
+                let code = parsed.code.clone();
+                async move {
+                    lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &code).await
+                }
+            },
+        )
+        .await?;
 
     if session.status != "pending" {
         return Err(LpmError::Script(format!(
@@ -280,23 +287,49 @@ pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), Lpm
             let (encrypted, ephemeral) =
                 lpm_vault::crypto::p256_pair_wrap_key(&wrapping_key, &browser_pub_b64)
                     .map_err(LpmError::Script)?;
-            lpm_vault::sync::approve_pairing_legacy(
-                &registry_url,
-                &auth_token,
-                &parsed.code,
-                &encrypted,
-                &ephemeral,
+            super::auth::execute_sync_with_bearer(
+                client,
+                lpm_auth::AuthRequirement::SessionRequired,
+                |registry_url, auth_token| {
+                    let code = parsed.code.clone();
+                    let encrypted = encrypted.clone();
+                    let ephemeral = ephemeral.clone();
+                    async move {
+                        lpm_vault::sync::approve_pairing_legacy(
+                            &registry_url,
+                            &auth_token,
+                            &code,
+                            &encrypted,
+                            &ephemeral,
+                        )
+                        .await
+                    }
+                },
             )
-            .await
-            .map_err(LpmError::Script)?;
+            .await?;
         }
         2 => {
             let exchange = lpm_vault::crypto::P256PairingKeyExchange::new(&browser_pub_b64)
                 .map_err(LpmError::Script)?;
             let ephemeral = exchange.ephemeral_public_key_b64().to_string();
-            lpm_vault::sync::stage_pairing(&registry_url, &auth_token, &parsed.code, &ephemeral)
-                .await
-                .map_err(LpmError::Script)?;
+            super::auth::execute_sync_with_bearer(
+                client,
+                lpm_auth::AuthRequirement::SessionRequired,
+                |registry_url, auth_token| {
+                    let code = parsed.code.clone();
+                    let ephemeral = ephemeral.clone();
+                    async move {
+                        lpm_vault::sync::stage_pairing(
+                            &registry_url,
+                            &auth_token,
+                            &code,
+                            &ephemeral,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
 
             let view = PairConfirmationView::new(
                 &parsed.code,
@@ -310,15 +343,26 @@ pub(super) async fn env_pair(args: &[&str], json_output: bool) -> Result<(), Lpm
             let wrapping_key =
                 lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
             let encrypted = exchange.wrap_key(&wrapping_key).map_err(LpmError::Script)?;
-            lpm_vault::sync::approve_pairing(
-                &registry_url,
-                &auth_token,
-                &parsed.code,
-                &encrypted,
-                &ephemeral,
+            super::auth::execute_sync_with_bearer(
+                client,
+                lpm_auth::AuthRequirement::SessionRequired,
+                |registry_url, auth_token| {
+                    let code = parsed.code.clone();
+                    let encrypted = encrypted.clone();
+                    let ephemeral = ephemeral.clone();
+                    async move {
+                        lpm_vault::sync::approve_pairing(
+                            &registry_url,
+                            &auth_token,
+                            &code,
+                            &encrypted,
+                            &ephemeral,
+                        )
+                        .await
+                    }
+                },
             )
-            .await
-            .map_err(LpmError::Script)?;
+            .await?;
         }
         version => {
             return Err(LpmError::Script(format!(
@@ -356,17 +400,20 @@ fn confirm_pairing(parsed: &PairArgs) -> Result<(), LpmError> {
     }
 }
 
-pub(super) async fn env_unpair(json_output: bool) -> Result<(), LpmError> {
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    // Unpair revokes browser pairings — same session-backed
-    // requirement as `pair`.
-    let auth_token = super::auth::resolve_session_bearer(&registry_url, json_output).await?;
-
+pub(super) async fn env_unpair(
+    client: &lpm_registry::RegistryClient,
+    json_output: bool,
+) -> Result<(), LpmError> {
     output::info("revoking all browser pairings...");
 
-    lpm_vault::sync::unpair_all(&registry_url, &auth_token)
-        .await
-        .map_err(LpmError::Script)?;
+    super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::SessionRequired,
+        |registry_url, auth_token| async move {
+            lpm_vault::sync::unpair_all(&registry_url, &auth_token).await
+        },
+    )
+    .await?;
 
     if json_output {
         println!(

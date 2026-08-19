@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::SyncError;
 use super::http::{
     read_capped_error_text, read_verified_response, sync_http_client_builder, sync_request_timeout,
     url_path_segment,
@@ -80,7 +81,7 @@ const MAX_REMOTE_PROJECT_PAGES: usize = 101;
 pub(super) async fn list_remote_from_url(
     url: &str,
     auth_token: &str,
-) -> Result<Vec<RemoteVault>, String> {
+) -> Result<Vec<RemoteVault>, SyncError> {
     let client = sync_http_client_builder()
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))?;
@@ -104,8 +105,9 @@ pub(super) async fn list_remote_from_url(
             .map_err(super::http::network_error)?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let body = read_capped_error_text(response).await;
-            return Err(format!("server error: {body}"));
+            return Err(SyncError::http(status, format!("server error: {body}")));
         }
 
         let data: ListVaultsResponse = response
@@ -115,7 +117,8 @@ pub(super) async fn list_remote_from_url(
         if projects.len() + data.vaults.len() > MAX_REMOTE_PROJECTS {
             return Err(format!(
                 "env project list exceeds the supported {MAX_REMOTE_PROJECTS}-project limit"
-            ));
+            )
+            .into());
         }
         projects.extend(data.vaults);
 
@@ -123,16 +126,19 @@ pub(super) async fn list_remote_from_url(
             return Ok(projects);
         };
         if next_cursor.is_empty() || cursor.as_deref() == Some(next_cursor.as_str()) {
-            return Err("env project pagination returned an invalid cursor".to_string());
+            return Err("env project pagination returned an invalid cursor".into());
         }
         cursor = Some(next_cursor);
     }
 
-    Err("env project pagination exceeded the supported page limit".to_string())
+    Err("env project pagination exceeded the supported page limit".into())
 }
 
 /// List all cloud env projects for the authenticated user.
-pub async fn list_remote(registry_url: &str, auth_token: &str) -> Result<Vec<RemoteVault>, String> {
+pub async fn list_remote(
+    registry_url: &str,
+    auth_token: &str,
+) -> Result<Vec<RemoteVault>, SyncError> {
     list_remote_from_url(&format!("{registry_url}/api/vaults"), auth_token).await
 }
 
@@ -144,7 +150,7 @@ pub async fn push(
     secrets: &HashMap<String, String>,
     expected_version: Option<i32>,
     force: bool,
-) -> Result<PushResponse, String> {
+) -> Result<PushResponse, SyncError> {
     let secrets_json =
         serde_json::to_string(secrets).map_err(|e| format!("failed to serialize secrets: {e}"))?;
 
@@ -177,7 +183,7 @@ pub async fn push_raw(
     expected_version: Option<i32>,
     force: bool,
     metadata: Option<&PushMetadata<'_>>,
-) -> Result<PushResponse, String> {
+) -> Result<PushResponse, SyncError> {
     let secrets_json = secrets_json.to_string();
 
     let (encrypted_blob, wrapped_key) = crypto::encrypt_vault_for_sync(&secrets_json)?;
@@ -220,15 +226,16 @@ pub async fn push_raw(
     let (status, body) = read_verified_response(response, auth_token).await?;
     if !status.is_success() {
         if let Ok(result) = serde_json::from_slice::<PushResponse>(&body) {
-            return Err(format_push_error(&result, status));
+            return Err(SyncError::http(status, format_push_error(&result, status)));
         }
 
         let message = std::str::from_utf8(&body).unwrap_or("").trim();
-        return Err(if message.is_empty() {
+        let message = if message.is_empty() {
             format!("server error: {status}")
         } else {
             message.to_string()
-        });
+        };
+        return Err(SyncError::http(status, message));
     }
 
     let result: PushResponse =
@@ -242,7 +249,7 @@ pub async fn pull(
     registry_url: &str,
     auth_token: &str,
     vault_id: &str,
-) -> Result<(HashMap<String, String>, i32), String> {
+) -> Result<(HashMap<String, String>, i32), SyncError> {
     let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
@@ -260,14 +267,16 @@ pub async fn pull(
         .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
+    if !status.is_success() {
+        let message = serde_json::from_slice::<PullResponse>(&body)
+            .ok()
+            .and_then(|result| result.error)
+            .unwrap_or_else(|| format!("server error: {status}"));
+        return Err(SyncError::http(status, message));
+    }
+
     let result: PullResponse =
         serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
-
-    if !status.is_success() {
-        return Err(result
-            .error
-            .unwrap_or_else(|| format!("server error: {status}")));
-    }
 
     let encrypted_blob = result
         .encrypted_blob
@@ -306,7 +315,7 @@ pub async fn pull_raw(
     registry_url: &str,
     auth_token: &str,
     vault_id: &str,
-) -> Result<(String, i32), String> {
+) -> Result<(String, i32), SyncError> {
     pull_raw_with_migration(registry_url, auth_token, vault_id, true).await
 }
 
@@ -317,7 +326,7 @@ pub async fn pull_raw_for_rotation(
     registry_url: &str,
     auth_token: &str,
     vault_id: &str,
-) -> Result<(String, i32), String> {
+) -> Result<(String, i32), SyncError> {
     pull_raw_with_migration(registry_url, auth_token, vault_id, false).await
 }
 
@@ -326,7 +335,7 @@ async fn pull_raw_with_migration(
     auth_token: &str,
     vault_id: &str,
     migrate_legacy: bool,
-) -> Result<(String, i32), String> {
+) -> Result<(String, i32), SyncError> {
     let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
@@ -344,14 +353,16 @@ async fn pull_raw_with_migration(
         .map_err(super::http::network_error)?;
 
     let (status, body) = read_verified_response(response, auth_token).await?;
+    if !status.is_success() {
+        let message = serde_json::from_slice::<PullResponse>(&body)
+            .ok()
+            .and_then(|result| result.error)
+            .unwrap_or_else(|| format!("server error: {status}"));
+        return Err(SyncError::http(status, message));
+    }
+
     let result: PullResponse =
         serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
-
-    if !status.is_success() {
-        return Err(result
-            .error
-            .unwrap_or_else(|| format!("server error: {status}")));
-    }
 
     let encrypted_blob = result
         .encrypted_blob
@@ -463,7 +474,7 @@ pub async fn pull_env(
     auth_token: &str,
     vault_id: &str,
     env_name: &str,
-) -> Result<(HashMap<String, String>, i32), String> {
+) -> Result<(HashMap<String, String>, i32), SyncError> {
     let (raw_json, version) = pull_raw(registry_url, auth_token, vault_id).await?;
 
     // Try multi-env format: {"environments": {"default": {...}, "staging": {...}}}
@@ -710,7 +721,7 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(message) if message == "vault version conflict"));
+        assert!(matches!(result, Err(message) if message.to_string() == "vault version conflict"));
     }
 
     /// 2xx responses without an X-LPM-Signature header must be rejected before
@@ -737,11 +748,11 @@ mod tests {
 
         let err = result.expect_err("missing signature must fail-closed");
         assert!(
-            err.contains(signature::SIGNATURE_HEADER),
+            err.to_string().contains(signature::SIGNATURE_HEADER),
             "error should name the missing header so users can act, got: {err:?}"
         );
         assert!(
-            err.contains("missing"),
+            err.to_string().contains("missing"),
             "error should say the header is missing, got: {err:?}"
         );
     }
@@ -788,7 +799,7 @@ mod tests {
 
         let err = result.expect_err("mismatched signature must fail-closed");
         assert!(
-            err.contains("does not match") || err.contains("tampering"),
+            err.to_string().contains("does not match") || err.to_string().contains("tampering"),
             "mismatch error should be specific, got: {err:?}"
         );
     }
@@ -831,7 +842,7 @@ mod tests {
         .await;
 
         let err = result.expect_err("push should surface the conflict error");
-        assert_eq!(err, "Version conflict");
+        assert_eq!(err.to_string(), "Version conflict");
     }
 
     /// Push success path must verify the signature before returning the
@@ -866,7 +877,7 @@ mod tests {
         .await;
 
         let err = result.expect_err("missing signature on push must fail-closed");
-        assert!(err.contains(signature::SIGNATURE_HEADER));
+        assert!(err.to_string().contains(signature::SIGNATURE_HEADER));
     }
 
     /// `pull` (the higher-level wrapper) must not bypass verification.
@@ -890,7 +901,7 @@ mod tests {
         let result = pull(&server.uri(), "auth-token", "vault-123").await;
 
         let err = result.expect_err("pull must require signature too");
-        assert!(err.contains(signature::SIGNATURE_HEADER));
+        assert!(err.to_string().contains(signature::SIGNATURE_HEADER));
     }
 
     #[cfg(debug_assertions)]
@@ -1144,11 +1155,12 @@ mod tests {
         .expect_err("server 409 must propagate as Err");
 
         assert!(
-            err.contains("Vault exists on the server"),
+            err.to_string().contains("Vault exists on the server"),
             "error sentence must be preserved: {err}"
         );
         assert!(
-            err.contains("Hint: Run `lpm env pull` then retry the push."),
+            err.to_string()
+                .contains("Hint: Run `lpm env pull` then retry the push."),
             "hint must be appended so the user gets the remediation in one shot: {err}"
         );
     }

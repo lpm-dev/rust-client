@@ -1,18 +1,24 @@
 use super::prelude::*;
 
 pub(super) async fn env_log(
+    client: &lpm_registry::RegistryClient,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
-    let result = lpm_vault::sync::get_audit_log(&registry_url, &auth_token, &vault_id, None)
-        .await
-        .map_err(LpmError::Script)?;
+    let result = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            async move {
+                lpm_vault::sync::get_audit_log(&registry_url, &auth_token, &vault_id, None).await
+            }
+        },
+    )
+    .await?;
 
     let entries = result.entries.unwrap_or_default();
 
@@ -45,6 +51,7 @@ pub(super) async fn env_log(
 }
 
 pub(super) async fn env_share(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -75,16 +82,11 @@ pub(super) async fn env_share(
         return Err(LpmError::Script("vault is empty, nothing to share".into()));
     }
 
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
     // Classify the sharing-key state before any wrap work. This
     // refuses the silent-overwrite path on RotationRequired and
     // prompts for step-up reauth on NeedsInitialSet before the
     // organization payload is encrypted for the current member set.
-    let private_key =
-        super::rotation::ensure_sharing_key_ready_for_org_op(&registry_url, &auth_token, "share")
-            .await?;
+    let private_key = super::rotation::ensure_sharing_key_ready_for_org_op(client, "share").await?;
 
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
@@ -98,10 +100,7 @@ pub(super) async fn env_share(
 
     let project_name = lpm_vault::vault_id::read_project_name(project_dir);
     let schema_value = super::sync_payload::build_push_schema_value(config.as_ref());
-    let push_metadata = lpm_vault::sync::PushMetadata {
-        name: Some(&project_name),
-        schema: schema_value.as_ref(),
-    };
+    let expected_version = super::sync_payload::expected_org_sync_version(project_dir, org_slug);
 
     if !json_output {
         output::info_line(install_ui::terminal_line!(
@@ -112,20 +111,36 @@ pub(super) async fn env_share(
         ));
     }
 
-    let result = lpm_vault::sync::push_org(
-        &registry_url,
-        &auth_token,
-        lpm_vault::sync::OrgPushRequest {
-            org_slug,
-            vault_id: &vault_id,
-            secrets_json: &secrets_json,
-            expected_version: super::sync_payload::expected_org_sync_version(project_dir, org_slug),
-            metadata: Some(&push_metadata),
+    let result = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| {
+            let project_name = project_name.clone();
+            let schema_value = schema_value.clone();
+            let vault_id = vault_id.clone();
+            let secrets_json = secrets_json.clone();
+            async move {
+                let push_metadata = lpm_vault::sync::PushMetadata {
+                    name: Some(&project_name),
+                    schema: schema_value.as_ref(),
+                };
+                lpm_vault::sync::push_org(
+                    &registry_url,
+                    &auth_token,
+                    lpm_vault::sync::OrgPushRequest {
+                        org_slug,
+                        vault_id: &vault_id,
+                        secrets_json: &secrets_json,
+                        expected_version,
+                        metadata: Some(&push_metadata),
+                    },
+                    &private_key,
+                )
+                .await
+            }
         },
-        &private_key,
     )
-    .await
-    .map_err(LpmError::Script)?;
+    .await?;
 
     if let Some(version) = result.version {
         lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, version)
@@ -151,17 +166,20 @@ pub(super) async fn env_share(
 
 /// List cloud vaults — personal or org.
 pub(super) async fn vars_list_remote(
+    client: &lpm_registry::RegistryClient,
     org_slug: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let registry_url = lpm_common::resolve_lpm_registry_url();
-    let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
     if let Some(slug) = org_slug {
         // List org vaults
-        let vaults = lpm_vault::sync::list_org_vaults(&registry_url, &auth_token, slug)
-            .await
-            .map_err(LpmError::Script)?;
+        let vaults = super::auth::execute_sync_with_bearer(
+            client,
+            lpm_auth::AuthRequirement::TokenRequired,
+            |registry_url, auth_token| async move {
+                lpm_vault::sync::list_org_vaults(&registry_url, &auth_token, slug).await
+            },
+        )
+        .await?;
 
         if json_output {
             let json: Vec<serde_json::Value> = vaults
@@ -223,9 +241,14 @@ pub(super) async fn vars_list_remote(
     }
 
     // Personal vaults
-    let vaults = lpm_vault::sync::list_remote(&registry_url, &auth_token)
-        .await
-        .map_err(LpmError::Script)?;
+    let vaults = super::auth::execute_sync_with_bearer(
+        client,
+        lpm_auth::AuthRequirement::TokenRequired,
+        |registry_url, auth_token| async move {
+            lpm_vault::sync::list_remote(&registry_url, &auth_token).await
+        },
+    )
+    .await?;
 
     if json_output {
         let json: Vec<serde_json::Value> = vaults
@@ -283,6 +306,7 @@ pub(super) async fn vars_list_remote(
 ///   lpm env diff staging             — local staging vs cloud staging
 ///   lpm env diff staging production  — two local environments
 pub(super) async fn vars_diff(
+    client: &lpm_registry::RegistryClient,
     args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
@@ -314,13 +338,20 @@ pub(super) async fn vars_diff(
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-        let registry_url = lpm_common::resolve_lpm_registry_url();
-        let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
-        let (remote, _version) =
-            lpm_vault::sync::pull_env(&registry_url, &auth_token, &vault_id, &resolved.canonical)
-                .await
-                .map_err(LpmError::Script)?;
+        let canonical = resolved.canonical.clone();
+        let (remote, _version) = super::auth::execute_sync_with_bearer(
+            client,
+            lpm_auth::AuthRequirement::TokenRequired,
+            |registry_url, auth_token| {
+                let vault_id = vault_id.clone();
+                let canonical = canonical.clone();
+                async move {
+                    lpm_vault::sync::pull_env(&registry_url, &auth_token, &vault_id, &canonical)
+                        .await
+                }
+            },
+        )
+        .await?;
 
         (
             format!("{} (local)", resolved.canonical),
@@ -334,12 +365,15 @@ pub(super) async fn vars_diff(
 
         let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-        let registry_url = lpm_common::resolve_lpm_registry_url();
-        let auth_token = super::auth::resolve_lpm_bearer(&registry_url, json_output).await?;
-
-        let (remote, _version) = lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id)
-            .await
-            .map_err(LpmError::Script)?;
+        let (remote, _version) = super::auth::execute_sync_with_bearer(
+            client,
+            lpm_auth::AuthRequirement::TokenRequired,
+            |registry_url, auth_token| {
+                let vault_id = vault_id.clone();
+                async move { lpm_vault::sync::pull(&registry_url, &auth_token, &vault_id).await }
+            },
+        )
+        .await?;
 
         (
             "default (local)".into(),
