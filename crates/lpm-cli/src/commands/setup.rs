@@ -95,13 +95,14 @@ async fn resolve_lpm_bearer(
     let token = session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
-        .map_err(|_| {
-            LpmError::Script(
+        .map_err(|error| match error {
+            LpmError::AuthRequired | LpmError::SessionExpired => LpmError::Script(
                 "no usable bearer is available. Set LPM_TOKEN for this command, or run `lpm login` and retry. LPM CLI can consume LPM_TOKEN directly; `setup ci npmrc` writes a protected literal token for npm-compatible clients."
                     .into(),
-            )
+            ),
+            other => other,
         })?;
-    let source = session.current_source();
+    let source = session.current_source()?;
     let storage = match source {
         Some(lpm_auth::TokenSource::StoredSession | lpm_auth::TokenSource::StoredLegacy) => {
             lpm_auth::auth_storage_status(registry_url)

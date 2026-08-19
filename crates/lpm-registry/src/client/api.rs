@@ -330,7 +330,7 @@ impl RegistryClient {
 
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let bearer = self
-                .current_bearer(AuthPosture::SessionRequired)
+                .current_bearer(AuthPosture::SessionRequired)?
                 .ok_or(LpmError::SessionExpired)?;
             let req = self
                 .http
@@ -387,7 +387,7 @@ impl RegistryClient {
 
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
             let mut req = publish_client.put(&url).json(payload);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired) {
+            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
                 req = req.bearer_auth(bearer);
             }
             if let Some(code) = otp {
@@ -637,7 +637,7 @@ impl RegistryClient {
         };
         self.execute_with_recovery(AuthPosture::SessionRequired, || async {
             let mut req = self.http.for_url(&url).await?.delete(&url);
-            if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired) {
+            if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired)? {
                 req = req.bearer_auth(bearer);
             }
             let response = self.send_with_retry(req).await?;

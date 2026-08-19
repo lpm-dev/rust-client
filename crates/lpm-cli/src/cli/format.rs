@@ -558,6 +558,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::AuthRequired => {
             diagnostic_lines("Authentication required", None, error)
         }
+        lpm_common::LpmError::CredentialStorage(reason) => {
+            diagnostic_lines("Credential storage error", Some(reason), error)
+        }
         lpm_common::LpmError::SudoNotSupported => {
             diagnostic_lines("Sudo is not supported", None, error)
         }
@@ -1387,6 +1390,27 @@ mod tests {
         assert_eq!(
             envelope["error"],
             serde_json::json!("project layout error: project node_modules is a symlink")
+        );
+    }
+
+    #[test]
+    fn credential_storage_error_keeps_its_local_failure_category() {
+        let error = lpm_common::LpmError::CredentialStorage(
+            "failed to read stored access credential".into(),
+        );
+
+        let envelope = json_error_value(&error);
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(
+            envelope["error_code"],
+            serde_json::json!("credential_storage")
+        );
+        assert_eq!(plain[0], "Credential storage error");
+        assert!(
+            envelope.get("next_steps").is_none(),
+            "local storage failures must not tell users to log in again"
         );
     }
 

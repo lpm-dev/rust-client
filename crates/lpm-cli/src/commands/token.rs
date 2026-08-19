@@ -59,7 +59,7 @@ pub async fn run_rotate(
     if let Some(new_token) = body.get("token").and_then(|t| t.as_str()) {
         // Store the new token
         let storage_backend = crate::auth::set_token_with_backend(registry_url, new_token)
-            .map_err(|e| LpmError::Registry(format!("failed to store new token: {e}")))?;
+            .map_err(|e| LpmError::CredentialStorage(format!("failed to store new token: {e}")))?;
         let storage_status = crate::auth::AuthStorageStatus::from_backend(storage_backend);
 
         // Store token expiry metadata.
@@ -113,9 +113,9 @@ pub async fn run_rotate(
 
 fn locally_managed_bearer(client: &RegistryClient) -> Result<String, LpmError> {
     let session = client.session().ok_or(LpmError::AuthRequired)?;
-    let source = session.current_source().ok_or(LpmError::AuthRequired)?;
+    let source = session.current_source()?.ok_or(LpmError::AuthRequired)?;
     if source.is_locally_managed() {
-        return session.current_bearer_lazy().ok_or(LpmError::AuthRequired);
+        return session.current_bearer_lazy()?.ok_or(LpmError::AuthRequired);
     }
 
     Err(LpmError::UnsupportedAuthSource {
@@ -130,7 +130,9 @@ fn clear_rejected_local_session_if_current(
 ) -> Result<(), LpmError> {
     crate::auth::clear_rejected_legacy_session_if_current(registry_url, rejected_access_token)
         .map(|_| ())
-        .map_err(|error| LpmError::Registry(format!("failed to clear rejected token: {error}")))
+        .map_err(|error| {
+            LpmError::CredentialStorage(format!("failed to clear rejected token: {error}"))
+        })
 }
 
 async fn rotate_once(

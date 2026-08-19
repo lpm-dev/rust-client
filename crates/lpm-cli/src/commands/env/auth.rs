@@ -24,7 +24,12 @@ pub(super) async fn resolve_lpm_bearer(
     session
         .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
         .await
-        .map_err(|_| LpmError::Script("not logged in. Run `lpm login` first".into()))
+        .map_err(|error| match error {
+            LpmError::AuthRequired | LpmError::SessionExpired => {
+                LpmError::Script("not logged in. Run `lpm login` first".into())
+            }
+            other => other,
+        })
 }
 
 /// Vault-pairing variant that requires a real interactive login (not
@@ -45,20 +50,23 @@ pub(super) async fn resolve_session_bearer(
         lpm_auth::SessionManager::new(registry_url, None),
         json_output,
     );
-    let has_any_source = session.current_source().is_some();
+    let has_any_source = session.current_source()?.is_some();
     session
         .bearer_string_for(lpm_auth::AuthRequirement::SessionRequired)
         .await
-        .map_err(|_| {
-            if has_any_source {
-                LpmError::Script(
-                    "your current login uses a legacy token that doesn't support vault pairing.\n  \
-                     Run `lpm logout` then `lpm login` to upgrade to a session-based login."
-                        .into(),
-                )
-            } else {
-                LpmError::Script("not logged in. Run `lpm login` first".into())
+        .map_err(|error| match error {
+            LpmError::AuthRequired | LpmError::SessionExpired => {
+                if has_any_source {
+                    LpmError::Script(
+                        "your current login uses a legacy token that doesn't support vault pairing.\n  \
+                         Run `lpm logout` then `lpm login` to upgrade to a session-based login."
+                            .into(),
+                    )
+                } else {
+                    LpmError::Script("not logged in. Run `lpm login` first".into())
+                }
             }
+            other => other,
         })
 }
 

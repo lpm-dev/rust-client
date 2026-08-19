@@ -270,7 +270,7 @@ impl RegistryClient {
                         .header("Accept", "application/json")
                         .header("Content-Type", "application/json")
                         .body(body);
-                    if let Some(bearer) = self.current_bearer(posture) {
+                    if let Some(bearer) = self.current_bearer(posture)? {
                         req = req.bearer_auth(bearer);
                     }
                     self.send_with_retry(req).await
