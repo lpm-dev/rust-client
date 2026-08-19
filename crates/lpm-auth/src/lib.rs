@@ -456,13 +456,21 @@ fn clear_stored_credential(
     keychain_clear: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     with_credential_store_lock(|| {
-        let file_key = kind.file_key(registry);
-        // A failed delete must leave surviving backend bytes unreadable.
-        credential_authority::set(registry, kind, CredentialAuthority::Revoked)
-            .map_err(|error| format!("failed to record credential revocation: {error}"))?;
-        combine_credential_results([keychain_clear(), clear_token_from_file(&file_key)])?;
-        credential_authority::clear(registry, kind)
+        clear_stored_credential_under_store_lock(registry, kind, keychain_clear)
     })
+}
+
+fn clear_stored_credential_under_store_lock(
+    registry: &str,
+    kind: CredentialKind,
+    keychain_clear: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let file_key = kind.file_key(registry);
+    // A failed delete must leave surviving backend bytes unreadable.
+    credential_authority::set(registry, kind, CredentialAuthority::Revoked)
+        .map_err(|error| format!("failed to record credential revocation: {error}"))?;
+    combine_credential_results([keychain_clear(), clear_token_from_file(&file_key)])?;
+    credential_authority::clear(registry, kind)
 }
 
 fn with_credential_store_lock<T>(
@@ -531,27 +539,78 @@ fn combine_clear_results(
 }
 
 pub(crate) fn clear_stored_access_token_unlocked(registry_url: &str) -> Result<(), String> {
+    with_credential_store_lock(|| clear_stored_access_token_under_store_lock(registry_url))
+}
+
+fn clear_stored_access_token_under_store_lock(registry_url: &str) -> Result<(), String> {
     #[cfg(test)]
     {
-        clear_stored_credential(registry_url, CredentialKind::Access, || Ok(()))
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || Ok(()))
     }
 
     #[cfg(not(test))]
     {
-        clear_token(registry_url)
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Access, || {
+            clear_token_from_keychain(registry_url)
+        })
     }
 }
 
 pub(crate) fn clear_stored_refresh_token_unlocked(registry_url: &str) -> Result<(), String> {
+    with_credential_store_lock(|| clear_stored_refresh_token_under_store_lock(registry_url))
+}
+
+fn clear_stored_refresh_token_under_store_lock(registry_url: &str) -> Result<(), String> {
     #[cfg(test)]
     {
-        clear_stored_credential(registry_url, CredentialKind::Refresh, || Ok(()))
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || Ok(()))
     }
 
     #[cfg(not(test))]
     {
-        clear_refresh_token(registry_url)
+        let account = scoped_refresh_account(registry_url);
+        clear_stored_credential_under_store_lock(registry_url, CredentialKind::Refresh, || {
+            clear_password_from_keychain_account(&account)
+        })
     }
+}
+
+pub(crate) fn clear_rejected_refresh_session_if_current(
+    registry_url: &str,
+    rejected_access: Option<&str>,
+    rejected_refresh: &str,
+    access_notice: impl FnOnce(),
+    refresh_notice: impl FnOnce(),
+) -> Result<(), String> {
+    with_credential_store_lock(|| {
+        let current_access = get_stored_credential_with_backend_unlocked(
+            registry_url,
+            CredentialKind::Access,
+            access_notice,
+        )?
+        .map(|credential| credential.token);
+        let current_refresh = get_stored_credential_with_backend_unlocked(
+            registry_url,
+            CredentialKind::Refresh,
+            refresh_notice,
+        )?
+        .map(|credential| credential.token);
+
+        let access_result = if current_access.as_deref() == rejected_access {
+            let expiry_result = clear_token_expiry_checked(registry_url);
+            let access_result = clear_stored_access_token_under_store_lock(registry_url);
+            combine_clear_results(access_result, expiry_result)
+        } else {
+            Ok(())
+        };
+        let refresh_result = if current_refresh.as_deref() == Some(rejected_refresh) {
+            clear_stored_refresh_token_under_store_lock(registry_url)
+        } else {
+            Ok(())
+        };
+
+        combine_clear_results(access_result, refresh_result)
+    })
 }
 
 pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), String> {
@@ -596,20 +655,46 @@ pub fn clear_rejected_legacy_session_if_current(
 ) -> Result<bool, String> {
     let lock_path = session_lock_path(registry_url)?;
     lpm_common::paths::with_exclusive_lock(lock_path, || {
-        let access_is_current =
-            get_stored_credential_with_backend_result(registry_url, CredentialKind::Access, || {})
-                .map_err(lpm_common::LpmError::CredentialStorage)?
-                .is_some_and(|credential| credential.token == rejected_access_token);
-        let refresh_presence = stored_credential_presence(registry_url, CredentialKind::Refresh);
-        if !access_is_current || refresh_presence != StoredCredentialPresence::Absent {
-            return Ok(false);
-        }
+        with_credential_store_lock(|| {
+            let access_is_current = get_stored_credential_with_backend_unlocked(
+                registry_url,
+                CredentialKind::Access,
+                || {},
+            )?
+            .is_some_and(|credential| credential.token == rejected_access_token);
+            let refresh_presence = match get_stored_credential_with_backend_unlocked(
+                registry_url,
+                CredentialKind::Refresh,
+                || {},
+            ) {
+                Ok(Some(_)) => StoredCredentialPresence::Present,
+                Ok(None) => StoredCredentialPresence::Absent,
+                Err(error) => {
+                    tracing::warn!("credential presence unavailable: {error}");
+                    StoredCredentialPresence::Unavailable
+                }
+            };
+            if !access_is_current || refresh_presence != StoredCredentialPresence::Absent {
+                return Ok(false);
+            }
 
-        let expiry_result = clear_token_expiry_checked(registry_url);
-        let access_result = clear_stored_access_token_unlocked(registry_url);
-        combine_credential_results([access_result, expiry_result])
-            .map_err(lpm_common::LpmError::CredentialStorage)?;
-        Ok(true)
+            let expiry_result = clear_token_expiry_checked(registry_url);
+            #[cfg(test)]
+            let access_result = clear_stored_credential_under_store_lock(
+                registry_url,
+                CredentialKind::Access,
+                || Ok(()),
+            );
+            #[cfg(not(test))]
+            let access_result = clear_stored_credential_under_store_lock(
+                registry_url,
+                CredentialKind::Access,
+                || clear_token_from_keychain(registry_url),
+            );
+            combine_credential_results([access_result, expiry_result])?;
+            Ok(true)
+        })
+        .map_err(lpm_common::LpmError::CredentialStorage)
     })
     .map_err(credential_storage_error_message)
 }
@@ -990,17 +1075,6 @@ fn resolve_stored_credential_from_backends(
         }
         KeychainCredentialResolution::Unavailable => {
             Err("keychain credential storage is unavailable".to_owned())
-        }
-    }
-}
-
-fn stored_credential_presence(registry: &str, kind: CredentialKind) -> StoredCredentialPresence {
-    match get_stored_credential_with_backend_result(registry, kind, || {}) {
-        Ok(Some(_)) => StoredCredentialPresence::Present,
-        Ok(None) => StoredCredentialPresence::Absent,
-        Err(error) => {
-            tracing::warn!("credential presence unavailable: {error}");
-            StoredCredentialPresence::Unavailable
         }
     }
 }
@@ -3219,6 +3293,84 @@ mod tests {
             assert_eq!(
                 get_token_from_file(registry).as_deref(),
                 Some("rejected-access-token")
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_token_replacement_survives_conditional_invalidation() {
+        with_temp_home(|home| {
+            let contention_marker = home.join("metadata-lock-contention");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                (
+                    "LPM_TEST_LOCK_CONTENTION_MARKER",
+                    Some(contention_marker.as_os_str().to_owned()),
+                ),
+            ]);
+            let registry = "https://registry.example";
+            set_token(registry, "rejected-access-token").unwrap();
+
+            let expiry_lock_path = token_expiry_lock_path().unwrap();
+            let (metadata_locked_tx, metadata_locked_rx) = std::sync::mpsc::channel();
+            let (release_metadata_tx, release_metadata_rx) = std::sync::mpsc::channel();
+            let metadata_holder = std::thread::spawn(move || {
+                lpm_common::paths::with_exclusive_lock(expiry_lock_path, || {
+                    metadata_locked_tx.send(()).unwrap();
+                    release_metadata_rx.recv().unwrap();
+                    Ok::<_, lpm_common::LpmError>(())
+                })
+                .unwrap();
+            });
+            metadata_locked_rx.recv().unwrap();
+
+            let (invalidation_tx, invalidation_rx) = std::sync::mpsc::channel();
+            let invalidator = std::thread::spawn(move || {
+                invalidation_tx
+                    .send(clear_rejected_legacy_session_if_current(
+                        registry,
+                        "rejected-access-token",
+                    ))
+                    .unwrap();
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !contention_marker.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                contention_marker.exists(),
+                "invalidation did not reach the metadata lock"
+            );
+
+            let (replacement_tx, replacement_rx) = std::sync::mpsc::channel();
+            let replacement = std::thread::spawn(move || {
+                replacement_tx
+                    .send(set_token(registry, "replacement-access-token"))
+                    .unwrap();
+            });
+            let replacement_finished_early =
+                match replacement_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                    Ok(result) => {
+                        result.unwrap();
+                        true
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(error) => panic!("replacement writer disconnected: {error}"),
+                };
+
+            release_metadata_tx.send(()).unwrap();
+            metadata_holder.join().unwrap();
+            assert!(invalidation_rx.recv().unwrap().unwrap());
+            invalidator.join().unwrap();
+            if !replacement_finished_early {
+                replacement_rx.recv().unwrap().unwrap();
+            }
+            replacement.join().unwrap();
+
+            assert_eq!(
+                get_stored_access_token(registry).as_deref(),
+                Some("replacement-access-token")
             );
         });
     }
