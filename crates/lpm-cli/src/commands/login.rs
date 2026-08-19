@@ -17,10 +17,13 @@ struct CliExchangeSession {
 fn parse_cli_exchange_session(body: &[u8]) -> Result<CliExchangeSession, LpmError> {
     let session: CliExchangeSession = serde_json::from_slice(body)
         .map_err(|error| LpmError::Registry(format!("exchange response parse error: {error}")))?;
-    if session.token.trim().is_empty()
-        || session.refresh_token.trim().is_empty()
-        || session.expires_in == 0
-        || chrono::DateTime::parse_from_rfc3339(&session.expires_at).is_err()
+    if session.expires_in == 0
+        || lpm_auth::validate_refresh_backed_session(
+            &session.token,
+            &session.refresh_token,
+            &session.expires_at,
+        )
+        .is_err()
     {
         return Err(LpmError::Registry(
             "exchange response did not contain a complete refresh session".to_string(),
@@ -679,7 +682,7 @@ mod tests {
             "token": "lpm_access_token",
             "refreshToken": "lpmrt_refresh_token",
             "expiresIn": 3600,
-            "expiresAt": "2030-01-01T00:00:00Z",
+            "expiresAt": "2099-01-01T00:00:00Z",
         })
     }
 
@@ -794,6 +797,18 @@ mod tests {
     }
 
     #[test]
+    fn exchange_response_rejects_an_already_expired_session() {
+        let mut response = valid_exchange_session();
+        response["expiresAt"] = serde_json::json!("2000-01-01T00:00:00Z");
+        let body = serde_json::to_vec(&response).expect("serialize expired session response");
+
+        assert!(
+            parse_cli_exchange_session(&body).is_err(),
+            "an already-expired exchange response must not become the active session"
+        );
+    }
+
+    #[test]
     fn exchange_response_accepts_a_complete_refresh_session() {
         let body =
             serde_json::to_vec(&valid_exchange_session()).expect("serialize session response");
@@ -802,7 +817,7 @@ mod tests {
         assert_eq!(session.token, "lpm_access_token");
         assert_eq!(session.refresh_token, "lpmrt_refresh_token");
         assert_eq!(session.expires_in, 3600);
-        assert_eq!(session.expires_at, "2030-01-01T00:00:00Z");
+        assert_eq!(session.expires_at, "2099-01-01T00:00:00Z");
     }
 
     #[test]

@@ -815,6 +815,11 @@ impl SessionManager {
         let data = parse_capped_refresh_response(resp).await?;
         crate::validate_refresh_backed_session(&data.token, &data.refresh_token, &data.expires_at)
             .map_err(LpmError::Registry)?;
+        if data.refresh_token == refresh_token {
+            return Err(LpmError::Registry(
+                "refresh response reused the consumed refresh credential".to_string(),
+            ));
+        }
 
         Ok(data)
     }
@@ -2183,6 +2188,32 @@ mod refresh_http_tests {
     }
 
     #[tokio::test]
+    async fn refresh_rejects_success_that_reuses_consumed_refresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-original",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server.uri()).refresh_now().await;
+
+        assert!(
+            result.is_err(),
+            "a rotating refresh response must replace the consumed refresh token: {result:?}"
+        );
+        assert_eq!(
+            crate::get_refresh_token(&server.uri()).as_deref(),
+            Some("rt-original")
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_rejects_success_with_empty_access_token() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -2223,6 +2254,32 @@ mod refresh_http_tests {
         assert!(
             result.is_err(),
             "a malformed access-token expiry must fail closed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_success_with_expired_session() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "at-rotated",
+                "refreshToken": "rt-rotated",
+                "expiresAt": "2000-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let _isolated = isolate_test_env();
+        let result = manager_for(&server.uri()).refresh_now().await;
+
+        assert!(
+            result.is_err(),
+            "an already-expired refresh response must not become the active session: {result:?}"
+        );
+        assert_eq!(
+            crate::get_refresh_token(&server.uri()).as_deref(),
+            Some("rt-original")
         );
     }
 
