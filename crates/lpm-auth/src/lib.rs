@@ -505,7 +505,6 @@ fn clear_stored_token(registry_url: &str) -> Result<(), String> {
     })
 }
 
-#[cfg(not(test))]
 fn combine_clear_results(
     keychain_result: Result<(), String>,
     file_result: Result<(), String>,
@@ -518,34 +517,62 @@ fn combine_clear_results(
     }
 }
 
+pub(crate) fn clear_stored_access_token_unlocked(registry_url: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        clear_stored_credential(registry_url, CredentialKind::Access, || Ok(()))
+    }
+
+    #[cfg(not(test))]
+    {
+        clear_token(registry_url)
+    }
+}
+
+pub(crate) fn clear_stored_refresh_token_unlocked(registry_url: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        clear_stored_credential(registry_url, CredentialKind::Refresh, || Ok(()))
+    }
+
+    #[cfg(not(test))]
+    {
+        clear_refresh_token(registry_url)
+    }
+}
+
+pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), String> {
+    if let Some(marker) = dirs::home_dir().map(|h| h.join(".lpm").join(".token-check")) {
+        let _ = std::fs::remove_file(marker);
+    }
+
+    let access_result = clear_stored_access_token_unlocked(registry_url);
+    let refresh_result = clear_stored_refresh_token_unlocked(registry_url);
+    clear_token_expiry(registry_url);
+    combine_clear_results(access_result, refresh_result)
+}
+
 /// Clear all local login state for a registry.
 ///
 /// This removes the access token, refresh token, and any stored session-expiry
 /// metadata so startup cannot silently restore a session after logout.
 pub fn clear_login_state(registry_url: &str) -> Result<(), String> {
-    // Best-effort cleanup of the legacy 24h validation marker file.
-    // Keeps logout idempotent on machines that still have the file.
-    if let Some(marker) = dirs::home_dir().map(|h| h.join(".lpm").join(".token-check")) {
-        let _ = std::fs::remove_file(marker);
-    }
+    let lock_path = session_lock_path(registry_url)?;
+    lpm_common::paths::with_exclusive_lock(lock_path, || {
+        clear_login_state_unlocked(registry_url).map_err(lpm_common::LpmError::CredentialStorage)
+    })
+    .map_err(credential_storage_error_message)
+}
 
-    #[cfg(test)]
-    let result = {
-        clear_stored_credential(registry_url, CredentialKind::Access, || Ok(()))?;
-        clear_stored_credential(registry_url, CredentialKind::Refresh, || Ok(()))?;
-        clear_token_expiry(registry_url);
-        Ok(())
-    };
-
-    #[cfg(not(test))]
-    let result = {
-        let access_result = clear_token(registry_url);
-        let refresh_result = clear_refresh_token(registry_url);
-        clear_token_expiry(registry_url);
-        combine_clear_results(access_result, refresh_result)
-    };
-
-    result
+/// Asynchronously clear all local login state under the per-registry session
+/// lock used by access-token refresh and login persistence.
+pub async fn clear_login_state_async(registry_url: &str) -> Result<(), String> {
+    let lock_path = session_lock_path(registry_url)?;
+    lpm_common::paths::with_exclusive_lock_async(lock_path, async {
+        clear_login_state_unlocked(registry_url).map_err(lpm_common::LpmError::CredentialStorage)
+    })
+    .await
+    .map_err(credential_storage_error_message)
 }
 
 /// Clear a server-rejected legacy session only if its access credential is
@@ -557,13 +584,17 @@ pub fn clear_rejected_legacy_session_if_current(
     let lock_path = session_lock_path(registry_url)?;
     lpm_common::paths::with_exclusive_lock(lock_path, || {
         let access_is_current =
-            get_stored_access_token(registry_url).as_deref() == Some(rejected_access_token);
+            get_stored_credential_with_backend_result(registry_url, CredentialKind::Access, || {})
+                .map_err(lpm_common::LpmError::CredentialStorage)?
+                .is_some_and(|credential| credential.token == rejected_access_token);
         let refresh_presence = stored_credential_presence(registry_url, CredentialKind::Refresh);
         if !access_is_current || refresh_presence != StoredCredentialPresence::Absent {
             return Ok(false);
         }
 
-        clear_login_state(registry_url).map_err(lpm_common::LpmError::CredentialStorage)?;
+        clear_token_expiry(registry_url);
+        clear_stored_access_token_unlocked(registry_url)
+            .map_err(lpm_common::LpmError::CredentialStorage)?;
         Ok(true)
     })
     .map_err(credential_storage_error_message)
