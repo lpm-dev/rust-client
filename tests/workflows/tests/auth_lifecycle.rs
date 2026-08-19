@@ -694,7 +694,7 @@ async fn invalid_access_token_entry_reports_failure_and_preserves_credential_sto
 }
 
 #[tokio::test]
-async fn malformed_session_expiry_metadata_blocks_refresh_and_preserves_session_state() {
+async fn malformed_session_expiry_metadata_is_reported_before_authenticated_request() {
     let project =
         TempProject::empty(r#"{"name":"auth-corrupt-expiry-refresh-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -707,7 +707,7 @@ async fn malformed_session_expiry_metadata_blocks_refresh_and_preserves_session_
         0,
     )
     .await;
-    mock.with_authenticated_whoami_error("stale-access-token", 401, 1)
+    mock.with_authenticated_whoami_error("stale-access-token", 401, 0)
         .await;
 
     seed_sessions(
