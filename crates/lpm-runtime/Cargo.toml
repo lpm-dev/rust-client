@@ -9,6 +9,7 @@ description = "Runtime version management for LPM — download, install, and aut
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-extractor = { workspace = true }
 lpm-http = { workspace = true }
 lpm-semver = { workspace = true }
 reqwest = { workspace = true }

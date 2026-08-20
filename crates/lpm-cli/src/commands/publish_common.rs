@@ -206,13 +206,30 @@ fn is_authored_skill_namespace_path(path: &Path) -> bool {
 // Tarball creation
 // ---------------------------------------------------------------------------
 
-/// Hard ceiling on the uncompressed tarball payload, applied
-/// incrementally while assembling. M49: pre-fix the 500 MB cap was
-/// only enforced AFTER the full `Vec<u8>` was built; a malicious or
-/// generated huge sparse file would exhaust memory before the cap
-/// fired. 500 MB matches the existing post-build limit in
-/// `publish.rs` (downstream `MAX_TARBALL_SIZE`).
-const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+/// Maximum size of the complete uncompressed tar stream, including headers,
+/// padding, metadata, and end markers.
+pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+
+pub(crate) const MAX_PUBLISH_ARCHIVE_ENTRIES: usize = 100_000;
+
+pub(crate) const MAX_PUBLISH_ARCHIVE_PATH_DEPTH: usize = 256;
+
+fn publish_tar_read_limits() -> lpm_extractor::TarArchiveLimits {
+    lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_UNCOMPRESSED_TARBALL_BYTES,
+        max_path_depth: MAX_PUBLISH_ARCHIVE_PATH_DEPTH,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_PUBLISH_ARCHIVE_ENTRIES)
+    }
+}
+
+#[cfg(test)]
+fn publish_tar_read_limits_with_entry_limit(max_entries: usize) -> lpm_extractor::TarArchiveLimits {
+    lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_UNCOMPRESSED_TARBALL_BYTES,
+        max_path_depth: MAX_PUBLISH_ARCHIVE_PATH_DEPTH,
+        ..lpm_extractor::TarArchiveLimits::new(max_entries)
+    }
+}
 
 /// Per-file size ceiling. The npm registry's per-file cap is well
 /// below 500 MB in practice — anything past that is almost always a
@@ -249,6 +266,7 @@ pub(crate) fn prepare_tarball(
         options,
         &source_dir,
         &canonical_root,
+        MAX_UNCOMPRESSED_TARBALL_BYTES,
         || {},
         |_| {},
     )
@@ -265,6 +283,7 @@ pub(crate) fn prepare_tarball_from_source_root(
         options,
         source_dir,
         source_root_path,
+        MAX_UNCOMPRESSED_TARBALL_BYTES,
         || {},
         |_| {},
     )
@@ -286,6 +305,7 @@ fn prepare_tarball_with_open_hook(
         options,
         &source_dir,
         &canonical_root,
+        MAX_UNCOMPRESSED_TARBALL_BYTES,
         || {},
         before_candidate_open,
     )
@@ -308,8 +328,31 @@ fn prepare_tarball_with_collection_and_open_hook(
         options,
         &source_dir,
         &canonical_root,
+        MAX_UNCOMPRESSED_TARBALL_BYTES,
         before_file_collection,
         before_candidate_open,
+    )
+}
+
+#[cfg(test)]
+fn prepare_tarball_with_archive_limit(
+    project_dir: &Path,
+    pkg_json: &serde_json::Value,
+    options: TarballOptions<'_>,
+    max_archive_bytes: u64,
+) -> Result<PreparedTarball, LpmError> {
+    let canonical_root = project_dir
+        .canonicalize()
+        .map_err(|e| LpmError::Registry(format!("cannot canonicalize project directory: {e}")))?;
+    let source_dir = open_tarball_source_root(&canonical_root)?;
+    prepare_tarball_with_source_root_and_open_hook(
+        pkg_json,
+        options,
+        &source_dir,
+        &canonical_root,
+        max_archive_bytes,
+        || {},
+        |_| {},
     )
 }
 
@@ -318,6 +361,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
     options: TarballOptions<'_>,
     project_source_dir: &Dir,
     canonical_root: &Path,
+    max_archive_bytes: u64,
     before_file_collection: impl FnOnce(),
     mut before_candidate_open: impl FnMut(&str),
 ) -> Result<PreparedTarball, LpmError> {
@@ -338,24 +382,30 @@ fn prepare_tarball_with_source_root_and_open_hook(
         collect_package_files(pkg_json, project_source_dir, restrict_authored_skills)?;
     let mut candidates = Vec::with_capacity(project_files.len());
     for file in project_files {
-        candidates.push(TarballCandidate {
-            source_path: PathBuf::from(&file.path),
-            source_root: Arc::clone(&project_source_root),
-            archive_path: file.path,
-            expected_content_sha256: None,
-        });
+        push_tarball_candidate(
+            &mut candidates,
+            TarballCandidate {
+                source_path: PathBuf::from(&file.path),
+                source_root: Arc::clone(&project_source_root),
+                archive_path: file.path,
+                expected_content_sha256: None,
+            },
+        )?;
     }
     if options.package_json_content.is_some()
         && !candidates
             .iter()
             .any(|candidate| candidate.archive_path == "package.json")
     {
-        candidates.push(TarballCandidate {
-            source_path: PathBuf::from("package.json"),
-            source_root: Arc::clone(&project_source_root),
-            archive_path: "package.json".to_string(),
-            expected_content_sha256: None,
-        });
+        push_tarball_candidate(
+            &mut candidates,
+            TarballCandidate {
+                source_path: PathBuf::from("package.json"),
+                source_root: Arc::clone(&project_source_root),
+                archive_path: "package.json".to_string(),
+                expected_content_sha256: None,
+            },
+        )?;
     }
     for retained in options
         .content_overrides
@@ -363,12 +413,15 @@ fn prepare_tarball_with_source_root_and_open_hook(
         .filter(|retained| retained.include_if_missing)
     {
         let source_path = validate_content_override_path(retained.path)?;
-        candidates.push(TarballCandidate {
-            source_path,
-            source_root: Arc::clone(&project_source_root),
-            archive_path: retained.path.to_string(),
-            expected_content_sha256: None,
-        });
+        push_tarball_candidate(
+            &mut candidates,
+            TarballCandidate {
+                source_path,
+                source_root: Arc::clone(&project_source_root),
+                archive_path: retained.path.to_string(),
+                expected_content_sha256: None,
+            },
+        )?;
     }
     candidates.retain(|candidate| {
         !options
@@ -385,12 +438,15 @@ fn prepare_tarball_with_source_root_and_open_hook(
                     .any(|skill| skill.path == candidate.archive_path)
         });
         for skill in validated_authored_skills {
-            candidates.push(TarballCandidate {
-                source_path: validate_content_override_path(skill.path)?,
-                source_root: Arc::clone(&project_source_root),
-                archive_path: skill.path.to_string(),
-                expected_content_sha256: None,
-            });
+            push_tarball_candidate(
+                &mut candidates,
+                TarballCandidate {
+                    source_path: validate_content_override_path(skill.path)?,
+                    source_root: Arc::clone(&project_source_root),
+                    archive_path: skill.path.to_string(),
+                    expected_content_sha256: None,
+                },
+            )?;
         }
     }
     collect_bundled_dependencies(
@@ -436,7 +492,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
         }
     }
     {
-        let mut builder = tar::Builder::new(&mut tar_data);
+        let limited = ArchiveSizeWriter::new(&mut tar_data, max_archive_bytes);
+        let mut builder = tar::Builder::new(limited);
         let mut open_source_root: Option<(Arc<TarballSourceRoot>, Dir)> = None;
 
         for candidate in candidates {
@@ -569,6 +626,55 @@ fn prepare_tarball_with_source_root_and_open_hook(
         secret_scan,
         readme: readme.map(|(_, content)| content),
     })
+}
+
+struct ArchiveSizeWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W> ArchiveSizeWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for ArchiveSizeWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let requested = buffer.len() as u64;
+        if requested > self.limit.saturating_sub(self.written) {
+            return Err(std::io::Error::other(format!(
+                "publish archive exceeds the {}-byte limit after tar headers, padding, and end markers",
+                self.limit
+            )));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn push_tarball_candidate(
+    candidates: &mut Vec<TarballCandidate>,
+    candidate: TarballCandidate,
+) -> Result<(), LpmError> {
+    if candidates.len() >= MAX_PUBLISH_ARCHIVE_ENTRIES {
+        return Err(LpmError::Registry(format!(
+            "publish archive exceeds the {MAX_PUBLISH_ARCHIVE_ENTRIES}-entry limit"
+        )));
+    }
+    validate_publish_archive_path(Path::new(&candidate.archive_path))?;
+    candidates.push(candidate);
+    Ok(())
 }
 
 impl TarballSourceRoot {
@@ -864,10 +970,13 @@ fn collect_package_files(
     if let Some(metadata) = safe_cap_metadata(source_dir, Path::new("package.json"))?
         && metadata.is_file()
     {
-        result.push(TarballFile {
-            path: "package.json".to_string(),
-            size: metadata.len(),
-        });
+        push_tarball_file(
+            &mut result,
+            TarballFile {
+                path: "package.json".to_string(),
+                size: metadata.len(),
+            },
+        )?;
     }
 
     if let Some(files_arr) = pkg_json.get("files").and_then(|f| f.as_array()) {
@@ -907,10 +1016,13 @@ fn collect_package_files(
             && metadata.is_file()
             && !result.iter().any(|f| f.path.eq_ignore_ascii_case(extra))
         {
-            result.push(TarballFile {
-                path: extra.to_string(),
-                size: metadata.len(),
-            });
+            push_tarball_file(
+                &mut result,
+                TarballFile {
+                    path: extra.to_string(),
+                    size: metadata.len(),
+                },
+            )?;
         }
     }
 
@@ -920,6 +1032,46 @@ fn collect_package_files(
     result.retain(|f| seen.insert(f.path.clone()));
 
     Ok(result)
+}
+
+fn push_tarball_file(result: &mut Vec<TarballFile>, file: TarballFile) -> Result<(), LpmError> {
+    if result.len() >= MAX_PUBLISH_ARCHIVE_ENTRIES {
+        return Err(LpmError::Registry(format!(
+            "publish archive exceeds the {MAX_PUBLISH_ARCHIVE_ENTRIES}-entry limit"
+        )));
+    }
+    validate_publish_archive_path(Path::new(&file.path))?;
+    result.push(file);
+    Ok(())
+}
+
+fn validate_publish_archive_path(path: &Path) -> Result<(), LpmError> {
+    const TAR_ROOT_COMPONENTS: usize = 1;
+    const TAR_ROOT_PREFIX_BYTES: usize = "package/".len();
+
+    let depth = path
+        .components()
+        .count()
+        .saturating_add(TAR_ROOT_COMPONENTS);
+    if depth > MAX_PUBLISH_ARCHIVE_PATH_DEPTH {
+        return Err(LpmError::Registry(format!(
+            "publish archive exceeds the {MAX_PUBLISH_ARCHIVE_PATH_DEPTH}-component nesting limit: {}",
+            path.display()
+        )));
+    }
+    let path_bytes = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_add(TAR_ROOT_PREFIX_BYTES);
+    if path_bytes > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES {
+        return Err(LpmError::Registry(format!(
+            "publish archive path exceeds the {}-byte limit: {}",
+            lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES,
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 enum PublishPatternSegment {
@@ -979,6 +1131,7 @@ fn collect_explicit_pattern(
     restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
+    validate_publish_archive_path(relative_dir)?;
     let Some(segment) = segments.get(index) else {
         return collect_cap_directory(directory, relative_dir, restrict_authored_skills, result);
     };
@@ -1086,10 +1239,13 @@ fn collect_pattern_entry(
     let last = index + 1 == segments.len();
     if metadata.is_file() {
         if last && archive_path != "package.json" {
-            result.push(TarballFile {
-                path: archive_path,
-                size: metadata.len(),
-            });
+            push_tarball_file(
+                result,
+                TarballFile {
+                    path: archive_path,
+                    size: metadata.len(),
+                },
+            )?;
         }
         return Ok(());
     }
@@ -1221,6 +1377,7 @@ fn collect_cap_directory(
     restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
+    validate_publish_archive_path(relative_dir)?;
     for entry in directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1237,10 +1394,13 @@ fn collect_cap_directory(
         }
         if metadata.is_file() {
             if archive_path != "package.json" {
-                result.push(TarballFile {
-                    path: archive_path,
-                    size: metadata.len(),
-                });
+                push_tarball_file(
+                    result,
+                    TarballFile {
+                        path: archive_path,
+                        size: metadata.len(),
+                    },
+                )?;
             }
         } else if metadata.is_dir() {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
@@ -1360,10 +1520,13 @@ fn collect_implicit_lpm_files(
                 Path::new(".lpm/skills"),
             )
         {
-            result.push(TarballFile {
-                path: portable_relative(&relative),
-                size: metadata.len(),
-            });
+            push_tarball_file(
+                result,
+                TarballFile {
+                    path: portable_relative(&relative),
+                    size: metadata.len(),
+                },
+            )?;
         }
     }
     Ok(())
@@ -1377,6 +1540,7 @@ fn collect_implicit_directory(
     depth: usize,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
+    validate_publish_archive_path(relative_dir)?;
     let matcher = ignore_file
         .map(|name| load_cap_ignore(directory, relative_dir, name))
         .transpose()?
@@ -1418,10 +1582,13 @@ fn collect_implicit_directory(
         {
             let archive_path = portable_relative(&relative);
             if archive_path != "package.json" {
-                result.push(TarballFile {
-                    path: archive_path,
-                    size: metadata.len(),
-                });
+                push_tarball_file(
+                    result,
+                    TarballFile {
+                        path: archive_path,
+                        size: metadata.len(),
+                    },
+                )?;
             }
         }
     }
@@ -1508,6 +1675,7 @@ fn collect_exact_publish_path(
     restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
+    validate_publish_archive_path(relative)?;
     let mut components = relative.components().peekable();
     let mut directory = source_dir.try_clone().map_err(LpmError::Io)?;
     let mut current = PathBuf::new();
@@ -1526,10 +1694,13 @@ fn collect_exact_publish_path(
             if metadata.is_file() {
                 let archive_path = portable_relative(&current);
                 if archive_path != "package.json" {
-                    result.push(TarballFile {
-                        path: archive_path,
-                        size: metadata.len(),
-                    });
+                    push_tarball_file(
+                        result,
+                        TarballFile {
+                            path: archive_path,
+                            size: metadata.len(),
+                        },
+                    )?;
                 }
             } else if metadata.is_dir() {
                 let child = open_cap_directory_entry(&directory, name, &current)?;
@@ -2104,6 +2275,8 @@ fn collect_bundle_tree(
     manifest_sha256: &[u8; 32],
     result: &mut Vec<TarballCandidate>,
 ) -> Result<(), LpmError> {
+    validate_publish_archive_path(relative_dir)?;
+    validate_publish_archive_path(Path::new(archive_root))?;
     for entry in directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
@@ -2137,13 +2310,16 @@ fn collect_bundle_tree(
             )?;
         } else if metadata.is_file() {
             let portable = portable_relative(&relative);
-            result.push(TarballCandidate {
-                source_path: relative.clone(),
-                source_root: Arc::clone(source_root),
-                archive_path: format!("{archive_root}/{portable}"),
-                expected_content_sha256: (relative == Path::new("package.json"))
-                    .then_some(*manifest_sha256),
-            });
+            push_tarball_candidate(
+                result,
+                TarballCandidate {
+                    source_path: relative.clone(),
+                    source_root: Arc::clone(source_root),
+                    archive_path: format!("{archive_root}/{portable}"),
+                    expected_content_sha256: (relative == Path::new("package.json"))
+                        .then_some(*manifest_sha256),
+                },
+            )?;
         }
     }
     Ok(())
@@ -2203,55 +2379,56 @@ pub(crate) fn rewrite_tarball_name_for_publish(
         scan_secrets.then(lpm_security::behavioral::secrets::SecretScanBudget::for_operation);
     let mut package_json_size = None;
     {
-        let mut archive = tar::Archive::new(tar_data.as_slice());
-        let mut builder = tar::Builder::new(&mut new_tar_data);
+        let limited = ArchiveSizeWriter::new(&mut new_tar_data, MAX_UNCOMPRESSED_TARBALL_BYTES);
+        let mut builder = tar::Builder::new(limited);
 
-        for entry_result in archive.entries().map_err(LpmError::Io)? {
-            let mut entry = entry_result.map_err(LpmError::Io)?;
-            let path = entry
-                .path()
-                .map_err(LpmError::Io)?
-                .to_string_lossy()
-                .to_string();
+        lpm_extractor::visit_tar_archive(
+            tar_data.as_slice(),
+            publish_tar_read_limits(),
+            |mut entry| {
+                let path = entry.path().to_string_lossy().to_string();
 
-            let mut content = Vec::new();
-            entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).map_err(LpmError::Io)?;
 
-            if path == "package/package.json" {
-                let mut pkg =
+                if path == "package/package.json" {
+                    let mut pkg =
                     serde_json::from_slice::<serde_json::Value>(&content).map_err(|error| {
                         LpmError::Registry(format!(
                             "failed to parse package.json while preparing target tarball: {error}"
                         ))
                     })?;
-                pkg["name"] = serde_json::json!(target_name);
-                content = serde_json::to_vec_pretty(&pkg).map_err(|error| {
-                    LpmError::Registry(format!(
-                        "failed to serialize package.json for target {target_name}: {error}"
-                    ))
-                })?;
-                package_json_size = Some(content.len() as u64);
-            }
+                    pkg["name"] = serde_json::json!(target_name);
+                    content = serde_json::to_vec_pretty(&pkg).map_err(|error| {
+                        LpmError::Registry(format!(
+                            "failed to serialize package.json for target {target_name}: {error}"
+                        ))
+                    })?;
+                    package_json_size = Some(content.len() as u64);
+                }
 
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(entry.header().mode().unwrap_or(0o644));
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &path, content.as_slice())
-                .map_err(LpmError::Io)?;
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(entry.header().mode().unwrap_or(0o644));
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, &path, content.as_slice())
+                    .map_err(LpmError::Io)?;
 
-            if let Some((scan, budget)) = secret_scan.as_mut().zip(secret_scan_budget.as_mut()) {
-                let scan_path = path.strip_prefix("package/").unwrap_or(&path);
-                let mut file_scan =
-                    lpm_security::behavioral::secrets::scan_file_content_with_budget(
-                        &content, scan_path, budget,
-                    );
-                ensure_publish_secret_scan_complete(&file_scan)?;
-                scan.matches.append(&mut file_scan.matches);
-                scan.files_scanned += file_scan.files_scanned;
-            }
-        }
+                if let Some((scan, budget)) = secret_scan.as_mut().zip(secret_scan_budget.as_mut())
+                {
+                    let scan_path = path.strip_prefix("package/").unwrap_or(&path);
+                    let mut file_scan =
+                        lpm_security::behavioral::secrets::scan_file_content_with_budget(
+                            &content, scan_path, budget,
+                        );
+                    ensure_publish_secret_scan_complete(&file_scan)?;
+                    scan.matches.append(&mut file_scan.matches);
+                    scan.files_scanned += file_scan.files_scanned;
+                }
+                Ok(std::ops::ControlFlow::<()>::Continue(()))
+            },
+        )?;
 
         builder.finish().map_err(LpmError::Io)?;
     }
@@ -2370,22 +2547,20 @@ pub fn rewrite_workspace_deps_in_tarball(
         .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
 
     let rewritten_package_json = {
-        let mut archive = tar::Archive::new(tar_data.as_slice());
         let mut rewritten = None;
-        for entry_result in archive.entries().map_err(LpmError::Io)? {
-            let mut entry = entry_result.map_err(LpmError::Io)?;
-            let path = entry
-                .path()
-                .map_err(LpmError::Io)?
-                .to_string_lossy()
-                .to_string();
-            if path == "package/package.json" {
-                let mut content = Vec::new();
-                entry.read_to_end(&mut content).map_err(LpmError::Io)?;
-                rewritten = rewrite_workspace_deps_in_package_json(&content, workspace)?;
-                break;
-            }
-        }
+        lpm_extractor::visit_tar_archive(
+            tar_data.as_slice(),
+            publish_tar_read_limits(),
+            |mut entry| {
+                if entry.path() == Path::new("package/package.json") {
+                    let mut content = Vec::new();
+                    entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+                    rewritten = rewrite_workspace_deps_in_package_json(&content, workspace)?;
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )?;
         rewritten
     };
 
@@ -2396,32 +2571,32 @@ pub fn rewrite_workspace_deps_in_tarball(
     // Rewrite: decompress → patch → recompress
     let mut new_tar_data = Vec::new();
     {
-        let mut archive = tar::Archive::new(tar_data.as_slice());
-        let mut builder = tar::Builder::new(&mut new_tar_data);
+        let limited = ArchiveSizeWriter::new(&mut new_tar_data, MAX_UNCOMPRESSED_TARBALL_BYTES);
+        let mut builder = tar::Builder::new(limited);
 
-        for entry_result in archive.entries().map_err(LpmError::Io)? {
-            let mut entry = entry_result.map_err(LpmError::Io)?;
-            let path = entry
-                .path()
-                .map_err(LpmError::Io)?
-                .to_string_lossy()
-                .to_string();
+        lpm_extractor::visit_tar_archive(
+            tar_data.as_slice(),
+            publish_tar_read_limits(),
+            |mut entry| {
+                let path = entry.path().to_string_lossy().to_string();
 
-            let mut content = Vec::new();
-            entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).map_err(LpmError::Io)?;
 
-            if path == "package/package.json" {
-                std::mem::swap(&mut content, &mut rewritten_package_json);
-            }
+                if path == "package/package.json" {
+                    std::mem::swap(&mut content, &mut rewritten_package_json);
+                }
 
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(entry.header().mode().unwrap_or(0o644));
-            header.set_cksum();
-            builder
-                .append_data(&mut header, &path, content.as_slice())
-                .map_err(LpmError::Io)?;
-        }
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(entry.header().mode().unwrap_or(0o644));
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, &path, content.as_slice())
+                    .map_err(LpmError::Io)?;
+                Ok(std::ops::ControlFlow::<()>::Continue(()))
+            },
+        )?;
 
         builder.finish().map_err(LpmError::Io)?;
     }
@@ -2726,6 +2901,244 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"package.json"));
         assert!(paths.contains(&"index.js"));
+    }
+
+    #[test]
+    fn publish_collection_rejects_more_than_100000_archive_entries() {
+        let project = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..=MAX_PUBLISH_ARCHIVE_ENTRIES)
+            .map(|index| format!("files/{index}"))
+            .collect();
+        let overrides: Vec<_> = paths
+            .iter()
+            .map(|path| PublishContentOverride {
+                path,
+                content: b"",
+                include_if_missing: true,
+            })
+            .collect();
+        let manifest = serde_json::json!({"files": []});
+
+        let error = match prepare_tarball(
+            project.path(),
+            &manifest,
+            TarballOptions {
+                content_overrides: &overrides,
+                ..TarballOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("publish accepted too many archive entries"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("entry"),
+            "expected entry-count limit error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn publish_collection_rejects_source_paths_deeper_than_256_components() {
+        let project = tempfile::tempdir().unwrap();
+        let mut directory = project.path().to_path_buf();
+        for _ in 0..MAX_PUBLISH_ARCHIVE_PATH_DEPTH {
+            directory.push("a");
+            std::fs::create_dir(&directory).unwrap();
+        }
+        std::fs::write(directory.join("index.js"), "value").unwrap();
+        let manifest = serde_json::json!({});
+
+        let error = match prepare_tarball(project.path(), &manifest, TarballOptions::default()) {
+            Ok(_) => panic!("publish accepted an excessively deep source path"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn publish_read_limit_counts_semantic_entries_independently_of_metadata_allowance() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for path in ["package/a", "package/b", "package/c"] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, std::io::empty())
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let error = lpm_extractor::visit_tar_archive(
+            tar_data.as_slice(),
+            publish_tar_read_limits_with_entry_limit(2),
+            |_| Ok(std::ops::ControlFlow::<()>::Continue(())),
+        )
+        .expect_err("publish read limit accepted too many semantic entries");
+
+        assert!(
+            error.to_string().contains("entry"),
+            "expected semantic entry-count error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn publish_rejects_source_path_that_package_prefix_pushes_past_depth_limit() {
+        let project = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..MAX_PUBLISH_ARCHIVE_PATH_DEPTH)
+            .map(|index| format!("p{index}"))
+            .collect();
+        let path = paths.join("/");
+        let override_file = PublishContentOverride {
+            path: &path,
+            content: b"",
+            include_if_missing: true,
+        };
+
+        let error = match prepare_tarball(
+            project.path(),
+            &serde_json::json!({"files": []}),
+            TarballOptions {
+                content_overrides: std::slice::from_ref(&override_file),
+                ..TarballOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("package prefix created an archive path past the nesting limit"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn publish_rejects_archive_paths_over_the_shared_byte_limit() {
+        let project = tempfile::tempdir().unwrap();
+        let path = "a".repeat(lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES + 1);
+        let override_file = PublishContentOverride {
+            path: &path,
+            content: b"",
+            include_if_missing: true,
+        };
+
+        let error = match prepare_tarball(
+            project.path(),
+            &serde_json::json!({"files": []}),
+            TarballOptions {
+                content_overrides: std::slice::from_ref(&override_file),
+                ..TarballOptions::default()
+            },
+        ) {
+            Ok(_) => panic!("publish accepted an archive path over the byte limit"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("path") && error.to_string().contains("byte"),
+            "expected path-byte-limit error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn publish_accepts_archive_path_at_the_depth_limit() {
+        let project = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..MAX_PUBLISH_ARCHIVE_PATH_DEPTH - 1)
+            .map(|index| format!("p{index}"))
+            .collect();
+        let path = paths.join("/");
+        let override_file = PublishContentOverride {
+            path: &path,
+            content: b"",
+            include_if_missing: true,
+        };
+
+        let prepared = prepare_tarball(
+            project.path(),
+            &serde_json::json!({"files": []}),
+            TarballOptions {
+                content_overrides: std::slice::from_ref(&override_file),
+                ..TarballOptions::default()
+            },
+        )
+        .unwrap();
+        let decoder = flate2::read::GzDecoder::new(prepared.data.as_slice());
+        let mut depths = Vec::new();
+        lpm_extractor::visit_tar_archive(decoder, publish_tar_read_limits(), |entry| {
+            depths.push(entry.path().components().count());
+            Ok(std::ops::ControlFlow::<()>::Continue(()))
+        })
+        .unwrap();
+
+        assert_eq!(depths, [MAX_PUBLISH_ARCHIVE_PATH_DEPTH]);
+    }
+
+    #[test]
+    fn publish_accepts_archive_path_at_the_byte_limit() {
+        const PREFIX_BYTES: usize = "package/".len();
+
+        let project = tempfile::tempdir().unwrap();
+        let path = "a".repeat(lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES - PREFIX_BYTES);
+        let override_file = PublishContentOverride {
+            path: &path,
+            content: b"",
+            include_if_missing: true,
+        };
+
+        let prepared = prepare_tarball(
+            project.path(),
+            &serde_json::json!({"files": []}),
+            TarballOptions {
+                content_overrides: std::slice::from_ref(&override_file),
+                ..TarballOptions::default()
+            },
+        )
+        .unwrap();
+        let decoder = flate2::read::GzDecoder::new(prepared.data.as_slice());
+        let mut path_bytes = Vec::new();
+        lpm_extractor::visit_tar_archive(decoder, publish_tar_read_limits(), |entry| {
+            path_bytes.push(entry.path().as_os_str().as_encoded_bytes().len());
+            Ok(std::ops::ControlFlow::<()>::Continue(()))
+        })
+        .unwrap();
+
+        assert_eq!(path_bytes, [lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES]);
+    }
+
+    #[test]
+    fn publish_archive_limit_counts_tar_headers_padding_and_end_markers() {
+        let project = tempfile::tempdir().unwrap();
+        let override_file = PublishContentOverride {
+            path: "index.js",
+            content: b"",
+            include_if_missing: true,
+        };
+
+        let error = match prepare_tarball_with_archive_limit(
+            project.path(),
+            &serde_json::json!({"files": []}),
+            TarballOptions {
+                content_overrides: std::slice::from_ref(&override_file),
+                ..TarballOptions::default()
+            },
+            1_024,
+        ) {
+            Ok(_) => panic!("publish archive framing bypassed the size limit"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("archive") && error.to_string().contains("1024"),
+            "expected archive-size limit error, got: {error}"
+        );
     }
 
     #[cfg(unix)]

@@ -60,39 +60,24 @@ fn stage_cache_archive_with_project(
     label: &str,
 ) -> Result<StagedOutputs, LpmError> {
     let dec = flate2::read::GzDecoder::new(archive_file);
-    let mut archive = tar::Archive::new(dec);
-    archive.set_preserve_permissions(false);
-    archive.set_preserve_ownerships(false);
-
     let mut total_bytes: u64 = 0;
-    let mut entries_seen: usize = 0;
     let mut staged = StagedOutputs::new_with_project(root, project)?;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_CACHE_ENTRY_BYTES,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_CACHE_ARCHIVE_ENTRIES)
+    };
 
-    for entry in archive
-        .entries()
-        .map_err(|error| LpmError::Task(format!("failed to read {label} entries: {error}")))?
-    {
-        let mut entry = entry
-            .map_err(|error| LpmError::Task(format!("failed to read {label} entry: {error}")))?;
-
-        entries_seen += 1;
-        if entries_seen > MAX_CACHE_ARCHIVE_ENTRIES {
-            return Err(LpmError::Task(format!(
-                "{label} exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
-            )));
-        }
-
-        let path = entry
-            .path()
-            .map_err(|error| LpmError::Task(format!("failed to read entry path: {error}")))?
-            .to_path_buf();
+    lpm_extractor::visit_tar_archive(dec, archive_limits, |mut entry| {
+        let path = entry.path().to_path_buf();
         validate_archive_path(&path, label)?;
-        validate_archive_entry_type(&entry, &path, label)?;
+        validate_archive_entry_type(entry.header().entry_type(), &path, label)?;
 
         let entry_size = entry.header().size().unwrap_or(0);
         check_archive_size_limits(entry_size, &mut total_bytes, &path, label)?;
-        staged.append(&mut entry, &path)?;
-    }
+        let header = entry.header().clone();
+        staged.append(&mut entry, &header, &path)?;
+        Ok(std::ops::ControlFlow::<()>::Continue(()))
+    })?;
 
     Ok(staged)
 }
@@ -102,30 +87,18 @@ pub(super) fn scan_cache_archive(
     label: &str,
 ) -> Result<usize, LpmError> {
     let dec = flate2::read::GzDecoder::new(archive_file);
-    let mut archive = tar::Archive::new(dec);
     let mut total_bytes = 0;
-    let mut entries_seen = 0;
     let mut paths = HashSet::new();
     let mut file_count = 0;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_CACHE_ENTRY_BYTES,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_CACHE_ARCHIVE_ENTRIES)
+    };
 
-    for entry in archive
-        .entries()
-        .map_err(|error| LpmError::Task(format!("failed to read {label} entries: {error}")))?
-    {
-        let mut entry = entry
-            .map_err(|error| LpmError::Task(format!("failed to read {label} entry: {error}")))?;
-        entries_seen += 1;
-        if entries_seen > MAX_CACHE_ARCHIVE_ENTRIES {
-            return Err(LpmError::Task(format!(
-                "{label} exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
-            )));
-        }
-        let path = entry
-            .path()
-            .map_err(|error| LpmError::Task(format!("failed to read entry path: {error}")))?
-            .to_path_buf();
+    lpm_extractor::visit_tar_archive(dec, archive_limits, |mut entry| {
+        let path = entry.path().to_path_buf();
         validate_archive_path(&path, label)?;
-        validate_archive_entry_type(&entry, &path, label)?;
+        validate_archive_entry_type(entry.header().entry_type(), &path, label)?;
         let entry_size = entry.header().size().unwrap_or(0);
         check_archive_size_limits(entry_size, &mut total_bytes, &path, label)?;
         let normalized = normalize_archive_path(&path, label)?;
@@ -141,7 +114,8 @@ pub(super) fn scan_cache_archive(
                 LpmError::Task(format!("failed to read {}: {error}", path.display()))
             })?;
         }
-    }
+        Ok(std::ops::ControlFlow::<()>::Continue(()))
+    })?;
 
     Ok(file_count)
 }
@@ -213,7 +187,8 @@ impl StagedOutputs {
 
     pub(super) fn append(
         &mut self,
-        entry: &mut tar::Entry<'_, impl Read>,
+        entry: &mut impl Read,
+        header: &tar::Header,
         archive_path: &Path,
     ) -> Result<(), LpmError> {
         let relative = normalize_archive_path(archive_path, "task cache archive")?;
@@ -224,7 +199,7 @@ impl StagedOutputs {
             )));
         }
 
-        if entry.header().entry_type().is_dir() {
+        if header.entry_type().is_dir() {
             create_directory_path_nofollow(&self.output, &relative, "staged output")?;
             return Ok(());
         }
@@ -255,7 +230,7 @@ impl StagedOutputs {
                     archive_path.display()
                 ))
             })?;
-        let archived_mtime = entry.header().mtime().map_err(|error| {
+        let archived_mtime = header.mtime().map_err(|error| {
             LpmError::Task(format!(
                 "failed to read task cache output timestamp {}: {error}",
                 archive_path.display()
@@ -279,7 +254,7 @@ impl StagedOutputs {
                     })?,
             ),
         )?;
-        set_staged_file_permissions(&staged_file, entry.header().mode().unwrap_or(0o644))?;
+        set_staged_file_permissions(&staged_file, header.mode().unwrap_or(0o644))?;
         #[cfg(test)]
         {
             let failure = STAGED_FILE_FINALIZE_FAILURE
@@ -2355,6 +2330,47 @@ impl Drop for RestoreTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_restore_rejects_paths_deeper_than_256_components_before_staging() {
+        use std::io::Write as _;
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(root_dir.path());
+        let project = tempfile::tempdir().unwrap();
+        let archive_path = root_dir.path().join("deep.tar.gz");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut path = String::new();
+        path.push_str(&"a/".repeat(256));
+        path.push_str("file.txt");
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &path, std::io::empty())
+            .unwrap();
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap().flush().unwrap();
+
+        let archive = std::fs::File::open(&archive_path).unwrap();
+        let error = match stage_cache_archive(&root, archive, project.path(), "task cache archive")
+        {
+            Ok(_) => panic!("an excessively deep archive path was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+        assert!(
+            std::fs::read_dir(project.path()).unwrap().next().is_none(),
+            "rejected restore created project output"
+        );
+    }
 
     fn append_journal_path(bytes: &mut Vec<u8>, path: &[u8]) {
         bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());

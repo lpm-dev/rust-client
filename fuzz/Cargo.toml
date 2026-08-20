@@ -27,3 +27,10 @@ path = "fuzz_targets/extractor_entry_path_sanitizer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "extractor_bounded_tar_walker"
+path = "fuzz_targets/extractor_bounded_tar_walker.rs"
+test = false
+doc = false
+bench = false

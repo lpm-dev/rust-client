@@ -740,31 +740,45 @@ fn stage_error_message(
 }
 
 fn read_manifest_from_tarball(data: &[u8]) -> Result<serde_json::Value, LpmError> {
+    read_manifest_from_tarball_with_entry_limit(data, 100_000)
+}
+
+fn read_manifest_from_tarball_with_entry_limit(
+    data: &[u8],
+    max_entries: usize,
+) -> Result<serde_json::Value, LpmError> {
     let decoder = GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|e| LpmError::Registry(format!("failed to read staged tarball: {e}")))?;
-
-    for entry in entries {
-        let mut entry = entry
-            .map_err(|e| LpmError::Registry(format!("failed to read staged tarball entry: {e}")))?;
-        let path = entry
-            .path()
-            .map_err(|e| LpmError::Registry(format!("failed to read staged tarball path: {e}")))?;
-        if path == Path::new("package/package.json") {
-            let mut content = String::new();
+    let archive_limits = lpm_extractor::TarArchiveLimits::new(max_entries);
+    let (_, manifest) = lpm_extractor::visit_tar_archive(decoder, archive_limits, |mut entry| {
+        if entry.path() == Path::new("package/package.json") {
+            if entry.size() > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
+                return Err(LpmError::Registry(format!(
+                    "staged manifest exceeds the {}-byte limit",
+                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES
+                )));
+            }
+            let mut content = Vec::with_capacity(entry.size() as usize);
             entry
-                .read_to_string(&mut content)
+                .by_ref()
+                .take(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES.saturating_add(1))
+                .read_to_end(&mut content)
                 .map_err(|e| LpmError::Registry(format!("failed to read staged manifest: {e}")))?;
-            return serde_json::from_str(&content)
-                .map_err(|e| LpmError::Registry(format!("staged manifest is invalid JSON: {e}")));
+            if content.len() as u64 > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
+                return Err(LpmError::Registry(format!(
+                    "staged manifest exceeds the {}-byte limit",
+                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES
+                )));
+            }
+            let manifest = serde_json::from_slice(&content)
+                .map_err(|e| LpmError::Registry(format!("staged manifest is invalid JSON: {e}")))?;
+            return Ok(std::ops::ControlFlow::Break(manifest));
         }
-    }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
 
-    Err(LpmError::Registry(
-        "downloaded staged tarball missing package/package.json".into(),
-    ))
+    manifest.ok_or_else(|| {
+        LpmError::Registry("downloaded staged tarball missing package/package.json".into())
+    })
 }
 
 fn safe_tarball_name(name: &str) -> String {
@@ -776,6 +790,40 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn staged_manifest_scan_enforces_its_entry_limit() {
+        use std::io::Write as _;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for path in ["package/a", "package/b", "package/package.json"] {
+                let content: &[u8] = if path.ends_with("package.json") {
+                    b"{}"
+                } else {
+                    b""
+                };
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_data).unwrap();
+        let archive = encoder.finish().unwrap();
+
+        let error = read_manifest_from_tarball_with_entry_limit(&archive, 2)
+            .expect_err("the staged manifest scan accepted too many entries");
+
+        assert!(
+            error.to_string().contains("too many"),
+            "expected entry-count limit error, got: {error}"
+        );
+    }
 
     #[test]
     fn endpoint_url_joins_registry_and_route_once() {

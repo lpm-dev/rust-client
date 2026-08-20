@@ -14,8 +14,412 @@ use lpm_common::{Integrity, LpmError};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
-use tar::Archive;
+
+/// Default maximum number of components in an archive entry path.
+pub const DEFAULT_MAX_ARCHIVE_PATH_DEPTH: usize = 256;
+/// Default maximum encoded length of an archive entry path.
+pub const DEFAULT_MAX_ARCHIVE_PATH_BYTES: usize = 32 * 1024;
+/// Default maximum payload size of one GNU or PAX metadata record.
+pub const DEFAULT_MAX_TAR_METADATA_BYTES: usize = 1024 * 1024;
+
+/// Resource limits enforced while walking a raw tar archive.
+#[derive(Clone, Copy, Debug)]
+pub struct TarArchiveLimits {
+    /// Maximum number of non-metadata entries.
+    pub max_entries: usize,
+    /// Maximum number of GNU and PAX metadata entries.
+    pub max_metadata_entries: usize,
+    /// Maximum declared size of one non-metadata entry.
+    pub max_entry_bytes: u64,
+    /// Maximum number of components in an entry path or link target.
+    pub max_path_depth: usize,
+    /// Maximum encoded length of an entry path or link target.
+    pub max_path_bytes: usize,
+    /// Maximum payload size of one GNU or PAX metadata entry.
+    pub max_metadata_bytes: usize,
+}
+
+impl TarArchiveLimits {
+    /// Creates limits with equal semantic-entry and metadata-entry caps.
+    pub const fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            max_metadata_entries: max_entries,
+            max_entry_bytes: u64::MAX,
+            max_path_depth: DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
+            max_path_bytes: DEFAULT_MAX_ARCHIVE_PATH_BYTES,
+            max_metadata_bytes: DEFAULT_MAX_TAR_METADATA_BYTES,
+        }
+    }
+}
+
+/// A tar entry whose effective GNU or PAX path metadata has been bounded.
+pub struct BoundedTarEntry<'a, R: Read> {
+    inner: tar::Entry<'a, R>,
+    path: PathBuf,
+    link_name: Option<PathBuf>,
+}
+
+impl<R: Read> BoundedTarEntry<'_, R> {
+    /// Returns the raw tar header.
+    ///
+    /// Use [`Self::path`] and [`Self::link_name`] for effective names because
+    /// GNU and PAX overrides are not written back into this header.
+    pub fn header(&self) -> &tar::Header {
+        self.inner.header()
+    }
+
+    /// Returns the validated entry size.
+    pub fn size(&self) -> u64 {
+        self.inner.size()
+    }
+
+    /// Returns the validated effective path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the validated effective link target when one is present.
+    pub fn link_name(&self) -> Option<&Path> {
+        self.link_name.as_deref()
+    }
+
+    /// Unpacks a non-link entry at an already validated destination path.
+    ///
+    /// Link entries must be materialized explicitly from [`Self::link_name`]
+    /// because GNU and PAX target overrides are not written into the raw
+    /// header.
+    pub fn unpack(&mut self, destination: &Path) -> std::io::Result<()> {
+        let entry_type = self.inner.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded tar link entries require explicit extraction",
+            ));
+        }
+        self.inner.unpack(destination).map(|_| ())
+    }
+}
+
+impl<R: Read> Read for BoundedTarEntry<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+#[derive(Default)]
+struct PaxMetadata {
+    path: Option<Vec<u8>>,
+    link_path: Option<Vec<u8>>,
+    size: Option<u64>,
+}
+
+/// Visits validated semantic entries in a tar archive.
+///
+/// GNU long-name and long-link records and local PAX path metadata are
+/// resolved before the visitor runs. A visitor break value suppresses later
+/// visitor calls, but the walker still validates all remaining archive
+/// entries before returning it.
+///
+/// # Errors
+///
+/// Returns an error for malformed metadata, unsupported sparse entries,
+/// limit violations, invalid paths, or visitor failures.
+pub fn visit_tar_archive<R, T, F>(
+    reader: R,
+    limits: TarArchiveLimits,
+    mut visitor: F,
+) -> Result<(R, Option<T>), LpmError>
+where
+    R: Read,
+    F: FnMut(BoundedTarEntry<'_, R>) -> Result<ControlFlow<T>, LpmError>,
+{
+    let mut archive = tar::Archive::new(reader);
+    let mut local_metadata = PaxMetadata::default();
+    let mut long_path: Option<Vec<u8>> = None;
+    let mut long_link: Option<Vec<u8>> = None;
+    let mut has_local_pax = false;
+    let mut entries_seen = 0usize;
+    let mut metadata_entries_seen = 0usize;
+    let mut stopped = None;
+
+    {
+        let entries = archive.entries().map_err(LpmError::Io)?.raw(true);
+        for entry_result in entries {
+            let mut entry = entry_result.map_err(LpmError::Io)?;
+            let entry_type = entry.header().entry_type();
+            let is_metadata = entry_type.is_gnu_longname()
+                || entry_type.is_gnu_longlink()
+                || entry_type.is_pax_local_extensions()
+                || entry_type.is_pax_global_extensions();
+            if is_metadata {
+                metadata_entries_seen = metadata_entries_seen.saturating_add(1);
+                if metadata_entries_seen > limits.max_metadata_entries {
+                    return Err(LpmError::Registry(format!(
+                        "tar archive exceeds the {}-metadata-entry limit",
+                        limits.max_metadata_entries
+                    )));
+                }
+            } else {
+                entries_seen = entries_seen.saturating_add(1);
+                if entries_seen > limits.max_entries {
+                    return Err(LpmError::Registry(format!(
+                        "tar archive exceeds the {}-entry limit (too many files)",
+                        limits.max_entries
+                    )));
+                }
+            }
+
+            if entry_type.is_gnu_longname() {
+                if long_path.is_some() {
+                    return Err(invalid_tar_metadata(
+                        "multiple GNU long-name records describe one entry",
+                    ));
+                }
+                long_path = Some(read_tar_metadata(&mut entry, limits)?);
+                continue;
+            }
+            if entry_type.is_gnu_longlink() {
+                if long_link.is_some() {
+                    return Err(invalid_tar_metadata(
+                        "multiple GNU long-link records describe one entry",
+                    ));
+                }
+                long_link = Some(read_tar_metadata(&mut entry, limits)?);
+                continue;
+            }
+            if entry_type.is_pax_local_extensions() {
+                if has_local_pax {
+                    return Err(invalid_tar_metadata(
+                        "multiple local PAX records describe one entry",
+                    ));
+                }
+                local_metadata = parse_pax_metadata(&read_tar_metadata(&mut entry, limits)?)?;
+                has_local_pax = true;
+                continue;
+            }
+            if entry_type.is_pax_global_extensions() {
+                let metadata = parse_pax_metadata(&read_tar_metadata(&mut entry, limits)?)?;
+                if metadata.path.is_some()
+                    || metadata.link_path.is_some()
+                    || metadata.size.is_some()
+                {
+                    return Err(invalid_tar_metadata(
+                        "global PAX path, linkpath, and size overrides are unsupported",
+                    ));
+                }
+                continue;
+            }
+            if entry_type.is_gnu_sparse() {
+                return Err(invalid_tar_metadata("GNU sparse entries are unsupported"));
+            }
+
+            let header_size = entry.header().size().map_err(LpmError::Io)?;
+            let effective_size = local_metadata.size.unwrap_or(header_size);
+            if effective_size > limits.max_entry_bytes {
+                return Err(LpmError::Registry(format!(
+                    "file too large in tar archive: {effective_size} bytes exceeds per-entry cap of {} bytes",
+                    limits.max_entry_bytes
+                )));
+            }
+            if effective_size != header_size {
+                return Err(invalid_tar_metadata(
+                    "PAX size override does not match the tar header",
+                ));
+            }
+
+            let path = if let Some(bytes) = long_path.take() {
+                tar_metadata_path(bytes, limits)?
+            } else if let Some(bytes) = local_metadata.path.take() {
+                tar_metadata_path(bytes, limits)?
+            } else {
+                let path = entry.header().path().map_err(LpmError::Io)?.into_owned();
+                validate_tar_path(&path, limits)?;
+                path
+            };
+            let link_name = if let Some(bytes) = long_link.take() {
+                Some(tar_metadata_path(bytes, limits)?)
+            } else if let Some(bytes) = local_metadata.link_path.take() {
+                Some(tar_metadata_path(bytes, limits)?)
+            } else {
+                entry
+                    .header()
+                    .link_name()
+                    .map_err(LpmError::Io)?
+                    .map(|path| path.into_owned())
+            };
+            validate_tar_path(&path, limits)?;
+            if let Some(link_name) = &link_name {
+                validate_tar_path(link_name, limits)?;
+            }
+
+            local_metadata = PaxMetadata::default();
+            has_local_pax = false;
+            if stopped.is_some() {
+                continue;
+            }
+            match visitor(BoundedTarEntry {
+                inner: entry,
+                path,
+                link_name,
+            })? {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(value) => {
+                    stopped = Some(value);
+                }
+            }
+        }
+    }
+
+    if long_path.is_some()
+        || long_link.is_some()
+        || local_metadata.path.is_some()
+        || local_metadata.link_path.is_some()
+        || local_metadata.size.is_some()
+        || has_local_pax
+    {
+        return Err(invalid_tar_metadata(
+            "metadata record does not describe a following tar entry",
+        ));
+    }
+
+    Ok((archive.into_inner(), stopped))
+}
+
+fn read_tar_metadata<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    limits: TarArchiveLimits,
+) -> Result<Vec<u8>, LpmError> {
+    let size = entry.header().size().map_err(LpmError::Io)?;
+    if size > limits.max_metadata_bytes as u64 {
+        return Err(LpmError::Registry(format!(
+            "tar metadata exceeds the {}-byte limit",
+            limits.max_metadata_bytes
+        )));
+    }
+    let mut content = Vec::with_capacity(size as usize);
+    entry
+        .take(size.saturating_add(1))
+        .read_to_end(&mut content)
+        .map_err(LpmError::Io)?;
+    if content.len() as u64 != size {
+        return Err(invalid_tar_metadata("truncated tar metadata record"));
+    }
+    Ok(content)
+}
+
+fn parse_pax_metadata(content: &[u8]) -> Result<PaxMetadata, LpmError> {
+    let mut metadata = PaxMetadata::default();
+    let mut offset = 0usize;
+    while offset < content.len() {
+        let relative_space = content[offset..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| invalid_tar_metadata("PAX record is missing its length separator"))?;
+        let space = offset + relative_space;
+        let length = usize::try_from(parse_decimal(&content[offset..space], "PAX record length")?)
+            .map_err(|_| invalid_tar_metadata("PAX record length overflows"))?;
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= content.len())
+            .ok_or_else(|| invalid_tar_metadata("PAX record length exceeds metadata payload"))?;
+        if length <= relative_space + 2 || content[end - 1] != b'\n' {
+            return Err(invalid_tar_metadata("PAX record has invalid framing"));
+        }
+        let record = &content[space + 1..end - 1];
+        let separator = record
+            .iter()
+            .position(|byte| *byte == b'=')
+            .ok_or_else(|| invalid_tar_metadata("PAX record is missing `=`"))?;
+        let key = &record[..separator];
+        let value = &record[separator + 1..];
+        match key {
+            b"path" => metadata.path = Some(value.to_vec()),
+            b"linkpath" => metadata.link_path = Some(value.to_vec()),
+            b"size" => metadata.size = Some(parse_decimal(value, "PAX size")?),
+            key if key.starts_with(b"GNU.sparse.") => {
+                return Err(invalid_tar_metadata(
+                    "GNU sparse PAX entries are unsupported",
+                ));
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    Ok(metadata)
+}
+
+fn parse_decimal(bytes: &[u8], label: &str) -> Result<u64, LpmError> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(invalid_tar_metadata(&format!("{label} is not decimal")));
+    }
+    let mut value = 0u64;
+    for digit in bytes {
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit - b'0')))
+            .ok_or_else(|| invalid_tar_metadata(&format!("{label} overflows")))?;
+    }
+    Ok(value)
+}
+
+fn tar_metadata_path(mut bytes: Vec<u8>, limits: TarArchiveLimits) -> Result<PathBuf, LpmError> {
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    if bytes.len() > limits.max_path_bytes {
+        return Err(LpmError::Registry(format!(
+            "tar entry path exceeds the {}-byte limit",
+            limits.max_path_bytes
+        )));
+    }
+    if bytes.contains(&0) {
+        return Err(invalid_tar_metadata("tar entry path contains a NUL byte"));
+    }
+    #[cfg(unix)]
+    let path = bytes_to_path(bytes);
+    #[cfg(not(unix))]
+    let path = bytes_to_path(bytes)?;
+    validate_tar_path(&path, limits)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn bytes_to_path(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt as _;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+fn bytes_to_path(bytes: Vec<u8>) -> Result<PathBuf, LpmError> {
+    String::from_utf8(bytes)
+        .map(PathBuf::from)
+        .map_err(|_| invalid_tar_metadata("tar entry path is not valid UTF-8 on this platform"))
+}
+
+fn validate_tar_path(path: &Path, limits: TarArchiveLimits) -> Result<(), LpmError> {
+    let depth = path.components().count();
+    if depth > limits.max_path_depth {
+        return Err(LpmError::Registry(format!(
+            "tar entry exceeds the {}-component nesting limit: {}",
+            limits.max_path_depth,
+            path.display()
+        )));
+    }
+    if path.as_os_str().len() > limits.max_path_bytes {
+        return Err(LpmError::Registry(format!(
+            "tar entry path exceeds the {}-byte limit",
+            limits.max_path_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn invalid_tar_metadata(message: &str) -> LpmError {
+    LpmError::Registry(format!("invalid tar metadata: {message}"))
+}
 
 /// Verify a tarball's integrity against an expected SRI hash.
 ///
@@ -300,9 +704,12 @@ const MAX_FILE_COUNT: usize = 100_000;
 /// Returns the list of extracted file paths (relative to `target_dir`).
 ///
 /// Enforces size limits to prevent tar-bomb attacks:
-/// - Max 5 GB total extraction size
-/// - Max 500 MB per individual file
+/// - Max 5 GiB total extraction size
+/// - Max 500 MiB per individual file
 /// - Max 100,000 files
+/// - Max 100,000 GNU or PAX metadata records
+/// - Max 256 path components and 32 KiB per encoded path
+/// - Max 1 MiB per GNU or PAX metadata record
 pub fn extract_tarball_from_reader(
     reader: impl std::io::Read,
     target_dir: &Path,
@@ -774,28 +1181,9 @@ where
     I: FnMut(EntryInfo<'_>),
     D: FnOnce(R) -> Result<(), LpmError>,
 {
-    let mut archive = Archive::new(reader);
-    // npm tarballs ship arbitrary uid/gid/mode/mtime that mean nothing to a
-    // downstream Node consumer. The tar crate's defaults call `fchmodat` +
-    // `fchownat` + `filetime::set_file_handle_times` per regular file.
-    // Disabling all three:
-    // - `preserve_permissions(false)` — drops ownership-aware chmod policy.
-    // - `preserve_ownerships(false)` — drops `fchownat`.
-    // - `preserve_mtime(false)` — drops `set_file_handle_times` →
-    //   `fsetattrlist` on macOS. mtime is meaningless for content-addressable
-    //   store bytes — `require()` doesn't read it; `lpm doctor` doesn't use it.
-    // Note: even with `preserve_permissions=false`, tar 0.4.45's `_set_perms`
-    // still unconditionally calls `set_permissions` (the flag only controls
-    // SUID-bit retention). Eliminating the residual `__fchmod` cost requires
-    // bypassing `entry.unpack()` for non-buffered entries — see the
-    // `write_buffered_entry` analogue used for source files below.
-    archive.set_preserve_permissions(false);
-    archive.set_preserve_ownerships(false);
-    archive.set_preserve_mtime(false);
     let mut extracted_files = Vec::new();
     let mut created_dirs = Vec::new();
     let mut total_size: u64 = 0;
-    let mut file_count: usize = 0;
 
     std::fs::create_dir_all(target_dir)?;
     let extraction_root = target_dir.canonicalize().map_err(LpmError::Io)?;
@@ -812,220 +1200,75 @@ where
     verified_parents.insert(extraction_root.clone());
     let mut seen_archive_paths = HashMap::with_capacity(64);
 
-    {
-        let entries = archive.entries()?;
-        for entry_result in entries {
-            let mut entry = match entry_result {
-                Ok(entry) => entry,
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        LpmError::Io(error),
-                    );
-                }
-            };
-
-            // Enforce file count limit
-            file_count += 1;
-            if file_count > limits.max_file_count {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Registry(format!(
-                        "tarball contains too many files (>{})",
-                        limits.max_file_count
-                    )),
-                );
-            }
-
-            // Enforce per-file and total size limits
+    let visit_result = visit_tar_archive(
+        reader,
+        TarArchiveLimits {
+            max_entry_bytes: limits.max_file_size,
+            ..TarArchiveLimits::new(limits.max_file_count)
+        },
+        |mut entry| {
             let size = entry.size();
             if size > limits.max_file_size {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Registry(format!(
-                        "file too large in tarball: {} bytes (max {})",
-                        size, limits.max_file_size
-                    )),
-                );
+                return Err(LpmError::Registry(format!(
+                    "file too large in tarball: {} bytes (max {})",
+                    size, limits.max_file_size
+                )));
             }
             total_size = total_size.saturating_add(size);
             if total_size > limits.max_extraction_size {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Registry(format!(
-                        "tarball extraction size limit exceeded ({} bytes)",
-                        limits.max_extraction_size
-                    )),
-                );
+                return Err(LpmError::Registry(format!(
+                    "tarball extraction size limit exceeded ({} bytes)",
+                    limits.max_extraction_size
+                )));
             }
 
-            let original_path = match entry.path() {
-                Ok(path) => path.into_owned(),
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        LpmError::Io(error),
-                    );
-                }
+            let original_path = entry.path().to_path_buf();
+            let Some(relative_path) = sanitize_entry_path(&original_path)? else {
+                return Ok(ControlFlow::<()>::Continue(()));
             };
 
-            let relative_path = match sanitize_entry_path(&original_path) {
-                Ok(Some(path)) => path,
-                Ok(None) => continue,
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        error,
-                    );
-                }
-            };
-
-            let target_path = match prepare_output_path(
+            let (target_path, mut entry_created_dirs) = prepare_output_path(
                 &extraction_root,
                 &relative_path,
                 &original_path,
                 &mut verified_parents,
-            ) {
-                Ok((path, mut entry_created_dirs)) => {
-                    created_dirs.append(&mut entry_created_dirs);
-                    path
-                }
-                Err(error) => {
-                    return rollback_extraction(
-                        &extraction_root,
-                        &extracted_files,
-                        &created_dirs,
-                        error,
-                    );
-                }
-            };
+            )?;
+            created_dirs.append(&mut entry_created_dirs);
 
-            // Safety: prevent path traversal
             if !target_path.starts_with(&extraction_root) {
-                return rollback_extraction(
-                    &extraction_root,
-                    &extracted_files,
-                    &created_dirs,
-                    LpmError::Registry(format!(
-                        "path traversal detected in tarball: {}",
-                        original_path.display()
-                    )),
-                );
+                return Err(LpmError::Registry(format!(
+                    "path traversal detected in tarball: {}",
+                    original_path.display()
+                )));
             }
 
-            // Only extract regular files (skip symlinks for security)
             if entry.header().entry_type().is_file() {
                 let duplicate_path =
-                    match record_case_fold_archive_path(&mut seen_archive_paths, &relative_path) {
-                        Ok(duplicate_path) => duplicate_path,
-                        Err(error) => {
-                            return rollback_extraction(
-                                &extraction_root,
-                                &extracted_files,
-                                &created_dirs,
-                                error,
-                            );
-                        }
-                    };
-
-                // Capture the tar entry's exec bits BEFORE any read; the
-                // header is parsed up-front by the tar crate. We honor
-                // whichever execute bits the tarball declares (user / group /
-                // other) and OR them onto the default 0644 mode after the
-                // write. SUID / SGID / sticky bits are deliberately dropped —
-                // same security posture as `set_preserve_permissions(false)`.
-                //
-                // Most npm package files are 0644 (no exec) and skip the
-                // post-write `set_permissions` call entirely. The only
-                // affected files are bin scripts (typically 0755) — usually
-                // 0–5 per package, so the syscall cost is negligible vs the
-                // install-side breakage when a `.bin` script lands as 0644
-                // (EACCES on `execve`).
+                    record_case_fold_archive_path(&mut seen_archive_paths, &relative_path)?;
                 let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
 
-                // P2 fused-scan hook: if the caller asked us to buffer this
-                // entry's bytes for inspection, read the entry into memory,
-                // write those bytes to disk, and hand them to the inspector.
-                // Otherwise stream directly via `entry.unpack()` as the pre-P2
-                // code did — same memory profile for non-buffered entries.
                 let buffer_this = buffer_predicate(&relative_path, size);
                 let (buffered_bytes, blake3_digest) = if buffer_this {
                     let mut buf = Vec::with_capacity(size as usize);
-                    if let Err(error) = entry.read_to_end(&mut buf) {
-                        return rollback_extraction(
-                            &extraction_root,
-                            &extracted_files,
-                            &created_dirs,
-                            LpmError::Io(error),
-                        );
-                    }
-                    if let Err(error) = write_buffered_entry(&target_path, &buf, duplicate_path) {
-                        return rollback_extraction(
-                            &extraction_root,
-                            &extracted_files,
-                            &created_dirs,
-                            error,
-                        );
-                    }
+                    entry.read_to_end(&mut buf).map_err(LpmError::Io)?;
+                    write_buffered_entry(&target_path, &buf, duplicate_path)?;
                     let digest = compute_blake3.then(|| *blake3::hash(&buf).as_bytes());
                     (Some(buf), digest)
                 } else {
-                    // Stream directly to disk via `io::copy` instead of
-                    // `entry.unpack()`. Even with the three `preserve_*`
-                    // flags false, tar 0.4.45's unpack path unconditionally
-                    // calls `_set_perms` (entry.rs:814) — the flag only
-                    // controls SUID-bit retention. Bypassing it drops the
-                    // residual `__fchmod` cost on every non-buffered entry.
-                    //
-                    // Same minimal write semantics as [`write_buffered_entry`]:
-                    // create-or-truncate, default mode (umask-respecting), no
-                    // post-write metadata calls.
-                    let digest = match stream_entry_to_disk(
+                    let digest = stream_entry_to_disk(
                         &mut entry,
                         &target_path,
                         compute_blake3,
                         duplicate_path,
-                    ) {
-                        Ok(digest) => digest,
-                        Err(error) => {
-                            return rollback_extraction(
-                                &extraction_root,
-                                &extracted_files,
-                                &created_dirs,
-                                error,
-                            );
-                        }
-                    };
+                    )?;
                     (None, digest)
                 };
 
-                // Restore the exec bits captured before the write. Skipped
-                // on Windows (NTFS doesn't have POSIX mode bits — bin
-                // scripts are dispatched by extension, not the X bit).
                 #[cfg(unix)]
                 if exec_bits != 0 {
                     use std::os::unix::fs::PermissionsExt;
                     let perms = std::fs::Permissions::from_mode(0o644 | exec_bits);
-                    if let Err(error) = std::fs::set_permissions(&target_path, perms) {
-                        return rollback_extraction(
-                            &extraction_root,
-                            &extracted_files,
-                            &created_dirs,
-                            LpmError::Io(error),
-                        );
-                    }
+                    std::fs::set_permissions(&target_path, perms).map_err(LpmError::Io)?;
                 }
                 #[cfg(not(unix))]
                 let _ = exec_bits;
@@ -1039,10 +1282,16 @@ where
 
                 extracted_files.push(relative_path);
             }
-        }
-    }
+            Ok(ControlFlow::<()>::Continue(()))
+        },
+    );
 
-    let inner = archive.into_inner();
+    let (inner, _) = match visit_result {
+        Ok(result) => result,
+        Err(error) => {
+            return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, error);
+        }
+    };
     if let Err(error) = drain_after_entries(inner) {
         return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, error);
     }
@@ -1070,8 +1319,8 @@ fn write_buffered_entry(
 /// the chmod/chown/utimes epilogue `tar::Entry::unpack` always emits.
 /// Used by the non-buffered branch of the extractor to bypass the
 /// tar unpack epilogue (chmod/chown/utimes).
-fn stream_entry_to_disk<R: std::io::Read>(
-    entry: &mut tar::Entry<'_, R>,
+fn stream_entry_to_disk(
+    entry: &mut impl Read,
     target_path: &Path,
     compute_blake3: bool,
     replace_existing: bool,
@@ -1391,7 +1640,7 @@ fn list_tarball_contents_with_limits(
 
     match decompress_gzip_libdeflate_with_limits(data, limits)? {
         BufferedGzipDecode::Decoded(decompressed) => {
-            list_tar_archive_contents(std::io::Cursor::new(decompressed), |_| Ok(()))
+            list_tar_archive_contents(std::io::Cursor::new(decompressed), limits, |_| Ok(()))
         }
         BufferedGzipDecode::NeedsStreaming => {
             list_tarball_contents_streaming(std::io::Cursor::new(data), limits)
@@ -1405,7 +1654,7 @@ fn list_tarball_contents_streaming<R: std::io::Read>(
 ) -> Result<Vec<PathBuf>, LpmError> {
     let decoder = GzDecoder::new(reader);
     let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
-    list_tar_archive_contents(limited, |mut reader| {
+    list_tar_archive_contents(limited, limits, |mut reader| {
         std::io::copy(&mut reader, &mut std::io::sink())
             .map(|_| ())
             .map_err(LpmError::Io)
@@ -1414,31 +1663,34 @@ fn list_tarball_contents_streaming<R: std::io::Read>(
 
 fn list_tar_archive_contents<R, D>(
     reader: R,
+    limits: ExtractionLimits,
     drain_after_entries: D,
 ) -> Result<Vec<PathBuf>, LpmError>
 where
     R: std::io::Read,
     D: FnOnce(R) -> Result<(), LpmError>,
 {
-    let mut archive = Archive::new(reader);
     let mut files = Vec::new();
     let mut seen_archive_paths = HashMap::with_capacity(64);
 
-    {
-        let entries = archive.entries()?;
-        for entry_result in entries {
-            let entry = entry_result?;
-            if entry.header().entry_type().is_file() {
-                let path = entry.path()?.into_owned();
-                if let Some(stripped) = sanitize_entry_path(&path)? {
-                    record_case_fold_archive_path(&mut seen_archive_paths, &stripped)?;
-                    files.push(stripped);
-                }
+    let (inner, _) = visit_tar_archive(
+        reader,
+        TarArchiveLimits {
+            max_entry_bytes: limits.max_file_size,
+            ..TarArchiveLimits::new(limits.max_file_count)
+        },
+        |entry| {
+            if entry.header().entry_type().is_file()
+                && let Some(stripped) = sanitize_entry_path(entry.path())?
+            {
+                record_case_fold_archive_path(&mut seen_archive_paths, &stripped)?;
+                files.push(stripped);
             }
-        }
-    }
+            Ok(ControlFlow::<()>::Continue(()))
+        },
+    )?;
 
-    drain_after_entries(archive.into_inner())?;
+    drain_after_entries(inner)?;
     Ok(files)
 }
 
@@ -2008,6 +2260,272 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar_data).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn create_tarball_with_path(path: &str) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::empty())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn create_tarball_with_gnu_longname(long_name: &[u8]) -> Vec<u8> {
+        let mut tar_data = Vec::with_capacity(long_name.len() + 2_048);
+
+        let mut longname_header = tar::Header::new_gnu();
+        longname_header.set_entry_type(tar::EntryType::GNULongName);
+        longname_header.set_size(long_name.len() as u64);
+        longname_header.set_mode(0o644);
+        longname_header.set_path("././@LongLink").unwrap();
+        longname_header.set_cksum();
+        tar_data.extend_from_slice(longname_header.as_bytes());
+        tar_data.extend_from_slice(long_name);
+        let padding = (512 - long_name.len() % 512) % 512;
+        tar_data.resize(tar_data.len() + padding, 0);
+
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_size(0);
+        file_header.set_mode(0o644);
+        file_header.set_path("package/fallback").unwrap();
+        file_header.set_cksum();
+        tar_data.extend_from_slice(file_header.as_bytes());
+        tar_data.resize(tar_data.len() + 1_024, 0);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn create_raw_tarball_with_paths(paths: &[&str]) -> Vec<u8> {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for path in paths {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, std::io::empty())
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        tar_data
+    }
+
+    #[test]
+    fn visitor_break_still_validates_trailing_archive_entries() {
+        let tar_data = create_raw_tarball_with_paths(&["package.json", "a/b/c"]);
+        let limits = TarArchiveLimits {
+            max_path_depth: 2,
+            ..TarArchiveLimits::new(10)
+        };
+
+        let error = visit_tar_archive(tar_data.as_slice(), limits, |_| Ok(ControlFlow::Break(())))
+            .expect_err("trailing entries must be validated after a visitor result is found");
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected trailing nesting-depth error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn visit_tar_archive_rejects_pax_sparse_metadata() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            builder
+                .append_pax_extensions([("GNU.sparse.map", b"0,1".as_slice())])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/file", b"x".as_slice())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let error = visit_tar_archive(tar_data.as_slice(), TarArchiveLimits::new(10), |_| {
+            Ok(ControlFlow::<()>::Continue(()))
+        })
+        .expect_err("PAX sparse metadata must be rejected");
+
+        assert!(
+            error.to_string().contains("sparse"),
+            "expected sparse metadata error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn visit_tar_archive_accepts_path_at_configured_depth() {
+        let tar_data = create_raw_tarball_with_paths(&["a/b/c"]);
+        let limits = TarArchiveLimits {
+            max_path_depth: 3,
+            ..TarArchiveLimits::new(1)
+        };
+        let mut paths = Vec::new();
+
+        visit_tar_archive(tar_data.as_slice(), limits, |entry| {
+            paths.push(entry.path().to_path_buf());
+            Ok(ControlFlow::<()>::Continue(()))
+        })
+        .unwrap();
+
+        assert_eq!(paths, [PathBuf::from("a/b/c")]);
+    }
+
+    #[test]
+    fn visit_tar_archive_enforces_metadata_entry_count_independently() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            builder
+                .append_pax_extensions([("comment", b"first".as_slice())])
+                .unwrap();
+            builder
+                .append_pax_extensions([("comment", b"second".as_slice())])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/file", std::io::empty())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let limits = TarArchiveLimits {
+            max_metadata_entries: 1,
+            ..TarArchiveLimits::new(10)
+        };
+
+        let error = visit_tar_archive(tar_data.as_slice(), limits, |_| {
+            Ok(ControlFlow::<()>::Continue(()))
+        })
+        .expect_err("metadata entries exceeded their independent limit");
+
+        assert!(
+            error.to_string().contains("metadata-entry"),
+            "expected metadata entry-count error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn visit_tar_archive_accepts_bounded_gnu_long_name() {
+        let mut long_name = b"package/".to_vec();
+        long_name.extend_from_slice("segment/".repeat(20).as_bytes());
+        long_name.extend_from_slice(b"file.js\0");
+        let tgz = create_tarball_with_gnu_longname(&long_name);
+        let mut expected = long_name;
+        expected.pop();
+        #[cfg(unix)]
+        let expected = bytes_to_path(expected);
+        #[cfg(not(unix))]
+        let expected = bytes_to_path(expected).unwrap();
+        let decoder = GzDecoder::new(tgz.as_slice());
+        let mut paths = Vec::new();
+
+        visit_tar_archive(decoder, TarArchiveLimits::new(1), |entry| {
+            paths.push(entry.path().to_path_buf());
+            Ok(ControlFlow::<()>::Continue(()))
+        })
+        .unwrap();
+
+        assert_eq!(paths, [expected]);
+    }
+
+    #[test]
+    fn visit_tar_archive_accepts_bounded_local_pax_path() {
+        let expected = "package/pax/path/file.js";
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            builder
+                .append_pax_extensions([("path", expected.as_bytes())])
+                .unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "fallback", std::io::empty())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut paths = Vec::new();
+
+        visit_tar_archive(tar_data.as_slice(), TarArchiveLimits::new(1), |entry| {
+            paths.push(entry.path().to_path_buf());
+            Ok(ControlFlow::<()>::Continue(()))
+        })
+        .unwrap();
+
+        assert_eq!(paths, [PathBuf::from(expected)]);
+    }
+
+    #[test]
+    fn list_tarball_contents_enforces_configured_entry_count() {
+        let tgz = create_tarball_with_n_empty_files(3);
+        let limits = ExtractionLimits {
+            max_file_count: 2,
+            ..DEFAULT_EXTRACTION_LIMITS
+        };
+
+        let error = list_tarball_contents_with_limits(&tgz, limits).unwrap_err();
+
+        assert!(
+            error.to_string().contains("too many"),
+            "expected entry-count limit error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn list_tarball_contents_rejects_more_than_256_path_components() {
+        let mut path = String::from("package/");
+        path.push_str(&"a/".repeat(256));
+        path.push_str("file.js");
+        let tgz = create_tarball_with_path(&path);
+
+        let error = list_tarball_contents(&tgz).unwrap_err();
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn list_tarball_contents_rejects_oversized_gnu_longname_metadata() {
+        let mut long_name = Vec::with_capacity(1024 * 1024 + 32);
+        long_name.extend_from_slice(b"package/");
+        while long_name.len() <= 1024 * 1024 {
+            long_name.extend_from_slice(b"a/");
+        }
+        long_name.extend_from_slice(b"file.js\0");
+        let tgz = create_tarball_with_gnu_longname(&long_name);
+
+        let error = list_tarball_contents(&tgz).unwrap_err();
+
+        assert!(
+            error.to_string().contains("metadata"),
+            "expected metadata limit error, got: {error}"
+        );
     }
 
     #[test]

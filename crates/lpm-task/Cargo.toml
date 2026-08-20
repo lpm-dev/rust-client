@@ -9,6 +9,7 @@ description = "Task graph, caching, and workspace-aware execution for LPM"
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-extractor = { workspace = true }
 lpm-workspace = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
