@@ -51,6 +51,7 @@ pub(crate) fn write_planned_manifests_then_git<T>(
 
 pub(super) struct AppliedReleaseTransaction {
     canonical_root: PathBuf,
+    root: cap_std::fs::Dir,
     state: ReleaseStateDirectory,
     allowed_manifests: Vec<PathBuf>,
     journal_bytes: Vec<u8>,
@@ -80,6 +81,7 @@ impl AppliedReleaseTransaction {
     fn rollback<T>(self, primary: LpmError) -> Result<T, LpmError> {
         rollback_after_apply_error(
             &self.canonical_root,
+            &self.root,
             &self.state,
             &self.allowed_manifests,
             &self.journal_bytes,
@@ -96,11 +98,13 @@ pub(super) fn apply_planned_manifests_with(
     mut write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
 ) -> Result<AppliedReleaseTransaction, LpmError> {
     let canonical_root = canonical_workspace_root(workspace_root)?;
-    let state = open_release_state_directory(&canonical_root, true)?.ok_or_else(|| {
-        LpmError::Script("could not create the release transaction directory".into())
-    })?;
+    let root = open_root_directory_nofollow(&canonical_root)?;
+    let state = open_release_state_directory_from_open_root(&canonical_root, &root, true)?
+        .ok_or_else(|| {
+            LpmError::Script("could not create the release transaction directory".into())
+        })?;
     ensure_no_pending_release_transaction_in(&state)?;
-    let resolved = resolve_planned_manifests(&canonical_root, manifests)?;
+    let resolved = resolve_planned_manifests_from_open_root(&canonical_root, &root, manifests)?;
     let (journal_bytes, commit) =
         serialize_planned_release_journal(&resolved, operation, version_git)?;
     persist_release_journal_in(&state, &journal_bytes)?;
@@ -116,6 +120,7 @@ pub(super) fn apply_planned_manifests_with(
             Err(error) => {
                 return rollback_after_apply_error(
                     &canonical_root,
+                    &root,
                     &state,
                     &allowed_manifests,
                     &journal_bytes,
@@ -126,6 +131,7 @@ pub(super) fn apply_planned_manifests_with(
         if current.as_slice() != manifest.original_bytes.as_ref() {
             return rollback_after_apply_error(
                 &canonical_root,
+                &root,
                 &state,
                 &allowed_manifests,
                 &journal_bytes,
@@ -138,6 +144,7 @@ pub(super) fn apply_planned_manifests_with(
         if let Err(error) = write_manifest(&resolved_manifest.target, &manifest.updated_bytes) {
             return rollback_after_apply_error(
                 &canonical_root,
+                &root,
                 &state,
                 &allowed_manifests,
                 &journal_bytes,
@@ -149,6 +156,7 @@ pub(super) fn apply_planned_manifests_with(
 
     Ok(AppliedReleaseTransaction {
         canonical_root,
+        root,
         state,
         allowed_manifests,
         journal_bytes,
@@ -183,13 +191,25 @@ pub(crate) fn ensure_no_pending_release_transaction(workspace_root: &Path) -> Re
     ensure_no_pending_release_transaction_in(&state)
 }
 
+pub(crate) fn ensure_no_pending_release_transaction_from_open_root(
+    canonical_root: &Path,
+    root: &cap_std::fs::Dir,
+) -> Result<(), LpmError> {
+    let Some(state) = open_release_state_directory_from_open_root(canonical_root, root, false)?
+    else {
+        return Ok(());
+    };
+    ensure_no_pending_release_transaction_in(&state)
+}
+
 pub(super) fn ensure_no_pending_release_transaction_in(
     state: &ReleaseStateDirectory,
 ) -> Result<(), LpmError> {
-    let Some((journal_bytes, journal)) = read_existing_release_journal_in(state)? else {
+    let Some(journal_bytes) = read_existing_release_journal_bytes_in(state)? else {
         return Ok(());
     };
-    validate_release_journal_header(&journal)?;
+    let journal = parse_recovery_release_journal(state, &journal_bytes)?;
+    validate_recovery_release_journal_header(&journal)?;
     if journal.state == ReleaseApplyJournalState::Complete
         || release_commit_is_durable_in(state, &journal_bytes)?
     {
@@ -201,20 +221,44 @@ pub(super) fn ensure_no_pending_release_transaction_in(
     )))
 }
 
-pub(crate) fn has_release_transaction(workspace_root: &Path) -> Result<bool, LpmError> {
-    let canonical_root = canonical_workspace_root(workspace_root)?;
-    let Some(state) = open_release_state_directory(&canonical_root, false)? else {
+pub(crate) fn has_release_transaction_from_open_root(
+    canonical_root: &Path,
+    root: &cap_std::fs::Dir,
+) -> Result<bool, LpmError> {
+    let Some(state) = open_release_state_directory_from_open_root(canonical_root, root, false)?
+    else {
         return Ok(false);
     };
     Ok(release_journal_exists_in(&state)? || release_commit_exists_in(&state)?)
 }
 
+#[cfg(test)]
 pub(crate) fn recover_pending_release_transaction(
     workspace_root: &Path,
     allowed_manifests: &[PathBuf],
 ) -> Result<bool, LpmError> {
     Ok(!matches!(
         recover_pending_release_transaction_inner(workspace_root, allowed_manifests)?,
+        RecoveryOutcome::None
+    ))
+}
+
+pub(crate) fn recover_pending_release_transaction_from_open_root(
+    canonical_root: &Path,
+    root: &cap_std::fs::Dir,
+    allowed_manifests: &[PathBuf],
+) -> Result<bool, LpmError> {
+    let Some(state) = open_release_state_directory_from_open_root(canonical_root, root, false)?
+    else {
+        return Ok(false);
+    };
+    Ok(!matches!(
+        recover_pending_release_transaction_in_open_root(
+            canonical_root,
+            root,
+            &state,
+            allowed_manifests,
+        )?,
         RecoveryOutcome::None
     ))
 }
@@ -247,23 +291,49 @@ pub(super) fn recover_pending_release_transaction_inner(
     workspace_root: &Path,
     allowed_manifests: &[PathBuf],
 ) -> Result<RecoveryOutcome, LpmError> {
+    recover_pending_release_transaction_inner_with_hook(workspace_root, allowed_manifests, || {})
+}
+
+pub(super) fn recover_pending_release_transaction_inner_with_hook(
+    workspace_root: &Path,
+    allowed_manifests: &[PathBuf],
+    after_root_open: impl FnOnce(),
+) -> Result<RecoveryOutcome, LpmError> {
     let canonical_root = canonical_workspace_root(workspace_root)?;
-    let Some(state) = open_release_state_directory(&canonical_root, false)? else {
+    let root = open_root_directory_nofollow(&canonical_root)?;
+    after_root_open();
+    let Some(state) = open_release_state_directory_from_open_root(&canonical_root, &root, false)?
+    else {
         return Ok(RecoveryOutcome::None);
     };
-    recover_pending_release_transaction_in(&canonical_root, &state, allowed_manifests)
+    recover_pending_release_transaction_in(&canonical_root, &root, &state, allowed_manifests)
 }
 
 pub(super) fn recover_pending_release_transaction_in(
     canonical_root: &Path,
+    root: &cap_std::fs::Dir,
     state: &ReleaseStateDirectory,
     allowed_manifests: &[PathBuf],
 ) -> Result<RecoveryOutcome, LpmError> {
-    let Some((journal_bytes, mut journal)) = read_existing_release_journal_in(state)? else {
+    recover_pending_release_transaction_in_open_root(canonical_root, root, state, allowed_manifests)
+}
+
+fn recover_pending_release_transaction_in_open_root(
+    canonical_root: &Path,
+    root: &cap_std::fs::Dir,
+    state: &ReleaseStateDirectory,
+    allowed_manifests: &[PathBuf],
+) -> Result<RecoveryOutcome, LpmError> {
+    let Some(journal_bytes) = read_existing_release_journal_bytes_in(state)? else {
         return recover_commit_marker_without_journal_in(state);
     };
-    validate_release_journal_header(&journal)?;
-    let commit = release_commit_for_journal(&journal, &journal_bytes);
+    let journal = parse_recovery_release_journal(state, &journal_bytes)?;
+    validate_recovery_release_journal_header(&journal)?;
+    let commit = release_commit_for_parts(
+        journal.operation.clone(),
+        journal.version_git.as_ref().map(|git| git.tag.clone()),
+        &journal_bytes,
+    );
     if journal.state == ReleaseApplyJournalState::Complete
         || release_commit_is_durable_in(state, &journal_bytes)?
     {
@@ -274,9 +344,14 @@ pub(super) fn recover_pending_release_transaction_in(
         remove_committed_release_journal_in(state, &journal_bytes, &commit)?;
         return Ok(outcome);
     }
-    let operation = journal.operation.clone();
-    let version_git = journal.version_git.take();
-    let entries = validate_recovery_entries(canonical_root, journal, allowed_manifests)?;
+    let operation = journal.operation;
+    let version_git = journal.version_git;
+    let entries = validate_recovery_entries_from_open_root(
+        canonical_root,
+        root,
+        journal.entries,
+        allowed_manifests,
+    )?;
 
     if let Some(git) = version_git
         && recover_version_git_transaction(canonical_root, &git, &entries)?
@@ -333,12 +408,13 @@ pub(super) fn recover_commit_marker_without_journal_in(
 
 pub(super) fn rollback_after_apply_error<T>(
     canonical_root: &Path,
+    root: &cap_std::fs::Dir,
     state: &ReleaseStateDirectory,
     allowed_manifests: &[PathBuf],
     trusted_journal_bytes: &[u8],
     primary: LpmError,
 ) -> Result<T, LpmError> {
-    match recover_pending_release_transaction_in(canonical_root, state, allowed_manifests) {
+    match recover_pending_release_transaction_in(canonical_root, root, state, allowed_manifests) {
         Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
         Ok(RecoveryOutcome::None) | Err(_) => {
             if let Err(error) = persist_release_journal_in(state, trusted_journal_bytes) {
@@ -346,7 +422,12 @@ pub(super) fn rollback_after_apply_error<T>(
                     "{primary}; rollback journal could not be restored: {error}"
                 )));
             }
-            match recover_pending_release_transaction_in(canonical_root, state, allowed_manifests) {
+            match recover_pending_release_transaction_in(
+                canonical_root,
+                root,
+                state,
+                allowed_manifests,
+            ) {
                 Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
                 Ok(RecoveryOutcome::None) => Err(LpmError::Script(format!(
                     "{primary}; rollback journal disappeared before recovery"
@@ -373,35 +454,52 @@ pub(super) fn read_release_journal(
     Ok((bytes, journal))
 }
 
-pub(super) fn read_existing_release_journal_in(
+pub(super) fn read_existing_release_journal_bytes_in(
     state: &ReleaseStateDirectory,
-) -> Result<Option<(Vec<u8>, ReleaseApplyJournal)>, LpmError> {
+) -> Result<Option<Vec<u8>>, LpmError> {
     let Some(bytes) =
         read_private_state_file_capped(state, RELEASE_JOURNAL_FILE, MAX_RELEASE_JOURNAL_BYTES)?
     else {
         return Ok(None);
     };
-    let journal = serde_json::from_slice(&bytes).map_err(|error| {
+    Ok(Some(bytes))
+}
+
+fn parse_recovery_release_journal<'a>(
+    state: &ReleaseStateDirectory,
+    bytes: &'a [u8],
+) -> Result<RecoveryApplyJournal<'a>, LpmError> {
+    serde_json::from_slice(bytes).map_err(|error| {
         LpmError::Script(format!(
             "cannot recover interrupted release transaction from {}: {error}",
             state.display.join(RELEASE_JOURNAL_FILE).display()
         ))
-    })?;
-    Ok(Some((bytes, journal)))
+    })
 }
 
-pub(super) fn validate_release_journal_header(
-    journal: &ReleaseApplyJournal,
+fn validate_recovery_release_journal_header(
+    journal: &RecoveryApplyJournal<'_>,
 ) -> Result<(), LpmError> {
-    if journal.schema_version != RELEASE_JOURNAL_SCHEMA_VERSION {
+    validate_release_journal_header_fields(
+        journal.schema_version,
+        journal.transaction_id,
+        journal.path_encoding,
+    )
+}
+
+fn validate_release_journal_header_fields(
+    schema_version: u32,
+    transaction_id: &str,
+    path_encoding: &str,
+) -> Result<(), LpmError> {
+    if schema_version != RELEASE_JOURNAL_SCHEMA_VERSION {
         return Err(LpmError::Script(format!(
             "release journal schema {} is unsupported; preserve the journal and use a compatible LPM version",
-            journal.schema_version
+            schema_version
         )));
     }
-    if journal.transaction_id.len() != RELEASE_TRANSACTION_ID_HEX_BYTES
-        || !journal
-            .transaction_id
+    if transaction_id.len() != RELEASE_TRANSACTION_ID_HEX_BYTES
+        || !transaction_id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
@@ -409,17 +507,27 @@ pub(super) fn validate_release_journal_header(
             "release journal contains an invalid transaction ID".into(),
         ));
     }
-    if journal.path_encoding != release_path_encoding() {
+    if path_encoding != release_path_encoding() {
         return Err(LpmError::Script(format!(
             "release journal path encoding `{}` is not valid on this platform",
-            journal.path_encoding
+            path_encoding
         )));
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn resolve_planned_manifests<'a>(
     canonical_root: &Path,
+    manifests: &'a [PlannedManifest],
+) -> Result<Vec<ResolvedPlannedManifest<'a>>, LpmError> {
+    let root_dir = open_root_directory_nofollow(canonical_root)?;
+    resolve_planned_manifests_from_open_root(canonical_root, &root_dir, manifests)
+}
+
+pub(super) fn resolve_planned_manifests_from_open_root<'a>(
+    canonical_root: &Path,
+    root_dir: &cap_std::fs::Dir,
     manifests: &'a [PlannedManifest],
 ) -> Result<Vec<ResolvedPlannedManifest<'a>>, LpmError> {
     if manifests.len() > MAX_RELEASE_JOURNAL_ENTRIES {
@@ -430,7 +538,6 @@ pub(super) fn resolve_planned_manifests<'a>(
     }
 
     let mut resolved = Vec::with_capacity(manifests.len());
-    let root_dir = open_root_directory_nofollow(canonical_root)?;
     let mut serialized_bytes = empty_release_journal_serialized_len();
     let mut total_original_bytes = 0usize;
     let mut total_updated_bytes = 0usize;
@@ -472,7 +579,7 @@ pub(super) fn resolve_planned_manifests<'a>(
                 MAX_RELEASE_JOURNAL_BYTES / (1024 * 1024)
             )));
         }
-        let target = open_manifest_target(&root_dir, canonical_root, &relative)?;
+        let target = open_manifest_target(root_dir, canonical_root, &relative)?;
         let current = read_manifest_target(&target)?;
         if current.as_slice() != manifest.original_bytes.as_ref() {
             return Err(LpmError::Script(format!(
@@ -764,6 +871,7 @@ pub(super) fn persist_release_commit_in(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn release_commit_for_journal(
     journal: &ReleaseApplyJournal,
     journal_bytes: &[u8],
@@ -934,15 +1042,16 @@ pub(super) fn remove_release_commit_receipt_in(
     Ok(())
 }
 
-pub(super) fn validate_recovery_entries(
+fn validate_recovery_entries_from_open_root(
     canonical_root: &Path,
-    journal: ReleaseApplyJournal,
+    root_dir: &cap_std::fs::Dir,
+    journal_entries: Vec<RecoveryApplyJournalEntry<'_>>,
     allowed_manifests: &[PathBuf],
 ) -> Result<Vec<RecoveryEntry>, LpmError> {
-    if journal.entries.is_empty() || journal.entries.len() > MAX_RELEASE_JOURNAL_ENTRIES {
+    if journal_entries.is_empty() || journal_entries.len() > MAX_RELEASE_JOURNAL_ENTRIES {
         return Err(LpmError::Script(format!(
             "release journal entry count {} is outside the supported range 1..={MAX_RELEASE_JOURNAL_ENTRIES}",
-            journal.entries.len()
+            journal_entries.len()
         )));
     }
 
@@ -950,12 +1059,11 @@ pub(super) fn validate_recovery_entries(
 
     let max_encoded_manifest = (lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize).div_ceil(3) * 4;
     let allowed_manifests = allowed_release_manifest_paths(canonical_root, allowed_manifests)?;
-    let root_dir = open_root_directory_nofollow(canonical_root)?;
     let mut total_original_bytes = 0usize;
     let mut previous_path: Option<PathBuf> = None;
-    let mut entries = Vec::with_capacity(journal.entries.len());
-    for entry in journal.entries {
-        if !valid_sha256_hex(&entry.original_sha256) || !valid_sha256_hex(&entry.updated_sha256) {
+    let mut entries = Vec::with_capacity(journal_entries.len());
+    for entry in journal_entries {
+        if !valid_sha256_hex(entry.original_sha256) || !valid_sha256_hex(entry.updated_sha256) {
             return Err(LpmError::Script(
                 "release journal contains an invalid SHA-256 digest".into(),
             ));
@@ -965,7 +1073,7 @@ pub(super) fn validate_recovery_entries(
                 "release journal contains an oversized manifest backup".into(),
             ));
         }
-        let original = STANDARD.decode(&entry.original_base64).map_err(|error| {
+        let original = STANDARD.decode(entry.original_base64).map_err(|error| {
             LpmError::Script(format!(
                 "release journal contains invalid manifest backup encoding: {error}"
             ))
@@ -986,7 +1094,7 @@ pub(super) fn validate_recovery_entries(
             ));
         }
 
-        let relative = decode_relative_path(&entry.path)?;
+        let relative = decode_relative_path(entry.path)?;
         if !allowed_manifests.contains(&relative) {
             return Err(LpmError::Script(format!(
                 "release journal target is not a release manifest: {}",
@@ -1002,7 +1110,7 @@ pub(super) fn validate_recovery_entries(
             ));
         }
         previous_path = Some(relative.clone());
-        let target = recovery_manifest_target(&root_dir, canonical_root, &relative)?;
+        let target = recovery_manifest_target(root_dir, canonical_root, &relative)?;
         let current = read_manifest_target(&target)?;
         let restore = if current == original {
             false
@@ -1017,7 +1125,7 @@ pub(super) fn validate_recovery_entries(
         entries.push(RecoveryEntry {
             target,
             original,
-            updated_sha256: entry.updated_sha256,
+            updated_sha256: entry.updated_sha256.to_owned(),
             restore,
         });
     }

@@ -9,7 +9,10 @@ use super::prepare::{
     validate_publish_tarball_size,
 };
 use super::secret_scan::{SecretScanLine, format_secret_scan_human, secret_scan_json};
-use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
+use super::skills::{
+    ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files,
+    ensure_lpm_in_files_with_write_hook,
+};
 use super::swift::extract_swift_metadata;
 use super::target::{deduplicate_targets, resolve_targets, validate_custom_publish_registry_url};
 use super::types::{LpmPublicationStatus, PublicationWaitResult, PublishResult, PublishTarget};
@@ -163,6 +166,251 @@ fn ensure_lpm_in_files_only_updates_the_top_level_field() {
     assert_eq!(updated["files"], serde_json::json!(["src/", ".lpm/skills"]));
 }
 
+#[cfg(unix)]
+#[test]
+fn ensure_lpm_in_files_rejects_a_replaced_project_directory_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let displaced_project = dir.path().join("displaced-project");
+    let replacement = dir.path().join("replacement");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    let original = r#"{
+  "name": "test",
+  "version": "1.0.0",
+  "files": ["src/"]
+}
+"#;
+    std::fs::write(project.join("package.json"), original).unwrap();
+    std::fs::write(replacement.join("package.json"), original).unwrap();
+
+    let mut manifest = read_publish_manifest(&project).unwrap();
+    let error =
+        ensure_lpm_in_files_with_write_hook(&mut manifest, ManifestWriteMode::Persist, || {
+            std::fs::rename(&project, &displaced_project).unwrap();
+            std::os::unix::fs::symlink(&replacement, &project).unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("changed while preparing"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(replacement.join("package.json")).unwrap(),
+        original
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_lpm_in_files_rejects_a_fifo_manifest_promptly() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let package_json = dir.path().join("package.json");
+    std::fs::write(
+        &package_json,
+        r#"{"name":"test","version":"1.0.0","files":["src/"]}"#,
+    )
+    .unwrap();
+    let mut manifest = read_publish_manifest(dir.path()).unwrap();
+    std::fs::remove_file(&package_json).unwrap();
+    let path = std::ffi::CString::new(package_json.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist)
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        sender.send(result).unwrap();
+    });
+    let result = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+        Ok(result) => result,
+        Err(error) => {
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&package_json)
+                .unwrap();
+            drop(writer);
+            let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+            worker.join().unwrap();
+            panic!("manifest persistence blocked on a FIFO: {error}");
+        }
+    };
+    worker.join().unwrap();
+
+    let error = result.expect_err("a FIFO manifest must be rejected");
+    assert!(error.contains("changed while preparing"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_publish_manifest_rejects_a_linked_package_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let external_manifest = dir.path().join("external-package.json");
+    std::fs::write(
+        &external_manifest,
+        r#"{"name":"external","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&external_manifest, project.join("package.json")).unwrap();
+
+    let error = read_publish_manifest(&project)
+        .err()
+        .expect("linked package.json must not be accepted")
+        .to_string();
+
+    assert!(error.contains("unsafe"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_preparation_rejects_a_project_root_replaced_after_manifest_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let displaced_project = dir.path().join("displaced-project");
+    let replacement = dir.path().join("replacement");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::write(
+        project.join("package.json"),
+        r#"{"name":"validated","version":"1.0.0","files":["index.js"]}"#,
+    )
+    .unwrap();
+    std::fs::write(project.join("index.js"), "validated content").unwrap();
+    std::fs::write(
+        replacement.join("package.json"),
+        r#"{"name":"replacement","version":"9.9.9","files":["index.js"]}"#,
+    )
+    .unwrap();
+    std::fs::write(replacement.join("index.js"), "replacement secret").unwrap();
+
+    let manifest = read_publish_manifest(&project).unwrap();
+    std::fs::rename(&project, &displaced_project).unwrap();
+    std::os::unix::fs::symlink(&replacement, &project).unwrap();
+
+    let error = prepare_publish_project_from_manifest(manifest, None, None, false)
+        .err()
+        .expect("replaced project root must be rejected")
+        .to_string();
+
+    assert!(error.contains("changed while preparing"), "{error}");
+}
+
+#[test]
+fn release_publish_intent_rejects_a_replaced_member_with_identical_manifests() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace_root = root.path().join("workspace");
+    let member = workspace_root.join("packages/member");
+    let replacement = root.path().join("replacement");
+    let displaced = workspace_root.join("packages/displaced");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::create_dir_all(&replacement).unwrap();
+    std::fs::write(
+        workspace_root.join("package.json"),
+        r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let manifest = r#"{"name":"publisher","version":"1.0.0","files":["index.js"]}"#;
+    for directory in [&member, &replacement] {
+        std::fs::write(directory.join("package.json"), manifest).unwrap();
+    }
+    std::fs::write(member.join("index.js"), "selected generation").unwrap();
+    std::fs::write(replacement.join("index.js"), "replacement generation").unwrap();
+    let workspace = lpm_workspace::discover_workspace(&member)
+        .unwrap()
+        .expect("workspace must be discovered");
+    let intent = super::orchestrator::plan_publish_intent(
+        &member, &workspace, true, false, false, false, None,
+    )
+    .unwrap();
+
+    std::fs::rename(&member, &displaced).unwrap();
+    std::fs::rename(&replacement, &member).unwrap();
+    let replacement_manifest = read_publish_manifest(&member).unwrap();
+    let error = super::orchestrator::validate_publish_intent(
+        &member,
+        &replacement_manifest,
+        &workspace,
+        &intent,
+        true,
+        false,
+        false,
+        false,
+        None,
+    )
+    .expect_err("directory identity replacement must invalidate the release publish intent")
+    .to_string();
+
+    assert!(
+        error.contains("changed after release publish preflight"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lpm_publish_archives_only_the_validated_authored_skill_set() {
+    let project = tempfile::tempdir().unwrap();
+    let skills = project.path().join(".lpm/skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    std::fs::write(
+        project.path().join("package.json"),
+        r#"{"name":"@lpm.dev/owner.package","version":"1.0.0","files":[".lpm/skills"]}"#,
+    )
+    .unwrap();
+    let valid = format!(
+        "---\nname: safe\ndescription: Safe package guidance\n---\n# Safe\n\n{}",
+        "This retained skill contains enough safe package guidance for validation and publication. ".repeat(2)
+    );
+    std::fs::write(skills.join("safe.md"), valid).unwrap();
+    crate::commands::skills::package::materialize(
+        project.path(),
+        "owner.consumer",
+        Some("1.0.0"),
+        &[lpm_registry::Skill {
+            name: "consumer".into(),
+            description: None,
+            version: None,
+            globs: Vec::new(),
+            content: Some(
+                "---\nname: consumer\ndescription: Consumer guidance\n---\n# Consumer\n\nThis materialized consumer guidance is intentionally excluded from package publication."
+                    .into(),
+            ),
+            raw_content: None,
+            size_bytes: None,
+        }],
+    )
+    .unwrap();
+    let manifest = read_publish_manifest(project.path()).unwrap();
+    let validation =
+        author::validate_publish_directory(&manifest.package_json_parent, project.path()).unwrap();
+    assert!(validation.is_valid());
+    std::fs::write(skills.join("late.md"), "not validated").unwrap();
+    std::fs::write(skills.join("private.txt"), "private notes").unwrap();
+    std::fs::create_dir(skills.join("nested")).unwrap();
+    std::fs::write(skills.join("nested/private.md"), "private nested notes").unwrap();
+    let materialized = skills.join("owner.consumer");
+    std::fs::remove_file(materialized.join(".lpm-package-skills.json")).unwrap();
+
+    let prepared = prepare_publish_project_from_manifest(
+        manifest,
+        None,
+        Some(&validation.validated_files),
+        false,
+    )
+    .unwrap();
+    let skill_paths = prepared
+        .tarball_files
+        .iter()
+        .filter(|file| file.path.starts_with(".lpm/skills/"))
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(skill_paths, vec![".lpm/skills/safe.md"]);
+}
+
 #[test]
 fn real_publish_preparation_persists_and_packs_authored_skills() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,7 +441,7 @@ fn real_publish_preparation_persists_and_packs_authored_skills() {
         ensure_lpm_in_files(&mut manifest, ManifestWriteMode::Persist).unwrap(),
         "the restrictive files array should be updated before tarball creation"
     );
-    let prepared = prepare_publish_project_from_manifest(project, manifest, None, true).unwrap();
+    let prepared = prepare_publish_project_from_manifest(manifest, None, None, true).unwrap();
 
     assert!(
         prepared
@@ -233,7 +481,7 @@ fn read_only_publish_preparation_packs_effective_manifest_without_writing_it() {
 
     let mut manifest = read_publish_manifest(project).unwrap();
     assert!(ensure_lpm_in_files(&mut manifest, ManifestWriteMode::ReadOnly).unwrap());
-    let prepared = prepare_publish_project_from_manifest(project, manifest, None, true).unwrap();
+    let prepared = prepare_publish_project_from_manifest(manifest, None, None, true).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(project.join("package.json")).unwrap(),

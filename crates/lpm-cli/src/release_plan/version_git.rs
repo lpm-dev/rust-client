@@ -203,8 +203,115 @@ pub(super) enum VersionGitRecoveryState {
     Completed,
 }
 
+trait VersionGitCommandRunner {
+    fn output(&self, args: &[OsString]) -> Result<Output, LpmError>;
+}
+
+struct PathVersionGitCommandRunner<'a> {
+    working_directory: &'a Path,
+}
+
+impl VersionGitCommandRunner for PathVersionGitCommandRunner<'_> {
+    fn output(&self, args: &[OsString]) -> Result<Output, LpmError> {
+        Command::new("git")
+            .args(args)
+            .current_dir(self.working_directory)
+            .output()
+            .map_err(LpmError::Io)
+    }
+}
+
+struct RecoveryVersionGitCommandRunner<'a> {
+    working_directory: &'a cap_std::fs::Dir,
+    #[cfg(not(unix))]
+    display: &'a Path,
+}
+
+#[cfg(unix)]
+impl VersionGitCommandRunner for RecoveryVersionGitCommandRunner<'_> {
+    fn output(&self, args: &[OsString]) -> Result<Output, LpmError> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let directory = self
+            .working_directory
+            .try_clone()
+            .map_err(LpmError::Io)?
+            .into_std_file();
+        let descriptor = directory.as_raw_fd();
+        let mut command = Command::new("git");
+        command.args(args);
+        unsafe {
+            // SAFETY: the retained directory file remains open until `output` returns, and
+            // `fchdir` is async-signal-safe between fork and exec.
+            command.pre_exec(move || {
+                if libc::fchdir(descriptor) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        command.output().map_err(LpmError::Io)
+    }
+}
+
+#[cfg(not(unix))]
+impl VersionGitCommandRunner for RecoveryVersionGitCommandRunner<'_> {
+    fn output(&self, args: &[OsString]) -> Result<Output, LpmError> {
+        let retained = same_file::Handle::from_file(
+            self.working_directory
+                .try_clone()
+                .map_err(LpmError::Io)?
+                .into_std_file(),
+        )
+        .map_err(LpmError::Io)?;
+        #[cfg(windows)]
+        let directory_guard = {
+            use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(self.display)
+                .map_err(LpmError::Io)?;
+            let metadata = guard.metadata().map_err(LpmError::Io)?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return Err(LpmError::Script(format!(
+                    "version transaction Git directory changed before recovery: {}",
+                    self.display.display()
+                )));
+            }
+            guard
+        };
+        #[cfg(windows)]
+        let current =
+            same_file::Handle::from_file(directory_guard.try_clone().map_err(LpmError::Io)?)
+                .map_err(LpmError::Io)?;
+        #[cfg(not(windows))]
+        let current = same_file::Handle::from_path(self.display).map_err(LpmError::Io)?;
+        if retained != current {
+            return Err(LpmError::Script(format!(
+                "version transaction Git directory changed before recovery: {}",
+                self.display.display()
+            )));
+        }
+        Command::new("git")
+            .args(args)
+            .current_dir(self.display)
+            .output()
+            .map_err(LpmError::Io)
+    }
+}
+
 pub(super) fn recover_version_git_transaction(
-    canonical_root: &Path,
+    _canonical_root: &Path,
     git: &VersionGitJournal,
     entries: &[RecoveryEntry],
 ) -> Result<VersionGitRecoveryState, LpmError> {
@@ -213,30 +320,24 @@ pub(super) fn recover_version_git_transaction(
             "version Git recovery requires exactly one package manifest".into(),
         ));
     };
-    let working_dir = entry.target.display.parent().ok_or_else(|| {
+    let _display = entry.target.display.parent().ok_or_else(|| {
         LpmError::Script("version transaction manifest has no parent directory".into())
     })?;
-    let canonical_working_dir = working_dir.canonicalize().map_err(LpmError::Io)?;
-    if canonical_working_dir != working_dir || !canonical_working_dir.starts_with(canonical_root) {
-        return Err(LpmError::Script(format!(
-            "version transaction Git directory changed outside the workspace: {}",
-            working_dir.display()
-        )));
-    }
-
-    let repository_root = version_git_repository_root(&canonical_working_dir)?;
-    let repository_manifest = entry
-        .target
-        .display
-        .strip_prefix(&repository_root)
-        .map_err(|_| {
-            LpmError::Script(format!(
-                "version transaction manifest is outside its Git worktree: {}",
-                entry.target.display.display()
-            ))
-        })?;
+    let runner = RecoveryVersionGitCommandRunner {
+        working_directory: &entry.target.parent,
+        #[cfg(not(unix))]
+        display: _display,
+    };
+    let prefix_output = require_version_git_success_with(
+        &runner,
+        [OsStr::new("rev-parse"), OsStr::new("--show-prefix")],
+    )?;
+    let mut prefix = path_from_git_output(prefix_output.stdout)?;
+    prefix.push(&entry.target.file_name);
+    validate_version_git_relative_path(&prefix)?;
+    let repository_manifest = prefix;
     let old_head =
-        resolve_version_git_commit(&repository_root, &format!("{}^{{commit}}", git.old_head))?;
+        resolve_version_git_commit_with(&runner, &format!("{}^{{commit}}", git.old_head))?;
     if old_head != git.old_head {
         return Err(LpmError::Script(
             "version transaction baseline Git commit does not match its journal".into(),
@@ -244,45 +345,45 @@ pub(super) fn recover_version_git_transaction(
     }
 
     let tag_ref = format!("refs/tags/{}", git.tag);
-    require_version_git_success(
-        &repository_root,
+    require_version_git_success_with(
+        &runner,
         [OsStr::new("check-ref-format"), OsStr::new(&tag_ref)],
     )?;
     let mut peeled_tag = OsString::from(&tag_ref);
     peeled_tag.push("^{commit}");
-    if let Some(tag_commit) = resolve_optional_version_git_commit(&repository_root, &peeled_tag)? {
+    if let Some(tag_commit) = resolve_optional_version_git_commit_with(&runner, &peeled_tag)? {
         if !entry.restore {
             return Err(LpmError::Script(
                 "the completed version tag exists but package.json no longer matches its journal; the release journal was preserved".into(),
             ));
         }
-        verify_version_git_commit(
-            &repository_root,
-            repository_manifest,
+        verify_version_git_commit_with(
+            &runner,
+            &repository_manifest,
             &git.old_head,
             &tag_commit,
             &entry.updated_sha256,
         )?;
         return Ok(VersionGitRecoveryState::Completed);
     }
-    if version_git_ref_exists(&repository_root, &tag_ref)? {
+    if version_git_ref_exists_with(&runner, &tag_ref)? {
         return Err(LpmError::Script(format!(
             "Git tag `{}` exists but does not identify the expected version commit; the release journal was preserved",
             git.tag
         )));
     }
 
-    let current_head = resolve_version_git_commit(&repository_root, "HEAD^{commit}")?;
+    let current_head = resolve_version_git_commit_with(&runner, "HEAD^{commit}")?;
     if current_head != git.old_head {
-        verify_version_git_commit(
-            &repository_root,
-            repository_manifest,
+        verify_version_git_commit_with(
+            &runner,
+            &repository_manifest,
             &git.old_head,
             &current_head,
             &entry.updated_sha256,
         )?;
-        require_version_git_success(
-            &repository_root,
+        require_version_git_success_with(
+            &runner,
             [
                 OsStr::new("update-ref"),
                 OsStr::new("-m"),
@@ -293,8 +394,8 @@ pub(super) fn recover_version_git_transaction(
             ],
         )?;
     }
-    require_version_git_success(
-        &repository_root,
+    require_version_git_success_with(
+        &runner,
         [
             OsStr::new("reset"),
             OsStr::new("--quiet"),
@@ -313,7 +414,25 @@ pub(super) fn verify_version_git_commit(
     candidate: &str,
     updated_sha256: &str,
 ) -> Result<(), LpmError> {
-    let parent = resolve_version_git_commit(repository_root, &format!("{candidate}^{{commit}}^"))?;
+    verify_version_git_commit_with(
+        &PathVersionGitCommandRunner {
+            working_directory: repository_root,
+        },
+        manifest,
+        old_head,
+        candidate,
+        updated_sha256,
+    )
+}
+
+fn verify_version_git_commit_with(
+    runner: &impl VersionGitCommandRunner,
+    manifest: &Path,
+    old_head: &str,
+    candidate: &str,
+    updated_sha256: &str,
+) -> Result<(), LpmError> {
+    let parent = resolve_version_git_commit_with(runner, &format!("{candidate}^{{commit}}^"))?;
     if parent != old_head {
         return Err(LpmError::Script(format!(
             "Git HEAD moved outside the version transaction; expected parent {old_head}, found {parent}. The release journal was preserved."
@@ -322,15 +441,15 @@ pub(super) fn verify_version_git_commit(
 
     let mut excluded_manifest = OsString::from(":(top,exclude,literal)");
     excluded_manifest.push(manifest.as_os_str());
-    let unchanged_elsewhere = version_git_output(
-        repository_root,
+    let unchanged_elsewhere = version_git_output_with(
+        runner,
         [
             OsStr::new("diff"),
             OsStr::new("--quiet"),
             OsStr::new(old_head),
             OsStr::new(candidate),
             OsStr::new("--"),
-            OsStr::new("."),
+            OsStr::new(":(top)"),
             excluded_manifest.as_os_str(),
         ],
     )?;
@@ -347,8 +466,8 @@ pub(super) fn verify_version_git_commit(
     let mut object_spec = OsString::from(candidate);
     object_spec.push(":");
     object_spec.push(manifest.as_os_str());
-    let size_output = require_version_git_success(
-        repository_root,
+    let size_output = require_version_git_success_with(
+        runner,
         [
             OsStr::new("cat-file"),
             OsStr::new("-s"),
@@ -362,8 +481,8 @@ pub(super) fn verify_version_git_commit(
                 .into(),
         ));
     }
-    let manifest_output = require_version_git_success(
-        repository_root,
+    let manifest_output = require_version_git_success_with(
+        runner,
         [
             OsStr::new("cat-file"),
             OsStr::new("blob"),
@@ -384,14 +503,7 @@ pub(super) fn version_git_repository_root(working_dir: &Path) -> Result<PathBuf,
         working_dir,
         [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")],
     )?;
-    let mut bytes = output.stdout;
-    while bytes
-        .last()
-        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        bytes.pop();
-    }
-    let path = path_from_git_bytes(bytes)?;
+    let path = path_from_git_output(output.stdout)?;
     path.canonicalize().map_err(LpmError::Io)
 }
 
@@ -399,8 +511,20 @@ pub(super) fn resolve_version_git_commit(
     repository_root: &Path,
     object: &str,
 ) -> Result<String, LpmError> {
-    let output = require_version_git_success(
-        repository_root,
+    resolve_version_git_commit_with(
+        &PathVersionGitCommandRunner {
+            working_directory: repository_root,
+        },
+        object,
+    )
+}
+
+fn resolve_version_git_commit_with(
+    runner: &impl VersionGitCommandRunner,
+    object: &str,
+) -> Result<String, LpmError> {
+    let output = require_version_git_success_with(
+        runner,
         [
             OsStr::new("rev-parse"),
             OsStr::new("--verify"),
@@ -414,8 +538,20 @@ pub(super) fn resolve_optional_version_git_commit(
     repository_root: &Path,
     object: &OsStr,
 ) -> Result<Option<String>, LpmError> {
-    let output = version_git_output(
-        repository_root,
+    resolve_optional_version_git_commit_with(
+        &PathVersionGitCommandRunner {
+            working_directory: repository_root,
+        },
+        object,
+    )
+}
+
+fn resolve_optional_version_git_commit_with(
+    runner: &impl VersionGitCommandRunner,
+    object: &OsStr,
+) -> Result<Option<String>, LpmError> {
+    let output = version_git_output_with(
+        runner,
         [
             OsStr::new("rev-parse"),
             OsStr::new("--verify"),
@@ -433,12 +569,12 @@ pub(super) fn resolve_optional_version_git_commit(
     }
 }
 
-pub(super) fn version_git_ref_exists(
-    repository_root: &Path,
+fn version_git_ref_exists_with(
+    runner: &impl VersionGitCommandRunner,
     reference: &str,
 ) -> Result<bool, LpmError> {
-    let output = version_git_output(
-        repository_root,
+    let output = version_git_output_with(
+        runner,
         [
             OsStr::new("rev-parse"),
             OsStr::new("--verify"),
@@ -458,6 +594,22 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    require_version_git_success_with(
+        &PathVersionGitCommandRunner {
+            working_directory: cwd,
+        },
+        args,
+    )
+}
+
+fn require_version_git_success_with<I, S>(
+    runner: &impl VersionGitCommandRunner,
+    args: I,
+) -> Result<Output, LpmError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args = args
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
@@ -467,7 +619,7 @@ where
         .map(|arg| arg.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
-    let output = version_git_output(cwd, &args)?;
+    let output = runner.output(&args)?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -480,11 +632,27 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(LpmError::Io)
+    version_git_output_with(
+        &PathVersionGitCommandRunner {
+            working_directory: cwd,
+        },
+        args,
+    )
+}
+
+fn version_git_output_with<I, S>(
+    runner: &impl VersionGitCommandRunner,
+    args: I,
+) -> Result<Output, LpmError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    runner.output(&args)
 }
 
 pub(super) fn version_git_stdout_text(command: &str, bytes: Vec<u8>) -> Result<String, LpmError> {
@@ -505,6 +673,30 @@ pub(super) fn version_git_error(command: &str, output: Output) -> LpmError {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if stderr.is_empty() { stdout } else { stderr };
     LpmError::Script(format!("git {command} failed: {detail}"))
+}
+
+fn path_from_git_output(mut bytes: Vec<u8>) -> Result<PathBuf, LpmError> {
+    while bytes
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        bytes.pop();
+    }
+    path_from_git_bytes(bytes)
+}
+
+fn validate_version_git_relative_path(path: &Path) -> Result<(), LpmError> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(LpmError::Script(format!(
+            "version transaction Git manifest path is unsafe: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

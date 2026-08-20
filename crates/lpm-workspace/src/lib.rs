@@ -28,8 +28,9 @@ pub use compat::{
     PNPM_PATCHES_DRIFT_META, PNPM_PEER_RULES_DRIFT_META, UNSUPPORTED_OVERRIDE_VALUES_META,
 };
 pub use discovery::{
-    Workspace, WorkspaceMember, collect_all_dependencies, discover_workspace, find_project_root,
-    find_workspace_root, read_workspace_root_package,
+    OpenWorkspaceRoot, Workspace, WorkspaceMember, collect_all_dependencies, discover_workspace,
+    discover_workspace_from_open_root, find_project_root, find_workspace_root,
+    find_workspace_root_from_open_project, read_workspace_root_package,
 };
 pub use error::WorkspaceError;
 pub use package_json::{

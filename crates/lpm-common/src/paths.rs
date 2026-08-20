@@ -52,6 +52,7 @@
 
 use crate::LpmError;
 use crate::color::Painted;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// Filename of the durable completeness marker written into every
@@ -395,6 +396,153 @@ const TEST_LOCK_CONTENTION_MARKER_ENV: &str = "LPM_TEST_LOCK_CONTENTION_MARKER";
 
 type LockWaitCallback = Box<dyn FnOnce() + Send>;
 
+#[derive(Clone, Copy)]
+enum LockFileComponent {
+    Data,
+    WriterIntent,
+    WriterQueue,
+}
+
+trait LockFileSource {
+    fn display_path(&self) -> &Path;
+
+    fn open(&self, component: LockFileComponent) -> std::io::Result<std::fs::File>;
+}
+
+struct AmbientLockFileSource<'a> {
+    data_path: &'a Path,
+}
+
+impl LockFileSource for AmbientLockFileSource<'_> {
+    fn display_path(&self) -> &Path {
+        self.data_path
+    }
+
+    fn open(&self, component: LockFileComponent) -> std::io::Result<std::fs::File> {
+        let path = match component {
+            LockFileComponent::Data => self.data_path.to_path_buf(),
+            LockFileComponent::WriterIntent => writer_intent_path_for(self.data_path),
+            LockFileComponent::WriterQueue => writer_queue_path_for(self.data_path),
+        };
+        open_lock_file(&path)
+    }
+}
+
+/// A retained capability for project-local lock files under `.lpm`.
+#[derive(Debug)]
+pub struct ProjectLockDirectory {
+    directory: cap_std::fs::Dir,
+    display: PathBuf,
+}
+
+impl ProjectLockDirectory {
+    /// Open or create `.lpm` relative to an already-open project or workspace root.
+    pub fn open_or_create(
+        project_root: &cap_std::fs::Dir,
+        project_display: &Path,
+    ) -> Result<Self, LpmError> {
+        use cap_fs_ext::DirExt as _;
+
+        let display = project_display.join(".lpm");
+        let directory = match project_root.open_dir_nofollow(".lpm") {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match project_root.create_dir(".lpm") {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(LpmError::Io(error)),
+                }
+                project_root.open_dir_nofollow(".lpm").map_err(|error| {
+                    LpmError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "refusing project lock directory that is not a real directory at {}: {error}",
+                            display.display()
+                        ),
+                    ))
+                })?
+            }
+            Err(error) => {
+                return Err(LpmError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "refusing project lock directory that is not a real directory at {}: {error}",
+                        display.display()
+                    ),
+                )));
+            }
+        };
+        let metadata = directory.dir_metadata().map_err(LpmError::Io)?;
+        if !metadata.is_dir() || capability_metadata_is_link_or_reparse(&metadata) {
+            return Err(LpmError::Io(std::io::Error::other(format!(
+                "refusing project lock directory that is not a real directory at {}",
+                display.display()
+            ))));
+        }
+        Ok(Self { directory, display })
+    }
+
+    /// Clone the retained directory capability for an independent lock acquisition.
+    pub fn try_clone(&self) -> Result<Self, LpmError> {
+        Ok(Self {
+            directory: self.directory.try_clone().map_err(LpmError::Io)?,
+            display: self.display.clone(),
+        })
+    }
+}
+
+/// Selects one of the stable project-local lock domains.
+#[derive(Clone, Copy)]
+pub enum ProjectLockKind {
+    Install,
+    Publish,
+}
+
+impl ProjectLockKind {
+    fn file_name(self) -> &'static OsStr {
+        match self {
+            Self::Install => OsStr::new(".install.lock"),
+            Self::Publish => OsStr::new(".publish.lock"),
+        }
+    }
+}
+
+struct CapabilityLockFileSource {
+    directory: cap_std::fs::Dir,
+    data_name: &'static OsStr,
+    display_path: PathBuf,
+}
+
+impl CapabilityLockFileSource {
+    fn new(directory: ProjectLockDirectory, kind: ProjectLockKind) -> Self {
+        let data_name = kind.file_name();
+        let display_path = directory.display.join(data_name);
+        Self {
+            directory: directory.directory,
+            data_name,
+            display_path,
+        }
+    }
+
+    fn component_name(&self, component: LockFileComponent) -> OsString {
+        match component {
+            LockFileComponent::Data => self.data_name.to_os_string(),
+            LockFileComponent::WriterIntent => derived_lock_name(self.data_name, "writer-intent"),
+            LockFileComponent::WriterQueue => derived_lock_name(self.data_name, "writer-queue"),
+        }
+    }
+}
+
+impl LockFileSource for CapabilityLockFileSource {
+    fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    fn open(&self, component: LockFileComponent) -> std::io::Result<std::fs::File> {
+        open_capability_lock_file(&self.directory, &self.component_name(component))
+    }
+}
+
 /// Derive the writer-intent gate path from the data lock path.
 /// `~/.lpm/store/.gc.lock` → `~/.lpm/store/.gc.lock.writer-intent`.
 fn writer_intent_path_for(data_path: &Path) -> PathBuf {
@@ -415,6 +563,13 @@ fn derived_lock_path(data_path: &Path, suffix: &str) -> PathBuf {
     );
     p.set_file_name(new_name);
     p
+}
+
+fn derived_lock_name(data_name: &OsStr, suffix: &str) -> OsString {
+    let mut name = data_name.to_os_string();
+    name.push(".");
+    name.push(suffix);
+    name
 }
 
 /// Default "waiting for…" message used by every wrapper that doesn't
@@ -482,6 +637,49 @@ fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .truncate(false)
         .open(lock_path)
+}
+
+fn open_capability_lock_file(
+    directory: &cap_std::fs::Dir,
+    name: &OsStr,
+) -> std::io::Result<std::fs::File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .follow(FollowSymlinks::No)
+        .nonblock(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = directory.open_with(name, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || capability_metadata_is_link_or_reparse(&metadata) {
+        return Err(std::io::Error::other(format!(
+            "refusing project lock path that is not a regular file: {}",
+            Path::new(name).display()
+        )));
+    }
+    Ok(file.into_std())
+}
+
+#[cfg(not(windows))]
+fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_symlink()
+}
+
+#[cfg(windows)]
+fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 /// Acquire a shared lock with a delayed wait-hint callback that fires
@@ -598,15 +796,12 @@ fn probe_queue_empty(rw: &mut fd_lock::RwLock<std::fs::File>) -> Result<bool, Lp
 /// 4. Drop the gate (kept shared only as long as needed to take data).
 ///
 /// Only the data lock is returned in the handle.
-fn acquire_shared_with_hint(
-    data_path: &Path,
+fn acquire_shared_from_source(
+    source: &impl LockFileSource,
     on_first_wait: impl FnOnce() + Send + 'static,
 ) -> Result<SharedLockHandle, LpmError> {
-    let intent_path = writer_intent_path_for(data_path);
-    let queue_path = writer_queue_path_for(data_path);
-
     let mut on_first_wait = Some(Box::new(on_first_wait) as Box<dyn FnOnce() + Send>);
-    let mut on_first_contention = test_lock_contention_callback(data_path);
+    let mut on_first_contention = test_lock_contention_callback(source.display_path());
     let start = std::time::Instant::now();
 
     // poll the writer-queue baton until no writer is queued.
@@ -615,7 +810,7 @@ fn acquire_shared_with_hint(
     // RwLock across iterations would require dropping the prior probe
     // anyway, so opening fresh is simpler.
     loop {
-        let queue_file = open_lock_file(&queue_path)?;
+        let queue_file = source.open(LockFileComponent::WriterQueue)?;
         let mut queue_rw = fd_lock::RwLock::new(queue_file);
         if probe_queue_empty(&mut queue_rw)? {
             break;
@@ -634,7 +829,7 @@ fn acquire_shared_with_hint(
     }
 
     // acquire gate-shared. Uncontended in the steady state.
-    let intent_file = open_lock_file(&intent_path)?;
+    let intent_file = source.open(LockFileComponent::WriterIntent)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
     poll_until_acquired(
         &mut intent_rw,
@@ -644,7 +839,7 @@ fn acquire_shared_with_hint(
     )?;
 
     // acquire data-shared.
-    let data_file = open_lock_file(data_path)?;
+    let data_file = source.open(LockFileComponent::Data)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
     poll_until_acquired(
         &mut data_rw,
@@ -671,18 +866,16 @@ fn acquire_shared_with_hint(
 ///    queue, so the access lock releases first, then new readers are
 ///    re-admitted only after the next writer (if any) has had a chance
 ///    to take the queue.
-fn acquire_exclusive_with_hint(
-    data_path: &Path,
+fn acquire_exclusive_from_source(
+    source: &impl LockFileSource,
     on_first_wait: impl FnOnce() + Send + 'static,
 ) -> Result<ExclusiveLockHandle, LpmError> {
-    let intent_path = writer_intent_path_for(data_path);
-    let queue_path = writer_queue_path_for(data_path);
-    let mut on_first_contention = test_lock_contention_callback(data_path);
+    let mut on_first_contention = test_lock_contention_callback(source.display_path());
 
     // take queue-shared. Multiple writers can each hold this
     // shared simultaneously — that's the point: every queued writer
     // contributes to the "writer is queued" signal readers see.
-    let queue_file = open_lock_file(&queue_path)?;
+    let queue_file = source.open(LockFileComponent::WriterQueue)?;
     let mut queue_rw = fd_lock::RwLock::new(queue_file);
     poll_until_acquired(
         &mut queue_rw,
@@ -694,7 +887,7 @@ fn acquire_exclusive_with_hint(
     // gate exclusive. Blocks new readers from passing the
     // gate. Existing in-body readers don't hold the gate so they
     // don't compete here.
-    let intent_file = open_lock_file(&intent_path)?;
+    let intent_file = source.open(LockFileComponent::WriterIntent)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
     poll_until_acquired(
         &mut intent_rw,
@@ -704,7 +897,7 @@ fn acquire_exclusive_with_hint(
     )?;
 
     // data exclusive. Wait for in-body readers to release.
-    let data_file = open_lock_file(data_path)?;
+    let data_file = source.open(LockFileComponent::Data)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
     poll_until_acquired(
         &mut data_rw,
@@ -718,6 +911,20 @@ fn acquire_exclusive_with_hint(
         _writer_intent: intent_rw,
         _writer_queue: queue_rw,
     })
+}
+
+fn acquire_shared_with_hint(
+    data_path: &Path,
+    on_first_wait: impl FnOnce() + Send + 'static,
+) -> Result<SharedLockHandle, LpmError> {
+    acquire_shared_from_source(&AmbientLockFileSource { data_path }, on_first_wait)
+}
+
+fn acquire_exclusive_with_hint(
+    data_path: &Path,
+    on_first_wait: impl FnOnce() + Send + 'static,
+) -> Result<ExclusiveLockHandle, LpmError> {
+    acquire_exclusive_from_source(&AmbientLockFileSource { data_path }, on_first_wait)
 }
 
 /// Run `body` under a **shared** `fd-lock` advisory lock on
@@ -768,6 +975,25 @@ pub async fn with_shared_lock_async<R>(
     })
     .await
     .map_err(|e| LpmError::Io(std::io::Error::other(format!("lock task join: {e}"))))??;
+    body.await
+}
+
+/// Run an async body under a shared project lock opened through a retained
+/// `.lpm` directory capability.
+pub async fn with_project_shared_lock_async<R>(
+    lock_directory: ProjectLockDirectory,
+    kind: ProjectLockKind,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    let source = CapabilityLockFileSource::new(lock_directory, kind);
+    let _handle =
+        tokio::task::spawn_blocking(move || acquire_shared_from_source(&source, default_wait_hint))
+            .await
+            .map_err(|error| {
+                LpmError::Io(std::io::Error::other(format!(
+                    "project lock task join: {error}"
+                )))
+            })??;
     body.await
 }
 
@@ -938,6 +1164,26 @@ pub async fn with_exclusive_lock_async<R>(
     })
     .await
     .map_err(|e| LpmError::Io(std::io::Error::other(format!("lock task join: {e}"))))??;
+    body.await
+}
+
+/// Run an async body under an exclusive project lock opened through a retained
+/// `.lpm` directory capability.
+pub async fn with_project_exclusive_lock_async<R>(
+    lock_directory: ProjectLockDirectory,
+    kind: ProjectLockKind,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    let source = CapabilityLockFileSource::new(lock_directory, kind);
+    let _handle = tokio::task::spawn_blocking(move || {
+        acquire_exclusive_from_source(&source, default_wait_hint)
+    })
+    .await
+    .map_err(|error| {
+        LpmError::Io(std::io::Error::other(format!(
+            "project lock task join: {error}"
+        )))
+    })??;
     body.await
 }
 

@@ -17,11 +17,12 @@ pub(crate) use npm_artifact::prepare_npm_target_artifact;
 pub use orchestrator::run;
 pub(crate) use orchestrator::{
     PreparedPublish, PublishExecutionReport, PublishIntent, execute_prepared_for_release,
-    plan_publish_intent, prepare_intent_with_workspace_lock_held,
+    plan_publish_intent_from_source, prepare_intent_with_workspace_lock_held,
 };
-pub(crate) use prepare::{prepare_publish_project, validate_publish_tarball_size};
+pub(crate) use prepare::{PublishSource, prepare_publish_project, validate_publish_tarball_size};
 pub(crate) use provenance::{
-    ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
+    ProvenanceRequest, materialize_provenance_request,
+    resolve_provenance_request_from_project_source,
 };
 pub(crate) use quality_gate::run_publish_quality_gate;
 pub(crate) use secret_scan::run_publish_secret_scan;

@@ -24,6 +24,27 @@ pub struct WorkspaceMember {
     pub package: PackageJson,
 }
 
+pub struct OpenWorkspaceRoot {
+    path: PathBuf,
+    directory: cap_std::fs::Dir,
+}
+
+impl OpenWorkspaceRoot {
+    #[inline]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[inline]
+    pub fn directory(&self) -> &cap_std::fs::Dir {
+        &self.directory
+    }
+
+    pub fn into_parts(self) -> (PathBuf, cap_std::fs::Dir) {
+        (self.path, self.directory)
+    }
+}
+
 pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, WorkspaceError> {
     let original_start = start_dir.to_path_buf();
     let mut current = start_dir.to_path_buf();
@@ -76,6 +97,37 @@ pub fn discover_workspace(start_dir: &Path) -> Result<Option<Workspace>, Workspa
     Ok(None)
 }
 
+/// Discover one already-selected workspace without reopening its root by name.
+pub fn discover_workspace_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    start_dir: &Path,
+) -> Result<Option<Workspace>, WorkspaceError> {
+    let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, root_dir)?;
+    let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let members = discover_members_from_open_root(root_path, root_dir, &globs)?;
+    validate_unique_package_names(root_path, &root_package, &members)?;
+    warn_on_member_catalogs(&members);
+    let workspace = Workspace {
+        root: root_path.to_path_buf(),
+        root_package,
+        members,
+    };
+    let start_is_root = start_dir == root_path;
+    let start_is_member = workspace
+        .members
+        .iter()
+        .any(|member| start_dir.starts_with(&member.path));
+    if start_is_root || start_is_member {
+        Ok(Some(workspace))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Find the applicable workspace root without reading or retaining member manifests.
 pub fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
     let mut current = start_dir.to_path_buf();
@@ -95,6 +147,117 @@ pub fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, Workspac
             return Ok(None);
         }
     }
+}
+
+pub fn find_workspace_root_from_open_project(
+    start_path: &Path,
+    start_dir: &cap_std::fs::Dir,
+) -> Result<Option<OpenWorkspaceRoot>, WorkspaceError> {
+    let start_identity = open_directory_identity(start_dir, start_path)?;
+    let mut current = start_path.to_path_buf();
+    loop {
+        let directory = if current == start_path {
+            start_dir.try_clone().map_err(|error| {
+                WorkspaceError::Io(format!(
+                    "failed to retain workspace candidate {}: {error}",
+                    current.display()
+                ))
+            })?
+        } else {
+            open_directory_nofollow(&current).map_err(|error| {
+                WorkspaceError::Io(format!(
+                    "failed to open workspace candidate {} safely: {error}",
+                    current.display()
+                ))
+            })?
+        };
+        match read_workspace_root_from_open_dir(&current, &directory) {
+            Ok((root_package, pnpm_workspace)) => {
+                let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+                if !globs.is_empty()
+                    && (current == start_path
+                        || workspace_globs_include_project(start_path, &current, &globs)?)
+                {
+                    let relative_project = start_path.strip_prefix(&current).map_err(|_| {
+                        WorkspaceError::Parse(format!(
+                            "selected project {} is outside workspace candidate {}",
+                            start_path.display(),
+                            current.display()
+                        ))
+                    })?;
+                    let Some(project_from_candidate) =
+                        open_relative_directory(&directory, relative_project)?
+                    else {
+                        return Err(WorkspaceError::Io(format!(
+                            "selected project {} changed while choosing workspace root {}",
+                            start_path.display(),
+                            current.display()
+                        )));
+                    };
+                    if open_directory_identity(&project_from_candidate, start_path)?
+                        != start_identity
+                    {
+                        return Err(WorkspaceError::Io(format!(
+                            "selected project {} does not belong to workspace root generation {}",
+                            start_path.display(),
+                            current.display()
+                        )));
+                    }
+                    return Ok(Some(OpenWorkspaceRoot {
+                        path: current,
+                        directory,
+                    }));
+                }
+            }
+            Err(WorkspaceError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+fn open_directory_identity(
+    directory: &cap_std::fs::Dir,
+    display: &Path,
+) -> Result<same_file::Handle, WorkspaceError> {
+    let file = directory.try_clone().map_err(|error| {
+        WorkspaceError::Io(format!(
+            "failed to retain directory identity for {}: {error}",
+            display.display()
+        ))
+    })?;
+    same_file::Handle::from_file(file.into_std_file()).map_err(|error| {
+        WorkspaceError::Io(format!(
+            "failed to identify directory {}: {error}",
+            display.display()
+        ))
+    })
+}
+
+fn workspace_globs_include_project(
+    project: &Path,
+    root: &Path,
+    globs: &[String],
+) -> Result<bool, WorkspaceError> {
+    let relative = project.strip_prefix(root).map_err(|_| {
+        WorkspaceError::Parse(format!(
+            "workspace candidate {} is outside {}",
+            project.display(),
+            root.display()
+        ))
+    })?;
+    let mut included = false;
+    let mut excluded = false;
+    for raw in globs {
+        if let Some(raw) = raw.strip_prefix('!') {
+            excluded |= WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
+        } else {
+            included |= WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
+        }
+    }
+    Ok(included && !excluded)
 }
 
 fn start_belongs_to_workspace(
@@ -207,6 +370,154 @@ fn read_workspace_root(
         merge_pnpm_workspace_config(&mut root_package, config);
     }
     Ok((root_package, pnpm_workspace))
+}
+
+fn read_workspace_root_from_open_dir(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+) -> Result<(PackageJson, Option<PnpmWorkspaceConfig>), WorkspaceError> {
+    let mut root_package = read_package_json_from_open_dir(
+        root_dir,
+        Path::new("package.json"),
+        &root_path.join("package.json"),
+    )?;
+    let pnpm_workspace = read_pnpm_workspace_from_open_dir(
+        root_dir,
+        Path::new("pnpm-workspace.yaml"),
+        &root_path.join("pnpm-workspace.yaml"),
+    )?;
+    if let Some(config) = pnpm_workspace.as_ref() {
+        merge_pnpm_workspace_config(&mut root_package, config);
+    }
+    Ok((root_package, pnpm_workspace))
+}
+
+fn read_package_json_from_open_dir(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<PackageJson, WorkspaceError> {
+    let content = read_text_from_open_dir(
+        directory,
+        relative,
+        display_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        false,
+    )?
+    .ok_or_else(|| WorkspaceError::NotFound(display_path.display().to_string()))?;
+    serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
+        WorkspaceError::Parse(format!(
+            "failed to parse {}: {error}",
+            display_path.display()
+        ))
+    })
+}
+
+fn read_pnpm_workspace_from_open_dir(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<Option<PnpmWorkspaceConfig>, WorkspaceError> {
+    let Some(content) = read_text_from_open_dir(
+        directory,
+        relative,
+        display_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    if content.trim().is_empty() {
+        return Ok(Some(PnpmWorkspaceConfig::default()));
+    }
+    let manifest =
+        serde_yaml::from_str::<Option<PnpmWorkspaceManifest>>(&content).map_err(|error| {
+            WorkspaceError::Parse(format!(
+                "failed to parse pnpm workspace manifest {}: {error}",
+                display_path.display()
+            ))
+        })?;
+    Ok(Some(manifest.unwrap_or_default().into_config()))
+}
+
+fn read_text_from_open_dir(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_path: &Path,
+    max_bytes: u64,
+    optional: bool,
+) -> Result<Option<String>, WorkspaceError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file = match directory.open_with(relative, &options) {
+        Ok(file) => file,
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WorkspaceError::NotFound(display_path.display().to_string()));
+        }
+        Err(error) => {
+            return Err(WorkspaceError::Io(format!(
+                "failed to open {} safely: {error}",
+                display_path.display()
+            )));
+        }
+    };
+    let metadata = file.metadata().map_err(|error| {
+        WorkspaceError::Io(format!(
+            "failed to inspect {}: {error}",
+            display_path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
+        return Err(WorkspaceError::Io(format!(
+            "workspace manifest {} is not a safe regular file",
+            display_path.display()
+        )));
+    }
+    lpm_common::read_text_file_capped_from_open_file_with_known_size(
+        file.into_std(),
+        display_path,
+        max_bytes,
+        metadata.len(),
+    )
+    .map(Some)
+    .map_err(|error| WorkspaceError::Io(error.to_string()))
+}
+
+fn open_directory_nofollow(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "workspace candidate path must be absolute",
+        ));
+    }
+    let root = path
+        .ancestors()
+        .last()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace candidate path has no filesystem root",
+            )
+        })?;
+    let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    let relative = path.strip_prefix(root).map_err(std::io::Error::other)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace candidate path contains an unsafe component",
+            ));
+        };
+        directory = directory.open_dir_nofollow(name)?;
+    }
+    Ok(directory)
 }
 
 /// Walk up from `start_dir` to find the nearest ancestor directory
@@ -440,6 +751,152 @@ fn discover_members(root: &Path, globs: &[String]) -> Result<Vec<WorkspaceMember
     Ok(members)
 }
 
+fn discover_members_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    globs: &[String],
+) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
+    let mut inclusions = Vec::new();
+    let mut exclusions = Vec::new();
+    for raw in globs {
+        if let Some(excluded) = raw.strip_prefix('!') {
+            exclusions.push(WorkspaceGlob::compile(root_path, excluded)?);
+        } else {
+            inclusions.push(WorkspaceGlob::compile(root_path, raw)?);
+        }
+    }
+    let mut members = std::collections::BTreeMap::new();
+    let match_options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+    for inclusion in inclusions {
+        let scan_relative = inclusion
+            .scan_root
+            .strip_prefix(root_path)
+            .map_err(|_| {
+                WorkspaceError::Parse(format!(
+                    "workspace scan root {} is outside {}",
+                    inclusion.scan_root.display(),
+                    root_path.display()
+                ))
+            })?
+            .to_path_buf();
+        if open_relative_directory(root_dir, &scan_relative)?.is_none() {
+            continue;
+        }
+        let mut pending = vec![(scan_relative, inclusion.scan_root_depth)];
+        while let Some((relative, depth)) = pending.pop() {
+            let Some(directory) = open_relative_directory(root_dir, &relative)? else {
+                continue;
+            };
+            if inclusion.matches_directory(&relative, match_options)
+                && !exclusions
+                    .iter()
+                    .any(|exclusion| exclusion.matches_relative_directory(&relative))
+                && !members.contains_key(&relative)
+            {
+                let display_path = root_path.join(&relative).join("package.json");
+                match read_package_json_from_open_dir(
+                    &directory,
+                    Path::new("package.json"),
+                    &display_path,
+                ) {
+                    Ok(package) => {
+                        members.insert(
+                            relative.clone(),
+                            WorkspaceMember {
+                                path: root_path.join(&relative),
+                                package,
+                            },
+                        );
+                    }
+                    Err(WorkspaceError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if inclusion
+                .max_depth
+                .is_some_and(|max_depth| depth >= max_depth)
+            {
+                continue;
+            }
+            let entries = directory.entries().map_err(|error| {
+                WorkspaceError::Io(format!(
+                    "failed to read {}: {error}",
+                    root_path.join(&relative).display()
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    WorkspaceError::Io(format!(
+                        "failed to read {}: {error}",
+                        root_path.join(&relative).display()
+                    ))
+                })?;
+                let name = entry.file_name();
+                if name == "node_modules" {
+                    continue;
+                }
+                let metadata = directory
+                    .symlink_metadata(Path::new(&name))
+                    .map_err(|error| {
+                        WorkspaceError::Io(format!(
+                            "failed to inspect {}: {error}",
+                            root_path.join(&relative).join(&name).display()
+                        ))
+                    })?;
+                if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                    continue;
+                }
+                pending.push((relative.join(name), depth + 1));
+            }
+        }
+    }
+    Ok(members.into_values().collect())
+}
+
+fn open_relative_directory(
+    root: &cap_std::fs::Dir,
+    relative: &Path,
+) -> Result<Option<cap_std::fs::Dir>, WorkspaceError> {
+    use cap_fs_ext::DirExt as _;
+
+    let mut directory = root.try_clone().map_err(|error| {
+        WorkspaceError::Io(format!("failed to clone workspace root handle: {error}"))
+    })?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        match directory.open_dir_nofollow(name) {
+            Ok(child) => directory = child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(WorkspaceError::Io(format!(
+                    "failed to open workspace directory {} safely: {error}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    Ok(Some(directory))
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 struct WorkspaceGlob {
     pattern: glob::Pattern,
     scan_root: PathBuf,
@@ -657,6 +1114,149 @@ mod tests {
             ws.members[0].package.name.as_deref(),
             Some("@lpm.dev/test.my-lib")
         );
+    }
+
+    #[test]
+    fn open_root_discovery_matches_workspace_members_and_catalogs() {
+        let dir = tempfile::tempdir().unwrap();
+        create_package_json(
+            dir.path(),
+            r#"{
+                "name": "monorepo",
+                "workspaces": ["packages/*", "!packages/private"],
+                "catalogs": {"default": {"react": "^19.0.0"}}
+            }"#,
+        );
+        for (path, name) in [("packages/app", "app"), ("packages/private", "private")] {
+            let member = dir.path().join(path);
+            fs::create_dir_all(&member).unwrap();
+            create_package_json(
+                &member,
+                &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            );
+        }
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        let workspace =
+            discover_workspace_from_open_root(dir.path(), &root, &dir.path().join("packages/app"))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(workspace.members.len(), 1);
+        assert_eq!(workspace.members[0].package.name.as_deref(), Some("app"));
+        assert_eq!(
+            workspace.root_package.catalogs["default"]["react"],
+            "^19.0.0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_root_discovery_rejects_a_fifo_manifest_promptly() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let package_json = dir.path().join("package.json");
+        let path = std::ffi::CString::new(package_json.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        let display_root = dir.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = discover_workspace_from_open_root(&display_root, &root, &display_root)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            sender.send(result).unwrap();
+        });
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result,
+            Err(error) => {
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&package_json)
+                    .unwrap();
+                drop(writer);
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("open-root workspace discovery blocked on a FIFO: {error}");
+            }
+        };
+        worker.join().unwrap();
+
+        let error = result.expect_err("a FIFO workspace manifest must be rejected");
+        assert!(error.contains("package.json"), "{error}");
+    }
+
+    #[test]
+    fn safe_workspace_root_selection_returns_the_opened_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        create_package_json(&root, r#"{"name":"root","workspaces":["packages/*"]}"#);
+        let project = root.join("packages/app");
+        fs::create_dir_all(&project).unwrap();
+        create_package_json(&project, r#"{"name":"app","version":"1.0.0"}"#);
+        let project_dir =
+            cap_std::fs::Dir::open_ambient_dir(&project, cap_std::ambient_authority()).unwrap();
+
+        let selected = find_workspace_root_from_open_project(&project, &project_dir)
+            .unwrap()
+            .expect("the project is a workspace member");
+
+        assert_eq!(selected.path(), root);
+        assert!(selected.directory().dir_metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn workspace_root_selection_rejects_a_project_handle_from_another_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_root = dir.path().canonicalize().unwrap();
+        let workspace = temp_root.join("workspace");
+        let project = workspace.join("packages/app");
+        fs::create_dir_all(&project).unwrap();
+        create_package_json(&workspace, r#"{"name":"original-root"}"#);
+        create_package_json(&project, r#"{"name":"original-app","version":"1.0.0"}"#);
+        let project_dir =
+            cap_std::fs::Dir::open_ambient_dir(&project, cap_std::ambient_authority()).unwrap();
+
+        fs::rename(&workspace, temp_root.join("displaced-workspace")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        create_package_json(
+            &workspace,
+            r#"{"name":"replacement-root","workspaces":["packages/*"]}"#,
+        );
+        create_package_json(&project, r#"{"name":"replacement-app","version":"9.9.9"}"#);
+
+        let error = find_workspace_root_from_open_project(&project, &project_dir)
+            .err()
+            .expect("a replacement ancestor must not contain the retained project handle")
+            .to_string();
+
+        assert!(error.contains("selected project"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_workspace_root_selection_rejects_a_linked_pnpm_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        create_package_json(&root, r#"{"name":"root"}"#);
+        let external = root.join("external-pnpm-workspace.yaml");
+        fs::write(&external, "packages:\n  - packages/*\n").unwrap();
+        std::os::unix::fs::symlink(&external, root.join("pnpm-workspace.yaml")).unwrap();
+        let project = root.join("packages/app");
+        fs::create_dir_all(&project).unwrap();
+        create_package_json(&project, r#"{"name":"app","version":"1.0.0"}"#);
+        let project_dir =
+            cap_std::fs::Dir::open_ambient_dir(&project, cap_std::ambient_authority()).unwrap();
+
+        let error = find_workspace_root_from_open_project(&project, &project_dir)
+            .err()
+            .expect("linked pnpm workspace metadata must be rejected")
+            .to_string();
+
+        assert!(error.contains("pnpm-workspace.yaml"), "{error}");
     }
 
     #[test]

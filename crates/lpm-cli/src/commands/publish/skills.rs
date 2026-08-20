@@ -1,7 +1,9 @@
 use super::prepare::PublishManifest;
 use crate::install_ui;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 use lpm_common::LpmError;
 use serde::Serialize;
+use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub(super) enum ManifestWriteMode {
@@ -45,6 +47,14 @@ pub(super) fn ensure_lpm_in_files(
     manifest: &mut PublishManifest,
     write_mode: ManifestWriteMode,
 ) -> Result<bool, LpmError> {
+    ensure_lpm_in_files_with_write_hook(manifest, write_mode, || {})
+}
+
+pub(super) fn ensure_lpm_in_files_with_write_hook(
+    manifest: &mut PublishManifest,
+    write_mode: ManifestWriteMode,
+    before_manifest_write: impl FnOnce(),
+) -> Result<bool, LpmError> {
     if let Some(files) = manifest.pkg_json.get("files").and_then(|f| f.as_array()) {
         let has_skills = files.iter().any(|f| {
             let s = f.as_str().unwrap_or("");
@@ -75,17 +85,18 @@ pub(super) fn ensure_lpm_in_files(
             serialized.push(b'\n');
 
             if matches!(write_mode, ManifestWriteMode::Persist) {
-                let current = lpm_common::read_text_file_capped(
-                    &manifest.package_json_path,
-                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-                )?;
+                let current = read_current_manifest(manifest)?;
                 if current != manifest.package_json_content {
-                    return Err(LpmError::Registry(format!(
-                        "{} changed while preparing the publish tarball",
-                        manifest.package_json_path.display()
-                    )));
+                    return Err(manifest_changed_error(manifest));
                 }
-                lpm_common::write_file_atomic(&manifest.package_json_path, &serialized)?;
+                before_manifest_write();
+                validate_named_manifest_parent(manifest)?;
+                crate::release_plan::write_publish_manifest_relative_durable(
+                    &manifest.package_json_parent,
+                    Path::new("package.json").as_os_str(),
+                    &serialized,
+                )?;
+                validate_named_manifest_parent(manifest)?;
                 install_ui::warn(
                     "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise",
                 );
@@ -96,6 +107,41 @@ pub(super) fn ensure_lpm_in_files(
         }
     }
     Ok(false)
+}
+
+fn read_current_manifest(manifest: &PublishManifest) -> Result<String, LpmError> {
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file = manifest
+        .package_json_parent
+        .open_with("package.json", &options)
+        .map_err(|_| manifest_changed_error(manifest))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| manifest_changed_error(manifest))?;
+    if !metadata.is_file()
+        || crate::commands::publish_common::metadata_is_link_or_reparse(&metadata)
+    {
+        return Err(manifest_changed_error(manifest));
+    }
+    let content = lpm_common::read_text_file_capped_from_open_file_with_known_size(
+        file.into_std(),
+        &manifest.package_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        metadata.len(),
+    )?;
+    Ok(content)
+}
+
+fn validate_named_manifest_parent(manifest: &PublishManifest) -> Result<(), LpmError> {
+    manifest.validate_named_project_root()
+}
+
+fn manifest_changed_error(manifest: &PublishManifest) -> LpmError {
+    LpmError::Registry(format!(
+        "{} changed while preparing the publish tarball",
+        manifest.package_json_path.display()
+    ))
 }
 
 fn package_json_indent(content: &str) -> Vec<u8> {

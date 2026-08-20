@@ -1,4 +1,4 @@
-use super::npm_artifact::{load_provenance_file, prepare_npm_target_artifact};
+use super::npm_artifact::prepare_npm_target_artifact;
 use super::output::{
     DryRunSummary, format_lpm_publication_notice, format_multi_publish_partial_summary,
     format_multi_publish_success_summary, format_publish_retry_detail,
@@ -7,10 +7,12 @@ use super::output::{
     publish_result_json, visibility_from_access,
 };
 use super::prepare::{
-    prepare_publish_project_from_manifest, read_publish_manifest, validate_publish_tarball_size,
+    PublishSource, prepare_publish_project_from_manifest, read_publish_manifest,
+    read_publish_manifest_from_source, validate_publish_tarball_size,
 };
 use super::provenance::{
-    ProvenanceRequest, materialize_provenance_request, resolve_provenance_request,
+    ProvenanceRequest, load_provenance_request_file, materialize_provenance_request,
+    resolve_provenance_request_from_project_source,
 };
 use super::quality_gate::run_publish_quality_gate;
 use super::secret_scan::run_publish_secret_scan;
@@ -30,7 +32,7 @@ use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 struct NpmFilePreflightInput<'a> {
     provenance_request: &'a ProvenanceRequest,
@@ -40,8 +42,22 @@ struct NpmFilePreflightInput<'a> {
     version: &'a str,
     version_data: &'a serde_json::Value,
     tarball_data: &'a std::sync::Arc<Vec<u8>>,
+    tarball_hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
     rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
     json_output: bool,
+}
+
+struct PublishTransactionRoot {
+    path: PathBuf,
+    directory: cap_std::fs::Dir,
+    identity: same_file::Handle,
+}
+
+impl PublishTransactionRoot {
+    #[inline]
+    fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 pub(crate) struct PreparedPublish {
@@ -64,6 +80,7 @@ pub(crate) struct PreparedPublish {
     publish_config: Option<lpm_runner::lpm_json::PublishConfig>,
     readme: Option<String>,
     tarball_data: std::sync::Arc<Vec<u8>>,
+    tarball_hashes: std::sync::Arc<publish_common::TarballHashes>,
     tarball_files: Vec<publish_common::TarballFile>,
     tarball_size: usize,
     lpm_config: Option<serde_json::Value>,
@@ -124,6 +141,7 @@ struct ResolvedPublishTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishIntent {
+    project_directory_identity: std::sync::Arc<same_file::Handle>,
     package_name: String,
     package_version: String,
     package_manifest_fingerprint: [u8; 32],
@@ -148,6 +166,7 @@ impl PublishIntent {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_publish_intent(
     project_dir: &Path,
@@ -159,6 +178,28 @@ pub(crate) fn plan_publish_intent(
     cli_registry: Option<&str>,
 ) -> Result<PublishIntent, LpmError> {
     let manifest = read_publish_manifest(project_dir)?;
+    publish_intent_from_manifest(
+        &manifest,
+        workspace,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_publish_intent_from_source(
+    source: PublishSource,
+    workspace: &lpm_workspace::Workspace,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+) -> Result<PublishIntent, LpmError> {
+    let manifest = read_publish_manifest_from_source(source)?;
     publish_intent_from_manifest(
         &manifest,
         workspace,
@@ -201,6 +242,7 @@ fn publish_intent_from_manifest(
     })?;
     let projected_manifest_fingerprint = projected_manifest_fingerprint(manifest, workspace)?;
     Ok(PublishIntent {
+        project_directory_identity: std::sync::Arc::clone(&manifest.package_json_parent_identity),
         package_name: manifest.name.clone(),
         package_version: manifest.version.clone(),
         package_manifest_fingerprint: Sha256::digest(manifest.package_json_content.as_bytes())
@@ -212,7 +254,7 @@ fn publish_intent_from_manifest(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_publish_intent(
+pub(super) fn validate_publish_intent(
     project_dir: &Path,
     manifest: &super::prepare::PublishManifest,
     workspace: &lpm_workspace::Workspace,
@@ -311,30 +353,46 @@ pub async fn run(
     no_provenance: bool,
     provenance_file: Option<&Path>,
 ) -> Result<(), LpmError> {
-    let project_dir = project_dir.canonicalize().map_err(LpmError::Io)?;
-    let transaction_root = lpm_workspace::find_workspace_root(&project_dir)
-        .map_err(|error| LpmError::Workspace(error.to_string()))?;
-    let transaction_root = transaction_root.unwrap_or_else(|| project_dir.clone());
+    let publish_source = PublishSource::open(project_dir)?;
+    let project_dir = publish_source.project_dir().to_path_buf();
+    let transaction_root = select_publish_transaction_root(&project_dir, &publish_source)?;
     let prepare = async {
-        ensure_publish_transaction_root_unchanged(&project_dir, &transaction_root)?;
+        ensure_publish_transaction_root_unchanged(
+            &project_dir,
+            &publish_source,
+            &transaction_root,
+        )?;
+        publish_source.validate_named_project_root()?;
         if dry_run || check_only {
-            crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
-        } else if crate::release_plan::has_release_transaction(&transaction_root)? {
-            let workspace = lpm_workspace::discover_workspace(&transaction_root)
-                .map_err(|error| LpmError::Workspace(error.to_string()))?;
+            crate::release_plan::ensure_no_pending_release_transaction_from_open_root(
+                transaction_root.path(),
+                &transaction_root.directory,
+            )?;
+        } else if crate::release_plan::has_release_transaction_from_open_root(
+            transaction_root.path(),
+            &transaction_root.directory,
+        )? {
+            let workspace = lpm_workspace::discover_workspace_from_open_root(
+                transaction_root.path(),
+                &transaction_root.directory,
+                transaction_root.path(),
+            )
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
             let allowed_manifests = workspace.map_or_else(
-                || vec![transaction_root.join("package.json")],
+                || vec![transaction_root.path().join("package.json")],
                 |workspace| {
                     crate::commands::release::release_workspace_manifest_paths(&workspace, true)
                 },
             );
-            crate::release_plan::recover_pending_release_transaction(
-                &transaction_root,
+            crate::release_plan::recover_pending_release_transaction_from_open_root(
+                transaction_root.path(),
+                &transaction_root.directory,
                 &allowed_manifests,
             )?;
         }
         prepare_with_workspace_lock_held(
             &project_dir,
+            publish_source,
             dry_run,
             check_only,
             wait_for_publication,
@@ -355,33 +413,97 @@ pub async fn run(
         )
         .await
     };
-    let install_lock = lpm_common::project_install_lock(&transaction_root);
-    let prepared = if dry_run || check_only {
-        lpm_common::with_shared_lock_async(install_lock, prepare).await?
-    } else {
-        lpm_common::with_exclusive_lock_async(install_lock, prepare).await?
-    };
+    let lock_directory = open_publish_lock_directory(&transaction_root)?;
+    let publication_lock_directory = lock_directory.try_clone()?;
+    let prepared =
+        with_publish_install_lock(lock_directory, dry_run || check_only, prepare).await?;
     if check_only {
         return execute_prepared(client, prepared).await;
     }
-    let publish_lock = lpm_common::project_publish_lock(&transaction_root);
-    lpm_common::with_exclusive_lock_async(publish_lock, execute_prepared(client, prepared)).await
+    with_publish_publication_lock(
+        publication_lock_directory,
+        execute_prepared(client, prepared),
+    )
+    .await
+}
+
+fn open_publish_lock_directory(
+    transaction_root: &PublishTransactionRoot,
+) -> Result<lpm_common::ProjectLockDirectory, LpmError> {
+    lpm_common::ProjectLockDirectory::open_or_create(
+        &transaction_root.directory,
+        transaction_root.path(),
+    )
+}
+
+async fn with_publish_install_lock<R>(
+    lock_directory: lpm_common::ProjectLockDirectory,
+    shared: bool,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    if shared {
+        lpm_common::with_project_shared_lock_async(
+            lock_directory,
+            lpm_common::ProjectLockKind::Install,
+            body,
+        )
+        .await
+    } else {
+        lpm_common::with_project_exclusive_lock_async(
+            lock_directory,
+            lpm_common::ProjectLockKind::Install,
+            body,
+        )
+        .await
+    }
+}
+
+async fn with_publish_publication_lock<R>(
+    lock_directory: lpm_common::ProjectLockDirectory,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    lpm_common::with_project_exclusive_lock_async(
+        lock_directory,
+        lpm_common::ProjectLockKind::Publish,
+        body,
+    )
+    .await
+}
+
+fn select_publish_transaction_root(
+    project_dir: &Path,
+    publish_source: &PublishSource,
+) -> Result<PublishTransactionRoot, LpmError> {
+    publish_source.validate_named_project_root()?;
+    let project_directory = publish_source.try_clone_directory()?;
+    let workspace =
+        lpm_workspace::find_workspace_root_from_open_project(project_dir, &project_directory)
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    let (path, directory) = workspace.map_or_else(
+        || (project_dir.to_path_buf(), project_directory),
+        lpm_workspace::OpenWorkspaceRoot::into_parts,
+    );
+    let identity =
+        same_file::Handle::from_file(directory.try_clone().map_err(LpmError::Io)?.into_std_file())
+            .map_err(LpmError::Io)?;
+    Ok(PublishTransactionRoot {
+        path,
+        directory,
+        identity,
+    })
 }
 
 fn ensure_publish_transaction_root_unchanged(
     project_dir: &Path,
-    expected_root: &Path,
+    publish_source: &PublishSource,
+    expected: &PublishTransactionRoot,
 ) -> Result<(), LpmError> {
-    let current_root = lpm_workspace::find_workspace_root(project_dir)
-        .map_err(|error| LpmError::Workspace(error.to_string()))?
-        .unwrap_or_else(|| project_dir.to_path_buf())
-        .canonicalize()
-        .map_err(LpmError::Io)?;
-    if current_root != expected_root {
+    let current = select_publish_transaction_root(project_dir, publish_source)?;
+    if current.path != expected.path || current.identity != expected.identity {
         return Err(LpmError::Registry(format!(
             "publish project scope changed while waiting for the transaction lock ({} -> {}); retry the command",
-            expected_root.display(),
-            current_root.display()
+            expected.path.display(),
+            current.path.display()
         )));
     }
     Ok(())
@@ -390,6 +512,7 @@ fn ensure_publish_transaction_root_unchanged(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_with_workspace_lock_held(
     project_dir: &Path,
+    publish_source: PublishSource,
     dry_run: bool,
     check_only: bool,
     wait_for_publication: bool,
@@ -408,7 +531,7 @@ pub(crate) async fn prepare_with_workspace_lock_held(
     no_provenance: bool,
     provenance_file: Option<&Path>,
 ) -> Result<PreparedPublish, LpmError> {
-    let publish_manifest = read_publish_manifest(project_dir)?;
+    let publish_manifest = read_publish_manifest_from_source(publish_source)?;
     let workspace = super::prepare::discover_workspace_for_publish(project_dir, &publish_manifest)?;
     prepare_publish_manifest_with_workspace_lock_held(
         project_dir,
@@ -541,11 +664,9 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
             std::time::Duration::from_secs,
         )
     });
-    // Publisher-authored skills must be validated and included in a restrictive
-    // package.json `files` list before the publish tarball is created.
-    let skills_dir = project_dir.join(".lpm").join("skills");
-    let has_skills = if targets_lpm {
-        let validation = author::validate_directory(&skills_dir)?;
+    let validated_skills = {
+        let validation =
+            author::validate_publish_directory(&publish_manifest.package_json_parent, project_dir)?;
 
         if !validation.security_issues.is_empty() {
             for located in &validation.security_issues {
@@ -572,8 +693,8 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
             ));
         }
 
-        let has_authored_skills = !validation.valid_files.is_empty();
-        if has_authored_skills {
+        let has_authored_skills = !validation.validated_files.is_empty();
+        if has_authored_skills && targets_lpm {
             if !json_output {
                 install_ui::done_untrusted(&format!(
                     "{} skill(s) validated",
@@ -587,18 +708,19 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
             };
             ensure_lpm_in_files(&mut publish_manifest, write_mode)?;
         }
-        has_authored_skills
-    } else {
-        false
+        validation.validated_files
     };
+    let has_skills = !validated_skills.is_empty();
 
     let PublishProject {
+        source_dir,
         pkg_json,
         name,
         version,
         publish_config,
         readme,
         tarball_data,
+        tarball_hashes,
         tarball_files,
         secret_scan,
         tarball_size,
@@ -606,9 +728,9 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         detected_ecosystem,
         swift_manifest,
     } = prepare_publish_project_from_manifest(
-        project_dir,
         publish_manifest,
         workspace,
+        Some(&validated_skills),
         !allow_secrets,
     )?;
     let publish_config_ref = publish_config.as_ref();
@@ -617,8 +739,9 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     let github_config = publish_config_ref.and_then(|p| p.github.as_ref());
     let gitlab_config = publish_config_ref.and_then(|p| p.gitlab.as_ref());
 
-    let provenance_request = resolve_provenance_request(
+    let provenance_request = resolve_provenance_request_from_project_source(
         project_dir,
+        &source_dir,
         &pkg_json,
         provenance_flag,
         no_provenance,
@@ -655,8 +778,13 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         &tarball_data,
         !allow_secrets,
     )?;
-    let version_data =
-        build_publish_version_data(&pkg_json, &name, &version, readme.as_deref(), &tarball_data);
+    let version_data = build_publish_version_data(
+        &pkg_json,
+        &name,
+        &version,
+        readme.as_deref(),
+        &tarball_hashes,
+    );
     let precomputed_npm_artifacts = precompute_file_provenance_artifacts(NpmFilePreflightInput {
         provenance_request: &provenance_request,
         targets: &targets,
@@ -665,6 +793,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         version: &version,
         version_data: &version_data,
         tarball_data: &tarball_data,
+        tarball_hashes: &tarball_hashes,
         rewritten_tarballs: &rewritten_tarballs,
         json_output,
     })
@@ -691,7 +820,6 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         Some(run_publish_quality_gate(PublishQualityGateInput {
             pkg_json: &pkg_json,
             readme: readme.as_deref(),
-            project_dir,
             tarball_files: &tarball_files,
             detected_ecosystem: &detected_ecosystem,
             swift_manifest: swift_manifest.as_ref(),
@@ -702,9 +830,8 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         None
     };
 
-    let local_skills_digest = has_skills
-        .then(|| author::compute_digest(&skills_dir))
-        .transpose()?;
+    let local_skills_digest =
+        has_skills.then(|| author::compute_validated_digest(&validated_skills));
 
     Ok(PreparedPublish {
         publish_started,
@@ -726,6 +853,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         publish_config,
         readme,
         tarball_data,
+        tarball_hashes,
         tarball_files,
         tarball_size,
         lpm_config,
@@ -780,6 +908,7 @@ async fn execute_prepared_inner(
         publish_config,
         readme,
         tarball_data,
+        tarball_hashes,
         tarball_files,
         tarball_size,
         lpm_config,
@@ -975,10 +1104,9 @@ async fn execute_prepared_inner(
         }
     }
 
-    let provenance_context = if matches!(provenance_request, ProvenanceRequest::File(_)) {
-        None
-    } else {
-        materialize_provenance_request(provenance_request).await?
+    let provenance_context = match provenance_request {
+        ProvenanceRequest::File(_) => None,
+        request => materialize_provenance_request(request).await?,
     };
 
     // Publish sequentially so per-target auth prompts and summaries stay deterministic.
@@ -994,23 +1122,24 @@ async fn execute_prepared_inner(
                 let lpm_result: Result<serde_json::Value, LpmError> = async {
                     let lpm_name = target_names.get("lpm").map_or(name.as_str(), |s| s.as_str());
 
-                    let lpm_tarball = target_tarball_data(
+                    let lpm_tarball = target_tarball(
                         lpm_name,
                         &name,
                         &tarball_data,
+                        &tarball_hashes,
                         &rewritten_tarballs,
                     )?;
 
                     // Recompute dist hashes from the final rewritten tarball so metadata
                     // matches the actual uploaded artifact (not the pre-rewrite original).
                     let mut lpm_version_data = version_data.clone();
-                    if lpm_name != name.as_str() {
-                        let lpm_hashes = publish_common::compute_hashes(lpm_tarball);
-                        lpm_version_data["dist"] = serde_json::json!({
-                            "shasum": lpm_hashes.shasum,
-                            "integrity": lpm_hashes.integrity,
-                        });
-                    }
+                    lpm_version_data["name"] = serde_json::json!(lpm_name);
+                    lpm_version_data["_id"] =
+                        serde_json::json!(format!("{lpm_name}@{version}"));
+                    lpm_version_data["dist"] = serde_json::json!({
+                        "shasum": lpm_tarball.hashes.shasum,
+                        "integrity": lpm_tarball.hashes.integrity,
+                    });
 
                     // Generate per-target provenance from the final rewritten tarball
                     if let Some(ref provenance) = provenance_context {
@@ -1020,8 +1149,7 @@ async fn execute_prepared_inner(
                                     .into(),
                             ));
                         };
-                        let final_hashes = publish_common::compute_hashes(lpm_tarball);
-                        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+                        let sha512_hex = integrity_to_sha512_hex(&lpm_tarball.hashes.integrity);
                         let slsa = provenance::build_slsa_statement(
                             &context.ci,
                             lpm_name,
@@ -1056,8 +1184,9 @@ async fn execute_prepared_inner(
                         lpm_name,
                         &version,
                         &readme,
-                        lpm_tarball,
+                        lpm_tarball.data,
                         &tarball_files,
+                        lpm_tarball.package_json_size,
                         &lpm_version_data,
                         &quality_result,
                         &lpm_config,
@@ -1287,17 +1416,19 @@ async fn execute_prepared_inner(
                         if let Some(artifact) = precomputed_npm_artifacts.remove(&target_key) {
                             artifact
                         } else {
-                            let final_tarball = target_tarball_data(
+                            let final_tarball = target_tarball(
                                 npm_name_str,
                                 &name,
                                 &tarball_data,
+                                &tarball_hashes,
                                 &rewritten_tarballs,
                             )?;
                             prepare_npm_target_artifact(NpmTargetArtifactInput {
                                 npm_name: npm_name_str,
                                 version: &version,
                                 base_version_data: &version_data,
-                                final_tarball_data: std::sync::Arc::clone(final_tarball),
+                                final_tarball_data: std::sync::Arc::clone(final_tarball.data),
+                                final_tarball_hashes: std::sync::Arc::clone(final_tarball.hashes),
                                 provenance_context: provenance_context.as_ref(),
                                 target_label: display,
                                 json_output,
@@ -1316,6 +1447,7 @@ async fn execute_prepared_inner(
                         &version,
                         &target_artifact.version_data,
                         &target_artifact.tarball_data,
+                        &target_artifact.tarball_hashes,
                         target_artifact.provenance_attachment.as_ref(),
                         npm_access,
                         &npm_tag,
@@ -1562,18 +1694,33 @@ fn prepare_rewritten_target_tarballs(
     Ok(rewritten_tarballs)
 }
 
-fn target_tarball_data<'a>(
+struct TargetTarball<'a> {
+    data: &'a std::sync::Arc<Vec<u8>>,
+    hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
+    package_json_size: Option<u64>,
+}
+
+fn target_tarball<'a>(
     target_name: &str,
     package_json_name: &str,
     base_tarball_data: &'a std::sync::Arc<Vec<u8>>,
+    base_tarball_hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
     rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
-) -> Result<&'a std::sync::Arc<Vec<u8>>, LpmError> {
+) -> Result<TargetTarball<'a>, LpmError> {
     if target_name == package_json_name {
-        return Ok(base_tarball_data);
+        return Ok(TargetTarball {
+            data: base_tarball_data,
+            hashes: base_tarball_hashes,
+            package_json_size: None,
+        });
     }
     rewritten_tarballs
         .get(target_name)
-        .map(|tarball| &tarball.data)
+        .map(|tarball| TargetTarball {
+            data: &tarball.data,
+            hashes: &tarball.hashes,
+            package_json_size: Some(tarball.package_json_size),
+        })
         .ok_or_else(|| {
             LpmError::Registry(format!(
                 "missing prepared tarball for renamed package {target_name}"
@@ -1604,10 +1751,10 @@ fn target_secret_scan<'a>(
 async fn precompute_file_provenance_artifacts(
     input: NpmFilePreflightInput<'_>,
 ) -> Result<HashMap<String, NpmTargetArtifact>, LpmError> {
-    let ProvenanceRequest::File(path) = input.provenance_request else {
+    let ProvenanceRequest::File(request) = input.provenance_request else {
         return Ok(HashMap::new());
     };
-    let file = load_provenance_file(path)?;
+    let file = load_provenance_request_file(request)?;
     let provenance = ResolvedProvenance::File(file);
     let npm_target_count = input
         .targets
@@ -1624,17 +1771,19 @@ async fn precompute_file_provenance_artifacts(
         let npm_name = input.target_names.get(&key).ok_or_else(|| {
             LpmError::Registry(format!("no name resolved for {}", target.display_name()))
         })?;
-        let tarball_data = target_tarball_data(
+        let tarball = target_tarball(
             npm_name,
             input.package_json_name,
             input.tarball_data,
+            input.tarball_hashes,
             input.rewritten_tarballs,
         )?;
         let artifact = prepare_npm_target_artifact(NpmTargetArtifactInput {
             npm_name,
             version: input.version,
             base_version_data: input.version_data,
-            final_tarball_data: std::sync::Arc::clone(tarball_data),
+            final_tarball_data: std::sync::Arc::clone(tarball.data),
+            final_tarball_hashes: std::sync::Arc::clone(tarball.hashes),
             provenance_context: Some(&provenance),
             target_label: target.display_name(),
             json_output: input.json_output,
@@ -1824,4 +1973,100 @@ pub(super) fn lpm_package_url(name: &str) -> Option<String> {
         return None;
     }
     Some(format!("https://lpm.dev/{package}"))
+}
+
+#[cfg(test)]
+mod transaction_root_tests {
+    use super::{
+        ensure_publish_transaction_root_unchanged, open_publish_lock_directory,
+        select_publish_transaction_root,
+    };
+    use crate::commands::publish::prepare::PublishSource;
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_transaction_root_rejects_a_linked_workspace_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let project = workspace.join("packages/app");
+        std::fs::create_dir_all(&project).unwrap();
+        let external = root.path().join("external-package.json");
+        std::fs::write(&external, r#"{"name":"root","workspaces":["packages/*"]}"#).unwrap();
+        std::os::unix::fs::symlink(&external, workspace.join("package.json")).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"app","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let source = PublishSource::open(&project).unwrap();
+        let Err(error) = select_publish_transaction_root(&project.canonicalize().unwrap(), &source)
+        else {
+            panic!("linked workspace metadata must not select the publish lock scope");
+        };
+        let error = error.to_string();
+
+        assert!(
+            error.contains("workspace") || error.contains("unsafe"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn publish_transaction_root_rejects_same_path_directory_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let displaced = root.path().join("displaced");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"selected","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let source = PublishSource::open(&project).unwrap();
+        let project_path = project.canonicalize().unwrap();
+        let expected = select_publish_transaction_root(&project_path, &source).unwrap();
+        std::fs::rename(&project, &displaced).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"replacement","version":"9.9.9"}"#,
+        )
+        .unwrap();
+
+        let error = ensure_publish_transaction_root_unchanged(&project_path, &source, &expected)
+            .expect_err("the publish transaction root identity must remain stable")
+            .to_string();
+
+        assert!(
+            error.contains("changed") && error.contains("retry"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_install_lock_rejects_a_linked_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"selected","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let source = PublishSource::open(&project).unwrap();
+        let transaction_root =
+            select_publish_transaction_root(&project.canonicalize().unwrap(), &source).unwrap();
+        std::os::unix::fs::symlink(&outside, project.join(".lpm")).unwrap();
+
+        let result = open_publish_lock_directory(&transaction_root);
+
+        assert!(
+            result.is_err() && std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "a linked state directory must not receive publish lock files: {result:?}"
+        );
+    }
 }

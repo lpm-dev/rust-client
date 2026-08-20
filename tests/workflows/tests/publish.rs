@@ -1557,6 +1557,29 @@ async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
     let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
     assert_eq!(payload["_id"], RESOLVED_NAME);
     assert_eq!(payload["name"], RESOLVED_NAME);
+    let published_version = &payload["versions"]["1.0.0"];
+    assert_eq!(published_version["name"], RESOLVED_NAME);
+    assert_eq!(published_version["_id"], format!("{RESOLVED_NAME}@1.0.0"));
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("publish payload must contain one tarball attachment");
+    let tarball_data = BASE64
+        .decode(
+            attachment["data"]
+                .as_str()
+                .expect("tarball attachment must be base64 text"),
+        )
+        .expect("tarball attachment must decode");
+    let manifest_bytes = extract_uploaded_file(&tarball_data, "package/package.json");
+    let published_manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("published manifest must parse");
+    assert_eq!(published_manifest["name"], RESOLVED_NAME);
+    let packed_manifest = published_version["_npmPackMeta"]["files"]
+        .as_array()
+        .and_then(|files| files.iter().find(|file| file["path"] == "package.json"))
+        .expect("pack metadata must contain package.json");
+    assert_eq!(packed_manifest["size"], manifest_bytes.len() as u64);
 }
 
 #[tokio::test]
@@ -1689,6 +1712,109 @@ catalog:
         "published tarball manifest must not leak catalog: references\n{}",
         serde_json::to_string_pretty(&published_package_json)
             .expect("published manifest must serialize")
+    );
+    assert_eq!(
+        payload["versions"]["1.0.0"]["dependencies"]["ms"],
+        serde_json::json!("^2.1.3"),
+        "LPM version metadata must use the dependency range archived in package.json"
+    );
+}
+
+#[tokio::test]
+async fn npm_version_metadata_matches_catalog_projected_tarball_manifest() {
+    const PACKAGE: &str = "catalog-publish-npm";
+    let mock = MockRegistry::start().await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/{PACKAGE}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .and(header("npm-command", "publish"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "catalog-publish-npm-workspace",
+        "version": "1.0.0",
+        "private": true
+    }"#,
+    );
+    project.write_file(
+        "pnpm-workspace.yaml",
+        r#"packages:
+  - "packages/*"
+catalog:
+  ms: ^2.1.3
+"#,
+    );
+    project.write_file(
+        "packages/lib/package.json",
+        &format!(
+            r#"{{
+            "name": "{PACKAGE}",
+            "version": "1.0.0",
+            "description": "Catalog npm metadata projection test",
+            "main": "index.js",
+            "license": "MIT",
+            "dependencies": {{"ms": "catalog:"}}
+        }}"#
+        ),
+    );
+    project.write_file("packages/lib/index.js", "module.exports = require(\"ms\")");
+    project.write_file(
+        "packages/lib/lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store custom registry token");
+    assert!(login.status.success());
+
+    let mut command = lpm(&project);
+    command.current_dir(project.path().join("packages/lib"));
+    let output = command
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("publish catalog-backed npm package");
+    assert!(
+        output.status.success(),
+        "catalog npm publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("npm publish must send one PUT");
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("npm payload must contain one tarball attachment");
+    let tarball_data = BASE64
+        .decode(attachment["data"].as_str().unwrap())
+        .expect("npm tarball attachment must decode");
+    let manifest = extract_uploaded_package_json(&tarball_data);
+
+    assert_eq!(
+        (
+            payload["versions"]["1.0.0"]["dependencies"]["ms"].as_str(),
+            manifest["dependencies"]["ms"].as_str(),
+        ),
+        (Some("^2.1.3"), Some("^2.1.3"))
     );
 }
 
@@ -2834,6 +2960,11 @@ fn publish_github_and_gitlab_together_yields_two_targets() {
 }
 
 fn extract_uploaded_package_json(tarball_data: &[u8]) -> serde_json::Value {
+    let content = extract_uploaded_file(tarball_data, "package/package.json");
+    serde_json::from_slice(&content).expect("published package.json must parse")
+}
+
+fn extract_uploaded_file(tarball_data: &[u8], expected_path: &str) -> Vec<u8> {
     use std::io::Read;
 
     let mut decoder = flate2::read::GzDecoder::new(tarball_data);
@@ -2852,15 +2983,15 @@ fn extract_uploaded_package_json(tarball_data: &[u8]) -> serde_json::Value {
             .path()
             .expect("published tarball entry path must read")
             .to_string_lossy()
-            == "package/package.json"
+            == expected_path
         {
-            let mut content = String::new();
+            let mut content = Vec::new();
             entry
-                .read_to_string(&mut content)
-                .expect("published package.json must read");
-            return serde_json::from_str(&content).expect("published package.json must parse");
+                .read_to_end(&mut content)
+                .expect("published tarball entry must read");
+            return content;
         }
     }
 
-    panic!("published tarball missing package/package.json");
+    panic!("published tarball missing {expected_path}");
 }

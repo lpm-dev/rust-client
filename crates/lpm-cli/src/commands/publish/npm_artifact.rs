@@ -2,7 +2,7 @@ use super::types::{
     LoadedProvenanceFile, NpmTargetArtifact, NpmTargetArtifactInput, ResolvedProvenance,
 };
 use super::version_data::integrity_to_sha512_hex;
-use crate::commands::publish_common::{self, NpmProvenanceAttachment};
+use crate::commands::publish_common::NpmProvenanceAttachment;
 use crate::{install_ui, provenance, sigstore};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -10,7 +10,7 @@ use lpm_common::LpmError;
 use std::io::Read as _;
 use std::path::Path;
 
-const PROVENANCE_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub(super) const PROVENANCE_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const IN_TOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
 const IN_TOTO_STATEMENT_V01: &str = "https://in-toto.io/Statement/v0.1";
 const SLSA_PROVENANCE_V1: &str = "https://slsa.dev/provenance/v1";
@@ -24,8 +24,7 @@ pub(crate) async fn prepare_npm_target_artifact(
     let mut version_data = input.base_version_data.clone();
     let mut provenance_attachment = None;
     if let Some(provenance) = input.provenance_context {
-        let final_hashes = publish_common::compute_hashes(&input.final_tarball_data);
-        let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
+        let sha512_hex = integrity_to_sha512_hex(&input.final_tarball_hashes.integrity);
         let expected_subject = lpm_common::npm_package_purl(input.npm_name, input.version);
 
         match provenance {
@@ -64,8 +63,8 @@ pub(crate) async fn prepare_npm_target_artifact(
                 version_data["_provenance"] = bundle_json.clone();
                 version_data["_npmProvenanceAttestations"] = bundle_json;
                 provenance_attachment = Some(NpmProvenanceAttachment {
-                    media_type: bundle.media_type,
-                    data: bundle_data,
+                    media_type: bundle.media_type.into(),
+                    data: bundle_data.into(),
                 });
             }
             ResolvedProvenance::File(file) => {
@@ -77,6 +76,7 @@ pub(crate) async fn prepare_npm_target_artifact(
 
     Ok(NpmTargetArtifact {
         tarball_data: input.final_tarball_data,
+        tarball_hashes: input.final_tarball_hashes,
         version_data,
         provenance_attachment,
     })
@@ -84,22 +84,44 @@ pub(crate) async fn prepare_npm_target_artifact(
 
 pub(crate) fn load_provenance_file(path: &Path) -> Result<LoadedProvenanceFile, LpmError> {
     let file = open_provenance_file(path)?;
+    let bytes = read_open_provenance_file(file, path)?;
+    parse_provenance_file_bytes(path, bytes)
+}
+
+pub(super) fn load_provenance_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<LoadedProvenanceFile, LpmError> {
+    if bytes.len() as u64 > PROVENANCE_FILE_MAX_BYTES {
+        return Err(provenance_file_too_large(path, bytes.len() as u64));
+    }
+    parse_provenance_file_bytes(path, bytes)
+}
+
+pub(super) fn read_open_provenance_file(
+    file: std::fs::File,
+    path: &Path,
+) -> Result<Vec<u8>, LpmError> {
     let metadata = file.metadata().map_err(LpmError::Io)?;
-    if !metadata.is_file() {
+    if !metadata.is_file() || provenance_metadata_is_link_or_reparse(&metadata) {
         return Err(LpmError::Registry(format!(
             "provenance file {} must be a regular file",
             path.display()
         )));
     }
-    if metadata.len() > PROVENANCE_FILE_MAX_BYTES {
-        return Err(LpmError::Registry(format!(
-            "provenance file {} is too large ({} bytes, max {PROVENANCE_FILE_MAX_BYTES})",
-            path.display(),
-            metadata.len()
-        )));
+    read_open_provenance_file_with_known_size(file, path, metadata.len())
+}
+
+pub(super) fn read_open_provenance_file_with_known_size(
+    mut file: std::fs::File,
+    path: &Path,
+    known_size: u64,
+) -> Result<Vec<u8>, LpmError> {
+    if known_size > PROVENANCE_FILE_MAX_BYTES {
+        return Err(provenance_file_too_large(path, known_size));
     }
-    let mut limited = file.take(PROVENANCE_FILE_MAX_BYTES + 1);
-    let mut bytes = Vec::with_capacity(metadata.len().min(PROVENANCE_FILE_MAX_BYTES) as usize);
+    let mut limited = file.by_ref().take(PROVENANCE_FILE_MAX_BYTES + 1);
+    let mut bytes = Vec::with_capacity(known_size.min(PROVENANCE_FILE_MAX_BYTES) as usize);
     limited.read_to_end(&mut bytes).map_err(LpmError::Io)?;
     if bytes.len() as u64 > PROVENANCE_FILE_MAX_BYTES {
         return Err(LpmError::Registry(format!(
@@ -107,12 +129,28 @@ pub(crate) fn load_provenance_file(path: &Path) -> Result<LoadedProvenanceFile, 
             path.display()
         )));
     }
-    let data = String::from_utf8(bytes).map_err(|e| {
-        LpmError::Registry(format!(
-            "invalid provenance file {}: expected UTF-8 Sigstore bundle JSON: {e}",
-            path.display()
-        ))
-    })?;
+    Ok(bytes)
+}
+
+fn provenance_file_too_large(path: &Path, size: u64) -> LpmError {
+    LpmError::Registry(format!(
+        "provenance file {} is too large ({size} bytes, max {PROVENANCE_FILE_MAX_BYTES})",
+        path.display()
+    ))
+}
+
+fn parse_provenance_file_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> Result<LoadedProvenanceFile, LpmError> {
+    let data: std::sync::Arc<str> = String::from_utf8(bytes)
+        .map_err(|e| {
+            LpmError::Registry(format!(
+                "invalid provenance file {}: expected UTF-8 Sigstore bundle JSON: {e}",
+                path.display()
+            ))
+        })?
+        .into();
     let bundle: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
         LpmError::Registry(format!(
             "invalid provenance file {}: expected Sigstore bundle JSON: {e}",
@@ -137,7 +175,10 @@ pub(crate) fn load_provenance_file(path: &Path) -> Result<LoadedProvenanceFile, 
     validate_identity_matches_predicate(&statement, &verified)?;
 
     Ok(LoadedProvenanceFile {
-        attachment: NpmProvenanceAttachment { media_type, data },
+        attachment: NpmProvenanceAttachment {
+            media_type: media_type.into(),
+            data,
+        },
         statement,
     })
 }
@@ -148,14 +189,39 @@ fn open_provenance_file(path: &Path) -> Result<std::fs::File, LpmError> {
 
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
         .map_err(LpmError::Io)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_provenance_file(path: &Path) -> Result<std::fs::File, LpmError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(LpmError::Io)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_provenance_file(path: &Path) -> Result<std::fs::File, LpmError> {
     std::fs::File::open(path).map_err(LpmError::Io)
+}
+
+#[cfg(not(windows))]
+fn provenance_metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn provenance_metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn validate_provenance_file_for_target(
@@ -554,6 +620,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn open_provenance_file_rejects_a_linked_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("external.sigstore");
+        let selected = dir.path().join("selected.sigstore");
+        std::fs::write(&target, b"external bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &selected).unwrap();
+
+        let error = open_provenance_file(&selected)
+            .expect_err("the selected provenance leaf must not be followed");
+
+        assert_ne!(error.to_string(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn load_provenance_file_rejects_fifo_without_blocking() {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
@@ -574,11 +655,13 @@ mod tests {
     #[tokio::test]
     async fn prepare_npm_target_artifact_rejects_file_provenance_subject_mismatch() {
         let tarball_data = std::sync::Arc::new(b"fake-tarball".to_vec());
-        let final_hashes = publish_common::compute_hashes(&tarball_data);
+        let final_hashes = std::sync::Arc::new(crate::commands::publish_common::compute_hashes(
+            &tarball_data,
+        ));
         let sha512_hex = integrity_to_sha512_hex(&final_hashes.integrity);
         let file = LoadedProvenanceFile {
             attachment: NpmProvenanceAttachment {
-                media_type: sigstore::SIGSTORE_BUNDLE_MEDIA_TYPE.to_string(),
+                media_type: sigstore::SIGSTORE_BUNDLE_MEDIA_TYPE.into(),
                 data: "{}".into(),
             },
             statement: statement_with_subject("pkg:npm/other@1.0.0", &sha512_hex),
@@ -590,6 +673,7 @@ mod tests {
             version: "1.0.0",
             base_version_data: &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
             final_tarball_data: tarball_data,
+            final_tarball_hashes: final_hashes,
             provenance_context: Some(&provenance),
             target_label: "npm",
             json_output: true,
