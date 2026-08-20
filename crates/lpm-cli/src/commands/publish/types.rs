@@ -230,7 +230,6 @@ pub(crate) enum ResolvedProvenance {
 
 #[derive(Debug)]
 pub(crate) struct NpmTargetArtifact {
-    pub(crate) tarball_data: std::sync::Arc<Vec<u8>>,
     pub(crate) tarball_hashes: std::sync::Arc<TarballHashes>,
     pub(crate) version_data: serde_json::Value,
     pub(crate) provenance_attachment: Option<NpmProvenanceAttachment>,
@@ -250,7 +249,6 @@ pub(crate) struct NpmTargetArtifactInput<'a> {
     pub(crate) npm_name: &'a str,
     pub(crate) version: &'a str,
     pub(crate) base_version_data: &'a serde_json::Value,
-    pub(crate) final_tarball_data: std::sync::Arc<Vec<u8>>,
     pub(crate) final_tarball_hashes: std::sync::Arc<TarballHashes>,
     pub(crate) provenance_context: Option<&'a ResolvedProvenance>,
     pub(crate) target_label: &'a str,

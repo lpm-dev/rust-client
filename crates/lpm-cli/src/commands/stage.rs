@@ -38,11 +38,8 @@ pub(crate) async fn publish_current_project(
         !options.allow_secrets,
     )?;
     if let Some(rewritten) = &rewritten_tarball {
-        publish::validate_publish_tarball_size(rewritten.data.len())?;
+        publish::validate_publish_tarball_size(rewritten.len())?;
     }
-    let final_tarball_data = rewritten_tarball
-        .as_ref()
-        .map_or(&prepared.tarball_data, |tarball| &tarball.data);
     let final_tarball_hashes = rewritten_tarball
         .as_ref()
         .map_or(&prepared.tarball_hashes, |tarball| &tarball.hashes);
@@ -84,7 +81,6 @@ pub(crate) async fn publish_current_project(
                 npm_name: &npm_name,
                 version: &prepared.version,
                 base_version_data: &version_data,
-                final_tarball_data: std::sync::Arc::clone(final_tarball_data),
                 final_tarball_hashes: std::sync::Arc::clone(final_tarball_hashes),
                 provenance_context: provenance_context.as_ref(),
                 target_label: "npm",
@@ -175,7 +171,6 @@ pub(crate) async fn publish_current_project(
             npm_name: &npm_name,
             version: &prepared.version,
             base_version_data: &version_data,
-            final_tarball_data: std::sync::Arc::clone(final_tarball_data),
             final_tarball_hashes: std::sync::Arc::clone(final_tarball_hashes),
             provenance_context: provenance_context.as_ref(),
             target_label: "npm",
@@ -183,6 +178,10 @@ pub(crate) async fn publish_current_project(
         })
         .await?
     };
+    let final_tarball_data = rewritten_tarball.as_ref().map_or_else(
+        || Ok(std::sync::Arc::clone(&prepared.tarball_data)),
+        |tarball| tarball.read_data().map(std::sync::Arc::new),
+    )?;
 
     let upload_spinner = if options.json_output {
         None
@@ -198,7 +197,7 @@ pub(crate) async fn publish_current_project(
         &npm_name,
         &prepared.version,
         &artifact.version_data,
-        &artifact.tarball_data,
+        &final_tarball_data,
         &artifact.tarball_hashes,
         artifact.provenance_attachment.as_ref(),
         &access,

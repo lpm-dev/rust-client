@@ -75,7 +75,6 @@ pub(crate) async fn prepare_npm_target_artifact(
     }
 
     Ok(NpmTargetArtifact {
-        tarball_data: input.final_tarball_data,
         tarball_hashes: input.final_tarball_hashes,
         version_data,
         provenance_attachment,
@@ -672,7 +671,6 @@ mod tests {
             npm_name: "pkg",
             version: "1.0.0",
             base_version_data: &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
-            final_tarball_data: tarball_data,
             final_tarball_hashes: final_hashes,
             provenance_context: Some(&provenance),
             target_label: "npm",
