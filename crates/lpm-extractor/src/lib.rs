@@ -492,9 +492,32 @@ const DEFAULT_EXTRACTION_LIMITS: ExtractionLimits = ExtractionLimits {
     max_file_count: MAX_FILE_COUNT,
 };
 
-enum BufferedGzipDecode {
-    Decoded(Vec<u8>),
+enum BufferedGzipDecode<'a> {
+    Decoded(BufferedGzipOutput<'a>),
     NeedsStreaming,
+}
+
+struct BufferedGzipOutput<'a> {
+    data: Vec<u8>,
+    _budget: AllocBudgetGuard<'a>,
+}
+
+impl BufferedGzipOutput<'_> {
+    #[cfg(test)]
+    fn into_vec(self) -> Vec<u8> {
+        self.data
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+}
+
+impl AsRef<[u8]> for BufferedGzipOutput<'_> {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 /// Decompress a single-member gzip stream into a freshly-allocated `Vec<u8>`.
@@ -513,7 +536,7 @@ enum BufferedGzipDecode {
 #[cfg(test)]
 fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
     match decompress_gzip_libdeflate_with_limits(compressed, DEFAULT_EXTRACTION_LIMITS)? {
-        BufferedGzipDecode::Decoded(decompressed) => Ok(decompressed),
+        BufferedGzipDecode::Decoded(decompressed) => Ok(decompressed.into_vec()),
         BufferedGzipDecode::NeedsStreaming => Err(LpmError::Registry(format!(
             "gzip decompressed output exceeds {}-byte buffered-decode limit",
             DEFAULT_EXTRACTION_LIMITS.max_buffered_decompressed_size
@@ -524,7 +547,15 @@ fn decompress_gzip_libdeflate(compressed: &[u8]) -> Result<Vec<u8>, LpmError> {
 fn decompress_gzip_libdeflate_with_limits(
     compressed: &[u8],
     limits: ExtractionLimits,
-) -> Result<BufferedGzipDecode, LpmError> {
+) -> Result<BufferedGzipDecode<'static>, LpmError> {
+    decompress_gzip_libdeflate_with_limits_and_budget(compressed, limits, &EXTRACT_BUDGET)
+}
+
+fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
+    compressed: &[u8],
+    limits: ExtractionLimits,
+    extract_budget: &'a AllocBudget,
+) -> Result<BufferedGzipDecode<'a>, LpmError> {
     if compressed.len() < 18 {
         return Err(LpmError::Registry(
             "gzip stream too short (need ≥18 bytes for header + footer)".to_string(),
@@ -559,22 +590,20 @@ fn decompress_gzip_libdeflate_with_limits(
         isize_hint
     };
 
-    // Hold a global budget reservation for the duration of the
-    // decompress call. The guard releases on every return path
-    // (early-return, error, panic) via Drop, so concurrent rayon
-    // workers serialize at the budget boundary instead of all
-    // racing to virtual-allocate the same 256 MiB simultaneously.
-    // The guard is re-acquired on the grow path below — held
-    // across the inner `vec![0u8; capacity]` allocation, which
-    // is where the actual reservation matters.
-    let mut budget = EXTRACT_BUDGET.acquire(capacity as u64);
+    // The reservation includes the compressed input and stays attached to the
+    // decoded buffer through tar walking. The grow path replaces it only after
+    // dropping the smaller output allocation.
+    let mut budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
         let mut output = vec![0u8; capacity];
         match decompressor.gzip_decompress(compressed, &mut output) {
             Ok(actual) => {
                 output.truncate(actual);
-                return Ok(BufferedGzipDecode::Decoded(output));
+                return Ok(BufferedGzipDecode::Decoded(BufferedGzipOutput {
+                    data: output,
+                    _budget: budget,
+                }));
             }
             Err(libdeflater::DecompressionError::InsufficientSpace) => {
                 if capacity >= max_buffered {
@@ -587,7 +616,7 @@ fn decompress_gzip_libdeflate_with_limits(
                 drop(output);
                 capacity = capacity.saturating_mul(2).min(max_buffered);
                 drop(budget);
-                budget = EXTRACT_BUDGET.acquire(capacity as u64);
+                budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
             }
             Err(e) => {
                 return Err(LpmError::Registry(format!(
@@ -601,8 +630,8 @@ fn decompress_gzip_libdeflate_with_limits(
 /// Maximum total extraction size (5 GB) — prevents zip-bomb / tar-bomb attacks.
 const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Global ceiling on the sum of in-flight gzip-decompress output
-/// allocations across all rayon workers. The single-tarball buffered
+/// Global ceiling on the sum of retained compressed input and in-flight
+/// gzip-decompress output across all rayon workers. The single-tarball buffered
 /// ceiling bounds one decode call at 256 MiB, but a registry-mirror
 /// attacker can publish N small packages each of which advertises a
 /// 256 MiB ISIZE; with 8 concurrent workers the peak virtual allocation
@@ -617,9 +646,8 @@ const MAX_EXTRACTION_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// hold a slot for more than a few ms.
 const PARALLEL_EXTRACT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Counting semaphore over bytes of in-flight allocation in
-/// `decompress_gzip_libdeflate`. Acquired on entry, released on
-/// return — see [`AllocBudgetGuard`].
+/// Counting semaphore over bytes retained by buffered gzip decoding.
+/// The reservation remains held until the decoded buffer is dropped.
 static EXTRACT_BUDGET: std::sync::LazyLock<AllocBudget> =
     std::sync::LazyLock::new(|| AllocBudget {
         available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
@@ -3265,6 +3293,39 @@ mod tests {
 
         let decompressed = decompress_gzip_libdeflate(&compressed).unwrap();
         assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn buffered_decode_keeps_input_and_output_budget_reserved_until_drop() {
+        use std::io::Write as _;
+
+        const BUDGET_BYTES: u64 = 64 * 1024;
+        let original = vec![b'x'; 4096];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+        let limits = ExtractionLimits {
+            max_buffered_compressed_size: 64 * 1024,
+            max_buffered_decompressed_size: 64 * 1024,
+            max_extraction_size: 64 * 1024,
+            max_file_size: 64 * 1024,
+            max_file_count: 16,
+        };
+
+        let BufferedGzipDecode::Decoded(decoded) =
+            decompress_gzip_libdeflate_with_limits_and_budget(&compressed, limits, &budget)
+                .unwrap()
+        else {
+            panic!("small gzip payload must use buffered decoding");
+        };
+        let reserved = decoded.capacity().saturating_add(compressed.len()) as u64;
+        assert_eq!(*budget.available.lock().unwrap(), BUDGET_BYTES - reserved);
+        drop(decoded);
+        assert_eq!(*budget.available.lock().unwrap(), BUDGET_BYTES);
     }
 
     /// L9 — the global budget must serialize a second acquire that

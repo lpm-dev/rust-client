@@ -7,7 +7,8 @@ use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 
-pub(super) const MAX_PUBLISH_TARBALL_BYTES: usize = 500 * 1024 * 1024;
+pub(super) const MAX_PUBLISH_TARBALL_BYTES: usize =
+    publish_common::MAX_COMPRESSED_TARBALL_BYTES as usize;
 
 pub(crate) struct PublishManifest {
     pub(crate) package_json_path: std::path::PathBuf,
