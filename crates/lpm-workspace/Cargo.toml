@@ -8,16 +8,20 @@ repository.workspace = true
 description = "Monorepo/workspace discovery and filtering for LPM"
 
 [dependencies]
+cap-fs-ext = { workspace = true }
+cap-std = "4.0.2"
 lpm-common = { workspace = true }
 lpm-semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+same-file = "1"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 glob = "0.3"
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3"
 
 [lints]

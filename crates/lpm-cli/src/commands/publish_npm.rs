@@ -419,6 +419,7 @@ pub async fn publish_to_npm(
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
+    tarball_hashes: &crate::commands::publish_common::TarballHashes,
     provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
     tag: &str,
@@ -433,6 +434,7 @@ pub async fn publish_to_npm(
         version,
         version_data,
         tarball_data,
+        tarball_hashes,
         provenance_attachment,
         access,
         tag,
@@ -484,6 +486,7 @@ async fn publish_to_npm_impl(
     version: &str,
     version_data: &serde_json::Value,
     tarball_data: &[u8],
+    tarball_hashes: &crate::commands::publish_common::TarballHashes,
     provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
     tag: &str,
@@ -513,7 +516,10 @@ async fn publish_to_npm_impl(
         npm_name,
         version,
         version_data,
-        tarball_data,
+        crate::commands::publish_common::TarballRef {
+            data: tarball_data,
+            hashes: tarball_hashes,
+        },
         access,
         NpmPayloadOptions {
             tag: Some(tag),
@@ -911,6 +917,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
             None,
             "public",
             "latest",
@@ -967,6 +974,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
             None,
             "public",
             "latest",
@@ -1001,6 +1009,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
             Some(&provenance),
             "public",
             "latest",
@@ -1021,8 +1030,8 @@ mod tests {
             .expect("publish request should be recorded");
         let payload: serde_json::Value = serde_json::from_slice(&publish_request.body).unwrap();
         let attachment = &payload["_attachments"]["plain-pkg-1.0.0.sigstore"];
-        assert_eq!(attachment["content_type"], provenance.media_type);
-        assert_eq!(attachment["data"], provenance.data);
+        assert_eq!(attachment["content_type"], provenance.media_type.as_ref());
+        assert_eq!(attachment["data"], provenance.data.as_ref());
         assert_eq!(attachment["length"], provenance.data.len());
     }
 
@@ -1059,6 +1068,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
             None,
             "public",
             "latest",
@@ -1122,6 +1132,7 @@ mod tests {
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
             b"fake-tarball",
+            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
             None,
             "public",
             "latest",

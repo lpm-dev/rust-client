@@ -15,6 +15,30 @@ pub const NPMRC_FILE_SIZE_CAP_BYTES: u64 = 1024 * 1024;
 /// Maximum size accepted for a CA bundle, client certificate, or private key.
 pub const TLS_MATERIAL_FILE_SIZE_CAP_BYTES: u64 = 1024 * 1024;
 
+/// Read at most `limit + 1` bytes from an arbitrary stream.
+///
+/// This is intended for pipes and other readers that do not have meaningful
+/// descriptor metadata. An oversized stream returns [`io::ErrorKind::InvalidData`].
+pub fn read_stream_capped<R: Read>(reader: R, limit: u64) -> io::Result<Vec<u8>> {
+    let read_limit = limit.checked_add(1).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stream size limit is too large",
+        )
+    })?;
+    let initial_capacity = usize::try_from(read_limit.min(INITIAL_BUFFER_CAPACITY_BYTES))
+        .map_err(|_| io::Error::other("bounded stream capacity is unsupported"))?;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("stream exceeds {limit}-byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// A distinguishable failure from a bounded local-file read.
 #[derive(Debug, Error)]
 pub enum BoundedReadError {
@@ -133,9 +157,71 @@ pub fn read_text_file_capped_from_open_file(
         .map(|content| (content, metadata))
 }
 
+/// Read bounded UTF-8 text when the caller already queried this descriptor's size.
+pub fn read_text_file_capped_from_open_file_with_known_size(
+    mut file: File,
+    path: &Path,
+    limit: u64,
+    known_size: u64,
+) -> Result<String, BoundedReadError> {
+    if known_size > limit {
+        return Err(BoundedReadError::TooLarge {
+            path: path.to_path_buf(),
+            limit,
+        });
+    }
+    let bytes = read_opened_file_capped(&mut file, path, limit, known_size)?;
+    String::from_utf8(bytes).map_err(|source| BoundedReadError::InvalidUtf8 {
+        path: path.to_path_buf(),
+        source: source.utf8_error(),
+    })
+}
+
 /// Read a bounded local file and validate it as UTF-8 text.
 pub fn read_text_file_capped(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
     read_text_file_capped_with_metadata(path, limit).map(|(content, _)| content)
+}
+
+/// Read bounded UTF-8 text without following a linked leaf or blocking on a special file.
+pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            BoundedReadError::NotFound {
+                path: path.to_path_buf(),
+            }
+        } else {
+            BoundedReadError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    let metadata = file.metadata().map_err(|source| BoundedReadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata_is_link_or_reparse(&metadata) {
+        return Err(BoundedReadError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "not a safe regular file"),
+        });
+    }
+    read_text_file_capped_from_open_file_with_known_size(file, path, limit, metadata.len())
 }
 
 /// Read a bounded UTF-8 text file and return metadata from the opened file.
@@ -181,7 +267,13 @@ fn read_opened_file_capped<R: Read>(
             .min(read_limit)
             .min(INITIAL_BUFFER_CAPACITY_BYTES),
     )
-    .expect("bounded initial capacity fits usize");
+    .map_err(|_| BoundedReadError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bounded read buffer capacity is unsupported on this platform",
+        ),
+    })?;
     let mut bytes = Vec::with_capacity(initial_capacity);
     reader
         .take(read_limit)
@@ -197,6 +289,19 @@ fn read_opened_file_capped<R: Read>(
         });
     }
     Ok(bytes)
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(test)]
@@ -277,6 +382,23 @@ mod tests {
             read_opened_file_capped(&mut reader, path, 5, 0),
             Err(BoundedReadError::TooLarge { limit: 5, .. })
         ));
+        assert_eq!(reader.position(), 6);
+    }
+
+    #[test]
+    fn stream_exactly_at_limit_is_read() {
+        let reader = Cursor::new(b"12345".as_slice());
+
+        assert_eq!(read_stream_capped(reader, 5).unwrap(), b"12345");
+    }
+
+    #[test]
+    fn stream_one_byte_over_limit_is_rejected_after_limit_plus_one_bytes() {
+        let mut reader = Cursor::new(b"123456789".as_slice());
+
+        let error = read_stream_capped(&mut reader, 5).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(reader.position(), 6);
     }
 

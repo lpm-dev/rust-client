@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub(super) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
-const MANIFEST_VERSION: u32 = 1;
-const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
+pub(super) const MANIFEST_VERSION: u32 = 1;
+pub(super) const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PackageSkillsManifest {

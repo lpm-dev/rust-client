@@ -28,16 +28,24 @@ pub(in crate::release_plan) fn open_release_state_directory(
     canonical_root: &Path,
     create: bool,
 ) -> Result<Option<ReleaseStateDirectory>, LpmError> {
+    let root = open_root_directory_nofollow(canonical_root)?;
+    open_release_state_directory_from_open_root(canonical_root, &root, create)
+}
+
+pub(in crate::release_plan) fn open_release_state_directory_from_open_root(
+    canonical_root: &Path,
+    root: &cap_std::fs::Dir,
+    create: bool,
+) -> Result<Option<ReleaseStateDirectory>, LpmError> {
     use cap_fs_ext::DirExt as _;
 
-    let root = open_root_directory_nofollow(canonical_root)?;
     let lpm_display = canonical_root.join(".lpm");
     let lpm_dir = match root.open_dir_nofollow(".lpm") {
         Ok(dir) => dir,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match create_private_cap_directory(&root, ".lpm") {
-                Ok(()) => sync_cap_directory(&root).map_err(LpmError::Io)?,
+            match create_private_cap_directory(root, ".lpm") {
+                Ok(()) => sync_cap_directory(root).map_err(LpmError::Io)?,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(LpmError::Io(error)),
             }
@@ -124,10 +132,10 @@ pub(in crate::release_plan) fn open_private_state_file(
     state: &ReleaseStateDirectory,
     name: &str,
 ) -> Result<Option<cap_std::fs::File>, LpmError> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 
     let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
     #[cfg(windows)]
     {
         use cap_std::fs::OpenOptionsExt as _;
@@ -765,10 +773,10 @@ pub(in crate::release_plan) fn ensure_regular_file(path: &Path) -> Result<(), Lp
 pub(in crate::release_plan) fn open_regular_manifest_file(
     target: &ManifestTarget,
 ) -> Result<cap_std::fs::File, LpmError> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 
     let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
     let file = target
         .parent
         .open_with(&target.file_name, &options)
@@ -860,8 +868,16 @@ pub(in crate::release_plan) fn write_manifest_target_durable(
     target: &ManifestTarget,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    let exact_mode = manifest_mode(target)?;
-    let (temporary_name, mut temporary) = create_manifest_temporary(&target.parent, exact_mode)?;
+    write_relative_file_durable(&target.parent, &target.file_name, bytes)
+}
+
+pub(in crate::release_plan) fn write_relative_file_durable(
+    parent: &cap_std::fs::Dir,
+    file_name: &OsStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let exact_mode = relative_file_mode(parent, file_name)?;
+    let (temporary_name, mut temporary) = create_manifest_temporary(parent, exact_mode)?;
     let result = (|| {
         temporary.write_all(bytes)?;
         #[cfg(unix)]
@@ -870,37 +886,33 @@ pub(in crate::release_plan) fn write_manifest_target_durable(
             temporary.set_permissions(cap_std::fs::Permissions::from_mode(mode))?;
         }
         temporary.sync_all()?;
-        replace_relative_file(
-            &target.parent,
-            &temporary_name,
-            &target.file_name,
-            temporary,
-        )?;
-        sync_cap_directory(&target.parent)
+        replace_relative_file(parent, &temporary_name, file_name, temporary)?;
+        sync_cap_directory(parent)
     })();
     if result.is_err() {
-        let _ = target.parent.remove_file(&temporary_name);
+        let _ = parent.remove_file(&temporary_name);
     }
     result
 }
 
-#[cfg(unix)]
-pub(in crate::release_plan) fn manifest_mode(
-    target: &ManifestTarget,
+fn relative_file_mode(
+    parent: &cap_std::fs::Dir,
+    file_name: &OsStr,
 ) -> std::io::Result<Option<u32>> {
-    use cap_std::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt as _;
 
-    let metadata = target.parent.symlink_metadata(&target.file_name)?;
-    Ok(metadata
-        .is_file()
-        .then(|| metadata.permissions().mode() & 0o7777))
-}
-
-#[cfg(not(unix))]
-pub(in crate::release_plan) fn manifest_mode(
-    _target: &ManifestTarget,
-) -> std::io::Result<Option<u32>> {
-    Ok(None)
+        let metadata = parent.symlink_metadata(file_name)?;
+        Ok(metadata
+            .is_file()
+            .then(|| metadata.permissions().mode() & 0o7777))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, file_name);
+        Ok(None)
+    }
 }
 
 pub(in crate::release_plan) fn create_manifest_temporary(
@@ -1080,9 +1092,9 @@ pub(in crate::release_plan) fn open_root_directory_nofollow(
         use std::os::unix::fs::OpenOptionsExt as _;
 
         let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        options.read(true).custom_flags(
+            libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        );
         options
             .open(path)
             .map(cap_std::fs::Dir::from_std_file)

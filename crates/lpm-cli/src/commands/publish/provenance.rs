@@ -1,13 +1,43 @@
-use super::npm_artifact::load_provenance_file;
+use super::npm_artifact::{
+    load_provenance_bytes, load_provenance_file, read_open_provenance_file_with_known_size,
+};
 use super::types::{ProvenanceContext, ResolvedProvenance};
 use crate::oidc;
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
+pub(crate) enum ProvenanceFileRequest {
+    AmbientPath(PathBuf),
+    ProjectFile {
+        display_path: PathBuf,
+        relative_path: PathBuf,
+        source_dir: Arc<cap_std::fs::Dir>,
+    },
+}
+
+impl std::fmt::Debug for ProvenanceFileRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AmbientPath(path) => formatter.debug_tuple("AmbientPath").field(path).finish(),
+            Self::ProjectFile {
+                display_path,
+                relative_path,
+                source_dir: _,
+            } => formatter
+                .debug_struct("ProjectFile")
+                .field("display_path", display_path)
+                .field("relative_path", relative_path)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) enum ProvenanceRequest {
     Generate,
-    File(PathBuf),
+    File(ProvenanceFileRequest),
     Disabled,
 }
 
@@ -16,7 +46,7 @@ pub(crate) async fn materialize_provenance_request(
 ) -> Result<Option<ResolvedProvenance>, LpmError> {
     match request {
         ProvenanceRequest::Disabled => Ok(None),
-        ProvenanceRequest::File(path) => load_provenance_file(&path)
+        ProvenanceRequest::File(file) => load_provenance_request_file(&file)
             .map(ResolvedProvenance::File)
             .map(Some),
         ProvenanceRequest::Generate => {
@@ -29,12 +59,91 @@ pub(crate) async fn materialize_provenance_request(
     }
 }
 
+pub(super) fn load_provenance_request_file(
+    request: &ProvenanceFileRequest,
+) -> Result<super::types::LoadedProvenanceFile, LpmError> {
+    match request {
+        ProvenanceFileRequest::AmbientPath(path) => load_provenance_file(path),
+        ProvenanceFileRequest::ProjectFile {
+            display_path,
+            relative_path,
+            source_dir,
+        } => {
+            let (file, known_size) = crate::commands::publish_common::open_tarball_source_file(
+                source_dir,
+                relative_path,
+                &display_path.to_string_lossy(),
+            )?;
+            let bytes = read_open_provenance_file_with_known_size(file, display_path, known_size)?;
+            load_provenance_bytes(display_path, bytes)
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_provenance_request(
     project_dir: &Path,
     pkg_json: &serde_json::Value,
     provenance_flag: bool,
     no_provenance: bool,
     provenance_file: Option<&Path>,
+) -> Result<ProvenanceRequest, LpmError> {
+    let canonical_project_dir = project_dir.canonicalize().map_err(LpmError::Io)?;
+    let project_source = Arc::new(crate::commands::publish_common::open_tarball_source_root(
+        &canonical_project_dir,
+    )?);
+    resolve_provenance_request_with_project_npmrc_loader(
+        &canonical_project_dir,
+        pkg_json,
+        provenance_flag,
+        no_provenance,
+        provenance_file,
+        || {
+            super::prepare::read_optional_publish_text(
+                &project_source,
+                Path::new(".npmrc"),
+                &canonical_project_dir.join(".npmrc"),
+                lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+            )
+        },
+        |path| resolve_provenance_file_request(&canonical_project_dir, &project_source, path),
+    )
+}
+
+pub(crate) fn resolve_provenance_request_from_project_source(
+    project_dir: &Path,
+    project_source: &Arc<cap_std::fs::Dir>,
+    pkg_json: &serde_json::Value,
+    provenance_flag: bool,
+    no_provenance: bool,
+    provenance_file: Option<&Path>,
+) -> Result<ProvenanceRequest, LpmError> {
+    resolve_provenance_request_with_project_npmrc_loader(
+        project_dir,
+        pkg_json,
+        provenance_flag,
+        no_provenance,
+        provenance_file,
+        || {
+            super::prepare::read_optional_publish_text(
+                project_source,
+                Path::new(".npmrc"),
+                &project_dir.join(".npmrc"),
+                lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+            )
+        },
+        |path| resolve_provenance_file_request(project_dir, project_source, path),
+    )
+}
+
+fn resolve_provenance_request_with_project_npmrc_loader(
+    project_dir: &Path,
+    pkg_json: &serde_json::Value,
+    provenance_flag: bool,
+    no_provenance: bool,
+    provenance_file: Option<&Path>,
+    load_project_npmrc: impl FnOnce() -> Result<Option<String>, LpmError>,
+    mut resolve_file: impl FnMut(&Path) -> Result<ProvenanceFileRequest, LpmError>,
 ) -> Result<ProvenanceRequest, LpmError> {
     if no_provenance {
         return Ok(ProvenanceRequest::Disabled);
@@ -43,10 +152,7 @@ pub(crate) fn resolve_provenance_request(
         return Ok(ProvenanceRequest::Generate);
     }
     if let Some(path) = provenance_file {
-        return Ok(ProvenanceRequest::File(resolve_provenance_file_path(
-            project_dir,
-            path,
-        )?));
+        return Ok(ProvenanceRequest::File(resolve_file(path)?));
     }
 
     if let Some(value) = package_publish_config_bool(pkg_json, "provenance")? {
@@ -58,31 +164,60 @@ pub(crate) fn resolve_provenance_request(
     }
 
     if let Some(request) = env_request()? {
-        return request.resolve_paths(project_dir);
+        return request.resolve_file(&mut resolve_file);
     }
 
-    if let Some(request) = npmrc_request(&project_dir.join(".npmrc"))? {
-        return request.resolve_paths(project_dir);
+    let project_npmrc_path = project_dir.join(".npmrc");
+    if let Some(content) = load_project_npmrc()?
+        && let Some(request) = parse_npmrc_request(&project_npmrc_path, &content)?
+    {
+        return request.resolve_file(&mut resolve_file);
     }
     if let Some(home) = dirs::home_dir()
         && let Some(request) = npmrc_request(&home.join(".npmrc"))?
     {
-        return request.resolve_paths(project_dir);
+        return request.resolve_file(&mut resolve_file);
     }
 
     Ok(ProvenanceRequest::Disabled)
 }
 
-fn resolve_provenance_file_path(project_dir: &Path, path: &Path) -> Result<PathBuf, LpmError> {
+fn resolve_provenance_file_request(
+    project_dir: &Path,
+    project_source: &Arc<cap_std::fs::Dir>,
+    path: &Path,
+) -> Result<ProvenanceFileRequest, LpmError> {
     if path.as_os_str().is_empty() {
         return Err(LpmError::Registry(
             "provenance file path must not be empty".into(),
         ));
     }
-    Ok(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_dir.join(path)
+    if path.is_absolute() {
+        return Ok(ProvenanceFileRequest::AmbientPath(path.to_path_buf()));
+    }
+    let mut relative_path = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => relative_path.push(component),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(LpmError::Registry(format!(
+                    "provenance file path {} is unsafe: relative paths must stay inside the selected project",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if relative_path.as_os_str().is_empty() {
+        return Err(LpmError::Registry(
+            "provenance file path must identify a file inside the selected project".into(),
+        ));
+    }
+    let display_path = project_dir.join(&relative_path);
+    Ok(ProvenanceFileRequest::ProjectFile {
+        display_path,
+        relative_path,
+        source_dir: Arc::clone(project_source),
     })
 }
 
@@ -178,25 +313,32 @@ enum NpmrcRequest {
 }
 
 impl NpmrcRequest {
-    fn resolve_paths(self, project_dir: &Path) -> Result<ProvenanceRequest, LpmError> {
+    fn resolve_file(
+        self,
+        mut resolve: impl FnMut(&Path) -> Result<ProvenanceFileRequest, LpmError>,
+    ) -> Result<ProvenanceRequest, LpmError> {
         match self {
             Self::Generate => Ok(ProvenanceRequest::Generate),
             Self::Disabled => Ok(ProvenanceRequest::Disabled),
-            Self::File(path) => {
-                resolve_provenance_file_path(project_dir, &path).map(ProvenanceRequest::File)
-            }
+            Self::File(path) => resolve(&path).map(ProvenanceRequest::File),
         }
     }
 }
 
 fn npmrc_request(path: &Path) -> Result<Option<NpmrcRequest>, LpmError> {
-    let content =
-        match lpm_common::read_text_file_capped(path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES) {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
+    let content = match lpm_common::read_text_file_capped_nofollow(
+        path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
 
+    parse_npmrc_request(path, &content)
+}
+
+fn parse_npmrc_request(path: &Path, content: &str) -> Result<Option<NpmrcRequest>, LpmError> {
     let mut request = None;
     let mut provenance_line = None;
     let mut provenance_file_line = None;
@@ -290,7 +432,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(request, ProvenanceRequest::Generate);
+        assert!(matches!(request, ProvenanceRequest::Generate));
     }
 
     #[test]
@@ -305,12 +447,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(request, ProvenanceRequest::Disabled);
+        assert!(matches!(request, ProvenanceRequest::Disabled));
     }
 
     #[test]
-    fn resolve_provenance_request_cli_file_resolves_relative_to_project() {
+    fn resolve_provenance_request_cli_file_binds_relative_to_project_source() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bundle.sigstore"), b"retained bundle").unwrap();
         let request = resolve_provenance_request(
             dir.path(),
             &pkg_json(serde_json::json!({})),
@@ -319,10 +462,91 @@ mod tests {
             Some(Path::new("bundle.sigstore")),
         )
         .unwrap();
+        let ProvenanceRequest::File(ProvenanceFileRequest::ProjectFile {
+            display_path,
+            relative_path,
+            source_dir: _,
+        }) = request
+        else {
+            panic!("expected a project provenance file");
+        };
         assert_eq!(
-            request,
-            ProvenanceRequest::File(dir.path().join("bundle.sigstore"))
+            (display_path, relative_path),
+            (
+                dir.path().canonicalize().unwrap().join("bundle.sigstore"),
+                PathBuf::from("bundle.sigstore")
+            )
         );
+    }
+
+    #[test]
+    fn resolve_provenance_request_normalizes_current_directory_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = resolve_provenance_request(
+            dir.path(),
+            &pkg_json(serde_json::json!({})),
+            false,
+            false,
+            Some(Path::new("./bundle.sigstore")),
+        )
+        .unwrap();
+        let ProvenanceRequest::File(ProvenanceFileRequest::ProjectFile { relative_path, .. }) =
+            request
+        else {
+            panic!("expected a project provenance file");
+        };
+
+        assert_eq!(relative_path, Path::new("bundle.sigstore"));
+    }
+
+    #[test]
+    fn resolve_provenance_request_rejects_relative_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(root.path().join("outside.sigstore"), b"outside bundle").unwrap();
+        let canonical = project.canonicalize().unwrap();
+        let source = Arc::new(
+            crate::commands::publish_common::open_tarball_source_root(&canonical).unwrap(),
+        );
+
+        let error = resolve_provenance_request_from_project_source(
+            &canonical,
+            &source,
+            &pkg_json(serde_json::json!({})),
+            false,
+            false,
+            Some(Path::new("../outside.sigstore")),
+        )
+        .expect_err("relative provenance paths must stay inside the project")
+        .to_string();
+
+        assert!(error.contains("unsafe"), "{error}");
+    }
+
+    #[test]
+    fn resolve_provenance_request_keeps_absolute_paths_explicitly_ambient() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical = project.path().canonicalize().unwrap();
+        let source = Arc::new(
+            crate::commands::publish_common::open_tarball_source_root(&canonical).unwrap(),
+        );
+        let absolute = canonical.join("bundle.sigstore");
+
+        let request = resolve_provenance_request_from_project_source(
+            &canonical,
+            &source,
+            &pkg_json(serde_json::json!({})),
+            false,
+            false,
+            Some(&absolute),
+        )
+        .unwrap();
+
+        let ProvenanceRequest::File(ProvenanceFileRequest::AmbientPath(resolved)) = request else {
+            panic!("expected an ambient provenance file");
+        };
+        assert_eq!(resolved, absolute);
     }
 
     #[test]
@@ -342,7 +566,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(request, ProvenanceRequest::Generate);
+        assert!(matches!(request, ProvenanceRequest::Generate));
     }
 
     #[test]
@@ -362,7 +586,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(request, ProvenanceRequest::Generate);
+        assert!(matches!(request, ProvenanceRequest::Generate));
     }
 
     #[test]
@@ -382,7 +606,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(request, ProvenanceRequest::Generate);
+        assert!(matches!(request, ProvenanceRequest::Generate));
     }
 
     #[test]
@@ -423,7 +647,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(request, ProvenanceRequest::Generate);
+        assert!(matches!(request, ProvenanceRequest::Generate));
     }
 
     #[test]
@@ -449,5 +673,110 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_provenance_request_rejects_a_linked_project_npmrc() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let external = root.path().join("external.npmrc");
+        std::fs::write(&external, "provenance=true\n").unwrap();
+        std::os::unix::fs::symlink(&external, project.join(".npmrc")).unwrap();
+        let _env = ScopedEnv::update([
+            ("NPM_CONFIG_PROVENANCE", None),
+            ("npm_config_provenance", None),
+            ("NPM_CONFIG_PROVENANCE_FILE", None),
+            ("npm_config_provenance_file", None),
+        ]);
+
+        let error = resolve_provenance_request(
+            &project,
+            &pkg_json(serde_json::json!({})),
+            false,
+            false,
+            None,
+        )
+        .expect_err("linked project .npmrc must not configure publish")
+        .to_string();
+
+        assert!(
+            error.contains(".npmrc") && error.contains("unsafe"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambient_npmrc_fifo_is_rejected_promptly() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(".npmrc");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let fifo_for_worker = fifo.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = npmrc_request(&fifo_for_worker)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            sender.send(result).unwrap();
+        });
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result,
+            Err(error) => {
+                let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                drop(writer);
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("ambient .npmrc loading blocked on a FIFO: {error}");
+            }
+        };
+        worker.join().unwrap();
+
+        let error = result.expect_err("an ambient FIFO .npmrc must be rejected");
+        assert!(error.contains(".npmrc"), "{error}");
+    }
+
+    #[test]
+    fn project_relative_provenance_keeps_the_selected_project_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let displaced = root.path().join("displaced");
+        let replacement = root.path().join("replacement");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(project.join("bundle.sigstore"), [0xff]).unwrap();
+        std::fs::write(replacement.join("bundle.sigstore"), b"{}").unwrap();
+        let canonical = project.canonicalize().unwrap();
+        let source = Arc::new(
+            crate::commands::publish_common::open_tarball_source_root(&canonical).unwrap(),
+        );
+        let request = resolve_provenance_request_from_project_source(
+            &canonical,
+            &source,
+            &pkg_json(serde_json::json!({})),
+            false,
+            false,
+            Some(Path::new("bundle.sigstore")),
+        )
+        .unwrap();
+        std::fs::rename(&project, &displaced).unwrap();
+        std::fs::rename(&replacement, &project).unwrap();
+
+        let ProvenanceRequest::File(request) = request else {
+            panic!("expected a project provenance snapshot");
+        };
+
+        let error = load_provenance_request_file(&request)
+            .expect_err("the selected invalid provenance generation must be loaded")
+            .to_string();
+
+        assert!(
+            error.contains("expected UTF-8 Sigstore bundle JSON"),
+            "{error}"
+        );
     }
 }

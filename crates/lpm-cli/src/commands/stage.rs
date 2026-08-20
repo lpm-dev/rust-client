@@ -43,6 +43,9 @@ pub(crate) async fn publish_current_project(
     let final_tarball_data = rewritten_tarball
         .as_ref()
         .map_or(&prepared.tarball_data, |tarball| &tarball.data);
+    let final_tarball_hashes = rewritten_tarball
+        .as_ref()
+        .map_or(&prepared.tarball_hashes, |tarball| &tarball.hashes);
     let final_secret_scan = rewritten_tarball
         .as_ref()
         .map_or(prepared.secret_scan.as_ref(), |tarball| {
@@ -52,8 +55,9 @@ pub(crate) async fn publish_current_project(
         npm_stage::resolve_npm_stage_registry_with_source(npm_config, options.npm_registry)?;
     let access = resolve_stage_access(options.access, &npm_name, npm_config)?;
     let (tag, tag_explicit) = resolve_stage_tag(options.tag, npm_config);
-    let provenance_request = publish::resolve_provenance_request(
+    let provenance_request = publish::resolve_provenance_request_from_project_source(
         project_dir,
+        &prepared.source_dir,
         &prepared.pkg_json,
         options.provenance,
         options.no_provenance,
@@ -70,7 +74,7 @@ pub(crate) async fn publish_current_project(
         &prepared.name,
         &prepared.version,
         prepared.readme.as_deref(),
-        &prepared.tarball_data,
+        &prepared.tarball_hashes,
     );
     let file_artifact = if matches!(provenance_request, publish::ProvenanceRequest::File(_)) {
         let provenance_context =
@@ -81,6 +85,7 @@ pub(crate) async fn publish_current_project(
                 version: &prepared.version,
                 base_version_data: &version_data,
                 final_tarball_data: std::sync::Arc::clone(final_tarball_data),
+                final_tarball_hashes: std::sync::Arc::clone(final_tarball_hashes),
                 provenance_context: provenance_context.as_ref(),
                 target_label: "npm",
                 json_output: options.json_output,
@@ -99,7 +104,6 @@ pub(crate) async fn publish_current_project(
     let quality = publish::run_publish_quality_gate(publish::PublishQualityGateInput {
         pkg_json: &prepared.pkg_json,
         readme: prepared.readme.as_deref(),
-        project_dir,
         tarball_files: &prepared.tarball_files,
         detected_ecosystem: &prepared.detected_ecosystem,
         swift_manifest: prepared.swift_manifest.as_ref(),
@@ -162,6 +166,7 @@ pub(crate) async fn publish_current_project(
         npm_stage::fetch_package_metadata(auth.token(), &npm_name, registry.url()).await?;
     publish_npm::enforce_npm_version_policy(&metadata, &npm_name, &prepared.version, tag_explicit)?;
     let artifact = if let Some(artifact) = file_artifact {
+        drop(provenance_request);
         artifact
     } else {
         let provenance_context =
@@ -171,6 +176,7 @@ pub(crate) async fn publish_current_project(
             version: &prepared.version,
             base_version_data: &version_data,
             final_tarball_data: std::sync::Arc::clone(final_tarball_data),
+            final_tarball_hashes: std::sync::Arc::clone(final_tarball_hashes),
             provenance_context: provenance_context.as_ref(),
             target_label: "npm",
             json_output: options.json_output,
@@ -193,6 +199,7 @@ pub(crate) async fn publish_current_project(
         &prepared.version,
         &artifact.version_data,
         &artifact.tarball_data,
+        &artifact.tarball_hashes,
         artifact.provenance_attachment.as_ref(),
         &access,
         &tag,

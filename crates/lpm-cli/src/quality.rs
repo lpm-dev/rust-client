@@ -20,7 +20,6 @@
 
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
-use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityResult {
@@ -90,7 +89,6 @@ fn normalize_score(earned_points: u32, applicable_points: u32) -> u32 {
 pub fn run_quality_checks(
     pkg_json: &serde_json::Value,
     readme: Option<&str>,
-    project_dir: &Path,
     files: &[String],
     ecosystem: &str,
     swift_manifest: Option<&serde_json::Value>,
@@ -104,11 +102,11 @@ pub fn run_quality_checks(
     match ecosystem {
         "swift" => {
             push_swift_code_quality_checks(&mut checks, swift_manifest, files);
-            push_swift_testing_checks(&mut checks, swift_manifest, project_dir);
+            push_swift_testing_checks(&mut checks, swift_manifest, files);
         }
         _ => {
             push_js_code_quality_checks(&mut checks, pkg_json, files);
-            push_js_testing_checks(&mut checks, pkg_json, project_dir);
+            push_js_testing_checks(&mut checks, pkg_json, files);
         }
     }
 
@@ -229,6 +227,9 @@ fn push_documentation_checks(
 
     // has-changelog (3pts)
     let has_changelog = files.iter().any(|f| {
+        if is_bundled_dependency_path(f) {
+            return false;
+        }
         let lower = f.to_lowercase();
         lower.contains("changelog") || lower.contains("changes") || lower.contains("history")
     });
@@ -272,6 +273,7 @@ fn push_js_code_quality_checks(
         || pkg_json.get("typings").is_some()
         || files
             .iter()
+            .filter(|path| !is_bundled_dependency_path(path))
             .any(|f| f.ends_with(".d.ts") || f.ends_with(".d.cts") || f.ends_with(".d.mts"));
     checks.push(QualityCheck {
         id: "has-types".into(),
@@ -368,6 +370,7 @@ fn push_js_code_quality_checks(
     // source-maps (1pt)
     let has_source_maps = files
         .iter()
+        .filter(|path| !is_bundled_dependency_path(path))
         .any(|f| f.ends_with(".js.map") || f.ends_with(".mjs.map"));
     checks.push(QualityCheck {
         id: "source-maps".into(),
@@ -505,6 +508,7 @@ fn push_swift_code_quality_checks(
         .iter()
         .filter(|f| {
             f.ends_with(".swift")
+                && !is_bundled_dependency_path(f)
                 && !f.to_lowercase().contains("tests/")
                 && !f.to_lowercase().contains("test/")
                 && *f != "Package.swift"
@@ -577,10 +581,12 @@ fn parse_tools_version_recent(version: &str) -> bool {
 fn push_js_testing_checks(
     checks: &mut Vec<QualityCheck>,
     pkg_json: &serde_json::Value,
-    project_dir: &Path,
+    files: &[String],
 ) {
     // has-test-files (7pts)
-    let has_test_files = check_test_files_js(project_dir);
+    let has_test_files = files
+        .iter()
+        .any(|path| !is_bundled_dependency_path(path) && is_js_test_file(path));
     checks.push(QualityCheck {
         id: "has-test-files".into(),
         category: "testing".into(),
@@ -616,7 +622,7 @@ fn push_js_testing_checks(
 fn push_swift_testing_checks(
     checks: &mut Vec<QualityCheck>,
     swift_manifest: Option<&serde_json::Value>,
-    project_dir: &Path,
+    files: &[String],
 ) {
     let empty_arr = serde_json::json!([]);
     let targets = swift_manifest
@@ -632,7 +638,11 @@ fn push_swift_testing_checks(
 
     // has-test-files (7pts) — test targets in Package.swift or test directories
     let has_test_targets = !test_targets.is_empty();
-    let has_test_dirs = project_dir.join("Tests").is_dir() || project_dir.join("tests").is_dir();
+    let has_test_dirs = files.iter().any(|path| {
+        path.split('/')
+            .next()
+            .is_some_and(|component| component == "Tests" || component == "tests")
+    });
     let has_tests = has_test_targets || has_test_dirs;
     checks.push(QualityCheck {
         id: "has-test-files".into(),
@@ -807,22 +817,19 @@ fn push_health_checks(
     }
 }
 
-/// Check if the project has test files (JS ecosystem).
-fn check_test_files_js(project_dir: &Path) -> bool {
-    for dir in ["test", "tests", "__tests__", "spec"] {
-        if project_dir.join(dir).is_dir() {
-            return true;
-        }
-    }
-    for pattern in ["*.test.*", "*.spec.*"] {
-        let glob_pattern = project_dir.join("**").join(pattern);
-        if let Ok(entries) = glob::glob(&glob_pattern.to_string_lossy())
-            && entries.into_iter().flatten().next().is_some()
-        {
-            return true;
-        }
-    }
-    false
+fn is_js_test_file(path: &str) -> bool {
+    let mut components = path.split('/');
+    let Some(file_name) = components.next_back() else {
+        return false;
+    };
+    components.any(|component| matches!(component, "test" | "tests" | "__tests__" | "spec"))
+        || file_name.contains(".test.")
+        || file_name.contains(".spec.")
+}
+
+fn is_bundled_dependency_path(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|component| component.eq_ignore_ascii_case("node_modules"))
 }
 
 #[cfg(test)]
@@ -835,7 +842,7 @@ mod tests {
             "name": "test",
             "version": "1.0.0",
         });
-        let result = run_quality_checks(&pkg, None, Path::new("/tmp"), &[], "js", None);
+        let result = run_quality_checks(&pkg, None, &[], "js", None);
         assert_eq!(result.max_score, 100, "JS total should be 100");
         assert!(result.applicable_points < 100);
     }
@@ -852,16 +859,13 @@ mod tests {
             "dependencies": [],
             "targets": [],
         });
-        let result =
-            run_quality_checks(&pkg, None, Path::new("/tmp"), &[], "swift", Some(&manifest));
+        let result = run_quality_checks(&pkg, None, &[], "swift", Some(&manifest));
         assert_eq!(result.max_score, 100, "Swift total should be 100");
         assert!(result.applicable_points < 100);
     }
 
     #[test]
     fn fully_passing_local_js_checks_normalize_to_100() {
-        let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join("tests")).unwrap();
         let pkg = serde_json::json!({
             "name": "excellent",
             "version": "1.0.0",
@@ -886,10 +890,11 @@ mod tests {
             "index.js".into(),
             "index.d.ts".into(),
             "index.js.map".into(),
+            "tests/index.test.js".into(),
             "CHANGELOG.md".into(),
             "LICENSE".into(),
         ];
-        let result = run_quality_checks(&pkg, Some(&readme), project.path(), &files, "js", None);
+        let result = run_quality_checks(&pkg, Some(&readme), &files, "js", None);
         let failures = result
             .checks
             .iter()
@@ -902,6 +907,72 @@ mod tests {
         );
         assert_eq!(result.score, 100);
         assert_eq!(result.earned_points, result.applicable_points);
+    }
+
+    #[test]
+    fn js_test_file_score_uses_the_published_file_set() {
+        let pkg = serde_json::json!({
+            "name": "published-files-only",
+            "version": "1.0.0",
+        });
+
+        let result = run_quality_checks(&pkg, None, &["index.js".into()], "js", None);
+        let test_files = result
+            .checks
+            .iter()
+            .find(|check| check.id == "has-test-files")
+            .unwrap();
+
+        assert!(!test_files.passed);
+    }
+
+    #[test]
+    fn bundled_dependency_files_do_not_award_root_package_quality_points() {
+        let pkg = serde_json::json!({
+            "name": "root-quality",
+            "version": "1.0.0",
+        });
+        let files = vec![
+            "node_modules/dependency/CHANGELOG.md".into(),
+            "node_modules/dependency/index.d.ts".into(),
+            "node_modules/dependency/index.js.map".into(),
+            "node_modules/dependency/tests/index.test.js".into(),
+        ];
+
+        let result = run_quality_checks(&pkg, None, &files, "js", None);
+
+        for id in [
+            "has-changelog",
+            "has-types",
+            "source-maps",
+            "has-test-files",
+        ] {
+            let check = result.checks.iter().find(|check| check.id == id).unwrap();
+            assert!(!check.passed, "{id} used a bundled dependency file");
+        }
+    }
+
+    #[test]
+    fn bundled_swift_sources_do_not_award_root_public_api_points() {
+        let manifest = serde_json::json!({
+            "platforms": [],
+            "dependencies": [],
+            "targets": [],
+            "toolsVersion": "5.9",
+        });
+        let mut checks = Vec::new();
+
+        push_swift_code_quality_checks(
+            &mut checks,
+            Some(&manifest),
+            &["node_modules/dependency/Sources/Foo.swift".into()],
+        );
+
+        let public_api = checks
+            .iter()
+            .find(|check| check.id == "has-public-api")
+            .unwrap();
+        assert!(!public_api.passed);
     }
 
     #[test]
@@ -989,7 +1060,7 @@ mod tests {
             ],
         });
         let mut checks = Vec::new();
-        push_swift_testing_checks(&mut checks, Some(&manifest), Path::new("/tmp"));
+        push_swift_testing_checks(&mut checks, Some(&manifest), &[]);
 
         let test_files = checks.iter().find(|c| c.id == "has-test-files").unwrap();
         assert!(test_files.passed);

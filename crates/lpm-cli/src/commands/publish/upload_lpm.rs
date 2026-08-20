@@ -14,6 +14,7 @@ pub(super) async fn publish_to_lpm(
     readme: &Option<String>,
     tarball_data: &[u8],
     tarball_files: &[TarballFile],
+    package_json_size_override: Option<u64>,
     version_data: &serde_json::Value,
     quality_result: &Option<quality::QualityResult>,
     lpm_config: &Option<serde_json::Value>,
@@ -94,14 +95,21 @@ pub(super) async fn publish_to_lpm(
         });
     }
 
+    let packed_size = |file: &TarballFile| {
+        if file.path == "package.json" {
+            package_json_size_override.unwrap_or(file.size)
+        } else {
+            file.size
+        }
+    };
     lpm_version["_npmPackMeta"] = serde_json::json!({
         "files": tarball_files.iter().map(|f| {
             serde_json::json!({
                 "path": f.path,
-                "size": f.size,
+                "size": packed_size(f),
             })
         }).collect::<Vec<_>>(),
-        "unpackedSize": tarball_files.iter().map(|f| f.size).sum::<u64>(),
+        "unpackedSize": tarball_files.iter().map(packed_size).sum::<u64>(),
         "fileCount": tarball_files.len(),
     });
 

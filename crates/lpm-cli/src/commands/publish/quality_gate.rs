@@ -10,7 +10,6 @@ pub(crate) fn run_publish_quality_gate(
     let result = quality::run_quality_checks(
         input.pkg_json,
         input.readme,
-        input.project_dir,
         &file_names,
         input.detected_ecosystem,
         input.swift_manifest,

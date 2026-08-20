@@ -16,7 +16,7 @@ const MAX_RELEASE_COMMIT_BYTES: u64 = 8 * 1024;
 const RELEASE_TRANSACTION_ID_BYTES: usize = 16;
 const RELEASE_TRANSACTION_ID_HEX_BYTES: usize = RELEASE_TRANSACTION_ID_BYTES * 2;
 const MAX_RELEASE_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RELEASE_JOURNAL_ENTRIES: usize = 10_000;
+const MAX_RELEASE_JOURNAL_ENTRIES: usize = 128;
 const MAX_RELEASE_ORIGINAL_BYTES: usize = 48 * 1024 * 1024;
 const MAX_RELEASE_UPDATED_BYTES: usize = 48 * 1024 * 1024;
 const MAX_RELEASE_PATH_BYTES: usize = 64 * 1024;
@@ -161,6 +161,7 @@ struct WorkspaceManifest {
     json: serde_json::Value,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseApplyJournal {
@@ -184,6 +185,7 @@ enum ReleaseApplyJournalState {
     Complete,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseApplyJournalEntry {
@@ -195,6 +197,44 @@ struct ReleaseApplyJournalEntry {
     original_base64: String,
     #[serde(deserialize_with = "deserialize_release_digest")]
     updated_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryApplyJournal<'a> {
+    schema_version: u32,
+    #[serde(
+        borrow,
+        deserialize_with = "deserialize_borrowed_release_transaction_id"
+    )]
+    transaction_id: &'a str,
+    operation: ReleaseTransactionOperation,
+    state: ReleaseApplyJournalState,
+    #[serde(
+        borrow,
+        deserialize_with = "deserialize_borrowed_release_path_encoding"
+    )]
+    path_encoding: &'a str,
+    #[serde(borrow, deserialize_with = "deserialize_recovery_journal_entries")]
+    entries: Vec<RecoveryApplyJournalEntry<'a>>,
+    #[serde(default)]
+    version_git: Option<VersionGitJournal>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryApplyJournalEntry<'a> {
+    #[serde(borrow, deserialize_with = "deserialize_borrowed_release_encoded_path")]
+    path: &'a str,
+    #[serde(borrow, deserialize_with = "deserialize_borrowed_release_digest")]
+    original_sha256: &'a str,
+    #[serde(
+        borrow,
+        deserialize_with = "deserialize_borrowed_release_manifest_backup"
+    )]
+    original_base64: &'a str,
+    #[serde(borrow, deserialize_with = "deserialize_borrowed_release_digest")]
+    updated_sha256: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -217,6 +257,7 @@ struct ReleaseApplyCommit {
     tag: Option<String>,
 }
 
+#[cfg(test)]
 fn deserialize_release_journal_entries<'de, D>(
     deserializer: D,
 ) -> Result<Vec<ReleaseApplyJournalEntry>, D::Error>
@@ -267,6 +308,57 @@ where
     deserializer.deserialize_seq(EntriesVisitor)
 }
 
+fn deserialize_recovery_journal_entries<'de, D>(
+    deserializer: D,
+) -> Result<Vec<RecoveryApplyJournalEntry<'de>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct EntriesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+        type Value = Vec<RecoveryApplyJournalEntry<'de>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_RELEASE_JOURNAL_ENTRIES} borrowed release journal entries"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|size| size > MAX_RELEASE_JOURNAL_ENTRIES)
+            {
+                return Err(serde::de::Error::invalid_length(
+                    MAX_RELEASE_JOURNAL_ENTRIES + 1,
+                    &self,
+                ));
+            }
+            let mut entries = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_RELEASE_JOURNAL_ENTRIES),
+            );
+            while let Some(entry) = sequence.next_element()? {
+                if entries.len() == MAX_RELEASE_JOURNAL_ENTRIES {
+                    return Err(serde::de::Error::invalid_length(entries.len() + 1, &self));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(EntriesVisitor)
+}
+
+#[cfg(test)]
 fn deserialize_release_path_encoding<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -274,6 +366,7 @@ where
     deserialize_bounded_string::<D, 32>(deserializer, "release journal path encoding")
 }
 
+#[cfg(test)]
 fn deserialize_release_transaction_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -284,6 +377,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn deserialize_release_encoded_path<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -301,6 +395,7 @@ where
     deserialize_bounded_string::<D, 64>(deserializer, "release manifest SHA-256 digest")
 }
 
+#[cfg(test)]
 fn deserialize_release_manifest_backup<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -323,6 +418,86 @@ where
     D: serde::Deserializer<'de>,
 {
     deserialize_bounded_string::<D, MAX_RELEASE_GIT_TAG_BYTES>(deserializer, "Git tag")
+}
+
+fn deserialize_borrowed_release_transaction_id<'de, D>(
+    deserializer: D,
+) -> Result<&'de str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_borrowed_str::<D, RELEASE_TRANSACTION_ID_HEX_BYTES>(
+        deserializer,
+        "release transaction ID",
+    )
+}
+
+fn deserialize_borrowed_release_path_encoding<'de, D>(deserializer: D) -> Result<&'de str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_borrowed_str::<D, 32>(deserializer, "release journal path encoding")
+}
+
+fn deserialize_borrowed_release_encoded_path<'de, D>(deserializer: D) -> Result<&'de str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_borrowed_str::<D, MAX_RELEASE_ENCODED_PATH_BYTES>(
+        deserializer,
+        "encoded release manifest path",
+    )
+}
+
+fn deserialize_borrowed_release_digest<'de, D>(deserializer: D) -> Result<&'de str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_borrowed_str::<D, 64>(deserializer, "release manifest SHA-256 digest")
+}
+
+fn deserialize_borrowed_release_manifest_backup<'de, D>(
+    deserializer: D,
+) -> Result<&'de str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_borrowed_str::<D, MAX_RELEASE_ENCODED_MANIFEST_BYTES>(
+        deserializer,
+        "encoded release manifest backup",
+    )
+}
+
+fn deserialize_bounded_borrowed_str<'de, D, const MAX: usize>(
+    deserializer: D,
+    description: &'static str,
+) -> Result<&'de str, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BorrowedStringVisitor<const MAX: usize> {
+        description: &'static str,
+    }
+
+    impl<'de, const MAX: usize> serde::de::Visitor<'de> for BorrowedStringVisitor<MAX> {
+        type Value = &'de str;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{} no longer than {MAX} bytes", self.description)
+        }
+
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.len() > MAX {
+                return Err(E::invalid_length(value.len(), &self));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_str(BorrowedStringVisitor::<MAX> { description })
 }
 
 fn deserialize_bounded_string<'de, D, const MAX: usize>(
@@ -531,11 +706,20 @@ pub(crate) use planning::{
     sorted_selected_indices, validate_workspace_internal_ranges,
 };
 pub(crate) use transaction::{
-    ensure_no_pending_release_transaction, has_release_transaction,
-    recover_pending_operation_transaction, recover_pending_release_transaction,
-    write_planned_manifests, write_planned_manifests_then_git,
+    ensure_no_pending_release_transaction, ensure_no_pending_release_transaction_from_open_root,
+    has_release_transaction_from_open_root, recover_pending_operation_transaction,
+    recover_pending_release_transaction_from_open_root, write_planned_manifests,
+    write_planned_manifests_then_git,
 };
 pub(crate) use version_git::create_version_commit_and_tag;
+
+pub(crate) fn write_publish_manifest_relative_durable(
+    parent: &cap_std::fs::Dir,
+    file_name: &OsStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    transaction::write_relative_file_durable(parent, file_name, bytes)
+}
 
 #[cfg(test)]
 mod tests {
@@ -611,6 +795,43 @@ mod tests {
             ReleaseTransactionOperationKind::ReleaseApply,
             b"release-plan-unit-test",
         )
+    }
+
+    fn run_git(directory: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap()
+    }
+
+    fn initialize_git_repository(directory: &Path) -> String {
+        assert!(run_git(directory, &["init", "--quiet"]).status.success());
+        assert!(
+            run_git(directory, &["add", "package.json"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(
+                directory,
+                &[
+                    "-c",
+                    "user.name=LPM Test",
+                    "-c",
+                    "user.email=lpm-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ],
+            )
+            .status
+            .success()
+        );
+        let output = run_git(directory, &["rev-parse", "HEAD"]);
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     #[test]
@@ -789,6 +1010,60 @@ mod tests {
         assert!(existing_release_journal_path(tmp.path()).unwrap().is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn release_transaction_entry_limit_fits_a_common_descriptor_budget() {
+        const CHILD_ENV: &str = "LPM_TEST_RELEASE_DESCRIPTOR_BUDGET_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("release_plan::tests::release_transaction_entry_limit_fits_a_common_descriptor_budget")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "descriptor-budget child failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let descriptor_limit = libc::rlimit {
+            rlim_cur: 256,
+            rlim_max: 256,
+        };
+        assert_eq!(
+            // SAFETY: the child owns this process-wide limit and passes a valid rlimit pointer.
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &descriptor_limit) },
+            0
+        );
+        let tmp = TempDir::new().unwrap();
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        let updated = br#"{"name":"demo","version":"1.0.1"}"#.to_vec();
+        let mut manifests = Vec::with_capacity(MAX_RELEASE_JOURNAL_ENTRIES);
+        for index in 0..MAX_RELEASE_JOURNAL_ENTRIES {
+            let manifest_path = tmp.path().join(index.to_string()).join("package.json");
+            std::fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+            std::fs::write(&manifest_path, original.as_ref()).unwrap();
+            manifests.push(PlannedManifest {
+                path: manifest_path,
+                original_bytes: Arc::clone(&original),
+                updated_bytes: updated.clone(),
+            });
+        }
+
+        write_planned_manifests(tmp.path(), &manifests, test_operation()).unwrap();
+
+        assert!(
+            manifests
+                .iter()
+                .all(|manifest| std::fs::read(&manifest.path).unwrap() == updated)
+        );
+    }
+
     #[test]
     fn write_planned_manifests_rejects_external_edits_made_after_planning() {
         let (tmp, workspace) = workspace_with_app_dep("^1.2.3");
@@ -803,6 +1078,50 @@ mod tests {
 
         assert!(error.to_string().contains("changed since it was read"));
         assert_eq!(std::fs::read_to_string(core_manifest).unwrap(), edited);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_manifest_open_rejects_a_fifo_promptly() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::sync::mpsc;
+
+        let root = TempDir::new().unwrap();
+        let manifest_path = root.path().join("package.json");
+        let encoded_path = std::ffi::CString::new(manifest_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(encoded_path.as_ptr(), 0o600) }, 0);
+        let canonical_root = canonical_workspace_root(root.path()).unwrap();
+        let root_dir = open_root_directory_nofollow(&canonical_root).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        let worker = std::thread::spawn(move || {
+            let result =
+                open_manifest_target(&root_dir, &canonical_root, Path::new("package.json"))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+            sender.send(result).unwrap();
+        });
+        let timely = receiver.recv_timeout(std::time::Duration::from_millis(250));
+        let completed_without_blocking = timely.is_ok();
+        let result = match timely {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&manifest_path)
+                    .unwrap();
+                drop(writer);
+                receiver.recv().unwrap()
+            }
+            Err(error) => panic!("release manifest worker disconnected: {error}"),
+        };
+        worker.join().unwrap();
+
+        assert!(
+            completed_without_blocking,
+            "opening a release manifest FIFO blocked recovery"
+        );
+        assert!(result.is_err(), "a release manifest FIFO must be rejected");
     }
 
     #[test]
@@ -894,6 +1213,32 @@ mod tests {
         .unwrap();
 
         assert_eq!(serialize_release_journal(&journal).unwrap().len(), expected);
+    }
+
+    #[test]
+    fn recovery_journal_keeps_encoded_manifest_backups_borrowed() {
+        let tmp = TempDir::new().unwrap();
+        let manifest_path = tmp.path().join("package.json");
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        std::fs::write(&manifest_path, original.as_ref()).unwrap();
+        let manifests = vec![PlannedManifest {
+            path: manifest_path,
+            original_bytes: original,
+            updated_bytes: br#"{"name":"demo","version":"1.0.1"}"#.to_vec(),
+        }];
+        let root = canonical_workspace_root(tmp.path()).unwrap();
+        let mut resolved = resolve_planned_manifests(&root, &manifests).unwrap();
+        let journal = build_release_journal(&mut resolved).unwrap();
+        let bytes = serialize_release_journal(&journal).unwrap();
+
+        let parsed: RecoveryApplyJournal<'_> = serde_json::from_slice(&bytes).unwrap();
+        let backup = parsed.entries[0].original_base64.as_bytes();
+        let bytes_start = bytes.as_ptr() as usize;
+        let bytes_end = bytes_start + bytes.len();
+        let backup_start = backup.as_ptr() as usize;
+
+        assert!(backup_start >= bytes_start);
+        assert!(backup_start + backup.len() <= bytes_end);
     }
 
     #[test]
@@ -1020,7 +1365,7 @@ mod tests {
         let state = open_release_state_directory(&root, false)
             .unwrap()
             .expect("release state must retain a completion receipt");
-        let (journal_bytes, _) = read_existing_release_journal_in(&state)
+        let journal_bytes = read_existing_release_journal_bytes_in(&state)
             .unwrap()
             .expect("release journal must be restored");
         assert!(release_commit_is_durable_in(&state, &journal_bytes).unwrap());
@@ -1225,7 +1570,8 @@ mod tests {
         }];
         let root = seed_release_journal(tmp.path(), &manifests);
         std::fs::write(&manifest_path, updated).unwrap();
-        let state = open_release_state_directory(&root, false)
+        let root_dir = open_root_directory_nofollow(&root).unwrap();
+        let state = open_release_state_directory_from_open_root(&root, &root_dir, false)
             .unwrap()
             .expect("seeded release state");
         let state_dir = tmp.path().join(".lpm/release-apply");
@@ -1235,6 +1581,7 @@ mod tests {
 
         let outcome = recover_pending_release_transaction_in(
             &root,
+            &root_dir,
             &state,
             &planned_manifest_paths(&manifests),
         )
@@ -1244,6 +1591,188 @@ mod tests {
         assert_eq!(std::fs::read(manifest_path).unwrap(), original.as_ref());
         assert!(!moved_state_dir.join(RELEASE_JOURNAL_FILE).exists());
         assert!(!outside.path().join(RELEASE_JOURNAL_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_recovery_keeps_using_the_selected_root_after_path_replacement() {
+        let base = TempDir::new().unwrap();
+        let selected = base.path().join("selected");
+        let displaced = base.path().join("displaced");
+        std::fs::create_dir(&selected).unwrap();
+        let manifest_path = selected.join("package.json");
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        let updated = br#"{"name":"demo","version":"1.0.1"}"#.to_vec();
+        std::fs::write(&manifest_path, original.as_ref()).unwrap();
+        let manifests = vec![PlannedManifest {
+            path: manifest_path.clone(),
+            original_bytes: Arc::clone(&original),
+            updated_bytes: updated.clone(),
+        }];
+        let root = seed_release_journal(&selected, &manifests);
+        std::fs::write(&manifest_path, updated).unwrap();
+        let root_dir = open_root_directory_nofollow(&root).unwrap();
+        std::fs::rename(&selected, &displaced).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let replacement = br#"{"name":"replacement","version":"9.9.9"}"#;
+        std::fs::write(selected.join("package.json"), replacement).unwrap();
+
+        assert!(
+            recover_pending_release_transaction_from_open_root(
+                &root,
+                &root_dir,
+                &planned_manifest_paths(&manifests),
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            std::fs::read(displaced.join("package.json")).unwrap(),
+            original.as_ref()
+        );
+        assert_eq!(
+            std::fs::read(selected.join("package.json")).unwrap(),
+            replacement
+        );
+        assert!(!displaced.join(".lpm/release-apply/journal.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_git_recovery_does_not_mutate_a_same_path_replacement_repository() {
+        let base = TempDir::new().unwrap();
+        let selected = base.path().join("selected");
+        let displaced = base.path().join("displaced");
+        std::fs::create_dir(&selected).unwrap();
+        let manifest_path = selected.join("package.json");
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        let updated = br#"{"name":"demo","version":"1.0.1"}"#.to_vec();
+        let replacement = br#"{"name":"replacement","version":"9.9.9"}"#;
+        std::fs::write(&manifest_path, original.as_ref()).unwrap();
+        let old_head = initialize_git_repository(&selected);
+        let manifests = vec![PlannedManifest {
+            path: manifest_path.clone(),
+            original_bytes: Arc::clone(&original),
+            updated_bytes: updated.clone(),
+        }];
+        let root = canonical_workspace_root(&selected).unwrap();
+        let resolved = resolve_planned_manifests(&root, &manifests).unwrap();
+        let (journal, _) = serialize_planned_release_journal(
+            &resolved,
+            test_operation(),
+            Some(VersionGitTransaction {
+                old_head,
+                tag: "v1.0.1".into(),
+            }),
+        )
+        .unwrap();
+        persist_release_journal(&root, &journal).unwrap();
+        std::fs::write(&manifest_path, &updated).unwrap();
+        let root_dir = open_root_directory_nofollow(&root).unwrap();
+        std::fs::rename(&selected, &displaced).unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "--quiet"])
+            .arg(&displaced)
+            .arg(&selected)
+            .output()
+            .unwrap();
+        assert!(clone.status.success());
+        std::fs::write(selected.join("package.json"), &updated).unwrap();
+        assert!(
+            run_git(&selected, &["add", "package.json"])
+                .status
+                .success()
+        );
+        assert!(
+            run_git(
+                &selected,
+                &[
+                    "-c",
+                    "user.name=LPM Test",
+                    "-c",
+                    "user.email=lpm-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "replacement version",
+                ],
+            )
+            .status
+            .success()
+        );
+        let replacement_head = run_git(&selected, &["rev-parse", "HEAD"]);
+        assert!(replacement_head.status.success());
+        let replacement_head = String::from_utf8(replacement_head.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(selected.join("package.json"), replacement).unwrap();
+
+        let outcome = recover_pending_release_transaction_from_open_root(
+            &root,
+            &root_dir,
+            &[root.join("package.json")],
+        )
+        .unwrap();
+
+        assert!(outcome);
+        assert_eq!(
+            std::fs::read(displaced.join("package.json")).unwrap(),
+            original.as_ref()
+        );
+        assert_eq!(
+            std::fs::read(selected.join("package.json")).unwrap(),
+            replacement
+        );
+        let current_replacement_head = run_git(&selected, &["rev-parse", "HEAD"]);
+        assert!(current_replacement_head.status.success());
+        assert_eq!(
+            String::from_utf8(current_replacement_head.stdout)
+                .unwrap()
+                .trim(),
+            replacement_head
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_recovery_does_not_mix_state_and_manifest_root_generations() {
+        let base = TempDir::new().unwrap();
+        let selected = base.path().join("selected");
+        let displaced = base.path().join("displaced");
+        std::fs::create_dir(&selected).unwrap();
+        let manifest_path = selected.join("package.json");
+        let original = Arc::<[u8]>::from(br#"{"name":"demo","version":"1.0.0"}"#.as_slice());
+        let updated = br#"{"name":"demo","version":"1.0.1"}"#.to_vec();
+        std::fs::write(&manifest_path, original.as_ref()).unwrap();
+        let manifests = vec![PlannedManifest {
+            path: manifest_path.clone(),
+            original_bytes: Arc::clone(&original),
+            updated_bytes: updated.clone(),
+        }];
+        let root = seed_release_journal(&selected, &manifests);
+        std::fs::write(&manifest_path, &updated).unwrap();
+        let outcome = recover_pending_release_transaction_inner_with_hook(
+            &root,
+            &[selected.join("package.json")],
+            || {
+                std::fs::rename(&selected, &displaced).unwrap();
+                std::fs::create_dir(&selected).unwrap();
+                std::fs::write(selected.join("package.json"), &updated).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, RecoveryOutcome::RolledBack));
+        assert_eq!(
+            std::fs::read(selected.join("package.json")).unwrap(),
+            updated
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("package.json")).unwrap(),
+            manifests[0].original_bytes.as_ref()
+        );
+        assert!(!displaced.join(".lpm/release-apply/journal.json").exists());
     }
 
     #[test]

@@ -693,8 +693,13 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
         Err(error) => return Err(format!("failed to read lpm.json: {error}")),
     };
 
+    parse_lpm_json(&content).map(Some)
+}
+
+/// Parse and validate an `lpm.json` document that was read by the caller.
+pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
     let mut config: LpmJsonConfig =
-        serde_json::from_str(&content).map_err(|error| match error.classify() {
+        serde_json::from_str(content).map_err(|error| match error.classify() {
             serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
                 format!("failed to parse lpm.json: {error}")
             }
@@ -720,7 +725,7 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
 
     validate_and_normalize_local_domain_hosts(&mut config)?;
 
-    Ok(Some(config))
+    Ok(config)
 }
 
 fn validate_task_cache_globs(config: &LpmJsonConfig) -> Result<(), String> {

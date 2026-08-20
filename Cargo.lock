@@ -3436,6 +3436,8 @@ name = "lpm-common"
 version = "0.75.0"
 dependencies = [
  "base64",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "dirs",
  "fd-lock",
@@ -4050,9 +4052,13 @@ dependencies = [
 name = "lpm-workspace"
 version = "0.75.0"
 dependencies = [
+ "cap-fs-ext",
+ "cap-std",
  "glob",
+ "libc",
  "lpm-common",
  "lpm-semver",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",

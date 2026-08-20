@@ -6,17 +6,16 @@ pub(crate) fn build_publish_version_data(
     name: &str,
     version: &str,
     readme: Option<&str>,
-    tarball_data: &[u8],
+    tarball_hashes: &publish_common::TarballHashes,
 ) -> serde_json::Value {
-    let hashes = publish_common::compute_hashes(tarball_data);
     let mut version_data = pkg_json.clone();
     version_data["_id"] = serde_json::json!(format!("{name}@{version}"));
     if let Some(readme_text) = readme {
         version_data["readme"] = serde_json::json!(readme_text);
     }
     version_data["dist"] = serde_json::json!({
-        "shasum": hashes.shasum,
-        "integrity": hashes.integrity,
+        "shasum": tarball_hashes.shasum,
+        "integrity": tarball_hashes.integrity,
     });
     version_data
 }
