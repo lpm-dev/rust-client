@@ -604,16 +604,23 @@ impl DirectoryIdentity {
 
     #[cfg(windows)]
     fn from_directory(directory: &Dir) -> std::io::Result<Self> {
-        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
 
-        let metadata = directory.try_clone()?.into_std_file().metadata()?;
-        let volume = metadata.volume_serial_number().ok_or_else(|| {
-            std::io::Error::other("publish directory volume identity is unavailable")
-        })?;
-        let index = metadata.file_index().ok_or_else(|| {
-            std::io::Error::other("publish directory file identity is unavailable")
-        })?;
-        Ok(Self::Windows { volume, index })
+        let directory = directory.try_clone()?.into_std_file();
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle belongs to the live directory file, and `information`
+        // is writable storage of the exact Win32 structure expected by the API.
+        if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self::Windows {
+            volume: information.dwVolumeSerialNumber,
+            index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
     }
 }
 
