@@ -6685,10 +6685,14 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(combined.contains("Behavioral metadata · 1 package · 2 signals"));
+    assert!(
+        combined.contains("Behavioral metadata · 1 package · 3 signals"),
+        "verbose install omitted Info behavioral metadata:\n{combined}",
+    );
     assert!(combined.contains("environment-variable access"));
     assert!(combined.contains("URL literals"));
-    assert!(combined.contains("lpm query \":env,:url-strings\""));
+    assert!(combined.contains("trivial package"));
+    assert!(combined.contains("lpm query \":env,:url-strings,:trivial\""));
     assert!(!combined.contains("lpm query \":critical\""));
     assert!(!combined.contains("Security summary"));
 }
