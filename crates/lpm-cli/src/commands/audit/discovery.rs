@@ -258,13 +258,7 @@ fn discover_from_npm_lockfile(
         let snapshot = read_foreign_lockfile_snapshot(lockfile_path)?;
         lpm_migrate::npm::parse_snapshot(&snapshot)?
     };
-    let exact_paths = parsed.package_paths.is_some();
-    let packages = migrated_to_discovered(
-        project_root,
-        parsed.packages,
-        parsed.package_paths,
-        exact_paths,
-    )?;
+    let packages = migrated_npm_to_discovered(project_root, parsed.packages)?;
 
     Ok(DiscoveryResult {
         manager: ManagerKind::Npm,
@@ -339,7 +333,7 @@ fn discover_from_yarn_lockfile(
             })
             .collect()
     } else {
-        migrated_to_discovered(project_root, migrated, None, false)?
+        migrated_to_discovered(project_root, migrated)?
     };
 
     Ok(DiscoveryResult {
@@ -369,7 +363,7 @@ fn discover_from_bun_lockfile(
     } else {
         lpm_migrate::bun::parse_selected(lockfile_path)?
     };
-    let packages = migrated_to_discovered(project_root, migrated, None, false)?;
+    let packages = migrated_to_discovered(project_root, migrated)?;
 
     Ok(DiscoveryResult {
         manager: ManagerKind::Bun,
@@ -388,30 +382,31 @@ fn discover_from_bun_lockfile(
 fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
     let nm_dir = project_root.join("node_modules");
 
-    let mut entries: Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf)> = Vec::new();
+    let mut entries: Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf, String)> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     collect_node_modules_entries(project_root, &nm_dir, &mut entries, &mut visited);
 
-    let version_lookup: std::collections::HashMap<std::path::PathBuf, (String, String)> = entries
-        .iter()
-        .map(|(pkg, _, pkg_dir)| (pkg_dir.clone(), (pkg.name.clone(), pkg.version.clone())))
-        .collect();
+    let scope_index = NodeModulesScopeIndex::new(project_root, &entries);
+    let mut resolved_dependencies = Vec::with_capacity(entries.len());
+    for (package_index, (_, dependency_names, _, _)) in entries.iter().enumerate() {
+        let mut dependencies = Vec::with_capacity(dependency_names.len());
+        for dependency_name in dependency_names {
+            if let Some((canonical_name, version)) =
+                scope_index.resolve(package_index, dependency_name)
+            {
+                dependencies.push((canonical_name.to_string(), version.to_string()));
+            }
+        }
+        resolved_dependencies.push(dependencies);
+    }
+    drop(scope_index);
 
     let packages = entries
         .into_iter()
-        .map(|(mut pkg, dep_names, pkg_dir)| {
-            pkg.dependencies = dep_names
-                .into_iter()
-                .filter_map(|dep_name| {
-                    resolve_node_modules_dependency(
-                        &pkg_dir,
-                        &dep_name,
-                        project_root,
-                        &version_lookup,
-                    )
-                })
-                .collect();
-            pkg
+        .zip(resolved_dependencies)
+        .map(|((mut package, _, _, _), dependencies)| {
+            package.dependencies = dependencies;
+            package
         })
         .collect();
 
@@ -430,7 +425,7 @@ fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
 fn collect_node_modules_entries(
     project_root: &Path,
     node_modules: &Path,
-    entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf)>,
+    entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf, String)>,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
 ) {
     let Ok(metadata) = std::fs::symlink_metadata(node_modules) else {
@@ -493,13 +488,18 @@ fn collect_node_modules_package(
     project_root: &Path,
     package_dir: &Path,
     name: &str,
-    entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf)>,
+    entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf, String)>,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
 ) {
     if let Some((package, dependencies)) =
         read_package_from_node_modules(project_root, package_dir, name)
     {
-        entries.push((package, dependencies, package_dir.to_path_buf()));
+        entries.push((
+            package,
+            dependencies,
+            package_dir.to_path_buf(),
+            name.to_string(),
+        ));
     }
     collect_node_modules_entries(
         project_root,
@@ -509,38 +509,98 @@ fn collect_node_modules_package(
     );
 }
 
-fn resolve_node_modules_dependency(
-    package_dir: &Path,
-    dependency: &str,
-    project_root: &Path,
-    versions: &std::collections::HashMap<std::path::PathBuf, (String, String)>,
-) -> Option<(String, String)> {
-    let mut base = package_dir.to_path_buf();
-    loop {
-        let candidate = base.join("node_modules").join(dependency);
-        if let Some(version) = versions.get(&candidate) {
-            return Some(version.clone());
+struct NodeModulesScopeIndex<'a> {
+    parents: Vec<Option<usize>>,
+    package_scopes: Vec<usize>,
+    visible_versions: HashMap<(usize, &'a str), (&'a str, &'a str)>,
+}
+
+impl<'a> NodeModulesScopeIndex<'a> {
+    fn new(
+        project_root: &'a Path,
+        entries: &'a [(DiscoveredPackage, Vec<String>, PathBuf, String)],
+    ) -> Self {
+        let mut scope_paths = Vec::with_capacity(entries.len() + 1);
+        let mut scope_by_path = HashMap::with_capacity(entries.len() + 1);
+        scope_paths.push(project_root);
+        scope_by_path.insert(project_root, 0usize);
+
+        for (_, _, package_dir, _) in entries {
+            let mut scope_path = package_dir.as_path();
+            while scope_path.starts_with(project_root) && scope_path != project_root {
+                if !scope_by_path.contains_key(scope_path) {
+                    let scope_id = scope_paths.len();
+                    scope_paths.push(scope_path);
+                    scope_by_path.insert(scope_path, scope_id);
+                }
+                scope_path = node_modules_parent_scope(scope_path).unwrap_or(project_root);
+            }
         }
-        let parent = base.parent()?;
-        base = if parent
-            .file_name()
-            .is_some_and(|name| name == "node_modules")
-        {
-            parent.parent()?.to_path_buf()
-        } else {
-            parent.to_path_buf()
-        };
-        if !base.starts_with(project_root) {
-            return None;
+
+        let mut parents = Vec::with_capacity(scope_paths.len());
+        for scope_path in &scope_paths {
+            if *scope_path == project_root {
+                parents.push(None);
+                continue;
+            }
+            let parent_path = node_modules_parent_scope(scope_path).unwrap_or(project_root);
+            parents.push(scope_by_path.get(parent_path).copied().or(Some(0)));
         }
+
+        let mut package_scopes = Vec::with_capacity(entries.len());
+        let mut visible_versions = HashMap::with_capacity(entries.len());
+        for (package, _, package_dir, installed_name) in entries {
+            package_scopes.push(
+                scope_by_path
+                    .get(package_dir.as_path())
+                    .copied()
+                    .unwrap_or(0),
+            );
+            let parent_path = node_modules_parent_scope(package_dir).unwrap_or(project_root);
+            let parent_scope = scope_by_path.get(parent_path).copied().unwrap_or(0);
+            visible_versions.insert(
+                (parent_scope, installed_name.as_str()),
+                (package.name.as_str(), package.version.as_str()),
+            );
+        }
+
+        Self {
+            parents,
+            package_scopes,
+            visible_versions,
+        }
+    }
+
+    fn resolve(&self, package_index: usize, dependency: &str) -> Option<(&'a str, &'a str)> {
+        let mut scope = self.package_scopes.get(package_index).copied();
+        while let Some(scope_id) = scope {
+            if let Some(identity) = self.visible_versions.get(&(scope_id, dependency)) {
+                return Some(*identity);
+            }
+            scope = self.parents.get(scope_id).copied().flatten();
+        }
+        None
     }
 }
 
-/// Read a single package's info from its `node_modules/<name>/package.json`.
-///
-/// Returns the discovered package and its dependency names (unresolved).
-/// Dependency versions are resolved in a second pass after all packages
-/// have been discovered, using a `name → version` lookup.
+fn node_modules_parent_scope(package_dir: &Path) -> Option<&Path> {
+    let parent = package_dir.parent()?;
+    if parent
+        .file_name()
+        .is_some_and(|name| name == "node_modules")
+    {
+        return parent.parent();
+    }
+    let node_modules = parent.parent()?;
+    if node_modules
+        .file_name()
+        .is_some_and(|name| name == "node_modules")
+    {
+        return node_modules.parent();
+    }
+    None
+}
+
 fn read_package_from_node_modules(
     project_root: &Path,
     pkg_dir: &Path,
@@ -561,7 +621,6 @@ fn read_package_from_node_modules(
     let rel_path = pkg_dir.strip_prefix(project_root).ok()?;
     let path = rel_path.to_string_lossy().to_string();
 
-    // Extract dependency names from package.json (versions resolved in second pass)
     let mut dep_names = Vec::new();
     if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
         for dep_name in deps.keys() {
@@ -573,6 +632,8 @@ fn read_package_from_node_modules(
             dep_names.push(dep_name.clone());
         }
     }
+    dep_names.sort_unstable();
+    dep_names.dedup();
 
     Some((
         DiscoveredPackage {
@@ -602,31 +663,27 @@ fn read_foreign_lockfile_snapshot(path: &Path) -> Result<String, LpmError> {
 fn migrated_to_discovered(
     project_root: &Path,
     migrated: Vec<lpm_migrate::MigratedPackage>,
-    mut raw_paths: Option<HashMap<String, Vec<String>>>,
-    require_exact_paths: bool,
 ) -> Result<Vec<DiscoveredPackage>, LpmError> {
     migrated_to_discovered_with(project_root, migrated, |package| {
-        let package_key = format!("{}@{}", package.name, package.version);
-        let path = raw_paths.as_mut().and_then(|paths| {
-            let queued = paths.get_mut(&package_key)?;
-            if queued.is_empty() {
-                None
-            } else {
-                Some(queued.remove(0))
-            }
-        });
-        if let Some(path) = path {
-            Ok(SelectedPackagePath::Validate(path))
-        } else if require_exact_paths {
-            Err(LpmError::Script(format!(
-                "package-lock.json did not retain an exact package path for {package_key}"
-            )))
-        } else {
-            Ok(SelectedPackagePath::Validate(format!(
-                "node_modules/{}",
-                package.name
-            )))
-        }
+        Ok(SelectedPackagePath::Validate(format!(
+            "node_modules/{}",
+            package.name
+        )))
+    })
+}
+
+fn migrated_npm_to_discovered(
+    project_root: &Path,
+    migrated: Vec<lpm_migrate::MigratedPackage>,
+) -> Result<Vec<DiscoveredPackage>, LpmError> {
+    migrated_to_discovered_with(project_root, migrated, |package| {
+        let path = package.lockfile_key.clone().ok_or_else(|| {
+            LpmError::Script(format!(
+                "package-lock.json did not retain the exact package path for {}@{}",
+                package.name, package.version
+            ))
+        })?;
+        Ok(SelectedPackagePath::Validate(path))
     })
 }
 
@@ -1079,6 +1136,42 @@ mod tests {
     }
 
     #[test]
+    fn node_modules_fallback_deduplicates_overlapping_dependency_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let package_dir = dir.path().join("node_modules/p");
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{
+                "name": "p",
+                "version": "1.0.0",
+                "dependencies": {"q": "1.0.0"},
+                "optionalDependencies": {"q": "1.0.0"}
+            }"#,
+        )
+        .unwrap();
+        let dependency_dir = dir.path().join("node_modules/q");
+        fs::create_dir_all(&dependency_dir).unwrap();
+        fs::write(
+            dependency_dir.join("package.json"),
+            r#"{"name":"q","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let result = discover_from_node_modules(dir.path());
+        let package = result
+            .packages
+            .iter()
+            .find(|package| package.name == "p")
+            .unwrap();
+
+        assert_eq!(
+            package.dependencies,
+            vec![("q".to_string(), "1.0.0".to_string())]
+        );
+    }
+
+    #[test]
     fn node_modules_fallback_discovers_nested_transitive_packages() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1131,6 +1224,39 @@ mod tests {
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "canonical-package");
         assert_eq!(result.packages[0].path, "node_modules/local-alias");
+    }
+
+    #[test]
+    fn node_modules_fallback_resolves_alias_dependencies_to_manifest_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/consumer")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/local-alias")).unwrap();
+        fs::write(
+            dir.path().join("node_modules/consumer/package.json"),
+            r#"{
+                "name": "consumer",
+                "version": "1.0.0",
+                "dependencies": {"local-alias": "npm:canonical-package@1.0.0"}
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("node_modules/local-alias/package.json"),
+            r#"{"name":"canonical-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        let result = discover_from_node_modules(dir.path());
+        let consumer = result
+            .packages
+            .iter()
+            .find(|package| package.name == "consumer")
+            .unwrap();
+
+        assert_eq!(
+            consumer.dependencies,
+            vec![("canonical-package".to_string(), "1.0.0".to_string())]
+        );
     }
 
     #[test]
@@ -1249,9 +1375,6 @@ version = "6.14.0"
 
     #[test]
     fn npm_duplicate_name_version_at_different_paths_preserved() {
-        // Bug: parse_npm_package_paths keys by name@version, so two instances
-        // of qs@1.0.0 at different paths collapse onto one. The second insert
-        // overwrites the first, losing a package instance.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
@@ -1312,10 +1435,100 @@ version = "6.14.0"
     }
 
     #[test]
+    fn npm_delimiter_ambiguous_coordinates_keep_their_exact_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"dependencies": {}}"#).unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "lockfileVersion": 3,
+                "packages": {
+                    "node_modules/a@b": {
+                        "version": "c",
+                        "resolved": "https://registry.npmjs.org/a-at-b/-/a-at-b-c.tgz"
+                    },
+                    "node_modules/z/node_modules/a": {
+                        "version": "b@c",
+                        "resolved": "https://registry.npmjs.org/a/-/a-b-c.tgz"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/a@b")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/z/node_modules/a")).unwrap();
+
+        let result = discover_packages(dir.path()).unwrap();
+        let identities_and_paths: Vec<_> = result
+            .packages
+            .iter()
+            .map(|package| {
+                (
+                    package.name.as_str(),
+                    package.version.as_str(),
+                    package.path.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            identities_and_paths,
+            vec![
+                ("a", "b@c", "node_modules/z/node_modules/a"),
+                ("a@b", "c", "node_modules/a@b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_v1_nested_instances_use_their_exact_installed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"dependencies": {}}"#).unwrap();
+        fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{
+                "lockfileVersion": 1,
+                "dependencies": {
+                    "a": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+                        "dependencies": {
+                            "dep": {
+                                "version": "1.0.0",
+                                "resolved": "https://registry.npmjs.org/dep/-/dep-1.0.0.tgz"
+                            }
+                        }
+                    },
+                    "dep": {
+                        "version": "2.0.0",
+                        "resolved": "https://registry.npmjs.org/dep/-/dep-2.0.0.tgz"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/a/node_modules/dep")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/dep")).unwrap();
+
+        let result = discover_packages(dir.path()).unwrap();
+        let dep_paths: Vec<_> = result
+            .packages
+            .iter()
+            .filter(|package| package.name == "dep")
+            .map(|package| (package.version.as_str(), package.path.as_str()))
+            .collect();
+
+        assert_eq!(
+            dep_paths,
+            vec![
+                ("1.0.0", "node_modules/a/node_modules/dep"),
+                ("2.0.0", "node_modules/dep"),
+            ]
+        );
+    }
+
+    #[test]
     fn npm_workspace_entries_dont_abort_path_recovery() {
-        // Bug: workspace entries like "packages/app" in package-lock.json
-        // caused parse_npm_package_paths to return None via ? propagation,
-        // losing ALL path recovery for the entire lockfile.
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
