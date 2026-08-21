@@ -21,7 +21,7 @@ mod support;
 use chrono::{SecondsFormat, Utc};
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry_and_npm};
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
@@ -281,7 +281,7 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
     })])
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["global", "list", "--outdated"])
         .output()
         .expect("failed to run lpm global list --outdated");
@@ -349,7 +349,7 @@ async fn global_list_outdated_treats_fresh_latest_as_up_to_date() {
     })])
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--json", "global", "list", "--outdated"])
         .output()
         .expect("failed to run lpm global list --outdated --json");
@@ -392,7 +392,7 @@ async fn global_list_outdated_routes_upstream_npm_packages_directly_to_npm() {
         .mount(mock.server())
         .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["global", "list", "--outdated"])
         .output()
         .expect("failed to run lpm global list --outdated");
@@ -447,7 +447,7 @@ async fn global_list_outdated_json_with_unresolved_metadata_exits_nonzero() {
     let mock = MockRegistry::start().await;
     mock.with_batch_metadata(vec![]).await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--json", "global", "list", "--outdated"])
         .output()
         .expect("failed to run lpm global list --outdated --json");
@@ -498,7 +498,7 @@ async fn global_list_outdated_human_with_unresolved_metadata_exits_nonzero() {
     let mock = MockRegistry::start().await;
     mock.with_batch_metadata(vec![]).await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["global", "list", "--outdated"])
         .output()
         .expect("failed to run lpm global list --outdated");
@@ -1043,7 +1043,7 @@ async fn global_update_dry_run_selects_latest_mature_candidate_when_latest_is_fr
     )
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--json", "global", "update", package, "--dry-run"])
         .output()
         .expect("failed to run lpm global update --dry-run --json");
@@ -1092,7 +1092,7 @@ async fn global_update_plans_upstream_npm_packages_without_contacting_the_worker
         .mount(mock.server())
         .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--json", "global", "update", "--dry-run"])
         .output()
         .expect("run direct npm global update plan");
@@ -1170,7 +1170,7 @@ async fn global_update_dry_run_rejects_exact_fresh_target() {
     )
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "--json",
             "global",
@@ -1227,7 +1227,7 @@ async fn global_update_dry_run_does_not_plan_an_implicit_registry_rollback() {
     let tarball = make_tarball(package, "1.9.0");
     mock.with_package(package, "1.9.0", &tarball).await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--json", "global", "update", "--dry-run"])
         .output()
         .expect("run global update against registry rollback");
@@ -1279,7 +1279,7 @@ async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
         .mount(mock.server())
         .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--json", "global", "update", "--dry-run"])
         .output()
         .expect("run bounded bulk global update plan");

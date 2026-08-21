@@ -12,7 +12,8 @@ use support::mock_registry::{
 };
 use support::{
     TempProject, configure_fake_node, lpm, lpm_spawnable, lpm_v1, lpm_v1_with_registry,
-    lpm_with_registry, project_bin_path, write_repeated_file, write_signed_unlock,
+    lpm_with_registry, lpm_with_registry_and_npm, project_bin_path, write_repeated_file,
+    write_signed_unlock,
 };
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -6577,7 +6578,7 @@ async fn install_hides_info_only_behavioral_metadata_by_default() {
         r#"{"name":"info-only-default-app","version":"1.0.0","dependencies":{"info-only-default":"1.0.0"}}"#,
     );
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["install", "--no-skills", "--no-editor-setup"])
         .output()
         .expect("run install with Info behavioral metadata");
@@ -6600,7 +6601,7 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
         r#"{"name":"info-only-verbose-app","version":"1.0.0","dependencies":{"info-only-verbose":"1.0.0"}}"#,
     );
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
         .output()
         .expect("run verbose install with Info behavioral metadata");
@@ -16523,7 +16524,7 @@ async fn install_does_not_verify_registry_signatures_by_default() {
     project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
     mount_unsigned_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -16551,7 +16552,7 @@ async fn install_config_signatures_true_blocks_unsigned_registry_package() {
     write_signatures_global_config(&project, true);
     mount_unsigned_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -16588,7 +16589,7 @@ async fn install_config_signatures_true_blocks_malformed_registry_signature() {
     write_signatures_global_config(&project, true);
     mount_malformed_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -16625,7 +16626,7 @@ async fn install_config_signatures_true_blocks_mismatched_registry_signature() {
     write_signatures_global_config(&project, true);
     mount_mismatched_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -16663,7 +16664,7 @@ async fn install_config_signatures_true_accepts_signed_registry_package() {
     write_signatures_global_config(&project, true);
     mount_signed_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -16696,7 +16697,7 @@ async fn install_config_signatures_true_persists_registry_signature_metadata_in_
     write_signatures_global_config(&project, true);
     mount_signed_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",

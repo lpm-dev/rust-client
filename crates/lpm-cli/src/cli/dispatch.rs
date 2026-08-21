@@ -2265,6 +2265,7 @@ async fn async_main() -> Result<()> {
                 // groups list + interactive review by top-level global,
                 // while persisted trust still remains per dependency row.
                 commands::approve_scripts::run_global(
+                    &client,
                     package.as_deref(),
                     yes,
                     list,
@@ -2285,6 +2286,7 @@ async fn async_main() -> Result<()> {
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 commands::approve_scripts::run(
+                    &client,
                     &cwd,
                     package.as_deref(),
                     yes,

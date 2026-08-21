@@ -10,7 +10,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry_and_npm};
 use wiremock::matchers::{method, path as wiremock_path, query_param};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
@@ -191,7 +191,7 @@ async fn upgrade_emits_zero_upgraded_when_lpm_dep_already_at_latest() {
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "1.4.2").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json"])
         .output()
         .expect("spawn lpm upgrade --json");
@@ -233,7 +233,7 @@ async fn upgrade_package_argument_limits_json_candidates_to_requested_dependency
     mount_lpm_pkg(&mock, requested, "1.1.0").await;
     mount_lpm_pkg(&mock, unrelated, "1.2.0").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", requested, "-y", "--dry-run", "--json"])
         .output()
         .expect("spawn targeted lpm upgrade --dry-run --json");
@@ -358,7 +358,7 @@ async fn upgrade_upgrades_npm_packages_with_public_npm_lock_source() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("spawn lpm upgrade");
@@ -451,7 +451,7 @@ async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_sp
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "strip-ansi-cjs", "-y"])
         .output()
         .expect("spawn targeted alias upgrade");
@@ -546,7 +546,7 @@ async fn upgrade_fetches_one_packument_for_multiple_aliases_of_one_package() {
     )
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .expect("run deduplicated alias upgrade plan");
@@ -590,7 +590,7 @@ async fn upgrade_updates_identical_entries_in_both_dependency_sections() {
     )
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("run cross-section upgrade");
@@ -683,7 +683,7 @@ async fn upgrade_selects_latest_mature_candidate_when_latest_is_inside_release_a
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("spawn lpm upgrade");
@@ -743,7 +743,7 @@ async fn upgrade_hydrates_missing_release_times_before_planning() {
         .mount(mock.server())
         .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .expect("run upgrade with hydrated release times");
@@ -794,7 +794,7 @@ async fn upgrade_plans_metadata_in_bounded_parallel_waves() {
         .mount(mock.server())
         .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .expect("run bounded upgrade plan");
@@ -848,7 +848,7 @@ async fn upgrade_upgrades_npm_packages_installed_through_configured_lpm_registry
     )
     .await;
 
-    lpm_with_registry(&project, &mock.url())
+    lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -862,7 +862,7 @@ async fn upgrade_upgrades_npm_packages_installed_through_configured_lpm_registry
         r#"{"name":"proxy-installed-up","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("spawn lpm upgrade");
@@ -925,7 +925,7 @@ async fn upgrade_skips_non_public_npm_sources_and_reports_them() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .expect("spawn lpm upgrade --dry-run --json");
@@ -962,7 +962,7 @@ async fn upgrade_dry_run_does_not_mutate_manifest_or_lockfile() {
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "2.0.0").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--major", "--dry-run", "--json"])
         .output()
         .expect("spawn lpm upgrade --major --dry-run --json");
@@ -996,7 +996,7 @@ async fn upgrade_dry_run_human_output_uses_slim_ui() {
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "1.5.0").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run"])
         .output()
         .expect("spawn lpm upgrade --dry-run");
@@ -1044,7 +1044,7 @@ async fn upgrade_patch_dry_run_human_output_applies_slim_color_roles_when_forced
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "1.0.1").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--color=always", "upgrade", "-y", "--dry-run"])
         .output()
         .expect("spawn colored lpm upgrade --dry-run");
@@ -1083,7 +1083,7 @@ async fn upgrade_writes_new_range_to_manifest_and_lockfile() {
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "2.0.0").await;
 
-    lpm_with_registry(&project, &mock.url())
+    lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--major"])
         .assert()
         .success();
@@ -1196,7 +1196,7 @@ async fn upgrade_executes_the_same_packument_snapshot_it_planned() {
             .await;
     }
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("run snapshot-consistent upgrade");
@@ -1319,7 +1319,7 @@ async fn workspace_member_upgrade_preserves_the_sibling_root_lockfile_projection
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "2.0.0").await;
     let app_dir = project.path().join("packages/app");
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .current_dir(&app_dir)
         .args(["upgrade", "-y", "--major"])
         .output()
@@ -1368,7 +1368,7 @@ async fn upgrade_rewrites_minified_manifest_json() {
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "2.0.0").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--major"])
         .output()
         .expect("spawn lpm upgrade on minified manifest");
@@ -1408,7 +1408,7 @@ async fn upgrade_dry_run_json_envelope_with_one_candidate_matches_snapshot() {
     let mock = MockRegistry::start().await;
     mount_lpm_pkg(&mock, pkg, "1.5.0").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .expect("spawn lpm upgrade --dry-run --json");
@@ -1694,7 +1694,7 @@ async fn upgrade_json_emits_one_document_after_successful_install() {
     let project = TempProject::empty("");
     let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json"])
         .output()
         .expect("spawn JSON upgrade");
@@ -1715,7 +1715,7 @@ async fn upgrade_json_emits_one_error_document_when_install_fails() {
     let mock = setup_up7_failed_install_fixture(&project).await;
     up7_write_lockfile(&project, &[(UP7_PKG, UP7_CURRENT)]);
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json"])
         .output()
         .expect("spawn failing JSON upgrade");
@@ -1732,7 +1732,7 @@ async fn upgrade_metadata_failure_is_not_reported_as_up_to_date() {
     seed_pinned_dep(&project, package, "^1.0.0", "1.0.0");
     let mock = MockRegistry::start().await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json"])
         .output()
         .expect("spawn upgrade with unavailable metadata");
@@ -1808,7 +1808,7 @@ async fn upgrade_yes_dry_run_json_shape_unchanged_with_enrichment() {
     let project = TempProject::empty("");
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn lpm upgrade");
@@ -1841,7 +1841,7 @@ async fn upgrade_yes_dry_run_does_not_mutate_package_json() {
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
     let before = project.read_file("package.json");
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run"])
         .output()
         .expect("spawn lpm upgrade --dry-run");
@@ -1863,7 +1863,7 @@ async fn upgrade_yes_writes_manifest_when_not_dry_run() {
     let project = TempProject::empty("");
     let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("spawn lpm upgrade");
@@ -1894,13 +1894,13 @@ async fn upgrade_default_in_no_tty_matches_yes_output() {
     let project = TempProject::empty("");
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
 
-    let yes_out = lpm_with_registry(&project, &mock.url())
+    let yes_out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade -y");
     assert!(yes_out.status.success());
 
-    let default_out = lpm_with_registry(&project, &mock.url())
+    let default_out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade (no -y)");
@@ -1999,7 +1999,7 @@ async fn upgrade_major_yes_jumps_to_latest_major_version() {
     let project = TempProject::empty("");
     let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MAJOR, true).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "--major", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade --major -y");
@@ -2036,7 +2036,7 @@ async fn upgrade_yes_marks_install_scripts_in_json() {
     let project = TempProject::empty("");
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade");
@@ -2056,7 +2056,7 @@ async fn upgrade_yes_marks_peer_violation_in_json() {
     let project = TempProject::empty("");
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade");
@@ -2088,7 +2088,7 @@ async fn upgrade_yes_marks_patch_invalidation_in_json() {
     let project = TempProject::empty("");
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade");
@@ -2119,7 +2119,7 @@ async fn upgrade_yes_install_failure_restores_manifest_and_invalidates_install_h
     let before = project.read_file("package.json");
     let lockfile_before = project.read_file("lpm.lock");
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("spawn upgrade");
@@ -2150,7 +2150,7 @@ async fn upgrade_yes_offline_install_after_upgrade_succeeds() {
     let project = TempProject::empty("");
     let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
 
-    let upgrade_out = lpm_with_registry(&project, &mock.url())
+    let upgrade_out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y"])
         .output()
         .expect("spawn upgrade");
@@ -2161,7 +2161,7 @@ async fn upgrade_yes_offline_install_after_upgrade_succeeds() {
         String::from_utf8_lossy(&upgrade_out.stderr)
     );
 
-    let offline_out = lpm_with_registry(&project, &mock.url())
+    let offline_out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["install", "--offline", "--json"])
         .output()
         .expect("spawn install --offline");
@@ -2187,7 +2187,7 @@ async fn upgrade_yes_dry_run_json_envelope_with_full_enrichment_smoke() {
     let project = TempProject::empty("");
     let mock = setup_up7_enriched_dry_run_fixture(&project).await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["upgrade", "-y", "--json", "--dry-run"])
         .output()
         .expect("spawn upgrade");

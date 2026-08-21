@@ -8,7 +8,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry_and_npm};
 use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -153,7 +153,7 @@ async fn outdated_empty_deps_emits_empty_json_envelope() {
     let project = TempProject::empty(r#"{"name":"empty-outdated","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -237,7 +237,7 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -314,7 +314,7 @@ async fn outdated_resolves_npm_aliases_through_their_canonical_package() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn outdated for npm alias");
@@ -403,7 +403,7 @@ async fn outdated_treats_fresh_latest_as_up_to_date_when_current_version_is_matu
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -461,7 +461,7 @@ async fn outdated_hydrates_missing_release_times_before_reporting() {
         .mount(&server)
         .await;
 
-    let output = lpm_with_registry(&project, &server.uri())
+    let output = lpm_with_registry_and_npm(&project, &server.uri())
         .args(["outdated", "--json"])
         .output()
         .expect("run outdated with hydrated release times");
@@ -505,7 +505,7 @@ async fn outdated_reports_npm_packages_installed_through_configured_lpm_registry
     )
     .await;
 
-    lpm_with_registry(&project, &mock.url())
+    lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -515,7 +515,7 @@ async fn outdated_reports_npm_packages_installed_through_configured_lpm_registry
         .assert()
         .success();
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -585,7 +585,7 @@ async fn outdated_includes_dev_dependencies_by_default() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -627,7 +627,7 @@ async fn outdated_registry_only_lpm_skips_non_lpm_packages() {
     mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
         .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json", "--registry-only", "lpm"])
         .output()
         .expect("spawn lpm outdated --json --registry-only lpm");
@@ -656,7 +656,7 @@ async fn outdated_skips_private_named_packages_without_npm_public_source() {
     mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
         .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -686,7 +686,7 @@ async fn outdated_metadata_lookup_failure_exits_nonzero_in_json_mode() {
 
     let mock = MockRegistry::start().await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -737,7 +737,7 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -793,7 +793,7 @@ async fn outdated_human_output_uses_slim_completion() {
     )
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated"])
         .output()
         .expect("spawn lpm outdated");
@@ -838,7 +838,7 @@ async fn outdated_reports_zero_when_installed_matches_latest() {
     let mock = MockRegistry::start().await;
     mount_lpm_package_latest(&mock, pkg, "1.4.2").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -870,7 +870,7 @@ async fn outdated_does_not_report_an_installed_version_above_the_registry_latest
     let mock = MockRegistry::start().await;
     mount_lpm_package_latest(&mock, package, "1.9.0").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn outdated for registry rollback");
@@ -920,7 +920,7 @@ async fn outdated_rejects_a_latest_tag_that_points_to_a_missing_version() {
         .mount(&server)
         .await;
 
-    let out = lpm_with_registry(&project, &server.uri())
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn outdated for dangling latest tag");
@@ -977,7 +977,7 @@ async fn outdated_runs_metadata_lookups_in_bounded_parallel_waves() {
         .mount(&server)
         .await;
 
-    let out = lpm_with_registry(&project, &server.uri())
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn bounded outdated check");
@@ -1043,7 +1043,7 @@ async fn outdated_json_envelope_with_one_outdated_pkg_matches_snapshot() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");

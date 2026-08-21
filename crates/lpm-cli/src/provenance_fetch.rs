@@ -911,6 +911,7 @@ pub(crate) fn map_fetch_result_to_status(
 /// `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
 /// approvals across runs.
 pub async fn fetch_provenance_for_pkgs(
+    registry: &lpm_registry::RegistryClient,
     pkgs: &[(String, String)],
     verify_policy: &VerifyPolicy,
 ) -> HashMap<(String, String), ProvenanceStatus> {
@@ -934,11 +935,8 @@ pub async fn fetch_provenance_for_pkgs(
                 .collect();
         }
     };
-    let registry = lpm_registry::RegistryClient::new();
-
     let cache_root_ref = &cache_root;
     let http_ref = &http;
-    let registry_ref = &registry;
     let verify_policy_ref = verify_policy;
 
     let futures = pkgs.iter().map(move |(name, version)| async move {
@@ -947,15 +945,15 @@ pub async fn fetch_provenance_for_pkgs(
         let (meta, registry_url) = if name.starts_with("@lpm.dev/") {
             match lpm_common::PackageName::parse(name) {
                 Ok(pkg_name) => (
-                    registry_ref.get_package_metadata(&pkg_name).await.ok(),
-                    registry_ref.base_url(),
+                    registry.get_package_metadata(&pkg_name).await.ok(),
+                    registry.base_url(),
                 ),
-                Err(_) => (None, registry_ref.base_url()),
+                Err(_) => (None, registry.base_url()),
             }
         } else {
             (
-                registry_ref.get_npm_package_metadata(name).await.ok(),
-                registry_ref.npm_registry_url(),
+                registry.get_npm_package_metadata(name).await.ok(),
+                registry.npm_registry_url(),
             )
         };
         let attestation_ref = meta
