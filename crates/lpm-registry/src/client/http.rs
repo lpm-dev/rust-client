@@ -4,6 +4,7 @@ use super::*;
 enum ClientPool {
     General,
     PolicyMetadata,
+    ManualRedirect,
 }
 
 /// Maximum time to establish a TCP + TLS connection.
@@ -85,7 +86,11 @@ impl HttpClients {
     /// underlying connection pool.
     #[cfg(test)]
     pub(super) fn from_default_client(default: reqwest::Client) -> Arc<Self> {
-        Self::from_default_clients(default.clone(), default)
+        let manual_redirect = lpm_http::client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build redirect-disabled test client");
+        Self::from_default_clients(default.clone(), default, manual_redirect)
     }
 
     /// Build an `HttpClients` with separate general and policy metadata
@@ -93,11 +98,13 @@ impl HttpClients {
     pub(super) fn from_default_clients(
         default: reqwest::Client,
         policy_metadata: reqwest::Client,
+        manual_redirect: reqwest::Client,
     ) -> Arc<Self> {
         Arc::new(Self {
             default: CachedClient {
                 client: default,
                 policy_metadata_client: policy_metadata,
+                manual_redirect_client: manual_redirect,
                 identity_fp: None,
             },
             eager: HashMap::new(),
@@ -206,10 +213,16 @@ impl HttpClients {
         self.for_url_pool(url, ClientPool::PolicyMetadata).await
     }
 
+    /// Resolve a redirect-disabled client for one explicit redirect hop.
+    pub async fn for_manual_redirect_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
+        self.for_url_pool(url, ClientPool::ManualRedirect).await
+    }
+
     async fn for_url_pool(&self, url: &str, pool: ClientPool) -> Result<reqwest::Client, LpmError> {
         let select = |cached: &CachedClient| match pool {
             ClientPool::General => cached.client.clone(),
             ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
+            ClientPool::ManualRedirect => cached.manual_redirect_client.clone(),
         };
         let Some(origin) = OriginKey::from_request_url(url) else {
             return Ok(select(&self.default));
@@ -379,13 +392,32 @@ pub(super) fn build_per_origin_http_client(
         CONNECT_TIMEOUT,
         READ_TIMEOUT,
         &synthetic,
-        identity,
+        identity.clone(),
     )?;
+    let manual_redirect_client =
+        RegistryClient::build_manual_redirect_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            &synthetic,
+            identity,
+        )?;
     Ok(CachedClient {
         client,
         policy_metadata_client,
+        manual_redirect_client,
         identity_fp,
     })
+}
+
+impl lpm_http::ReplayableHttpClientProvider for HttpClients {
+    type Error = LpmError;
+
+    fn client_for_url(
+        &self,
+        url: &reqwest::Url,
+    ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
+        self.for_manual_redirect_url(url.as_str())
+    }
 }
 
 /// Inline PEM marker check — duplicates the parser-time helper in

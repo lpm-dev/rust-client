@@ -1,7 +1,6 @@
 use super::swift::extract_swift_metadata;
-use crate::commands::publish_common::TarballFile;
+use crate::commands::publish_common::{self, TarballFile};
 use crate::{install_ui, quality};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 
@@ -12,7 +11,7 @@ pub(super) async fn publish_to_lpm(
     name: &str,
     version: &str,
     readme: &Option<String>,
-    tarball_data: &[u8],
+    tarball_data: &std::sync::Arc<Vec<u8>>,
     tarball_files: &[TarballFile],
     package_json_size_override: Option<u64>,
     version_data: &serde_json::Value,
@@ -127,48 +126,43 @@ pub(super) async fn publish_to_lpm(
         lpm_version["_swiftManifest"] = extract_swift_metadata(manifest);
     }
 
-    // Pre-allocate the base64 buffer from the encoded-size estimate.
     let tarball_key = format!(
         "{}-{}.tgz",
         name.replace('/', "-").replace('@', ""),
         version
     );
-    let tarball_mb = tarball_data.len() / (1024 * 1024);
-    if tarball_mb > 50 && !json_output {
-        let peak_mb = tarball_data.len() * 4 / 3 / (1024 * 1024) + tarball_mb;
-        install_ui::warn_untrusted(&format!(
-            "Large tarball ({tarball_mb}MB). This will require ~{peak_mb}MB of memory."
-        ));
-    }
-    let mut tarball_base64 = String::with_capacity(tarball_data.len() * 4 / 3 + 4);
-    BASE64.encode_string(tarball_data, &mut tarball_base64);
-
-    let payload = serde_json::json!({
-        "_id": name,
-        "name": name,
-        "description": lpm_version.get("description"),
-        "readme": readme,
-        "_ecosystem": detected_ecosystem,
-        "dist-tags": {
-            "latest": version,
-        },
-        "versions": {
-            version: lpm_version,
-        },
-        "_attachments": {
-            tarball_key: {
-                "content_type": "application/gzip",
-                "data": tarball_base64,
-                "length": tarball_data.len(),
-            }
-        },
-    });
+    let mut fields = serde_json::Map::with_capacity(7);
+    fields.insert("_id".into(), serde_json::json!(name));
+    fields.insert("name".into(), serde_json::json!(name));
+    fields.insert(
+        "description".into(),
+        lpm_version
+            .get("description")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    );
+    fields.insert(
+        "readme".into(),
+        readme.as_ref().map_or(serde_json::Value::Null, |value| {
+            serde_json::Value::String(value.clone())
+        }),
+    );
+    fields.insert("_ecosystem".into(), serde_json::json!(detected_ecosystem));
+    fields.insert("dist-tags".into(), serde_json::json!({"latest": version}));
+    fields.insert("versions".into(), serde_json::json!({version: lpm_version}));
+    let payload = publish_common::prepare_json_publish_body(
+        fields,
+        &tarball_key,
+        "application/gzip",
+        tarball_data,
+        None,
+    )?;
 
     let encoded_name = urlencoding::encode(name);
     client
         .publish_package(
             &encoded_name,
-            &payload,
+            payload.replayable(),
             otp_code.as_deref(),
             tarball_data.len(),
         )

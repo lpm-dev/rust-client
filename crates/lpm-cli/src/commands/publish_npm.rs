@@ -418,7 +418,7 @@ pub async fn publish_to_npm(
     npm_name: &str,
     version: &str,
     version_data: &serde_json::Value,
-    tarball_data: &[u8],
+    tarball_data: &std::sync::Arc<Vec<u8>>,
     tarball_hashes: &crate::commands::publish_common::TarballHashes,
     provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
@@ -485,7 +485,7 @@ async fn publish_to_npm_impl(
     npm_name: &str,
     version: &str,
     version_data: &serde_json::Value,
-    tarball_data: &[u8],
+    tarball_data: &std::sync::Arc<Vec<u8>>,
     tarball_hashes: &crate::commands::publish_common::TarballHashes,
     provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
@@ -525,7 +525,7 @@ async fn publish_to_npm_impl(
             tag: Some(tag),
             provenance_attachment,
         },
-    );
+    )?;
 
     // S3: Scale timeout based on tarball size
     let tarball_mb = tarball_data.len() as u64 / (1024 * 1024);
@@ -533,6 +533,12 @@ async fn publish_to_npm_impl(
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
     let client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
+    let web_auth_client = lpm_http::client_builder()
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
@@ -551,20 +557,14 @@ async fn publish_to_npm_impl(
     }
 
     // First attempt
-    let mut req =
-        web_auth::add_npm_web_auth_headers(client.put(&url), web_auth::NPM_COMMAND_PUBLISH)
-            .json(&payload)
-            .bearer_auth(token);
+    let mut req = npm_publish_request(&client, &url, &payload, token, timeout);
     if let Some(code) = &otp_code {
         req = req.header("npm-otp", code);
     }
 
-    let response = req.send().await.map_err(|e| {
-        LpmError::Registry(format!(
-            "npm publish request failed: {}",
-            lpm_http::display_error(&e)
-        ))
-    })?;
+    let response = execute_npm_publish_request(&client, req, &payload)
+        .await
+        .map_err(|e| LpmError::Registry(format!("npm publish request failed: {e}")))?;
 
     let status = response.status();
     let headers = response.headers().clone();
@@ -580,7 +580,7 @@ async fn publish_to_npm_impl(
             }
 
             let otp = web_auth::complete_web_auth_challenge(
-                &client,
+                &web_auth_client,
                 &challenge,
                 "publish",
                 json_output,
@@ -590,18 +590,12 @@ async fn publish_to_npm_impl(
             )
             .await?;
 
-            let retry_req =
-                web_auth::add_npm_web_auth_headers(client.put(&url), web_auth::NPM_COMMAND_PUBLISH)
-                    .json(&payload)
-                    .bearer_auth(token)
-                    .header("npm-otp", &otp);
+            let retry_req = npm_publish_request(&client, &url, &payload, token, timeout)
+                .header("npm-otp", &otp);
 
-            let retry_response = retry_req.send().await.map_err(|e| {
-                LpmError::Registry(format!(
-                    "npm publish retry failed: {}",
-                    lpm_http::display_error(&e)
-                ))
-            })?;
+            let retry_response = execute_npm_publish_request(&client, retry_req, &payload)
+                .await
+                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
             return handle_npm_response(retry_response, npm_name, version, start).await;
         }
@@ -622,18 +616,12 @@ async fn publish_to_npm_impl(
             let otp = prompt_npm_otp()?;
 
             // Retry with OTP header
-            let retry_req =
-                web_auth::add_npm_web_auth_headers(client.put(&url), web_auth::NPM_COMMAND_PUBLISH)
-                    .json(&payload)
-                    .bearer_auth(token)
-                    .header("npm-otp", &otp);
+            let retry_req = npm_publish_request(&client, &url, &payload, token, timeout)
+                .header("npm-otp", &otp);
 
-            let retry_response = retry_req.send().await.map_err(|e| {
-                LpmError::Registry(format!(
-                    "npm publish retry failed: {}",
-                    lpm_http::display_error(&e)
-                ))
-            })?;
+            let retry_response = execute_npm_publish_request(&client, retry_req, &payload)
+                .await
+                .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
             return handle_npm_response(retry_response, npm_name, version, start).await;
         }
@@ -644,6 +632,32 @@ async fn publish_to_npm_impl(
     }
 
     handle_npm_response(response, npm_name, version, start).await
+}
+
+fn npm_publish_request(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &crate::commands::publish_common::PreparedPublishBody,
+    token: &str,
+    timeout: Duration,
+) -> reqwest::RequestBuilder {
+    web_auth::add_npm_web_auth_headers(client.put(url), web_auth::NPM_COMMAND_PUBLISH)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CONTENT_LENGTH, payload.len())
+        .timeout(timeout)
+        .body(payload.request_body())
+        .bearer_auth(token)
+}
+
+async fn execute_npm_publish_request(
+    client: &reqwest::Client,
+    request: reqwest::RequestBuilder,
+    payload: &crate::commands::publish_common::PreparedPublishBody,
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<std::convert::Infallible>> {
+    let request = request
+        .build()
+        .map_err(lpm_http::ReplayableRequestError::request)?;
+    lpm_http::send_with_replayable_redirects(client, request, Some(payload.replayable())).await
 }
 
 /// Handle npm publish response, mapping HTTP status codes to clear errors.
@@ -762,6 +776,8 @@ fn is_otp_required(status: reqwest::StatusCode, headers: &reqwest::header::Heade
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use std::sync::Arc;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -911,13 +927,15 @@ mod tests {
             .mount(&server)
             .await;
 
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let result = publish_to_npm_impl(
             "npm-token",
             "plain-pkg",
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
-            b"fake-tarball",
-            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
+            &tarball,
+            &hashes,
             None,
             "public",
             "latest",
@@ -953,6 +971,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_to_npm_replays_exact_put_body_across_same_origin_307() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", "/redirected-publish"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/redirected-publish"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tarball = Arc::new(b"redirected-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
+        let result = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            &tarball,
+            &hashes,
+            None,
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .expect("same-origin 307 should replay npm publish");
+
+        assert!(result.success);
+        let requests = server.received_requests().await.unwrap();
+        let publish_requests = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .collect::<Vec<_>>();
+        assert_eq!(publish_requests.len(), 2);
+        assert_eq!(publish_requests[0].body, publish_requests[1].body);
+        assert_eq!(
+            publish_requests[1]
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(publish_requests[1].body.len().to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_strips_bearer_and_otp_across_cross_origin_303() {
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/capture"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&target)
+            .await;
+
+        let redirector = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "web-otp-token"
+            })))
+            .mount(&redirector)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .and(header("npm-otp", "web-otp-token"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header("location", format!("{}/capture", target.uri())),
+            )
+            .with_priority(1)
+            .mount(&redirector)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "authUrl": format!("{}/auth", redirector.uri()),
+                "doneUrl": format!("{}/done", redirector.uri())
+            })))
+            .with_priority(2)
+            .mount(&redirector)
+            .await;
+
+        let tarball = Arc::new(b"redirected-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
+        let result = publish_to_npm_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            &tarball,
+            &hashes,
+            None,
+            "public",
+            "latest",
+            &redirector.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+        )
+        .await
+        .expect("cross-origin 303 should complete without forwarding credentials");
+
+        assert!(result.success);
+        let requests = target.received_requests().await.unwrap();
+        let redirected = requests.first().expect("redirect target request");
+        assert!(redirected.headers.get("authorization").is_none());
+        assert!(redirected.headers.get("x-otp").is_none());
+        assert!(redirected.headers.get("npm-otp").is_none());
+    }
+
+    #[tokio::test]
     async fn publish_to_npm_rejects_oversized_response_body() {
         const RESPONSE_CAP: usize = 10 * 1024 * 1024;
         let server = MockServer::start().await;
@@ -968,13 +1109,15 @@ mod tests {
             .mount(&server)
             .await;
 
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let error = publish_to_npm_impl(
             "npm-token",
             "plain-pkg",
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
-            b"fake-tarball",
-            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
+            &tarball,
+            &hashes,
             None,
             "public",
             "latest",
@@ -1003,13 +1146,15 @@ mod tests {
             data: r#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.2"}"#.into(),
         };
 
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let result = publish_to_npm_impl(
             "npm-token",
             "plain-pkg",
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
-            b"fake-tarball",
-            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
+            &tarball,
+            &hashes,
             Some(&provenance),
             "public",
             "latest",
@@ -1062,13 +1207,15 @@ mod tests {
             .mount(&server)
             .await;
 
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let result = publish_to_npm_impl(
             "npm-token",
             "plain-pkg",
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
-            b"fake-tarball",
-            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
+            &tarball,
+            &hashes,
             None,
             "public",
             "latest",
@@ -1088,6 +1235,17 @@ mod tests {
             .filter(|request| request.method.as_str() == "PUT")
             .collect();
         assert_eq!(publish_requests.len(), 2);
+        assert_eq!(publish_requests[0].body, publish_requests[1].body);
+        let payload: serde_json::Value = serde_json::from_slice(&publish_requests[0].body).unwrap();
+        let encoded = payload["_attachments"]["plain-pkg-1.0.0.tgz"]["data"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap(),
+            b"fake-tarball"
+        );
         assert_eq!(
             publish_requests[1]
                 .headers
@@ -1126,13 +1284,15 @@ mod tests {
             .mount(&server)
             .await;
 
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let err = publish_to_npm_impl(
             "npm-token",
             "plain-pkg",
             "1.0.0",
             &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
-            b"fake-tarball",
-            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
+            &tarball,
+            &hashes,
             None,
             "public",
             "latest",

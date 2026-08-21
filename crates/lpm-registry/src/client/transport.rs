@@ -321,30 +321,27 @@ impl RegistryClient {
     /// the server may have stored the version before returning an error.
     /// On 500: checks if the version already exists — if so, treats as success.
     /// Only retries on: 502, 503, 504 (gateway errors) and network failures.
-    pub(super) async fn send_publish_safe(
+    pub(super) async fn send_publish_safe<F>(
         &self,
-        request_builder: reqwest::RequestBuilder,
+        mut request_factory: F,
+        payload: &lpm_http::ReplayableRequestBody,
         encoded_name: &str,
-    ) -> Result<reqwest::Response, LpmError> {
+    ) -> Result<reqwest::Response, LpmError>
+    where
+        F: FnMut() -> Result<reqwest::RequestBuilder, LpmError>,
+    {
         self.validate_base_url()?;
-
-        let request = request_builder
-            .build()
-            .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
 
         let mut last_error = None;
 
         for attempt in 0..=MAX_RETRIES {
-            let req = request.try_clone().ok_or_else(|| {
-                LpmError::Network("request body cannot be retried (not cloneable)".into())
-            })?;
+            let req = request_factory()?
+                .build()
+                .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
 
-            // Route via the request's URL so a per-origin client (eager
-            // hit OR lazy build) handles its own TLS context. Lazy build
-            // fires for transitive registry / CDN origins that surface
-            // from resolved metadata after the eager set was computed.
-            let client_for_req = self.http.for_url(req.url().as_str()).await?;
-            match client_for_req.execute(req).await {
+            match lpm_http::send_with_replayable_redirects(self.http.as_ref(), req, Some(payload))
+                .await
+            {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
@@ -439,18 +436,19 @@ impl RegistryClient {
                         }
                     }
                 }
-                Err(e) => {
-                    if lpm_http::is_https_downgrade(&e) {
-                        return Err(LpmError::Network(lpm_http::error_chain(&e)));
-                    }
+                Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
+                Err(lpm_http::ReplayableRequestError::Request(error)) => {
                     // Network-level errors are retryable
-                    last_error = Some(LpmError::Network(lpm_http::display_error(&e).to_string()));
+                    last_error = Some(LpmError::Network(
+                        lpm_http::display_error(&error).to_string(),
+                    ));
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;
                         continue;
                     }
                 }
+                Err(error) => return Err(LpmError::Network(error.to_string())),
             }
         }
 

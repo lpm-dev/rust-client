@@ -370,7 +370,7 @@ impl RegistryClient {
     pub async fn publish_package(
         &self,
         encoded_name: &str,
-        payload: &serde_json::Value,
+        payload: &lpm_http::ReplayableRequestBody,
         otp: Option<&str>,
         tarball_size_bytes: usize,
     ) -> Result<serde_json::Value, LpmError> {
@@ -379,23 +379,39 @@ impl RegistryClient {
         // S3: Scale timeout based on tarball size
         let tarball_mb = tarball_size_bytes as u64 / (1024 * 1024);
         let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
+        let timeout = Duration::from_secs(timeout_secs);
         let publish_client = lpm_http::client_builder()
-            .timeout(Duration::from_secs(timeout_secs))
+            .timeout(timeout)
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;
 
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
-            let mut req = publish_client.put(&url).json(payload);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
-                req = req.bearer_auth(bearer);
-            }
-            if let Some(code) = otp {
-                req = req.header("x-otp", code);
-            }
+            let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
 
             // S4: Publish-safe send — no retry on 500, only on gateway errors
-            let response = self.send_publish_safe(req, encoded_name).await?;
+            let response = self
+                .send_publish_safe(
+                    || {
+                        let body = payload.body();
+                        let mut request = publish_client
+                            .put(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .header(reqwest::header::CONTENT_LENGTH, payload.len())
+                            .timeout(timeout)
+                            .body(body);
+                        if let Some(bearer) = bearer.as_ref() {
+                            request = request.bearer_auth(bearer);
+                        }
+                        if let Some(code) = otp {
+                            request = request.header("x-otp", code);
+                        }
+                        Ok(request)
+                    },
+                    payload,
+                    encoded_name,
+                )
+                .await?;
             let status = response.status();
             let body: serde_json::Value =
                 parse_capped_api_json(response, "publish response").await?;

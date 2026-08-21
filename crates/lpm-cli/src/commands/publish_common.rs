@@ -2762,14 +2762,204 @@ pub(crate) struct NpmPayloadOptions<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TarballRef<'a> {
-    pub(crate) data: &'a [u8],
+    pub(crate) data: &'a std::sync::Arc<Vec<u8>>,
     pub(crate) hashes: &'a TarballHashes,
+}
+
+pub(crate) struct PreparedPublishBody {
+    body: lpm_http::ReplayableRequestBody,
+}
+
+impl PreparedPublishBody {
+    #[inline]
+    pub(crate) fn len(&self) -> u64 {
+        self.body.len()
+    }
+
+    pub(crate) fn request_body(&self) -> reqwest::Body {
+        self.body.body()
+    }
+
+    #[inline]
+    pub(crate) fn replayable(&self) -> &lpm_http::ReplayableRequestBody {
+        &self.body
+    }
+
+    #[cfg(test)]
+    fn resident_encoded_bytes(&self) -> usize {
+        self.body.resident_encoded_bytes()
+    }
+}
+
+pub(crate) struct JsonPublishAttachment<'a> {
+    pub(crate) key: String,
+    pub(crate) content_type: &'a str,
+    pub(crate) data: &'a Arc<str>,
+    pub(crate) length: usize,
+}
+
+pub(crate) fn prepare_json_publish_body(
+    fields: serde_json::Map<String, serde_json::Value>,
+    tarball_key: &str,
+    tarball_content_type: &str,
+    tarball_data: &std::sync::Arc<Vec<u8>>,
+    extra_attachment: Option<JsonPublishAttachment<'_>>,
+) -> Result<PreparedPublishBody, LpmError> {
+    let mut prefix = Vec::with_capacity(64 * 1024);
+    write_json_publish_payload_prefix(&mut prefix, &fields, tarball_key, tarball_content_type)?;
+    let body = if let Some(attachment) = extra_attachment.as_ref() {
+        let mut infix = Vec::with_capacity(256);
+        write_json_publish_payload_infix(&mut infix, tarball_data.len(), attachment)?;
+        let mut suffix = Vec::with_capacity(64);
+        write_json_publish_payload_final_suffix(&mut suffix, attachment.length)?;
+        lpm_http::ReplayableRequestBody::from_base64_and_json_string_parts(
+            prefix,
+            std::sync::Arc::clone(tarball_data),
+            infix,
+            Arc::clone(attachment.data),
+            suffix,
+        )
+        .map_err(LpmError::Io)?
+    } else {
+        let mut suffix = Vec::with_capacity(64);
+        write_json_publish_payload_suffix(&mut suffix, tarball_data.len(), None)?;
+        lpm_http::ReplayableRequestBody::from_base64_json_parts(
+            prefix,
+            std::sync::Arc::clone(tarball_data),
+            suffix,
+        )
+        .map_err(LpmError::Io)?
+    };
+    Ok(PreparedPublishBody { body })
+}
+
+#[cfg(test)]
+fn write_json_publish_payload<W: std::io::Write>(
+    writer: &mut W,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    tarball_key: &str,
+    tarball_content_type: &str,
+    tarball_data: &[u8],
+    extra_attachment: Option<&JsonPublishAttachment<'_>>,
+) -> Result<(), LpmError> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use std::io::Write as _;
+
+    write_json_publish_payload_prefix(writer, fields, tarball_key, tarball_content_type)?;
+    {
+        let mut encoder = base64::write::EncoderWriter::new(&mut *writer, &BASE64);
+        encoder.write_all(tarball_data).map_err(LpmError::Io)?;
+        encoder.finish().map_err(LpmError::Io)?;
+    }
+    write_json_publish_payload_suffix(writer, tarball_data.len(), extra_attachment)
+}
+
+fn write_json_publish_payload_prefix<W: std::io::Write>(
+    writer: &mut W,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    tarball_key: &str,
+    tarball_content_type: &str,
+) -> Result<(), LpmError> {
+    writer.write_all(b"{").map_err(LpmError::Io)?;
+    for (index, (key, value)) in fields.iter().enumerate() {
+        write_json_member_prefix(writer, key, index == 0)?;
+        serde_json::to_writer(&mut *writer, value).map_err(|error| {
+            LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+        })?;
+    }
+    write_json_member_prefix(writer, "_attachments", fields.is_empty())?;
+    writer.write_all(b"{").map_err(LpmError::Io)?;
+    write_json_member_prefix(writer, tarball_key, true)?;
+    writer
+        .write_all(b"{\"content_type\":")
+        .map_err(LpmError::Io)?;
+    serde_json::to_writer(&mut *writer, tarball_content_type).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+    })?;
+    writer.write_all(b",\"data\":\"").map_err(LpmError::Io)
+}
+
+fn write_json_publish_payload_suffix<W: std::io::Write>(
+    writer: &mut W,
+    tarball_length: usize,
+    extra_attachment: Option<&JsonPublishAttachment<'_>>,
+) -> Result<(), LpmError> {
+    writer.write_all(b"\",\"length\":").map_err(LpmError::Io)?;
+    serde_json::to_writer(&mut *writer, &tarball_length).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+    })?;
+    writer.write_all(b"}").map_err(LpmError::Io)?;
+
+    if let Some(attachment) = extra_attachment {
+        write_json_member_prefix(writer, &attachment.key, false)?;
+        writer
+            .write_all(b"{\"content_type\":")
+            .map_err(LpmError::Io)?;
+        serde_json::to_writer(&mut *writer, attachment.content_type).map_err(|error| {
+            LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+        })?;
+        writer.write_all(b",\"data\":").map_err(LpmError::Io)?;
+        serde_json::to_writer(&mut *writer, attachment.data.as_ref()).map_err(|error| {
+            LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+        })?;
+        writer.write_all(b",\"length\":").map_err(LpmError::Io)?;
+        serde_json::to_writer(&mut *writer, &attachment.length).map_err(|error| {
+            LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+        })?;
+        writer.write_all(b"}").map_err(LpmError::Io)?;
+    }
+    writer.write_all(b"}}").map_err(LpmError::Io)
+}
+
+fn write_json_publish_payload_infix<W: std::io::Write>(
+    writer: &mut W,
+    tarball_length: usize,
+    attachment: &JsonPublishAttachment<'_>,
+) -> Result<(), LpmError> {
+    writer.write_all(b"\",\"length\":").map_err(LpmError::Io)?;
+    serde_json::to_writer(&mut *writer, &tarball_length).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+    })?;
+    writer.write_all(b"}").map_err(LpmError::Io)?;
+    write_json_member_prefix(writer, &attachment.key, false)?;
+    writer
+        .write_all(b"{\"content_type\":")
+        .map_err(LpmError::Io)?;
+    serde_json::to_writer(&mut *writer, attachment.content_type).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+    })?;
+    writer.write_all(b",\"data\":").map_err(LpmError::Io)
+}
+
+fn write_json_publish_payload_final_suffix<W: std::io::Write>(
+    writer: &mut W,
+    attachment_length: usize,
+) -> Result<(), LpmError> {
+    writer.write_all(b",\"length\":").map_err(LpmError::Io)?;
+    serde_json::to_writer(&mut *writer, &attachment_length).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+    })?;
+    writer.write_all(b"}}}").map_err(LpmError::Io)
+}
+
+fn write_json_member_prefix<W: std::io::Write>(
+    writer: &mut W,
+    key: &str,
+    first: bool,
+) -> Result<(), LpmError> {
+    if !first {
+        writer.write_all(b",").map_err(LpmError::Io)?;
+    }
+    serde_json::to_writer(&mut *writer, key).map_err(|error| {
+        LpmError::Registry(format!("failed to serialize publish payload: {error}"))
+    })?;
+    writer.write_all(b":").map_err(LpmError::Io)
 }
 
 /// Build the npm-compatible publish payload.
 ///
 /// Takes the LPM version_data, strips LPM-specific fields, sets npm-required
-/// fields, and returns a JSON value ready for PUT to the target registry.
+/// fields, and streams the JSON and Base64 attachment into a replayable body.
 pub(crate) fn build_npm_payload(
     registry_url: &str,
     npm_name: &str,
@@ -2778,9 +2968,38 @@ pub(crate) fn build_npm_payload(
     tarball: TarballRef<'_>,
     access: &str,
     options: NpmPayloadOptions<'_>,
-) -> serde_json::Value {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+) -> Result<PreparedPublishBody, LpmError> {
+    let (fields, tarball_key, provenance_attachment) = npm_payload_parts(
+        registry_url,
+        npm_name,
+        version,
+        version_data,
+        tarball.hashes,
+        access,
+        options,
+    );
+    prepare_json_publish_body(
+        fields,
+        &tarball_key,
+        "application/octet-stream",
+        tarball.data,
+        provenance_attachment,
+    )
+}
 
+fn npm_payload_parts<'a>(
+    registry_url: &str,
+    npm_name: &str,
+    version: &str,
+    version_data: &serde_json::Value,
+    tarball_hashes: &TarballHashes,
+    access: &str,
+    options: NpmPayloadOptions<'a>,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    String,
+    Option<JsonPublishAttachment<'a>>,
+) {
     let dist_tag = options.tag.unwrap_or("latest");
     let provenance_attachment = options.provenance_attachment;
 
@@ -2802,8 +3021,8 @@ pub(crate) fn build_npm_payload(
     npm_version["_id"] = serde_json::json!(format!("{npm_name}@{version}"));
 
     npm_version["dist"] = serde_json::json!({
-        "shasum": tarball.hashes.shasum,
-        "integrity": tarball.hashes.integrity,
+        "shasum": tarball_hashes.shasum,
+        "integrity": tarball_hashes.integrity,
         "tarball": npm_tarball_url(registry_url, npm_name, version),
     });
 
@@ -2811,45 +3030,26 @@ pub(crate) fn build_npm_payload(
     // npm CLI uses `{name}-{version}.tgz` with the full scoped name. GitHub Packages
     // is strict about this matching; npmjs.org is lenient.
     let tarball_key = format!("{npm_name}-{version}.tgz");
-    // S8: Pre-allocate base64 string to avoid double allocation
-    let mut tarball_base64 = String::with_capacity(tarball.data.len() * 4 / 3 + 4);
-    BASE64.encode_string(tarball.data, &mut tarball_base64);
-
-    let mut attachments =
-        serde_json::Map::with_capacity(1 + usize::from(provenance_attachment.is_some()));
-    attachments.insert(
-        tarball_key,
-        serde_json::json!({
-            "content_type": "application/octet-stream",
-            "data": tarball_base64,
-            "length": tarball.data.len(),
-        }),
+    let mut fields = serde_json::Map::with_capacity(6);
+    fields.insert("_id".into(), serde_json::json!(npm_name));
+    fields.insert("name".into(), serde_json::json!(npm_name));
+    fields.insert(
+        "description".into(),
+        npm_version
+            .get("description")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
     );
-    if let Some(attachment) = provenance_attachment {
-        let provenance_key = format!("{npm_name}-{version}.sigstore");
-        attachments.insert(
-            provenance_key,
-            serde_json::json!({
-                "content_type": attachment.media_type.as_ref(),
-                "data": attachment.data.as_ref(),
-                "length": javascript_string_length(&attachment.data),
-            }),
-        );
-    }
-
-    serde_json::json!({
-        "_id": npm_name,
-        "name": npm_name,
-        "description": npm_version.get("description"),
-        "access": access,
-        "dist-tags": {
-            dist_tag: version,
-        },
-        "versions": {
-            version: npm_version,
-        },
-        "_attachments": attachments,
-    })
+    fields.insert("access".into(), serde_json::json!(access));
+    fields.insert("dist-tags".into(), serde_json::json!({dist_tag: version}));
+    fields.insert("versions".into(), serde_json::json!({version: npm_version}));
+    let provenance_attachment = provenance_attachment.map(|attachment| JsonPublishAttachment {
+        key: format!("{npm_name}-{version}.sigstore"),
+        content_type: attachment.media_type.as_ref(),
+        data: &attachment.data,
+        length: javascript_string_length(&attachment.data),
+    });
+    (fields, tarball_key, provenance_attachment)
 }
 
 fn javascript_string_length(value: &str) -> usize {
@@ -2870,18 +3070,53 @@ mod tests {
         options: NpmPayloadOptions<'_>,
     ) -> serde_json::Value {
         let hashes = compute_hashes(tarball_data);
-        build_npm_payload(
+        build_test_npm_payload_with_hashes(
             registry_url,
             npm_name,
             version,
             version_data,
-            TarballRef {
-                data: tarball_data,
-                hashes: &hashes,
-            },
+            tarball_data,
+            &hashes,
             access,
             options,
         )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the test helper mirrors the production payload inputs"
+    )]
+    fn build_test_npm_payload_with_hashes(
+        registry_url: &str,
+        npm_name: &str,
+        version: &str,
+        version_data: &serde_json::Value,
+        tarball_data: &[u8],
+        hashes: &TarballHashes,
+        access: &str,
+        options: NpmPayloadOptions<'_>,
+    ) -> serde_json::Value {
+        let (fields, tarball_key, extra_attachment) = npm_payload_parts(
+            registry_url,
+            npm_name,
+            version,
+            version_data,
+            hashes,
+            access,
+            options,
+        );
+        let encoded_len = tarball_data.len().div_ceil(3) * 4;
+        let mut serialized = Vec::with_capacity(encoded_len.saturating_add(1024));
+        write_json_publish_payload(
+            &mut serialized,
+            &fields,
+            &tarball_key,
+            "application/octet-stream",
+            tarball_data,
+            extra_attachment.as_ref(),
+        )
+        .unwrap();
+        serde_json::from_slice(&serialized).unwrap()
     }
 
     fn tarball_contents(data: &[u8]) -> std::collections::BTreeMap<String, Vec<u8>> {
@@ -5266,15 +5501,13 @@ mod tests {
             integrity: "sha512-precomputed".into(),
         };
 
-        let payload = build_npm_payload(
+        let payload = build_test_npm_payload_with_hashes(
             "https://registry.npmjs.org",
             "pkg",
             "1.0.0",
             &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
-            TarballRef {
-                data: b"tarball bytes are not rehashed here",
-                hashes: &hashes,
-            },
+            b"tarball bytes are not rehashed here",
+            &hashes,
             "public",
             NpmPayloadOptions::default(),
         );
@@ -5285,6 +5518,85 @@ mod tests {
                 payload["versions"]["1.0.0"]["dist"]["integrity"].as_str(),
             ),
             (Some("precomputed-sha1"), Some("sha512-precomputed"))
+        );
+    }
+
+    #[test]
+    fn npm_publish_payload_encoded_buffers_do_not_scale_with_archive_size() {
+        let small_tarball = Arc::new(vec![0x5a; 96]);
+        let small_hashes = compute_hashes(&small_tarball);
+        let small_payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "pkg",
+            "1.0.0",
+            &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
+            TarballRef {
+                data: &small_tarball,
+                hashes: &small_hashes,
+            },
+            "public",
+            NpmPayloadOptions::default(),
+        )
+        .unwrap();
+        let large_tarball = Arc::new(vec![0x5a; 4 * 1024 * 1024]);
+        let large_hashes = compute_hashes(&large_tarball);
+        let initial_large_references = Arc::strong_count(&large_tarball);
+        let large_payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "pkg",
+            "1.0.0",
+            &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
+            TarballRef {
+                data: &large_tarball,
+                hashes: &large_hashes,
+            },
+            "public",
+            NpmPayloadOptions::default(),
+        )
+        .unwrap();
+
+        assert!(
+            large_payload.resident_encoded_bytes()
+                <= small_payload.resident_encoded_bytes().saturating_add(64)
+        );
+        assert_eq!(
+            Arc::strong_count(&large_tarball),
+            initial_large_references + 1
+        );
+    }
+
+    #[test]
+    fn npm_publish_payload_streams_near_limit_escape_heavy_provenance() {
+        let provenance_data: Arc<str> = "\\\"".repeat(5 * 1024 * 1024).into();
+        let provenance = NpmProvenanceAttachment {
+            media_type: "application/vnd.dev.sigstore.bundle+json;version=0.2".into(),
+            data: Arc::clone(&provenance_data),
+        };
+        let tarball = Arc::new(b"tarball".to_vec());
+        let hashes = compute_hashes(&tarball);
+        let initial_provenance_references = Arc::strong_count(&provenance_data);
+
+        let payload = build_npm_payload(
+            "https://registry.npmjs.org",
+            "pkg",
+            "1.0.0",
+            &serde_json::json!({"name": "pkg", "version": "1.0.0"}),
+            TarballRef {
+                data: &tarball,
+                hashes: &hashes,
+            },
+            "public",
+            NpmPayloadOptions {
+                tag: None,
+                provenance_attachment: Some(&provenance),
+            },
+        )
+        .unwrap();
+
+        assert!(payload.resident_encoded_bytes() < 128 * 1024);
+        assert_eq!(
+            Arc::strong_count(&provenance_data),
+            initial_provenance_references + 1
         );
     }
 
