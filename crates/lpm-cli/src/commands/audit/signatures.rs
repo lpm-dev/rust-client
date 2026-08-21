@@ -184,12 +184,14 @@ sig = "MEQCIEvidence"
             packages: vec![DiscoveredPackage {
                 name: "private-pkg".to_string(),
                 version: "1.0.0".to_string(),
+                instance_id: None,
                 path: "node_modules/private-pkg".to_string(),
                 integrity: Some("sha512-private".to_string()),
                 patch_sha256: None,
                 resolved_url: Some(
                     "https://registry.example.test/private-pkg/-/private-pkg-1.0.0.tgz".to_string(),
                 ),
+                local_source_dir: None,
                 scan_mode: ScanMode::LocalMissing,
                 is_dev: false,
                 is_optional: false,
@@ -197,6 +199,7 @@ sig = "MEQCIEvidence"
             }],
             lpm_lockfile: None,
             lpm_lockfile_content: None,
+            workspace_root: None,
         };
 
         let inputs = registry_signature_inputs_from_discovery(discovery).unwrap();

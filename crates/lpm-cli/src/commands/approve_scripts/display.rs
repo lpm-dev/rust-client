@@ -24,7 +24,7 @@ use super::prelude::*;
 pub(super) fn print_version_diff_card_for_blocked(
     blocked: &BlockedPackage,
     trusted: &TrustedDependencies,
-    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
     lpm_root: &lpm_common::LpmRoot,
 ) {
     let Some((prior_version, binding)) =
@@ -187,7 +187,7 @@ pub(super) fn truncate_for_display(s: &str, max: usize) -> String {
 /// script-hash function.
 pub(super) fn print_full_script(
     blocked: &BlockedPackage,
-    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
     lpm_root: &lpm_common::LpmRoot,
 ) {
     let pkg_dir = match crate::commands::audit::inventory::find_project_baseline(
@@ -269,7 +269,7 @@ pub(super) fn print_listing(
     // flag for uniform agent parsing.
     dry_run: bool,
     json_output: bool,
-    baseline_index: Option<&lpm_store::V2BaselineIndex>,
+    baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
     lpm_root: &lpm_common::LpmRoot,
 ) {
     if json_output {

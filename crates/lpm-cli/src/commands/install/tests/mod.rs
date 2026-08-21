@@ -234,6 +234,32 @@ fn v1_linker_rejects_contextual_instances_of_one_artifact() {
 }
 
 #[test]
+fn v1_linker_rejects_same_coordinate_instances_from_different_sources() {
+    let first_id = lpm_common::PackageInstanceId::derive(
+        "plugin",
+        "1.0.0",
+        "registry+https://registry.npmjs.org",
+        "root/left/plugin",
+    );
+    let second_id = lpm_common::PackageInstanceId::derive(
+        "plugin",
+        "1.0.0",
+        "directory+../plugin",
+        "root/right/plugin",
+    );
+    let mut first = fake_pkg("plugin", "1.0.0", false);
+    first.instance_id = Some(first_id);
+    let mut second = first.clone();
+    second.instance_id = Some(second_id);
+    second.source = "directory+../plugin".to_string();
+
+    let error = validate_store_graph_compatibility(&[first, second], lpm_store::StoreVersion::V1)
+        .expect_err("v1 cannot represent same-coordinate packages from different sources");
+
+    assert!(error.to_string().contains("LPM_STORE_VERSION=v2"));
+}
+
+#[test]
 fn publish_ages_from_resolved_metadata_uses_registry_published_at() {
     let mut old = fake_pkg("old-pkg", "1.0.0", false);
     old.registry_published_at = Some("2020-01-01T00:00:00Z".to_string());

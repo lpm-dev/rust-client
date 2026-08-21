@@ -553,8 +553,10 @@ pub fn link_v2_one_with_timings(
     .entered();
     let entry = populate_one(target, store, &plan.key_map, &plan.meta_platform)?;
     let mat = MaterializedPackage {
+        instance_id: Some(target.instance_id),
         name: target.target.name.clone(),
         version: target.target.version.clone(),
+        analysis_source: None,
         destination: store.paths().link_package_dir(&entry.key),
     };
     Ok((mat, entry.freshly_populated, entry.timings))
@@ -1189,8 +1191,10 @@ fn existing_link_entry_packages(
             &v2t.target.version,
         )?;
         materialized.push(MaterializedPackage {
+            instance_id: Some(v2t.instance_id),
             name: v2t.target.name.clone(),
             version: v2t.target.version.clone(),
+            analysis_source: None,
             destination: package_dir,
         });
     }

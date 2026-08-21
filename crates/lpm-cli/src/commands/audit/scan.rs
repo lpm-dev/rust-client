@@ -3,7 +3,7 @@ use std::path::Path;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 
-use super::behavior::{BehavioralSummary, run_behavioral_analysis};
+use super::behavior::{BehavioralSummary, package_result_key, run_behavioral_analysis};
 use super::discovery::{self, DiscoveryResult, ScanMode};
 use super::osv::{OsvVulnerability, run_osv_scan};
 use super::policy::AuditLevel;
@@ -27,7 +27,7 @@ pub(super) async fn run_scan(
     json_output: bool,
     level: Option<AuditLevel>,
 ) -> Result<AuditScan, LpmError> {
-    let discovery = discovery::discover_packages(project_dir)?;
+    let discovery = discovery::discover_packages_retaining_parsed_lpm_lockfile(project_dir)?;
     let lpm_packages: Vec<(String, String)> = discovery
         .packages
         .iter()
@@ -46,20 +46,31 @@ pub(super) async fn run_scan(
             ))
         })?;
 
-        for (name, version) in &lpm_packages {
-            let metadata = metadata_map.get(name).ok_or_else(|| {
+        for package in discovery
+            .packages
+            .iter()
+            .filter(|package| package.name.starts_with("@lpm.dev/"))
+        {
+            let metadata = metadata_map.get(&package.name).ok_or_else(|| {
                 LpmError::Registry(format!(
-                    "LPM registry returned no metadata for installed package {name}@{version}"
+                    "LPM registry returned no metadata for installed package {}@{}",
+                    package.name, package.version,
                 ))
             })?;
-            let version_metadata = metadata.version(version).ok_or_else(|| {
+            let version_metadata = metadata.version(&package.version).ok_or_else(|| {
                 LpmError::Registry(format!(
-                    "LPM registry metadata omitted installed version {name}@{version}"
+                    "LPM registry metadata omitted installed version {}@{}",
+                    package.name, package.version,
                 ))
             })?;
             checked_lpm += 1;
 
-            results.push(registry_audit_result(name, version, version_metadata));
+            let mut result =
+                registry_audit_result(&package.name, &package.version, version_metadata);
+            result.identity = package_result_key(discovery.manager, package);
+            result.instance_id = package.instance_id;
+            result.path = Some(package.path.clone());
+            results.push(result);
         }
     }
 

@@ -445,10 +445,16 @@ pub struct LinkResult {
 /// stays correct across linker layout changes.
 #[derive(Debug, Clone)]
 pub struct MaterializedPackage {
+    /// Exact graph identity when the linker mode carries it end-to-end.
+    /// Legacy v1 materializations leave this empty; v1 rejects ambiguous
+    /// same-artifact instances before linking.
+    pub instance_id: Option<lpm_common::PackageInstanceId>,
     /// Package name (e.g., `"lodash"`, `"@types/node"`).
     pub name: String,
     /// Exact version string (e.g., `"4.17.21"`).
     pub version: String,
+    /// Original live directory for local `file:` and `link:` sources.
+    pub analysis_source: Option<PathBuf>,
     /// Absolute path to the package directory in `node_modules`. The
     /// directory directly contains the package's `package.json` (and
     /// the LPM-internal sentinels `.integrity` /

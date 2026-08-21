@@ -2,9 +2,9 @@
 //!
 //! Two layers of security checking:
 //!
-//! 1. **Client-side analysis** (all packages): Reads `.lpm-security.json` from
-//!    the store for every installed package (npm + @lpm.dev). Produces a
-//!    severity-tiered summary of behavioral tags.
+//! 1. **Client-side analysis** (all packages): Scans each installed package's
+//!    live materialization (npm + @lpm.dev). Produces a severity-tiered summary
+//!    of behavioral tags.
 //!
 //! 2. **Registry-side analysis** (@lpm.dev only): Fetches behavioral tags and
 //!    lifecycle scripts from registry metadata, then merges behavioral tags
@@ -13,11 +13,13 @@
 //! Uses batch metadata endpoint for @lpm.dev packages (1 request for all).
 
 use crate::install_ui;
+use lpm_linker::MaterializedPackage;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
 use lpm_security::query::{InstallVisibility, PseudoClass, Severity, behavioral_tag_policies};
-use lpm_store::V2BaselineIndex;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// A tagged issue found in a package.
 struct TagIssue {
@@ -49,6 +51,7 @@ impl SummaryCounts {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SecuritySummaryPackage {
+    pub(crate) instance_id: Option<lpm_common::PackageInstanceId>,
     pub(crate) name: String,
     pub(crate) version: String,
     pub(crate) source: String,
@@ -69,6 +72,10 @@ impl SecuritySummaryPackage {
         key.push_str(&self.source);
         key.push('\u{1f}');
         key.push_str(integrity);
+        if let Some(instance_id) = self.instance_id {
+            key.push('\u{1f}');
+            key.push_str(&instance_id.to_string());
+        }
         key
     }
 }
@@ -81,15 +88,14 @@ enum SecuritySummaryLine {
 
 /// Run the full post-install security summary.
 ///
-/// Reads `.lpm-security.json` from the store for ALL packages, then
-/// fetches registry metadata for @lpm.dev packages to merge behavioral
-/// tags and lifecycle scripts. Vulnerabilities and registry security findings
-/// are available only through `lpm audit` or audit-after-install.
+/// Scans every live package materialization, then fetches registry metadata for
+/// @lpm.dev packages to merge behavioral tags and lifecycle scripts.
+/// Vulnerabilities and registry security findings are available only through
+/// `lpm audit` or audit-after-install.
 pub(crate) async fn post_install_security_summary(
     client: &RegistryClient,
-    lpm_root: &lpm_common::LpmRoot,
-    baseline_index: Option<&V2BaselineIndex>,
     packages: &[SecuritySummaryPackage],
+    materialized: &[MaterializedPackage],
     json_output: bool,
     verbose: bool,
     fetch_lpm_security_insights: bool,
@@ -100,46 +106,29 @@ pub(crate) async fn post_install_security_summary(
 
     // ── Client-side analysis (all packages) ──────────
 
-    let empty_baseline_index = V2BaselineIndex::default();
-    let baseline_index = baseline_index.unwrap_or(&empty_baseline_index);
     let show_progress = !json_output && packages.len() > 50;
     if show_progress {
         install_ui::phase_untrusted(&format!(
-            "Checking cached security results for {} packages",
+            "Scanning security behavior for {} installed packages",
             packages.len()
         ));
     }
 
+    let analyses: Vec<_> = packages
+        .par_iter()
+        .filter_map(|package| {
+            analyze_live_package(package, materialized).map(|analysis| (package, analysis))
+        })
+        .collect();
     let mut tag_counts = SummaryCounts::default();
-
-    for (i, package) in packages.iter().enumerate() {
-        if show_progress && i % 50 == 0 && i > 0 {
-            install_ui::phase_untrusted(&format!(
-                "Checked cached security results for {i}/{} packages",
-                packages.len()
-            ));
-        }
-
-        let analysis = match lpm_store::find_installed_package_baseline_by_identity_indexed(
-            baseline_index,
-            lpm_root,
-            &package.name,
-            &package.version,
-            package.integrity.as_deref(),
-        )
-        .and_then(|baseline| behavioral::read_cached_analysis(&baseline.pristine_dir))
-        {
-            Some(a) => a,
-            None => continue,
-        };
-
+    for (package, analysis) in analyses {
         let pkg_id = package.finding_key();
         collect_tags_from_analysis(&analysis, &pkg_id, &mut tag_counts);
     }
 
     if show_progress {
         install_ui::done_untrusted(&format!(
-            "Checked cached security results for {} packages",
+            "Scanned security behavior for {} installed packages",
             packages.len()
         ));
     }
@@ -196,6 +185,56 @@ pub(crate) async fn post_install_security_summary(
     }
 
     emit_human_security_summary(packages.len(), &issues, verbose);
+}
+
+fn analyze_live_package(
+    package: &SecuritySummaryPackage,
+    materialized: &[MaterializedPackage],
+) -> Option<PackageAnalysis> {
+    let exact = package.instance_id.and_then(|instance_id| {
+        materialized
+            .iter()
+            .find(|candidate| candidate.instance_id == Some(instance_id))
+    });
+    let selected = exact.or_else(|| {
+        let mut candidates = materialized.iter().filter(|candidate| {
+            candidate.instance_id.is_none()
+                && candidate.name == package.name
+                && candidate.version == package.version
+        });
+        candidates.next().map(|first| {
+            candidates.fold(first, |selected, candidate| {
+                if candidate.destination < selected.destination {
+                    candidate
+                } else {
+                    selected
+                }
+            })
+        })
+    })?;
+    let source = selected
+        .analysis_source
+        .as_deref()
+        .unwrap_or(&selected.destination);
+    let directory = open_materialized_package(source).ok()?;
+    Some(behavioral::analyze_package_from_open_dir(&directory))
+}
+
+fn open_materialized_package(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized package path has no parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "materialized package path has no final component",
+        )
+    })?;
+    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    cap_fs_ext::DirExt::open_dir_nofollow(&parent, name)
 }
 
 fn lpm_packages_for_enrichment(
@@ -550,6 +589,7 @@ mod tests {
     use lpm_security::behavioral::source::SourceTags;
     use lpm_security::behavioral::supply_chain::SupplyChainTags;
     use lpm_security::behavioral::{AnalysisMeta, PackageAnalysis};
+    use lpm_store::V2BaselineIndex;
     use lpm_store::v2::link_meta::{LinkMeta, LinkMetaPlatform};
     use std::sync::Arc;
 
@@ -576,6 +616,7 @@ mod tests {
 
     fn summary_package(name: &str, is_lpm: bool) -> SecuritySummaryPackage {
         SecuritySummaryPackage {
+            instance_id: None,
             name: name.to_string(),
             version: "1.0.0".to_string(),
             source: "https://registry.example.test".to_string(),
@@ -599,6 +640,98 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["@lpm.dev/secure"]
         );
+    }
+
+    #[test]
+    fn live_security_analysis_selects_the_exact_materialized_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let first_dir = root.path().join("first");
+        let second_dir = root.path().join("second");
+        for (directory, source) in [
+            (&first_dir, "module.exports = () => eval('first')\n"),
+            (
+                &second_dir,
+                "require('child_process').exec('echo second')\n",
+            ),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join("package.json"),
+                r#"{"name":"duplicate","version":"1.0.0","license":"MIT"}"#,
+            )
+            .unwrap();
+            std::fs::write(directory.join("index.js"), source).unwrap();
+        }
+        let first_id =
+            lpm_common::PackageInstanceId::derive("duplicate", "1.0.0", "registry+first", "first");
+        let second_id = lpm_common::PackageInstanceId::derive(
+            "duplicate",
+            "1.0.0",
+            "registry+second",
+            "second",
+        );
+        let materialized = [
+            MaterializedPackage {
+                instance_id: Some(first_id),
+                name: "duplicate".to_string(),
+                version: "1.0.0".to_string(),
+                analysis_source: None,
+                destination: first_dir,
+            },
+            MaterializedPackage {
+                instance_id: Some(second_id),
+                name: "duplicate".to_string(),
+                version: "1.0.0".to_string(),
+                analysis_source: None,
+                destination: second_dir,
+            },
+        ];
+        let package = SecuritySummaryPackage {
+            instance_id: Some(second_id),
+            name: "duplicate".to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+second".to_string(),
+            integrity: Some("sha512-shared".to_string()),
+            is_lpm: false,
+        };
+
+        let analysis = analyze_live_package(&package, &materialized).unwrap();
+
+        assert!(!analysis.source.eval);
+        assert!(analysis.source.child_process);
+    }
+
+    #[test]
+    fn live_security_analysis_reads_the_original_directory_source() {
+        let root = tempfile::tempdir().unwrap();
+        let wrapper = root.path().join("wrapper");
+        let source = root.path().join("source");
+        for directory in [&wrapper, &source] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join("package.json"),
+                r#"{"name":"local","version":"1.0.0","license":"MIT"}"#,
+            )
+            .unwrap();
+        }
+        std::fs::write(wrapper.join("index.js"), "module.exports = 1\n").unwrap();
+        std::fs::write(
+            source.join("index.js"),
+            "module.exports = () => eval('live')\n",
+        )
+        .unwrap();
+        let materialized = [MaterializedPackage {
+            instance_id: None,
+            name: "local".to_string(),
+            version: "1.0.0".to_string(),
+            analysis_source: Some(source),
+            destination: wrapper,
+        }];
+        let package = summary_package("local", false);
+
+        let analysis = analyze_live_package(&package, &materialized).unwrap();
+
+        assert!(analysis.source.eval);
     }
 
     fn write_cached_analysis_link(
@@ -1009,6 +1142,7 @@ mod tests {
     #[test]
     fn severity_groups_keep_same_coordinates_from_distinct_sources() {
         let npm = SecuritySummaryPackage {
+            instance_id: None,
             name: "duplicate".to_string(),
             version: "1.0.0".to_string(),
             source: "registry+https://registry.npmjs.org".to_string(),
@@ -1016,6 +1150,7 @@ mod tests {
             is_lpm: false,
         };
         let custom = SecuritySummaryPackage {
+            instance_id: None,
             name: "duplicate".to_string(),
             version: "1.0.0".to_string(),
             source: "registry+https://registry.example.com".to_string(),
@@ -1050,6 +1185,7 @@ mod tests {
     #[test]
     fn severity_groups_redact_registry_credentials_and_url_components() {
         let package = SecuritySummaryPackage {
+            instance_id: None,
             name: "duplicate".to_string(),
             version: "1.0.0".to_string(),
             source: "registry+https://user:password@example.test/private?token=query-secret"
@@ -1058,6 +1194,7 @@ mod tests {
             is_lpm: false,
         };
         let sibling = SecuritySummaryPackage {
+            instance_id: None,
             name: "duplicate".to_string(),
             version: "1.0.0".to_string(),
             source: "registry+https://registry.npmjs.org".to_string(),

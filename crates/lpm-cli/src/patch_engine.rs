@@ -2197,8 +2197,10 @@ mod tests {
             std::fs::write(&p, bytes).unwrap();
         }
         let m = MaterializedPackage {
+            instance_id: None,
             name: name.to_string(),
             version: version.to_string(),
+            analysis_source: None,
             destination: dir.path().to_path_buf(),
         };
         (dir, m)

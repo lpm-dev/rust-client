@@ -3727,7 +3727,7 @@ fn link_one_package_directory_uses_per_file_symlinks_and_plus_wrapper() {
     let target = LinkTarget {
         name: "local-foo".to_string(),
         version: "0.0.0".to_string(),
-        store_path: src,
+        store_path: src.clone(),
         dependencies: vec![],
         aliases: HashMap::new(),
         is_direct: true,
@@ -3740,6 +3740,10 @@ fn link_one_package_directory_uses_per_file_symlinks_and_plus_wrapper() {
 
     let result = link_packages(&project_dir, &[target], false, None).unwrap();
     assert_eq!(result.linked, 1);
+    assert_eq!(
+        result.materialized[0].analysis_source.as_deref(),
+        Some(src.as_path())
+    );
 
     // Wrapper at the `+` shape, not `@`.
     let wrapper = project_dir.join(".lpm/wrappers/local-foo+f-deadbeef00000000");

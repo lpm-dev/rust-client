@@ -1693,6 +1693,7 @@ async fn run_with_options_under_store_lock(
         let all_packages: Vec<crate::security_check::SecuritySummaryPackage> = packages
             .iter()
             .map(|package| crate::security_check::SecuritySummaryPackage {
+                instance_id: package.instance_id,
                 name: package.name.clone(),
                 version: package.version.clone(),
                 source: package.source.clone(),
@@ -1702,9 +1703,8 @@ async fn run_with_options_under_store_lock(
             .collect();
         crate::security_check::post_install_security_summary(
             client,
-            lpm_root,
-            baseline_index.as_ref(),
             &all_packages,
+            &link_result.materialized,
             false,
             verbose,
             fetch_lpm_security_insights,

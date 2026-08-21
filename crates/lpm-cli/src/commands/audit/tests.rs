@@ -94,10 +94,12 @@ fn osv_skips_lpm_packages() {
         DiscoveredPackage {
             name: "@lpm.dev/owner.utils".into(),
             version: "1.0.0".into(),
+            instance_id: None,
             path: "@lpm.dev/owner.utils".into(),
             integrity: None,
             patch_sha256: None,
             resolved_url: None,
+            local_source_dir: None,
             scan_mode: ScanMode::RegistryAndStore,
             is_dev: false,
             is_optional: false,
@@ -106,10 +108,12 @@ fn osv_skips_lpm_packages() {
         DiscoveredPackage {
             name: "lodash".into(),
             version: "4.17.21".into(),
+            instance_id: None,
             path: "node_modules/lodash".into(),
             integrity: None,
             patch_sha256: None,
             resolved_url: Some("https://artifactory.example.com/lodash-4.17.21.tgz".into()),
+            local_source_dir: None,
             scan_mode: ScanMode::FullLocal,
             is_dev: false,
             is_optional: false,
@@ -235,8 +239,11 @@ fn fail_on_behavior_catches_high_severity() {
     // --fail-on behavior should fail on both critical AND high behaviors.
     // A package using eval() (high severity) must trigger exit 1.
     let results = [AuditResult {
+        identity: "sketchy-pkg@1.0.0".into(),
         name: "sketchy-pkg".into(),
         version: "1.0.0".into(),
+        instance_id: None,
+        path: None,
         quality_score: None,
         issues: vec![AuditIssue {
             severity: "high".into(),

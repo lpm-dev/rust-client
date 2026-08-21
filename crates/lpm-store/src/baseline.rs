@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lpm_common::LpmError;
 
@@ -79,8 +80,12 @@ pub enum PackageBaselineLayout {
 /// with no virtual-store entries get an empty map and pay only the v1 fallback.
 #[derive(Debug, Clone, Default)]
 pub struct V2BaselineIndex {
-    by_coords: HashMap<(String, String), InstalledPackageBaseline>,
-    by_integrity: HashMap<String, InstalledPackageBaseline>,
+    by_coords: HashMap<(String, String), Arc<InstalledPackageBaseline>>,
+    by_integrity: HashMap<String, Arc<InstalledPackageBaseline>>,
+    ambiguous_integrities: HashSet<String>,
+    by_graph_digest: HashMap<String, Arc<InstalledPackageBaseline>>,
+    graph_dependencies: HashMap<String, Vec<crate::v2::link_meta::LinkMetaDep>>,
+    graph_digest_by_package_dir: HashMap<PathBuf, String>,
 }
 
 impl V2BaselineIndex {
@@ -129,7 +134,28 @@ impl V2BaselineIndex {
                 merged.by_coords.entry(key).or_insert(baseline);
             }
             for (key, baseline) in partial.by_integrity {
-                merged.by_integrity.entry(key).or_insert(baseline);
+                if let Some(existing) = merged.by_integrity.get(&key) {
+                    if existing.package_dir != baseline.package_dir {
+                        merged.ambiguous_integrities.insert(key);
+                    }
+                } else {
+                    merged.by_integrity.insert(key, baseline);
+                }
+            }
+            merged
+                .ambiguous_integrities
+                .extend(partial.ambiguous_integrities);
+            for (key, baseline) in partial.by_graph_digest {
+                merged.by_graph_digest.entry(key).or_insert(baseline);
+            }
+            for (key, dependencies) in partial.graph_dependencies {
+                merged.graph_dependencies.entry(key).or_insert(dependencies);
+            }
+            for (key, graph_digest) in partial.graph_digest_by_package_dir {
+                merged
+                    .graph_digest_by_package_dir
+                    .entry(key)
+                    .or_insert(graph_digest);
             }
         }
         merged
@@ -139,8 +165,13 @@ impl V2BaselineIndex {
         use {HashSet, VecDeque};
 
         let links_root = store_v2.paths().links_root();
-        let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
-        let mut by_integrity: HashMap<String, InstalledPackageBaseline> = HashMap::new();
+        let mut by_coords: HashMap<(String, String), Arc<InstalledPackageBaseline>> =
+            HashMap::new();
+        let mut by_integrity: HashMap<String, Arc<InstalledPackageBaseline>> = HashMap::new();
+        let mut ambiguous_integrities = HashSet::new();
+        let mut by_graph_digest = HashMap::new();
+        let mut graph_dependencies = HashMap::new();
+        let mut graph_digest_by_package_dir = HashMap::new();
 
         // Seeds: every direct symlink under `<project>/node_modules/`
         // whose target lives inside `<links_root>/<key>/`. Direct-bin
@@ -213,6 +244,7 @@ impl V2BaselineIndex {
                 name: meta_name,
                 version: meta_version,
                 source_sri: meta_sri,
+                graph_key_digest_hex: graph_digest,
                 deps: meta_deps,
                 ..
             } = meta;
@@ -237,15 +269,32 @@ impl V2BaselineIndex {
             // walk inserts before the BFS, and BFS itself is FIFO, so
             // the chosen entry is whichever is closer to the project
             // root in the symlink graph.
-            let baseline = InstalledPackageBaseline {
+            let baseline = Arc::new(InstalledPackageBaseline {
                 package_dir,
                 pristine_dir,
                 integrity: meta_sri.clone(),
                 layout: PackageBaselineLayout::V2,
-            };
-            by_integrity
-                .entry(meta_sri)
-                .or_insert_with(|| baseline.clone());
+            });
+            if let Some(existing) = by_integrity.get(&meta_sri) {
+                if existing.package_dir != baseline.package_dir {
+                    ambiguous_integrities.insert(meta_sri.clone());
+                }
+            } else {
+                by_integrity.insert(meta_sri, Arc::clone(&baseline));
+            }
+            graph_digest_by_package_dir.insert(
+                baseline
+                    .package_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| baseline.package_dir.clone()),
+                graph_digest.clone(),
+            );
+            by_graph_digest
+                .entry(graph_digest.clone())
+                .or_insert_with(|| Arc::clone(&baseline));
+            graph_dependencies
+                .entry(graph_digest)
+                .or_insert_with(|| meta_deps.clone());
             by_coords
                 .entry((meta_name, meta_version))
                 .or_insert(baseline);
@@ -282,6 +331,10 @@ impl V2BaselineIndex {
         Self {
             by_coords,
             by_integrity,
+            ambiguous_integrities,
+            by_graph_digest,
+            graph_dependencies,
+            graph_digest_by_package_dir,
         }
     }
 
@@ -299,8 +352,13 @@ impl V2BaselineIndex {
     /// `lpm rebuild` / `lpm approve-scripts` and any other read of
     /// project-side script state.
     pub fn build(lpm_root: &lpm_common::LpmRoot) -> Result<Self, LpmError> {
-        let mut by_coords: HashMap<(String, String), InstalledPackageBaseline> = HashMap::new();
-        let mut by_integrity: HashMap<String, InstalledPackageBaseline> = HashMap::new();
+        let mut by_coords: HashMap<(String, String), Arc<InstalledPackageBaseline>> =
+            HashMap::new();
+        let mut by_integrity: HashMap<String, Arc<InstalledPackageBaseline>> = HashMap::new();
+        let mut ambiguous_integrities = HashSet::new();
+        let mut by_graph_digest = HashMap::new();
+        let mut graph_dependencies = HashMap::new();
+        let mut graph_digest_by_package_dir = HashMap::new();
         for version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
             let store_v2 = crate::v2::Store::from_lpm_root_for_version(lpm_root, version);
             for (link_dir, meta) in store_v2.iter_link_entries()? {
@@ -313,28 +371,51 @@ impl V2BaselineIndex {
                     Ok(p) if p.exists() => p,
                     _ => package_dir.clone(),
                 };
-                let baseline = InstalledPackageBaseline {
+                let baseline = Arc::new(InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
                     integrity: meta.source_sri.clone(),
                     layout: PackageBaselineLayout::V2,
-                };
-                by_integrity
-                    .entry(meta.source_sri)
-                    .or_insert_with(|| baseline.clone());
+                });
+                if let Some(existing) = by_integrity.get(&meta.source_sri) {
+                    if existing.package_dir != baseline.package_dir {
+                        ambiguous_integrities.insert(meta.source_sri.clone());
+                    }
+                } else {
+                    by_integrity.insert(meta.source_sri.clone(), Arc::clone(&baseline));
+                }
+                graph_digest_by_package_dir.insert(
+                    baseline
+                        .package_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| baseline.package_dir.clone()),
+                    meta.graph_key_digest_hex.clone(),
+                );
+                by_graph_digest
+                    .entry(meta.graph_key_digest_hex.clone())
+                    .or_insert_with(|| Arc::clone(&baseline));
+                graph_dependencies
+                    .entry(meta.graph_key_digest_hex)
+                    .or_insert(meta.deps);
                 by_coords.entry(key).or_insert(baseline);
             }
         }
         Ok(Self {
             by_coords,
             by_integrity,
+            ambiguous_integrities,
+            by_graph_digest,
+            graph_dependencies,
+            graph_digest_by_package_dir,
         })
     }
 
     /// O(1) lookup. `None` means no v2 link entry covers the
     /// `(name, version)` pair — caller should fall back to v1.
     pub fn lookup(&self, name: &str, version: &str) -> Option<&InstalledPackageBaseline> {
-        self.by_coords.get(&(name.to_string(), version.to_string()))
+        self.by_coords
+            .get(&(name.to_string(), version.to_string()))
+            .map(Arc::as_ref)
     }
 
     /// O(1) lookup by the package tarball's SRI identity.
@@ -342,7 +423,48 @@ impl V2BaselineIndex {
     /// Unlike [`Self::lookup`], this remains unambiguous when different
     /// registries provide different bytes for the same package coordinates.
     pub fn lookup_by_integrity(&self, integrity: &str) -> Option<&InstalledPackageBaseline> {
-        self.by_integrity.get(integrity)
+        (!self.ambiguous_integrities.contains(integrity))
+            .then(|| self.by_integrity.get(integrity).map(Arc::as_ref))
+            .flatten()
+    }
+
+    /// Resolve the exact virtual-store materialization identified by a graph digest.
+    pub fn lookup_by_graph_digest(&self, graph_digest: &str) -> Option<&InstalledPackageBaseline> {
+        self.by_graph_digest.get(graph_digest).map(Arc::as_ref)
+    }
+
+    /// Resolve a graph digest while sharing the indexed baseline allocation.
+    pub fn lookup_shared_by_graph_digest(
+        &self,
+        graph_digest: &str,
+    ) -> Option<&Arc<InstalledPackageBaseline>> {
+        self.by_graph_digest.get(graph_digest)
+    }
+
+    /// Resolve an unambiguous integrity while sharing the indexed baseline allocation.
+    pub fn lookup_shared_by_integrity(
+        &self,
+        integrity: &str,
+    ) -> Option<&Arc<InstalledPackageBaseline>> {
+        (!self.ambiguous_integrities.contains(integrity))
+            .then(|| self.by_integrity.get(integrity))
+            .flatten()
+    }
+
+    /// Return the exact dependency graph edges recorded for a link entry.
+    pub fn graph_dependencies(
+        &self,
+        graph_digest: &str,
+    ) -> Option<&[crate::v2::link_meta::LinkMetaDep]> {
+        self.graph_dependencies.get(graph_digest).map(Vec::as_slice)
+    }
+
+    /// Match a project-side symlink target to its exact link-entry digest.
+    pub fn graph_digest_for_package_dir(&self, package_dir: &Path) -> Option<&str> {
+        let canonical = package_dir.canonicalize().ok()?;
+        self.graph_digest_by_package_dir
+            .get(&canonical)
+            .map(String::as_str)
     }
 }
 
@@ -1231,6 +1353,10 @@ mod tests {
         let hit = index
             .lookup("react", "18.0.0")
             .expect("either entry should satisfy the lookup");
+        assert!(
+            index.lookup_by_integrity(&sri).is_none(),
+            "an integrity shared by multiple materializations is not an exact identity"
+        );
         // Re-build and confirm the same entry wins. Stable
         // first-match-wins in the face of multi-entry coords.
         let index2 = V2BaselineIndex::build(&lpm_root).unwrap();

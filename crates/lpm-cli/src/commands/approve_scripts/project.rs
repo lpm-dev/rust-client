@@ -280,6 +280,8 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         project_dir,
         &lpm_root,
         store_version,
+        None,
+        None,
     );
 
     // Resolve the operator's provenance policy before branching. The

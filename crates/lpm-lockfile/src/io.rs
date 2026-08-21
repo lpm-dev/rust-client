@@ -43,7 +43,8 @@ impl Lockfile {
                     Ok(ProjectLockfile {
                         path,
                         importer: ".".to_string(),
-                        lockfile: lockfile.project_importer(".")?,
+                        lockfile: lockfile.as_lockfile().project_root_importer()?,
+                        workspace_root: None,
                         content,
                     })
                 }));
@@ -63,10 +64,15 @@ impl Lockfile {
             if !lockfile.as_lockfile().importers.contains_key(&importer) {
                 continue;
             }
+            let workspace_root = WorkspaceRootLockfile {
+                root: root.to_path_buf(),
+                lockfile: lockfile.as_lockfile().project_root_importer()?,
+            };
             return Ok(ProjectLockfile {
                 path,
                 lockfile: lockfile.project_importer(&importer)?,
                 importer,
+                workspace_root: Some(workspace_root),
                 content,
             });
         }
@@ -345,8 +351,15 @@ pub struct ProjectLockfile {
     pub path: PathBuf,
     pub importer: String,
     pub lockfile: Lockfile,
+    pub workspace_root: Option<WorkspaceRootLockfile>,
     /// Exact authoritative TOML bytes decoded into this project view.
     pub content: String,
+}
+
+/// Owning workspace-container projection retained with a member lockfile view.
+pub struct WorkspaceRootLockfile {
+    pub root: PathBuf,
+    pub lockfile: Lockfile,
 }
 
 fn importer_path(relative: &Path) -> Option<String> {

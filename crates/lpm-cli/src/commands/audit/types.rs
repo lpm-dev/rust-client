@@ -100,8 +100,11 @@ fn increment_severity(counts: &mut AuditSeverityCounts, severity: &str) -> bool 
 
 #[derive(Debug)]
 pub(super) struct AuditResult {
+    pub(super) identity: String,
     pub(super) name: String,
     pub(super) version: String,
+    pub(super) instance_id: Option<lpm_common::PackageInstanceId>,
+    pub(super) path: Option<String>,
     pub(super) quality_score: Option<u32>,
     pub(super) issues: Vec<AuditIssue>,
 }
@@ -122,8 +125,11 @@ mod tests {
     #[test]
     fn audit_summary_preserves_each_critical_registry_finding() {
         let results = [AuditResult {
+            identity: "@lpm.dev/test.package@1.0.0".to_string(),
             name: "@lpm.dev/test.package".to_string(),
             version: "1.0.0".to_string(),
+            instance_id: None,
+            path: None,
             quality_score: None,
             issues: vec![
                 AuditIssue {

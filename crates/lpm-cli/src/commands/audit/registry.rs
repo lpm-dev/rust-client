@@ -24,8 +24,11 @@ pub(super) fn registry_audit_result(
     }
 
     AuditResult {
+        identity: format!("{name}@{version}"),
         name: name.to_string(),
         version: version.to_string(),
+        instance_id: None,
+        path: None,
         quality_score,
         issues,
     }
