@@ -887,6 +887,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_workspace_internal_ranges_uses_the_discovered_manifest_snapshot() {
+        let (_tmp, mut workspace) = workspace_with_app_dep("^1.2.3");
+        workspace.members[0].package.version = Some("2.0.0".to_string());
+
+        let error = validate_workspace_internal_ranges(&workspace)
+            .expect_err("the stale internal range must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("current workspace version 2.0.0")
+        );
+    }
+
+    #[test]
     fn planned_manifests_reject_pretty_json_that_exceeds_the_manifest_limit() {
         let tmp = TempDir::new().unwrap();
         let mut manifest = String::with_capacity(5_100_000);

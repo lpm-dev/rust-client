@@ -3,11 +3,17 @@ use crate::install_ui;
 use crate::output;
 use crate::release_plan::{self, ReleasePlan};
 use crate::workspace_select;
-use lpm_common::{LpmError, PackageName};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use lpm_semver::VersionBump;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+#[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
+const RELEASE_WORKSPACE_DISCOVERY_MARKER_ENV: &str =
+    "LPM_INTERNAL_TEST_RELEASE_WORKSPACE_DISCOVERY_MARKER";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ReleaseSelection {
@@ -41,6 +47,40 @@ pub(crate) struct ReleasePublishOptions {
 struct ReleasePublishMember {
     path: PathBuf,
     intent: publish::PublishIntent,
+}
+
+struct ReleasePublishWorkspace {
+    member_paths_by_name: HashMap<String, PathBuf>,
+    member_paths: Vec<PathBuf>,
+    generation: lpm_workspace::PublishWorkspaceGeneration,
+}
+
+impl ReleasePublishWorkspace {
+    fn from_snapshot(
+        snapshot: lpm_workspace::Workspace,
+        initial_root: &SelectedReleaseWorkspaceRoot,
+    ) -> Result<Self, LpmError> {
+        let mut member_paths_by_name = HashMap::with_capacity(snapshot.members.len());
+        let mut member_paths = Vec::with_capacity(snapshot.members.len());
+        for member in &snapshot.members {
+            member_paths.push(member.path.clone());
+            if let Some(name) = member.package.name.as_ref() {
+                member_paths_by_name.insert(name.clone(), member.path.clone());
+            }
+        }
+        let generation = lpm_workspace::capture_publish_workspace_generation_from_open_root(
+            &initial_root.path,
+            &initial_root.directory,
+            &member_paths_by_name,
+            &member_paths,
+        )
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+        Ok(Self {
+            member_paths_by_name,
+            member_paths,
+            generation,
+        })
+    }
 }
 
 struct SelectedReleaseWorkspaceRoot {
@@ -105,6 +145,17 @@ impl SelectedReleaseWorkspaceRoot {
     }
 
     fn discover(&self, start_dir: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
+        #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
+        if let Some(marker_path) = std::env::var_os(RELEASE_WORKSPACE_DISCOVERY_MARKER_ENV) {
+            use std::io::Write as _;
+
+            let mut marker = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(marker_path)
+                .map_err(LpmError::Io)?;
+            marker.write_all(b"discover\n").map_err(LpmError::Io)?;
+        }
         lpm_workspace::discover_workspace_from_open_root(&self.path, &self.directory, start_dir)
             .map_err(|error| LpmError::Workspace(error.to_string()))?
             .ok_or_else(|| {
@@ -331,16 +382,52 @@ async fn publish_intent_members(
     options: &ReleasePublishOptions,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    validate_unique_publication_destinations(client, &members)?;
     let mut results = Vec::with_capacity(members.len());
-    let mut already_published = Vec::with_capacity(members.len());
-    for member in &members {
-        already_published.push(publish_member_preflight(client, &member.intent).await?);
-    }
+    let has_npm_compatible_targets = members
+        .iter()
+        .any(|member| member.intent.has_npm_compatible_targets());
+    let has_lpm_target = members.iter().any(|member| member.intent.has_lpm_target());
+    let has_npm_target = members.iter().any(|member| member.intent.has_npm_target());
+    let publish_clients = publish::ReleasePublishClients::new(
+        has_npm_compatible_targets,
+        has_lpm_target,
+        has_npm_target,
+        !options.dry_run,
+    )?;
+    let already_published = preflight_publish_members(client, &members, &publish_clients).await?;
+    let workspace = refresh_release_publish_workspace(
+        &initial_root,
+        install_lock.try_clone()?,
+        &members,
+        options.dry_run,
+    )
+    .await?;
 
     for (index, (member, is_published)) in members.iter().zip(&already_published).enumerate() {
         let name = member.intent.package_name().to_string();
         let version = member.intent.package_version().to_string();
         if *is_published {
+            if let Err(error) = validate_release_publish_member(
+                &initial_root,
+                &workspace,
+                install_lock.try_clone()?,
+                member,
+                options,
+            )
+            .await
+            {
+                let error_summary = release_publish_error_summary(&error);
+                append_failed_and_unattempted_results(
+                    &mut results,
+                    member,
+                    &members[index + 1..],
+                    &error_summary,
+                    &[],
+                );
+                emit_release_publish_results(&results, members.len(), options, json_output, false)?;
+                return Err(LpmError::ExitCode(1));
+            }
             results.push(serde_json::json!({
                 "name": name,
                 "version": version,
@@ -355,7 +442,8 @@ async fn publish_intent_members(
         }
 
         let prepared = match prepare_release_publish_member(
-            initial_root.try_clone()?,
+            &initial_root,
+            &workspace,
             install_lock.try_clone()?,
             member,
             options,
@@ -390,7 +478,7 @@ async fn publish_intent_members(
         }
 
         let publish_result: Result<publish::PublishExecutionReport, LpmError> =
-            publish::execute_prepared_for_release(client, prepared).await;
+            publish::execute_prepared_for_release(client, prepared, &publish_clients).await;
         match publish_result {
             Ok(report) if report.success => {}
             Ok(report) => {
@@ -517,30 +605,142 @@ fn emit_release_publish_results(
     Ok(())
 }
 
+async fn refresh_release_publish_workspace(
+    initial_root: &SelectedReleaseWorkspaceRoot,
+    install_lock: lpm_common::ProjectLockDirectory,
+    members: &[ReleasePublishMember],
+    dry_run: bool,
+) -> Result<ReleasePublishWorkspace, LpmError> {
+    let refresh = async {
+        initial_root.validate_named_path()?;
+        let workspace = initial_root.discover(&initial_root.path)?;
+        release_plan::validate_workspace_internal_ranges(&workspace)?;
+        let current_member_paths: HashSet<&Path> = workspace
+            .members
+            .iter()
+            .map(|member| member.path.as_path())
+            .collect();
+        for member in members {
+            if !current_member_paths.contains(member.path.as_path()) {
+                return Err(LpmError::Registry(format!(
+                    "{} changed after release publish preflight; retry the command",
+                    member.path.display()
+                )));
+            }
+        }
+        ReleasePublishWorkspace::from_snapshot(workspace, initial_root)
+    };
+    if dry_run {
+        lpm_common::with_project_shared_lock_async(
+            install_lock,
+            lpm_common::ProjectLockKind::Install,
+            refresh,
+        )
+        .await
+    } else {
+        lpm_common::with_project_exclusive_lock_async(
+            install_lock,
+            lpm_common::ProjectLockKind::Install,
+            refresh,
+        )
+        .await
+    }
+}
+
+fn current_release_publish_projection(
+    initial_root: &SelectedReleaseWorkspaceRoot,
+    workspace: &ReleasePublishWorkspace,
+    member: &ReleasePublishMember,
+    validate_workspace_generation: bool,
+) -> Result<(lpm_workspace::Workspace, publish::PublishManifest), LpmError> {
+    initial_root.validate_named_path()?;
+    let relative = member.path.strip_prefix(&initial_root.path).map_err(|_| {
+        LpmError::Registry(format!(
+            "release workspace member is outside the selected root: {}",
+            member.path.display()
+        ))
+    })?;
+    let directory = publish_common::open_cap_directory_path(&initial_root.directory, relative)?
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "release workspace member changed during publish: {}",
+                member.path.display()
+            ))
+        })?;
+    let source = publish::PublishSource::from_open_directory(member.path.clone(), directory)?;
+    let publish_manifest = publish::read_publish_manifest_from_source(source)?;
+    let projection_context = lpm_workspace::PublishProjectionContext::new(
+        &workspace.member_paths_by_name,
+        &workspace.member_paths,
+        &workspace.generation,
+        validate_workspace_generation,
+    );
+    let projection = lpm_workspace::read_publish_projection_from_open_root(
+        &initial_root.path,
+        &initial_root.directory,
+        &member.path,
+        &publish_manifest.package_json_content,
+        &projection_context,
+    )
+    .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    release_plan::validate_workspace_internal_ranges(&projection)?;
+    Ok((projection, publish_manifest))
+}
+
+async fn validate_release_publish_member(
+    initial_root: &SelectedReleaseWorkspaceRoot,
+    workspace: &ReleasePublishWorkspace,
+    install_lock: lpm_common::ProjectLockDirectory,
+    member: &ReleasePublishMember,
+    options: &ReleasePublishOptions,
+) -> Result<(), LpmError> {
+    let validate = async {
+        let (projection, publish_manifest) =
+            current_release_publish_projection(initial_root, workspace, member, !options.dry_run)?;
+        publish::validate_intent_with_workspace_lock_held(
+            &member.path,
+            &publish_manifest,
+            &projection,
+            &member.intent,
+            options.npm,
+            options.lpm,
+            options.github,
+            options.gitlab,
+            options.publish_registry.as_deref(),
+        )
+    };
+    if options.dry_run {
+        lpm_common::with_project_shared_lock_async(
+            install_lock,
+            lpm_common::ProjectLockKind::Install,
+            validate,
+        )
+        .await
+    } else {
+        lpm_common::with_project_exclusive_lock_async(
+            install_lock,
+            lpm_common::ProjectLockKind::Install,
+            validate,
+        )
+        .await
+    }
+}
+
 async fn prepare_release_publish_member(
-    initial_root: SelectedReleaseWorkspaceRoot,
+    initial_root: &SelectedReleaseWorkspaceRoot,
+    workspace: &ReleasePublishWorkspace,
     install_lock: lpm_common::ProjectLockDirectory,
     member: &ReleasePublishMember,
     options: &ReleasePublishOptions,
     json_output: bool,
 ) -> Result<publish::PreparedPublish, LpmError> {
     let prepare = async {
-        initial_root.validate_named_path()?;
-        let workspace = initial_root.discover(&initial_root.path)?;
-        release_plan::validate_workspace_internal_ranges(&workspace)?;
-        let remains_a_member = workspace
-            .members
-            .iter()
-            .any(|current| current.path == member.path);
-        if !remains_a_member {
-            return Err(LpmError::Registry(format!(
-                "{} changed after release publish preflight; retry the command",
-                member.path.display()
-            )));
-        }
+        let (projection, publish_manifest) =
+            current_release_publish_projection(initial_root, workspace, member, !options.dry_run)?;
         publish::prepare_intent_with_workspace_lock_held(
             &member.path,
-            &workspace,
+            publish_manifest,
+            &projection,
             &member.intent,
             options.dry_run,
             false,
@@ -579,48 +779,207 @@ async fn prepare_release_publish_member(
     }
 }
 
-async fn publish_member_preflight(
-    client: &RegistryClient,
-    publish: &publish::PublishIntent,
-) -> Result<bool, LpmError> {
-    let name = publish.package_name();
-    let version = publish.package_version();
-    let mut checked_targets = 0usize;
-    let mut existing_targets = Vec::new();
-    let mut target_count = 0usize;
+const RELEASE_PREFLIGHT_CONCURRENCY: usize = 4;
 
-    for (target, target_name) in publish.resolved_targets() {
-        target_count += 1;
-        match target {
-            publish::PublishTarget::Lpm => {
-                checked_targets += 1;
-                if lpm_version_exists(client, target_name, version).await? {
-                    existing_targets.push(target.display_name().to_string());
-                }
+async fn preflight_publish_members(
+    client: &RegistryClient,
+    members: &[ReleasePublishMember],
+    clients: &publish::ReleasePublishClients,
+) -> Result<Vec<bool>, LpmError> {
+    let permit_limit = u32::try_from(RELEASE_PREFLIGHT_CONCURRENCY)
+        .map_err(|_| LpmError::Registry("release preflight concurrency is invalid".into()))?;
+    let permits = tokio::sync::Semaphore::new(RELEASE_PREFLIGHT_CONCURRENCY);
+    let mut jobs = members
+        .iter()
+        .enumerate()
+        .flat_map(|(member_index, member)| {
+            (0..member.intent.preflight_target_count())
+                .map(move |target_index| (member_index, target_index, member))
+        })
+        .enumerate();
+    let mut in_flight = FuturesUnordered::new();
+    for _ in 0..RELEASE_PREFLIGHT_CONCURRENCY {
+        let Some((job_index, (member_index, target_index, member))) = jobs.next() else {
+            break;
+        };
+        in_flight.push(run_release_preflight_job(
+            job_index,
+            member_index,
+            target_index,
+            member,
+            client,
+            clients,
+            &permits,
+            permit_limit,
+        ));
+    }
+
+    let mut checked_targets = vec![0usize; members.len()];
+    let mut existing_targets = vec![Vec::new(); members.len()];
+    let mut already_published = vec![false; members.len()];
+    let mut ordered_outcomes = BTreeMap::new();
+    let mut next_ordered_job = 0usize;
+    let mut earliest_observed_error = None;
+
+    while let Some((job_index, member_index, outcome)) = in_flight.next().await {
+        if outcome.is_err() {
+            earliest_observed_error = Some(
+                earliest_observed_error
+                    .map_or(job_index, |earliest: usize| earliest.min(job_index)),
+            );
+        }
+        ordered_outcomes.insert(job_index, (member_index, outcome));
+
+        while let Some((member_index, outcome)) = ordered_outcomes.remove(&next_ordered_job) {
+            let outcome = outcome?;
+            checked_targets[member_index] += 1;
+            if outcome.version_exists {
+                existing_targets[member_index].push(outcome.target_display);
             }
-            publish::PublishTarget::Npm => {
-                checked_targets += 1;
-                if npm_version_exists(client, target_name, version).await? {
-                    existing_targets.push(target.display_name().to_string());
+            if checked_targets[member_index]
+                == members[member_index].intent.preflight_target_count()
+            {
+                let existing = &existing_targets[member_index];
+                let all_exist = existing.len() == checked_targets[member_index];
+                if !all_exist && !existing.is_empty() {
+                    let member = &members[member_index];
+                    return Err(LpmError::Registry(format!(
+                        "{}@{} already exists on {}; release publish cannot partially skip targets. Re-run with a narrower publish target.",
+                        member.intent.package_name(),
+                        member.intent.package_version(),
+                        existing.join(", ")
+                    )));
                 }
+                already_published[member_index] = all_exist;
             }
-            publish::PublishTarget::GitHub
-            | publish::PublishTarget::GitLab
-            | publish::PublishTarget::Custom(_) => {}
+            next_ordered_job += 1;
+        }
+
+        while in_flight.len() < RELEASE_PREFLIGHT_CONCURRENCY {
+            let Some((job_index, (member_index, target_index, member))) = jobs.next() else {
+                break;
+            };
+            if earliest_observed_error.is_some_and(|error_index| job_index > error_index) {
+                break;
+            }
+            in_flight.push(run_release_preflight_job(
+                job_index,
+                member_index,
+                target_index,
+                member,
+                client,
+                clients,
+                &permits,
+                permit_limit,
+            ));
         }
     }
-
-    let already_published = checked_targets > 0 && existing_targets.len() == target_count;
-    if !already_published && !existing_targets.is_empty() {
-        return Err(LpmError::Registry(format!(
-            "{}@{} already exists on {}; release publish cannot partially skip targets. Re-run with a narrower publish target.",
-            name,
-            version,
-            existing_targets.join(", ")
-        )));
-    }
-
     Ok(already_published)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_release_preflight_job(
+    job_index: usize,
+    member_index: usize,
+    target_index: usize,
+    member: &ReleasePublishMember,
+    client: &RegistryClient,
+    clients: &publish::ReleasePublishClients,
+    permits: &tokio::sync::Semaphore,
+    permit_limit: u32,
+) -> (
+    usize,
+    usize,
+    Result<publish::PublishTargetPreflight, LpmError>,
+) {
+    let outcome = member
+        .intent
+        .preflight_target(target_index, client, clients, permits, permit_limit)
+        .await;
+    (job_index, member_index, outcome)
+}
+
+fn validate_unique_publication_destinations(
+    client: &RegistryClient,
+    members: &[ReleasePublishMember],
+) -> Result<(), LpmError> {
+    let mut destinations = HashMap::new();
+    for member in members {
+        for (protocol, endpoint, name, version) in
+            member.intent.publication_coordinates(client.base_url())
+        {
+            let endpoint = normalize_publication_endpoint(endpoint)?;
+            let coordinate = (protocol.to_string(), endpoint, name.to_string());
+            if let Some((previous_path, previous_version)) =
+                destinations.insert(coordinate, (&member.path, version))
+            {
+                let detail = if previous_version == version {
+                    format!("the same publication destination for {name}@{version}")
+                } else {
+                    format!(
+                        "the same remote package {name} at different versions ({previous_version} and {version})"
+                    )
+                };
+                return Err(LpmError::Registry(format!(
+                    "{} and {} resolve to {detail}",
+                    previous_path.display(),
+                    member.path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_publication_endpoint(endpoint: &str) -> Result<String, LpmError> {
+    let mut parsed = reqwest::Url::parse(endpoint).map_err(|error| {
+        LpmError::Registry(format!("invalid publish registry endpoint: {error}"))
+    })?;
+    let normalized_path = canonicalize_url_path(parsed.path());
+    let normalized_path = normalized_path.trim_end_matches('/');
+    parsed.set_path(if normalized_path.is_empty() {
+        "/"
+    } else {
+        normalized_path
+    });
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn canonicalize_url_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut normalized = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            let decoded = (high << 4) | low;
+            if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'.' | b'_' | b'~') {
+                normalized.push(char::from(decoded));
+            } else {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                normalized.push('%');
+                normalized.push(char::from(HEX[usize::from(high)]));
+                normalized.push(char::from(HEX[usize::from(low)]));
+            }
+            index += 3;
+            continue;
+        }
+        normalized.push(char::from(bytes[index]));
+        index += 1;
+    }
+    normalized
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn build_plan_read_only(
@@ -748,42 +1107,21 @@ fn emit_plan(plan: &ReleasePlan, dry_run: bool, json_output: bool) -> Result<(),
     Ok(())
 }
 
-async fn lpm_version_exists(
-    client: &RegistryClient,
-    name: &str,
-    version: &str,
-) -> Result<bool, LpmError> {
-    if !name.starts_with("@lpm.dev/") {
-        return Ok(false);
-    }
-    let package_name = PackageName::parse(name)?;
-    match client.get_package_metadata(&package_name).await {
-        Ok(metadata) => Ok(metadata.versions.contains_key(version)),
-        Err(err) if err.to_string().contains("not found") => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-async fn npm_version_exists(
-    client: &RegistryClient,
-    name: &str,
-    version: &str,
-) -> Result<bool, LpmError> {
-    match client.get_npm_package_metadata(name).await {
-        Ok(metadata) => Ok(metadata.versions.contains_key(version)),
-        Err(err) if is_not_found_error(&err) => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-fn is_not_found_error(error: &LpmError) -> bool {
-    let message = error.to_string();
-    message.contains("not found") || message.contains("404")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_endpoint_normalization_decodes_unreserved_path_bytes() {
+        let plain = normalize_publication_endpoint("https://registry.example.test/npm").unwrap();
+        let encoded_lower =
+            normalize_publication_endpoint("https://registry.example.test/%6epm").unwrap();
+        let encoded_upper =
+            normalize_publication_endpoint("https://registry.example.test/%6Epm").unwrap();
+
+        assert_eq!(encoded_lower, plain);
+        assert_eq!(encoded_upper, plain);
+    }
 
     #[test]
     fn release_workspace_selection_keeps_the_opened_generation_after_same_path_replacement() {

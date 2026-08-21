@@ -6,9 +6,11 @@ use super::output::{
     print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
     publish_result_json, visibility_from_access,
 };
+#[cfg(test)]
+use super::prepare::read_publish_manifest;
 use super::prepare::{
-    PublishSource, prepare_publish_project_from_manifest, read_publish_manifest,
-    read_publish_manifest_from_source, validate_publish_tarball_size,
+    PublishSource, prepare_publish_project_from_manifest, read_publish_manifest_from_source,
+    validate_publish_tarball_size,
 };
 use super::provenance::{
     ProvenanceRequest, load_provenance_request_file, materialize_provenance_request,
@@ -28,7 +30,7 @@ use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_wit
 use crate::commands::skills::author;
 use crate::commands::{npm_auth, publish_common, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, sigstore};
-use lpm_common::LpmError;
+use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
@@ -45,6 +47,80 @@ struct NpmFilePreflightInput<'a> {
     tarball_hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
     rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
     json_output: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NpmCompatiblePublishEndpoint {
+    registry_url: String,
+    tag_explicit: bool,
+}
+
+struct ResolvedNpmTargetCredential {
+    token: String,
+    auth_source: Option<&'static str>,
+}
+
+pub(crate) struct ReleasePublishClients {
+    npm_preflight: Option<reqwest::Client>,
+    registry_oidc: Option<reqwest::Client>,
+    npm_oidc: Option<reqwest::Client>,
+    registry_provider_jwt: tokio::sync::OnceCell<String>,
+    npm_provider_jwt: tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>,
+    npm_publish: Option<publish_npm::NpmPublishClients>,
+}
+
+impl ReleasePublishClients {
+    pub(crate) fn new(
+        has_npm_compatible_targets: bool,
+        has_lpm_target: bool,
+        has_npm_target: bool,
+        prepare_upload_clients: bool,
+    ) -> Result<Self, LpmError> {
+        let registry_oidc = (has_lpm_target && oidc::registry_exchange_jwt_available())
+            .then(oidc::build_registry_oidc_exchange_client)
+            .transpose()?;
+        let npm_oidc = (has_npm_target && oidc::npm_trusted_publish_jwt_available())
+            .then(npm_auth::build_npm_oidc_exchange_client)
+            .transpose()?;
+        let npm_preflight = has_npm_compatible_targets
+            .then(publish_npm::build_npm_publish_preflight_client)
+            .transpose()?;
+        let npm_publish = (has_npm_compatible_targets && prepare_upload_clients)
+            .then(publish_npm::build_npm_publish_clients)
+            .transpose()?;
+        Ok(Self {
+            npm_preflight,
+            registry_oidc,
+            npm_oidc,
+            registry_provider_jwt: tokio::sync::OnceCell::new(),
+            npm_provider_jwt: tokio::sync::OnceCell::new(),
+            npm_publish,
+        })
+    }
+
+    async fn exchange_registry_publish_token(
+        &self,
+        registry_url: &str,
+        package_name: &str,
+        publication_wait_timeout: Option<std::time::Duration>,
+    ) -> Result<oidc::OidcToken, LpmError> {
+        let client = self.registry_oidc.as_ref().ok_or_else(|| {
+            LpmError::Registry("release registry OIDC client is unavailable".into())
+        })?;
+        oidc::validate_registry_exchange_url(registry_url)?;
+        let provider_jwt = self
+            .registry_provider_jwt
+            .get_or_try_init(oidc::resolve_registry_exchange_jwt)
+            .await?;
+        oidc::exchange_publish_oidc_token_with_client_and_jwt(
+            client,
+            registry_url,
+            package_name,
+            provider_jwt,
+            publication_wait_timeout,
+        )
+        .await
+    }
 }
 
 struct PublishTransactionRoot {
@@ -91,6 +167,7 @@ pub(crate) struct PreparedPublish {
     version_data: serde_json::Value,
     precomputed_npm_artifacts: HashMap<String, NpmTargetArtifact>,
     quality_result: Option<crate::quality::QualityResult>,
+    npm_version_preflighted: bool,
 }
 
 pub(crate) struct PublishExecutionReport {
@@ -137,6 +214,12 @@ impl PublishExecutionReport {
 struct ResolvedPublishTarget {
     target: PublishTarget,
     name: String,
+    npm_endpoint: Option<NpmCompatiblePublishEndpoint>,
+}
+
+pub(crate) struct PublishTargetPreflight {
+    pub(crate) target_display: String,
+    pub(crate) version_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,11 +242,157 @@ impl PublishIntent {
         &self.package_version
     }
 
-    pub(crate) fn resolved_targets(&self) -> impl Iterator<Item = (&PublishTarget, &str)> {
+    pub(crate) fn preflight_target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    pub(crate) fn has_npm_compatible_targets(&self) -> bool {
         self.targets
             .iter()
-            .map(|target| (&target.target, target.name.as_str()))
+            .any(|target| target.npm_endpoint.is_some())
     }
+
+    pub(crate) fn has_lpm_target(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|target| matches!(target.target, PublishTarget::Lpm))
+    }
+
+    pub(crate) fn has_npm_target(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|target| matches!(target.target, PublishTarget::Npm))
+    }
+
+    pub(crate) async fn preflight_target(
+        &self,
+        target_index: usize,
+        client: &RegistryClient,
+        clients: &ReleasePublishClients,
+        permits: &tokio::sync::Semaphore,
+        permit_limit: u32,
+    ) -> Result<PublishTargetPreflight, LpmError> {
+        let resolved = self.targets.get(target_index).ok_or_else(|| {
+            LpmError::Registry("release publish preflight target index is invalid".into())
+        })?;
+        let version_exists = match &resolved.target {
+            PublishTarget::Lpm => {
+                let light_permit = acquire_preflight_permits(permits, 1).await?;
+                let oidc_client;
+                let client = if clients.registry_oidc.is_some() {
+                    let oidc_token = clients
+                        .exchange_registry_publish_token(client.base_url(), &resolved.name, None)
+                        .await
+                        .map_err(|error| {
+                            LpmError::Registry(format!(
+                                "Trusted Publisher exchange failed for {}: {error}",
+                                resolved.name
+                            ))
+                        })?;
+                    oidc_client = client
+                        .clone_with_config()
+                        .with_token_override(oidc_token.token);
+                    &oidc_client
+                } else {
+                    client
+                };
+                let preflight = client
+                    .publish_preflight(&resolved.name, &self.package_version)
+                    .await?;
+                drop(light_permit);
+                if !preflight.package_exists {
+                    false
+                } else {
+                    let _metadata_permit = acquire_preflight_permits(permits, permit_limit).await?;
+                    let package_name = PackageName::parse(&resolved.name)?;
+                    match client.refetch_package_metadata(&package_name).await {
+                        Ok(metadata) => {
+                            if metadata.name != resolved.name {
+                                return Err(LpmError::Registry(format!(
+                                    "LPM metadata returned an unexpected package (expected '{}', received '{}')",
+                                    resolved.name, metadata.name
+                                )));
+                            }
+                            metadata.versions.contains_key(&self.package_version)
+                        }
+                        Err(LpmError::NotFound(_)) => false,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            PublishTarget::Npm
+            | PublishTarget::GitHub
+            | PublishTarget::GitLab
+            | PublishTarget::Custom(_) => {
+                let endpoint = resolved.npm_endpoint.as_ref().ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "no npm-compatible endpoint resolved for {}",
+                        resolved.target.display_name()
+                    ))
+                })?;
+                let npm_client = clients.npm_preflight.as_ref().ok_or_else(|| {
+                    LpmError::Registry("npm publish preflight client is unavailable".into())
+                })?;
+                let permit_count = if endpoint.tag_explicit {
+                    1
+                } else {
+                    permit_limit
+                };
+                let _permit = acquire_preflight_permits(permits, permit_count).await?;
+                let credential = resolve_npm_target_credential(
+                    &resolved.target,
+                    &resolved.name,
+                    &endpoint.registry_url,
+                    Some(clients),
+                )
+                .await?;
+                matches!(
+                    publish_npm::preflight_npm_publish_version_with_client(
+                        npm_client,
+                        &credential.token,
+                        &resolved.name,
+                        &self.package_version,
+                        endpoint.tag_explicit,
+                        &endpoint.registry_url,
+                    )
+                    .await?,
+                    publish_npm::NpmPublishVersionPreflight::AlreadyPublished
+                )
+            }
+        };
+        Ok(PublishTargetPreflight {
+            target_display: resolved.target.display_name().to_string(),
+            version_exists,
+        })
+    }
+
+    pub(crate) fn publication_coordinates<'a>(
+        &'a self,
+        lpm_registry_url: &'a str,
+    ) -> impl Iterator<Item = (&'static str, &'a str, &'a str, &'a str)> + 'a {
+        self.targets.iter().map(move |resolved| {
+            let (protocol, endpoint) = match &resolved.npm_endpoint {
+                Some(endpoint) => ("npm", endpoint.registry_url.as_str()),
+                None => ("lpm", lpm_registry_url),
+            };
+            (
+                protocol,
+                endpoint,
+                resolved.name.as_str(),
+                self.package_version.as_str(),
+            )
+        })
+    }
+}
+
+async fn acquire_preflight_permits(
+    permits: &tokio::sync::Semaphore,
+    count: u32,
+) -> Result<tokio::sync::SemaphorePermit<'_>, LpmError> {
+    permits
+        .acquire_many(count)
+        .await
+        .map_err(|_| LpmError::Registry("release preflight scheduler closed unexpectedly".into()))
 }
 
 #[cfg(test)]
@@ -235,7 +464,13 @@ fn publish_intent_from_manifest(
         let name = target_names.get(&key).cloned().ok_or_else(|| {
             LpmError::Registry(format!("no name resolved for {}", target.display_name()))
         })?;
-        resolved_targets.push(ResolvedPublishTarget { target, name });
+        let npm_endpoint =
+            resolve_npm_compatible_publish_endpoint(&target, manifest.publish_config.as_ref())?;
+        resolved_targets.push(ResolvedPublishTarget {
+            target,
+            name,
+            npm_endpoint,
+        });
     }
     let publish_config = serde_json::to_vec(&manifest.publish_config).map_err(|error| {
         LpmError::Registry(format!("failed to fingerprint publish config: {error}"))
@@ -554,6 +789,7 @@ pub(crate) async fn prepare_with_workspace_lock_held(
         provenance_flag,
         no_provenance,
         provenance_file,
+        false,
     )
     .await
 }
@@ -561,6 +797,7 @@ pub(crate) async fn prepare_with_workspace_lock_held(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_intent_with_workspace_lock_held(
     project_dir: &Path,
+    publish_manifest: super::prepare::PublishManifest,
     workspace: &lpm_workspace::Workspace,
     intent: &PublishIntent,
     dry_run: bool,
@@ -581,7 +818,6 @@ pub(crate) async fn prepare_intent_with_workspace_lock_held(
     no_provenance: bool,
     provenance_file: Option<&Path>,
 ) -> Result<PreparedPublish, LpmError> {
-    let publish_manifest = read_publish_manifest(project_dir)?;
     validate_publish_intent(
         project_dir,
         &publish_manifest,
@@ -614,8 +850,34 @@ pub(crate) async fn prepare_intent_with_workspace_lock_held(
         provenance_flag,
         no_provenance,
         provenance_file,
+        true,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_intent_with_workspace_lock_held(
+    project_dir: &Path,
+    publish_manifest: &super::prepare::PublishManifest,
+    workspace: &lpm_workspace::Workspace,
+    intent: &PublishIntent,
+    cli_npm: bool,
+    cli_lpm: bool,
+    cli_github: bool,
+    cli_gitlab: bool,
+    cli_registry: Option<&str>,
+) -> Result<(), LpmError> {
+    validate_publish_intent(
+        project_dir,
+        publish_manifest,
+        workspace,
+        intent,
+        cli_npm,
+        cli_lpm,
+        cli_github,
+        cli_gitlab,
+        cli_registry,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -640,6 +902,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     provenance_flag: bool,
     no_provenance: bool,
     provenance_file: Option<&Path>,
+    npm_version_preflighted: bool,
 ) -> Result<PreparedPublish, LpmError> {
     let publish_started = std::time::Instant::now();
     let mut publish_manifest = publish_manifest;
@@ -864,6 +1127,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         version_data,
         precomputed_npm_artifacts,
         quality_result,
+        npm_version_preflighted,
     })
 }
 
@@ -871,7 +1135,7 @@ pub(crate) async fn execute_prepared(
     client: &RegistryClient,
     prepared: PreparedPublish,
 ) -> Result<(), LpmError> {
-    execute_prepared_inner(client, prepared, true)
+    execute_prepared_inner(client, prepared, true, None)
         .await?
         .into_command_result()
 }
@@ -879,14 +1143,16 @@ pub(crate) async fn execute_prepared(
 pub(crate) async fn execute_prepared_for_release(
     client: &RegistryClient,
     prepared: PreparedPublish,
+    release_clients: &ReleasePublishClients,
 ) -> Result<PublishExecutionReport, LpmError> {
-    execute_prepared_inner(client, prepared, false).await
+    execute_prepared_inner(client, prepared, false, Some(release_clients)).await
 }
 
 async fn execute_prepared_inner(
     client: &RegistryClient,
     prepared: PreparedPublish,
     emit_summary: bool,
+    release_clients: Option<&ReleasePublishClients>,
 ) -> Result<PublishExecutionReport, LpmError> {
     let PreparedPublish {
         publish_started,
@@ -919,6 +1185,7 @@ async fn execute_prepared_inner(
         version_data,
         mut precomputed_npm_artifacts,
         quality_result,
+        npm_version_preflighted,
     } = prepared;
     let publish_config = publish_config.as_ref();
     let npm_config = publish_config.and_then(|config| config.npm.as_ref());
@@ -954,12 +1221,24 @@ async fn execute_prepared_inner(
             let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
                 LpmError::Registry("no resolved LPM.dev package name for OIDC exchange".into())
             })?;
-            let oidc_token = oidc::exchange_publish_oidc_token(
-                client.base_url(),
-                resolved_lpm_name,
-                publication_wait_timeout,
-            )
-            .await
+            let oidc_token = if let Some(release_clients) =
+                release_clients.filter(|clients| clients.registry_oidc.is_some())
+            {
+                release_clients
+                    .exchange_registry_publish_token(
+                        client.base_url(),
+                        resolved_lpm_name,
+                        publication_wait_timeout,
+                    )
+                    .await
+            } else {
+                oidc::exchange_publish_oidc_token(
+                    client.base_url(),
+                    resolved_lpm_name,
+                    publication_wait_timeout,
+                )
+                .await
+            }
             .map_err(|error| {
                 LpmError::Registry(format!(
                     "Trusted Publisher exchange failed for {resolved_lpm_name}: {error}"
@@ -1108,6 +1387,12 @@ async fn execute_prepared_inner(
         ProvenanceRequest::File(_) => None,
         request => materialize_provenance_request(request).await?,
     };
+    let npm_preflight_client =
+        if !npm_version_preflighted && targets.iter().any(is_npm_compatible_target) {
+            Some(publish_npm::build_npm_publish_preflight_client()?)
+        } else {
+            None
+        };
 
     // Publish sequentially so per-target auth prompts and summaries stay deterministic.
     // All per-target errors are caught and collected — the loop NEVER aborts early.
@@ -1296,80 +1581,33 @@ async fn execute_prepared_inner(
                         ))
                     })?;
 
-                    // Resolve registry URL, token, display name per target
-                    let (registry_url, token, display, auth_source) = match target {
-                        PublishTarget::Npm => {
-                            let registry_url = publish_npm::resolve_npm_registry(npm_config);
-                            let npm_auth =
-                                npm_auth::resolve_publish_auth(npm_name_str, &registry_url)
-                                    .await?;
-                            (
-                                registry_url,
-                                npm_auth.token().to_string(),
-                                "npm",
-                                Some(npm_auth.source().as_str()),
-                            )
-                        }
-                        PublishTarget::GitHub => (
-                            "https://npm.pkg.github.com".to_string(),
-                            auth::get_github_token().ok_or_else(|| {
-                                LpmError::Registry(
-                                    "no GitHub Packages token found. Run `gh auth login --hostname github.com`, run `lpm login --github --token <pat>`, or set GITHUB_TOKEN.".into(),
-                                )
-                            })?,
-                            "GitHub Packages",
-                            None,
-                        ),
-                        PublishTarget::GitLab => {
-                            let gl_cfg = publish_config.and_then(|p| p.gitlab.as_ref());
-                            let project_id = gl_cfg
-                                .and_then(|c| c.project_id.as_deref())
-                                .ok_or_else(|| {
-                                    LpmError::Registry(
-                                        "GitLab publish requires publish.gitlab.projectId in lpm.json"
-                                            .into(),
-                                    )
-                                })?;
-                            let gitlab_host = gl_cfg
-                                .and_then(|c| c.registry.as_deref())
-                                .unwrap_or("https://gitlab.com");
-                            if gitlab_host.trim_end_matches('/') != "https://gitlab.com" {
-                                tracing::warn!(
-                                    target_url = %crate::install_ui::safe_url_origin(gitlab_host),
-                                    "publish.gitlab.registry overridden — an exact registry-scoped token is required",
-                                );
-                            }
-                            let url = format!(
-                                "{}/api/v4/projects/{}/packages/npm",
-                                gitlab_host.trim_end_matches('/'),
-                                urlencoding::encode(project_id)
-                            );
-                            let token = auth::get_gitlab_token_for_host(&url).ok_or_else(|| {
-                                LpmError::Registry(format!(
-                                    "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --login-registry {} --token <token>`.",
-                                    crate::install_ui::safe_url_origin(&url)
-                                ))
-                            })?;
-                            (
-                                url,
-                                token,
-                                "GitLab Packages",
-                                None,
-                            )
-                        }
-                        PublishTarget::Custom(url) => (
-                            url.clone(),
-                            auth::get_custom_registry_token(url).ok_or_else(|| {
-                                let safe_origin = crate::install_ui::safe_url_origin(url);
-                                LpmError::Registry(format!(
-                                    "no token found for {safe_origin}. Run `lpm login --login-registry <configured-registry-url> --token <token>`."
-                                ))
-                            })?,
-                            "custom",
-                            None,
-                        ),
-                        _ => unreachable!(),
-                    };
+                    let endpoint = resolve_npm_compatible_publish_endpoint(target, publish_config)?
+                        .ok_or_else(|| {
+                            LpmError::Registry(format!(
+                                "no npm-compatible endpoint resolved for {}",
+                                target.display_name()
+                            ))
+                        })?;
+                    let credential = resolve_npm_target_credential(
+                        target,
+                        npm_name_str,
+                        &endpoint.registry_url,
+                        release_clients,
+                    )
+                    .await?;
+                    let registry_url = endpoint.registry_url;
+                    let token = credential.token;
+                    let display = target.display_name();
+                    let auth_source = credential.auth_source;
+
+                    if matches!(target, PublishTarget::GitLab)
+                        && !registry_url.starts_with("https://gitlab.com/api/v4/projects/")
+                    {
+                        tracing::warn!(
+                            target_url = %crate::install_ui::safe_url_origin(&registry_url),
+                            "publish.gitlab.registry overridden — an exact registry-scoped token is required",
+                        );
+                    }
 
                     if auth_source == Some("oidc") && !json_output {
                         install_ui::phase("Using npm Trusted Publishing (OIDC)");
@@ -1389,17 +1627,24 @@ async fn execute_prepared_inner(
                         )));
                     }
                     let npm_tag = publish_npm::resolve_npm_tag(npm_config);
-                    let npm_tag_explicit = npm_config
-                        .and_then(|config| config.tag.as_deref())
-                        .is_some();
-                    publish_npm::preflight_npm_publish_version(
-                        &token,
-                        npm_name_str,
-                        &version,
-                        npm_tag_explicit,
-                        &registry_url,
-                    )
-                    .await?;
+                    if let Some(preflight_client) = npm_preflight_client.as_ref()
+                        && matches!(
+                            publish_npm::preflight_npm_publish_version_with_client(
+                                preflight_client,
+                                &token,
+                                npm_name_str,
+                                &version,
+                                endpoint.tag_explicit,
+                                &registry_url,
+                            )
+                            .await?,
+                            publish_npm::NpmPublishVersionPreflight::AlreadyPublished
+                        )
+                    {
+                        return Err(LpmError::Registry(format!(
+                            "version {version} already exists on npm for {npm_name_str}"
+                        )));
+                    }
 
                     // OTP preemption
                     let registry_key_for_otp = match target {
@@ -1443,22 +1688,44 @@ async fn execute_prepared_inner(
                     } else {
                         Some(install_ui::spin_line(format_upload_message(display)))
                     };
-                    let npm_result = publish_npm::publish_to_npm(
-                        &token,
-                        npm_name_str,
-                        &version,
-                        &target_artifact.version_data,
-                        &final_tarball_data,
-                        &target_artifact.tarball_hashes,
-                        target_artifact.provenance_attachment.as_ref(),
-                        npm_access,
-                        &npm_tag,
-                        &registry_url,
-                        otp_preempt,
-                        json_output,
-                        yes,
-                    )
-                    .await?;
+                    let npm_result = if let Some(clients) =
+                        release_clients.and_then(|clients| clients.npm_publish.as_ref())
+                    {
+                        publish_npm::publish_to_npm_with_clients(
+                            clients,
+                            &token,
+                            npm_name_str,
+                            &version,
+                            &target_artifact.version_data,
+                            &final_tarball_data,
+                            &target_artifact.tarball_hashes,
+                            target_artifact.provenance_attachment.as_ref(),
+                            npm_access,
+                            &npm_tag,
+                            &registry_url,
+                            otp_preempt,
+                            json_output,
+                            yes,
+                        )
+                        .await?
+                    } else {
+                        publish_npm::publish_to_npm(
+                            &token,
+                            npm_name_str,
+                            &version,
+                            &target_artifact.version_data,
+                            &final_tarball_data,
+                            &target_artifact.tarball_hashes,
+                            target_artifact.provenance_attachment.as_ref(),
+                            npm_access,
+                            &npm_tag,
+                            &registry_url,
+                            otp_preempt,
+                            json_output,
+                            yes,
+                        )
+                        .await?
+                    };
                     drop(upload_spinner);
                     if !json_output {
                         print_upload_details(
@@ -1819,6 +2086,140 @@ fn is_npm_compatible_target(target: &PublishTarget) -> bool {
             | PublishTarget::GitLab
             | PublishTarget::Custom(_)
     )
+}
+
+fn resolve_npm_compatible_publish_endpoint(
+    target: &PublishTarget,
+    publish_config: Option<&lpm_runner::lpm_json::PublishConfig>,
+) -> Result<Option<NpmCompatiblePublishEndpoint>, LpmError> {
+    let npm_config = publish_config.and_then(|config| config.npm.as_ref());
+    let registry_url = match target {
+        PublishTarget::Lpm => return Ok(None),
+        PublishTarget::Npm => publish_npm::resolve_npm_registry(npm_config),
+        PublishTarget::GitHub => "https://npm.pkg.github.com".to_string(),
+        PublishTarget::GitLab => {
+            let gitlab_config = publish_config.and_then(|config| config.gitlab.as_ref());
+            let project_id = gitlab_config
+                .and_then(|config| config.project_id.as_deref())
+                .ok_or_else(|| {
+                    LpmError::Registry(
+                        "GitLab Packages requires publish.gitlab.projectId in lpm.json".into(),
+                    )
+                })?;
+            let registry = gitlab_config
+                .and_then(|config| config.registry.as_deref())
+                .unwrap_or("https://gitlab.com");
+            format!(
+                "{}/api/v4/projects/{}/packages/npm",
+                registry.trim_end_matches('/'),
+                urlencoding::encode(project_id)
+            )
+        }
+        PublishTarget::Custom(url) => url.clone(),
+    };
+    Ok(Some(NpmCompatiblePublishEndpoint {
+        registry_url,
+        tag_explicit: npm_config
+            .and_then(|config| config.tag.as_deref())
+            .is_some(),
+    }))
+}
+
+#[cfg(test)]
+mod npm_compatible_publish_endpoint_tests {
+    use super::{
+        NpmCompatiblePublishEndpoint, PublishTarget, resolve_npm_compatible_publish_endpoint,
+    };
+
+    #[test]
+    fn github_preflight_uses_the_github_packages_registry() {
+        let endpoint = resolve_npm_compatible_publish_endpoint(&PublishTarget::GitHub, None)
+            .unwrap()
+            .expect("GitHub must resolve an npm-compatible endpoint");
+
+        assert_eq!(
+            endpoint,
+            NpmCompatiblePublishEndpoint {
+                registry_url: "https://npm.pkg.github.com".to_string(),
+                tag_explicit: false,
+            }
+        );
+    }
+
+    #[test]
+    fn custom_registry_preflight_uses_the_exact_configured_endpoint() {
+        let registry = "https://registry.example.test/npm/private";
+        let endpoint = resolve_npm_compatible_publish_endpoint(
+            &PublishTarget::Custom(registry.to_string()),
+            None,
+        )
+        .unwrap()
+        .expect("custom registries must resolve an npm-compatible endpoint");
+
+        assert_eq!(endpoint.registry_url, registry);
+    }
+}
+
+async fn resolve_npm_target_credential(
+    target: &PublishTarget,
+    npm_name: &str,
+    registry_url: &str,
+    release_clients: Option<&ReleasePublishClients>,
+) -> Result<ResolvedNpmTargetCredential, LpmError> {
+    match target {
+        PublishTarget::Npm => {
+            let npm_auth = if let Some((client, provider_jwt)) = release_clients.and_then(|clients| {
+                clients
+                    .npm_oidc
+                    .as_ref()
+                    .map(|client| (client, &clients.npm_provider_jwt))
+            }) {
+                npm_auth::resolve_publish_auth_with_oidc_context(
+                    npm_name,
+                    registry_url,
+                    client,
+                    provider_jwt,
+                )
+                .await?
+            } else {
+                npm_auth::resolve_publish_auth(npm_name, registry_url).await?
+            };
+            Ok(ResolvedNpmTargetCredential {
+                token: npm_auth.token().to_string(),
+                auth_source: Some(npm_auth.source().as_str()),
+            })
+        }
+        PublishTarget::GitHub => Ok(ResolvedNpmTargetCredential {
+            token: auth::get_github_token().ok_or_else(|| {
+                LpmError::Registry(
+                    "no GitHub Packages token found. Run `gh auth login --hostname github.com`, run `lpm login --github --token <pat>`, or set GITHUB_TOKEN."
+                        .into(),
+                )
+            })?,
+            auth_source: None,
+        }),
+        PublishTarget::GitLab => Ok(ResolvedNpmTargetCredential {
+            token: auth::get_gitlab_token_for_host(registry_url).ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --login-registry {} --token <token>`.",
+                    crate::install_ui::safe_url_origin(registry_url)
+                ))
+            })?,
+            auth_source: None,
+        }),
+        PublishTarget::Custom(url) => Ok(ResolvedNpmTargetCredential {
+            token: auth::get_custom_registry_token(url).ok_or_else(|| {
+                let safe_origin = crate::install_ui::safe_url_origin(url);
+                LpmError::Registry(format!(
+                    "no token found for {safe_origin}. Run `lpm login --login-registry <configured-registry-url> --token <token>`."
+                ))
+            })?,
+            auth_source: None,
+        }),
+        PublishTarget::Lpm => Err(LpmError::Registry(
+            "LPM is not an npm-compatible publish target".into(),
+        )),
+    }
 }
 
 pub(crate) fn resolve_target_names(

@@ -57,14 +57,48 @@ pub(crate) async fn resolve_publish_auth(
     .await
 }
 
+pub(crate) async fn resolve_publish_auth_with_oidc_context(
+    npm_name: &str,
+    registry_url: &str,
+    oidc_client: &reqwest::Client,
+    provider_jwt: &tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>,
+) -> Result<NpmAuth, LpmError> {
+    resolve_publish_auth_with_policy_and_oidc_client(
+        npm_name,
+        registry_url,
+        NpmRegistryAuthPolicy::RequireRegistryScopedToken,
+        Some(oidc_client),
+        Some(provider_jwt),
+    )
+    .await
+}
+
 pub(crate) async fn resolve_publish_auth_with_policy(
     npm_name: &str,
     registry_url: &str,
     policy: NpmRegistryAuthPolicy,
 ) -> Result<NpmAuth, LpmError> {
+    resolve_publish_auth_with_policy_and_oidc_client(npm_name, registry_url, policy, None, None)
+        .await
+}
+
+async fn resolve_publish_auth_with_policy_and_oidc_client(
+    npm_name: &str,
+    registry_url: &str,
+    policy: NpmRegistryAuthPolicy,
+    oidc_client: Option<&reqwest::Client>,
+    provider_jwt: Option<&tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>>,
+) -> Result<NpmAuth, LpmError> {
     if oidc::npm_trusted_publish_jwt_available() {
         if registry_supports_npm_trusted_publishing(registry_url) {
-            let oidc_error = match exchange_trusted_publish_token(npm_name, registry_url).await {
+            let oidc_error = match exchange_trusted_publish_token(
+                npm_name,
+                registry_url,
+                oidc_client,
+                provider_jwt,
+            )
+            .await
+            {
                 Ok(token) => {
                     return Ok(NpmAuth {
                         token,
@@ -157,17 +191,37 @@ fn normalized_registry_url(registry_url: &str) -> String {
     registry_url.trim_end_matches('/').to_string()
 }
 
-async fn exchange_trusted_publish_token(
-    npm_name: &str,
-    registry_url: &str,
-) -> Result<String, LpmError> {
-    let jwt = oidc::resolve_npm_trusted_publish_jwt().await?;
-    let client = reqwest::Client::builder()
+pub(crate) fn build_npm_oidc_exchange_client() -> Result<reqwest::Client, LpmError> {
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
-        .map_err(|e| LpmError::Registry(format!("npm OIDC client build failed: {e}")))?;
+        .map_err(|error| LpmError::Registry(format!("npm OIDC client build failed: {error}")))
+}
+
+async fn exchange_trusted_publish_token(
+    npm_name: &str,
+    registry_url: &str,
+    shared_client: Option<&reqwest::Client>,
+    provider_jwt: Option<&tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>>,
+) -> Result<String, LpmError> {
+    let owned_jwt;
+    let jwt = if let Some(provider_jwt) = provider_jwt {
+        provider_jwt
+            .get_or_try_init(oidc::resolve_npm_trusted_publish_jwt)
+            .await?
+    } else {
+        owned_jwt = oidc::resolve_npm_trusted_publish_jwt().await?;
+        &owned_jwt
+    };
+    let owned_client;
+    let client = if let Some(client) = shared_client {
+        client
+    } else {
+        owned_client = build_npm_oidc_exchange_client()?;
+        &owned_client
+    };
     let url = npm_oidc_exchange_url(registry_url, npm_name);
 
     let response = client
@@ -181,7 +235,7 @@ async fn exchange_trusted_publish_token(
     let status = response.status();
     let body = read_response_body_capped(response, "npm OIDC token exchange").await?;
     if !status.is_success() {
-        return Err(LpmError::Registry(npm_oidc_error_message(status, &body)));
+        return Err(LpmError::Registry(npm_oidc_error_message(status)));
     }
 
     let payload: NpmOidcExchangeResponse = serde_json::from_slice(&body)
@@ -255,26 +309,8 @@ async fn read_response_body_capped(
     Ok(bytes)
 }
 
-fn npm_oidc_error_message(status: StatusCode, body: &[u8]) -> String {
-    let registry_message = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .or_else(|| value.get("error"))
-                .and_then(|field| field.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            std::str::from_utf8(body)
-                .ok()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "unknown error".to_string());
-
-    format!("npm OIDC token exchange failed ({status}): {registry_message}")
+fn npm_oidc_error_message(status: StatusCode) -> String {
+    format!("npm OIDC token exchange failed with HTTP {status}")
 }
 
 #[cfg(test)]
@@ -355,6 +391,27 @@ mod tests {
 
         assert_eq!(auth.token(), "short-lived-npm-token");
         assert_eq!(auth.source(), NpmAuthSource::Oidc);
+    }
+
+    #[tokio::test]
+    async fn npm_oidc_exchange_error_does_not_echo_the_submitted_jwt() {
+        let _env = scoped(&[("NPM_ID_TOKEN", NPM_ID_TOKEN)]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/oidc/token/exchange/package/%40scope%2Fpkg"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": format!("rejected bearer {NPM_ID_TOKEN}"),
+            })))
+            .mount(&server)
+            .await;
+
+        let error = exchange_trusted_publish_token("@scope/pkg", &server.uri(), None, None)
+            .await
+            .expect_err("the reflected JWT response must fail")
+            .to_string();
+
+        assert!(!error.contains(NPM_ID_TOKEN), "OIDC JWT leaked: {error}");
+        assert!(error.contains("HTTP 403") || error.contains("403 Forbidden"));
     }
 
     #[tokio::test]

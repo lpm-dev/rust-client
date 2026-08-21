@@ -181,7 +181,8 @@ async fn publish_preflight_rejects_an_unsuccessful_success_envelope() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": false,
             "name": "@lpm.dev/owner.resolved",
-            "version": "1.2.3"
+            "version": "1.2.3",
+            "packageExists": false
         })))
         .mount(&server)
         .await;
@@ -208,7 +209,8 @@ async fn publish_preflight_rejects_a_mismatched_response_identity() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
             "name": "@lpm.dev/owner.other",
-            "version": "9.9.9"
+            "version": "9.9.9",
+            "packageExists": false
         })))
         .mount(&server)
         .await;
@@ -222,6 +224,33 @@ async fn publish_preflight_rejects_a_mismatched_response_identity() {
         .to_string();
 
     assert!(error.contains("mismatched package identity"), "{error}");
+}
+
+#[tokio::test]
+async fn publish_preflight_rejects_a_response_without_package_existence() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .await
+        .expect_err("a missing packageExists field must fail closed")
+        .to_string();
+
+    assert!(error.contains("packageExists"), "{error}");
 }
 
 #[tokio::test]

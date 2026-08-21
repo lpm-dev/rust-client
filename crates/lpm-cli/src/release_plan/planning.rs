@@ -96,24 +96,44 @@ pub(crate) fn validate_workspace_internal_ranges(
 ) -> Result<(), LpmError> {
     let mut versions = HashMap::with_capacity(workspace.members.len());
     for member in &workspace.members {
-        let manifest = read_workspace_manifest(&member.path, member.path.join("package.json"))?;
-        versions.insert(manifest.name, manifest.version.to_string());
+        let manifest_path = member.path.join("package.json");
+        let name = member.package.name.as_deref().ok_or_else(|| {
+            LpmError::Script(format!(
+                "{} is missing a string `name` field",
+                manifest_path.display()
+            ))
+        })?;
+        let version = member
+            .package
+            .version
+            .as_deref()
+            .ok_or_else(|| {
+                LpmError::Script(format!(
+                    "{} is missing a string `version` field",
+                    manifest_path.display()
+                ))
+            })
+            .and_then(Version::parse)?;
+        versions.insert(name, version.to_string());
     }
 
     for member in &workspace.members {
-        let manifest = read_workspace_manifest(&member.path, member.path.join("package.json"))?;
-        let Some(obj) = manifest.json.as_object() else {
-            continue;
-        };
-        for section in DEPENDENCY_SECTIONS {
-            let Some(deps) = obj.get(*section).and_then(serde_json::Value::as_object) else {
-                continue;
-            };
-            for (dependency, spec_value) in deps {
+        let manifest_path = member.path.join("package.json");
+        let name = member.package.name.as_deref().ok_or_else(|| {
+            LpmError::Script(format!(
+                "{} is missing a string `name` field",
+                manifest_path.display()
+            ))
+        })?;
+        let dependency_sections = [
+            &member.package.dependencies,
+            &member.package.dev_dependencies,
+            &member.package.peer_dependencies,
+            &member.package.optional_dependencies,
+        ];
+        for dependencies in dependency_sections {
+            for (dependency, spec) in dependencies {
                 let Some(version) = versions.get(dependency.as_str()) else {
-                    continue;
-                };
-                let Some(spec) = spec_value.as_str() else {
                     continue;
                 };
                 if dynamic_workspace_spec(spec) || spec.starts_with("catalog:") {
@@ -123,10 +143,10 @@ pub(crate) fn validate_workspace_internal_ranges(
                 if !range_satisfies_version(range, version) {
                     return Err(LpmError::Script(format!(
                         "`{}` depends on `{}` as `{}` in {}, which does not accept current workspace version {}",
-                        manifest.name,
+                        name,
                         dependency,
                         spec,
-                        manifest.manifest_path.display(),
+                        manifest_path.display(),
                         version
                     )));
                 }

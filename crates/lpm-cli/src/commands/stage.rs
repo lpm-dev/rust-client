@@ -491,7 +491,10 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_blocks_duplicate_published_version() {
-        let metadata = serde_json::json!({ "versions": { "1.0.0": {} } });
+        let metadata = serde_json::json!({
+            "name": "pkg",
+            "versions": { "1.0.0": { "name": "pkg", "version": "1.0.0" } }
+        });
         let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.0.0", false)
             .unwrap_err()
             .to_string();
@@ -500,7 +503,10 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_requires_explicit_tag_for_prerelease() {
-        let metadata = serde_json::json!({ "versions": { "1.0.0": {} } });
+        let metadata = serde_json::json!({
+            "name": "pkg",
+            "versions": { "1.0.0": { "name": "pkg", "version": "1.0.0" } }
+        });
         let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.1.0-beta.1", false)
             .unwrap_err()
             .to_string();
@@ -509,7 +515,10 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_blocks_implicit_latest_for_lower_version() {
-        let metadata = serde_json::json!({ "versions": { "2.0.0": {} } });
+        let metadata = serde_json::json!({
+            "name": "pkg",
+            "versions": { "2.0.0": { "name": "pkg", "version": "2.0.0" } }
+        });
         let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.9.0", false)
             .unwrap_err()
             .to_string();
@@ -518,7 +527,24 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_allows_lower_version_with_explicit_tag() {
-        let metadata = serde_json::json!({ "versions": { "2.0.0": {} } });
+        let metadata = serde_json::json!({
+            "name": "pkg",
+            "versions": { "2.0.0": { "name": "pkg", "version": "2.0.0" } }
+        });
         assert!(publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.9.0", true).is_ok());
+    }
+
+    #[test]
+    fn enforce_stage_version_policy_rejects_mismatched_package_identity() {
+        let metadata = serde_json::json!({
+            "name": "different-package",
+            "versions": {}
+        });
+
+        let error = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.0.0", false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unexpected package"), "{error}");
     }
 }
