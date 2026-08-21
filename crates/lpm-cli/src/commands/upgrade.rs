@@ -1,10 +1,14 @@
 use crate::install_ui;
 use crate::manifest_dependency::ManifestDependencySpec;
-use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
+use crate::npm_public_source::{
+    LockfileRootIndex, NpmMetadataSource, lockfile_npm_metadata_source,
+    read_optional_project_lockfile,
+};
 use crate::prompt::prompt_err;
 #[cfg(test)]
 use crate::upgrade_engine::PeerViolation;
 use crate::upgrade_engine::{self, PatchInvalidation, PeerImpact, SemverClass};
+use futures::StreamExt;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::PackageMetadata;
@@ -13,7 +17,10 @@ use lpm_semver::{Version, VersionReq};
 use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
+
+const METADATA_PLANNING_CONCURRENCY: usize = 4;
 
 // ── Mode resolution ─────────────────────────────────────────────────
 
@@ -80,10 +87,20 @@ enum TargetKind {
     AbsoluteLatest,
 }
 
-#[derive(Debug, Clone)]
-enum MetadataLookup {
-    Lpm(PackageName),
-    Npm(NpmMetadataSource),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MetadataRoute {
+    Lpm,
+    PublicNpm,
+    ConfiguredRegistry,
+}
+
+impl MetadataRoute {
+    fn upstream_route(self) -> lpm_registry::UpstreamRoute {
+        match self {
+            Self::PublicNpm => lpm_registry::UpstreamRoute::NpmDirect,
+            Self::Lpm | Self::ConfiguredRegistry => lpm_registry::UpstreamRoute::LpmWorker,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -93,8 +110,14 @@ struct UpgradeDependency {
     range: String,
     manifest_value: String,
     is_dev: bool,
-    lookup: MetadataLookup,
+    route: MetadataRoute,
     manifest_spec: ManifestDependencySpec,
+}
+
+struct MetadataJob {
+    route: MetadataRoute,
+    lookup_name: String,
+    dependency_indices: Vec<usize>,
 }
 
 /// enriched candidate — drives both the interactive multiselect
@@ -112,6 +135,9 @@ struct EnrichedCandidate {
     has_install_scripts: bool,
     peer_impact: PeerImpact,
     patch_invalidation: Option<PatchInvalidation>,
+    lookup_name: String,
+    route: MetadataRoute,
+    selected_metadata: Arc<PackageMetadata>,
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -167,11 +193,12 @@ pub async fn run(
         false,
         json_output,
     )?;
+    let planning_client = client.clone_with_config().without_metadata_memory_cache();
+    let install_client = client.clone_with_metadata_memory_cache();
 
     // Read lockfile ONCE
-    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .ok()
-        .map(|project| project.lockfile);
+    let lockfile = read_optional_project_lockfile(project_dir)?;
+    let roots = LockfileRootIndex::new(lockfile.as_ref());
 
     let mut skipped_private: Vec<String> = Vec::new();
     let all_deps = filter_requested_deps(extract_deps_from_value(&doc), requested_packages)?;
@@ -182,7 +209,7 @@ pub async fn run(
         let lookup_name = manifest_spec.lookup_name(&name, lockfile.as_ref());
 
         if lookup_name.starts_with("@lpm.dev/") {
-            let pkg_name = PackageName::parse(&lookup_name).map_err(|error| {
+            PackageName::parse(&lookup_name).map_err(|error| {
                 LpmError::Script(format!(
                     "invalid LPM dependency name `{name}` (registry name `{lookup_name}`): {error}"
                 ))
@@ -193,21 +220,23 @@ pub async fn run(
                 range,
                 manifest_value,
                 is_dev,
-                lookup: MetadataLookup::Lpm(pkg_name),
+                route: MetadataRoute::Lpm,
                 manifest_spec,
             });
             continue;
         }
 
-        if let Some(source) = lockfile_npm_metadata_source(lockfile.as_ref(), &lookup_name, client)
-        {
+        if let Some(source) = lockfile_npm_metadata_source(&roots, &name, &lookup_name, client) {
             upgradeable_deps.push(UpgradeDependency {
                 name,
                 lookup_name,
                 range,
                 manifest_value,
                 is_dev,
-                lookup: MetadataLookup::Npm(source),
+                route: match source {
+                    NpmMetadataSource::PublicNpm => MetadataRoute::PublicNpm,
+                    NpmMetadataSource::ConfiguredRegistry => MetadataRoute::ConfiguredRegistry,
+                },
                 manifest_spec,
             });
             continue;
@@ -228,212 +257,106 @@ pub async fn run(
         install_ui::phase("Checking dependencies for newer matching versions");
     }
 
-    // Fetch all metadata concurrently
-    let fetch_futures: Vec<_> = upgradeable_deps
-        .iter()
-        .map(|dep| async move {
-            let result = fetch_metadata(client, &dep.lookup, &dep.lookup_name).await;
-            (dep, result)
-        })
-        .collect();
-    let fetch_results = futures::future::join_all(fetch_futures).await;
+    let mut job_indices: HashMap<(MetadataRoute, String), usize> =
+        HashMap::with_capacity(upgradeable_deps.len());
+    let mut jobs: Vec<MetadataJob> = Vec::with_capacity(upgradeable_deps.len());
+    for (dependency_index, dependency) in upgradeable_deps.iter().enumerate() {
+        let key = (dependency.route, dependency.lookup_name.clone());
+        if let Some(job_index) = job_indices.get(&key).copied() {
+            jobs[job_index].dependency_indices.push(dependency_index);
+        } else {
+            let job_index = jobs.len();
+            job_indices.insert(key, job_index);
+            jobs.push(MetadataJob {
+                route: dependency.route,
+                lookup_name: dependency.lookup_name.clone(),
+                dependency_indices: vec![dependency_index],
+            });
+        }
+    }
 
-    let mut candidates: Vec<EnrichedCandidate> = Vec::new();
+    let planning_client_ref = &planning_client;
+    let fetches = futures::stream::iter(jobs.into_iter().map(move |job| async move {
+        let result = fetch_metadata(planning_client_ref, job.route, &job.lookup_name).await;
+        (job, result)
+    }))
+    .buffer_unordered(METADATA_PLANNING_CONCURRENCY);
+    futures::pin_mut!(fetches);
+
+    let mut candidates = Vec::with_capacity(upgradeable_deps.len());
     let mut fetch_failures = Vec::new();
-
-    for (dep, metadata_result) in fetch_results {
-        let metadata = match metadata_result {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    "failed to fetch metadata for {} via {}: {}",
-                    dep.name,
-                    dep.lookup_name,
-                    e
-                );
-                fetch_failures.push(format!("{}: {e}", dep.name));
+    while let Some((job, metadata_result)) = fetches.next().await {
+        let mut metadata = match metadata_result {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                for dependency_index in job.dependency_indices {
+                    let dependency = &upgradeable_deps[dependency_index];
+                    tracing::warn!(
+                        "failed to fetch metadata for {} via {}: {}",
+                        dependency.name,
+                        dependency.lookup_name,
+                        error
+                    );
+                    fetch_failures
+                        .push((dependency_index, format!("{}: {error}", dependency.name)));
+                }
                 continue;
             }
         };
 
-        let latest = match crate::release_age_selection::latest_allowed_version(
-            &metadata,
-            &release_age_policy,
-        ) {
-            Some(v) => v,
-            None => continue,
+        let release_time_source = match job.route {
+            MetadataRoute::PublicNpm => {
+                crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect
+            }
+            MetadataRoute::Lpm | MetadataRoute::ConfiguredRegistry => {
+                crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly
+            }
         };
-
-        if !is_valid_version_string(&latest) {
-            tracing::warn!(
-                "skipping {}: registry returned invalid version string {:?}",
-                dep.name,
-                latest
-            );
+        if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
+            &planning_client,
+            &mut metadata,
+            &release_age_policy,
+            release_time_source,
+        )
+        .await
+        {
+            for dependency_index in job.dependency_indices {
+                let dependency = &upgradeable_deps[dependency_index];
+                fetch_failures.push((dependency_index, format!("{}: {error}", dependency.name)));
+            }
             continue;
         }
 
-        let available_versions =
-            crate::release_age_selection::allowed_version_strings(&metadata, &release_age_policy);
-
-        let installed_ver = lockfile.as_ref().and_then(|lf| {
-            lf.find_package(&dep.lookup_name)
-                .map(|p| p.version.as_str())
-        });
-
-        // Build enrichment data from the target version's metadata.
-        // We use the LATEST version's metadata for enrichment since that's
-        // what the user will get post-upgrade.
-        let enrich = |target_version: &str| -> (bool, PeerImpact, Option<PatchInvalidation>) {
-            let meta = metadata.version(target_version);
-            let has_scripts = meta.is_some_and(upgrade_engine::target_has_install_scripts);
-            let peer_deps = meta
-                .map(|m| m.peer_dependencies.clone())
-                .unwrap_or_default();
-            let peer_impact = upgrade_engine::compute_peer_impact(&peer_deps, lockfile.as_ref());
-            let from_ver = installed_ver.unwrap_or("0.0.0");
-            let patch_inv = upgrade_engine::detect_patch_invalidation(
+        for dependency_index in job.dependency_indices {
+            let dependency = &upgradeable_deps[dependency_index];
+            match plan_upgrade_dependency(
+                dependency,
+                &metadata,
+                mode,
+                major,
+                &release_age_policy,
+                &roots,
+                lockfile.as_ref(),
                 &patched_deps,
-                &dep.lookup_name,
-                from_ver,
-                target_version,
-            );
-            (has_scripts, peer_impact, patch_inv)
-        };
-
-        match mode {
-            ResolvedMode::NonInteractive => {
-                // Today's behavior: single candidate per dep
-                let (target_version, new_range) = compute_upgrade(
-                    &dep.range,
-                    installed_ver,
-                    &latest,
-                    &available_versions,
-                    major,
-                );
-                let target_version = match target_version {
-                    Some(v) => v,
-                    None => continue,
-                };
-
-                let should_skip = if let Some(installed) = installed_ver {
-                    installed == target_version
-                } else {
-                    dep.range == new_range
-                };
-                if should_skip {
-                    continue;
-                }
-
-                let from =
-                    installed_ver.map_or_else(|| version_from_range(&dep.range), str::to_string);
-                let semver_class = upgrade_engine::classify_semver_change(&from, &target_version);
-                let (has_scripts, peer_impact, patch_inv) = enrich(&target_version);
-                let new_manifest_value = dep.manifest_spec.render_new_value(&new_range);
-
-                candidates.push(EnrichedCandidate {
-                    name: dep.name.clone(),
-                    from,
-                    current_range: dep.manifest_value.clone(),
-                    new_range: new_manifest_value,
-                    to: target_version,
-                    is_dev: dep.is_dev,
-                    target_kind: if major {
-                        TargetKind::AbsoluteLatest
-                    } else {
-                        TargetKind::WithinMajor
-                    },
-                    semver_class,
-                    has_install_scripts: has_scripts,
-                    peer_impact,
-                    patch_invalidation: patch_inv,
-                });
-            }
-            ResolvedMode::Interactive => {
-                // Dual-row mode: compute within-major AND absolute-latest.
-                let (within_target, within_range) = compute_upgrade(
-                    &dep.range,
-                    installed_ver,
-                    &latest,
-                    &available_versions,
-                    false,
-                );
-                let (abs_target, abs_range) = compute_upgrade(
-                    &dep.range,
-                    installed_ver,
-                    &latest,
-                    &available_versions,
-                    true,
-                );
-
-                let from =
-                    installed_ver.map_or_else(|| version_from_range(&dep.range), str::to_string);
-
-                // Emit within-major row if it's a real upgrade
-                if let Some(ref wt) = within_target {
-                    let should_skip = if let Some(installed) = installed_ver {
-                        installed == wt.as_str()
-                    } else {
-                        dep.range == within_range
-                    };
-                    if !should_skip {
-                        let semver_class = upgrade_engine::classify_semver_change(&from, wt);
-                        let (has_scripts, peer_impact, patch_inv) = enrich(wt);
-                        let new_manifest_value = dep.manifest_spec.render_new_value(&within_range);
-                        candidates.push(EnrichedCandidate {
-                            name: dep.name.clone(),
-                            from: from.clone(),
-                            current_range: dep.manifest_value.clone(),
-                            new_range: new_manifest_value,
-                            to: wt.clone(),
-                            is_dev: dep.is_dev,
-                            target_kind: TargetKind::WithinMajor,
-                            semver_class,
-                            has_install_scripts: has_scripts,
-                            peer_impact,
-                            patch_invalidation: patch_inv,
-                        });
-                    }
-                }
-
-                // Emit absolute-latest row if it differs from the within-major
-                if let Some(ref at) = abs_target {
-                    let same_as_within = within_target.as_deref() == Some(at.as_str());
-                    if !same_as_within {
-                        let should_skip = if let Some(installed) = installed_ver {
-                            installed == at.as_str()
-                        } else {
-                            dep.range == abs_range
-                        };
-                        if !should_skip {
-                            let semver_class = upgrade_engine::classify_semver_change(&from, at);
-                            let (has_scripts, peer_impact, patch_inv) = enrich(at);
-                            let new_manifest_value = dep.manifest_spec.render_new_value(&abs_range);
-                            candidates.push(EnrichedCandidate {
-                                name: dep.name.clone(),
-                                from: from.clone(),
-                                current_range: dep.manifest_value.clone(),
-                                new_range: new_manifest_value,
-                                to: at.clone(),
-                                is_dev: dep.is_dev,
-                                target_kind: TargetKind::AbsoluteLatest,
-                                semver_class,
-                                has_install_scripts: has_scripts,
-                                peer_impact,
-                                patch_invalidation: patch_inv,
-                            });
-                        }
-                    }
+            ) {
+                Ok(planned) => candidates.extend(planned),
+                Err(error) => {
+                    fetch_failures.push((dependency_index, format!("{}: {error}", dependency.name)))
                 }
             }
         }
     }
 
     if !fetch_failures.is_empty() {
+        fetch_failures.sort_by_key(|(dependency_index, _)| *dependency_index);
+        let messages = fetch_failures
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>();
         return Err(LpmError::Registry(format!(
             "could not determine upgrade status for {} package(s): {}",
             fetch_failures.len(),
-            fetch_failures.join("; ")
+            messages.join("; ")
         )));
     }
     let fetch_errors = 0;
@@ -460,8 +383,8 @@ pub async fn run(
 
     // ── Selection ───────────────────────────────────────────────────
 
-    let selected: Vec<EnrichedCandidate> = match mode {
-        ResolvedMode::NonInteractive => candidates.clone(),
+    let selected = match mode {
+        ResolvedMode::NonInteractive => candidates,
         ResolvedMode::Interactive => {
             let selection = select_candidates_interactively(&candidates)?;
             if selection.is_empty() {
@@ -474,7 +397,7 @@ pub async fn run(
 
     // Deduplicate: if both within-major and absolute-latest rows were
     // selected for the same package, take the highest target version.
-    let deduped = deduplicate_by_highest_target(&selected);
+    let deduped = deduplicate_by_highest_target(selected);
 
     // ── Display + dry-run gate ──────────────────────────────────────
 
@@ -523,6 +446,8 @@ pub async fn run(
             return Ok(());
         }
     }
+
+    seed_selected_metadata_for_install(&install_client, &deduped)?;
 
     // ── Mutate package.json ─────────────────────────────────────────
 
@@ -583,7 +508,7 @@ pub async fn run(
 
                 let lpm_root = lpm_common::LpmRoot::from_env()?;
                 let install_result = crate::commands::install::run_with_options_with_lpm_root(
-                    client,
+                    &install_client,
                     project_dir,
                     json_output,
                     false, // offline
@@ -652,6 +577,51 @@ pub async fn run(
     Ok(())
 }
 
+fn seed_selected_metadata_for_install(
+    client: &RegistryClient,
+    candidates: &[EnrichedCandidate],
+) -> Result<(), LpmError> {
+    let mut metadata_by_route: HashMap<(MetadataRoute, String), PackageMetadata> =
+        HashMap::with_capacity(candidates.len());
+    for candidate in candidates {
+        let key = (candidate.route, candidate.lookup_name.clone());
+        match metadata_by_route.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate.selected_metadata.as_ref().clone());
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                merge_selected_metadata(entry.get_mut(), &candidate.selected_metadata);
+            }
+        }
+    }
+
+    for ((route, name), metadata) in metadata_by_route {
+        if !client.seed_metadata_for_command(&name, &route.upstream_route(), Arc::new(metadata)) {
+            return Err(LpmError::Registry(format!(
+                "failed to retain validated upgrade metadata for '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn merge_selected_metadata(existing: &mut PackageMetadata, incoming: &PackageMetadata) {
+    existing.versions.extend(incoming.versions.clone());
+    existing.time.extend(incoming.time.clone());
+    for (tag, version) in &incoming.dist_tags {
+        let replace = existing.dist_tags.get(tag).is_none_or(|current| {
+            match (Version::parse(version), Version::parse(current)) {
+                (Ok(candidate), Ok(current)) => candidate > current,
+                _ => version > current,
+            }
+        });
+        if replace {
+            existing.dist_tags.insert(tag.clone(), version.clone());
+        }
+    }
+    existing.latest_version = existing.dist_tags.get("latest").cloned();
+}
+
 fn remove_optional_file(path: &Path) -> Result<(), LpmError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -665,18 +635,195 @@ fn remove_optional_file(path: &Path) -> Result<(), LpmError> {
 
 async fn fetch_metadata(
     client: &RegistryClient,
-    lookup: &MetadataLookup,
+    route: MetadataRoute,
     name: &str,
 ) -> Result<PackageMetadata, LpmError> {
-    match lookup {
-        MetadataLookup::Lpm(pkg_name) => client.get_package_metadata(pkg_name).await,
-        MetadataLookup::Npm(NpmMetadataSource::PublicNpm) => {
-            client.get_npm_package_metadata(name).await
+    match route {
+        MetadataRoute::Lpm => {
+            let package = PackageName::parse(name).map_err(|error| {
+                LpmError::Script(format!("invalid LPM dependency name `{name}`: {error}"))
+            })?;
+            client
+                .revalidate_package_metadata_with_timings(&package)
+                .await
+                .map(|result| result.metadata)
         }
-        MetadataLookup::Npm(NpmMetadataSource::ConfiguredRegistry) => {
-            client.get_npm_package_metadata_proxy_only(name).await
+        MetadataRoute::PublicNpm => client
+            .revalidate_npm_metadata_direct_with_timings(name)
+            .await
+            .map(|result| result.metadata),
+        MetadataRoute::ConfiguredRegistry => {
+            client
+                .revalidate_npm_package_metadata_proxy_only(name)
+                .await
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_upgrade_dependency(
+    dependency: &UpgradeDependency,
+    metadata: &PackageMetadata,
+    mode: ResolvedMode,
+    major: bool,
+    release_age_policy: &lpm_resolver::ResolverPolicy,
+    roots: &LockfileRootIndex<'_>,
+    lockfile: Option<&lpm_lockfile::Lockfile>,
+    patched_dependencies: &HashMap<String, lpm_workspace::PatchedDependencyEntry>,
+) -> Result<Vec<EnrichedCandidate>, LpmError> {
+    let allowed_versions =
+        crate::release_age_selection::allowed_version_index(metadata, release_age_policy)?;
+    let latest = allowed_versions.latest;
+    if !is_valid_version_string(&latest) {
+        return Err(LpmError::Registry(format!(
+            "registry returned invalid version string {latest:?} for '{}'",
+            dependency.lookup_name
+        )));
+    }
+
+    let installed_version = roots
+        .root_package(&dependency.name, &dependency.lookup_name)
+        .map(|package| package.version.as_str());
+    let from =
+        installed_version.map_or_else(|| version_from_range(&dependency.range), str::to_string);
+
+    let build_candidate = |target_version: String,
+                           new_range: String,
+                           target_kind: TargetKind|
+     -> Result<EnrichedCandidate, LpmError> {
+        let target = metadata.version(&target_version).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "registry selected missing version '{}@{target_version}'",
+                metadata.name
+            ))
+        })?;
+        let peer_impact = upgrade_engine::compute_peer_impact(&target.peer_dependencies, lockfile);
+        let patch_invalidation = upgrade_engine::detect_patch_invalidation(
+            patched_dependencies,
+            &dependency.lookup_name,
+            installed_version.unwrap_or("0.0.0"),
+            &target_version,
+        );
+        let selected_metadata = Arc::new(compact_metadata_for_version(metadata, &target_version)?);
+        Ok(EnrichedCandidate {
+            name: dependency.name.clone(),
+            from: from.clone(),
+            current_range: dependency.manifest_value.clone(),
+            new_range: dependency.manifest_spec.render_new_value(&new_range),
+            to: target_version.clone(),
+            is_dev: dependency.is_dev,
+            target_kind,
+            semver_class: upgrade_engine::classify_semver_change(&from, &target_version),
+            has_install_scripts: upgrade_engine::target_has_install_scripts(target),
+            peer_impact,
+            patch_invalidation,
+            lookup_name: dependency.lookup_name.clone(),
+            route: dependency.route,
+            selected_metadata,
+        })
+    };
+
+    let mut planned = Vec::with_capacity(if mode == ResolvedMode::Interactive {
+        2
+    } else {
+        1
+    });
+    match mode {
+        ResolvedMode::NonInteractive => {
+            let (target, new_range) = compute_upgrade(
+                &dependency.range,
+                installed_version,
+                &latest,
+                &allowed_versions.versions,
+                major,
+            );
+            if let Some(target) = target
+                && installed_version.is_none_or(|installed| installed != target)
+                && (installed_version.is_some() || dependency.range != new_range)
+            {
+                planned.push(build_candidate(
+                    target,
+                    new_range,
+                    if major {
+                        TargetKind::AbsoluteLatest
+                    } else {
+                        TargetKind::WithinMajor
+                    },
+                )?);
+            }
+        }
+        ResolvedMode::Interactive => {
+            let (within_target, within_range) = compute_upgrade(
+                &dependency.range,
+                installed_version,
+                &latest,
+                &allowed_versions.versions,
+                false,
+            );
+            let (absolute_target, absolute_range) = compute_upgrade(
+                &dependency.range,
+                installed_version,
+                &latest,
+                &allowed_versions.versions,
+                true,
+            );
+            if let Some(target) = within_target.as_ref()
+                && installed_version.is_none_or(|installed| installed != target)
+                && (installed_version.is_some() || dependency.range != within_range)
+            {
+                planned.push(build_candidate(
+                    target.clone(),
+                    within_range,
+                    TargetKind::WithinMajor,
+                )?);
+            }
+            if let Some(target) = absolute_target
+                && within_target.as_deref() != Some(target.as_str())
+                && installed_version.is_none_or(|installed| installed != target)
+                && (installed_version.is_some() || dependency.range != absolute_range)
+            {
+                planned.push(build_candidate(
+                    target,
+                    absolute_range,
+                    TargetKind::AbsoluteLatest,
+                )?);
+            }
+        }
+    }
+    Ok(planned)
+}
+
+fn compact_metadata_for_version(
+    metadata: &PackageMetadata,
+    version: &str,
+) -> Result<PackageMetadata, LpmError> {
+    let selected = metadata.version(version).cloned().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "registry selected missing version '{}@{version}'",
+            metadata.name
+        ))
+    })?;
+    let mut dist_tags = HashMap::with_capacity(1);
+    dist_tags.insert("latest".to_string(), version.to_string());
+    let mut versions = HashMap::with_capacity(1);
+    versions.insert(version.to_string(), selected);
+    let mut time = HashMap::with_capacity(1);
+    if let Some(published_at) = metadata.time.get(version) {
+        time.insert(version.to_string(), published_at.clone());
+    }
+    Ok(PackageMetadata {
+        name: metadata.name.clone(),
+        description: None,
+        modified: metadata.modified.clone(),
+        dist_tags,
+        versions,
+        time,
+        downloads: None,
+        distribution_mode: metadata.distribution_mode.clone(),
+        package_type: metadata.package_type.clone(),
+        latest_version: Some(version.to_string()),
+        ecosystem: metadata.ecosystem.clone(),
+    })
 }
 
 fn emit_upgrade_json(
@@ -790,28 +937,30 @@ fn select_candidates_interactively(
 
 /// When both the within-major and absolute-latest rows are selected for
 /// the same package, keep only the one with the higher target version.
-fn deduplicate_by_highest_target(selected: &[EnrichedCandidate]) -> Vec<EnrichedCandidate> {
-    let mut best: HashMap<String, EnrichedCandidate> = HashMap::new();
-    for c in selected {
-        let key = format!("{}|{}", c.name, c.current_range);
-        let replace = match best.get(&key) {
-            None => true,
-            Some(existing) => {
-                // Higher version wins. If both parse, compare structurally;
-                // if either fails to parse, compare lexicographically.
-                match (Version::parse(&c.to), Version::parse(&existing.to)) {
-                    (Ok(a), Ok(b)) => a > b,
-                    _ => c.to > existing.to,
-                }
-            }
-        };
-        if replace {
-            best.insert(key, c.clone());
-        }
-    }
-    let mut result: Vec<EnrichedCandidate> = best.into_values().collect();
-    result.sort_by(|a, b| a.name.cmp(&b.name));
-    result
+fn deduplicate_by_highest_target(mut selected: Vec<EnrichedCandidate>) -> Vec<EnrichedCandidate> {
+    selected.sort_unstable_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.current_range.cmp(&right.current_range))
+            .then_with(|| left.is_dev.cmp(&right.is_dev))
+            .then_with(
+                || match (Version::parse(&left.to), Version::parse(&right.to)) {
+                    (Ok(left), Ok(right)) => right.cmp(&left),
+                    _ => right.to.cmp(&left.to),
+                },
+            )
+    });
+    selected.dedup_by(|next, current| {
+        next.name == current.name
+            && next.current_range == current.current_range
+            && next.is_dev == current.is_dev
+    });
+    selected.sort_unstable_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.is_dev.cmp(&right.is_dev))
+    });
+    selected
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────
@@ -1009,12 +1158,19 @@ fn compute_upgrade(
     current_range: &str,
     installed_version: Option<&str>,
     latest: &str,
-    available_versions: &[String],
+    available_versions: &[Version],
     major: bool,
 ) -> (Option<String>, String) {
     let simple_range = simple_version_range(current_range);
 
     if major {
+        if installed_version
+            .and_then(|version| Version::parse(version).ok())
+            .zip(Version::parse(latest).ok())
+            .is_some_and(|(installed, target)| target <= installed)
+        {
+            return (None, current_range.to_string());
+        }
         let prefix = simple_range.map_or("", |(prefix, _)| prefix);
         let new_range = format!("{prefix}{latest}");
         return (Some(latest.to_string()), new_range);
@@ -1027,7 +1183,6 @@ fn compute_upgrade(
             let requirement = VersionReq::parse(current_range).ok()?;
             available_versions
                 .iter()
-                .filter_map(|version| Version::parse(version).ok())
                 .filter(|version| !version.is_prerelease() && requirement.matches(version))
                 .max()
                 .map(|version| version.major())
@@ -1045,18 +1200,19 @@ fn compute_upgrade(
         }
     };
 
-    let mut same_major_versions: Vec<Version> = available_versions
+    let Some(best) = available_versions
         .iter()
-        .filter_map(|v| Version::parse(v).ok())
-        .filter(|v| v.major() == current_major && !v.is_prerelease())
-        .collect();
-
-    if same_major_versions.is_empty() {
+        .rev()
+        .find(|version| version.major() == current_major && !version.is_prerelease())
+    else {
+        return (None, current_range.to_string());
+    };
+    if installed_version
+        .and_then(|version| Version::parse(version).ok())
+        .is_some_and(|installed| best <= &installed)
+    {
         return (None, current_range.to_string());
     }
-
-    lpm_semver::sort_versions(&mut same_major_versions);
-    let best = same_major_versions.last().unwrap();
     let best_str = best.to_string();
     let new_range = simple_range.map_or_else(
         || current_range.to_string(),
@@ -1166,9 +1322,18 @@ mod tests {
 
     // ── compute_upgrade (preserved from original) ───────────────────
 
+    fn parsed_versions(versions: &[&str]) -> Vec<Version> {
+        let mut parsed = versions
+            .iter()
+            .map(|version| Version::parse(version).unwrap())
+            .collect::<Vec<_>>();
+        parsed.sort();
+        parsed
+    }
+
     #[test]
     fn default_mode_stays_within_major() {
-        let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
+        let available = parsed_versions(&["1.2.0", "1.5.0", "2.0.0"]);
         let (target, new_range) = compute_upgrade("^1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
         assert_eq!(new_range, "^1.5.0");
@@ -1176,7 +1341,7 @@ mod tests {
 
     #[test]
     fn major_mode_jumps_to_latest() {
-        let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
+        let available = parsed_versions(&["1.2.0", "1.5.0", "2.0.0"]);
         let (target, new_range) = compute_upgrade("^1.2.0", None, "2.0.0", &available, true);
         assert_eq!(target, Some("2.0.0".to_string()));
         assert_eq!(new_range, "^2.0.0");
@@ -1184,7 +1349,7 @@ mod tests {
 
     #[test]
     fn default_mode_same_major_as_latest() {
-        let available = vec!["2.0.0".into(), "2.1.0".into(), "2.3.0".into()];
+        let available = parsed_versions(&["2.0.0", "2.1.0", "2.3.0"]);
         let (target, new_range) = compute_upgrade("^2.0.0", None, "2.3.0", &available, false);
         assert_eq!(target, Some("2.3.0".to_string()));
         assert_eq!(new_range, "^2.3.0");
@@ -1192,7 +1357,7 @@ mod tests {
 
     #[test]
     fn default_mode_tilde_prefix_preserved() {
-        let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
+        let available = parsed_versions(&["1.2.0", "1.5.0", "2.0.0"]);
         let (target, new_range) = compute_upgrade("~1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
         assert_eq!(new_range, "~1.5.0");
@@ -1200,7 +1365,7 @@ mod tests {
 
     #[test]
     fn default_mode_no_prefix() {
-        let available = vec!["1.2.0".into(), "1.5.0".into(), "2.0.0".into()];
+        let available = parsed_versions(&["1.2.0", "1.5.0", "2.0.0"]);
         let (target, new_range) = compute_upgrade("1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
         assert_eq!(new_range, "1.5.0");
@@ -1208,19 +1373,14 @@ mod tests {
 
     #[test]
     fn default_mode_skips_prereleases() {
-        let available = vec![
-            "1.2.0".into(),
-            "1.6.0-beta.1".into(),
-            "1.5.0".into(),
-            "2.0.0".into(),
-        ];
+        let available = parsed_versions(&["1.2.0", "1.6.0-beta.1", "1.5.0", "2.0.0"]);
         let (target, _) = compute_upgrade("^1.2.0", None, "2.0.0", &available, false);
         assert_eq!(target, Some("1.5.0".to_string()));
     }
 
     #[test]
     fn default_mode_keeps_complex_ranges_within_the_current_major() {
-        let available = vec!["1.9.0".into(), "1.9.1".into(), "2.0.0".into()];
+        let available = parsed_versions(&["1.9.0", "1.9.1", "2.0.0"]);
 
         let result = compute_upgrade(">=1.0.0 <2.0.0", Some("1.9.0"), "2.0.0", &available, false);
 
@@ -1228,6 +1388,15 @@ mod tests {
             result,
             (Some("1.9.1".to_string()), ">=1.0.0 <2.0.0".to_string())
         );
+    }
+
+    #[test]
+    fn compute_upgrade_does_not_turn_a_registry_rollback_into_a_downgrade() {
+        let available = parsed_versions(&["2.3.0", "2.4.0"]);
+
+        let result = compute_upgrade("^2.0.0", Some("2.5.0"), "2.4.0", &available, false);
+
+        assert_eq!(result, (None, "^2.0.0".to_string()));
     }
 
     // ── resolve_mode ────────────────────────────────────────────────
@@ -1335,6 +1504,19 @@ mod tests {
         } else {
             None
         };
+        let selected_metadata = Arc::new(PackageMetadata {
+            name: "@lpm.dev/test.pkg".into(),
+            description: None,
+            modified: None,
+            dist_tags: HashMap::new(),
+            versions: HashMap::new(),
+            time: HashMap::new(),
+            downloads: None,
+            distribution_mode: None,
+            package_type: None,
+            latest_version: None,
+            ecosystem: None,
+        });
         EnrichedCandidate {
             name: "@lpm.dev/test.pkg".into(),
             from: "1.2.0".into(),
@@ -1347,6 +1529,9 @@ mod tests {
             has_install_scripts: has_scripts,
             peer_impact,
             patch_invalidation,
+            lookup_name: "@lpm.dev/test.pkg".into(),
+            route: MetadataRoute::Lpm,
+            selected_metadata,
         }
     }
 
@@ -1410,6 +1595,21 @@ mod tests {
                 violations: vec![],
             },
             patch_invalidation: None,
+            lookup_name: "pkg".into(),
+            route: MetadataRoute::PublicNpm,
+            selected_metadata: Arc::new(PackageMetadata {
+                name: "pkg".into(),
+                description: None,
+                modified: None,
+                dist_tags: HashMap::new(),
+                versions: HashMap::new(),
+                time: HashMap::new(),
+                downloads: None,
+                distribution_mode: None,
+                package_type: None,
+                latest_version: None,
+                ecosystem: None,
+            }),
         };
         let major = EnrichedCandidate {
             to: "4.0.0".into(),
@@ -1418,7 +1618,7 @@ mod tests {
             semver_class: SemverClass::Major,
             ..minor.clone()
         };
-        let deduped = deduplicate_by_highest_target(&[minor, major]);
+        let deduped = deduplicate_by_highest_target(vec![minor, major]);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].to, "4.0.0");
     }
@@ -1442,10 +1642,40 @@ mod tests {
                 violations: vec![],
             },
             patch_invalidation: None,
+            lookup_name: "pkg".into(),
+            route: MetadataRoute::PublicNpm,
+            selected_metadata: Arc::new(PackageMetadata {
+                name: "pkg".into(),
+                description: None,
+                modified: None,
+                dist_tags: HashMap::new(),
+                versions: HashMap::new(),
+                time: HashMap::new(),
+                downloads: None,
+                distribution_mode: None,
+                package_type: None,
+                latest_version: None,
+                ecosystem: None,
+            }),
         };
-        let deduped = deduplicate_by_highest_target(&[minor]);
+        let deduped = deduplicate_by_highest_target(vec![minor]);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].to, "3.9.0");
+    }
+
+    #[test]
+    fn deduplicate_keeps_identical_declarations_from_both_dependency_sections() {
+        let runtime = make_candidate(SemverClass::Patch, false, true, false);
+        let development = EnrichedCandidate {
+            is_dev: true,
+            ..runtime.clone()
+        };
+
+        let deduped = deduplicate_by_highest_target(vec![runtime, development]);
+
+        assert_eq!(deduped.len(), 2);
+        assert!(deduped.iter().any(|candidate| !candidate.is_dev));
+        assert!(deduped.iter().any(|candidate| candidate.is_dev));
     }
 
     // ── extract_deps_from_value (preserved) ─────────────────────────

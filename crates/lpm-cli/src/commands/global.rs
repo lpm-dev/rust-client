@@ -7,16 +7,18 @@
 
 use crate::install_ui;
 use chrono::Utc;
+use futures::StreamExt;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock};
 use lpm_global::{
     GlobalManifest, PackageEntry, PackageSource, Shim, artifacts_complete, emit_shim,
     find_command_collisions, remove_shim,
 };
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 const LOCAL_LINK_SPEC_PREFIX: &str = "link:";
+const GLOBAL_OUTDATED_METADATA_CONCURRENCY: usize = 4;
 
 /// Subcommands of `lpm global`. Defined here (not in `main.rs`) so the
 /// dispatcher and the implementation share the same type without needing
@@ -230,38 +232,6 @@ async fn run_list_outdated(
         return Ok(());
     }
 
-    let mut metadata: HashMap<String, lpm_registry::PackageMetadata> =
-        HashMap::with_capacity(lpm_names.len() + npm_names.len());
-    let mut metadata_errors: HashMap<String, String> = HashMap::new();
-
-    if !lpm_names.is_empty() {
-        match client.batch_metadata(&lpm_names).await {
-            Ok(batch) => metadata.extend(batch),
-            Err(e) => {
-                return Err(LpmError::Script(format!(
-                    "batch metadata fetch failed — cannot compute outdated: {e}"
-                )));
-            }
-        }
-    }
-
-    let npm_fetches = npm_names.iter().map(|name| async move {
-        (
-            name.clone(),
-            client.get_npm_package_metadata(name.as_str()).await,
-        )
-    });
-    for (name, result) in futures::future::join_all(npm_fetches).await {
-        match result {
-            Ok(package_metadata) => {
-                metadata.insert(name, package_metadata);
-            }
-            Err(error) => {
-                metadata_errors.insert(name, error.to_string());
-            }
-        }
-    }
-
     let mut outdated: Vec<OutdatedRow> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();
     let mut unresolved: Vec<UnresolvedRow> = Vec::new();
@@ -272,43 +242,97 @@ async fn run_list_outdated(
         json_output,
     )?;
 
-    for (name, entry) in &manifest.packages {
-        if entry.source == PackageSource::LocalLink {
-            continue;
-        }
-        let Some(meta) = metadata.get(name) else {
-            unresolved.push(UnresolvedRow {
-                package: name.clone(),
-                reason: metadata_errors.get(name).cloned().unwrap_or_else(|| {
-                    "no registry metadata returned for this package".to_string()
-                }),
-            });
-            continue;
-        };
-        let latest = match pick_latest_matching(meta, &entry.saved_spec, &release_age_policy) {
-            Ok(v) => v,
-            Err(reason) => {
+    if !lpm_names.is_empty() {
+        let mut pending_names: HashSet<String> = lpm_names.iter().cloned().collect();
+        let mut stream = client
+            .batch_metadata_stream(&lpm_names)
+            .await
+            .map_err(|error| {
+                LpmError::Script(format!(
+                    "batch metadata fetch failed — cannot compute outdated: {error}"
+                ))
+            })?;
+        while let Some((name, mut metadata)) = stream.next().await? {
+            pending_names.remove(&name);
+            let Some(entry) = manifest.packages.get(&name) else {
+                continue;
+            };
+            if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
+                client,
+                &mut metadata,
+                &release_age_policy,
+                crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly,
+            )
+            .await
+            {
                 unresolved.push(UnresolvedRow {
-                    package: name.clone(),
-                    reason,
+                    package: name,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            classify_global_outdated_entry(
+                &name,
+                entry,
+                &metadata,
+                manifest,
+                &release_age_policy,
+                &mut outdated,
+                &mut up_to_date,
+                &mut unresolved,
+            );
+        }
+        unresolved.extend(pending_names.into_iter().map(|package| UnresolvedRow {
+            package,
+            reason: "no registry metadata returned for this package".to_string(),
+        }));
+    }
+
+    let npm_fetches = futures::stream::iter(npm_names.into_iter().map(|name| async move {
+        let result = client.get_npm_metadata_direct(&name).await;
+        (name, result)
+    }))
+    .buffer_unordered(GLOBAL_OUTDATED_METADATA_CONCURRENCY);
+    futures::pin_mut!(npm_fetches);
+    while let Some((name, metadata_result)) = npm_fetches.next().await {
+        let mut metadata = match metadata_result {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                unresolved.push(UnresolvedRow {
+                    package: name,
+                    reason: error.to_string(),
                 });
                 continue;
             }
         };
-        if latest == entry.resolved {
-            up_to_date.push(name.clone());
-        } else {
-            let absolute_latest =
-                pick_absolute_latest(meta, &release_age_policy).unwrap_or_else(|| latest.clone());
-            outdated.push(OutdatedRow {
-                package: name.clone(),
-                current: entry.resolved.clone(),
-                wanted: latest,
-                latest: absolute_latest,
-                saved_spec: entry.saved_spec.clone(),
-                bins: enrich_commands(name, entry, manifest),
+        if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
+            client,
+            &mut metadata,
+            &release_age_policy,
+            crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect,
+        )
+        .await
+        {
+            unresolved.push(UnresolvedRow {
+                package: name,
+                reason: error.to_string(),
             });
+            continue;
         }
+        let entry = manifest
+            .packages
+            .get(&name)
+            .expect("npm name came from the global manifest");
+        classify_global_outdated_entry(
+            &name,
+            entry,
+            &metadata,
+            manifest,
+            &release_age_policy,
+            &mut outdated,
+            &mut up_to_date,
+            &mut unresolved,
+        );
     }
     outdated.sort_by(|a, b| a.package.cmp(&b.package));
     up_to_date.sort();
@@ -323,6 +347,68 @@ async fn run_list_outdated(
         return Err(LpmError::ExitCode(1));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_global_outdated_entry(
+    name: &str,
+    entry: &PackageEntry,
+    metadata: &lpm_registry::PackageMetadata,
+    manifest: &GlobalManifest,
+    release_age_policy: &lpm_resolver::ResolverPolicy,
+    outdated: &mut Vec<OutdatedRow>,
+    up_to_date: &mut Vec<String>,
+    unresolved: &mut Vec<UnresolvedRow>,
+) {
+    let allowed_versions =
+        match crate::release_age_selection::allowed_version_index(metadata, release_age_policy) {
+            Ok(index) => index,
+            Err(error) => {
+                unresolved.push(UnresolvedRow {
+                    package: name.to_string(),
+                    reason: error.to_string(),
+                });
+                return;
+            }
+        };
+    let wanted = match pick_latest_matching_from_index(
+        metadata,
+        &entry.saved_spec,
+        release_age_policy,
+        &allowed_versions,
+    ) {
+        Ok(version) => version,
+        Err(reason) => {
+            unresolved.push(UnresolvedRow {
+                package: name.to_string(),
+                reason,
+            });
+            return;
+        }
+    };
+    if !version_is_newer(&entry.resolved, &wanted) {
+        up_to_date.push(name.to_string());
+        return;
+    }
+    let latest = allowed_versions.latest;
+    outdated.push(OutdatedRow {
+        package: name.to_string(),
+        current: entry.resolved.clone(),
+        wanted,
+        latest,
+        saved_spec: entry.saved_spec.clone(),
+        bins: enrich_commands(name, entry, manifest),
+    });
+}
+
+fn version_is_newer(current: &str, candidate: &str) -> bool {
+    matches!(
+        (
+            lpm_semver::Version::parse(current),
+            lpm_semver::Version::parse(candidate)
+        ),
+        (Ok(current), Ok(candidate)) if candidate > current
+    )
 }
 
 /// One row in the `--outdated` report where the registry has a newer
@@ -348,28 +434,27 @@ struct UnresolvedRow {
 /// Pick the highest registry version that satisfies `saved_spec`.
 /// Same resolver-precedence as `update_global::pick_version` but
 /// inlined here to keep `lpm global list --outdated` independent of `update_global` internals.
-fn pick_latest_matching(
+fn pick_latest_matching_from_index(
     meta: &lpm_registry::PackageMetadata,
     saved_spec: &str,
     policy: &lpm_resolver::ResolverPolicy,
+    allowed_versions: &crate::release_age_selection::AllowedVersionIndex,
 ) -> Result<String, String> {
     // Dist-tag fast path: `latest`, `next`, etc. can appear in
     // saved_spec directly (e.g. bulk-install default). Mirrors
     // update_global.
     if meta.dist_tags.contains_key(saved_spec) {
-        return crate::release_age_selection::resolve_version_spec_with_policy(
-            meta, saved_spec, policy,
-        )
-        .map_err(|error| error.to_string());
+        return allowed_versions
+            .resolve_spec(meta, saved_spec, policy)
+            .map_err(|error| error.to_string());
     }
     // Exact pins that disappeared upstream should surface as unresolved,
     // not silently report up-to-date.
     if lpm_semver::Version::parse(saved_spec).is_ok() {
         if meta.versions.contains_key(saved_spec)
-            && crate::release_age_selection::resolve_version_spec_with_policy(
-                meta, saved_spec, policy,
-            )
-            .is_ok()
+            && allowed_versions
+                .resolve_spec(meta, saved_spec, policy)
+                .is_ok()
         {
             return Ok(saved_spec.to_string());
         }
@@ -381,30 +466,25 @@ fn pick_latest_matching(
     }
     // Wildcard: highest version allowed by the active release-age policy.
     if saved_spec == "*" {
-        if let Some(version) = crate::release_age_selection::latest_allowed_version(meta, policy) {
-            return Ok(version);
-        }
-        if meta
-            .versions
-            .keys()
-            .all(|s| lpm_semver::Version::parse(s).is_err())
-        {
-            return Err(format!("no parseable versions for '{}'", meta.name));
-        }
-        return Err(format!("no version of '{}' satisfies '*'", meta.name));
+        return Ok(allowed_versions.latest.clone());
     }
     // Range: max-satisfying.
     lpm_semver::VersionReq::parse(saved_spec)
         .map_err(|e| format!("saved_spec {saved_spec:?} is not a valid range: {e}"))?;
-    crate::release_age_selection::resolve_version_spec_with_policy(meta, saved_spec, policy)
+    allowed_versions
+        .resolve_spec(meta, saved_spec, policy)
         .map_err(|error| error.to_string())
 }
 
-fn pick_absolute_latest(
+#[cfg(test)]
+fn pick_latest_matching(
     meta: &lpm_registry::PackageMetadata,
+    saved_spec: &str,
     policy: &lpm_resolver::ResolverPolicy,
-) -> Option<String> {
-    crate::release_age_selection::latest_allowed_version(meta, policy)
+) -> Result<String, String> {
+    let allowed_versions = crate::release_age_selection::allowed_version_index(meta, policy)
+        .map_err(|error| error.to_string())?;
+    pick_latest_matching_from_index(meta, saved_spec, policy, &allowed_versions)
 }
 
 fn emit_outdated_json(

@@ -393,6 +393,19 @@ impl ResolverPolicy {
         self.cutoff_unix.is_some() && self.minimum_release_age_packages.is_none()
     }
 
+    /// Return true when abbreviated metadata can hide release times newer than the cutoff.
+    pub fn metadata_may_need_release_times(
+        &self,
+        package: &CanonicalKey,
+        modified: Option<&str>,
+    ) -> bool {
+        self.metadata_modified_after_cutoff_for_package(
+            package,
+            modified,
+            modified.and_then(parse_npm_time_unix),
+        )
+    }
+
     #[inline]
     pub fn trust_policy(&self) -> TrustPolicyMode {
         self.trust_policy

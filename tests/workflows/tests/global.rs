@@ -23,7 +23,48 @@ use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{method, path as wm_path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
+
+#[derive(Clone)]
+struct RecordDelayedGlobalUpdateMetadataStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for RecordDelayedGlobalUpdateMetadataStart {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record global-update metadata request start")
+            .push(std::time::Instant::now());
+        let name = request
+            .url
+            .path()
+            .strip_prefix("/api/registry/")
+            .unwrap_or_default();
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" },
+                    "1.1.0": {
+                        "name": name,
+                        "version": "1.1.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/package.tgz",
+                            "integrity": "sha512-test"
+                        }
+                    }
+                },
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-01-01T00:00:00.000Z"
+                }
+            }))
+    }
+}
 
 #[cfg(unix)]
 fn chmod_executable(path: &std::path::Path) {
@@ -226,10 +267,16 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
     mock.with_batch_metadata(vec![serde_json::json!({
         "name": "@lpm.dev/acme.demo-cli",
         "dist-tags": { "latest": "2.0.0" },
+        "modified": iso8601_n_secs_ago(86_400),
         "versions": {
             "1.0.0": { "name": "@lpm.dev/acme.demo-cli", "version": "1.0.0" },
             "1.5.0": { "name": "@lpm.dev/acme.demo-cli", "version": "1.5.0" },
             "2.0.0": { "name": "@lpm.dev/acme.demo-cli", "version": "2.0.0" }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.5.0": iso8601_n_secs_ago(2 * 86_400),
+            "2.0.0": iso8601_n_secs_ago(86_400)
         }
     })])
     .await;
@@ -319,7 +366,7 @@ async fn global_list_outdated_treats_fresh_latest_as_up_to_date() {
 }
 
 #[tokio::test]
-async fn global_list_outdated_routes_upstream_npm_packages_through_package_metadata() {
+async fn global_list_outdated_routes_upstream_npm_packages_directly_to_npm() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     seed_global_package(&project, "demo-cli", vec!["demo".to_string()]);
 
@@ -327,14 +374,20 @@ async fn global_list_outdated_routes_upstream_npm_packages_through_package_metad
     let metadata = serde_json::json!({
         "name": "demo-cli",
         "dist-tags": { "latest": "2.0.0" },
+        "modified": iso8601_n_secs_ago(86_400),
         "versions": {
             "1.0.0": { "name": "demo-cli", "version": "1.0.0" },
             "1.5.0": { "name": "demo-cli", "version": "1.5.0" },
             "2.0.0": { "name": "demo-cli", "version": "2.0.0" }
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.5.0": iso8601_n_secs_ago(2 * 86_400),
+            "2.0.0": iso8601_n_secs_ago(86_400)
         }
     });
     Mock::given(method("GET"))
-        .and(wm_path("/api/registry/demo-cli"))
+        .and(wm_path("/demo-cli"))
         .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
         .mount(mock.server())
         .await;
@@ -346,7 +399,7 @@ async fn global_list_outdated_routes_upstream_npm_packages_through_package_metad
 
     assert!(
         output.status.success(),
-        "global list --outdated must route npm globals through package metadata\nstdout: {}\nstderr: {}",
+        "global list --outdated must route npm globals directly\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -360,16 +413,14 @@ async fn global_list_outdated_routes_upstream_npm_packages_through_package_metad
         .map(|request| request.url.path().to_string())
         .collect();
     assert!(
-        received_paths
-            .iter()
-            .any(|path| path == "/api/registry/demo-cli"),
-        "npm global must use the per-package metadata path, got {received_paths:?}"
+        received_paths.iter().any(|path| path == "/demo-cli"),
+        "npm global must use the direct npm metadata path, got {received_paths:?}"
     );
     assert!(
         !received_paths
             .iter()
-            .any(|path| path == "/api/registry/batch-metadata"),
-        "npm global must not be sent to LPM batch metadata, got {received_paths:?}"
+            .any(|path| path.starts_with("/api/registry")),
+        "npm global must not be disclosed to the LPM Worker, got {received_paths:?}"
     );
 
     let combined = strip_ansi(&format!(
@@ -1009,6 +1060,67 @@ async fn global_update_dry_run_selects_latest_mature_candidate_when_latest_is_fr
 }
 
 #[tokio::test]
+async fn global_update_plans_upstream_npm_packages_without_contacting_the_worker() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package = "direct-update-tool";
+    seed_global_package(&project, package, vec![package.to_string()]);
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball(package, "1.1.0");
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" },
+                "1.1.0": {
+                    "name": package,
+                    "version": "1.1.0",
+                    "dist": {
+                        "tarball": mock.tarball_url(package, "1.1.0"),
+                        "integrity": compute_integrity(&tarball)
+                    }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-01T00:00:00.000Z"
+            }
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "update", "--dry-run"])
+        .output()
+        .expect("run direct npm global update plan");
+    assert!(
+        output.status.success(),
+        "direct npm update planning should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid global update envelope");
+    assert_eq!(envelope["plans"][0]["action"], serde_json::json!("upgrade"));
+    assert_eq!(envelope["plans"][0]["to"], serde_json::json!("1.1.0"));
+    let paths = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        !paths.iter().any(|path| path.starts_with("/api/registry")),
+        "upstream npm package names must not be disclosed to the Worker: {paths:?}"
+    );
+}
+
+#[tokio::test]
 async fn global_update_dry_run_rejects_exact_fresh_target() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     let package = "@lpm.dev/acme.cooldown-update-exact";
@@ -1087,6 +1199,112 @@ async fn global_update_dry_run_rejects_exact_fresh_target() {
             .as_str()
             .is_some_and(|reason| reason.contains("minimumReleaseAge")),
         "plan error should explain the cooldown block: {envelope:#}",
+    );
+}
+
+#[tokio::test]
+async fn global_update_dry_run_does_not_plan_an_implicit_registry_rollback() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package = "@lpm.dev/acme.rollback-update";
+    seed_global_package_with_source(
+        &project,
+        package,
+        PackageSource::LpmDev,
+        vec!["rollback-update".to_string()],
+    );
+    let root = isolated_lpm_root(&project);
+    let mut manifest = lpm_global::read_for(&root).expect("read global manifest fixture");
+    let active = manifest
+        .packages
+        .get_mut(package)
+        .expect("seeded package row");
+    active.saved_spec = "*".to_string();
+    active.resolved = "2.0.0".to_string();
+    active.root = format!("installs/{package}@2.0.0");
+    lpm_global::write_for(&root, &manifest).expect("write rollback manifest fixture");
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball(package, "1.9.0");
+    mock.with_package(package, "1.9.0", &tarball).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "update", "--dry-run"])
+        .output()
+        .expect("run global update against registry rollback");
+    assert!(
+        output.status.success(),
+        "implicit rollback should be a successful no-op\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid global update envelope");
+    assert_eq!(envelope["plans"][0]["action"], serde_json::json!("skip"));
+    assert_eq!(envelope["plans"][0]["current"], serde_json::json!("2.0.0"));
+}
+
+#[tokio::test]
+async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
+    const PACKAGE_COUNT: usize = 8;
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    let mut manifest = GlobalManifest::default();
+    for index in 0..PACKAGE_COUNT {
+        let package = format!("@lpm.dev/acme.parallel-update-{index}");
+        manifest.packages.insert(
+            package.clone(),
+            PackageEntry {
+                saved_spec: "^1".to_string(),
+                resolved: "1.0.0".to_string(),
+                integrity: "sha512-test".to_string(),
+                source: PackageSource::LpmDev,
+                installed_at: Utc::now(),
+                root: format!("installs/{package}@1.0.0"),
+                commands: vec![format!("parallel-update-{index}")],
+            },
+        );
+    }
+    lpm_global::write_for(&root, &manifest).expect("write bulk global manifest fixture");
+
+    let mock = MockRegistry::start().await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(
+            r"^/api/registry/@lpm\.dev/acme\.parallel-update-[0-9]+$",
+        ))
+        .respond_with(RecordDelayedGlobalUpdateMetadataStart {
+            starts: std::sync::Arc::clone(&starts),
+            delay: std::time::Duration::from_millis(250),
+        })
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "global", "update", "--dry-run"])
+        .output()
+        .expect("run bounded bulk global update plan");
+    assert!(
+        output.status.success(),
+        "bounded bulk plan should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let starts = starts.lock().expect("read global-update request starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let first = *starts.iter().min().unwrap();
+    let mut offsets = starts
+        .iter()
+        .map(|start| start.duration_since(first))
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert!(offsets[3] < std::time::Duration::from_millis(150));
+    assert!(
+        offsets[4] >= std::time::Duration::from_millis(200),
+        "more than four metadata requests ran in the first wave: {offsets:?}"
+    );
+    assert!(
+        offsets[7] < std::time::Duration::from_millis(450),
+        "the planner did not refill promptly for the second wave: {offsets:?}"
     );
 }
 

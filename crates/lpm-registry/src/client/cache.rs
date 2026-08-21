@@ -14,6 +14,7 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 /// any decode work happens.
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
 const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
+pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
@@ -32,6 +33,46 @@ const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 /// co-exist with the same magic.
 pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V3\n";
 
+pub(super) fn ensure_private_metadata_cache_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_metadata_cache_file(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        ensure_private_metadata_cache_dir(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(content)
+}
+
+fn reserve_pending_metadata_cache_bytes(
+    budget: &Arc<tokio::sync::Semaphore>,
+    bytes: usize,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let permits = u32::try_from(bytes).ok()?;
+    Arc::clone(budget).try_acquire_many_owned(permits).ok()
+}
+
 impl RegistryClient {
     // ─── Metadata Cache ──────────────────────────────────────────────
 
@@ -46,6 +87,35 @@ impl RegistryClient {
         key.push(':');
         key.push_str(cache_key);
         key
+    }
+
+    fn routed_metadata_memory_cache_key(&self, name: &str, route: &crate::UpstreamRoute) -> String {
+        use std::fmt::Write as _;
+
+        match route {
+            crate::UpstreamRoute::NpmDirect => {
+                let cache_key = self.npm_direct_metadata_cache_key(name);
+                self.direct_metadata_memory_cache_key(&cache_key)
+            }
+            crate::UpstreamRoute::LpmWorker => {
+                let mut key = String::with_capacity(self.base_url.len() + name.len() + 24);
+                write!(key, "worker:{}:", self.base_url.len())
+                    .expect("writing registry length to a String cannot fail");
+                key.push_str(&self.base_url);
+                key.push(':');
+                key.push_str(name);
+                key
+            }
+            crate::UpstreamRoute::Custom { target, .. } => {
+                let mut key = String::with_capacity(target.base_url.len() + name.len() + 24);
+                write!(key, "custom:{}:", target.base_url.len())
+                    .expect("writing registry length to a String cannot fail");
+                key.push_str(&target.base_url);
+                key.push(':');
+                key.push_str(name);
+                key
+            }
+        }
     }
 
     pub(super) fn read_metadata_memory_cache(&self, key: &str) -> Option<PackageMetadata> {
@@ -65,14 +135,87 @@ impl RegistryClient {
     /// Returns immutable command-scoped direct-registry metadata without
     /// cloning the packument.
     pub fn npm_metadata_direct_memory_cache(&self, name: &str) -> Option<Arc<PackageMetadata>> {
-        let cache_key = format!("npm:{name}");
-        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
+        self.npm_metadata_memory_cache(name, &crate::UpstreamRoute::NpmDirect)
+    }
+
+    /// Return immutable metadata seeded for one route during the current command.
+    pub fn npm_metadata_memory_cache(
+        &self,
+        name: &str,
+        route: &crate::UpstreamRoute,
+    ) -> Option<Arc<PackageMetadata>> {
+        let memory_cache_key = self.routed_metadata_memory_cache_key(name, route);
         let cached = self.read_metadata_memory_cache_arc(&memory_cache_key);
         if cached.is_some() {
             crate::timing::record_metadata_request(name);
             crate::timing::record_metadata_cache_hit();
         }
         cached
+    }
+
+    /// Seed one immutable, already-validated packument for later resolver use.
+    pub fn seed_metadata_for_command(
+        &self,
+        name: &str,
+        route: &crate::UpstreamRoute,
+        metadata: Arc<PackageMetadata>,
+    ) -> bool {
+        let Some(cache) = &self.metadata_memory_cache else {
+            return false;
+        };
+        if name.starts_with("@lpm.dev/") && !matches!(route, crate::UpstreamRoute::LpmWorker) {
+            return false;
+        }
+        if metadata.name != name
+            || metadata
+                .versions
+                .values()
+                .any(|version| version.name != name)
+        {
+            return false;
+        }
+
+        let route_mode = match route {
+            crate::UpstreamRoute::LpmWorker => Some(crate::RouteMode::Proxy),
+            crate::UpstreamRoute::NpmDirect => Some(crate::RouteMode::Direct),
+            crate::UpstreamRoute::Custom { .. } => None,
+        };
+        if let Some(route_mode) = route_mode {
+            let Some(overrides) = &self.metadata_route_overrides else {
+                return false;
+            };
+            let mut overrides = overrides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match overrides.entry(name.to_string()) {
+                std::collections::hash_map::Entry::Occupied(entry)
+                    if *entry.get() != route_mode =>
+                {
+                    return false;
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(route_mode);
+                }
+            }
+        }
+
+        let key = self.routed_metadata_memory_cache_key(name, route);
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, metadata);
+        true
+    }
+
+    /// Return the package routes pinned by validated command-scoped metadata.
+    pub fn metadata_route_overrides(&self) -> Option<HashMap<String, crate::RouteMode>> {
+        self.metadata_route_overrides.as_ref().map(|overrides| {
+            overrides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
     }
 
     pub(super) fn remember_metadata_for_command(&self, key: &str, metadata: &PackageMetadata) {
@@ -123,6 +266,19 @@ impl RegistryClient {
         }
     }
 
+    fn invalidate_metadata_cache_key(&self, key: &str) {
+        self.invalidate_metadata_memory_cache(key);
+        let direct_memory_key = self.direct_metadata_memory_cache_key(key);
+        self.invalidate_metadata_memory_cache(&direct_memory_key);
+        if let Some(path) = self.cache_path(key) {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::debug!(%error, "failed to invalidate metadata cache entry"),
+            }
+        }
+    }
+
     pub(super) fn cache_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = self.cache_dir.as_ref()?;
         use sha2::{Digest, Sha256};
@@ -132,33 +288,32 @@ impl RegistryClient {
         Some(dir.join(&hash[..16]))
     }
 
-    /// Invalidate a cached metadata entry served by the LPM Worker
-    /// (`@lpm.dev/*`) or by direct npm.org (built-in `npm:{name}`).
+    /// Invalidate cached packuments for the current Worker principal and the
+    /// configured direct npm origin.
     ///
     /// Used when a tarball download returns 404 — the cached metadata
     /// likely references an unpublished version. Deleting the cache
     /// forces a fresh fetch on the next request.
     ///
-    /// **Limitation:** custom-registry metadata (served by
+    /// Custom-registry metadata (served by
     /// `get_npm_metadata_from`) is keyed by
     /// `npm:<auth_fingerprint>:<full_url>` — neither the URL nor the
     /// auth is recoverable from `package_name` alone, so this method
     /// cannot invalidate those entries. Callers on the custom-registry
     /// path MUST use [`Self::invalidate_custom_metadata_cache`] instead.
     pub fn invalidate_metadata_cache(&self, package_name: &str) {
-        let cache_key = if package_name.starts_with("@lpm.dev/") {
-            format!("lpm:{package_name}")
+        if package_name.starts_with("@lpm.dev/") {
+            if let Ok(key) = self.lpm_metadata_cache_key(package_name) {
+                self.invalidate_metadata_cache_key(&key);
+            }
         } else {
-            format!("npm:{package_name}")
-        };
-        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
-        self.invalidate_metadata_memory_cache(&memory_cache_key);
-        if let Some(path) = self.cache_path(&cache_key)
-            && path.exists()
-        {
-            let _ = std::fs::remove_file(&path);
-            tracing::debug!("invalidated metadata cache for {package_name}");
+            let direct_key = self.npm_direct_metadata_cache_key(package_name);
+            self.invalidate_metadata_cache_key(&direct_key);
+            if let Ok(worker_key) = self.npm_worker_metadata_cache_key(package_name) {
+                self.invalidate_metadata_cache_key(&worker_key);
+            }
         }
+        tracing::debug!("invalidated metadata cache for {package_name}");
     }
 
     /// Invalidate a direct-npm exact-version metadata document.
@@ -168,15 +323,9 @@ impl RegistryClient {
     /// version that failed and clears this cache alongside the package-level
     /// metadata cache.
     pub fn invalidate_npm_version_metadata_cache(&self, package_name: &str, version: &str) {
-        let cache_key = format!("npm-version:{package_name}@{version}");
-        let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
-        self.invalidate_metadata_memory_cache(&memory_cache_key);
-        if let Some(path) = self.cache_path(&cache_key)
-            && path.exists()
-        {
-            let _ = std::fs::remove_file(&path);
-            tracing::debug!("invalidated npm version metadata cache for {package_name}@{version}");
-        }
+        let cache_key = self.npm_direct_version_metadata_cache_key(package_name, version);
+        self.invalidate_metadata_cache_key(&cache_key);
+        tracing::debug!("invalidated npm version metadata cache for {package_name}@{version}");
     }
 
     /// Invalidate a cached custom-registry metadata entry.
@@ -198,6 +347,7 @@ impl RegistryClient {
             principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
         );
         self.invalidate_metadata_memory_cache(&cache_key);
+        self.invalidate_metadata_memory_cache(&format!("custom:{cache_key}"));
         if let Some(path) = self.cache_path(&cache_key)
             && path.exists()
         {
@@ -212,10 +362,9 @@ impl RegistryClient {
     /// no deserialization. Used by the resolver's batch-prefetch logic to
     /// skip HTTP requests for packages already on disk from a prior batch.
     pub fn is_metadata_fresh(&self, package_name: &str) -> bool {
-        let cache_key = if package_name.starts_with("@lpm.dev/") {
-            format!("lpm:{package_name}")
-        } else {
-            format!("npm:{package_name}")
+        let cache_key = match self.batch_metadata_cache_key(package_name) {
+            Some(key) => key,
+            None => return false,
         };
         let Some(path) = self.cache_path(&cache_key) else {
             return false;
@@ -492,48 +641,48 @@ impl RegistryClient {
         // `time` + `versions._behavioralTags`), fall back to JSON.
         // Named format adds ~10% size vs. array format but the cache files
         // are small (≤30 KB) so the delta is negligible.
-        let data = match rmp_serde::to_vec_named(metadata) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    "MessagePack serialization failed for {key}, falling back to JSON: {e}"
-                );
-                serde_json::to_vec(metadata).unwrap_or_default()
-            }
-        };
-        if data.is_empty() {
-            return;
-        }
-
         let etag_str = etag.unwrap_or("");
-
-        // Build: MAGIC ETag\ndata. The magic constant ends with `\n` so the
-        // ETag line begins immediately after it.
-        let mut content =
-            Vec::with_capacity(METADATA_CACHE_MAGIC.len() + etag_str.len() + 1 + data.len());
+        let prefix_len = METADATA_CACHE_MAGIC.len() + etag_str.len() + 1;
+        let mut content = Vec::with_capacity(prefix_len + 4096);
         content.extend_from_slice(METADATA_CACHE_MAGIC);
         content.extend_from_slice(etag_str.as_bytes());
         content.push(b'\n');
-        content.extend_from_slice(&data);
+
+        if let Err(messagepack_error) = rmp_serde::encode::write_named(&mut content, metadata) {
+            content.truncate(prefix_len);
+            if let Err(json_error) = serde_json::to_writer(&mut content, metadata) {
+                tracing::warn!(
+                    "metadata cache serialization failed for {key}: MessagePack: {messagepack_error}; JSON: {json_error}"
+                );
+                return;
+            }
+        }
+        if content.len() == prefix_len || content.len() as u64 > METADATA_CACHE_FILE_CAP {
+            return;
+        }
 
         let key_owned = key.to_string();
-        // Sync path: no runtime available, OR caller explicitly opted
-        // into synchronous writes (test helpers verifying cache-hit
-        // behavior — see `with_synchronous_cache_writes` docs).
         let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
-            if let Err(e) = std::fs::write(&path, &content) {
+            if let Err(e) = write_metadata_cache_file(&path, &content) {
                 tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
             return;
         }
-        // Async context: dispatch the blocking write to spawn_blocking.
-        // The handle is recorded on `pending_cache_writes` so tests can
-        // deterministically await completion via
-        // `flush_pending_cache_writes()`. Production callers ignore it.
+
+        let Some(reservation) =
+            reserve_pending_metadata_cache_bytes(&self.pending_cache_write_bytes, content.len())
+        else {
+            tracing::debug!(
+                bytes = content.len(),
+                "skipping best-effort metadata cache write because the queued-byte budget is full"
+            );
+            return;
+        };
         let handle = runtime_handle.unwrap();
         let join = handle.spawn_blocking(move || {
-            if let Err(e) = std::fs::write(&path, &content) {
+            let _reservation = reservation;
+            if let Err(e) = write_metadata_cache_file(&path, &content) {
                 tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
         });
@@ -562,6 +711,77 @@ impl RegistryClient {
             // via `tracing::warn!`; nothing actionable on this side.
             let _ = h.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_write_budget_tests {
+    use super::*;
+
+    #[test]
+    fn queued_metadata_cache_writes_cannot_exceed_the_byte_budget() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(
+            MAX_PENDING_METADATA_CACHE_BYTES,
+        ));
+        let retained = reserve_pending_metadata_cache_bytes(&budget, 96 * 1024 * 1024)
+            .expect("the first write must fit in the byte budget");
+
+        assert!(
+            reserve_pending_metadata_cache_bytes(&budget, 33 * 1024 * 1024).is_none(),
+            "a queued write must not exceed the remaining byte budget"
+        );
+        assert_eq!(budget.available_permits(), 32 * 1024 * 1024);
+
+        drop(retained);
+        assert_eq!(budget.available_permits(), MAX_PENDING_METADATA_CACHE_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod command_metadata_seed_tests {
+    use super::*;
+
+    fn package_metadata(name: &str) -> Arc<PackageMetadata> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" }
+                }
+            }))
+            .expect("valid package metadata"),
+        )
+    }
+
+    #[test]
+    fn command_metadata_seed_rejects_conflicting_routes_for_one_package() {
+        let client = RegistryClient::new().clone_with_metadata_memory_cache();
+        let package = "shared-canonical-package";
+
+        assert!(client.seed_metadata_for_command(
+            package,
+            &crate::UpstreamRoute::NpmDirect,
+            package_metadata(package),
+        ));
+        assert!(!client.seed_metadata_for_command(
+            package,
+            &crate::UpstreamRoute::LpmWorker,
+            package_metadata(package),
+        ));
+        assert_eq!(
+            client
+                .metadata_route_overrides()
+                .expect("command cache has route overrides")
+                .get(package),
+            Some(&crate::RouteMode::Direct)
+        );
+        assert!(
+            client
+                .npm_metadata_memory_cache(package, &crate::UpstreamRoute::LpmWorker)
+                .is_none(),
+            "rejected metadata must not remain reachable under the conflicting route"
+        );
     }
 }
 

@@ -957,6 +957,7 @@ fn locate_test_sandbox_helper() -> Option<PathBuf> {
 pub fn lpm_with_registry(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
     let mut cmd = lpm(project);
     cmd.args(["--registry", registry_url, "--insecure"]);
+    cmd.env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry_url);
     cmd
 }
 

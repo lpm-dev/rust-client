@@ -1,18 +1,46 @@
 use crate::install_ui;
 use crate::manifest_dependency::ManifestDependencySpec;
-use crate::npm_public_source::{NpmMetadataSource, lockfile_npm_metadata_source};
+use crate::npm_public_source::{
+    LockfileRootIndex, NpmMetadataSource, lockfile_npm_metadata_source,
+    read_optional_project_lockfile,
+};
+use futures::StreamExt;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::RegistryClient;
-use std::collections::BTreeSet;
+use lpm_registry::{PackageMetadata, RegistryClient};
+use lpm_semver::Version;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 const OUTDATED_JSON_SCHEMA_VERSION: u32 = 2;
+const OUTDATED_METADATA_CONCURRENCY: usize = 4;
 
-struct DependencyEntry {
+struct ManifestDependencyEntry {
     name: String,
     range: String,
     section: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MetadataRoute {
+    Lpm,
+    PublicNpm,
+    ConfiguredRegistry,
+}
+
+struct DependencyEntry {
+    name: String,
+    lookup_name: String,
+    version_range: String,
+    manifest_range: String,
+    section: &'static str,
+    route: MetadataRoute,
+}
+
+struct MetadataJob {
+    lookup_name: String,
+    route: MetadataRoute,
+    dependency_indices: Vec<usize>,
 }
 
 struct OutdatedResult {
@@ -48,14 +76,14 @@ pub async fn run(
 
     let mut dep_entries = Vec::with_capacity(pkg.dependencies.len() + pkg.dev_dependencies.len());
     for (name, range) in pkg.dependencies {
-        dep_entries.push(DependencyEntry {
+        dep_entries.push(ManifestDependencyEntry {
             name,
             range,
             section: "dependencies",
         });
     }
     for (name, range) in pkg.dev_dependencies {
-        dep_entries.push(DependencyEntry {
+        dep_entries.push(ManifestDependencyEntry {
             name,
             range,
             section: "devDependencies",
@@ -78,9 +106,8 @@ pub async fn run(
         return Ok(());
     }
 
-    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .ok()
-        .map(|project| project.lockfile);
+    let lockfile = read_optional_project_lockfile(project_dir)?;
+    let roots = LockfileRootIndex::new(lockfile.as_ref());
     let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
         project_dir,
         None,
@@ -94,93 +121,143 @@ pub async fn run(
             .then_with(|| left.section.cmp(right.section))
     });
 
-    let mut results = Vec::new();
-    let mut lookup_failures = Vec::new();
+    let mut dependencies = Vec::with_capacity(dep_entries.len());
     let mut skipped_private: BTreeSet<String> = BTreeSet::new();
-
-    for dep in dep_entries {
+    for dependency in dep_entries {
         let (manifest_spec, version_range) =
-            ManifestDependencySpec::from_manifest_value(&dep.name, &dep.range)?;
-        let lookup_name = manifest_spec.lookup_name(&dep.name, lockfile.as_ref());
-        let metadata = if lookup_name.starts_with("@lpm.dev/") {
-            let pkg_name = PackageName::parse(&lookup_name).map_err(|error| {
+            ManifestDependencySpec::from_manifest_value(&dependency.name, &dependency.range)?;
+        let lookup_name = manifest_spec.lookup_name(&dependency.name, lockfile.as_ref());
+        let route = if lookup_name.starts_with("@lpm.dev/") {
+            PackageName::parse(&lookup_name).map_err(|error| {
                 LpmError::Script(format!(
                     "invalid LPM dependency name `{}` (registry name `{lookup_name}`): {error}",
-                    dep.name
+                    dependency.name
                 ))
             })?;
-            client.get_package_metadata(&pkg_name).await
+            MetadataRoute::Lpm
         } else if include_npm {
-            // Only query metadata endpoints that the lockfile already
-            // proves saw this package name: public npm directly, or the
-            // configured LPM registry worker. Unknown/custom sources are
-            // skipped so private package names are not disclosed to a new
-            // service.
-            match lockfile_npm_metadata_source(lockfile.as_ref(), &lookup_name, client) {
-                Some(NpmMetadataSource::PublicNpm) => {
-                    client.get_npm_package_metadata(&lookup_name).await
-                }
-                Some(NpmMetadataSource::ConfiguredRegistry) => {
-                    client
-                        .get_npm_package_metadata_proxy_only(&lookup_name)
-                        .await
-                }
+            match lockfile_npm_metadata_source(&roots, &dependency.name, &lookup_name, client) {
+                Some(NpmMetadataSource::PublicNpm) => MetadataRoute::PublicNpm,
+                Some(NpmMetadataSource::ConfiguredRegistry) => MetadataRoute::ConfiguredRegistry,
                 None => {
-                    skipped_private.insert(dep.name.clone());
+                    skipped_private.insert(dependency.name);
                     continue;
                 }
             }
         } else {
             continue;
         };
+        dependencies.push(DependencyEntry {
+            name: dependency.name,
+            lookup_name,
+            version_range,
+            manifest_range: dependency.range,
+            section: dependency.section,
+            route,
+        });
+    }
 
-        match metadata {
-            Ok(metadata) => {
-                let installed = lockfile.as_ref().and_then(|lockfile| {
-                    lockfile
-                        .find_package(&lookup_name)
-                        .map(|package| package.version.clone())
-                });
-                let latest = crate::release_age_selection::latest_allowed_version(
-                    &metadata,
-                    &release_age_policy,
-                )
-                .or_else(|| installed.clone())
-                .unwrap_or_else(|| {
-                    metadata
-                        .latest_version_tag()
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-                let wanted = crate::release_age_selection::resolve_version_spec_with_policy(
-                    &metadata,
-                    &version_range,
-                    &release_age_policy,
-                )
-                .ok();
+    let mut job_indices: HashMap<(MetadataRoute, String), usize> =
+        HashMap::with_capacity(dependencies.len());
+    let mut jobs: Vec<MetadataJob> = Vec::with_capacity(dependencies.len());
+    for (dependency_index, dependency) in dependencies.iter().enumerate() {
+        let key = (dependency.route, dependency.lookup_name.clone());
+        if let Some(job_index) = job_indices.get(&key).copied() {
+            jobs[job_index].dependency_indices.push(dependency_index);
+        } else {
+            let job_index = jobs.len();
+            job_indices.insert(key, job_index);
+            jobs.push(MetadataJob {
+                lookup_name: dependency.lookup_name.clone(),
+                route: dependency.route,
+                dependency_indices: vec![dependency_index],
+            });
+        }
+    }
 
-                let installed_str = installed.as_deref().unwrap_or("?");
-                let is_outdated = installed.as_deref() != Some(latest.as_str());
+    let fetches = futures::stream::iter(jobs.into_iter().map(|job| async move {
+        let result = fetch_metadata(client, job.route, &job.lookup_name).await;
+        (job, result)
+    }))
+    .buffer_unordered(OUTDATED_METADATA_CONCURRENCY);
+    futures::pin_mut!(fetches);
 
-                results.push(OutdatedResult {
-                    name: dep.name,
-                    current: installed_str.to_string(),
-                    wanted,
-                    wanted_range: dep.range,
-                    latest,
-                    section: dep.section,
-                    outdated: is_outdated,
-                });
+    let mut indexed_results = Vec::with_capacity(dependencies.len());
+    let mut lookup_failures = Vec::new();
+    while let Some((job, metadata_result)) = fetches.next().await {
+        let mut metadata = match metadata_result {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                for dependency_index in job.dependency_indices {
+                    let dependency = &dependencies[dependency_index];
+                    lookup_failures.push((
+                        dependency_index,
+                        LookupFailure {
+                            name: dependency.name.clone(),
+                            section: dependency.section,
+                            reason: error.to_string(),
+                        },
+                    ));
+                }
+                continue;
             }
-            Err(e) => {
-                lookup_failures.push(LookupFailure {
-                    name: dep.name,
-                    section: dep.section,
-                    reason: e.to_string(),
-                });
+        };
+        let release_time_source = match job.route {
+            MetadataRoute::PublicNpm => {
+                crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect
+            }
+            MetadataRoute::Lpm | MetadataRoute::ConfiguredRegistry => {
+                crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly
+            }
+        };
+        if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
+            client,
+            &mut metadata,
+            &release_age_policy,
+            release_time_source,
+        )
+        .await
+        {
+            for dependency_index in job.dependency_indices {
+                let dependency = &dependencies[dependency_index];
+                lookup_failures.push((
+                    dependency_index,
+                    LookupFailure {
+                        name: dependency.name.clone(),
+                        section: dependency.section,
+                        reason: error.to_string(),
+                    },
+                ));
+            }
+            continue;
+        }
+
+        for dependency_index in job.dependency_indices {
+            let dependency = &dependencies[dependency_index];
+            match plan_outdated_result(dependency, &metadata, &roots, &release_age_policy) {
+                Ok(result) => indexed_results.push((dependency_index, result)),
+                Err(error) => lookup_failures.push((
+                    dependency_index,
+                    LookupFailure {
+                        name: dependency.name.clone(),
+                        section: dependency.section,
+                        reason: error.to_string(),
+                    },
+                )),
             }
         }
     }
+
+    indexed_results.sort_by_key(|(dependency_index, _)| *dependency_index);
+    let results = indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect::<Vec<_>>();
+    lookup_failures.sort_by_key(|(dependency_index, _)| *dependency_index);
+    let lookup_failures = lookup_failures
+        .into_iter()
+        .map(|(_, failure)| failure)
+        .collect::<Vec<_>>();
 
     if json_output {
         let outdated_count = results.iter().filter(|result| result.outdated).count();
@@ -341,6 +418,60 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+async fn fetch_metadata(
+    client: &RegistryClient,
+    route: MetadataRoute,
+    name: &str,
+) -> Result<PackageMetadata, LpmError> {
+    match route {
+        MetadataRoute::Lpm => {
+            let package = PackageName::parse(name).map_err(|error| {
+                LpmError::Script(format!("invalid LPM dependency name `{name}`: {error}"))
+            })?;
+            client.get_package_metadata(&package).await
+        }
+        MetadataRoute::PublicNpm => client.get_npm_metadata_direct(name).await,
+        MetadataRoute::ConfiguredRegistry => client.get_npm_package_metadata_proxy_only(name).await,
+    }
+}
+
+fn plan_outdated_result(
+    dependency: &DependencyEntry,
+    metadata: &PackageMetadata,
+    roots: &LockfileRootIndex<'_>,
+    release_age_policy: &lpm_resolver::ResolverPolicy,
+) -> Result<OutdatedResult, LpmError> {
+    let installed = roots
+        .root_package(&dependency.name, &dependency.lookup_name)
+        .map(|package| package.version.clone());
+    let allowed_versions =
+        crate::release_age_selection::allowed_version_index(metadata, release_age_policy)?;
+    let latest = allowed_versions.latest.clone();
+    let wanted = allowed_versions
+        .resolve_spec(metadata, &dependency.version_range, release_age_policy)
+        .ok();
+    let outdated = installed
+        .as_deref()
+        .is_some_and(|current| version_is_newer(current, &latest));
+
+    Ok(OutdatedResult {
+        name: dependency.name.clone(),
+        current: installed.unwrap_or_else(|| "?".to_string()),
+        wanted,
+        wanted_range: dependency.manifest_range.clone(),
+        latest,
+        section: dependency.section,
+        outdated,
+    })
+}
+
+fn version_is_newer(current: &str, candidate: &str) -> bool {
+    matches!(
+        (Version::parse(current), Version::parse(candidate)),
+        (Ok(current), Ok(candidate)) if candidate > current
+    )
 }
 
 fn style_latest_version(latest: &str, wanted: &str) -> String {

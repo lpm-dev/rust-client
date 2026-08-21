@@ -300,7 +300,7 @@ impl RegistryClient {
         // process. That is strictly better than failing construction.
         let cache_dir = LpmRoot::from_env().ok().map(|root| {
             let dir = root.cache_metadata();
-            if let Err(e) = std::fs::create_dir_all(&dir) {
+            if let Err(e) = super::cache::ensure_private_metadata_cache_dir(&dir) {
                 tracing::warn!("failed to create metadata cache directory: {}", e);
             }
             dir
@@ -313,8 +313,12 @@ impl RegistryClient {
             token: None,
             cache_dir,
             pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_cache_write_bytes: Arc::new(tokio::sync::Semaphore::new(
+                super::cache::MAX_PENDING_METADATA_CACHE_BYTES,
+            )),
             metadata_memory_cache: None,
             release_time_memory_cache: None,
+            metadata_route_overrides: None,
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
@@ -437,6 +441,11 @@ impl RegistryClient {
     /// Pass `None` to disable disk caching entirely (all reads miss,
     /// all writes are no-ops).
     pub fn with_cache_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        if let Some(path) = dir.as_deref()
+            && let Err(error) = super::cache::ensure_private_metadata_cache_dir(path)
+        {
+            tracing::warn!("failed to secure metadata cache directory: {error}");
+        }
         self.cache_dir = dir;
         self
     }
@@ -730,8 +739,10 @@ impl RegistryClient {
             // Share the pending-writes tracker so flush() drains writes
             // queued by ANY clone of this client.
             pending_cache_writes: Arc::clone(&self.pending_cache_writes),
+            pending_cache_write_bytes: Arc::clone(&self.pending_cache_write_bytes),
             metadata_memory_cache: self.metadata_memory_cache.as_ref().map(Arc::clone),
             release_time_memory_cache: self.release_time_memory_cache.as_ref().map(Arc::clone),
+            metadata_route_overrides: self.metadata_route_overrides.as_ref().map(Arc::clone),
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
@@ -752,6 +763,7 @@ impl RegistryClient {
         let mut client = self.clone_with_config();
         client.metadata_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
         client.release_time_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+        client.metadata_route_overrides = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
         client
     }
 
@@ -760,6 +772,7 @@ impl RegistryClient {
     pub fn without_metadata_memory_cache(mut self) -> Self {
         self.metadata_memory_cache = None;
         self.release_time_memory_cache = None;
+        self.metadata_route_overrides = None;
         self
     }
 

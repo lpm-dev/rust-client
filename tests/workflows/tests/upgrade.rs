@@ -11,6 +11,75 @@ mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
+use wiremock::matchers::{method, path as wiremock_path, query_param};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
+
+#[derive(Clone)]
+struct RecordDelayedUpgradeMetadataStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for RecordDelayedUpgradeMetadataStart {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record upgrade metadata request start")
+            .push(std::time::Instant::now());
+        let name = request
+            .url
+            .path()
+            .strip_prefix("/api/registry/")
+            .unwrap_or_default();
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" },
+                    "1.1.0": { "name": name, "version": "1.1.0" }
+                },
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-01-01T00:00:00.000Z"
+                }
+            }))
+    }
+}
+
+#[derive(Clone)]
+struct SequentialUpgradeMetadata {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    first: serde_json::Value,
+    second: serde_json::Value,
+    batch: bool,
+}
+
+impl Respond for SequentialUpgradeMetadata {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let metadata = if call == 0 {
+            self.first.clone()
+        } else {
+            self.second.clone()
+        };
+        if self.batch {
+            let name = metadata["name"].as_str().expect("metadata package name");
+            let body = format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "name": name,
+                    "metadata": metadata,
+                }))
+                .expect("serialize sequential batch metadata")
+            );
+            ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson")
+        } else {
+            ResponseTemplate::new(200).set_body_json(metadata)
+        }
+    }
+}
 
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
     use chrono::SecondsFormat;
@@ -232,6 +301,29 @@ fn upgrade_package_argument_unknown_registry_source_fails_clearly() {
 
 // ─── Behavior contracts ─────────────────────────────────────────────────
 
+#[test]
+fn upgrade_rejects_a_corrupt_project_lockfile() {
+    let project = TempProject::empty(
+        r#"{"name":"corrupt-lock-upgrade","version":"1.0.0","dependencies":{"@lpm.dev/acme.corrupt":"^1.0.0"}}"#,
+    );
+    project.write_file("lpm.lock", "this is not a lockfile");
+
+    let out = lpm(&project)
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("spawn upgrade with corrupt lockfile");
+
+    assert!(!out.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("failed to read project lockfile")),
+        "error should identify the corrupt lockfile: {envelope:#}",
+    );
+}
+
 /// A dependency whose lockfile source is the public npm registry should
 /// be eligible for `lpm upgrade`, matching `lpm outdated`'s default
 /// cross-ecosystem surface.
@@ -320,6 +412,16 @@ async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_sp
         name: "strip-ansi".to_string(),
         version: "6.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["strip-ansi@5.0.0".to_string()],
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: None,
+        dependency_targets: std::collections::BTreeMap::new(),
+        peer_targets: std::collections::BTreeMap::new(),
+        name: "strip-ansi".to_string(),
+        version: "5.0.0".to_string(),
+        source: Some("registry+https://lpm.dev".to_string()),
         ..Default::default()
     });
     support::finalize_exact_lockfile_fixture(
@@ -373,12 +475,141 @@ async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_sp
         lockfile.root_aliases.get("strip-ansi-cjs"),
         Some(&"strip-ansi".to_string())
     );
+    let received_paths = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect::<Vec<_>>();
+    assert!(received_paths.iter().any(|path| path == "/strip-ansi"));
+    assert!(
+        !received_paths
+            .iter()
+            .any(|path| path == "/api/registry/strip-ansi"),
+        "the same-name transitive source must not override the exact public root: {received_paths:?}"
+    );
     let entry = lockfile
         .packages
         .iter()
         .find(|package| package.name == "strip-ansi")
         .expect("lockfile must record the canonical alias target");
     assert_eq!(entry.version, "6.1.0");
+}
+
+#[tokio::test]
+async fn upgrade_fetches_one_packument_for_multiple_aliases_of_one_package() {
+    let project = TempProject::empty(
+        r#"{"name":"alias-dedup-upgrade","version":"1.0.0","dependencies":{"ansi-a":"npm:strip-ansi@^6.0.0","ansi-b":"npm:strip-ansi@^6.0.0"}}"#,
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile
+        .root_aliases
+        .insert("ansi-a".to_string(), "strip-ansi".to_string());
+    lockfile
+        .root_aliases
+        .insert("ansi-b".to_string(), "strip-ansi".to_string());
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "strip-ansi".to_string(),
+        version: "6.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[
+            ("ansi-a", "strip-ansi", "6.0.0"),
+            ("ansi-b", "strip-ansi", "6.0.0"),
+        ],
+    );
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write alias-dedup lockfile");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        "strip-ansi",
+        "6.1.0",
+        &[
+            (
+                "6.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("strip-ansi", "6.0.0")),
+            ),
+            (
+                "6.1.0",
+                serde_json::json!({}),
+                Some(make_tarball("strip-ansi", "6.1.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--dry-run", "--json"])
+        .output()
+        .expect("run deduplicated alias upgrade plan");
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid upgrade envelope");
+    assert_eq!(envelope["upgraded"], serde_json::json!(2));
+    let request_count = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests")
+        .into_iter()
+        .filter(|request| request.url.path() == "/strip-ansi")
+        .count();
+    assert_eq!(request_count, 1, "canonical aliases must share one lookup");
+}
+
+#[tokio::test]
+async fn upgrade_updates_identical_entries_in_both_dependency_sections() {
+    let package = "@lpm.dev/owner.cross-section";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"cross-section-upgrade","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}},"devDependencies":{{"{package}":"^1.0.0"}}}}"#,
+    ));
+    project.write_file(
+        "lpm.lock",
+        &format!(
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n[[packages]]\nname = \"{package}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
+        ),
+    );
+    let mock = MockRegistry::start().await;
+    let old_tarball = make_tarball(package, "1.0.0");
+    let new_tarball = make_tarball(package, "1.1.0");
+    mock.with_full_package_metadata(
+        package,
+        "1.1.0",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(old_tarball)),
+            ("1.1.0", serde_json::json!({}), Some(new_tarball)),
+        ],
+    )
+    .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("run cross-section upgrade");
+    assert!(
+        output.status.success(),
+        "both dependency sections should upgrade\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest["dependencies"][package],
+        serde_json::json!("^1.1.0")
+    );
+    assert_eq!(
+        manifest["devDependencies"][package],
+        serde_json::json!("^1.1.0")
+    );
 }
 
 #[tokio::test]
@@ -466,6 +697,130 @@ async fn upgrade_selects_latest_mature_candidate_when_latest_is_inside_release_a
     let pkg_json: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(pkg_json["dependencies"][pkg], serde_json::json!("^1.1.0"));
+}
+
+#[tokio::test]
+async fn upgrade_hydrates_missing_release_times_before_planning() {
+    let package = "@lpm.dev/owner.hydrated-upgrade";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"hydrated-upgrade","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}},"lpm":{{"minimumReleaseAge":86400}}}}"#,
+    ));
+    project.write_file(
+        "lpm.lock",
+        &format!(
+            "[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n\n[[packages]]\nname = \"{package}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
+        ),
+    );
+
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "1.1.0" },
+            "modified": iso8601_n_secs_ago(3_600),
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" },
+                "1.1.0": { "name": package, "version": "1.1.0" }
+            }
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{package}")))
+        .and(query_param("release_times", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "time": {
+                "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+                "1.1.0": iso8601_n_secs_ago(3_600)
+            }
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--dry-run", "--json"])
+        .output()
+        .expect("run upgrade with hydrated release times");
+    assert!(
+        output.status.success(),
+        "release-time hydration should produce a clean no-op\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid upgrade envelope");
+    assert_eq!(envelope["upgraded"], serde_json::json!(0));
+}
+
+#[tokio::test]
+async fn upgrade_plans_metadata_in_bounded_parallel_waves() {
+    const PACKAGE_COUNT: usize = 8;
+    let mut dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
+    let mut lockfile =
+        String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("@lpm.dev/owner.parallel-upgrade-{index}");
+        dependencies.insert(name.clone(), serde_json::json!("^1.0.0"));
+        lockfile.push_str(&format!(
+            "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
+        ));
+    }
+    let project = TempProject::empty(
+        &serde_json::to_string(&serde_json::json!({
+            "name": "parallel-upgrade",
+            "version": "1.0.0",
+            "dependencies": dependencies,
+        }))
+        .unwrap(),
+    );
+    project.write_file("lpm.lock", &lockfile);
+
+    let mock = MockRegistry::start().await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(
+            r"^/api/registry/@lpm\.dev/owner\.parallel-upgrade-[0-9]+$",
+        ))
+        .respond_with(RecordDelayedUpgradeMetadataStart {
+            starts: std::sync::Arc::clone(&starts),
+            delay: std::time::Duration::from_millis(250),
+        })
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y", "--dry-run", "--json"])
+        .output()
+        .expect("run bounded upgrade plan");
+    assert!(
+        output.status.success(),
+        "bounded upgrade plan should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let starts = starts.lock().expect("read upgrade request starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let first = *starts.iter().min().unwrap();
+    let mut offsets = starts
+        .iter()
+        .map(|start| start.duration_since(first))
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert!(offsets[3] < std::time::Duration::from_millis(150));
+    assert!(
+        offsets[4] >= std::time::Duration::from_millis(200),
+        "more than four metadata requests ran in the first wave: {offsets:?}"
+    );
+    assert!(
+        offsets[7] < std::time::Duration::from_millis(450),
+        "the planner did not refill promptly for the second wave: {offsets:?}"
+    );
 }
 
 #[tokio::test]
@@ -755,6 +1110,145 @@ async fn upgrade_writes_new_range_to_manifest_and_lockfile() {
 }
 
 #[tokio::test]
+async fn upgrade_executes_the_same_packument_snapshot_it_planned() {
+    let package = "@lpm.dev/owner.snapshot-upgrade";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"snapshot-upgrade","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}}}}"#,
+    ));
+    let mock = MockRegistry::start().await;
+    let planned_tarball = make_tarball(package, "1.1.0");
+    let later_tarball = make_tarball(package, "1.2.0");
+    let planned_integrity = compute_integrity(&planned_tarball);
+    let later_integrity = compute_integrity(&later_tarball);
+    let planned_metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": "1.1.0" },
+        "versions": {
+            "1.0.0": { "name": package, "version": "1.0.0" },
+            "1.1.0": {
+                "name": package,
+                "version": "1.1.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.1.0"),
+                    "integrity": planned_integrity.clone(),
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+    let later_metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": { "latest": "1.2.0" },
+        "versions": {
+            "1.0.0": { "name": package, "version": "1.0.0" },
+            "1.1.0": planned_metadata["versions"]["1.1.0"].clone(),
+            "1.2.0": {
+                "name": package,
+                "version": "1.2.0",
+                "dist": {
+                    "tarball": mock.tarball_url(package, "1.2.0"),
+                    "integrity": later_integrity,
+                },
+                "dependencies": {}
+            }
+        },
+        "time": {
+            "1.0.0": "2025-01-01T00:00:00.000Z",
+            "1.1.0": "2025-01-01T00:00:00.000Z",
+            "1.2.0": "2025-01-01T00:00:00.000Z"
+        }
+    });
+    let metadata_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder = SequentialUpgradeMetadata {
+        calls: metadata_calls.clone(),
+        first: planned_metadata.clone(),
+        second: later_metadata.clone(),
+        batch: false,
+    };
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{package}")))
+        .respond_with(responder)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(wiremock_path("/api/registry/batch-metadata"))
+        .respond_with(SequentialUpgradeMetadata {
+            calls: metadata_calls.clone(),
+            first: planned_metadata,
+            second: later_metadata,
+            batch: true,
+        })
+        .mount(mock.server())
+        .await;
+    for (version, tarball) in [("1.1.0", planned_tarball), ("1.2.0", later_tarball)] {
+        let tarball_path = reqwest::Url::parse(&mock.tarball_url(package, version))
+            .expect("valid mock tarball URL")
+            .path()
+            .to_string();
+        Mock::given(method("GET"))
+            .and(wiremock_path(tarball_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+            .mount(mock.server())
+            .await;
+    }
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("run snapshot-consistent upgrade");
+    assert!(
+        output.status.success(),
+        "snapshot-consistent upgrade failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let metadata_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("mock registry request log")
+        .into_iter()
+        .filter(|request| {
+            request.url.path() == format!("/api/registry/{package}")
+                || request.url.path() == "/api/registry/batch-metadata"
+        })
+        .map(|request| {
+            format!(
+                "{} {} {}",
+                request.method,
+                request.url.path(),
+                String::from_utf8_lossy(&request.body)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metadata_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "planning and installation must share one root packument: {metadata_requests:?}"
+    );
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read upgraded lockfile");
+    let locked = lockfile
+        .packages
+        .iter()
+        .find(|entry| entry.name == package)
+        .expect("upgraded package is locked");
+    assert_eq!(locked.version, "1.1.0");
+    assert_eq!(
+        locked.integrity.as_deref(),
+        Some(planned_integrity.as_str())
+    );
+    let installed: serde_json::Value =
+        serde_json::from_str(&project.read_file(&format!("node_modules/{package}/package.json")))
+            .expect("installed package manifest");
+    assert_eq!(installed["version"], "1.1.0");
+}
+
+#[tokio::test]
 async fn workspace_member_upgrade_preserves_the_sibling_root_lockfile_projection() {
     let pkg = "@lpm.dev/owner.workspace-upgrade";
     let project = TempProject::empty(
@@ -941,7 +1435,6 @@ async fn upgrade_dry_run_json_envelope_with_one_candidate_matches_snapshot() {
 // only support single-version mounts.
 
 use wiremock::matchers::{method as wm_method, path as wm_path};
-use wiremock::{Mock, ResponseTemplate};
 
 const UP7_PKG: &str = "@lpm.dev/acme.widget";
 const UP7_CURRENT: &str = "1.2.0";
