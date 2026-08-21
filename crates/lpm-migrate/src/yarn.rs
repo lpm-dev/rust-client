@@ -6,22 +6,27 @@
 //! 1. Parse all entries with their specifiers, version, resolved source, integrity, and dependency ranges.
 //! 2. Build a specifier→version map, then resolve each dependency range to an exact version.
 
-use crate::MigratedPackage;
+use crate::{
+    BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, read_lockfile_snapshot,
+};
 use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::Path;
 
 pub fn parse(path: &Path, _project_dir: &Path) -> Result<Vec<MigratedPackage>, LpmError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_lockfile_snapshot(path)?;
     parse_str(&content)
 }
 
 pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
-    if is_berry_lockfile(content) {
-        return parse_berry_str(content);
-    }
+    let packages = if is_berry_lockfile(content) {
+        parse_berry_str(content)?
+    } else {
+        parse_v1_str(content)?
+    };
 
-    parse_v1_str(content)
+    enforce_package_limit(packages.len())?;
+    Ok(packages)
 }
 
 fn parse_v1_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
@@ -30,17 +35,17 @@ fn parse_v1_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
 }
 
 fn parse_berry_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
-    let root: serde_yaml::Value = serde_yaml::from_str(content)
+    let root: BoundedMap<serde_yaml::Mapping, { MAX_PACKAGES + 1 }> = serde_yaml::from_str(content)
         .map_err(|e| LpmError::Script(format!("failed to parse Yarn Berry lockfile: {e}")))?;
-    let Some(root) = root.as_mapping() else {
-        return Err(LpmError::Script(
-            "Yarn Berry lockfile root must be a mapping".to_string(),
-        ));
-    };
+    let package_count = root
+        .keys()
+        .filter(|key| key.as_str() != Some("__metadata"))
+        .count();
+    enforce_package_limit(package_count)?;
 
-    let mut entries = Vec::with_capacity(root.len().saturating_sub(1));
+    let mut entries = Vec::with_capacity(package_count);
 
-    for (key, value) in root {
+    for (key, value) in root.iter() {
         let Some(descriptor_key) = key.as_str() else {
             continue;
         };
@@ -114,6 +119,7 @@ fn resolve_entries(entries: Vec<YarnEntry>) -> Vec<MigratedPackage> {
                 .collect();
 
             MigratedPackage {
+                lockfile_key: None,
                 name: entry.name,
                 version: entry.version,
                 resolved: entry.resolved,
@@ -338,7 +344,7 @@ fn flush_and_start_new(
     entries: &mut Vec<YarnEntry>,
 ) -> Result<Option<State>, LpmError> {
     if let Some(entry) = current.take() {
-        entries.push(entry);
+        push_entry(entries, entry)?;
     }
 
     let trimmed = line.trim_end();
@@ -381,7 +387,7 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
         if line.trim().is_empty() {
             // If we were in an entry, a blank line terminates it.
             if let Some(entry) = current.take() {
-                entries.push(entry);
+                push_entry(&mut entries, entry)?;
                 state = State::TopLevel;
             }
             continue;
@@ -494,10 +500,16 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
 
     // Flush any remaining entry at end of file.
     if let Some(entry) = current.take() {
-        entries.push(entry);
+        push_entry(&mut entries, entry)?;
     }
 
     Ok(entries)
+}
+
+fn push_entry(entries: &mut Vec<YarnEntry>, entry: YarnEntry) -> Result<(), LpmError> {
+    enforce_package_limit(entries.len().saturating_add(1))?;
+    entries.push(entry);
+    Ok(())
 }
 
 /// Parse a dependency line like `"accepts" "~1.3.8"` or `accepts "~1.3.8"`.
@@ -963,5 +975,21 @@ negotiator@0.6.3:
                     .starts_with("https://registry.yarnpkg.com/")
             );
         }
+    }
+
+    #[test]
+    fn berry_package_limit_is_enforced_before_the_overflow_value_is_decoded() {
+        use std::fmt::Write as _;
+
+        let mut lockfile = String::with_capacity(crate::MAX_PACKAGES * 38);
+        lockfile.push_str("__metadata:\n  version: 8\n");
+        for index in 0..crate::MAX_PACKAGES {
+            writeln!(lockfile, "p{index}@npm:1.0.0:\n  version: 1.0.0").unwrap();
+        }
+        lockfile.push_str("overflow@npm:1.0.0: [\n");
+
+        let error = parse_str(&lockfile).unwrap_err();
+
+        assert!(error.to_string().contains("package map exceeds"));
     }
 }

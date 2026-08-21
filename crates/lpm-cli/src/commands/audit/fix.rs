@@ -76,7 +76,7 @@ async fn run_fix_inner(
     let mut doc: serde_json::Value = serde_json::from_slice(&original_content)
         .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
 
-    let discovery = discovery::discover_packages(project_dir)?;
+    let discovery = discovery::discover_packages_retaining_lpm_lockfile(project_dir)?;
     if discovery.manager != ManagerKind::Lpm {
         return Err(LpmError::Script(format!(
             "`lpm audit fix` currently supports LPM-managed projects only (found {} inventory). \
@@ -96,9 +96,15 @@ async fn run_fix_inner(
             "`lpm audit fix` cannot safely choose patched versions because the OSV scan degraded: {reason}"
         )));
     }
-    let project_lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .map_err(|e| LpmError::Script(format!("failed to read lpm.lock: {e}")))?;
-    let lockfile = project_lockfile.lockfile;
+    let lockfile = discovery.lpm_lockfile.as_ref().ok_or_else(|| {
+        LpmError::Script("audit fix discovery did not retain its LPM lockfile snapshot".into())
+    })?;
+    let lockfile_content = discovery.lpm_lockfile_content.as_ref().ok_or_else(|| {
+        LpmError::Script("audit fix discovery did not retain its LPM lockfile bytes".into())
+    })?;
+    let retained_lockfile_path = discovery.lockfile_path.as_ref().ok_or_else(|| {
+        LpmError::Script("audit fix discovery did not retain its LPM lockfile path".into())
+    })?;
 
     let mut vulns_by_instance: HashMap<(String, String), Vec<&OsvVulnerability>> = HashMap::new();
     for vuln in &osv_outcome.vulns {
@@ -114,7 +120,7 @@ async fn run_fix_inner(
         let target_name = dep.target_name.as_str();
         let locked_package = match select_installed_direct_locked_package(
             project_dir,
-            &lockfile,
+            lockfile,
             &dep.local_name,
             target_name,
         ) {
@@ -267,34 +273,29 @@ async fn run_fix_inner(
             project_dir,
             &project_dirs,
             async {
-                if !crate::commands::install::workspace_lockfile::project_lockfile_unchanged(
-                    project_dir,
-                    Some(&lockfile),
-                )
-                .map_err(|error| {
-                    LpmError::Script(format!(
-                        "failed to re-read lpm.lock before applying audit fixes: {error}"
-                    ))
-                })? {
-                    return Err(LpmError::Script(
-                        "lpm.lock changed while audit fixes were being planned; no changes were applied"
-                            .into(),
-                    ));
-                }
-
                 let lockfile_path =
                     crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+                if lockfile_path != *retained_lockfile_path {
+                    return Err(LpmError::Script(
+                        "the active lpm.lock changed while audit fixes were being planned; no changes were applied"
+                            .to_string(),
+                    ));
+                }
                 let lockfile_binary_path = lockfile_path.with_extension("lockb");
                 let install_hash_path = project_dir.join(".lpm").join("install-hash");
+                maybe_test_pause_before_transaction_snapshot();
                 let transaction =
                     crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
-                        &[(pkg_json_path.as_path(), original_content.as_slice())],
-                        &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
+                        &[
+                            (pkg_json_path.as_path(), original_content.as_slice()),
+                            (lockfile_path.as_path(), lockfile_content.as_ref()),
+                        ],
+                        &[lockfile_binary_path.as_path()],
                         &[install_hash_path.as_path()],
                     )
                     .map_err(|error| {
                         LpmError::Script(format!(
-                            "package.json changed while audit fix was planning; no changes were applied: {error}"
+                            "package.json or lpm.lock changed while audit fix was planning; no changes were applied: {error}"
                         ))
                     })?;
 
@@ -337,6 +338,28 @@ async fn run_fix_inner(
         started_at.elapsed(),
     );
     audit_fix_completion(&skipped)
+}
+
+fn maybe_test_pause_before_transaction_snapshot() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let Ok(marker) = std::env::var("LPM_TEST_PAUSE_BEFORE_AUDIT_FIX_SNAPSHOT") else {
+        return;
+    };
+    let marker = PathBuf::from(marker);
+    std::fs::write(&marker, b"ready").expect("write audit-fix snapshot test marker");
+    let resume = marker.with_extension("resume");
+    for _ in 0..1_000 {
+        if resume.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(
+        "timed out waiting for audit-fix snapshot test resume marker {}",
+        resume.display()
+    );
 }
 
 fn audit_fix_completion(skipped: &[AuditFixSkipped]) -> Result<(), LpmError> {

@@ -186,6 +186,251 @@ pub fn analyze_package_with_timings(
     )
 }
 
+/// Analyze a package through an already-open directory capability.
+///
+/// The descriptor pins the selected package root. Every nested directory and
+/// file is opened without following links, so concurrent path replacement
+/// cannot redirect the scan outside that root.
+pub fn analyze_package_from_open_dir(package_dir: &cap_std::fs::Dir) -> PackageAnalysis {
+    let mut source_files = Vec::new();
+    let mut discovery_limit_reached = false;
+    collect_cap_source_files(
+        package_dir,
+        Path::new(""),
+        &mut source_files,
+        &mut discovery_limit_reached,
+    );
+    source_files.sort_unstable();
+    let mut file_result = if source_files.len() >= 20 {
+        analyze_cap_files_parallel(package_dir, &source_files)
+    } else {
+        analyze_cap_files_sequential(package_dir, &source_files)
+    };
+    file_result.meta.limit_reached |= discovery_limit_reached;
+    let mut supply_chain_tags = file_result.supply_chain;
+    if file_result.meta.files_scanned > 0 {
+        supply_chain_tags.trivial =
+            file_result.total_code_lines < 10 && file_result.total_export_count <= 1;
+    }
+    let mut url_domains = file_result.url_domains;
+    url_domains.sort_unstable();
+    url_domains.dedup();
+    let mut meta = file_result.meta;
+    meta.url_domains = url_domains;
+
+    let manifest_tags = analyze_package_manifest_from_open_dir(package_dir);
+    PackageAnalysis {
+        version: SCHEMA_VERSION,
+        analyzed_at: chrono::Utc::now().to_rfc3339(),
+        source: file_result.source,
+        supply_chain: supply_chain_tags,
+        manifest: manifest_tags,
+        meta,
+    }
+}
+
+fn collect_cap_source_files(
+    directory: &cap_std::fs::Dir,
+    relative_dir: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+    limit_reached: &mut bool,
+) {
+    use cap_fs_ext::DirExt as _;
+
+    let Ok(entries) = directory.entries() else {
+        return;
+    };
+    for entry in entries {
+        if files.len() >= MAX_FILES_PER_PACKAGE {
+            *limit_reached = true;
+            return;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let relative = relative_dir.join(&name);
+        let Ok(metadata) = directory.symlink_metadata(&name) else {
+            continue;
+        };
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            if !PackageAnalyzer::should_scan_directory(&relative) {
+                continue;
+            }
+            let Ok(child) = directory.open_dir_nofollow(&name) else {
+                continue;
+            };
+            collect_cap_source_files(&child, &relative, files, limit_reached);
+        } else if metadata.is_file() && PackageAnalyzer::should_scan(&relative, metadata.len()) {
+            files.push(relative);
+        }
+    }
+}
+
+fn analyze_cap_single_file(
+    package_dir: &cap_std::fs::Dir,
+    relative_path: &Path,
+    comment_buf: &mut Vec<u8>,
+) -> Option<FileAnalysisResult> {
+    let (file, size) = open_cap_source_file(package_dir, relative_path).ok()?;
+    let filename = relative_path.file_name()?.to_str()?;
+    if size > MAX_FILE_SIZE {
+        let mut file = file.into_std();
+        let sample =
+            read_oversized_source_sample_from_open_file(&mut file, size).unwrap_or_default();
+        return Some(analyze_oversized_source_sample(
+            relative_path,
+            size,
+            &sample,
+            comment_buf,
+        ));
+    }
+    let bytes =
+        lpm_common::read_file_capped_from_open_file(file.into_std(), relative_path, MAX_FILE_SIZE)
+            .ok()?
+            .0;
+    Some(analyze_bytes_with_scratch(filename, &bytes, comment_buf))
+}
+
+fn open_cap_source_file(
+    root: &cap_std::fs::Dir,
+    relative_path: &Path,
+) -> std::io::Result<(cap_std::fs::File, u64)> {
+    use cap_fs_ext::{
+        DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _,
+    };
+
+    let mut parent = root.try_clone()?;
+    let mut components = relative_path.components().peekable();
+    let mut leaf = None;
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source path contains an unsafe component",
+            ));
+        };
+        if components.peek().is_some() {
+            parent = parent.open_dir_nofollow(name)?;
+        } else {
+            leaf = Some(name.to_os_string());
+        }
+    }
+    let leaf = leaf.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source path has no file name",
+        )
+    })?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file = parent.open_with(&leaf, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.is_symlink() {
+        return Err(std::io::Error::other(
+            "source path is not a safe regular file",
+        ));
+    }
+    Ok((file, metadata.len()))
+}
+
+fn analyze_cap_files_sequential(
+    package_dir: &cap_std::fs::Dir,
+    files: &[std::path::PathBuf],
+) -> AccumulatedResult {
+    let mut source_tags = SourceTags::default();
+    let mut supply_chain_tags = SupplyChainTags::default();
+    let mut meta = AnalysisMeta::default();
+    let mut all_url_domains = Vec::new();
+    let mut total_code_lines = 0usize;
+    let mut total_export_count = 0usize;
+    let mut comment_buf = Vec::new();
+
+    for relative_path in files {
+        if let Some(result) = analyze_cap_single_file(package_dir, relative_path, &mut comment_buf)
+        {
+            if meta.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
+                meta.limit_reached = true;
+                break;
+            }
+            accumulate_result(
+                &mut source_tags,
+                &mut supply_chain_tags,
+                &mut all_url_domains,
+                &mut total_code_lines,
+                &mut total_export_count,
+                &mut meta,
+                result,
+            );
+        }
+    }
+    AccumulatedResult {
+        source: source_tags,
+        supply_chain: supply_chain_tags,
+        url_domains: all_url_domains,
+        total_code_lines,
+        total_export_count,
+        meta,
+    }
+}
+
+fn analyze_cap_files_parallel(
+    package_dir: &cap_std::fs::Dir,
+    files: &[std::path::PathBuf],
+) -> AccumulatedResult {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let files_scanned = AtomicUsize::new(0);
+    let bytes_scanned = AtomicU64::new(0);
+    let results: Vec<FileAnalysisResult> = files
+        .par_iter()
+        .map_init(Vec::new, |comment_buf, relative_path| {
+            if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
+                || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES
+            {
+                return None;
+            }
+            let result = analyze_cap_single_file(package_dir, relative_path, comment_buf)?;
+            files_scanned.fetch_add(result.files_scanned, Ordering::Relaxed);
+            bytes_scanned.fetch_add(result.bytes_scanned, Ordering::Relaxed);
+            Some(result)
+        })
+        .filter_map(|result| result)
+        .collect();
+
+    let mut source_tags = SourceTags::default();
+    let mut supply_chain_tags = SupplyChainTags::default();
+    let mut all_url_domains = Vec::new();
+    let mut total_code_lines = 0usize;
+    let mut total_export_count = 0usize;
+    let mut meta = AnalysisMeta::default();
+    for result in results {
+        accumulate_result(
+            &mut source_tags,
+            &mut supply_chain_tags,
+            &mut all_url_domains,
+            &mut total_code_lines,
+            &mut total_export_count,
+            &mut meta,
+            result,
+        );
+    }
+    meta.limit_reached |= files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
+        || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES;
+    AccumulatedResult {
+        source: source_tags,
+        supply_chain: supply_chain_tags,
+        url_domains: all_url_domains,
+        total_code_lines,
+        total_export_count,
+        meta,
+    }
+}
+
 /// Intermediate result from scanning a single file. Public so the
 /// streaming path in lpm-store can feed per-entry bytes into
 /// [`analyze_bytes`] and merge results without reopening [`PackageAnalyzer`].
@@ -335,15 +580,22 @@ fn analyze_oversized_source_sample(
 
 fn read_oversized_source_sample(file_path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(file_path)?;
+    read_oversized_source_sample_from_open_file(&mut file, size)
+}
+
+fn read_oversized_source_sample_from_open_file(
+    file: &mut std::fs::File,
+    size: u64,
+) -> std::io::Result<Vec<u8>> {
     let chunk = OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES.min(size as usize);
     let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
 
-    read_file_chunk(&mut file, 0, chunk, &mut sample)?;
+    read_file_chunk(file, 0, chunk, &mut sample)?;
 
     let tail_start = size.saturating_sub(chunk as u64);
     if tail_start > chunk as u64 {
         sample.push(b'\n');
-        read_file_chunk(&mut file, tail_start, chunk, &mut sample)?;
+        read_file_chunk(file, tail_start, chunk, &mut sample)?;
     }
 
     Ok(sample)
@@ -598,13 +850,20 @@ fn collect_source_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+
+        if lpm_common::is_symlink_or_junction(&metadata) {
+            continue;
+        }
 
         // Skip hidden files/directories
         if name_str.starts_with('.') {
             continue;
         }
 
-        if path.is_dir() {
+        if metadata.is_dir() {
             // Skip node_modules (shouldn't exist in store, but defensive)
             if name_str == "node_modules" || name_str == "__tests__" || name_str == "test" {
                 continue;
@@ -648,7 +907,28 @@ fn analyze_package_manifest(package_dir: &Path) -> ManifestTags {
         Err(_) => return ManifestTags::default(),
     };
 
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
+    analyze_package_manifest_content(&content)
+}
+
+fn analyze_package_manifest_from_open_dir(package_dir: &cap_std::fs::Dir) -> ManifestTags {
+    let Ok((file, _)) = open_cap_source_file(package_dir, Path::new("package.json")) else {
+        return ManifestTags::default();
+    };
+    let Ok((content, _)) = lpm_common::read_file_capped_from_open_file(
+        file.into_std(),
+        Path::new("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) else {
+        return ManifestTags::default();
+    };
+    let Ok(content) = std::str::from_utf8(&content) else {
+        return ManifestTags::default();
+    };
+    analyze_package_manifest_content(content)
+}
+
+fn analyze_package_manifest_content(content: &str) -> ManifestTags {
+    let parsed: serde_json::Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(_) => return ManifestTags::default(),
     };
@@ -766,6 +1046,19 @@ impl PackageAnalyzer {
             .and_then(|e| e.to_str())
             .unwrap_or("");
         SOURCE_EXTENSIONS.contains(&ext)
+    }
+
+    fn should_scan_directory(relative_path: &Path) -> bool {
+        relative_path.components().all(|component| {
+            let std::path::Component::Normal(name) = component else {
+                return false;
+            };
+            let name = name.to_string_lossy();
+            !name.starts_with('.')
+                && name != "node_modules"
+                && name != "__tests__"
+                && name != "test"
+        })
     }
 
     /// Should the extractor buffer this source entry for full byte-level scanning?
@@ -1090,6 +1383,126 @@ mod tests {
         let analysis = analyze_package(dir.path());
         assert!(analysis.manifest.copyleft_license);
         assert!(!analysis.manifest.no_license);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn analyze_package_does_not_follow_nested_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let package = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[(
+                "package.json",
+                r#"{"name":"safe","version":"1.0.0","license":"MIT"}"#,
+            )],
+        );
+        create_test_package(outside.path(), &[("outside.js", "eval('outside')")]);
+        symlink(outside.path(), package.path().join("linked-outside")).unwrap();
+
+        let analysis = analyze_package(package.path());
+
+        assert!(
+            !analysis.source.eval,
+            "behavioral analysis must not leave the selected package through nested symlinks"
+        );
+    }
+
+    #[test]
+    fn capability_analysis_matches_path_analysis_for_parallel_packages() {
+        let package = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[(
+                "package.json",
+                r#"{"name":"parallel","version":"1.0.0","license":"MIT"}"#,
+            )],
+        );
+        for index in 0..24 {
+            fs::write(
+                package.path().join(format!("source-{index}.js")),
+                format!("export const value{index} = fetch('https://example.test/{index}');\n"),
+            )
+            .unwrap();
+        }
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let path_analysis = analyze_package(package.path());
+        let capability_analysis = analyze_package_from_open_dir(&directory);
+        let mut path_json = serde_json::to_value(path_analysis).unwrap();
+        let mut capability_json = serde_json::to_value(capability_analysis).unwrap();
+        path_json["analyzedAt"] = serde_json::Value::Null;
+        capability_json["analyzedAt"] = serde_json::Value::Null;
+
+        assert_eq!(capability_json, path_json);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_analysis_keeps_the_open_package_root_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let package = parent.path().join("package");
+        create_test_package(
+            &package,
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"safe","version":"1.0.0","license":"MIT"}"#,
+                ),
+                ("index.js", "module.exports = 1;\n"),
+            ],
+        );
+        create_test_package(
+            outside.path(),
+            &[
+                ("package.json", r#"{"name":"outside","version":"9.0.0"}"#),
+                ("index.js", "eval('outside')\n"),
+            ],
+        );
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&package, cap_std::ambient_authority()).unwrap();
+        fs::rename(&package, parent.path().join("detached")).unwrap();
+        symlink(outside.path(), &package).unwrap();
+
+        let analysis = analyze_package_from_open_dir(&directory);
+
+        assert!(!analysis.source.eval);
+        assert!(!analysis.manifest.no_license);
+        assert_eq!(analysis.meta.files_scanned, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capability_analysis_does_not_follow_nested_directory_junctions() {
+        let package = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[(
+                "package.json",
+                r#"{"name":"safe","version":"1.0.0","license":"MIT"}"#,
+            )],
+        );
+        create_test_package(outside.path(), &[("outside.js", "eval('outside')")]);
+        lpm_common::create_dir_symlink_or_junction(
+            outside.path(),
+            &package.path().join("linked-outside"),
+        )
+        .unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let analysis = analyze_package_from_open_dir(&directory);
+
+        assert!(!analysis.source.eval);
     }
 
     #[test]

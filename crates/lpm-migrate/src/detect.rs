@@ -4,7 +4,7 @@
 //! manager kind and lockfile format version. When multiple lockfiles exist,
 //! the most recently modified one wins.
 
-use crate::{DetectedSource, SourceKind};
+use crate::{DetectedLockfile, DetectedSource, SourceKind};
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
 
@@ -23,25 +23,38 @@ const LOCKFILE_CANDIDATES: &[(&str, SourceKind)] = &[
 /// - Warns about other lockfiles via `tracing::warn!`.
 /// - Errors if no lockfile is found.
 pub fn detect_source(project_dir: &Path) -> Result<DetectedSource, LpmError> {
+    let selected = detect_lockfile(project_dir)?.ok_or_else(no_lockfile_error)?;
+    let version = detect_version(&selected.path, selected.kind)?;
+
+    Ok(DetectedSource {
+        kind: selected.kind,
+        path: selected.path,
+        version,
+    })
+}
+
+/// Select a foreign lockfile without reading or decoding its contents.
+///
+/// Returns `Ok(None)` when the directory contains no candidate. Metadata
+/// failures for a present candidate are returned to the caller.
+pub fn detect_lockfile(project_dir: &Path) -> Result<Option<DetectedLockfile>, LpmError> {
     let mut found: Vec<(PathBuf, SourceKind, std::time::SystemTime)> = Vec::new();
 
     for &(filename, kind) in LOCKFILE_CANDIDATES {
         let path = project_dir.join(filename);
-        if path.exists() {
-            let mtime = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(LpmError::Io(error)),
+        };
+        if metadata.is_file() {
+            let mtime = metadata.modified().map_err(LpmError::Io)?;
             found.push((path, kind, mtime));
         }
     }
 
     if found.is_empty() {
-        return Err(LpmError::Script(
-            "no lockfile found. Expected one of: package-lock.json, yarn.lock, \
-             pnpm-lock.yaml, bun.lockb, bun.lock"
-                .to_string(),
-        ));
+        return Ok(None);
     }
 
     // Sort by mtime descending (most recent first). On ties, the earlier
@@ -61,13 +74,18 @@ pub fn detect_source(project_dir: &Path) -> Result<DetectedSource, LpmError> {
         );
     }
 
-    let version = detect_version(chosen_path, *chosen_kind)?;
-
-    Ok(DetectedSource {
+    Ok(Some(DetectedLockfile {
         kind: *chosen_kind,
         path: chosen_path.clone(),
-        version,
-    })
+    }))
+}
+
+fn no_lockfile_error() -> LpmError {
+    LpmError::Script(
+        "no lockfile found. Expected one of: package-lock.json, yarn.lock, \
+         pnpm-lock.yaml, bun.lockb, bun.lock"
+            .to_string(),
+    )
 }
 
 /// Detect the lockfile format version for the given lockfile.
@@ -82,21 +100,15 @@ fn detect_version(path: &Path, kind: SourceKind) -> Result<u32, LpmError> {
 
 /// npm: parse `lockfileVersion` from JSON.
 fn detect_npm_version(path: &Path) -> Result<u32, LpmError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::read_lockfile_snapshot(path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
-
-    let version = json
-        .get("lockfileVersion")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u32;
-
-    Ok(version)
+    crate::npm::lockfile_version_from_value(&json)
 }
 
 /// yarn: check for `# yarn lockfile v1` or Berry's `__metadata` block.
 /// Yarn v1 uses a custom format; Yarn Berry (v2+) uses YAML.
 fn detect_yarn_version(path: &Path) -> Result<u32, LpmError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::read_lockfile_snapshot(path)?;
 
     // Yarn Berry (v2+) lockfiles start with __metadata and contain a "cacheKey"
     if content.contains("__metadata:") {
@@ -124,7 +136,7 @@ fn detect_yarn_version(path: &Path) -> Result<u32, LpmError> {
 
 /// pnpm: parse `lockfileVersion` from the first few lines of YAML.
 fn detect_pnpm_version(path: &Path) -> Result<u32, LpmError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::read_lockfile_snapshot(path)?;
 
     for line in content.lines().take(5) {
         let trimmed = line.trim();
@@ -288,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_npm_v1_default() {
+    fn detect_npm_rejects_missing_lockfile_version() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package-lock.json"),
@@ -296,8 +308,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = detect_source(dir.path()).unwrap();
-        assert_eq!(result.kind, SourceKind::Npm);
-        assert_eq!(result.version, 1);
+        let error = detect_source(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("missing lockfileVersion"));
     }
 }

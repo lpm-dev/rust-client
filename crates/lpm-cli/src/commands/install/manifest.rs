@@ -462,6 +462,7 @@ pub(super) fn registry_signature_inputs_from_install_packages(
                 name: package.name.clone(),
                 version: package.version.clone(),
                 source: Some(package.source.clone()),
+                resolved_url: None,
                 integrity: package.integrity.clone(),
                 signatures: package.registry_signatures.clone(),
                 published_at: package.registry_published_at.clone(),

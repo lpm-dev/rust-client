@@ -9,38 +9,205 @@
 //! 1. Collect all packages into a lookup map (`name → version`) for dependency resolution
 //! 2. Build `MigratedPackage` entries with exact resolved dependency versions
 
-use crate::MigratedPackage;
+use crate::{
+    BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, read_lockfile_snapshot,
+};
 use lpm_common::LpmError;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::warn;
 
+/// One decoded npm lockfile snapshot and the exact installed paths that
+/// correspond to its normalized registry package rows.
+#[derive(Debug)]
+pub struct ParsedNpmLockfile {
+    pub version: u32,
+    pub packages: Vec<MigratedPackage>,
+    pub package_paths: Option<HashMap<String, Vec<String>>>,
+}
+
+type NpmPackageMap = BoundedMap<serde_json::Map<String, Value>, MAX_PACKAGES>;
+
+#[derive(Deserialize)]
+struct NpmLockfile {
+    #[serde(rename = "lockfileVersion")]
+    lockfile_version: Option<Value>,
+    packages: Option<NpmPackageMap>,
+    dependencies: Option<NpmPackageMap>,
+}
+
 /// Parse an npm `package-lock.json` file from disk.
 pub fn parse(path: &Path, lockfile_version: u32) -> Result<Vec<MigratedPackage>, LpmError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_lockfile_snapshot(path)?;
     parse_str(&content, lockfile_version)
+}
+
+/// Decode an npm lockfile snapshot once for audit discovery.
+pub fn parse_snapshot(content: &str) -> Result<ParsedNpmLockfile, LpmError> {
+    let lockfile = decode_lockfile(content)?;
+    let version = lockfile_version_from_field(lockfile.lockfile_version.as_ref())?;
+    let package_paths = lockfile
+        .packages
+        .as_ref()
+        .map(|packages| package_paths_from_packages(packages))
+        .transpose()?;
+    let packages = parse_lockfile_maps(&lockfile, version)?;
+
+    Ok(ParsedNpmLockfile {
+        version,
+        packages,
+        package_paths,
+    })
 }
 
 /// Parse npm `package-lock.json` content from a string.
 pub fn parse_str(content: &str, lockfile_version: u32) -> Result<Vec<MigratedPackage>, LpmError> {
-    let json: Value = serde_json::from_str(content)?;
+    let lockfile = decode_lockfile(content)?;
+    let detected_version = lockfile_version_from_field(lockfile.lockfile_version.as_ref())?;
+    if detected_version != lockfile_version {
+        return Err(LpmError::Script(format!(
+            "npm lockfile version changed while parsing: detected {detected_version}, expected {lockfile_version}"
+        )));
+    }
+    parse_lockfile_maps(&lockfile, detected_version)
+}
+
+fn decode_lockfile(content: &str) -> Result<NpmLockfile, LpmError> {
+    serde_json::from_str(content)
+        .map_err(|error| LpmError::Script(format!("invalid package-lock.json: {error}")))
+}
+
+/// Read and validate `lockfileVersion` from a parsed package-lock snapshot.
+pub fn lockfile_version_from_value(json: &Value) -> Result<u32, LpmError> {
+    lockfile_version_from_field(json.get("lockfileVersion"))
+}
+
+fn lockfile_version_from_field(value: Option<&Value>) -> Result<u32, LpmError> {
+    let value = value.ok_or_else(|| {
+        LpmError::Script("package-lock.json is missing lockfileVersion".to_string())
+    })?;
+    let raw = value.as_u64().ok_or_else(|| {
+        LpmError::Script("package-lock.json has a non-integer lockfileVersion".to_string())
+    })?;
+    let version = u32::try_from(raw).map_err(|_| {
+        LpmError::Script(format!(
+            "package-lock.json lockfileVersion {raw} exceeds the supported integer range"
+        ))
+    })?;
+    if !(1..=3).contains(&version) {
+        return Err(LpmError::Script(format!(
+            "unsupported npm lockfile version {version}; supported versions are 1, 2, and 3"
+        )));
+    }
+    Ok(version)
+}
+
+fn parse_lockfile_maps(
+    lockfile: &NpmLockfile,
+    lockfile_version: u32,
+) -> Result<Vec<MigratedPackage>, LpmError> {
+    if !(1..=3).contains(&lockfile_version) {
+        return Err(LpmError::Script(format!(
+            "unsupported npm lockfile version {lockfile_version}; supported versions are 1, 2, and 3"
+        )));
+    }
+    if let Some(packages) = &lockfile.packages {
+        return parse_packages_block(packages);
+    }
+    if lockfile_version == 1
+        && let Some(dependencies) = &lockfile.dependencies
+    {
+        return parse_dependencies_block(dependencies);
+    }
+    Err(LpmError::Script(
+        "package-lock.json has no 'packages' or 'dependencies' block".to_string(),
+    ))
+}
+
+/// Parse a previously decoded package-lock snapshot.
+pub fn parse_value(json: &Value, lockfile_version: u32) -> Result<Vec<MigratedPackage>, LpmError> {
+    if !(1..=3).contains(&lockfile_version) {
+        return Err(LpmError::Script(format!(
+            "unsupported npm lockfile version {lockfile_version}; supported versions are 1, 2, and 3"
+        )));
+    }
 
     // v2 and v3 both have "packages" — prefer it over "dependencies"
     if let Some(packages) = json.get("packages").and_then(|p| p.as_object()) {
-        return Ok(parse_packages_block(packages));
+        return parse_packages_block(packages);
     }
 
     // v1 fallback: use "dependencies" block
     if lockfile_version <= 1
         && let Some(deps) = json.get("dependencies").and_then(|d| d.as_object())
     {
-        return Ok(parse_dependencies_block(deps));
+        return parse_dependencies_block(deps);
     }
 
     Err(LpmError::Script(
         "package-lock.json has no 'packages' or 'dependencies' block".to_string(),
     ))
+}
+
+/// Return the normalized identity of one registry-backed v2/v3 package row.
+pub fn registry_package_identity<'a>(key: &str, value: &'a Value) -> Option<(String, &'a str)> {
+    if key.is_empty()
+        || value.get("link").and_then(Value::as_bool).unwrap_or(false)
+        || !key.contains("node_modules/")
+        || value.get("resolved").and_then(Value::as_str).is_none()
+    {
+        return None;
+    }
+    let name = extract_name_from_key(key)?;
+    let version = value.get("version").and_then(Value::as_str)?;
+    Some((name, version))
+}
+
+/// Build the exact-path FIFO from the same decoded DOM used for normalization.
+pub fn package_paths_from_value(
+    json: &Value,
+) -> Result<Option<HashMap<String, Vec<String>>>, LpmError> {
+    let Some(packages) = json.get("packages").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    enforce_package_limit(packages.len())?;
+
+    package_paths_from_packages(packages).map(Some)
+}
+
+fn package_paths_from_packages(
+    packages: &serde_json::Map<String, Value>,
+) -> Result<HashMap<String, Vec<String>>, LpmError> {
+    enforce_package_limit(packages.len())?;
+    let mut paths = HashMap::with_capacity(packages.len());
+    for (path, value) in packages {
+        let Some((name, version)) = registry_package_identity(path, value) else {
+            continue;
+        };
+        validate_package_path(path)?;
+        paths
+            .entry(format!("{name}@{version}"))
+            .or_insert_with(Vec::new)
+            .push(path.clone());
+    }
+    Ok(paths)
+}
+
+fn validate_package_path(raw: &str) -> Result<(), LpmError> {
+    let path = Path::new(raw);
+    if raw.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(LpmError::Script(format!(
+            "package-lock.json contains an unsafe package path: {raw}"
+        )));
+    }
+    Ok(())
 }
 
 /// Intermediate entry collected during first pass.
@@ -86,7 +253,10 @@ fn extract_name_from_key(key: &str) -> Option<String> {
 }
 
 /// Parse the v2/v3 `packages` block.
-fn parse_packages_block(packages: &serde_json::Map<String, Value>) -> Vec<MigratedPackage> {
+fn parse_packages_block(
+    packages: &serde_json::Map<String, Value>,
+) -> Result<Vec<MigratedPackage>, LpmError> {
+    enforce_package_limit(packages.len())?;
     // First pass: collect all entries and build name → version lookup
     let mut entries = Vec::with_capacity(packages.len());
     // name → version (shallowest nesting level preferred)
@@ -95,48 +265,15 @@ fn parse_packages_block(packages: &serde_json::Map<String, Value>) -> Vec<Migrat
     let mut version_depth: HashMap<String, usize> = HashMap::with_capacity(packages.len());
 
     for (key, value) in packages {
-        // Skip root entry
-        if key.is_empty() {
+        let Some((name, version)) = registry_package_identity(key, value) else {
             continue;
-        }
-
-        // Skip workspace links (symlinks in node_modules/)
-        if value.get("link").and_then(|v| v.as_bool()).unwrap_or(false) {
-            continue;
-        }
-
-        // Skip workspace member definitions (paths like "packages/app" that
-        // don't contain "node_modules/"). These are local projects, not
-        // installed packages.
-        if !key.contains("node_modules/") {
-            continue;
-        }
-
-        let name = match extract_name_from_key(key) {
-            Some(n) => n,
-            None => {
-                warn!(key, "skipping package-lock entry with unparseable key");
-                continue;
-            }
         };
-
-        let version = match value.get("version").and_then(|v| v.as_str()) {
-            Some(v) => v.to_string(),
-            None => {
-                warn!(key, "skipping package-lock entry without version");
-                continue;
-            }
-        };
+        let version = version.to_string();
 
         let resolved = value
             .get("resolved")
             .and_then(|v| v.as_str())
             .map(String::from);
-
-        // Skip entries without resolved URL (file: deps, workspace links, etc.)
-        if resolved.is_none() {
-            continue;
-        }
 
         let integrity = value
             .get("integrity")
@@ -210,6 +347,7 @@ fn parse_packages_block(packages: &serde_json::Map<String, Value>) -> Vec<Migrat
         dependencies.sort_by(|a, b| a.0.cmp(&b.0));
 
         result.push(MigratedPackage {
+            lockfile_key: None,
             name: entry.name.clone(),
             version: entry.version.clone(),
             resolved: entry.resolved.clone(),
@@ -223,7 +361,8 @@ fn parse_packages_block(packages: &serde_json::Map<String, Value>) -> Vec<Migrat
     // Sort by name then version for deterministic output
     result.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
 
-    result
+    enforce_package_limit(result.len())?;
+    Ok(result)
 }
 
 /// Resolve a dependency's exact version using npm's node_modules resolution algorithm.
@@ -274,19 +413,20 @@ fn resolve_dependency_version(
 }
 
 /// Parse the v1 `dependencies` block (nested tree format).
-fn parse_dependencies_block(deps: &serde_json::Map<String, Value>) -> Vec<MigratedPackage> {
+fn parse_dependencies_block(
+    deps: &serde_json::Map<String, Value>,
+) -> Result<Vec<MigratedPackage>, LpmError> {
     let mut result = Vec::new();
-    // First pass: collect all packages for version lookup
-    let mut version_lookup: HashMap<String, String> = HashMap::new();
-    collect_v1_versions(deps, &mut version_lookup);
+    let mut version_lookup: HashMap<String, String> = HashMap::with_capacity(deps.len());
+    let mut raw_package_count = 0usize;
+    collect_v1_versions(deps, &mut version_lookup, &mut raw_package_count)?;
 
-    // Second pass: build migrated packages
-    parse_v1_deps_recursive(deps, &version_lookup, &mut result);
+    parse_v1_deps_recursive(deps, &version_lookup, &mut result)?;
 
     // Sort by name then version for deterministic output
     result.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
 
-    result
+    Ok(result)
 }
 
 /// Maximum nesting depth for v1 recursive parsing.
@@ -297,20 +437,25 @@ const MAX_V1_DEPTH: usize = 256;
 fn collect_v1_versions(
     deps: &serde_json::Map<String, Value>,
     lookup: &mut HashMap<String, String>,
-) {
-    collect_v1_versions_inner(deps, lookup, 0);
+    package_count: &mut usize,
+) -> Result<(), LpmError> {
+    collect_v1_versions_inner(deps, lookup, package_count, 0)
 }
 
 fn collect_v1_versions_inner(
     deps: &serde_json::Map<String, Value>,
     lookup: &mut HashMap<String, String>,
+    package_count: &mut usize,
     depth: usize,
-) {
+) -> Result<(), LpmError> {
     if depth > MAX_V1_DEPTH {
-        warn!("npm v1 lockfile exceeds max nesting depth ({MAX_V1_DEPTH}), truncating");
-        return;
+        return Err(LpmError::Script(format!(
+            "npm v1 lockfile exceeds the maximum nesting depth of {MAX_V1_DEPTH}"
+        )));
     }
     for (name, value) in deps {
+        *package_count = package_count.saturating_add(1);
+        enforce_package_limit(*package_count)?;
         if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
             // Root-level wins; don't overwrite
             lookup
@@ -319,9 +464,10 @@ fn collect_v1_versions_inner(
         }
         // Recurse into nested dependencies
         if let Some(nested) = value.get("dependencies").and_then(|d| d.as_object()) {
-            collect_v1_versions_inner(nested, lookup, depth + 1);
+            collect_v1_versions_inner(nested, lookup, package_count, depth + 1)?;
         }
     }
+    Ok(())
 }
 
 /// Recursively parse v1 dependencies tree into flat `MigratedPackage` list.
@@ -329,8 +475,8 @@ fn parse_v1_deps_recursive(
     deps: &serde_json::Map<String, Value>,
     version_lookup: &HashMap<String, String>,
     result: &mut Vec<MigratedPackage>,
-) {
-    parse_v1_deps_recursive_inner(deps, version_lookup, result, 0);
+) -> Result<(), LpmError> {
+    parse_v1_deps_recursive_inner(deps, version_lookup, result, 0)
 }
 
 fn parse_v1_deps_recursive_inner(
@@ -338,10 +484,11 @@ fn parse_v1_deps_recursive_inner(
     version_lookup: &HashMap<String, String>,
     result: &mut Vec<MigratedPackage>,
     depth: usize,
-) {
+) -> Result<(), LpmError> {
     if depth > MAX_V1_DEPTH {
-        warn!("npm v1 lockfile exceeds max nesting depth ({MAX_V1_DEPTH}), truncating");
-        return;
+        return Err(LpmError::Script(format!(
+            "npm v1 lockfile exceeds the maximum nesting depth of {MAX_V1_DEPTH}"
+        )));
     }
     for (name, value) in deps {
         let version = match value.get("version").and_then(|v| v.as_str()) {
@@ -382,6 +529,7 @@ fn parse_v1_deps_recursive_inner(
         dependencies.sort_by(|a, b| a.0.cmp(&b.0));
 
         result.push(MigratedPackage {
+            lockfile_key: None,
             name: name.clone(),
             version,
             resolved,
@@ -390,12 +538,14 @@ fn parse_v1_deps_recursive_inner(
             is_optional,
             is_dev,
         });
+        enforce_package_limit(result.len())?;
 
         // Recurse into nested dependencies
         if let Some(nested) = value.get("dependencies").and_then(|d| d.as_object()) {
-            parse_v1_deps_recursive_inner(nested, version_lookup, result, depth + 1);
+            parse_v1_deps_recursive_inner(nested, version_lookup, result, depth + 1)?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -973,5 +1123,124 @@ mod tests {
         let json = r#"{ "lockfileVersion": 3 }"#;
         let result = parse_str(json, 3);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_lockfile_version_even_with_packages_block() {
+        let error = parse_str(
+            r#"{
+                "lockfileVersion": 4,
+                "packages": {
+                    "node_modules/future": {
+                        "version": "1.0.0",
+                        "resolved": "https://registry.npmjs.org/future/-/future-1.0.0.tgz"
+                    }
+                }
+            }"#,
+            4,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported npm lockfile version")
+        );
+    }
+
+    #[test]
+    fn parse_rejects_missing_lockfile_version() {
+        let error = parse_snapshot(r#"{"packages": {}}"#).unwrap_err();
+
+        assert!(error.to_string().contains("missing lockfileVersion"));
+    }
+
+    #[test]
+    fn parse_rejects_nonnumeric_lockfile_version() {
+        let error = parse_snapshot(r#"{"lockfileVersion": "3", "packages": {}}"#).unwrap_err();
+
+        assert!(error.to_string().contains("non-integer lockfileVersion"));
+    }
+
+    #[test]
+    fn parse_rejects_lockfile_version_larger_than_u32() {
+        let error =
+            parse_snapshot(r#"{"lockfileVersion": 4294967296, "packages": {}}"#).unwrap_err();
+
+        assert!(error.to_string().contains("supported integer range"));
+    }
+
+    #[test]
+    fn raw_package_map_limit_is_enforced_before_filtering() {
+        let mut packages = serde_json::Map::new();
+        for index in 0..=crate::MAX_PACKAGES {
+            packages.insert(format!("skipped-{index}"), Value::Null);
+        }
+        let json = Value::Object(serde_json::Map::from_iter([
+            ("lockfileVersion".to_string(), Value::from(3)),
+            ("packages".to_string(), Value::Object(packages)),
+        ]));
+
+        let error = parse_value(&json, 3).unwrap_err();
+
+        assert!(error.to_string().contains("200001 packages"));
+    }
+
+    #[test]
+    fn raw_v1_dependency_limit_is_enforced_before_filtering() {
+        let mut dependencies = serde_json::Map::new();
+        for index in 0..=crate::MAX_PACKAGES {
+            dependencies.insert(
+                format!("filtered-{index}"),
+                serde_json::json!({"version": "1.0.0"}),
+            );
+        }
+        let json = Value::Object(serde_json::Map::from_iter([
+            ("lockfileVersion".to_string(), Value::from(1)),
+            ("dependencies".to_string(), Value::Object(dependencies)),
+        ]));
+
+        let error = parse_value(&json, 1).unwrap_err();
+
+        assert!(error.to_string().contains("200001 packages"));
+    }
+
+    #[test]
+    fn v1_dependency_depth_limit_fails_instead_of_truncating_inventory() {
+        let mut nested = serde_json::json!({
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/sentinel/-/sentinel-1.0.0.tgz"
+        });
+        for depth in (0..=MAX_V1_DEPTH).rev() {
+            nested = serde_json::json!({
+                "version": "1.0.0",
+                "resolved": format!("https://registry.npmjs.org/level-{depth}/-/level-{depth}-1.0.0.tgz"),
+                "dependencies": {format!("level-{depth}"): nested}
+            });
+        }
+        let json = serde_json::json!({
+            "lockfileVersion": 1,
+            "dependencies": {"root": nested}
+        });
+
+        let error = parse_value(&json, 1).unwrap_err();
+
+        assert!(error.to_string().contains("nesting depth"));
+    }
+
+    #[test]
+    fn package_map_limit_is_enforced_before_the_overflow_value_is_decoded() {
+        use std::fmt::Write as _;
+
+        let mut lockfile = String::with_capacity(crate::MAX_PACKAGES * 16);
+        lockfile.push_str(r#"{"lockfileVersion":3,"packages":{"#);
+        for index in 0..crate::MAX_PACKAGES {
+            write!(lockfile, r#""p{index}":null,"#).unwrap();
+        }
+        lockfile.push_str(r#""overflow":["#);
+
+        let error = parse_snapshot(&lockfile).unwrap_err();
+
+        assert!(error.to_string().contains("package map exceeds"));
     }
 }

@@ -239,6 +239,39 @@ impl RouteTable {
         self.mode.route_for_package(name)
     }
 
+    /// Return the configured npm-compatible route only when `candidate`
+    /// is within the registry path authorized for `name`.
+    pub fn custom_route_for_package_url(
+        &self,
+        name: &str,
+        candidate: &str,
+    ) -> Option<UpstreamRoute> {
+        if let Some(target) = self.npmrc_scope_target_for_package(name) {
+            return registry_url_contains(candidate, &target.base_url).then(|| {
+                UpstreamRoute::Custom {
+                    target: target.clone(),
+                    auth: self.npmrc.auth_for_url(&target.base_url).cloned(),
+                }
+            });
+        }
+        if name.starts_with("@jsr/") {
+            return registry_url_contains(candidate, JSR_NPM_REGISTRY_URL).then(|| {
+                UpstreamRoute::Custom {
+                    target: RegistryTarget {
+                        base_url: Arc::from(JSR_NPM_REGISTRY_URL),
+                        kind: RegistryKind::NpmCompatible,
+                    },
+                    auth: self.npmrc.auth_for_url(JSR_NPM_REGISTRY_URL).cloned(),
+                }
+            });
+        }
+        let target = self.npmrc.default_registry.as_ref()?;
+        registry_url_contains(candidate, &target.base_url).then(|| UpstreamRoute::Custom {
+            target: target.clone(),
+            auth: self.npmrc.auth_for_url(&target.base_url).cloned(),
+        })
+    }
+
     fn npmrc_scope_target_for_package(&self, name: &str) -> Option<&RegistryTarget> {
         let scope_end = name.find('/')?;
         let scope = name.get(..scope_end)?;
@@ -416,6 +449,29 @@ impl RouteTable {
         }
         origins
     }
+}
+
+fn registry_url_contains(candidate: &str, registry: &str) -> bool {
+    let Ok(candidate) = reqwest::Url::parse(candidate) else {
+        return false;
+    };
+    let Ok(registry) = reqwest::Url::parse(registry) else {
+        return false;
+    };
+    if candidate.scheme() != registry.scheme()
+        || candidate.host_str().map(str::to_ascii_lowercase)
+            != registry.host_str().map(str::to_ascii_lowercase)
+        || candidate.port_or_known_default() != registry.port_or_known_default()
+    {
+        return false;
+    }
+    let base = registry.path().trim_end_matches('/');
+    base.is_empty()
+        || candidate.path() == base
+        || candidate
+            .path()
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Fatal `.npmrc` parse errors that block `RouteTable` construction.

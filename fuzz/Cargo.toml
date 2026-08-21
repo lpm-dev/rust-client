@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 lpm-extractor = { path = "../crates/lpm-extractor" }
+lpm-migrate = { path = "../crates/lpm-migrate" }
 lpm-semver = { path = "../crates/lpm-semver" }
 
 [workspace]
@@ -31,6 +32,13 @@ bench = false
 [[bin]]
 name = "extractor_bounded_tar_walker"
 path = "fuzz_targets/extractor_bounded_tar_walker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "foreign_lockfile_parsers"
+path = "fuzz_targets/foreign_lockfile_parsers.rs"
 test = false
 doc = false
 bench = false

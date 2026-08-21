@@ -439,6 +439,9 @@ jobs:
       - name: Bounded tar walker fuzz smoke
         run: cargo +nightly fuzz run extractor_bounded_tar_walker -- -runs=2000
 
+      - name: Foreign lockfile parser fuzz smoke
+        run: cargo +nightly fuzz run foreign_lockfile_parsers -- -runs=2000
+
   windows-platform-backends:
     name: Windows platform backend runtime checks
     runs-on: windows-latest

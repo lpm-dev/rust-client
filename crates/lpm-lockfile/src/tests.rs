@@ -5097,6 +5097,10 @@ fn read_for_project_returns_the_nearest_workspace_importer_projection() {
     assert_eq!(projected.importer, "packages/app");
     assert_eq!(projected.path, directory.path().join(LOCKFILE_NAME));
     assert_eq!(projected.lockfile.packages[0].name, "app-dep");
+    assert_eq!(
+        projected.content,
+        std::fs::read_to_string(directory.path().join(LOCKFILE_NAME)).unwrap()
+    );
 }
 
 #[test]

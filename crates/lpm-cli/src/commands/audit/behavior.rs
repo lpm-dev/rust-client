@@ -87,6 +87,7 @@ pub(super) fn run_behavioral_analysis(
     let mut with_actionable_findings = 0usize;
 
     let project_cache_ref = project_cache.as_ref();
+    let project_root_directory = open_project_root(&discovery.project_root).ok();
     let loaded: Vec<LoadedBehavioralAnalysis> = scannable
         .par_iter()
         .filter_map(|pkg| {
@@ -96,21 +97,23 @@ pub(super) fn run_behavioral_analysis(
                 "local"
             };
             let cache_integrity = inventory::audit_cache_integrity(pkg);
+            let store_baseline = if pkg.scan_mode == ScanMode::RegistryAndStore {
+                lpm_root.as_ref().and_then(|root| {
+                    inventory::find_project_baseline(
+                        baseline_index.as_ref(),
+                        root,
+                        &pkg.name,
+                        &pkg.version,
+                    )
+                })
+            } else {
+                None
+            };
             let cached_analysis = if pkg.scan_mode == ScanMode::RegistryAndStore {
                 let store_analysis = if inventory::can_reuse_lpm_store_analysis(pkg) {
-                    lpm_root
-                        .as_ref()
-                        .and_then(|root| {
-                            inventory::find_project_baseline(
-                                baseline_index.as_ref(),
-                                root,
-                                &pkg.name,
-                                &pkg.version,
-                            )
-                        })
-                        .and_then(|baseline| {
-                            lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
-                        })
+                    store_baseline.as_ref().and_then(|baseline| {
+                        lpm_security::behavioral::read_cached_analysis(&baseline.package_dir)
+                    })
                 } else {
                     None
                 };
@@ -125,11 +128,19 @@ pub(super) fn run_behavioral_analysis(
                     .cloned()
             };
 
-            let abs_path = discovery.project_root.join(&pkg.path);
             let (analysis, cache_update) = if let Some(analysis) = cached_analysis {
                 (analysis, None)
-            } else if abs_path.is_dir() {
-                let analysis = lpm_security::behavioral::analyze_package(&abs_path);
+            } else if let Some(package_directory) = store_baseline
+                .as_ref()
+                .and_then(|baseline| open_project_root(&baseline.package_dir).ok())
+                .or_else(|| {
+                    project_root_directory
+                        .as_ref()
+                        .and_then(|root| open_relative_directory_nofollow(root, &pkg.path).ok())
+                })
+            {
+                let analysis =
+                    lpm_security::behavioral::analyze_package_from_open_dir(&package_directory);
                 let cache_update = BehavioralCacheUpdate {
                     path: pkg.path.clone(),
                     name: pkg.name.clone(),
@@ -239,6 +250,35 @@ pub(super) fn run_behavioral_analysis(
     }
 }
 
+fn open_project_root(path: &std::path::Path) -> std::io::Result<cap_std::fs::Dir> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "audit project root must be absolute",
+        ));
+    }
+    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+}
+
+fn open_relative_directory_nofollow(
+    root: &cap_std::fs::Dir,
+    relative: &str,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt as _;
+
+    let mut directory = root.try_clone()?;
+    for component in std::path::Path::new(relative).components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audit package path contains an unsafe component",
+            ));
+        };
+        directory = directory.open_dir_nofollow(name)?;
+    }
+    Ok(directory)
+}
+
 /// Convert a PackageAnalysis into AuditIssues.
 pub(super) fn analysis_to_issues(
     analysis: &lpm_security::behavioral::PackageAnalysis,
@@ -305,6 +345,8 @@ mod tests {
                 is_optional: false,
                 dependencies: Vec::new(),
             }],
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
         };
         let mut results = Vec::new();
 
@@ -319,6 +361,65 @@ mod tests {
 
         assert_eq!(summary.packages_scanned, 1);
         assert_eq!(summary.packages_with_actionable_findings, 0);
+        assert!(results.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn behavioral_scan_does_not_follow_a_replaced_package_root() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let package_dir = project.path().join("node_modules/replaced");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"replaced","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("index.js"), "module.exports = 1;\n").unwrap();
+        std::fs::write(
+            outside.path().join("package.json"),
+            r#"{"name":"outside","version":"9.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("index.js"), "eval('outside')\n").unwrap();
+        let discovery = DiscoveryResult {
+            manager: ManagerKind::Npm,
+            lockfile_path: None,
+            project_root: project.path().to_path_buf(),
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages: vec![DiscoveredPackage {
+                name: "replaced".to_string(),
+                version: "1.0.0".to_string(),
+                path: "node_modules/replaced".to_string(),
+                integrity: Some("sha512-replaced".to_string()),
+                patch_sha256: None,
+                resolved_url: None,
+                scan_mode: ScanMode::FullLocal,
+                is_dev: false,
+                is_optional: false,
+                dependencies: Vec::new(),
+            }],
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+        };
+        std::fs::rename(&package_dir, project.path().join("detached-package")).unwrap();
+        symlink(outside.path(), &package_dir).unwrap();
+        let mut results = Vec::new();
+
+        let summary = run_behavioral_analysis(
+            &discovery,
+            &mut results,
+            &[],
+            false,
+            None,
+            lpm_store::StoreVersion::V2,
+        );
+
+        assert_eq!(summary.packages_scanned, 0);
         assert!(results.is_empty());
     }
 }

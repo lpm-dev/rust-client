@@ -215,6 +215,7 @@ mod tests {
 
     fn make_pkg(name: &str, version: &str, resolved: Option<&str>) -> MigratedPackage {
         MigratedPackage {
+            lockfile_key: None,
             name: name.to_string(),
             version: version.to_string(),
             resolved: resolved.map(String::from),
@@ -263,6 +264,7 @@ mod tests {
                 Some("https://registry.npmjs.org/real-pkg/-/real-pkg-1.0.0.tgz"),
             ),
             MigratedPackage {
+                lockfile_key: None,
                 name: "local-pkg".to_string(),
                 version: "1.0.0".to_string(),
                 resolved: Some("file:../local-pkg".to_string()),
@@ -272,6 +274,7 @@ mod tests {
                 is_dev: false,
             },
             MigratedPackage {
+                lockfile_key: None,
                 name: "git-pkg".to_string(),
                 version: "1.0.0".to_string(),
                 resolved: Some("git+https://github.com/user/repo.git#abc123".to_string()),
@@ -281,6 +284,7 @@ mod tests {
                 is_dev: false,
             },
             MigratedPackage {
+                lockfile_key: None,
                 name: "link-pkg".to_string(),
                 version: "1.0.0".to_string(),
                 resolved: Some("link:./packages/link-pkg".to_string()),
@@ -305,6 +309,7 @@ mod tests {
     #[test]
     fn skips_empty_name() {
         let packages = vec![MigratedPackage {
+            lockfile_key: None,
             name: String::new(),
             version: "1.0.0".to_string(),
             resolved: Some("https://registry.npmjs.org/x.tgz".to_string()),
@@ -425,6 +430,7 @@ mod tests {
     #[test]
     fn preserves_deps_as_name_at_version() {
         let packages = vec![MigratedPackage {
+            lockfile_key: None,
             name: "express".to_string(),
             version: "4.22.1".to_string(),
             resolved: Some("https://registry.npmjs.org/express/-/express-4.22.1.tgz".to_string()),
@@ -480,6 +486,7 @@ mod tests {
     #[test]
     fn skips_version_with_file_prefix() {
         let packages = vec![MigratedPackage {
+            lockfile_key: None,
             name: "local".to_string(),
             version: "file:../local".to_string(),
             resolved: None,
@@ -498,6 +505,7 @@ mod tests {
     fn skips_workspace_and_patch_protocols() {
         let packages = vec![
             MigratedPackage {
+                lockfile_key: None,
                 name: "workspace-a".to_string(),
                 version: "0.0.0-use.local".to_string(),
                 resolved: Some("workspace:packages/workspace-a".to_string()),
@@ -507,6 +515,7 @@ mod tests {
                 is_dev: false,
             },
             MigratedPackage {
+                lockfile_key: None,
                 name: "patched".to_string(),
                 version: "1.0.0".to_string(),
                 resolved: Some("patch:patched@npm%3A1.0.0#./patched.patch".to_string()),
