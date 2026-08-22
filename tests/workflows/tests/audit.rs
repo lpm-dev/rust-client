@@ -1215,6 +1215,88 @@ async fn audit_lpm_metadata_failure_exits_nonzero() {
 }
 
 #[tokio::test]
+async fn audit_starts_registry_and_osv_requests_concurrently() {
+    let package = "@lpm.dev/test.concurrent-audit";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"concurrent-audit","version":"1.0.0","dependencies":{{"{package}":"1.0.0","clean-pkg":"1.0.0"}}}}"#
+    ));
+    project.write_file(
+        &format!("node_modules/{package}/package.json"),
+        &format!(r#"{{"name":"{package}","version":"1.0.0"}}"#),
+    );
+    project.write_file(
+        "node_modules/clean-pkg/package.json",
+        r#"{"name":"clean-pkg","version":"1.0.0"}"#,
+    );
+
+    let mock = MockRegistry::start().await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry_starts = std::sync::Arc::clone(&starts);
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(move |_: &wiremock::Request| {
+            registry_starts
+                .lock()
+                .unwrap()
+                .push(("registry", std::time::Instant::now()));
+            let body = format!(
+                "{}\n",
+                serde_json::json!({
+                    "name": package,
+                    "metadata": {
+                        "name": package,
+                        "dist-tags": {"latest": "1.0.0"},
+                        "versions": {"1.0.0": {"name": package, "version": "1.0.0"}}
+                    }
+                })
+            );
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(800))
+                .set_body_raw(body, "application/x-ndjson")
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let osv_starts = std::sync::Arc::clone(&starts);
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(move |_: &wiremock::Request| {
+            osv_starts
+                .lock()
+                .unwrap()
+                .push(("osv", std::time::Instant::now()));
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(800))
+                .set_body_json(serde_json::json!({"results": [{}]}))
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+
+    let output = run_audit_json(&project, &mock, &[]);
+
+    assert!(
+        output.status.success(),
+        "concurrent audit failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let starts = starts.lock().unwrap();
+    assert_eq!(
+        starts.len(),
+        2,
+        "unexpected request starts: {starts:?}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let separation = starts[1].1.duration_since(starts[0].1);
+    assert!(
+        separation < std::time::Duration::from_millis(500),
+        "registry and OSV requests started serially: {starts:?}"
+    );
+}
+
+#[tokio::test]
 async fn audit_lpm_missing_installed_metadata_does_not_fall_back_to_latest() {
     let package = "@lpm.dev/test.audit-missing-version";
     let project = TempProject::empty(&format!(
@@ -3474,6 +3556,28 @@ fn audit_secrets_rejects_package_links_outside_approved_roots() {
     assert!(
         !output.status.success() && stderr.contains("outside approved package roots"),
         "external package links must fail closed\nstdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_secrets_fails_closed_when_an_installed_package_cannot_be_resolved() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(r#"{"name":"unresolvable-secrets","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+    symlink("loop", project.path().join("node_modules/loop")).unwrap();
+
+    let output = lpm(&project)
+        .args(["audit", "--secrets"])
+        .output()
+        .expect("failed to run lpm audit --secrets");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+
+    assert!(
+        !output.status.success() && stderr.contains("failed to resolve installed package path"),
+        "unresolvable installed package paths must fail closed\nstdout: {}\nstderr: {stderr}",
         String::from_utf8_lossy(&output.stdout),
     );
 }

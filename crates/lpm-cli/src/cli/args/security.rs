@@ -69,13 +69,14 @@ pub(crate) struct AuditArgs {
     pub(crate) action: Option<commands::audit::AuditCmd>,
 
     /// Minimum severity level to report (info/low, moderate/medium, high, critical).
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, conflicts_with_all = ["secrets", "fix"])]
     pub(crate) level: Option<commands::audit::AuditLevel>,
 
     /// CI exit code policy (`vuln`, `behavior`, or `all`).
     #[arg(
         long,
         value_name = "POLICY",
+        conflicts_with = "fix",
         long_help = "CI exit code policy: what triggers a non-zero exit code.\n\n\
   vuln     — only confirmed vulnerabilities (OSV/registry)\n\
   behavior — only critical/high behavioral flags\n\

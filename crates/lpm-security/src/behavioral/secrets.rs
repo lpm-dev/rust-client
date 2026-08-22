@@ -478,7 +478,7 @@ fn is_scannable_file(file_path: &str) -> bool {
 
 /// Scan all files in a directory for secrets and blocked files.
 ///
-/// Walks the directory tree, skipping node_modules and hidden directories.
+/// Walks the directory tree, skipping nested `node_modules` and `.git` directories.
 /// Returns a combined result with all matches.
 pub fn scan_directory(dir: &std::path::Path) -> SecretScanResult {
     let mut budget = SecretScanBudget::for_operation();
@@ -498,8 +498,7 @@ pub fn scan_directory_with_budget(
     }
 
     let walker = ignore::WalkBuilder::new(dir)
-        .hidden(false) // We DO want to check hidden files like .env
-        .git_ignore(true)
+        .standard_filters(false)
         .filter_entry(|entry| {
             let name = entry.file_name().to_str().unwrap_or("");
             // Skip node_modules and .git
@@ -858,6 +857,32 @@ mod tests {
 
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.limit_exceeded, Some(SecretScanLimit::Findings));
+    }
+
+    #[test]
+    fn scan_directory_does_not_allow_package_ignore_rules_to_hide_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ignored/nested")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(dir.path().join(".ignore"), "also-ignored.js\n").unwrap();
+        std::fs::write(
+            dir.path().join("ignored/nested/secret.js"),
+            format!("const token = 'ghp_{}';\n", "A".repeat(36)),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("also-ignored.js"),
+            "const token = 'AKIAIOSFODNN7EXAMPLE';\n",
+        )
+        .unwrap();
+
+        let result = scan_directory(dir.path());
+
+        assert_eq!(
+            result.matches.len(),
+            2,
+            "installed package ignore files must not reduce secret-scan coverage: {result:?}"
+        );
     }
 
     #[test]

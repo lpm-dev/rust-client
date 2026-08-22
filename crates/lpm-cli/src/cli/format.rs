@@ -49,22 +49,40 @@ where
     })
 }
 
-fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
-    let Some(Commands::Login(args)) = &cli.command else {
-        return None;
-    };
-    if !args.save_env_token || args.token.is_none() {
-        return None;
+pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
+    if let Some(Commands::Login(args)) = &cli.command
+        && args.save_env_token
+        && args.token.is_some()
+    {
+        let mut command = Cli::command();
+        let login = command
+            .find_subcommand_mut("login")
+            .expect("login command must exist");
+        return Some(login.error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "the argument '--save-env-token' cannot be used with '--token <TOKEN>'",
+        ));
     }
 
-    let mut command = Cli::command();
-    let login = command
-        .find_subcommand_mut("login")
-        .expect("login command must exist");
-    Some(login.error(
-        clap::error::ErrorKind::ArgumentConflict,
-        "the argument '--save-env-token' cannot be used with '--token <TOKEN>'",
-    ))
+    if let Some(Commands::Audit(args)) = &cli.command
+        && args.action.is_some()
+        && (args.level.is_some()
+            || args.fail_on.is_some()
+            || args.secrets
+            || args.fix
+            || args.dry_run)
+    {
+        let mut command = Cli::command();
+        let audit = command
+            .find_subcommand_mut("audit")
+            .expect("audit command must exist");
+        return Some(audit.error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "audit mode options cannot be combined with an audit subcommand",
+        ));
+    }
+
+    None
 }
 
 #[derive(Debug, Eq, PartialEq)]
