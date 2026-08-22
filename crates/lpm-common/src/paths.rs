@@ -450,7 +450,15 @@ impl ProjectLockDirectory {
                 match project_root.create_dir(".lpm") {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(LpmError::Io(error)),
+                    Err(error) => {
+                        return Err(LpmError::Io(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to create project lock directory {}: {error}",
+                                display.display()
+                            ),
+                        )));
+                    }
                 }
                 project_root.open_dir_nofollow(".lpm").map_err(|error| {
                     LpmError::Io(std::io::Error::new(
@@ -472,7 +480,15 @@ impl ProjectLockDirectory {
                 )));
             }
         };
-        let metadata = directory.dir_metadata().map_err(LpmError::Io)?;
+        let metadata = directory.dir_metadata().map_err(|error| {
+            LpmError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect project lock directory {}: {error}",
+                    display.display()
+                ),
+            ))
+        })?;
         if !metadata.is_dir() || capability_metadata_is_link_or_reparse(&metadata) {
             return Err(LpmError::Io(std::io::Error::other(format!(
                 "refusing project lock directory that is not a real directory at {}",
@@ -539,7 +555,16 @@ impl LockFileSource for CapabilityLockFileSource {
     }
 
     fn open(&self, component: LockFileComponent) -> std::io::Result<std::fs::File> {
-        open_capability_lock_file(&self.directory, &self.component_name(component))
+        let name = self.component_name(component);
+        open_capability_lock_file(&self.directory, &name).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open project lock component {}: {error}",
+                    self.display_path.with_file_name(&name).display()
+                ),
+            )
+        })
     }
 }
 
@@ -643,6 +668,8 @@ fn open_capability_lock_file(
     directory: &cap_std::fs::Dir,
     name: &OsStr,
 ) -> std::io::Result<std::fs::File> {
+    const TRANSIENT_NOT_FOUND_RETRIES: usize = 2;
+
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 
     let mut options = cap_std::fs::OpenOptions::new();
@@ -658,7 +685,22 @@ fn open_capability_lock_file(
         use cap_std::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let file = directory.open_with(name, &options)?;
+    let mut retries = 0;
+    let file = loop {
+        match directory.open_with(name, &options) {
+            Ok(file) => break file,
+            // macOS can transiently report ENOENT when no-follow creates race on
+            // the same missing entry. Retry only through the retained capability.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && retries < TRANSIENT_NOT_FOUND_RETRIES =>
+            {
+                retries += 1;
+                std::thread::yield_now();
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let metadata = file.metadata()?;
     if !metadata.is_file() || capability_metadata_is_link_or_reparse(&metadata) {
         return Err(std::io::Error::other(format!(

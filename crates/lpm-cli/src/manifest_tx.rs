@@ -43,7 +43,12 @@
 //! and converge. This is documented as a known limitation of the rollback
 //! boundary.
 
+use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+const IN_MEMORY_SNAPSHOT_LIMIT: u64 = 1024 * 1024;
+const IN_MEMORY_SNAPSHOT_BUDGET: usize = 8 * 1024 * 1024;
 
 /// A guard that restores or invalidates one or more files on `Drop`,
 /// unless [`Self::commit`] is called first.
@@ -61,15 +66,97 @@ pub struct ManifestTransaction {
     /// `Some(bytes)` if the file existed at snapshot time, or `None` if
     /// it did not (rollback removes the file in that case).
     snapshots: Vec<SnapshotEntry>,
+    snapshot_paths: HashSet<PathBuf>,
+    in_memory_snapshot_bytes: usize,
     /// Files deleted on rollback, regardless of their pre-snapshot state.
     /// Cache files where stale data is worse than no data.
     invalidate: Vec<PathBuf>,
+    rollback_dirs: Vec<PathBuf>,
     committed: bool,
 }
 
 struct SnapshotEntry {
     path: PathBuf,
-    original_bytes: Option<Vec<u8>>,
+    original: Option<SnapshotContent>,
+}
+
+enum SnapshotContent {
+    Memory(Vec<u8>),
+    File(std::fs::File),
+}
+
+impl SnapshotContent {
+    fn from_bytes(bytes: Vec<u8>, in_memory_bytes: &mut usize) -> std::io::Result<Self> {
+        if bytes.len() as u64 <= IN_MEMORY_SNAPSHOT_LIMIT
+            && in_memory_bytes.saturating_add(bytes.len()) <= IN_MEMORY_SNAPSHOT_BUDGET
+        {
+            *in_memory_bytes += bytes.len();
+            return Ok(Self::Memory(bytes));
+        }
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&bytes)?;
+        Ok(Self::File(file))
+    }
+
+    fn from_path(path: &Path, in_memory_bytes: &mut usize) -> std::io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refusing transaction snapshot path that is not a regular file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let mut source = std::fs::File::open(path)?;
+        let opened_metadata = source.metadata()?;
+        if !opened_metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "transaction snapshot path changed before it could be opened: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let file_len = opened_metadata.len();
+        if file_len <= IN_MEMORY_SNAPSHOT_LIMIT
+            && in_memory_bytes.saturating_add(file_len as usize) <= IN_MEMORY_SNAPSHOT_BUDGET
+        {
+            let mut bytes = vec![0_u8; file_len as usize];
+            source.read_exact(&mut bytes)?;
+            let mut extra = [0_u8; 1];
+            if source.read(&mut extra)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "transaction snapshot path grew while it was read: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            *in_memory_bytes += bytes.len();
+            return Ok(Self::Memory(bytes));
+        }
+        let mut file = tempfile::tempfile()?;
+        std::io::copy(&mut source, &mut file)?;
+        Ok(Self::File(file))
+    }
+
+    fn restore(&mut self, path: &Path) -> std::io::Result<()> {
+        match self {
+            Self::Memory(bytes) => lpm_common::write_file_atomic(path, bytes),
+            Self::File(source) => {
+                source.seek(SeekFrom::Start(0))?;
+                lpm_common::write_file_atomic_with(
+                    path,
+                    lpm_common::AtomicWriteOptions::new(),
+                    |destination| std::io::copy(source, destination).map(|_| ()),
+                )
+            }
+        }
+    }
 }
 
 impl ManifestTransaction {
@@ -104,17 +191,39 @@ impl ManifestTransaction {
         invalidate: &[&Path],
     ) -> std::io::Result<Self> {
         let mut snapshots = Vec::with_capacity(required.len() + optional.len());
+        let mut snapshot_paths = HashSet::with_capacity(required.len() + optional.len());
+        let mut in_memory_snapshot_bytes = 0;
 
         for path in required {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing required transaction snapshot path that is not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
             let bytes = lpm_common::read_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
                 .map_err(std::io::Error::other)?;
             snapshots.push(SnapshotEntry {
                 path: path.to_path_buf(),
-                original_bytes: Some(bytes),
+                original: Some(SnapshotContent::from_bytes(
+                    bytes,
+                    &mut in_memory_snapshot_bytes,
+                )?),
             });
+            snapshot_paths.insert(path.to_path_buf());
         }
 
-        Self::finish_install_state_snapshot(snapshots, optional, invalidate)
+        Self::finish_install_state_snapshot(
+            snapshots,
+            snapshot_paths,
+            in_memory_snapshot_bytes,
+            optional,
+            invalidate,
+        )
     }
 
     /// Snapshot install state only if every required file still has the
@@ -125,10 +234,27 @@ impl ManifestTransaction {
         invalidate: &[&Path],
     ) -> std::io::Result<Self> {
         let mut snapshots = Vec::with_capacity(required.len() + optional.len());
-        Self::snapshot_optional_paths(&mut snapshots, optional)?;
+        let mut snapshot_paths = HashSet::with_capacity(required.len() + optional.len());
+        let mut in_memory_snapshot_bytes = 0;
+        Self::snapshot_optional_paths(
+            &mut snapshots,
+            &mut snapshot_paths,
+            &mut in_memory_snapshot_bytes,
+            optional,
+        )?;
         let invalidate = invalidate.iter().map(|p| p.to_path_buf()).collect();
 
         for (path, expected) in required {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "refusing required transaction snapshot path that is not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
             let bytes = lpm_common::read_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
                 .map_err(std::io::Error::other)?;
             if bytes != *expected {
@@ -139,47 +265,136 @@ impl ManifestTransaction {
             }
             snapshots.push(SnapshotEntry {
                 path: path.to_path_buf(),
-                original_bytes: Some(bytes),
+                original: Some(SnapshotContent::from_bytes(
+                    bytes,
+                    &mut in_memory_snapshot_bytes,
+                )?),
             });
+            snapshot_paths.insert(path.to_path_buf());
         }
 
         Ok(Self {
             snapshots,
+            snapshot_paths,
+            in_memory_snapshot_bytes,
             invalidate,
+            rollback_dirs: Vec::new(),
             committed: false,
         })
     }
 
     fn finish_install_state_snapshot(
         mut snapshots: Vec<SnapshotEntry>,
+        mut snapshot_paths: HashSet<PathBuf>,
+        mut in_memory_snapshot_bytes: usize,
         optional: &[&Path],
         invalidate: &[&Path],
     ) -> std::io::Result<Self> {
-        Self::snapshot_optional_paths(&mut snapshots, optional)?;
+        Self::snapshot_optional_paths(
+            &mut snapshots,
+            &mut snapshot_paths,
+            &mut in_memory_snapshot_bytes,
+            optional,
+        )?;
 
         Ok(Self {
             snapshots,
+            snapshot_paths,
+            in_memory_snapshot_bytes,
             invalidate: invalidate.iter().map(|p| p.to_path_buf()).collect(),
+            rollback_dirs: Vec::new(),
             committed: false,
         })
     }
 
     fn snapshot_optional_paths(
         snapshots: &mut Vec<SnapshotEntry>,
+        snapshot_paths: &mut HashSet<PathBuf>,
+        in_memory_snapshot_bytes: &mut usize,
         optional: &[&Path],
     ) -> std::io::Result<()> {
         for path in optional {
-            let original_bytes = match std::fs::read(path) {
-                Ok(bytes) => Some(bytes),
+            if !snapshot_paths.insert(path.to_path_buf()) {
+                continue;
+            }
+            let original = match SnapshotContent::from_path(path, in_memory_snapshot_bytes) {
+                Ok(content) => Some(content),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
             };
             snapshots.push(SnapshotEntry {
                 path: path.to_path_buf(),
-                original_bytes,
+                original,
             });
         }
         Ok(())
+    }
+
+    pub fn snapshot_optional_path(&mut self, path: &Path) -> std::io::Result<()> {
+        if !self.snapshot_paths.insert(path.to_path_buf()) {
+            return Ok(());
+        }
+        let original = match SnapshotContent::from_path(path, &mut self.in_memory_snapshot_bytes) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        self.snapshots.push(SnapshotEntry {
+            path: path.to_path_buf(),
+            original,
+        });
+        Ok(())
+    }
+
+    pub fn snapshot_optional_path_with_bytes(
+        &mut self,
+        path: &Path,
+        original_bytes: Option<Vec<u8>>,
+    ) -> std::io::Result<()> {
+        if !self.snapshot_paths.insert(path.to_path_buf()) {
+            return Ok(());
+        }
+        self.snapshots.push(SnapshotEntry {
+            path: path.to_path_buf(),
+            original: original_bytes
+                .map(|bytes| SnapshotContent::from_bytes(bytes, &mut self.in_memory_snapshot_bytes))
+                .transpose()?,
+        });
+        Ok(())
+    }
+
+    pub fn snapshot_optional_path_from_file(
+        &mut self,
+        path: &Path,
+        mut original: std::fs::File,
+    ) -> std::io::Result<()> {
+        if !self.snapshot_paths.insert(path.to_path_buf()) {
+            return Ok(());
+        }
+        if !original.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "refusing transaction snapshot source that is not a regular file",
+            ));
+        }
+        original.seek(SeekFrom::Start(0))?;
+        self.snapshots.push(SnapshotEntry {
+            path: path.to_path_buf(),
+            original: Some(SnapshotContent::File(original)),
+        });
+        Ok(())
+    }
+
+    pub fn remove_dirs_on_rollback(&mut self, directories: impl IntoIterator<Item = PathBuf>) {
+        self.rollback_dirs.extend(directories);
+        self.rollback_dirs.sort_unstable_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| right.cmp(left))
+        });
+        self.rollback_dirs.dedup();
     }
 
     /// Mark the transaction as successful. The `Drop` impl will not
@@ -197,10 +412,10 @@ impl Drop for ManifestTransaction {
         }
 
         // (1) Restore snapshotted paths.
-        for entry in &self.snapshots {
-            match &entry.original_bytes {
-                Some(bytes) => {
-                    if let Err(e) = lpm_common::write_file_atomic(&entry.path, bytes) {
+        for entry in &mut self.snapshots {
+            match &mut entry.original {
+                Some(original) => {
+                    if let Err(e) = original.restore(&entry.path) {
                         tracing::error!(
                             "manifest transaction rollback: failed to restore {}: {e}",
                             entry.path.display()
@@ -232,6 +447,23 @@ impl Drop for ManifestTransaction {
                 Err(e) => {
                     tracing::error!(
                         "manifest transaction rollback: failed to invalidate {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        for path in &self.rollback_dirs {
+            match std::fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => {
+                    tracing::error!(
+                        "manifest transaction rollback: failed to remove directory {}: {error}",
                         path.display()
                     );
                 }
@@ -321,6 +553,28 @@ mod tests {
 
         assert_eq!(read(&a), b"original-a");
         assert_eq!(read(&b), b"original-b");
+    }
+
+    #[test]
+    fn snapshot_from_open_file_restores_destination_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("destination.bin");
+        let backup = dir.path().join("backup.bin");
+        write(&destination, b"original destination");
+        write(&backup, b"original destination");
+
+        {
+            let mut transaction = ManifestTransaction::snapshot(&[]).unwrap();
+            transaction
+                .snapshot_optional_path_from_file(
+                    &destination,
+                    std::fs::File::open(&backup).unwrap(),
+                )
+                .unwrap();
+            write(&destination, b"replacement");
+        }
+
+        assert_eq!(read(&destination), b"original destination");
     }
 
     #[test]
@@ -452,6 +706,20 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_install_state_refuses_optional_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"private outside bytes").unwrap();
+        let linked_lockfile = dir.path().join("package-lock.json");
+        std::os::unix::fs::symlink(outside.path(), &linked_lockfile).unwrap();
+
+        let result = ManifestTransaction::snapshot_install_state(&[], &[&linked_lockfile], &[]);
+
+        assert!(result.is_err());
+    }
+
     /// Invalidate paths are deleted on rollback regardless of their
     /// pre-snapshot state. Cache invalidation contract.
     #[test]
@@ -526,5 +794,19 @@ mod tests {
         assert_eq!(read(&manifest), b"{\"new\":true}");
         assert_eq!(read(&lockfile), b"new lockfile");
         assert_eq!(read(&install_hash), b"new hash");
+    }
+
+    #[test]
+    fn rollback_restores_file_backed_large_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.lock");
+        let original = vec![b'a'; IN_MEMORY_SNAPSHOT_LIMIT as usize + 1];
+        write(&path, &original);
+
+        let transaction = ManifestTransaction::snapshot_install_state(&[], &[&path], &[]).unwrap();
+        write(&path, b"changed");
+        drop(transaction);
+
+        assert_eq!(read(&path), original);
     }
 }

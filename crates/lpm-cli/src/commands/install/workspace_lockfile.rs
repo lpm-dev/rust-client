@@ -441,7 +441,15 @@ pub(super) async fn with_project_install_lock<F, T>(
 where
     F: Future<Output = Result<T, LpmError>>,
 {
-    let canonical_root = project_root.canonicalize().map_err(LpmError::Io)?;
+    let canonical_root = project_root.canonicalize().map_err(|error| {
+        LpmError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to resolve project lock root {}: {error}",
+                project_root.display()
+            ),
+        ))
+    })?;
     if let Ok(active_root) = ACTIVE_PROJECT_INSTALL_ROOT.try_with(Clone::clone) {
         if active_root != canonical_root {
             return Err(LpmError::Script(format!(
@@ -453,12 +461,30 @@ where
         return future.await;
     }
 
-    let lock_path = lpm_common::project_install_lock(&canonical_root);
+    let project_directory =
+        cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority()).map_err(
+            |error| {
+                LpmError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open project lock root {}: {error}",
+                        canonical_root.display()
+                    ),
+                ))
+            },
+        )?;
+    let lock_directory =
+        lpm_common::ProjectLockDirectory::open_or_create(&project_directory, &canonical_root)?;
     let transaction = ACTIVE_PROJECT_INSTALL_ROOT.scope(canonical_root.clone(), async {
         crate::release_plan::ensure_no_pending_release_transaction(&canonical_root)?;
         future.await
     });
-    lpm_common::with_exclusive_lock_async(lock_path, transaction).await
+    lpm_common::with_project_exclusive_lock_async(
+        lock_directory,
+        lpm_common::ProjectLockKind::Install,
+        transaction,
+    )
+    .await
 }
 
 pub(super) async fn scope<F, T>(
@@ -481,7 +507,7 @@ where
         .await
 }
 
-pub(super) async fn scope_member_install<F, T>(project_dir: &Path, future: F) -> Result<T, LpmError>
+pub(crate) async fn scope_member_install<F, T>(project_dir: &Path, future: F) -> Result<T, LpmError>
 where
     F: Future<Output = Result<T, LpmError>>,
 {
@@ -502,7 +528,16 @@ where
         return future.await;
     }
     let Some(initial_workspace) = discover_workspace(project_dir)? else {
-        return with_project_install_lock(project_dir, future).await;
+        let transaction = async {
+            if let Some(workspace) = discover_workspace(project_dir)? {
+                return Err(LpmError::Script(format!(
+                    "a workspace rooted at {} appeared while waiting for the install transaction; retry the command",
+                    workspace.root.display(),
+                )));
+            }
+            future.await
+        };
+        return with_project_install_lock(project_dir, transaction).await;
     };
     let workspace_root = initial_workspace.root;
     let transaction = async {
@@ -526,13 +561,29 @@ where
             &workspace.root,
             &legacy_importers,
         )?);
-        let result = scope(
-            Arc::clone(&coordinator),
-            Arc::<str>::from(importer.as_str()),
-            future,
-        )
-        .await?;
-        if coordinator.commit(std::slice::from_ref(&importer))? {
+        let transaction_root = workspace.root.clone();
+        let (result, remove_legacy_importers) = ACTIVE_TRANSACTION
+            .scope(
+                WorkspaceLockfileTransaction {
+                    root: transaction_root,
+                    coordinator: Arc::clone(&coordinator),
+                    manifest_transactions: Mutex::new(Vec::new()),
+                },
+                async {
+                    let result = scope(
+                        Arc::clone(&coordinator),
+                        Arc::<str>::from(importer.as_str()),
+                        future,
+                    )
+                    .await?;
+                    let remove_legacy_importers =
+                        coordinator.commit(std::slice::from_ref(&importer))?;
+                    commit_pending_manifest_transactions();
+                    Ok::<_, LpmError>((result, remove_legacy_importers))
+                },
+            )
+            .await?;
+        if remove_legacy_importers {
             remove_member_lockfiles(&legacy_importers);
         }
         Ok(result)

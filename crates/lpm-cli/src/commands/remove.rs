@@ -99,7 +99,7 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
             crate::editor_skills::remove_editor_skills(project_dir, short);
         }
 
-        let tracked_files: Vec<PathBuf> = record.files.into_iter().collect();
+        let tracked_files: Vec<PathBuf> = record.files.into_keys().collect();
         for tracked_path in &tracked_files {
             let absolute_path =
                 crate::added_sources_state::resolve_manifest_path(project_dir, tracked_path);

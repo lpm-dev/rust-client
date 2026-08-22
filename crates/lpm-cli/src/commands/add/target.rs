@@ -72,8 +72,23 @@ pub(super) fn resolve_add_target(spec: &str) -> Result<ResolvedAddInput, LpmErro
     let rest = if let Some(pos) = spec.find('?') {
         let q = &spec[pos + 1..];
         for param in q.split('&') {
-            if let Some(eq) = param.find('=') {
-                inline_config.insert(param[..eq].to_string(), param[eq + 1..].to_string());
+            let Some((key, value)) = param.split_once('=') else {
+                return Err(LpmError::Registry(format!(
+                    "invalid inline configuration '{param}'; expected key=value"
+                )));
+            };
+            if key.is_empty() {
+                return Err(LpmError::Registry(
+                    "inline configuration keys cannot be empty".to_string(),
+                ));
+            }
+            if inline_config
+                .insert(key.to_string(), value.to_string())
+                .is_some()
+            {
+                return Err(LpmError::Registry(format!(
+                    "inline configuration '{key}' was provided more than once"
+                )));
             }
         }
         &spec[..pos]
@@ -218,6 +233,16 @@ mod tests {
         }
         assert_eq!(config.get("theme").map(String::as_str), Some("dark"));
         assert_eq!(config.get("variant").map(String::as_str), Some("primary"));
+    }
+
+    #[test]
+    fn resolve_add_target_rejects_malformed_inline_config() {
+        for spec in ["react?missing-value", "react?=value", "react?key=value&"] {
+            assert!(
+                resolve_add_target(spec).is_err(),
+                "malformed query must fail: {spec}"
+            );
+        }
     }
 
     #[test]
