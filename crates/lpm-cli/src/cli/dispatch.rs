@@ -1884,7 +1884,7 @@ async fn async_main() -> Result<()> {
                 cli.json,
                 query_verbose || cli.verbose,
                 assert_none,
-                &format,
+                format,
             )
             .await
         }

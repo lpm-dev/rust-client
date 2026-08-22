@@ -306,6 +306,29 @@ async fn query_osv_batch_with_warnings(
     query_osv_batch_from_url(packages, &osv_url).await
 }
 
+pub(crate) async fn query_vulnerable_versions(
+    packages: &[(String, String)],
+) -> Result<HashMap<String, HashSet<String>>, LpmError> {
+    let mut seen = HashSet::with_capacity(packages.len());
+    let mut unique = Vec::with_capacity(packages.len());
+    for (name, version) in packages {
+        if seen.insert((name.as_str(), version.as_str())) {
+            unique.push((name.clone(), version.clone()));
+        }
+    }
+
+    let vulnerabilities = query_osv_batch_with_warnings(&unique, false).await?;
+    let mut versions: HashMap<String, HashSet<String>> =
+        HashMap::with_capacity(vulnerabilities.len());
+    for vulnerability in vulnerabilities {
+        versions
+            .entry(vulnerability.package)
+            .or_default()
+            .insert(vulnerability.version);
+    }
+    Ok(versions)
+}
+
 async fn query_osv_batch_from_url(
     packages: &[(String, String)],
     osv_url: &str,

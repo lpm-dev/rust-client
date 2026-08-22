@@ -251,16 +251,6 @@ impl PackageInventory {
             baseline_index,
         }
     }
-
-    /// Get all non-@lpm.dev packages as `(name, version)` pairs for OSV queries.
-    pub fn npm_package_pairs(&self) -> Vec<(String, String)> {
-        self.discovery
-            .packages
-            .iter()
-            .filter(|p| !p.name.starts_with("@lpm.dev/"))
-            .map(|p| (p.name.clone(), p.version.clone()))
-            .collect()
-    }
 }
 
 pub(crate) fn load_behavioral_analyses(
