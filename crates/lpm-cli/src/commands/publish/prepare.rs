@@ -702,42 +702,57 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     let package_root = snapshot.path().join("package");
     std::fs::create_dir(&package_root).ok()?;
     let decoder = flate2::read::GzDecoder::new(tarball_data);
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries().ok()? {
-        let mut entry = entry.ok()?;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: publish_common::MAX_UNCOMPRESSED_TARBALL_BYTES,
+        max_path_depth: publish_common::MAX_PUBLISH_ARCHIVE_PATH_DEPTH,
+        ..lpm_extractor::TarArchiveLimits::new(publish_common::MAX_PUBLISH_ARCHIVE_ENTRIES)
+    };
+    lpm_extractor::visit_tar_archive(decoder, archive_limits, |mut entry| {
         if !entry.header().entry_type().is_file() {
-            return None;
+            return Err(LpmError::Registry(
+                "Swift publish artifact contains a non-file entry".into(),
+            ));
         }
-        let path = entry.path().ok()?;
+        let path = entry.path();
         let mut components = path.components();
         let Some(std::path::Component::Normal(prefix)) = components.next() else {
-            return None;
+            return Err(LpmError::Registry(
+                "Swift publish artifact contains an invalid path".into(),
+            ));
         };
         if prefix != std::ffi::OsStr::new("package") {
-            return None;
+            return Err(LpmError::Registry(
+                "Swift publish artifact contains an invalid root".into(),
+            ));
         }
         let mut relative = std::path::PathBuf::new();
         for component in components {
             let std::path::Component::Normal(name) = component else {
-                return None;
+                return Err(LpmError::Registry(
+                    "Swift publish artifact contains an unsafe path".into(),
+                ));
             };
             relative.push(name);
         }
         if relative.as_os_str().is_empty() {
-            return None;
+            return Err(LpmError::Registry(
+                "Swift publish artifact contains an empty path".into(),
+            ));
         }
         let output = package_root.join(relative);
         if let Some(parent) = output.parent() {
-            std::fs::create_dir_all(parent).ok()?;
+            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
         }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(output)
-            .ok()?;
-        std::io::copy(&mut entry, &mut file).ok()?;
-        file.flush().ok()?;
-    }
+            .map_err(LpmError::Io)?;
+        std::io::copy(&mut entry, &mut file).map_err(LpmError::Io)?;
+        file.flush().map_err(LpmError::Io)?;
+        Ok(std::ops::ControlFlow::<()>::Continue(()))
+    })
+    .ok()?;
     let mut command = std::process::Command::new(program);
     command
         .args(["package", "dump-package"])
@@ -1473,5 +1488,50 @@ mod tests {
 
         assert!(manifest.is_none());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swift_manifest_inspection_rejects_deep_archives_before_starting_swift() {
+        use std::io::Write as _;
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut path = String::from("package/");
+            path.push_str(&"a/".repeat(256));
+            path.push_str("Package.swift");
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &path, std::io::empty())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_data).unwrap();
+        let archive = encoder.finish().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-marker");
+        let marker = directory.path().join("started");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\ntouch '{}'\nprintf '{{}}'\n", marker.display()),
+        );
+
+        let manifest = dump_swift_manifest_from_publish_artifact_with_command(
+            &archive,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(1),
+            128,
+        );
+
+        assert!(manifest.is_none());
+        assert!(
+            !marker.exists(),
+            "Swift started for a rejected deep archive"
+        );
     }
 }

@@ -1175,38 +1175,20 @@ fn restore_remote_artifact_locked_if(
     validate: impl FnOnce() -> Result<bool, LpmError>,
 ) -> Result<Option<CacheHit>, LpmError> {
     let dec = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(dec);
-    archive.set_preserve_permissions(false);
-    archive.set_preserve_ownerships(false);
-
     let mut total_bytes: u64 = 0;
-    let mut entries_seen: usize = 0;
     let mut meta_json: Option<String> = None;
     let mut stdout: Option<String> = None;
     let mut stderr: Option<String> = None;
     let mut staged_outputs = StagedOutputs::new_with_project(root, project)?;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_CACHE_ENTRY_BYTES,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_CACHE_ARCHIVE_ENTRIES)
+    };
 
-    for entry in archive
-        .entries()
-        .map_err(|e| LpmError::Task(format!("failed to read remote cache artifact entries: {e}")))?
-    {
-        let mut entry = entry.map_err(|e| {
-            LpmError::Task(format!("failed to read remote cache artifact entry: {e}"))
-        })?;
-
-        entries_seen += 1;
-        if entries_seen > MAX_CACHE_ARCHIVE_ENTRIES {
-            return Err(LpmError::Task(format!(
-                "remote cache artifact exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
-            )));
-        }
-
-        let path = entry
-            .path()
-            .map_err(|e| LpmError::Task(format!("failed to read entry path: {e}")))?
-            .to_path_buf();
+    lpm_extractor::visit_tar_archive(dec, archive_limits, |mut entry| {
+        let path = entry.path().to_path_buf();
         validate_archive_path(&path, "remote cache artifact")?;
-        validate_archive_entry_type(&entry, &path, "remote cache artifact")?;
+        validate_archive_entry_type(entry.header().entry_type(), &path, "remote cache artifact")?;
 
         let entry_size = entry.header().size().unwrap_or(0);
         check_archive_size_limits(entry_size, &mut total_bytes, &path, "remote cache artifact")?;
@@ -1219,7 +1201,7 @@ fn restore_remote_artifact_locked_if(
             }
             validate_text_entry_size(entry_size, lpm_common::STATE_FILE_SIZE_CAP_BYTES, &path)?;
             meta_json = Some(read_entry_to_string(&mut entry, &path)?);
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
         if path == Path::new(".lpm-cache/stdout.log") {
             if stdout.is_some() {
@@ -1229,7 +1211,7 @@ fn restore_remote_artifact_locked_if(
             }
             validate_text_entry_size(entry_size, MAX_CACHE_LOG_BYTES, &path)?;
             stdout = Some(read_entry_to_string(&mut entry, &path)?);
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
         if path == Path::new(".lpm-cache/stderr.log") {
             if stderr.is_some() {
@@ -1239,7 +1221,7 @@ fn restore_remote_artifact_locked_if(
             }
             validate_text_entry_size(entry_size, MAX_CACHE_LOG_BYTES, &path)?;
             stderr = Some(read_entry_to_string(&mut entry, &path)?);
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
 
         let Ok(rel) = path.strip_prefix("outputs") else {
@@ -1249,11 +1231,13 @@ fn restore_remote_artifact_locked_if(
             )));
         };
         if rel.as_os_str().is_empty() {
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
 
-        staged_outputs.append(&mut entry, rel)?;
-    }
+        let header = entry.header().clone();
+        staged_outputs.append(&mut entry, &header, rel)?;
+        Ok(std::ops::ControlFlow::<()>::Continue(()))
+    })?;
 
     let meta_json = meta_json.ok_or_else(|| {
         LpmError::Task("remote cache artifact is missing .lpm-cache/meta.json".into())
@@ -1781,11 +1765,10 @@ fn validate_archive_path(path: &Path, label: &str) -> Result<(), LpmError> {
 }
 
 fn validate_archive_entry_type(
-    entry: &tar::Entry<'_, impl Read>,
+    header_type: tar::EntryType,
     path: &Path,
     label: &str,
 ) -> Result<(), LpmError> {
-    let header_type = entry.header().entry_type();
     if !(header_type.is_file() || header_type.is_dir()) {
         return Err(LpmError::Task(format!(
             "{label} contains non-regular entry ({:?}): {}",
@@ -1819,10 +1802,7 @@ fn check_archive_size_limits(
     Ok(())
 }
 
-fn read_entry_to_string(
-    entry: &mut tar::Entry<'_, impl Read>,
-    path: &Path,
-) -> Result<String, LpmError> {
+fn read_entry_to_string(entry: &mut impl Read, path: &Path) -> Result<String, LpmError> {
     let mut content = String::new();
     entry
         .read_to_string(&mut content)
@@ -3130,8 +3110,9 @@ mod tests {
         let mut entries = archive.entries().unwrap();
         let mut entry = entries.next().unwrap().unwrap();
         let mut staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let header = entry.header().clone();
         staged
-            .append(&mut entry, Path::new("dist/value.txt"))
+            .append(&mut entry, &header, Path::new("dist/value.txt"))
             .unwrap();
 
         let staging_path = staged.temp_path().to_path_buf();

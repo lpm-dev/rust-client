@@ -454,25 +454,13 @@ fn extract_binary_from_tarball(
     binary_name: &str,
 ) -> Result<(), LpmError> {
     let decoder = flate2::read::GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
-
     let mut found_files = Vec::new();
-    let mut entry_count = 0usize;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_PLUGIN_EXTRACTED_BYTES,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_PLUGIN_ARCHIVE_ENTRIES)
+    };
 
-    for entry in archive
-        .entries()
-        .map_err(|e| LpmError::Plugin(format!("failed to read plugin archive: {e}")))?
-    {
-        let mut entry =
-            entry.map_err(|e| LpmError::Plugin(format!("failed to read archive entry: {e}")))?;
-
-        entry_count += 1;
-        if entry_count > MAX_PLUGIN_ARCHIVE_ENTRIES {
-            return Err(LpmError::Plugin(format!(
-                "plugin archive exceeds {MAX_PLUGIN_ARCHIVE_ENTRIES} entries",
-            )));
-        }
-
+    let (_, found) = lpm_extractor::visit_tar_archive(decoder, archive_limits, |mut entry| {
         let entry_size = entry.size();
         if entry_size > MAX_PLUGIN_EXTRACTED_BYTES {
             return Err(LpmError::Plugin(format!(
@@ -480,18 +468,17 @@ fn extract_binary_from_tarball(
             )));
         }
 
-        let path = entry
+        let file_name = entry
             .path()
-            .map_err(|e| LpmError::Plugin(format!("failed to read entry path: {e}")))?;
-
-        let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
         found_files.push(file_name.clone());
 
-        if file_name == binary_name || file_name.starts_with(&format!("{binary_name}-")) {
+        if entry.header().entry_type().is_file()
+            && (file_name == binary_name || file_name.starts_with(&format!("{binary_name}-")))
+        {
             let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
             let copied = std::io::copy(&mut bounded, destination)
                 .map_err(|e| LpmError::Plugin(format!("failed to extract {binary_name}: {e}")))?;
@@ -500,8 +487,13 @@ fn extract_binary_from_tarball(
                     "plugin archive entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
                 )));
             }
-            return Ok(());
+            return Ok(std::ops::ControlFlow::Break(()));
         }
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
+
+    if found.is_some() {
+        return Ok(());
     }
 
     Err(LpmError::Plugin(format!(
@@ -528,10 +520,13 @@ fn extract_binary_from_zip(
         )));
     }
 
-    let mut found_files = Vec::new();
+    let mut found_files = Vec::with_capacity(archive.len());
+    let mut matched_index = None;
+    let executable_name = format!("{binary_name}.exe");
+    let versioned_prefix = format!("{binary_name}-");
 
     for i in 0..archive.len() {
-        let mut entry = archive
+        let entry = archive
             .by_index(i)
             .map_err(|e| LpmError::Plugin(format!("failed to read ZIP entry: {e}")))?;
 
@@ -548,6 +543,13 @@ fn extract_binary_from_zip(
                 entry.name()
             ))
         })?;
+        if enclosed.components().count() > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
+            return Err(LpmError::Plugin(format!(
+                "plugin ZIP entry exceeds the {}-component nesting limit: {}",
+                lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
+                enclosed.display()
+            )));
+        }
         let file_name = enclosed
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -556,28 +558,32 @@ fn extract_binary_from_zip(
         found_files.push(file_name.clone());
 
         let is_match = file_name == binary_name
-            || file_name == format!("{binary_name}.exe")
-            || file_name.starts_with(&format!("{binary_name}-"));
-
-        if is_match && !entry.is_dir() {
-            let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
-            let copied = std::io::copy(&mut bounded, destination).map_err(|e| {
-                LpmError::Plugin(format!("failed to extract {binary_name} from ZIP: {e}"))
-            })?;
-            if copied >= MAX_PLUGIN_EXTRACTED_BYTES {
-                return Err(LpmError::Plugin(format!(
-                    "plugin ZIP entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
-                )));
-            }
-            return Ok(());
+            || file_name == executable_name
+            || file_name.starts_with(&versioned_prefix);
+        if matched_index.is_none() && is_match && !entry.is_dir() {
+            matched_index = Some(i);
         }
     }
 
-    Err(LpmError::Plugin(format!(
-        "binary '{}' not found in ZIP archive. Found: [{}]",
-        binary_name,
-        found_files.join(", ")
-    )))
+    let Some(matched_index) = matched_index else {
+        return Err(LpmError::Plugin(format!(
+            "binary '{}' not found in ZIP archive. Found: [{}]",
+            binary_name,
+            found_files.join(", ")
+        )));
+    };
+    let mut entry = archive
+        .by_index(matched_index)
+        .map_err(|e| LpmError::Plugin(format!("failed to reopen ZIP entry: {e}")))?;
+    let mut bounded = std::io::Read::take(&mut entry, MAX_PLUGIN_EXTRACTED_BYTES);
+    let copied = std::io::copy(&mut bounded, destination)
+        .map_err(|e| LpmError::Plugin(format!("failed to extract {binary_name} from ZIP: {e}")))?;
+    if copied >= MAX_PLUGIN_EXTRACTED_BYTES {
+        return Err(LpmError::Plugin(format!(
+            "plugin ZIP entry expanded beyond {MAX_PLUGIN_EXTRACTED_BYTES} bytes",
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -765,9 +771,37 @@ mod tests {
         let err = extract_binary_from_tarball(&gz_data, &mut destination, "oxlint").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("exceeds") && msg.contains("entries"),
+            msg.contains("exceeds") && msg.contains("entry"),
             "must label entry-count overflow: {msg}"
         );
+    }
+
+    #[test]
+    fn tarball_extraction_rejects_paths_deeper_than_256_components() {
+        let mut path = "a/".repeat(256);
+        path.push_str("oxlint");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &path, &b"value"[..])
+            .unwrap();
+        let tar_data = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &tar_data).unwrap();
+        let archive = encoder.finish().unwrap();
+        let mut destination = Vec::new();
+
+        let error = extract_binary_from_tarball(&archive, &mut destination, "oxlint")
+            .expect_err("an excessively deep plugin archive path must be rejected");
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+        assert!(destination.is_empty(), "rejected archive wrote a binary");
     }
 
     #[test]
@@ -797,6 +831,55 @@ mod tests {
             !root.path().join("oxlint").exists(),
             "zip traversal must not write outside the destination"
         );
+    }
+
+    #[test]
+    fn zip_extraction_rejects_paths_deeper_than_256_components() {
+        let mut path = "a/".repeat(256);
+        path.push_str("oxlint");
+        let buffer = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buffer);
+        writer
+            .start_file(&path, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"value").unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let mut destination = Vec::new();
+
+        let error = extract_binary_from_zip(&archive, &mut destination, "oxlint")
+            .expect_err("an excessively deep plugin ZIP path must be rejected");
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+        assert!(destination.is_empty(), "rejected archive wrote a binary");
+    }
+
+    #[test]
+    fn zip_extraction_validates_trailing_paths_before_writing_binary() {
+        let mut deep_path = "a/".repeat(256);
+        deep_path.push_str("other");
+        let buffer = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buffer);
+        writer
+            .start_file("oxlint", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"value").unwrap();
+        writer
+            .start_file(&deep_path, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let mut destination = Vec::new();
+
+        let error = extract_binary_from_zip(&archive, &mut destination, "oxlint")
+            .expect_err("a trailing deep ZIP path must reject the archive");
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+        assert!(destination.is_empty(), "rejected archive wrote a binary");
     }
 
     #[test]

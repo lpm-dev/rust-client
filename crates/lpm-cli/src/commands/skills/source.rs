@@ -692,25 +692,17 @@ struct ExtractedGithubArchive {
 
 fn extract_github_archive(bytes: &[u8]) -> Result<ExtractedGithubArchive, LpmError> {
     let decoder = GzDecoder::new(Cursor::new(bytes));
-    let mut archive = tar::Archive::new(decoder);
     let mut root: Option<PathBuf> = None;
     let mut files = BTreeMap::new();
     let mut unsafe_entries = BTreeMap::new();
     let mut expanded_bytes = 0usize;
-    for (entry_count, entry) in archive
-        .entries()
-        .map_err(|error| LpmError::Registry(format!("invalid GitHub tar archive: {error}")))?
-        .enumerate()
-    {
-        let mut entry = entry.map_err(|error| {
-            LpmError::Registry(format!("invalid GitHub tar archive entry: {error}"))
-        })?;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_EXPANDED_BYTES as u64,
+        max_path_depth: MAX_DIRECTORY_DEPTH + 2,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_ARCHIVE_ENTRIES)
+    };
+    lpm_extractor::visit_tar_archive(decoder, archive_limits, |mut entry| {
         let entry_type = entry.header().entry_type();
-        if entry_count >= MAX_ARCHIVE_ENTRIES {
-            return Err(LpmError::Registry(format!(
-                "GitHub archive exceeds the {MAX_ARCHIVE_ENTRIES}-entry limit"
-            )));
-        }
         let entry_size = entry.size();
         if entry_size > (MAX_EXPANDED_BYTES - expanded_bytes) as u64 {
             return Err(LpmError::Registry(format!(
@@ -718,13 +710,7 @@ fn extract_github_archive(bytes: &[u8]) -> Result<ExtractedGithubArchive, LpmErr
             )));
         }
         expanded_bytes += entry_size as usize;
-        if entry_type.is_pax_global_extensions() {
-            continue;
-        }
-        let path = entry
-            .path()
-            .map_err(|error| LpmError::Registry(format!("invalid GitHub archive path: {error}")))?
-            .into_owned();
+        let path = entry.path().to_path_buf();
         if !is_safe_relative_path(&path) {
             return Err(LpmError::Registry(format!(
                 "refusing unsafe path in GitHub archive: {}",
@@ -749,7 +735,7 @@ fn extract_github_archive(bytes: &[u8]) -> Result<ExtractedGithubArchive, LpmErr
         }
         let relative: PathBuf = components.collect();
         if relative.as_os_str().is_empty() && entry_type.is_dir() {
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
         if relative.as_os_str().is_empty() || !is_safe_relative_path(&relative) {
             return Err(LpmError::Registry(
@@ -763,7 +749,7 @@ fn extract_github_archive(bytes: &[u8]) -> Result<ExtractedGithubArchive, LpmErr
             )));
         }
         if entry_type.is_dir() {
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
         if !entry_type.is_file() {
             let kind = if entry_type.is_symlink() {
@@ -778,14 +764,14 @@ fn extract_github_archive(bytes: &[u8]) -> Result<ExtractedGithubArchive, LpmErr
                 "special-entry"
             };
             unsafe_entries.insert(relative, kind.to_string());
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
         if entry_size > MAX_FILE_BYTES as u64 {
             unsafe_entries.insert(
                 relative,
                 format!("file larger than the {MAX_FILE_BYTES}-byte limit"),
             );
-            continue;
+            return Ok(std::ops::ControlFlow::<()>::Continue(()));
         }
         let mut content = Vec::with_capacity(entry_size as usize);
         entry.read_to_end(&mut content).map_err(|error| {
@@ -797,7 +783,8 @@ fn extract_github_archive(bytes: &[u8]) -> Result<ExtractedGithubArchive, LpmErr
                 relative.display()
             )));
         }
-    }
+        Ok(std::ops::ControlFlow::<()>::Continue(()))
+    })?;
     if files.is_empty() {
         return Err(LpmError::Registry(
             "GitHub archive contains no files".into(),

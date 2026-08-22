@@ -395,25 +395,13 @@ const MAX_ENTRY_COUNT: usize = 50_000;
 /// via `..` path components (zip-slip attack). See CVE-2018-1002200.
 fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), LpmError> {
     let decoder = flate2::read::GzDecoder::new(data);
-    let mut archive = tar::Archive::new(decoder);
-
     let mut total_bytes: u64 = 0;
-    let mut entry_count: usize = 0;
+    let archive_limits = lpm_extractor::TarArchiveLimits {
+        max_entry_bytes: MAX_ENTRY_BYTES,
+        ..lpm_extractor::TarArchiveLimits::new(MAX_ENTRY_COUNT)
+    };
 
-    for entry in archive
-        .entries()
-        .map_err(|e| LpmError::Script(format!("failed to read tarball entries: {e}")))?
-    {
-        let mut entry =
-            entry.map_err(|e| LpmError::Script(format!("failed to read tarball entry: {e}")))?;
-
-        entry_count += 1;
-        if entry_count > MAX_ENTRY_COUNT {
-            return Err(LpmError::Script(format!(
-                "tarball entry count exceeds {MAX_ENTRY_COUNT}"
-            )));
-        }
-
+    lpm_extractor::visit_tar_archive(decoder, archive_limits, |mut entry| {
         let entry_size = entry.size();
         if entry_size > MAX_ENTRY_BYTES {
             return Err(LpmError::Script(format!(
@@ -427,27 +415,232 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), LpmError> {
             )));
         }
 
-        let path = entry
-            .path()
-            .map_err(|e| LpmError::Script(format!("failed to read tarball entry path: {e}")))?;
+        let path = entry.path();
 
-        // Reject any entry containing `..` components (path traversal / zip-slip)
-        if path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
+        if path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
             return Err(LpmError::Script(format!(
                 "path traversal detected in tarball entry: {}",
                 path.display()
             )));
         }
-
-        entry
-            .unpack_in(dest)
-            .map_err(|e| LpmError::Script(format!("failed to extract tarball entry: {e}")))?;
-    }
+        let output = dest.join(path);
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            ensure_runtime_archive_directory(dest, path)?;
+            entry
+                .unpack(&output)
+                .map_err(|e| LpmError::Script(format!("failed to extract tarball entry: {e}")))?;
+        } else if entry_type.is_file() {
+            ensure_runtime_archive_parent(dest, path)?;
+            entry
+                .unpack(&output)
+                .map_err(|e| LpmError::Script(format!("failed to extract tarball entry: {e}")))?;
+        } else if entry_type.is_symlink() {
+            ensure_runtime_archive_parent(dest, path)?;
+            let target = entry.link_name().ok_or_else(|| {
+                LpmError::Script(format!("tarball symlink has no target: {}", path.display()))
+            })?;
+            validate_runtime_symlink_target(path, target)?;
+            replace_runtime_symlink(target, &output)?;
+        } else if entry_type.is_hard_link() {
+            ensure_runtime_archive_parent(dest, path)?;
+            let target = entry.link_name().ok_or_else(|| {
+                LpmError::Script(format!(
+                    "tarball hard link has no target: {}",
+                    path.display()
+                ))
+            })?;
+            let target = validate_runtime_hard_link_target(dest, target)?;
+            replace_runtime_hard_link(&target, &output)?;
+        } else {
+            return Err(LpmError::Script(format!(
+                "unsupported tarball entry type {entry_type:?}: {}",
+                path.display()
+            )));
+        }
+        Ok(std::ops::ControlFlow::<()>::Continue(()))
+    })?;
 
     Ok(())
+}
+
+fn ensure_runtime_archive_parent(root: &Path, path: &Path) -> Result<(), LpmError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    ensure_runtime_archive_directory(root, parent)
+}
+
+fn ensure_runtime_archive_directory(root: &Path, path: &Path) -> Result<(), LpmError> {
+    let mut current = root.to_path_buf();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(LpmError::Script(format!(
+                    "tarball entry traverses a non-directory path: {}",
+                    current.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current).map_err(|error| {
+                    LpmError::Script(format!(
+                        "failed to create tarball directory {}: {error}",
+                        current.display()
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(LpmError::Script(format!(
+                    "failed to inspect tarball directory {}: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_symlink_target(path: &Path, target: &Path) -> Result<(), LpmError> {
+    let mut resolved_depth = path
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(_) => {
+                resolved_depth = resolved_depth.saturating_add(1);
+            }
+            std::path::Component::ParentDir if resolved_depth > 0 => {
+                resolved_depth -= 1;
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(LpmError::Script(format!(
+                    "tarball symlink escapes the extraction root: {} -> {}",
+                    path.display(),
+                    target.display()
+                )));
+            }
+        }
+    }
+    if target.as_os_str().is_empty() {
+        return Err(LpmError::Script(format!(
+            "tarball symlink has an empty target: {}",
+            path.display()
+        )));
+    }
+    if resolved_depth > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
+        return Err(LpmError::Script(format!(
+            "tarball symlink target exceeds the {}-component nesting limit: {} -> {}",
+            lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
+            path.display(),
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_runtime_hard_link_target(
+    root: &Path,
+    target: &Path,
+) -> Result<std::path::PathBuf, LpmError> {
+    if target.as_os_str().is_empty()
+        || target.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(LpmError::Script(format!(
+            "tarball hard link has an unsafe target: {}",
+            target.display()
+        )));
+    }
+
+    let mut source = root.to_path_buf();
+    let mut components = target.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        source.push(name);
+        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+            LpmError::Script(format!(
+                "failed to inspect tarball hard-link target {}: {error}",
+                source.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink()
+            || (components.peek().is_some() && !metadata.is_dir())
+            || (components.peek().is_none() && !metadata.is_file())
+        {
+            return Err(LpmError::Script(format!(
+                "tarball hard link has an unsafe target: {}",
+                target.display()
+            )));
+        }
+    }
+    Ok(source)
+}
+
+#[cfg(unix)]
+fn replace_runtime_symlink(target: &Path, output: &Path) -> Result<(), LpmError> {
+    use std::os::unix::fs::symlink;
+
+    replace_runtime_link(output, || symlink(target, output), "symlink")
+}
+
+#[cfg(windows)]
+fn replace_runtime_symlink(target: &Path, output: &Path) -> Result<(), LpmError> {
+    use std::os::windows::fs::symlink_file;
+
+    replace_runtime_link(output, || symlink_file(target, output), "symlink")
+}
+
+fn replace_runtime_hard_link(target: &Path, output: &Path) -> Result<(), LpmError> {
+    replace_runtime_link(output, || std::fs::hard_link(target, output), "hard link")
+}
+
+fn replace_runtime_link(
+    output: &Path,
+    create: impl Fn() -> std::io::Result<()>,
+    label: &str,
+) -> Result<(), LpmError> {
+    match create() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(output).map_err(|error| {
+                LpmError::Script(format!(
+                    "failed to replace tarball {label} {}: {error}",
+                    output.display()
+                ))
+            })?;
+            create().map_err(|error| {
+                LpmError::Script(format!(
+                    "failed to create tarball {label} {}: {error}",
+                    output.display()
+                ))
+            })
+        }
+        Err(error) => Err(LpmError::Script(format!(
+            "failed to create tarball {label} {}: {error}",
+            output.display()
+        ))),
+    }
 }
 
 /// Extract a .zip archive with path traversal protection and
@@ -490,7 +683,16 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), LpmError> {
         }
 
         let outpath = match file.enclosed_name() {
-            Some(path) => dest.join(path),
+            Some(path) => {
+                if path.components().count() > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
+                    return Err(LpmError::Script(format!(
+                        "ZIP entry exceeds the {}-component nesting limit: {}",
+                        lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
+                        path.display()
+                    )));
+                }
+                dest.join(path)
+            }
             None => {
                 // enclosed_name() returns None for entries with path traversal
                 return Err(LpmError::Script(format!(
@@ -826,11 +1028,10 @@ mod tests {
             } else {
                 let mut builder = tar::Builder::new(Vec::new());
                 let mut header = tar::Header::new_gnu();
-                header.set_path(path).unwrap();
                 header.set_size(data.len() as u64);
                 header.set_mode(0o644);
                 header.set_cksum();
-                builder.append(&header, data).unwrap();
+                builder.append_data(&mut header, path, data).unwrap();
                 // Get raw bytes without the end-of-archive marker
                 let built = builder.into_inner().unwrap();
                 // Each entry is header (512) + data (padded to 512). Builder adds
@@ -849,6 +1050,63 @@ mod tests {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(&tar_bytes).unwrap();
         gz.finish().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn build_tar_gz_with_symlink(path: &str, target: &str) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let content = b"console.log('npm');\n";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(content.len() as u64);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        builder
+            .append_data(
+                &mut file_header,
+                "node-v22/lib/node_modules/npm/bin/npm-cli.js",
+                content.as_slice(),
+            )
+            .unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_size(0);
+        link_header.set_mode(0o777);
+        link_header.set_link_name(target).unwrap();
+        link_header.set_cksum();
+        builder
+            .append_data(&mut link_header, path, std::io::empty())
+            .unwrap();
+
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn build_tar_gz_with_hard_link(path: &str, target: &str) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let content = b"runtime";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_size(content.len() as u64);
+        file_header.set_mode(0o755);
+        file_header.set_cksum();
+        builder
+            .append_data(&mut file_header, target, content.as_slice())
+            .unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Link);
+        link_header.set_size(0);
+        link_header.set_mode(0o755);
+        link_header.set_link_name(target).unwrap();
+        link_header.set_cksum();
+        builder
+            .append_data(&mut link_header, path, std::io::empty())
+            .unwrap();
+
+        builder.into_inner().unwrap().finish().unwrap()
     }
 
     /// Build a raw tar entry with arbitrary path (bypassing validation).
@@ -978,6 +1236,94 @@ mod tests {
     }
 
     #[test]
+    fn extract_tarball_rejects_paths_deeper_than_256_components() {
+        let mut path = "a/".repeat(256);
+        path.push_str("file.txt");
+        let archive = build_tar_gz(&[(&path, b"value")]);
+        let dest = TempDir::new().unwrap();
+
+        let error = extract_tarball(&archive, dest.path())
+            .expect_err("an excessively deep tar path must be rejected");
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+        assert!(
+            std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+            "rejected tar archive created output"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_preserves_safe_relative_runtime_symlinks() {
+        let archive =
+            build_tar_gz_with_symlink("node-v22/bin/npm", "../lib/node_modules/npm/bin/npm-cli.js");
+        let dest = TempDir::new().unwrap();
+
+        extract_tarball(&archive, dest.path()).expect("safe runtime symlink should extract");
+
+        assert_eq!(
+            std::fs::read_link(dest.path().join("node-v22/bin/npm")).unwrap(),
+            std::path::Path::new("../lib/node_modules/npm/bin/npm-cli.js")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_rejects_runtime_symlink_targets_outside_the_root() {
+        let archive = build_tar_gz_with_symlink("node-v22/bin/npm", "../../../escape");
+        let root = TempDir::new().unwrap();
+        let dest = root.path().join("runtime");
+        std::fs::create_dir(&dest).unwrap();
+
+        let error = extract_tarball(&archive, &dest)
+            .expect_err("an out-of-root runtime symlink must be rejected");
+
+        assert!(
+            error.to_string().contains("escapes"),
+            "expected symlink escape error, got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_rejects_a_preexisting_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let archive = build_tar_gz(&[("node-v22/bin/node", b"runtime")]);
+        let root = TempDir::new().unwrap();
+        let dest = root.path().join("runtime");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, dest.join("node-v22")).unwrap();
+
+        let error = extract_tarball(&archive, &dest)
+            .expect_err("a runtime entry through a symlink parent must be rejected");
+
+        assert!(
+            error.to_string().contains("non-directory"),
+            "expected symlink-parent error, got: {error}"
+        );
+        assert!(!outside.join("bin/node").exists());
+    }
+
+    #[test]
+    fn extract_tarball_preserves_safe_runtime_hard_links() {
+        let archive = build_tar_gz_with_hard_link("node-v22/bin/node-copy", "node-v22/bin/node");
+        let dest = TempDir::new().unwrap();
+
+        extract_tarball(&archive, dest.path()).expect("safe runtime hard link should extract");
+
+        assert_eq!(
+            std::fs::read(dest.path().join("node-v22/bin/node-copy")).unwrap(),
+            b"runtime"
+        );
+    }
+
+    #[test]
     fn extract_zip_rejects_path_traversal() {
         let root = TempDir::new().unwrap();
         let dest = root.path().join("extract");
@@ -1001,6 +1347,32 @@ mod tests {
         assert!(
             !root.path().join("escape.txt").exists(),
             "zip traversal must not write outside the destination"
+        );
+    }
+
+    #[test]
+    fn extract_zip_rejects_paths_deeper_than_256_components() {
+        let mut path = "a/".repeat(256);
+        path.push_str("file.txt");
+        let buffer = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(buffer);
+        writer
+            .start_file(&path, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"value").unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        let dest = TempDir::new().unwrap();
+
+        let error = extract_zip(&archive, dest.path())
+            .expect_err("an excessively deep ZIP path must be rejected");
+
+        assert!(
+            error.to_string().contains("nesting"),
+            "expected nesting-depth limit error, got: {error}"
+        );
+        assert!(
+            std::fs::read_dir(dest.path()).unwrap().next().is_none(),
+            "rejected ZIP archive created output"
         );
     }
 
