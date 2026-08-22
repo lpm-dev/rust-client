@@ -1165,12 +1165,76 @@ async fn run_locked(
             }
         }
 
-        let (source_action, backup_path, backup_digest, destination_snapshot) = if dest_existed
-            && previous_is_current
-        {
-            let previous = previous_file.as_ref().expect("checked above");
-            if previous.action == Some(crate::added_sources_state::AddedSourceFileAction::Overwrite)
-            {
+        let (source_action, backup_path, backup_digest, backup_mode, destination_snapshot) =
+            if dest_existed && previous_is_current {
+                let previous = previous_file.as_ref().expect("checked above");
+                if previous.action
+                    == Some(crate::added_sources_state::AddedSourceFileAction::Overwrite)
+                {
+                    let recorded_backup = previous.backup_path.as_ref().ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "source state for '{}' is missing its overwrite backup",
+                            manifest_path.display()
+                        ))
+                    })?;
+                    let backup_path = crate::added_sources_state::validate_recorded_backup_path(
+                        &package_state_key,
+                        &manifest_path,
+                        recorded_backup,
+                    )?;
+                    crate::added_sources_state::validate_existing_backup(
+                        project_dir,
+                        &backup_path,
+                        previous.backup_digest.as_deref(),
+                    )?;
+                }
+                (
+                    previous.action.expect("checked above"),
+                    previous
+                        .backup_path
+                        .as_deref()
+                        .map(|recorded| {
+                            crate::added_sources_state::validate_recorded_backup_path(
+                                &package_state_key,
+                                &manifest_path,
+                                recorded,
+                            )
+                        })
+                        .transpose()?,
+                    previous.backup_digest.clone(),
+                    previous.backup_mode,
+                    None,
+                )
+            } else if dest_existed {
+                let backup_path = crate::added_sources_state::backup_path_for_file(
+                    &package_state_key,
+                    &manifest_path,
+                );
+                let absolute_backup = project_dir.join(&backup_path);
+                tx.remove_dirs_on_rollback(missing_path_directories(project_dir, &absolute_backup));
+                tx.snapshot_optional_path(&absolute_backup)
+                    .map_err(|error| {
+                        LpmError::Registry(format!(
+                            "failed to snapshot source backup '{}': {error}",
+                            absolute_backup.display()
+                        ))
+                    })?;
+                let written_backup =
+                    crate::added_sources_state::write_backup(project_dir, &backup_path, dest_path)?;
+                let destination_snapshot =
+                    std::fs::File::open(&absolute_backup).map_err(LpmError::Io)?;
+                (
+                    crate::added_sources_state::AddedSourceFileAction::Overwrite,
+                    Some(backup_path),
+                    Some(written_backup.digest),
+                    written_backup.original_mode,
+                    Some(destination_snapshot),
+                )
+            } else if previous_file.as_ref().is_some_and(|previous| {
+                previous.action
+                    == Some(crate::added_sources_state::AddedSourceFileAction::Overwrite)
+            }) {
+                let previous = previous_file.as_ref().expect("checked above");
                 let recorded_backup = previous.backup_path.as_ref().ok_or_else(|| {
                     LpmError::Registry(format!(
                         "source state for '{}' is missing its overwrite backup",
@@ -1187,90 +1251,31 @@ async fn run_locked(
                     &backup_path,
                     previous.backup_digest.as_deref(),
                 )?;
-            }
-            (
-                previous.action.expect("checked above"),
-                previous
-                    .backup_path
-                    .as_deref()
-                    .map(|recorded| {
-                        crate::added_sources_state::validate_recorded_backup_path(
-                            &package_state_key,
-                            &manifest_path,
-                            recorded,
-                        )
-                    })
-                    .transpose()?,
-                previous.backup_digest.clone(),
-                None,
-            )
-        } else if dest_existed {
-            let backup_path = crate::added_sources_state::backup_path_for_file(
-                &package_state_key,
-                &manifest_path,
-            );
-            let absolute_backup = project_dir.join(&backup_path);
-            tx.remove_dirs_on_rollback(missing_path_directories(project_dir, &absolute_backup));
-            tx.snapshot_optional_path(&absolute_backup)
-                .map_err(|error| {
-                    LpmError::Registry(format!(
-                        "failed to snapshot source backup '{}': {error}",
-                        absolute_backup.display()
-                    ))
-                })?;
-            let backup_digest =
-                crate::added_sources_state::write_backup(project_dir, &backup_path, dest_path)?;
-            let destination_snapshot =
-                std::fs::File::open(&absolute_backup).map_err(LpmError::Io)?;
-            (
-                crate::added_sources_state::AddedSourceFileAction::Overwrite,
-                Some(backup_path),
-                Some(backup_digest),
-                Some(destination_snapshot),
-            )
-        } else if previous_file.as_ref().is_some_and(|previous| {
-            previous.action == Some(crate::added_sources_state::AddedSourceFileAction::Overwrite)
-        }) {
-            let previous = previous_file.as_ref().expect("checked above");
-            let recorded_backup = previous.backup_path.as_ref().ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "source state for '{}' is missing its overwrite backup",
-                    manifest_path.display()
-                ))
-            })?;
-            let backup_path = crate::added_sources_state::validate_recorded_backup_path(
-                &package_state_key,
-                &manifest_path,
-                recorded_backup,
-            )?;
-            crate::added_sources_state::validate_existing_backup(
-                project_dir,
-                &backup_path,
-                previous.backup_digest.as_deref(),
-            )?;
-            (
-                crate::added_sources_state::AddedSourceFileAction::Overwrite,
-                Some(backup_path),
-                previous.backup_digest.clone(),
-                None,
-            )
-        } else {
-            if previous_file
-                .as_ref()
-                .is_some_and(|previous| previous.backup_path.is_some())
-            {
-                return Err(LpmError::Registry(format!(
-                    "source state for '{}' has a backup without overwrite ownership",
-                    manifest_path.display()
-                )));
-            }
-            (
-                crate::added_sources_state::AddedSourceFileAction::Create,
-                None,
-                None,
-                None,
-            )
-        };
+                (
+                    crate::added_sources_state::AddedSourceFileAction::Overwrite,
+                    Some(backup_path),
+                    previous.backup_digest.clone(),
+                    previous.backup_mode,
+                    None,
+                )
+            } else {
+                if previous_file
+                    .as_ref()
+                    .is_some_and(|previous| previous.backup_path.is_some())
+                {
+                    return Err(LpmError::Registry(format!(
+                        "source state for '{}' has a backup without overwrite ownership",
+                        manifest_path.display()
+                    )));
+                }
+                (
+                    crate::added_sources_state::AddedSourceFileAction::Create,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
         // Write (rewritten text or copy binary)
         let snapshot_result = if let Some(snapshot) = destination_snapshot {
             tx.snapshot_optional_path_from_file(dest_path, snapshot)
@@ -1298,6 +1303,7 @@ async fn run_locked(
                 action: Some(source_action),
                 backup_path,
                 backup_digest,
+                backup_mode,
             },
         ));
         file_actions.push((

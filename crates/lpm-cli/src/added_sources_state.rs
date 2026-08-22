@@ -53,6 +53,13 @@ pub struct AddedSourceFile {
     pub backup_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_mode: Option<u32>,
+}
+
+pub struct WrittenSourceBackup {
+    pub digest: String,
+    pub original_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -320,13 +327,21 @@ pub fn write_backup(
     project_dir: &Path,
     relative_backup_path: &Path,
     source: &Path,
-) -> Result<String, LpmError> {
+) -> Result<WrittenSourceBackup, LpmError> {
     let file_name = managed_backup_file_name(relative_backup_path)?;
     let backup_directory = ensure_backup_directory(project_dir)?;
     let backup_path = backup_directory.join(file_name);
     ensure_regular_or_missing(&backup_path, "source backup")?;
     ensure_regular_or_missing(source, "source backup input")?;
     let mut source = std::fs::File::open(source).map_err(LpmError::Io)?;
+    #[cfg(unix)]
+    let original_mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        Some(source.metadata()?.permissions().mode() & 0o7777)
+    };
+    #[cfg(not(unix))]
+    let original_mode = None;
     let mut hasher = Sha256::new();
     lpm_common::write_file_atomic_with(
         &backup_path,
@@ -345,7 +360,10 @@ pub fn write_backup(
         },
     )
     .map_err(LpmError::Io)?;
-    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+    Ok(WrittenSourceBackup {
+        digest: format!("sha256-{}", hex::encode(hasher.finalize())),
+        original_mode,
+    })
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> String {
@@ -528,6 +546,7 @@ fn parse_state(path: &Path, bytes: &[u8]) -> Result<AddedSourcesState, LpmError>
                                 action: None,
                                 backup_path: None,
                                 backup_digest: None,
+                                backup_mode: None,
                             },
                         )
                     })
@@ -596,6 +615,7 @@ mod tests {
             action: Some(AddedSourceFileAction::Create),
             backup_path: None,
             backup_digest: None,
+            backup_mode: None,
         }
     }
 
@@ -710,18 +730,19 @@ mod tests {
         let project = tempdir().unwrap();
         let source = project.path().join("secret.txt");
         std::fs::write(&source, b"secret").unwrap();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o751)).unwrap();
         let relative = PathBuf::from(".lpm")
             .join(BACKUP_DIRECTORY)
             .join("backup.bak");
 
-        write_backup(project.path(), &relative, &source).unwrap();
+        let written = write_backup(project.path(), &relative, &source).unwrap();
 
         let mode = std::fs::metadata(project.path().join(relative))
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
+        assert_eq!(written.original_mode, Some(0o751));
         assert_eq!(mode, 0o600);
     }
 }

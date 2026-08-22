@@ -2075,6 +2075,16 @@ async fn add_new_version_replaces_unchanged_created_and_overwritten_outputs() {
     let created_project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
     let overwritten_project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
     overwritten_project.write_file("components/Source.ts", "original project bytes\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(
+            overwritten_project.path().join("components/Source.ts"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+    }
 
     lpm_with_registry(&created_project, &mock.url())
         .args([
@@ -2119,6 +2129,8 @@ async fn add_new_version_replaces_unchanged_created_and_overwritten_outputs() {
         serde_json::from_str(&overwritten_project.read_file(".lpm/added-sources.json")).unwrap();
     let overwritten_file = &overwritten_state["packages"][package]["files"]["components/Source.ts"];
     assert_eq!(overwritten_file["action"], "overwrite");
+    #[cfg(unix)]
+    assert_eq!(overwritten_file["backup_mode"], 0o751);
     let backup_path = overwritten_file["backup_path"]
         .as_str()
         .expect("overwrite backup path");
