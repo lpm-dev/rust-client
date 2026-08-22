@@ -32,7 +32,7 @@ use clap::Subcommand;
 use lpm_common::LpmError;
 use lpm_workspace::{TrustedDependencies, TrustedDependencyBinding};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Stable JSON schema version for `lpm trust {diff,prune} --json`.
 ///
@@ -210,6 +210,17 @@ where
     F: std::future::Future<Output = Result<T, LpmError>>,
 {
     let initial_workspace_root = discover_workspace_root(project_dir)?;
+    scope_project_policy_mutation_from(project_dir, initial_workspace_root, mutation).await
+}
+
+async fn scope_project_policy_mutation_from<F, T>(
+    project_dir: &Path,
+    initial_workspace_root: Option<PathBuf>,
+    mutation: F,
+) -> Result<T, LpmError>
+where
+    F: std::future::Future<Output = Result<T, LpmError>>,
+{
     let lock_root = initial_workspace_root.as_deref().unwrap_or(project_dir);
     let lock_path = lpm_common::project_install_lock(lock_root);
     lpm_common::with_exclusive_lock_async(lock_path, async {
@@ -552,32 +563,23 @@ async fn run_prune(
         ));
     }
 
-    let installed_names = installed_names_from_lockfile(project_dir)?;
+    if json && !dry_run && !yes {
+        return Err(LpmError::Script(
+            "lpm trust prune --json requires `--yes` before it can mutate package.json. \
+             Pass `--yes` to proceed or `--dry-run` to preview."
+                .into(),
+        ));
+    }
 
-    // Load the raw JSON so we can write it back with minimal churn
-    // (preserve ordering, whitespace, etc.). Parse
-    // `trustedDependencies` via the typed path to reuse the variant-
-    // aware stale computation.
-    let manifest_text =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
-        .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
-    // Audit-v4 F2: malformed `lpm.trustedDependencies` surfaces as a
-    // hard error instead of silently defaulting to empty. The typed
-    // read `lpm trust diff` uses via `lpm_workspace::read_package_json`
-    // already has this strictness; this path now matches.
-    let trusted = extract_trusted_dependencies(&manifest)?;
-    let stale = compute_stale_keys(&trusted, &installed_names);
+    if yes && !dry_run {
+        let initial_workspace_root = discover_workspace_root(project_dir)?;
+        return scope_project_policy_mutation_from(project_dir, initial_workspace_root, async {
+            prune_current_manifest(project_dir, json, true, None)
+        })
+        .await;
+    }
 
-    // Audit-v4 F1: structured output MUST reflect the actual final
-    // state of the file. The previous implementation emitted JSON
-    // pre-mutation (with an optimistic `mutated: true`) and could
-    // then exit with an error on the non-TTY/confirmation guard,
-    // leaving JSON consumers with an inaccurate contract. We now
-    // emit at most ONE structured block per invocation, always at
-    // the terminal branch, with the actual `mutated` state.
-
-    // Empty: trivial success, no mutation.
+    let (_, stale) = load_prune_state(project_dir)?;
     if stale.is_empty() {
         if json {
             print_prune_json(&stale, dry_run, false);
@@ -587,13 +589,10 @@ async fn run_prune(
         return Ok(());
     }
 
-    // Preview the stale list in human mode. JSON mode renders the
-    // full list as part of its structured output below.
     if !json {
         print_prune_human_preview(&stale);
     }
 
-    // Dry-run: report would-mutate without actually mutating.
     if dry_run {
         if json {
             print_prune_json(&stale, dry_run, false);
@@ -607,38 +606,76 @@ async fn run_prune(
         return Ok(());
     }
 
-    // Non-TTY without --yes is a hard error: prune mutates
-    // package.json. No prompting without explicit opt-in from CI /
-    // scripts. Error BEFORE any success-shaped output.
-    if !yes && !is_tty() {
+    if !stdin_is_terminal() {
         return Err(LpmError::Script(
             "lpm trust prune needs a TTY for confirmation. Pass `--yes` to \
              proceed non-interactively, or `--dry-run` to preview."
                 .into(),
         ));
     }
-    if !yes && !json {
-        let confirmed = cliclack::confirm(format!(
-            "Remove {} stale entry/entries from package.json?",
-            stale.len()
-        ))
-        .interact()
-        .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
-        if !confirmed {
-            install_ui::warn("Nothing pruned");
-            return Ok(());
-        }
+    let initial_workspace_root = discover_workspace_root(project_dir)?;
+    let confirmed = cliclack::confirm(format!(
+        "Remove {} stale entry/entries from package.json?",
+        stale.len()
+    ))
+    .interact()
+    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+    if !confirmed {
+        install_ui::warn("Nothing pruned");
+        return Ok(());
     }
 
-    // Mutate, THEN emit — so `mutated: true` in JSON mode is an
-    // accurate post-condition, not an optimistic prediction. Any
-    // error from `write_manifest` propagates via `?` and the caller
-    // sees the failure; no partial JSON is emitted on failure paths.
+    scope_project_policy_mutation_from(project_dir, initial_workspace_root, async {
+        prune_current_manifest(project_dir, json, false, Some(&stale))
+    })
+    .await
+}
+
+fn load_prune_state(project_dir: &Path) -> Result<(serde_json::Value, Vec<String>), LpmError> {
+    let installed_names = installed_names_from_lockfile(project_dir)?;
+    let pkg_json_path = project_dir.join("package.json");
+    let manifest_text =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
+    let trusted = extract_trusted_dependencies(&manifest)?;
+    let stale = compute_stale_keys(&trusted, &installed_names);
+    Ok((manifest, stale))
+}
+
+fn prune_current_manifest(
+    project_dir: &Path,
+    json: bool,
+    print_preview: bool,
+    confirmed_stale: Option<&[String]>,
+) -> Result<(), LpmError> {
+    let (mut manifest, mut stale) = load_prune_state(project_dir)?;
+    if let Some(confirmed_stale) = confirmed_stale {
+        let confirmed: std::collections::HashSet<&str> =
+            confirmed_stale.iter().map(String::as_str).collect();
+        stale.retain(|key| confirmed.contains(key.as_str()));
+    }
+
+    if stale.is_empty() {
+        if json {
+            print_prune_json(&stale, false, false);
+        } else if confirmed_stale.is_some() {
+            install_ui::done("No confirmed stale trust entries remain · package.json unchanged");
+        } else {
+            install_ui::done("No stale trust entries · package.json unchanged");
+        }
+        return Ok(());
+    }
+
+    if print_preview && !json {
+        print_prune_human_preview(&stale);
+    }
+
     remove_stale_from_manifest(&mut manifest, &stale);
-    write_manifest(&pkg_json_path, &manifest)?;
+    write_manifest(&project_dir.join("package.json"), &manifest)?;
 
     if json {
-        print_prune_json(&stale, dry_run, true);
+        print_prune_json(&stale, false, true);
     } else {
         install_ui::done_untrusted(&format!(
             "Removed {} stale trust {}",
@@ -656,11 +693,8 @@ async fn run_prune(
 ///   matches the install-side behavior for projects that haven't
 ///   declared any trust bindings.
 /// - Key present but of an invalid shape (not a string array, not an
-///   object map, field typos inside bindings, etc.) → `Err`. **Audit-v4
-///   F2 fix:** previously this used `unwrap_or_default()` which
-///   silently produced an empty set, causing `trust prune` to report
-///   "nothing to prune" on a manifest with a typo. Now it matches the
-///   strictness of the typed read path `trust diff` uses.
+///   object map, field typos inside bindings, etc.) → `Err`, matching
+///   the strictness of the typed read path `trust diff` uses.
 fn extract_trusted_dependencies(
     manifest: &serde_json::Value,
 ) -> Result<TrustedDependencies, LpmError> {
@@ -706,10 +740,8 @@ fn write_manifest(path: &Path, manifest: &serde_json::Value) -> Result<(), LpmEr
 
 /// Render the stale-entry preview list (human mode only).
 ///
-/// Callers must guard on `!stale.is_empty()` before invoking; the
-/// empty case now owns its own success message in `run_prune`
-/// directly so JSON and human paths share exactly one terminal
-/// output per invocation (audit-v4 F1).
+/// Callers must guard on `!stale.is_empty()` before invoking so JSON
+/// and human paths each produce one terminal output per invocation.
 fn print_prune_human_preview(stale: &[String]) {
     install_ui::phase("Pruning stale trust entries");
     println!("{}", install_ui::section("stale"));
@@ -736,9 +768,9 @@ fn print_prune_json(stale: &[String], dry_run: bool, will_mutate: bool) {
     println!("{}", serde_json::to_string_pretty(&body).unwrap());
 }
 
-fn is_tty() -> bool {
+fn stdin_is_terminal() -> bool {
     use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
+    std::io::stdin().is_terminal()
 }
 
 // Unused import guard for the `Binding` type (referenced via
@@ -1030,8 +1062,6 @@ mod tests {
         );
     }
 
-    // ── Audit-v4 fixes ────────────────────────────────────────────
-
     #[test]
     fn extract_trusted_dependencies_absent_key_is_ok_default() {
         // "Key not present" is NOT an error — it's a project that
@@ -1078,14 +1108,6 @@ mod tests {
 
     #[test]
     fn extract_trusted_dependencies_malformed_shape_errors() {
-        // Audit-v4 F2: the previous `unwrap_or_default()` path
-        // silently treated malformed shapes as empty, so `trust
-        // prune` would report "nothing to prune" on a manifest
-        // with a typo. Post-fix: a hard error with an actionable
-        // message pointing at the accepted forms.
-        //
-        // Valid shapes: string array OR object map. Number, bool,
-        // string, nested-object-of-strings are all invalid.
         for bad in [
             r#"{"lpm":{"trustedDependencies":42}}"#,
             r#"{"lpm":{"trustedDependencies":"esbuild"}}"#,
@@ -1109,10 +1131,6 @@ mod tests {
 
     #[test]
     fn run_prune_empty_stale_does_not_mutate_manifest() {
-        // Audit-v4 F1 corollary: the empty-stale path reports
-        // `mutated: false` AND must leave package.json untouched
-        // (byte-identical). Proves the JSON emission and the file
-        // state are in sync.
         let dir = tempdir().unwrap();
         let pkg_json = dir.path().join("package.json");
         let original = r#"{"name":"proj","lpm":{"trustedDependencies":{"esbuild@1.0.0":{}}}}"#;
@@ -1204,9 +1222,6 @@ mod tests {
 
     #[test]
     fn run_prune_malformed_trusted_deps_errors_before_any_write() {
-        // Audit-v4 F2 end-to-end: bad shape propagates as LpmError
-        // from `run_prune` before any file write. package.json
-        // stays byte-identical on the error path.
         let dir = tempdir().unwrap();
         let pkg_json = dir.path().join("package.json");
         let original = r#"{"name":"proj","lpm":{"trustedDependencies":42}}"#;
