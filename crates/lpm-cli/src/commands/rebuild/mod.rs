@@ -42,8 +42,9 @@ mod trust;
 mod tests;
 
 use self::build_cache::{
-    BuildCacheInvocation, BuildCacheScratch, build_key_for_package, is_cacheable_native_build,
-    marker_requires_key_validation, read_build_marker_key, read_v2_graph_key_digest,
+    BuildCacheInvocation, BuildCacheScratch, BuildMarkerState, build_key_for_package,
+    is_cacheable_native_build, marker_requires_key_validation, read_build_marker,
+    read_v2_graph_key_digest, remove_build_marker_durably, write_build_marker,
 };
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
@@ -51,10 +52,12 @@ pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
 use self::package_dir::prepare_live_package_dir;
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
+#[cfg(test)]
+use self::scripts::toposort_packages;
 use self::scripts::{
     BUILD_MARKER, BuildCacheMetrics, ScriptablePackage, count_untrusted_unbuilt,
-    read_lifecycle_scripts, rebuild_dry_run_envelope, rebuild_package_failure_message,
-    rebuild_package_label, rebuild_summary_envelope, scripts_word, toposort_packages,
+    package_build_layers, read_lifecycle_scripts, rebuild_dry_run_envelope,
+    rebuild_package_failure_message, rebuild_package_label, rebuild_summary_envelope, scripts_word,
     warn_stale_trusted_deps, widen_to_build_by_policy,
 };
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
@@ -67,11 +70,22 @@ use lpm_common::color::Painted;
 use lpm_sandbox::SandboxMode;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
 use lpm_store::{PackageBaselineLayout, V2BaselineIndex};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 300;
+const MAX_CONCURRENT_LIFECYCLE_BUILDS: usize = 4;
+
+#[derive(Default)]
+struct PackageExecutionResult {
+    successes: usize,
+    failures: usize,
+    completed_scripts: usize,
+    built_packages: Vec<RebuildPackageIdentity>,
+    build_cache: BuildCacheMetrics,
+}
 
 fn elapsed_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
@@ -140,20 +154,23 @@ pub async fn run(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<(), LpmError> {
-    run_with_report(
+    crate::commands::install::workspace_lockfile::scope_member_project_mutation(
         project_dir,
-        specific_packages,
-        all,
-        dry_run,
-        force,
-        timeout_secs,
-        json_output,
-        deny_all,
-        no_sandbox,
-        strict_sandbox,
-        sandbox_log,
-        effective_policy,
-        advisor_approvals,
+        run_with_report(
+            project_dir,
+            specific_packages,
+            all,
+            dry_run,
+            force,
+            timeout_secs,
+            json_output,
+            deny_all,
+            no_sandbox,
+            strict_sandbox,
+            sandbox_log,
+            effective_policy,
+            advisor_approvals,
+        ),
     )
     .await
     .map(|_| ())
@@ -305,6 +322,11 @@ async fn run_under_store_lock(
     // same-coordinate packages coexist; the project-scoped walk avoids
     // returning a sibling project's patched copy of the same package.
     let baseline_index = V2BaselineIndex::for_project(project_dir, &lpm_root);
+    let instance_baselines = crate::commands::audit::inventory::build_instance_baselines(
+        project_dir,
+        &baseline_index,
+        &lockfile,
+    );
 
     // Collect packages that have lifecycle scripts
     let mut scriptable_packages: Vec<ScriptablePackage> = Vec::new();
@@ -312,16 +334,21 @@ async fn run_under_store_lock(
     for lp in &lockfile.packages {
         // Virtual-store-aware lookup, routed through the invocation-local index.
         // `live_package_dir` returns `None` when the package isn't in
-        // either store (workspace/file/link sources, corrupt
-        // installs); silent skip preserves the previously
-        // `pkg_json_path.exists()` semantic for non-store sources
-        // while fixing the virtual-store-installed-and-skipped data-loss bug.
-        let baseline = match lpm_store::find_installed_package_baseline_indexed(
-            &baseline_index,
-            &lpm_root,
-            &lp.name,
-            &lp.version,
-        ) {
+        // either store, including workspace/file/link sources. Once a
+        // baseline exists, its manifest must remain readable and valid.
+        let baseline = match lp.instance_id {
+            Some(instance_id) => instance_baselines
+                .get(&instance_id)
+                .map(|baseline| baseline.as_ref().clone()),
+            None => lpm_store::find_installed_package_baseline_by_identity_indexed(
+                &baseline_index,
+                &lpm_root,
+                &lp.name,
+                &lp.version,
+                lp.integrity.as_deref(),
+            ),
+        };
+        let baseline = match baseline {
             Some(baseline) => baseline,
             None => continue,
         };
@@ -334,20 +361,16 @@ async fn run_under_store_lock(
         let pristine_path = baseline.pristine_dir;
         let pkg_json_path = pkg_dir.join("package.json");
 
-        if !pkg_json_path.exists() {
-            continue;
-        }
-
-        let scripts = match read_lifecycle_scripts(&pkg_json_path) {
-            Some(s) if !s.is_empty() => s,
+        let scripts = match read_lifecycle_scripts(&pkg_json_path)? {
+            Some(s) => s,
             _ => continue,
         };
 
         let marker_path = pkg_dir.join(BUILD_MARKER);
-        let is_built = marker_path.exists();
-        let build_marker_key = is_built
-            .then(|| read_build_marker_key(&marker_path))
-            .flatten();
+        let (is_built, build_marker_key) = match read_build_marker(&marker_path)? {
+            BuildMarkerState::Absent => (false, None),
+            BuildMarkerState::Present { key } => (true, key),
+        };
 
         // trust decision
         // now flows through the shared [`evaluate_trust`] helper so
@@ -412,6 +435,7 @@ async fn run_under_store_lock(
             });
 
         scriptable_packages.push(ScriptablePackage {
+            instance_id: lp.instance_id,
             name: lp.name.clone(),
             version: lp.version.clone(),
             integrity: lp.integrity.clone(),
@@ -475,21 +499,26 @@ async fn run_under_store_lock(
         // Build specific packages by name
         let mut selected = Vec::new();
         let mut missing = Vec::new();
+        let mut seen_requests = std::collections::HashSet::new();
         for name in specific_packages {
-            let found = scriptable_packages
-                .iter()
-                .find(|p| p.name == *name || p.name.ends_with(&format!(".{name}")));
-            match found {
-                Some(pkg) => selected.push(pkg),
-                None => {
-                    let safe_name = lpm_common::sanitize_for_terminal(name);
-                    if !json_output {
-                        install_ui::warn_untrusted(&format!(
-                            "{safe_name} has no lifecycle scripts or is not installed"
-                        ));
-                    }
-                    missing.push(safe_name);
+            if !seen_requests.insert(name.as_str()) {
+                continue;
+            }
+            let suffix = format!(".{name}");
+            let before = selected.len();
+            selected.extend(
+                scriptable_packages
+                    .iter()
+                    .filter(|package| package.name == *name || package.name.ends_with(&suffix)),
+            );
+            if selected.len() == before {
+                let safe_name = lpm_common::sanitize_for_terminal(name);
+                if !json_output {
+                    install_ui::warn_untrusted(&format!(
+                        "{safe_name} has no lifecycle scripts or is not installed"
+                    ));
                 }
+                missing.push(safe_name);
             }
         }
         if !missing.is_empty() {
@@ -522,8 +551,12 @@ async fn run_under_store_lock(
             .collect()
     };
 
-    // Sort in dependency order: if A depends on B, build B first (Kahn's toposort)
-    let to_build = toposort_packages(to_build, &lockfile);
+    let to_build_layers = package_build_layers(to_build, &lockfile);
+    let to_build = to_build_layers
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
 
     if to_build.is_empty() {
         if json_output {
@@ -1115,18 +1148,30 @@ async fn run_under_store_lock(
     let v3_store_root = virtual_store_root.join("v3");
     let v2_store_root = virtual_store_root.join("v2");
 
-    for pkg in &to_build {
+    let lifecycle_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(MAX_CONCURRENT_LIFECYCLE_BUILDS)
+        .thread_name(|index| format!("lpm-rebuild-{index}"))
+        .build()
+        .map_err(|error| LpmError::Registry(format!("failed to start rebuild workers: {error}")))?;
+
+    for layer in &to_build_layers {
+        let layer_results = lifecycle_pool.install(|| {
+            layer
+                .par_iter()
+                .map(|pkg| {
+                    let pkg = *pkg;
+                    let mut result = PackageExecutionResult::default();
         let mut pkg_success = true;
 
         let key_start = std::time::Instant::now();
         let mut build_key = build_cache_invocation
             .as_ref()
             .and_then(|invocation| build_key_for_package(invocation, pkg, project_dir));
-        build_cache_metrics.key_ms += elapsed_millis(key_start.elapsed());
+        result.build_cache.key_ms += elapsed_millis(key_start.elapsed());
         if build_key.is_some() {
-            build_cache_metrics.eligible += 1;
+            result.build_cache.eligible += 1;
         } else if is_cacheable_native_build(pkg) {
-            build_cache_metrics.bypassed += 1;
+            result.build_cache.bypassed += 1;
         }
         let package_store_version = match rebuild_store_version(
             &pkg.store_path,
@@ -1149,8 +1194,8 @@ async fn run_under_store_lock(
                 if json_output {
                     install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error));
                 }
-                failures += 1;
-                continue;
+                result.failures += 1;
+                return result;
             }
         };
         let virtual_store =
@@ -1172,8 +1217,8 @@ async fn run_under_store_lock(
                     if json_output {
                         install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error));
                     }
-                    failures += 1;
-                    continue;
+                    result.failures += 1;
+                    return result;
                 }
             }
         } else {
@@ -1188,7 +1233,7 @@ async fn run_under_store_lock(
                         pkg.name,
                         pkg.version
                     );
-                    build_cache_metrics.bypassed += 1;
+                    result.build_cache.bypassed += 1;
                     build_key = None;
                     None
                 }
@@ -1223,51 +1268,78 @@ async fn run_under_store_lock(
             Err(e) => {
                 if !json_output {
                     let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                    let error = e.to_string();
                     install_ui::detail_line(crate::install_ui::terminal_line!(
                         "  {} {}  {}",
                         install_ui::red("✗"),
                         label,
-                        lpm_common::sanitize_terminal_inline(&error),
+                        lpm_common::sanitize_terminal_inline(&e),
                     ));
                 }
                 if json_output {
                     install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &e));
                 }
-                failures += 1;
-                continue;
+                result.failures += 1;
+                return result;
             }
         };
 
         let marker_path = pkg.store_path.join(BUILD_MARKER);
-        let current_marker_exists = marker_path.is_file();
-        let current_marker_key = current_marker_exists
-            .then(|| read_build_marker_key(&marker_path))
-            .flatten();
-        if force {
-            if let Err(error) = std::fs::remove_file(&marker_path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(
-                    "failed to clear build marker for forced rebuild of {}: {error}",
-                    pkg.name
-                );
+        let current_marker = match read_build_marker(&marker_path) {
+            Ok(marker) => marker,
+            Err(error) => {
+                if !json_output {
+                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} {}  {}",
+                        install_ui::red("✗"),
+                        label,
+                        lpm_common::sanitize_terminal_inline(&error.to_string()),
+                    ));
+                }
+                result.failures += 1;
+                return result;
             }
-        } else if current_marker_exists {
+        };
+        if force {
+            if matches!(current_marker, BuildMarkerState::Present { .. })
+                && let Err(error) = remove_build_marker_durably(&marker_path)
+            {
+                if !json_output {
+                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} {}  failed to clear build marker: {}",
+                        install_ui::red("✗"),
+                        label,
+                        lpm_common::sanitize_terminal_inline(&error.to_string()),
+                    ));
+                }
+                result.failures += 1;
+                return result;
+            }
+        } else if let BuildMarkerState::Present {
+            key: current_marker_key,
+        } = current_marker
+        {
             match (current_marker_key.as_deref(), build_key.as_ref()) {
                 (Some(marker_key), Some(key)) if marker_key == key.as_str() => {
-                    build_cache_metrics.local_state_hits += 1;
-                    continue;
+                    result.build_cache.local_state_hits += 1;
+                    return result;
                 }
-                (_, None) => continue,
+                (_, None) => return result,
                 _ => {
-                    if let Err(error) = std::fs::remove_file(&marker_path)
-                        && error.kind() != std::io::ErrorKind::NotFound
-                    {
-                        tracing::warn!(
-                            "failed to clear stale build marker for {}: {error}",
-                            pkg.name
-                        );
+                    if let Err(error) = remove_build_marker_durably(&marker_path) {
+                        if !json_output {
+                            let label =
+                                format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                            install_ui::detail_line(crate::install_ui::terminal_line!(
+                                "  {} {}  failed to clear stale build marker: {}",
+                                install_ui::red("✗"),
+                                label,
+                                lpm_common::sanitize_terminal_inline(&error.to_string()),
+                            ));
+                        }
+                        result.failures += 1;
+                        return result;
                     }
                 }
             }
@@ -1276,25 +1348,33 @@ async fn run_under_store_lock(
             let lookup_start = std::time::Instant::now();
             match virtual_store.reusable_build_artifact(key) {
                 Ok(Some(artifact)) => {
-                    build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
+                    result.build_cache.lookup_ms += elapsed_millis(lookup_start.elapsed());
                     let restore_start = std::time::Instant::now();
                     match virtual_store.restore_build_artifact(&artifact, &pkg.store_path) {
                         Ok(()) => {
-                            build_cache_metrics.restore_ms +=
+                            result.build_cache.restore_ms +=
                                 elapsed_millis(restore_start.elapsed());
-                            build_cache_metrics.hits += 1;
-                            build_cache_metrics.scripts_avoided += pkg.scripts.len();
-                            build_cache_metrics.restored_bytes += artifact.manifest.unpacked_bytes;
-                            build_cache_metrics.lifecycle_ms_avoided +=
+                            result.build_cache.hits += 1;
+                            result.build_cache.scripts_avoided += pkg.scripts.len();
+                            result.build_cache.restored_bytes += artifact.manifest.unpacked_bytes;
+                            result.build_cache.lifecycle_ms_avoided +=
                                 artifact.manifest.lifecycle_duration_ms;
-                            if let Err(error) = std::fs::write(
-                                pkg.store_path.join(BUILD_MARKER),
-                                key.as_str().as_bytes(),
-                            ) {
-                                tracing::warn!(
-                                    "failed to write restored build marker for {}: {error}",
-                                    pkg.name
-                                );
+                            if let Err(error) = write_build_marker(&marker_path, Some(key.as_str()))
+                            {
+                                if !json_output {
+                                    let label = format!(
+                                        "{:<package_label_width$}",
+                                        rebuild_package_label(pkg)
+                                    );
+                                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                                        "  {} {}  failed to persist restored build marker: {}",
+                                        install_ui::red("✗"),
+                                        label,
+                                        lpm_common::sanitize_terminal_inline(&error.to_string()),
+                                    ));
+                                }
+                                result.failures += 1;
+                                return result;
                             }
                             if !json_output {
                                 let label =
@@ -1306,18 +1386,18 @@ async fn run_under_store_lock(
                                     install_ui::dim("build cache hit"),
                                 ));
                             }
-                            successes += 1;
-                            built_packages.push((
+                            result.successes += 1;
+                            result.built_packages.push((
                                 pkg.name.clone(),
                                 pkg.version.clone(),
                                 pkg.integrity.clone(),
                             ));
-                            continue;
+                            return result;
                         }
                         Err(error) => {
-                            build_cache_metrics.restore_ms +=
+                            result.build_cache.restore_ms +=
                                 elapsed_millis(restore_start.elapsed());
-                            build_cache_metrics.misses += 1;
+                            result.build_cache.misses += 1;
                             tracing::warn!(
                                 "failed to restore build cache entry for {}@{}: {error}",
                                 pkg.name,
@@ -1327,12 +1407,12 @@ async fn run_under_store_lock(
                     }
                 }
                 Ok(None) => {
-                    build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
-                    build_cache_metrics.misses += 1;
+                    result.build_cache.lookup_ms += elapsed_millis(lookup_start.elapsed());
+                    result.build_cache.misses += 1;
                 }
                 Err(error) => {
-                    build_cache_metrics.lookup_ms += elapsed_millis(lookup_start.elapsed());
-                    build_cache_metrics.misses += 1;
+                    result.build_cache.lookup_ms += elapsed_millis(lookup_start.elapsed());
+                    result.build_cache.misses += 1;
                     tracing::warn!(
                         "failed to inspect build cache entry for {}@{}: {error}",
                         pkg.name,
@@ -1347,7 +1427,7 @@ async fn run_under_store_lock(
             if let Err(error) =
                 virtual_store.restore_pristine_package(&pkg.pristine_path, &pkg.store_path)
             {
-                build_cache_metrics.rematerialize_ms +=
+                result.build_cache.rematerialize_ms +=
                     elapsed_millis(rematerialize_start.elapsed());
                 if !json_output {
                     let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
@@ -1359,10 +1439,11 @@ async fn run_under_store_lock(
                         lpm_common::sanitize_terminal_inline(&error),
                     ));
                 }
-                failures += 1;
-                continue;
+                result.failures += 1;
+                return result;
             }
-            build_cache_metrics.rematerialize_ms += elapsed_millis(rematerialize_start.elapsed());
+            result.build_cache.rematerialize_ms +=
+                elapsed_millis(rematerialize_start.elapsed());
         }
 
         let build_cache_scratch = if build_key.is_some() {
@@ -1386,9 +1467,37 @@ async fn run_under_store_lock(
         } else {
             None
         };
-        let script_tmpdir = build_cache_scratch
-            .as_ref()
-            .map_or(tmpdir.as_path(), BuildCacheScratch::path);
+        let package_tmpdir = if build_cache_scratch.is_none() {
+            match tempfile::Builder::new()
+                .prefix("lpm-rebuild-")
+                .tempdir_in(&tmpdir)
+            {
+                Ok(package_tmpdir) => Some(package_tmpdir),
+                Err(error) => {
+                    if !json_output {
+                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                        install_ui::detail_line(crate::install_ui::terminal_line!(
+                            "  {} {}  failed to create package temporary directory: {}",
+                            install_ui::red("✗"),
+                            label,
+                            lpm_common::sanitize_terminal_inline(&error.to_string()),
+                        ));
+                    }
+                    result.failures += 1;
+                    return result;
+                }
+            }
+        } else {
+            None
+        };
+        let script_tmpdir = if let Some(scratch) = build_cache_scratch.as_ref() {
+            scratch.path()
+        } else if let Some(package_tmpdir) = package_tmpdir.as_ref() {
+            package_tmpdir.path()
+        } else {
+            result.failures += 1;
+            return result;
+        };
         let mut package_sandbox_options = sandbox_options.clone();
         package_sandbox_options.build_cache_isolation = build_key.is_some();
 
@@ -1425,19 +1534,18 @@ async fn run_under_store_lock(
                             install_ui::dim(phase),
                         ));
                     }
-                    completed_scripts += 1;
+                    result.completed_scripts += 1;
                 }
                 Err(e) => {
                     pkg_success = false;
                     if !json_output {
                         let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                        let error = e.to_string();
                         install_ui::detail_line(crate::install_ui::terminal_line!(
                             "  {} {}  {} failed: {}",
                             install_ui::red("✗"),
                             label,
                             install_ui::dim(phase),
-                            lpm_common::sanitize_terminal_inline(&error),
+                            lpm_common::sanitize_terminal_inline(&e),
                         ));
                     }
                     break; // Don't run subsequent phases if one fails
@@ -1461,19 +1569,42 @@ async fn run_under_store_lock(
                         pkg.version
                     );
                 }
-                build_cache_metrics.publish_ms += elapsed_millis(publish_start.elapsed());
+                result.build_cache.publish_ms += elapsed_millis(publish_start.elapsed());
             }
-            let marker_path = pkg.store_path.join(BUILD_MARKER);
-            let marker = build_key
-                .as_ref()
-                .map_or(&[][..], |key| key.as_str().as_bytes());
-            if let Err(e) = std::fs::write(&marker_path, marker) {
-                tracing::warn!("failed to write build marker for {}: {e}", pkg.name);
+            if let Err(error) =
+                write_build_marker(&marker_path, build_key.as_ref().map(|key| key.as_str()))
+            {
+                if !json_output {
+                    let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} {}  failed to persist build marker: {}",
+                        install_ui::red("✗"),
+                        label,
+                        lpm_common::sanitize_terminal_inline(&error.to_string()),
+                    ));
+                }
+                result.failures += 1;
+                return result;
             }
-            successes += 1;
-            built_packages.push((pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()));
+            result.successes += 1;
+            result.built_packages.push((
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.integrity.clone(),
+            ));
         } else {
-            failures += 1;
+            result.failures += 1;
+        }
+                    result
+                })
+                .collect::<Vec<_>>()
+        });
+        for result in layer_results {
+            successes += result.successes;
+            failures += result.failures;
+            completed_scripts += result.completed_scripts;
+            built_packages.extend(result.built_packages);
+            build_cache_metrics.merge(result.build_cache);
         }
     }
 

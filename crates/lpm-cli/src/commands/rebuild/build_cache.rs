@@ -15,13 +15,15 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod toolchain_snapshot;
 
 const TOOLCHAIN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const TOOLCHAIN_PROBE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const TOOLCHAIN_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+const TOOLCHAIN_PROBE_CONCURRENCY: usize = 4;
 const RUNTIME_ONLY_TOOLCHAIN_FINGERPRINT: &str = "runtime-and-dependency-graph-v2";
 
 const TOOLCHAIN_PROBES: &[(&str, &[&str])] = &[
@@ -370,16 +372,88 @@ pub(super) fn marker_requires_key_validation(package: &ScriptablePackage) -> boo
     package.build_marker_key.is_some() && is_cacheable_native_build(package)
 }
 
-pub(super) fn read_build_marker_key(marker_path: &Path) -> Option<String> {
-    let bytes = std::fs::read(marker_path).ok()?;
-    if bytes.len() != 64
-        || !bytes
-            .iter()
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BuildMarkerState {
+    Absent,
+    Present { key: Option<String> },
+}
+
+pub(super) fn read_build_marker(
+    marker_path: &Path,
+) -> Result<BuildMarkerState, lpm_common::LpmError> {
+    let content = match lpm_common::read_text_file_capped_nofollow(marker_path, 64) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(BuildMarkerState::Absent),
+        Err(error) => {
+            return Err(lpm_common::LpmError::Store(format!(
+                "invalid build marker {}: {error}",
+                marker_path.display()
+            )));
+        }
+    };
+    if content.is_empty() {
+        return Ok(BuildMarkerState::Present { key: None });
+    }
+    if content.len() == 64
+        && content
+            .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
-        return None;
+        return Ok(BuildMarkerState::Present { key: Some(content) });
     }
-    String::from_utf8(bytes).ok()
+    Err(lpm_common::LpmError::Store(format!(
+        "invalid build marker {}: expected an empty marker or a lowercase SHA-256 key",
+        marker_path.display()
+    )))
+}
+
+pub(super) fn write_build_marker(marker_path: &Path, key: Option<&str>) -> std::io::Result<()> {
+    write_build_marker_with(marker_path, key, |marker_path, content| {
+        lpm_common::write_file_atomic_with_options(
+            marker_path,
+            content,
+            lpm_common::AtomicWriteOptions::new()
+                .sync_file()
+                .sync_parent(),
+        )
+    })
+}
+
+fn write_build_marker_with(
+    marker_path: &Path,
+    key: Option<&str>,
+    write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match write(marker_path, key.unwrap_or_default().as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(write_error) => match remove_build_marker_durably(marker_path) {
+            Ok(()) => Err(write_error),
+            Err(cleanup_error) => Err(std::io::Error::new(
+                write_error.kind(),
+                format!(
+                    "{write_error}; additionally failed to clear the build marker: {cleanup_error}"
+                ),
+            )),
+        },
+    }
+}
+
+pub(super) fn remove_build_marker_durably(marker_path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(marker_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+
+    #[cfg(unix)]
+    {
+        let parent = marker_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 pub(super) fn build_key_for_package(
@@ -502,7 +576,10 @@ fn detect_node_runtime(
     if !output.status.success() {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    if output.stdout.total_bytes > TOOLCHAIN_PROBE_OUTPUT_LIMIT as u64 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout.retained).ok()?;
     let executable = PathBuf::from(value.get("execPath")?.as_str()?);
     Some(BuildRuntimeFingerprint {
         runtime: "node".into(),
@@ -688,17 +765,44 @@ fn toolchain_probe_environment(
     probe_environment
 }
 
-fn read_bounded_probe_stream<R: Read>(mut reader: R) -> Vec<u8> {
+struct ProbeStream {
+    retained: Vec<u8>,
+    digest: [u8; 32],
+    total_bytes: u64,
+}
+
+impl ProbeStream {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.retained.len()
+    }
+}
+
+struct ToolchainProbeOutput {
+    status: std::process::ExitStatus,
+    stdout: ProbeStream,
+    stderr: ProbeStream,
+}
+
+fn read_bounded_probe_stream<R: Read>(mut reader: R) -> ProbeStream {
     let mut retained = Vec::with_capacity(8 * 1024);
     let mut chunk = [0_u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    let mut total_bytes = 0_u64;
     while let Ok(read) = reader.read(&mut chunk) {
         if read == 0 {
             break;
         }
+        hasher.update(&chunk[..read]);
+        total_bytes = total_bytes.saturating_add(read as u64);
         let remaining = TOOLCHAIN_PROBE_OUTPUT_LIMIT.saturating_sub(retained.len());
         retained.extend_from_slice(&chunk[..read.min(remaining)]);
     }
-    retained
+    ProbeStream {
+        retained,
+        digest: hasher.finalize().into(),
+        total_bytes,
+    }
 }
 
 fn terminate_toolchain_probe(child: &mut std::process::Child) {
@@ -717,7 +821,7 @@ fn run_bounded_toolchain_probe(
     executable: &Path,
     args: &[&str],
     environment: &HashMap<String, String>,
-) -> Option<std::process::Output> {
+) -> Option<ToolchainProbeOutput> {
     let mut command = Command::new(executable);
     command
         .args(args)
@@ -770,11 +874,45 @@ fn run_bounded_toolchain_probe(
     }
     let stdout = stdout_reader.join().ok()?;
     let stderr = stderr_reader.join().ok()?;
-    Some(std::process::Output {
+    Some(ToolchainProbeOutput {
         status: status?,
         stdout,
         stderr,
     })
+}
+
+fn run_indexed_jobs_bounded<T: Send>(
+    job_count: usize,
+    max_concurrency: usize,
+    job: impl Fn(usize) -> T + Sync,
+) -> Vec<Option<T>> {
+    if job_count == 0 {
+        return Vec::new();
+    }
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new((0..job_count).map(|_| None).collect::<Vec<_>>());
+    std::thread::scope(|scope| {
+        for _ in 0..job_count.min(max_concurrency.max(1)) {
+            let next = &next;
+            let results = &results;
+            let job = &job;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= job_count {
+                        break;
+                    }
+                    let output = job(index);
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = Some(output);
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -898,33 +1036,20 @@ fn compute_toolchain_fingerprint(
     trusted_executables: &[Option<TrustedExecutable>],
 ) -> std::io::Result<ComputedToolchainFingerprint> {
     let mut hasher = Sha256::new();
-    hasher.update(b"lpm-toolchain-host-v6\0");
+    hasher.update(b"lpm-toolchain-host-v7\0");
     let probe_environment = toolchain_probe_environment(trusted_environment);
-    let probe_outputs = std::thread::scope(|scope| {
-        #[expect(
-            clippy::needless_collect,
-            reason = "all probes must start before any join blocks"
-        )]
-        let handles = TOOLCHAIN_PROBES
-            .iter()
-            .zip(trusted_executables)
-            .map(|((_, args), executable)| {
-                let probe_environment = &probe_environment;
-                scope.spawn(move || {
-                    let executable = executable.as_ref()?;
-                    run_bounded_toolchain_probe(
-                        &executable.invocation_path,
-                        args,
-                        probe_environment,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().ok().flatten())
-            .collect::<Vec<_>>()
-    });
+    let probe_outputs = run_indexed_jobs_bounded(
+        TOOLCHAIN_PROBES.len(),
+        TOOLCHAIN_PROBE_CONCURRENCY,
+        |index| {
+            let (_, args) = TOOLCHAIN_PROBES[index];
+            let executable = trusted_executables[index].as_ref()?;
+            run_bounded_toolchain_probe(&executable.invocation_path, args, &probe_environment)
+        },
+    )
+    .into_iter()
+    .map(Option::flatten)
+    .collect::<Vec<_>>();
     for (((program, args), executable), output) in TOOLCHAIN_PROBES
         .iter()
         .zip(trusted_executables)
@@ -937,8 +1062,11 @@ fn compute_toolchain_fingerprint(
             hasher.update(b"\0");
         }
         if let Some(output) = output {
-            hasher.update(&output.stdout);
-            hasher.update(&output.stderr);
+            hasher.update(output.status.code().unwrap_or(-1).to_le_bytes());
+            hasher.update(output.stdout.total_bytes.to_le_bytes());
+            hasher.update(output.stdout.digest);
+            hasher.update(output.stderr.total_bytes.to_le_bytes());
+            hasher.update(output.stderr.digest);
         }
         if let Some(executable) = executable {
             hasher.update(b"trusted\0");
@@ -966,8 +1094,15 @@ fn compute_toolchain_fingerprint(
             .find_map(|((program, args), output)| {
                 (*program == "pkg-config"
                     && *args == ["--variable=pc_path", "pkg-config"]
-                    && output.as_ref().is_some_and(|value| value.status.success()))
-                .then(|| output.as_ref().map(|value| value.stdout.as_slice()))
+                    && output.as_ref().is_some_and(|value| {
+                        value.status.success()
+                            && value.stdout.total_bytes <= TOOLCHAIN_PROBE_OUTPUT_LIMIT as u64
+                    }))
+                .then(|| {
+                    output
+                        .as_ref()
+                        .map(|value| value.stdout.retained.as_slice())
+                })
                 .flatten()
             });
     let pkg_config_paths = pkg_config_search_paths(trusted_environment, pkg_config_pc_path);
@@ -992,7 +1127,7 @@ fn compute_toolchain_fingerprint(
         .map(|(_, value)| PathBuf::from(value))
         .or_else(dirs::home_dir)
     {
-        hash_directory_tree(&home.join(".node-gyp"), &mut hasher)?;
+        hash_node_gyp_state(&home.join(".node-gyp"), &mut hasher)?;
     }
     Ok(ComputedToolchainFingerprint {
         fingerprint: format!("sha256-{}", hex::encode(hasher.finalize())),
@@ -1069,6 +1204,34 @@ fn pkg_config_search_paths(
 fn hash_pkg_config_directories(paths: &[PathBuf], hasher: &mut Sha256) -> std::io::Result<()> {
     for path in paths {
         hash_directory_tree(path, hasher)?;
+    }
+    Ok(())
+}
+
+fn hash_node_gyp_state(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    hasher.update(b"node-gyp-state-v2\0");
+    let mut versions = match std::fs::read_dir(root) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"absent\x1e");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    versions.sort_unstable_by_key(std::fs::DirEntry::file_name);
+    for version in versions {
+        if !version.file_type()?.is_dir() {
+            continue;
+        }
+        hash_os_path(hasher, Path::new(&version.file_name()));
+        for relative in [
+            "installVersion",
+            "common.gypi",
+            "include/node/node_version.h",
+            "include/node/config.gypi",
+        ] {
+            hash_optional_file(&version.path().join(relative), hasher)?;
+        }
     }
     Ok(())
 }
@@ -1330,6 +1493,7 @@ mod tests {
 
     fn scriptable_package(name: &str, command: &str) -> ScriptablePackage {
         ScriptablePackage {
+            instance_id: None,
             name: name.into(),
             version: "1.0.0".into(),
             integrity: None,
@@ -1471,32 +1635,63 @@ mod tests {
         let key = "a".repeat(64);
         std::fs::write(&marker, &key).unwrap();
 
-        assert_eq!(read_build_marker_key(&marker), Some(key));
+        assert_eq!(
+            read_build_marker(&marker).unwrap(),
+            BuildMarkerState::Present { key: Some(key) }
+        );
     }
 
     #[test]
-    fn build_marker_reader_preserves_legacy_and_corrupt_markers_as_unkeyed() {
+    fn build_marker_reader_preserves_legacy_empty_marker_as_unkeyed() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join(".lpm-built");
         std::fs::write(&marker, b"").unwrap();
-        assert!(read_build_marker_key(&marker).is_none());
-
-        std::fs::write(&marker, "G".repeat(64)).unwrap();
-        assert!(read_build_marker_key(&marker).is_none());
+        assert_eq!(
+            read_build_marker(&marker).unwrap(),
+            BuildMarkerState::Present { key: None }
+        );
     }
 
     #[test]
-    fn directory_tree_hash_changes_when_node_headers_change() {
+    fn build_marker_reader_rejects_corrupt_key() {
         let temp = tempfile::tempdir().unwrap();
-        let headers = temp.path().join("include/node");
-        std::fs::create_dir_all(&headers).unwrap();
-        std::fs::write(headers.join("node.h"), b"first").unwrap();
-        let mut first = Sha256::new();
-        hash_directory_tree(temp.path(), &mut first).unwrap();
+        let marker = temp.path().join(".lpm-built");
+        std::fs::write(&marker, "G".repeat(64)).unwrap();
+        assert!(read_build_marker(&marker).is_err());
+    }
 
-        std::fs::write(headers.join("node.h"), b"second").unwrap();
+    #[test]
+    fn failed_build_marker_commit_cannot_leave_a_marker_that_suppresses_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(".lpm-built");
+        let key = "a".repeat(64);
+
+        let error = write_build_marker_with(&marker, Some(&key), |path, content| {
+            std::fs::write(path, content)?;
+            Err(std::io::Error::other("injected parent sync failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected parent sync failure");
+        assert_eq!(
+            read_build_marker(&marker).unwrap(),
+            BuildMarkerState::Absent
+        );
+    }
+
+    #[test]
+    fn node_gyp_hash_changes_when_version_header_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let node_gyp = temp.path().join(".node-gyp");
+        let headers = node_gyp.join("22.0.0/include/node");
+        std::fs::create_dir_all(&headers).unwrap();
+        std::fs::write(headers.join("node_version.h"), b"first").unwrap();
+        let mut first = Sha256::new();
+        hash_node_gyp_state(&node_gyp, &mut first).unwrap();
+
+        std::fs::write(headers.join("node_version.h"), b"second").unwrap();
         let mut second = Sha256::new();
-        hash_directory_tree(temp.path(), &mut second).unwrap();
+        hash_node_gyp_state(&node_gyp, &mut second).unwrap();
 
         assert_ne!(first.finalize(), second.finalize());
     }
@@ -1676,7 +1871,10 @@ mod tests {
         let output =
             run_bounded_toolchain_probe(&executable.invocation_path, &[], &environment).unwrap();
 
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "rustc");
+        assert_eq!(
+            String::from_utf8(output.stdout.retained).unwrap().trim(),
+            "rustc"
+        );
     }
 
     #[test]
@@ -1691,7 +1889,10 @@ mod tests {
 
         let output = run_bounded_toolchain_probe(&probe, &[], &HashMap::new()).unwrap();
 
-        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "/");
+        assert_eq!(
+            String::from_utf8(output.stdout.retained).unwrap().trim(),
+            "/"
+        );
     }
 
     #[test]
@@ -1767,11 +1968,29 @@ mod tests {
 
     #[test]
     fn toolchain_probe_reader_discards_output_beyond_limit() {
-        let input = vec![b'x'; TOOLCHAIN_PROBE_OUTPUT_LIMIT + 1024];
+        let input = vec![b'x'; 1024 * 1024];
 
         let output = read_bounded_probe_stream(std::io::Cursor::new(input));
 
-        assert_eq!(output.len(), TOOLCHAIN_PROBE_OUTPUT_LIMIT);
+        assert!(output.len() <= 64 * 1024);
+        assert_eq!(output.total_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn toolchain_probe_scheduler_limits_active_jobs() {
+        use std::sync::Arc;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let outputs = run_indexed_jobs_bounded(24, TOOLCHAIN_PROBE_CONCURRENCY, |_| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+
+        assert!(outputs.iter().all(Option::is_some));
+        assert_eq!(maximum.load(Ordering::SeqCst), TOOLCHAIN_PROBE_CONCURRENCY);
     }
 
     #[test]

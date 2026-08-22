@@ -171,18 +171,20 @@ pub(super) fn prepare_live_package_dir(
     store_root: &Path,
     baseline_index: Option<&V2BaselineIndex>,
 ) -> Result<PathBuf, String> {
-    let live = live_package_dir(
-        project_dir,
-        pkg_name,
-        pkg_version,
-        wrapper_id,
-        store_path,
-        baseline_index,
-    );
+    let live = if path_is_virtual_link_entry(store_path, store_root) {
+        store_path.to_path_buf()
+    } else {
+        live_package_dir(
+            project_dir,
+            pkg_name,
+            pkg_version,
+            wrapper_id,
+            store_path,
+            baseline_index,
+        )
+    };
 
-    let is_virtual_link_entry = ["v2", "v3"]
-        .iter()
-        .any(|version| path_resolves_under(&live, &virtual_links_root(store_root, version)));
+    let is_virtual_link_entry = path_is_virtual_link_entry(&live, store_root);
     if !is_virtual_link_entry && path_lives_in_protected_store_area(&live, store_root) {
         return Err(format!(
             "package {pkg_name}@{pkg_version} not linked into project — \
@@ -223,6 +225,12 @@ fn path_resolves_under(path: &Path, root: &Path) -> bool {
 fn path_is_symlink(path: &Path) -> bool {
     path.symlink_metadata()
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn path_is_virtual_link_entry(path: &Path, store_root: &Path) -> bool {
+    ["v2", "v3"]
+        .iter()
+        .any(|version| path_resolves_under(path, &virtual_links_root(store_root, version)))
 }
 
 fn virtual_links_root(store_root: &Path, version: &str) -> PathBuf {

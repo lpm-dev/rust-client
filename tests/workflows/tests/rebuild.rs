@@ -21,7 +21,10 @@
 mod support;
 
 use support::assertions;
-use support::{TempProject, lpm};
+use support::{
+    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, wait_for_lock_contention,
+    write_signed_unlock_for,
+};
 
 // ─── Reference postinstall bodies ───────────────────────────────────────
 //
@@ -126,13 +129,49 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) {
 /// spawn (not just tier classification / dry-run) skip the spawn-side
 /// assertion when Node is missing rather than failing — the suite must
 /// still run in minimal containers.
-#[cfg(target_os = "macos")]
 fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[test]
+fn rebuild_executes_independent_packages_concurrently() {
+    if !node_available() {
+        eprintln!("skipping: node is required for the lifecycle concurrency workflow");
+        return;
+    }
+
+    let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none"]);
+    write_policy_manifest(&project, "rebuild-independent-concurrency", None, &[]);
+    let package_names = ["parallel-a", "parallel-b", "parallel-c", "parallel-d"];
+    for name in package_names {
+        let store_pkg = seed_scripted_package(&project, name, "1.0.0", "node overlap.js");
+        std::fs::write(
+            store_pkg.join("overlap.js"),
+            format!(
+                "const fs=require('fs'),p=require('path'),d=p.join(process.env.INIT_CWD,'.lpm','rebuild-overlap');fs.mkdirSync(d,{{recursive:true}});fs.writeFileSync(p.join(d,'{name}'),'');const end=Date.now()+3000;while(fs.readdirSync(d).length<4&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);process.exit(fs.readdirSync(d).length===4?0:1);"
+            ),
+        )
+        .unwrap();
+        seed_wrapper(&project, &store_pkg, name, "1.0.0");
+    }
+    write_lockfile_for_packages(&project, &package_names.map(|name| (name, "1.0.0")));
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--no-sandbox"])
+        .output()
+        .expect("run independent lifecycle builds");
+
+    assert!(
+        output.status.success(),
+        "independent lifecycle packages must overlap instead of timing out serially\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_lockfile_for_packages(project: &TempProject, packages: &[(&str, &str)]) {
@@ -654,6 +693,158 @@ fn rebuild_named_missing_package_fails_in_json_mode() {
     assert!(
         error.contains("missing-pkg") && error.contains("lifecycle scripts"),
         "JSON error must name the requested package and why it was not rebuildable: {envelope}",
+    );
+}
+
+#[test]
+fn rebuild_fails_when_an_installed_manifest_is_malformed() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-malformed-installed-manifest", None, &[]);
+    let store_pkg = seed_scripted_package(&project, "malformed-pkg", "1.0.0", "echo ok");
+    write_lockfile_for_packages(&project, &[("malformed-pkg", "1.0.0")]);
+    std::fs::write(store_pkg.join("package.json"), b"{not-json").unwrap();
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--dry-run"])
+        .output()
+        .expect("run rebuild with malformed installed manifest");
+
+    assert!(
+        !output.status.success(),
+        "rebuild must fail closed instead of treating a malformed installed manifest as scriptless\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rebuild_fails_when_an_installed_manifest_is_missing() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-missing-installed-manifest", None, &[]);
+    let store_pkg = seed_scripted_package(&project, "missing-manifest-pkg", "1.0.0", "echo ok");
+    write_lockfile_for_packages(&project, &[("missing-manifest-pkg", "1.0.0")]);
+    std::fs::remove_file(store_pkg.join("package.json")).unwrap();
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--dry-run"])
+        .output()
+        .expect("run rebuild with missing installed manifest");
+
+    assert!(
+        !output.status.success(),
+        "rebuild must fail closed instead of treating a missing installed manifest as scriptless\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rebuild_rejects_a_directory_in_place_of_the_build_marker() {
+    let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none"]);
+    write_policy_manifest(&project, "rebuild-directory-marker", None, &[]);
+    let store_pkg = seed_scripted_package(
+        &project,
+        "directory-marker-pkg",
+        "1.0.0",
+        "echo ran > lifecycle-ran",
+    );
+    seed_wrapper(&project, &store_pkg, "directory-marker-pkg", "1.0.0");
+    write_lockfile_for_packages(&project, &[("directory-marker-pkg", "1.0.0")]);
+    std::fs::create_dir(store_pkg.join(".lpm-built")).unwrap();
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--force", "--no-sandbox"])
+        .output()
+        .expect("run rebuild with directory marker");
+
+    assert!(
+        !output.status.success(),
+        "rebuild must not report success when it cannot replace an invalid build marker\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !project
+            .path()
+            .join(".lpm/wrappers/directory-marker-pkg@1.0.0/node_modules/directory-marker-pkg/lifecycle-ran")
+            .exists(),
+        "an invalid marker must be rejected before lifecycle execution"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rebuild_rejects_a_symlinked_build_marker_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-symlink-marker", None, &[]);
+    let store_pkg = seed_scripted_package(&project, "symlink-marker-pkg", "1.0.0", "true");
+    write_lockfile_for_packages(&project, &[("symlink-marker-pkg", "1.0.0")]);
+    let sentinel = project.path().join("marker-sentinel");
+    std::fs::write(&sentinel, b"external").unwrap();
+    symlink(&sentinel, store_pkg.join(".lpm-built")).unwrap();
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--dry-run"])
+        .output()
+        .expect("run rebuild with symlink marker");
+
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"external");
+}
+
+#[cfg(unix)]
+#[test]
+fn rebuild_fails_when_the_success_marker_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none"]);
+    write_policy_manifest(&project, "rebuild-unwritable-marker", None, &[]);
+    let store_pkg = seed_scripted_package(&project, "unwritable-marker-pkg", "1.0.0", "true");
+    seed_wrapper(&project, &store_pkg, "unwritable-marker-pkg", "1.0.0");
+    write_lockfile_for_packages(&project, &[("unwritable-marker-pkg", "1.0.0")]);
+    std::fs::set_permissions(&store_pkg, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let output = lpm(&project)
+        .args(["rebuild", "--all", "--no-sandbox"])
+        .output()
+        .expect("run rebuild with unwritable marker directory");
+
+    assert!(
+        !output.status.success(),
+        "rebuild must not report a package as built when its success marker is not durable"
+    );
+}
+
+#[test]
+fn standalone_rebuild_waits_for_the_project_install_lock() {
+    let project = TempProject::empty("");
+    write_policy_manifest(&project, "rebuild-project-lock", None, &[]);
+    seed_scripted_package(&project, "locked-pkg", "1.0.0", "true");
+    write_lockfile_for_packages(&project, &[("locked-pkg", "1.0.0")]);
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(&lock_path).expect("hold project install lock");
+    let marker_path = project.home().join("rebuild-lock-contention");
+    let mut command = lpm_spawnable(&project);
+    command
+        .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
+        .args(["rebuild", "--all", "--dry-run"]);
+    let mut child = command.spawn().expect("spawn rebuild while lock is held");
+
+    wait_for_lock_contention(&mut child, &marker_path, &lock_path);
+    drop(transaction_lock);
+    let output = child
+        .wait_with_output()
+        .expect("finish rebuild after lock release");
+
+    assert!(
+        output.status.success(),
+        "rebuild failed after install lock release: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
