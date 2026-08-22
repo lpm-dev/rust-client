@@ -152,6 +152,18 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "moves an orphan into a randomized tombstone before recursive deletion",
     ),
     (
+        "crates/lpm-cli/src/commands/remove.rs::move_path",
+        "moves preflight-validated project-owned entries into an exclusively created quarantine and records each move for rollback",
+    ),
+    (
+        "crates/lpm-cli/src/commands/remove.rs::restore_file",
+        "moves an integrity-verified managed backup into its validated destination while retaining the open file and rollback entry",
+    ),
+    (
+        "crates/lpm-cli/src/commands/remove.rs::drop",
+        "restores paths recorded by the source-removal transaction after an incomplete mutation",
+    ),
+    (
         "crates/lpm-cli/src/commands/install/workspace_project_state.rs::move_to_backup",
         "moves project-owned install state into an exclusively created rollback directory before replacement",
     ),
