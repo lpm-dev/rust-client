@@ -49,10 +49,50 @@ pub(crate) struct PreparedTarball {
 }
 
 pub(crate) struct RewrittenTarball {
-    pub(crate) data: std::sync::Arc<Vec<u8>>,
+    file: std::sync::Mutex<tempfile::NamedTempFile>,
+    len: usize,
     pub(crate) hashes: std::sync::Arc<TarballHashes>,
     pub(crate) package_json_size: u64,
     pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
+}
+
+impl RewrittenTarball {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn read_data(&self) -> Result<Vec<u8>, LpmError> {
+        use std::io::{Read as _, Seek as _};
+
+        let mut file = self.file.lock().map_err(|_| {
+            LpmError::Registry("prepared publish tarball file lock is poisoned".into())
+        })?;
+        let metadata = file.as_file().metadata().map_err(LpmError::Io)?;
+        if metadata.len() != self.len as u64 {
+            return Err(LpmError::Registry(
+                "prepared publish tarball changed before upload".into(),
+            ));
+        }
+        file.as_file_mut()
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(LpmError::Io)?;
+        let mut bytes = Vec::with_capacity(self.len);
+        file.as_file_mut()
+            .take(self.len as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(LpmError::Io)?;
+        if bytes.len() != self.len {
+            return Err(LpmError::Registry(
+                "prepared publish tarball changed while being read".into(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_archive_bytes(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -682,12 +722,59 @@ impl<W: std::io::Write> std::io::Write for ArchiveSizeWriter<W> {
     }
 }
 
-type PublishGzipEncoder = flate2::write::GzEncoder<ArchiveSizeWriter<Vec<u8>>>;
-type PublishTarBuilder<'a> = tar::Builder<ArchiveSizeWriter<&'a mut PublishGzipEncoder>>;
+struct HashingWriter<W> {
+    inner: W,
+    sha1: sha1::Sha1,
+    sha512: sha2::Sha512,
+    written: u64,
+}
+
+impl<W> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        use sha1::Digest as _;
+
+        Self {
+            inner,
+            sha1: sha1::Sha1::new(),
+            sha512: sha2::Sha512::new(),
+            written: 0,
+        }
+    }
+
+    fn finish(self) -> (W, TarballHashes, u64) {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        use sha1::Digest as _;
+
+        let hashes = TarballHashes {
+            shasum: format!("{:x}", self.sha1.finalize()),
+            integrity: format!("sha512-{}", BASE64.encode(self.sha512.finalize())),
+        };
+        (self.inner, hashes, self.written)
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        use sha1::Digest as _;
+
+        let written = self.inner.write(buffer)?;
+        self.sha1.update(&buffer[..written]);
+        self.sha512.update(&buffer[..written]);
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+type PublishGzipEncoder<W> = flate2::write::GzEncoder<ArchiveSizeWriter<W>>;
+type PublishTarBuilder<'a, W> = tar::Builder<ArchiveSizeWriter<&'a mut PublishGzipEncoder<W>>>;
 
 fn write_gzipped_tar<T>(
     max_archive_bytes: u64,
-    write_entries: impl FnOnce(&mut PublishTarBuilder<'_>) -> Result<T, LpmError>,
+    write_entries: impl FnOnce(&mut PublishTarBuilder<'_, Vec<u8>>) -> Result<T, LpmError>,
 ) -> Result<(Vec<u8>, T), LpmError> {
     write_gzipped_tar_with_limits(
         max_archive_bytes,
@@ -699,9 +786,26 @@ fn write_gzipped_tar<T>(
 fn write_gzipped_tar_with_limits<T>(
     max_archive_bytes: u64,
     max_compressed_bytes: u64,
-    write_entries: impl FnOnce(&mut PublishTarBuilder<'_>) -> Result<T, LpmError>,
+    write_entries: impl FnOnce(&mut PublishTarBuilder<'_, Vec<u8>>) -> Result<T, LpmError>,
 ) -> Result<(Vec<u8>, T), LpmError> {
-    let compressed = ArchiveSizeWriter::gzip(Vec::with_capacity(64 * 1024), max_compressed_bytes);
+    write_gzipped_tar_to(
+        Vec::with_capacity(64 * 1024),
+        max_archive_bytes,
+        max_compressed_bytes,
+        write_entries,
+    )
+}
+
+fn write_gzipped_tar_to<W, T>(
+    output: W,
+    max_archive_bytes: u64,
+    max_compressed_bytes: u64,
+    write_entries: impl FnOnce(&mut PublishTarBuilder<'_, W>) -> Result<T, LpmError>,
+) -> Result<(W, T), LpmError>
+where
+    W: std::io::Write,
+{
+    let compressed = ArchiveSizeWriter::gzip(output, max_compressed_bytes);
     let mut encoder = flate2::write::GzEncoder::new(compressed, flate2::Compression::default());
     let result = {
         let limited = ArchiveSizeWriter::tar(&mut encoder, max_archive_bytes);
@@ -2394,10 +2498,7 @@ pub fn rewrite_tarball_name(
 ) -> Result<Vec<u8>, LpmError> {
     let rewritten =
         rewrite_tarball_name_for_publish(tarball_data, original_name, target_name, false)?;
-    Ok(rewritten.map_or_else(
-        || tarball_data.to_vec(),
-        |tarball| tarball.data.as_ref().clone(),
-    ))
+    rewritten.map_or_else(|| Ok(tarball_data.to_vec()), |tarball| tarball.read_data())
 }
 
 pub(crate) fn rewrite_tarball_name_for_publish(
@@ -2417,64 +2518,75 @@ pub(crate) fn rewrite_tarball_name_for_publish(
     let mut secret_scan_budget =
         scan_secrets.then(lpm_security::behavioral::secrets::SecretScanBudget::for_operation);
     let mut package_json_size = None;
-    let (gzipped, ()) = write_gzipped_tar(MAX_UNCOMPRESSED_TARBALL_BYTES, |builder| {
-        lpm_extractor::visit_tar_archive(
-            GzDecoder::new(tarball_data),
-            publish_tar_read_limits(),
-            |mut entry| {
-                let path = entry.path().to_string_lossy().to_string();
+    let temporary = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
+    let output = HashingWriter::new(temporary);
+    let (output, ()) = write_gzipped_tar_to(
+        output,
+        MAX_UNCOMPRESSED_TARBALL_BYTES,
+        MAX_COMPRESSED_TARBALL_BYTES,
+        |builder| {
+            lpm_extractor::visit_tar_archive(
+                GzDecoder::new(tarball_data),
+                publish_tar_read_limits(),
+                |mut entry| {
+                    let path = entry.path().to_string_lossy().to_string();
 
-                let mut content = Vec::new();
-                entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+                    let mut content = Vec::new();
+                    entry.read_to_end(&mut content).map_err(LpmError::Io)?;
 
-                if path == "package/package.json" {
-                    let mut pkg =
+                    if path == "package/package.json" {
+                        let mut pkg =
                     serde_json::from_slice::<serde_json::Value>(&content).map_err(|error| {
                         LpmError::Registry(format!(
                             "failed to parse package.json while preparing target tarball: {error}"
                         ))
                     })?;
-                    pkg["name"] = serde_json::json!(target_name);
-                    content = serde_json::to_vec_pretty(&pkg).map_err(|error| {
-                        LpmError::Registry(format!(
-                            "failed to serialize package.json for target {target_name}: {error}"
-                        ))
-                    })?;
-                    package_json_size = Some(content.len() as u64);
-                }
+                        pkg["name"] = serde_json::json!(target_name);
+                        content = serde_json::to_vec_pretty(&pkg).map_err(|error| {
+                            LpmError::Registry(format!(
+                                "failed to serialize package.json for target {target_name}: {error}"
+                            ))
+                        })?;
+                        package_json_size = Some(content.len() as u64);
+                    }
 
-                let mut header = tar::Header::new_gnu();
-                header.set_size(content.len() as u64);
-                header.set_mode(entry.header().mode().unwrap_or(0o644));
-                header.set_cksum();
-                builder
-                    .append_data(&mut header, &path, content.as_slice())
-                    .map_err(LpmError::Io)?;
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(content.len() as u64);
+                    header.set_mode(entry.header().mode().unwrap_or(0o644));
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, &path, content.as_slice())
+                        .map_err(LpmError::Io)?;
 
-                if let Some((scan, budget)) = secret_scan.as_mut().zip(secret_scan_budget.as_mut())
-                {
-                    let scan_path = path.strip_prefix("package/").unwrap_or(&path);
-                    let mut file_scan =
-                        lpm_security::behavioral::secrets::scan_file_content_with_budget(
-                            &content, scan_path, budget,
-                        );
-                    ensure_publish_secret_scan_complete(&file_scan)?;
-                    scan.matches.append(&mut file_scan.matches);
-                    scan.files_scanned += file_scan.files_scanned;
-                }
-                Ok(std::ops::ControlFlow::<()>::Continue(()))
-            },
-        )?;
-        Ok(())
-    })?;
+                    if let Some((scan, budget)) =
+                        secret_scan.as_mut().zip(secret_scan_budget.as_mut())
+                    {
+                        let scan_path = path.strip_prefix("package/").unwrap_or(&path);
+                        let mut file_scan =
+                            lpm_security::behavioral::secrets::scan_file_content_with_budget(
+                                &content, scan_path, budget,
+                            );
+                        ensure_publish_secret_scan_complete(&file_scan)?;
+                        scan.matches.append(&mut file_scan.matches);
+                        scan.files_scanned += file_scan.files_scanned;
+                    }
+                    Ok(std::ops::ControlFlow::<()>::Continue(()))
+                },
+            )?;
+            Ok(())
+        },
+    )?;
     let package_json_size = package_json_size.ok_or_else(|| {
         LpmError::Registry("publish tarball is missing package/package.json".into())
     })?;
 
-    let hashes = std::sync::Arc::new(compute_hashes(&gzipped));
+    let (file, hashes, len) = output.finish();
+    let len = usize::try_from(len)
+        .map_err(|_| LpmError::Registry("prepared publish tarball is too large".into()))?;
     Ok(Some(RewrittenTarball {
-        data: std::sync::Arc::new(gzipped),
-        hashes,
+        file: std::sync::Mutex::new(file),
+        len,
+        hashes: std::sync::Arc::new(hashes),
         package_json_size,
         secret_scan,
     }))

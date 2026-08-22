@@ -1174,6 +1174,8 @@ async fn execute_prepared_inner(
                         lpm_version_data["_npmProvenanceAttestations"] = bundle_json;
                     }
 
+                    let lpm_tarball_data = lpm_tarball.read_data()?;
+
                     let upload_spinner = if json_output {
                         None
                     } else {
@@ -1184,7 +1186,7 @@ async fn execute_prepared_inner(
                         lpm_name,
                         &version,
                         &readme,
-                        lpm_tarball.data,
+                        &lpm_tarball_data,
                         &tarball_files,
                         lpm_tarball.package_json_size,
                         &lpm_version_data,
@@ -1412,22 +1414,21 @@ async fn execute_prepared_inner(
                         || auth::is_otp_required(registry_key_for_otp);
 
                     let target_key = target.key();
+                    let final_tarball = target_tarball(
+                        npm_name_str,
+                        &name,
+                        &tarball_data,
+                        &tarball_hashes,
+                        &rewritten_tarballs,
+                    )?;
                     let target_artifact =
                         if let Some(artifact) = precomputed_npm_artifacts.remove(&target_key) {
                             artifact
                         } else {
-                            let final_tarball = target_tarball(
-                                npm_name_str,
-                                &name,
-                                &tarball_data,
-                                &tarball_hashes,
-                                &rewritten_tarballs,
-                            )?;
                             prepare_npm_target_artifact(NpmTargetArtifactInput {
                                 npm_name: npm_name_str,
                                 version: &version,
                                 base_version_data: &version_data,
-                                final_tarball_data: std::sync::Arc::clone(final_tarball.data),
                                 final_tarball_hashes: std::sync::Arc::clone(final_tarball.hashes),
                                 provenance_context: provenance_context.as_ref(),
                                 target_label: display,
@@ -1435,6 +1436,7 @@ async fn execute_prepared_inner(
                             })
                             .await?
                         };
+                    let final_tarball_data = final_tarball.read_data()?;
 
                     let upload_spinner = if json_output {
                         None
@@ -1446,7 +1448,7 @@ async fn execute_prepared_inner(
                         npm_name_str,
                         &version,
                         &target_artifact.version_data,
-                        &target_artifact.tarball_data,
+                        &final_tarball_data,
                         &target_artifact.tarball_hashes,
                         target_artifact.provenance_attachment.as_ref(),
                         npm_access,
@@ -1688,16 +1690,31 @@ fn prepare_rewritten_target_tarballs(
                 "target tarball rewrite was skipped for renamed package {target_name}"
             ))
         })?;
-        validate_publish_tarball_size(rewritten.data.len())?;
+        validate_publish_tarball_size(rewritten.len())?;
         rewritten_tarballs.insert(target_name.clone(), rewritten);
     }
     Ok(rewritten_tarballs)
 }
 
+#[derive(Clone, Copy)]
+enum TargetTarballData<'a> {
+    Base(&'a std::sync::Arc<Vec<u8>>),
+    Rewritten(&'a publish_common::RewrittenTarball),
+}
+
 struct TargetTarball<'a> {
-    data: &'a std::sync::Arc<Vec<u8>>,
+    data: TargetTarballData<'a>,
     hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
     package_json_size: Option<u64>,
+}
+
+impl TargetTarball<'_> {
+    fn read_data(&self) -> Result<std::sync::Arc<Vec<u8>>, LpmError> {
+        match self.data {
+            TargetTarballData::Base(data) => Ok(std::sync::Arc::clone(data)),
+            TargetTarballData::Rewritten(tarball) => tarball.read_data().map(std::sync::Arc::new),
+        }
+    }
 }
 
 fn target_tarball<'a>(
@@ -1709,7 +1726,7 @@ fn target_tarball<'a>(
 ) -> Result<TargetTarball<'a>, LpmError> {
     if target_name == package_json_name {
         return Ok(TargetTarball {
-            data: base_tarball_data,
+            data: TargetTarballData::Base(base_tarball_data),
             hashes: base_tarball_hashes,
             package_json_size: None,
         });
@@ -1717,7 +1734,7 @@ fn target_tarball<'a>(
     rewritten_tarballs
         .get(target_name)
         .map(|tarball| TargetTarball {
-            data: &tarball.data,
+            data: TargetTarballData::Rewritten(tarball),
             hashes: &tarball.hashes,
             package_json_size: Some(tarball.package_json_size),
         })
@@ -1782,7 +1799,6 @@ async fn precompute_file_provenance_artifacts(
             npm_name,
             version: input.version,
             base_version_data: input.version_data,
-            final_tarball_data: std::sync::Arc::clone(tarball.data),
             final_tarball_hashes: std::sync::Arc::clone(tarball.hashes),
             provenance_context: Some(&provenance),
             target_label: target.display_name(),
@@ -2068,5 +2084,80 @@ mod transaction_root_tests {
             result.is_err() && std::fs::read_dir(&outside).unwrap().next().is_none(),
             "a linked state directory must not receive publish lock files: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rewritten_tarball_tests {
+    use super::{HashMap, PublishTarget, prepare_rewritten_target_tarballs};
+    use std::io::Write as _;
+
+    fn package_tarball(name: &str) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let manifest = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", manifest.as_bytes())
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        encoder.flush().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn rewritten_target_tarballs_keep_no_archive_bytes_resident() {
+        let targets = [PublishTarget::Npm, PublishTarget::GitHub];
+        let target_names = HashMap::from([
+            ("npm".to_string(), "npm-name".to_string()),
+            ("github".to_string(), "@owner/github-name".to_string()),
+        ]);
+        let base = package_tarball("source-name");
+
+        let rewritten =
+            prepare_rewritten_target_tarballs(&targets, &target_names, "source-name", &base, false)
+                .unwrap();
+        let resident_bytes: usize = rewritten
+            .values()
+            .map(crate::commands::publish_common::RewrittenTarball::resident_archive_bytes)
+            .sum();
+
+        assert_eq!(resident_bytes, 0);
+    }
+
+    #[test]
+    fn file_backed_rewritten_tarball_hashes_match_staged_bytes() {
+        let targets = [PublishTarget::Npm];
+        let target_names = HashMap::from([("npm".to_string(), "target-name".to_string())]);
+        let base = package_tarball("source-name");
+        let rewritten =
+            prepare_rewritten_target_tarballs(&targets, &target_names, "source-name", &base, false)
+                .unwrap();
+        let tarball = &rewritten["target-name"];
+
+        let data = tarball.read_data().unwrap();
+
+        assert_eq!(
+            crate::commands::publish_common::compute_hashes(&data),
+            *tarball.hashes
+        );
+    }
+
+    #[test]
+    fn file_backed_rewritten_tarball_can_be_read_more_than_once() {
+        let targets = [PublishTarget::Npm];
+        let target_names = HashMap::from([("npm".to_string(), "target-name".to_string())]);
+        let base = package_tarball("source-name");
+        let rewritten =
+            prepare_rewritten_target_tarballs(&targets, &target_names, "source-name", &base, false)
+                .unwrap();
+        let tarball = &rewritten["target-name"];
+
+        assert_eq!(tarball.read_data().unwrap(), tarball.read_data().unwrap());
     }
 }
