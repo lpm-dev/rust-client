@@ -6,7 +6,7 @@ expression: envelope
   "$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json",
   "bomFormat": "CycloneDX",
   "specVersion": "1.7",
-  "serialNumber": "urn:uuid:9c26e496-514e-5ce2-a779-c75e2512d629",
+  "serialNumber": "urn:uuid:49b4c271-a0db-5ef8-a5fd-7aacc638f4d1",
   "version": 1,
   "metadata": {
     "timestamp": "[TIMESTAMP]",
@@ -47,7 +47,7 @@ expression: envelope
   "components": [
     {
       "type": "library",
-      "bom-ref": "lpm:component:ansi-regex@5.0.1:edef7430b6f189df",
+      "bom-ref": "lpm:component:ansi-regex@5.0.1:4bbc21cead1c1707",
       "name": "ansi-regex",
       "version": "5.0.1",
       "purl": "pkg:npm/ansi-regex@5.0.1",
@@ -78,7 +78,7 @@ expression: envelope
     },
     {
       "type": "library",
-      "bom-ref": "lpm:component:left-pad@1.3.0:1cb6d62314202788",
+      "bom-ref": "lpm:component:left-pad@1.3.0:a0e6fe5594bb5737",
       "name": "left-pad",
       "version": "1.3.0",
       "purl": "pkg:npm/left-pad@1.3.0",
@@ -148,17 +148,17 @@ expression: envelope
     {
       "ref": "lpm:root",
       "dependsOn": [
-        "lpm:component:left-pad@1.3.0:1cb6d62314202788"
+        "lpm:component:left-pad@1.3.0:a0e6fe5594bb5737"
       ]
     },
     {
-      "ref": "lpm:component:ansi-regex@5.0.1:edef7430b6f189df",
+      "ref": "lpm:component:ansi-regex@5.0.1:4bbc21cead1c1707",
       "dependsOn": []
     },
     {
-      "ref": "lpm:component:left-pad@1.3.0:1cb6d62314202788",
+      "ref": "lpm:component:left-pad@1.3.0:a0e6fe5594bb5737",
       "dependsOn": [
-        "lpm:component:ansi-regex@5.0.1:edef7430b6f189df"
+        "lpm:component:ansi-regex@5.0.1:4bbc21cead1c1707"
       ]
     }
   ]

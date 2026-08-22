@@ -5,6 +5,37 @@ mod support;
 use support::{
     TempProject, installed_manifest_dependency_graph, lpm, workspace_projection_project,
 };
+use wiremock::matchers::{method, path, path_regex};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
+
+#[derive(Clone)]
+struct RecordDelayedSbomMetadataStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for RecordDelayedSbomMetadataStart {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record SBOM metadata request start")
+            .push(std::time::Instant::now());
+        let name = request
+            .url
+            .path()
+            .strip_prefix("/api/registry/")
+            .unwrap_or_default();
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" }
+                }
+            }))
+    }
+}
 
 #[tokio::test]
 async fn sbom_resolves_hoisted_and_isolated_transitives_with_distinct_versions() {
@@ -149,6 +180,535 @@ fn seed_project() -> TempProject {
         }"#,
     );
     project
+}
+
+fn contextual_sbom_project() -> TempProject {
+    const SOURCE: &str = "registry+https://registry.npmjs.org";
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "contextual-sbom",
+            "version": "1.0.0",
+            "dependencies": {
+                "parent-a": "1.0.0",
+                "parent-b": "1.0.0"
+            }
+        }"#,
+    );
+    let shared_a = lpm_common::PackageInstanceId::derive("shared", "1.0.0", SOURCE, "a");
+    let shared_b = lpm_common::PackageInstanceId::derive("shared", "1.0.0", SOURCE, "b");
+    let parent_a = lpm_common::PackageInstanceId::derive("parent-a", "1.0.0", SOURCE, "root-a");
+    let parent_b = lpm_common::PackageInstanceId::derive("parent-b", "1.0.0", SOURCE, "root-b");
+
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(parent_a),
+        name: "parent-a".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(SOURCE.to_string()),
+        dependencies: vec!["shared@1.0.0".to_string()],
+        dependency_targets: [("shared".to_string(), shared_a)].into(),
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(parent_b),
+        name: "parent-b".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(SOURCE.to_string()),
+        dependencies: vec!["shared@1.0.0".to_string()],
+        dependency_targets: [("shared".to_string(), shared_b)].into(),
+        ..Default::default()
+    });
+    for instance_id in [shared_a, shared_b] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: "shared".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(SOURCE.to_string()),
+            ..Default::default()
+        });
+    }
+    for (local_name, package, instance_id) in [
+        ("parent-a", "parent-a", parent_a),
+        ("parent-b", "parent-b", parent_b),
+    ] {
+        lockfile.root_resolutions.insert(
+            local_name.to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: package.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(SOURCE.to_string()),
+            },
+        );
+    }
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write contextual SBOM lockfile");
+    for name in ["parent-a", "parent-b", "shared"] {
+        project.write_file(
+            &format!("node_modules/{name}/package.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        );
+    }
+    project
+}
+
+fn component_reference(document: &serde_json::Value, name: &str) -> String {
+    document["components"]
+        .as_array()
+        .expect("CycloneDX components")
+        .iter()
+        .find(|component| component["name"] == name)
+        .and_then(|component| component["bom-ref"].as_str())
+        .unwrap_or_else(|| panic!("missing component reference for {name}"))
+        .to_string()
+}
+
+fn dependency_targets(document: &serde_json::Value, reference: &str) -> Vec<String> {
+    document["dependencies"]
+        .as_array()
+        .expect("CycloneDX dependencies")
+        .iter()
+        .find(|dependency| dependency["ref"] == reference)
+        .and_then(|dependency| dependency["dependsOn"].as_array())
+        .unwrap_or_else(|| panic!("missing dependency entry for {reference}"))
+        .iter()
+        .map(|target| {
+            target
+                .as_str()
+                .expect("dependency target string")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn sbom_cyclonedx_preserves_contextual_instances_and_exact_edges() {
+    let project = contextual_sbom_project();
+
+    let output = lpm(&project).args(["sbom"]).output().expect("run SBOM");
+    assert!(
+        output.status.success(),
+        "contextual CycloneDX generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CycloneDX JSON");
+    let shared_refs = document["components"]
+        .as_array()
+        .expect("CycloneDX components")
+        .iter()
+        .filter(|component| component["name"] == "shared")
+        .map(|component| {
+            component["bom-ref"]
+                .as_str()
+                .expect("shared bom-ref")
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let parent_a = component_reference(&document, "parent-a");
+    let parent_b = component_reference(&document, "parent-b");
+    let parent_a_targets = dependency_targets(&document, &parent_a);
+    let parent_b_targets = dependency_targets(&document, &parent_b);
+
+    assert_eq!(
+        shared_refs.len(),
+        2,
+        "contextual instances need unique bom-ref values"
+    );
+    assert_eq!(parent_a_targets.len(), 1);
+    assert_eq!(parent_b_targets.len(), 1);
+    assert_ne!(
+        parent_a_targets, parent_b_targets,
+        "each parent must retain its exact contextual target"
+    );
+}
+
+#[test]
+fn sbom_spdx_preserves_contextual_package_ids_and_exact_edges() {
+    let project = contextual_sbom_project();
+
+    let output = lpm(&project)
+        .args(["sbom", "--format", "spdx"])
+        .output()
+        .expect("run SPDX SBOM");
+    assert!(
+        output.status.success(),
+        "contextual SPDX generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("SPDX JSON");
+    let shared_ids = document["packages"]
+        .as_array()
+        .expect("SPDX packages")
+        .iter()
+        .filter(|package| package["name"] == "shared")
+        .map(|package| {
+            package["SPDXID"]
+                .as_str()
+                .expect("shared SPDXID")
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let parent_edges = document["relationships"]
+        .as_array()
+        .expect("SPDX relationships")
+        .iter()
+        .filter(|relationship| relationship["relationshipType"] == "DEPENDS_ON")
+        .filter_map(|relationship| {
+            let source = relationship["spdxElementId"].as_str()?;
+            let target = relationship["relatedSpdxElement"].as_str()?;
+            source.contains("parent-").then(|| target.to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        shared_ids.len(),
+        2,
+        "contextual instances need unique SPDX IDs"
+    );
+    assert_eq!(
+        parent_edges.len(),
+        2,
+        "each parent must retain its exact contextual SPDX target"
+    );
+}
+
+#[test]
+fn sbom_propagates_optional_and_development_scopes_to_transitive_dependencies() {
+    const SOURCE: &str = "registry+https://registry.npmjs.org";
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "scope-sbom",
+            "version": "1.0.0",
+            "optionalDependencies": { "optional-root": "1.0.0" },
+            "devDependencies": { "dev-root": "1.0.0" }
+        }"#,
+    );
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for (index, (name, dependency)) in [
+        ("optional-root", Some("optional-child")),
+        ("optional-child", None),
+        ("dev-root", Some("dev-child")),
+        ("dev-child", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let instance_id =
+            lpm_common::PackageInstanceId::derive(name, "1.0.0", SOURCE, &format!("scope/{index}"));
+        let dependency_targets = dependency
+            .map(|target| {
+                let target_index = if target == "optional-child" { 1 } else { 3 };
+                [(
+                    target.to_string(),
+                    lpm_common::PackageInstanceId::derive(
+                        target,
+                        "1.0.0",
+                        SOURCE,
+                        &format!("scope/{target_index}"),
+                    ),
+                )]
+                .into()
+            })
+            .unwrap_or_default();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(SOURCE.to_string()),
+            dependencies: dependency
+                .map(|target| vec![format!("{target}@1.0.0")])
+                .unwrap_or_default(),
+            dependency_targets,
+            ..Default::default()
+        });
+        if matches!(name, "optional-root" | "dev-root") {
+            lockfile.root_resolutions.insert(
+                name.to_string(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(instance_id),
+                    package: name.to_string(),
+                    version: "1.0.0".to_string(),
+                    source: Some(SOURCE.to_string()),
+                },
+            );
+        }
+        project.write_file(
+            &format!("node_modules/{name}/package.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        );
+    }
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write scope SBOM lockfile");
+
+    let output = lpm(&project).args(["sbom"]).output().expect("run SBOM");
+    assert!(
+        output.status.success(),
+        "scope CycloneDX generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CycloneDX JSON");
+    let scope = |name: &str| {
+        document["components"]
+            .as_array()
+            .expect("CycloneDX components")
+            .iter()
+            .find(|component| component["name"] == name)
+            .and_then(|component| component["scope"].as_str())
+            .unwrap_or_else(|| panic!("missing scope for {name}"))
+    };
+
+    assert_eq!(scope("optional-child"), "optional");
+    assert_eq!(scope("dev-child"), "excluded");
+}
+
+#[tokio::test]
+async fn sbom_registry_metadata_rejects_a_response_that_omits_the_locked_version() {
+    const PACKAGE: &str = "@lpm.dev/sbom.metadata";
+    const SOURCE: &str = "registry+https://lpm.dev";
+
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"registry-sbom","version":"1.0.0","dependencies":{{"{PACKAGE}":"1.0.0"}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: PACKAGE.to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(SOURCE.to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(PACKAGE, PACKAGE, "1.0.0")]);
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write registry SBOM lockfile");
+    project.write_file(
+        "node_modules/@lpm.dev/sbom.metadata/package.json",
+        &format!(r#"{{"name":"{PACKAGE}","version":"1.0.0"}}"#),
+    );
+    let registry = support::mock_registry::MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/sbom.metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE,
+            "dist-tags": {"latest": "2.0.0"},
+            "versions": {
+                "2.0.0": {"name": PACKAGE, "version": "2.0.0"}
+            }
+        })))
+        .mount(registry.server())
+        .await;
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            &registry.url(),
+            "--insecure",
+            "sbom",
+            "--registry-metadata",
+        ])
+        .output()
+        .expect("run registry-enriched SBOM");
+
+    assert!(
+        !output.status.success(),
+        "explicit registry enrichment must fail when locked metadata is absent"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not include locked version 1.0.0"),
+        "missing-version failure must identify the locked version: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sbom_registry_metadata_propagates_fetch_failures() {
+    const PACKAGE: &str = "@lpm.dev/sbom.fetch-failure";
+    const SOURCE: &str = "registry+https://lpm.dev";
+
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"registry-sbom","version":"1.0.0","dependencies":{{"{PACKAGE}":"1.0.0"}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: PACKAGE.to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(SOURCE.to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(PACKAGE, PACKAGE, "1.0.0")]);
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write registry SBOM lockfile");
+    project.write_file(
+        "node_modules/@lpm.dev/sbom.fetch-failure/package.json",
+        &format!(r#"{{"name":"{PACKAGE}","version":"1.0.0"}}"#),
+    );
+    let registry = support::mock_registry::MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/sbom.fetch-failure"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(registry.server())
+        .await;
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            &registry.url(),
+            "--insecure",
+            "sbom",
+            "--registry-metadata",
+        ])
+        .output()
+        .expect("run registry-enriched SBOM");
+
+    assert!(
+        !output.status.success(),
+        "explicit registry enrichment must propagate registry failures"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to fetch registry metadata"),
+        "registry failure must retain enrichment context: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sbom_fetches_independent_registry_metadata_concurrently() {
+    const SOURCE: &str = "registry+https://lpm.dev";
+    const PACKAGE_COUNT: usize = 8;
+
+    let dependencies = (0..PACKAGE_COUNT)
+        .map(|index| format!(r#""@lpm.dev/sbom.concurrent-{index}":"1.0.0""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"concurrent-sbom","version":"1.0.0","dependencies":{{{dependencies}}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("@lpm.dev/sbom.concurrent-{index}");
+        let instance_id =
+            lpm_common::PackageInstanceId::derive(&name, "1.0.0", SOURCE, "sbom/root");
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: name.clone(),
+            version: "1.0.0".to_string(),
+            source: Some(SOURCE.to_string()),
+            ..Default::default()
+        });
+        lockfile.root_resolutions.insert(
+            name.clone(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(instance_id),
+                package: name.clone(),
+                version: "1.0.0".to_string(),
+                source: Some(SOURCE.to_string()),
+            },
+        );
+        project.write_file(
+            &format!("node_modules/{name}/package.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        );
+    }
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write concurrent SBOM lockfile");
+
+    let registry = support::mock_registry::MockRegistry::start().await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/registry/@lpm\.dev/sbom\.concurrent-[0-7]$",
+        ))
+        .respond_with(RecordDelayedSbomMetadataStart {
+            starts: starts.clone(),
+            delay: std::time::Duration::from_millis(200),
+        })
+        .mount(registry.server())
+        .await;
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            &registry.url(),
+            "--insecure",
+            "sbom",
+            "--registry-metadata",
+        ])
+        .output()
+        .expect("run registry-enriched SBOM");
+    assert!(
+        output.status.success(),
+        "concurrent SBOM enrichment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let starts = starts.lock().expect("read SBOM request starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let spread = starts
+        .iter()
+        .max()
+        .expect("latest request")
+        .duration_since(*starts.iter().min().expect("earliest request"));
+    assert!(
+        spread < std::time::Duration::from_millis(400),
+        "independent metadata requests started too far apart: {spread:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sbom_output_rejects_a_final_symlink_without_overwriting_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let project = seed_project();
+    let outside = tempfile::tempdir().expect("create external SBOM directory");
+    let sentinel = outside.path().join("sentinel.json");
+    std::fs::write(&sentinel, "sentinel").expect("write external sentinel");
+    symlink(&sentinel, project.path().join("bom.json")).expect("link SBOM output");
+
+    let output = lpm(&project)
+        .args(["sbom", "--output", "bom.json"])
+        .output()
+        .expect("run SBOM with linked output");
+
+    assert!(
+        !output.status.success(),
+        "linked SBOM output must be rejected"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sentinel).expect("read external sentinel"),
+        "sentinel"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sbom_output_rejects_a_symlinked_parent_without_writing_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = seed_project();
+    let outside = tempfile::tempdir().expect("create external SBOM directory");
+    symlink(outside.path(), project.path().join("reports")).expect("link SBOM output parent");
+
+    let output = lpm(&project)
+        .args(["sbom", "--output", "reports/bom.json"])
+        .output()
+        .expect("run SBOM with linked output parent");
+
+    assert!(
+        !output.status.success(),
+        "linked SBOM output parent must be rejected"
+    );
+    assert!(
+        !outside.path().join("bom.json").exists(),
+        "SBOM must not be written through a linked parent"
+    );
 }
 
 #[test]
