@@ -24,6 +24,72 @@ pub struct WorkspaceMember {
     pub package: PackageJson,
 }
 
+#[derive(Deserialize)]
+struct WorkspacePackageName {
+    name: Option<String>,
+}
+
+struct WorkspaceMemberScan {
+    member_paths: Vec<PathBuf>,
+    directory_paths: Vec<PathBuf>,
+}
+
+struct WorkspaceGenerationEntry {
+    relative_path: PathBuf,
+    directory: bool,
+    metadata: WorkspaceMetadataGeneration,
+}
+
+#[derive(PartialEq, Eq)]
+struct WorkspaceMetadataGeneration {
+    len: u64,
+    modified: cap_std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    creation_time: u64,
+    #[cfg(windows)]
+    attributes: u32,
+}
+
+/// An opaque filesystem generation captured for release-publish revalidation.
+pub struct PublishWorkspaceGeneration {
+    root_package: PackageJson,
+    inclusions: Vec<WorkspaceGlob>,
+    exclusions: Vec<WorkspaceGlob>,
+    entries: Vec<WorkspaceGenerationEntry>,
+}
+
+/// Cached workspace state used to construct one release-publish projection.
+pub struct PublishProjectionContext<'a> {
+    member_paths_by_name: &'a HashMap<String, PathBuf>,
+    member_paths: &'a [PathBuf],
+    generation: &'a PublishWorkspaceGeneration,
+    validate_generation: bool,
+}
+
+impl<'a> PublishProjectionContext<'a> {
+    pub fn new(
+        member_paths_by_name: &'a HashMap<String, PathBuf>,
+        member_paths: &'a [PathBuf],
+        generation: &'a PublishWorkspaceGeneration,
+        validate_generation: bool,
+    ) -> Self {
+        Self {
+            member_paths_by_name,
+            member_paths,
+            generation,
+            validate_generation,
+        }
+    }
+}
+
 pub struct OpenWorkspaceRoot {
     path: PathBuf,
     directory: cap_std::fs::Dir,
@@ -126,6 +192,293 @@ pub fn discover_workspace_from_open_root(
     } else {
         Ok(None)
     }
+}
+
+pub fn read_publish_projection_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    project_path: &Path,
+    project_package_json: &str,
+    context: &PublishProjectionContext<'_>,
+) -> Result<Workspace, WorkspaceError> {
+    let refreshed_root;
+    let refreshed_globs;
+    let (root_package, inclusions, exclusions) =
+        if !context.validate_generation || context.generation.is_current(root_dir)? {
+            (
+                &context.generation.root_package,
+                context.generation.inclusions.as_slice(),
+                context.generation.exclusions.as_slice(),
+            )
+        } else {
+            let (root_package, pnpm_workspace) =
+                read_workspace_root_from_open_dir(root_path, root_dir)?;
+            let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+            refreshed_root = root_package;
+            refreshed_globs = compile_workspace_globs(root_path, &globs)?;
+            let current_member_scan = discover_member_paths_from_open_root(
+                root_path,
+                root_dir,
+                &refreshed_globs.0,
+                &refreshed_globs.1,
+            )?;
+            validate_publish_workspace_names_from_open_root(
+                root_path,
+                root_dir,
+                &refreshed_root,
+                &current_member_scan.member_paths,
+                Some((project_path, project_package_json)),
+                context.member_paths_by_name,
+                context.member_paths,
+            )?;
+            (
+                &refreshed_root,
+                refreshed_globs.0.as_slice(),
+                refreshed_globs.1.as_slice(),
+            )
+        };
+    if inclusions.is_empty()
+        || !compiled_workspace_globs_include_project(
+            project_path,
+            root_path,
+            inclusions,
+            exclusions,
+        )?
+    {
+        return Err(WorkspaceError::Parse(format!(
+            "workspace member {} is no longer selected by {}",
+            project_path.display(),
+            root_path.display()
+        )));
+    }
+    let project_package =
+        serde_json::from_str::<PackageJson>(lpm_common::strip_utf8_bom_str(project_package_json))
+            .map_err(|error| {
+            WorkspaceError::Parse(format!(
+                "failed to parse {}: {error}",
+                project_path.join("package.json").display()
+            ))
+        })?;
+    let dependency_sections = [
+        &project_package.dependencies,
+        &project_package.dev_dependencies,
+        &project_package.peer_dependencies,
+        &project_package.optional_dependencies,
+    ];
+    let referenced_names = dependency_sections
+        .into_iter()
+        .flat_map(|dependencies| dependencies.iter())
+        .filter_map(|(name, _)| {
+            context
+                .member_paths_by_name
+                .contains_key(name)
+                .then_some(name)
+        });
+    let mut seen_paths = HashSet::with_capacity(context.member_paths_by_name.len().min(8));
+    seen_paths.insert(project_path);
+    let mut members = Vec::with_capacity(1 + referenced_names.size_hint().0);
+    for name in referenced_names {
+        let Some(member_path) = context.member_paths_by_name.get(name) else {
+            continue;
+        };
+        if !seen_paths.insert(member_path.as_path()) {
+            continue;
+        }
+        if !compiled_workspace_globs_include_project(
+            member_path,
+            root_path,
+            inclusions,
+            exclusions,
+        )? {
+            return Err(WorkspaceError::Parse(format!(
+                "workspace dependency {} is no longer selected by {}",
+                member_path.display(),
+                root_path.display()
+            )));
+        }
+        let relative = member_path.strip_prefix(root_path).map_err(|_| {
+            WorkspaceError::Parse(format!(
+                "workspace dependency {} is outside {}",
+                member_path.display(),
+                root_path.display()
+            ))
+        })?;
+        let directory = open_relative_directory(root_dir, relative)?.ok_or_else(|| {
+            WorkspaceError::NotFound(member_path.join("package.json").display().to_string())
+        })?;
+        let package = read_package_json_from_open_dir(
+            &directory,
+            Path::new("package.json"),
+            &member_path.join("package.json"),
+        )?;
+        members.push(WorkspaceMember {
+            path: member_path.clone(),
+            package,
+        });
+    }
+    members.push(WorkspaceMember {
+        path: project_path.to_path_buf(),
+        package: project_package,
+    });
+
+    Ok(Workspace {
+        root: root_path.to_path_buf(),
+        root_package: root_package.clone(),
+        members,
+    })
+}
+
+/// Capture the workspace member and configuration generation used by release publishing.
+pub fn capture_publish_workspace_generation_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    expected_paths_by_name: &HashMap<String, PathBuf>,
+    expected_member_paths: &[PathBuf],
+) -> Result<PublishWorkspaceGeneration, WorkspaceError> {
+    let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, root_dir)?;
+    let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+    let (inclusions, exclusions) = compile_workspace_globs(root_path, &globs)?;
+    let member_scan =
+        discover_member_paths_from_open_root(root_path, root_dir, &inclusions, &exclusions)?;
+    validate_publish_workspace_names_from_open_root(
+        root_path,
+        root_dir,
+        &root_package,
+        &member_scan.member_paths,
+        None,
+        expected_paths_by_name,
+        expected_member_paths,
+    )?;
+
+    let mut directory_paths = member_scan.directory_paths;
+    directory_paths.push(PathBuf::new());
+    directory_paths.sort_unstable();
+    directory_paths.dedup();
+    let mut entries =
+        Vec::with_capacity(directory_paths.len() + member_scan.member_paths.len() + 2);
+    for relative_path in directory_paths {
+        entries.push(capture_workspace_generation_entry(
+            root_dir,
+            relative_path,
+            true,
+        )?);
+    }
+    entries.push(capture_workspace_generation_entry(
+        root_dir,
+        PathBuf::from("package.json"),
+        false,
+    )?);
+    if root_dir.symlink_metadata("pnpm-workspace.yaml").is_ok() {
+        entries.push(capture_workspace_generation_entry(
+            root_dir,
+            PathBuf::from("pnpm-workspace.yaml"),
+            false,
+        )?);
+    }
+    for relative_path in member_scan.member_paths {
+        entries.push(capture_workspace_generation_entry(
+            root_dir,
+            relative_path.join("package.json"),
+            false,
+        )?);
+    }
+    Ok(PublishWorkspaceGeneration {
+        root_package,
+        inclusions,
+        exclusions,
+        entries,
+    })
+}
+
+impl PublishWorkspaceGeneration {
+    fn is_current(&self, root_dir: &cap_std::fs::Dir) -> Result<bool, WorkspaceError> {
+        for expected in &self.entries {
+            let Some(metadata) = workspace_generation_metadata(root_dir, &expected.relative_path)?
+            else {
+                return Ok(false);
+            };
+            if metadata.is_dir() != expected.directory
+                || metadata_is_link_or_reparse(&metadata)
+                || workspace_metadata_generation(&metadata, &expected.relative_path)?
+                    != expected.metadata
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+fn capture_workspace_generation_entry(
+    root_dir: &cap_std::fs::Dir,
+    relative_path: PathBuf,
+    directory: bool,
+) -> Result<WorkspaceGenerationEntry, WorkspaceError> {
+    let metadata = workspace_generation_metadata(root_dir, &relative_path)?
+        .ok_or_else(|| WorkspaceError::NotFound(relative_path.display().to_string()))?;
+    if metadata.is_dir() != directory || metadata_is_link_or_reparse(&metadata) {
+        return Err(WorkspaceError::Io(format!(
+            "workspace generation path {} changed type",
+            relative_path.display()
+        )));
+    }
+    let generation = workspace_metadata_generation(&metadata, &relative_path)?;
+    Ok(WorkspaceGenerationEntry {
+        relative_path,
+        directory,
+        metadata: generation,
+    })
+}
+
+fn workspace_generation_metadata(
+    root_dir: &cap_std::fs::Dir,
+    relative_path: &Path,
+) -> Result<Option<cap_std::fs::Metadata>, WorkspaceError> {
+    let result = if relative_path.as_os_str().is_empty() {
+        root_dir.dir_metadata()
+    } else {
+        root_dir.symlink_metadata(relative_path)
+    };
+    match result {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(WorkspaceError::Io(format!(
+            "failed to inspect workspace generation path {}: {error}",
+            relative_path.display()
+        ))),
+    }
+}
+
+fn workspace_metadata_generation(
+    metadata: &cap_std::fs::Metadata,
+    relative_path: &Path,
+) -> Result<WorkspaceMetadataGeneration, WorkspaceError> {
+    let modified = metadata.modified().map_err(|error| {
+        WorkspaceError::Io(format!(
+            "failed to inspect workspace generation for {}: {error}",
+            relative_path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    use cap_std::fs::MetadataExt as _;
+    #[cfg(windows)]
+    use cap_std::fs::MetadataExt as _;
+    Ok(WorkspaceMetadataGeneration {
+        len: metadata.len(),
+        modified,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+        #[cfg(windows)]
+        creation_time: metadata.creation_time(),
+        #[cfg(windows)]
+        attributes: metadata.file_attributes(),
+    })
 }
 
 /// Find the applicable workspace root without reading or retaining member manifests.
@@ -241,6 +594,32 @@ fn workspace_globs_include_project(
     root: &Path,
     globs: &[String],
 ) -> Result<bool, WorkspaceError> {
+    let (inclusions, exclusions) = compile_workspace_globs(root, globs)?;
+    compiled_workspace_globs_include_project(project, root, &inclusions, &exclusions)
+}
+
+fn compile_workspace_globs(
+    root: &Path,
+    globs: &[String],
+) -> Result<(Vec<WorkspaceGlob>, Vec<WorkspaceGlob>), WorkspaceError> {
+    let mut inclusions = Vec::with_capacity(globs.len());
+    let mut exclusions = Vec::new();
+    for raw in globs {
+        if let Some(excluded) = raw.strip_prefix('!') {
+            exclusions.push(WorkspaceGlob::compile(root, excluded)?);
+        } else {
+            inclusions.push(WorkspaceGlob::compile(root, raw)?);
+        }
+    }
+    Ok((inclusions, exclusions))
+}
+
+fn compiled_workspace_globs_include_project(
+    project: &Path,
+    root: &Path,
+    inclusions: &[WorkspaceGlob],
+    exclusions: &[WorkspaceGlob],
+) -> Result<bool, WorkspaceError> {
     let relative = project.strip_prefix(root).map_err(|_| {
         WorkspaceError::Parse(format!(
             "workspace candidate {} is outside {}",
@@ -248,16 +627,12 @@ fn workspace_globs_include_project(
             root.display()
         ))
     })?;
-    let mut included = false;
-    let mut excluded = false;
-    for raw in globs {
-        if let Some(raw) = raw.strip_prefix('!') {
-            excluded |= WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
-        } else {
-            included |= WorkspaceGlob::compile(root, raw)?.matches_relative_directory(relative);
-        }
-    }
-    Ok(included && !excluded)
+    Ok(inclusions
+        .iter()
+        .any(|glob| glob.matches_relative_directory(relative))
+        && !exclusions
+            .iter()
+            .any(|glob| glob.matches_relative_directory(relative)))
 }
 
 fn start_belongs_to_workspace(
@@ -333,6 +708,131 @@ fn validate_unique_package_names(
         "duplicate workspace package names are not allowed: {}",
         conflicts.join("; ")
     )))
+}
+
+fn validate_publish_workspace_names_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    root_package: &PackageJson,
+    current_member_paths: &[PathBuf],
+    current_project: Option<(&Path, &str)>,
+    expected_paths_by_name: &HashMap<String, PathBuf>,
+    expected_member_paths: &[PathBuf],
+) -> Result<(), WorkspaceError> {
+    let expected_relative_paths = expected_member_paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(root_path)
+                .map(Path::to_path_buf)
+                .map_err(|_| {
+                    WorkspaceError::Parse(format!(
+                        "workspace member {} is outside {}",
+                        path.display(),
+                        root_path.display()
+                    ))
+                })
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let current_relative_paths = current_member_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if current_relative_paths != expected_relative_paths {
+        return Err(WorkspaceError::Parse(
+            "workspace member set changed after release publish preflight; retry the command"
+                .into(),
+        ));
+    }
+
+    let mut expected_names_by_path = HashMap::with_capacity(expected_paths_by_name.len());
+    for (name, path) in expected_paths_by_name {
+        expected_names_by_path.insert(path.as_path(), name.as_str());
+    }
+    let mut paths_by_name = std::collections::BTreeMap::<String, Vec<PathBuf>>::new();
+    if let Some(name) = root_package.name.as_ref() {
+        paths_by_name
+            .entry(name.clone())
+            .or_default()
+            .push(root_path.to_path_buf());
+    }
+    let mut renamed_member = None;
+    for relative in current_member_paths {
+        let path = root_path.join(relative);
+        let name = if let Some((_, project_package_json)) =
+            current_project.filter(|(project_path, _)| path == *project_path)
+        {
+            serde_json::from_str::<WorkspacePackageName>(lpm_common::strip_utf8_bom_str(
+                project_package_json,
+            ))
+            .map(|package| package.name)
+            .map_err(|error| {
+                WorkspaceError::Parse(format!(
+                    "failed to parse {}: {error}",
+                    path.join("package.json").display()
+                ))
+            })?
+        } else {
+            let directory = open_relative_directory(root_dir, relative)?.ok_or_else(|| {
+                WorkspaceError::NotFound(path.join("package.json").display().to_string())
+            })?;
+            read_workspace_package_name_from_open_dir(&directory, &path.join("package.json"))?
+        };
+        let expected_name = expected_names_by_path.get(path.as_path()).copied();
+        if name.as_deref() != expected_name && renamed_member.is_none() {
+            renamed_member = Some(path.clone());
+        }
+        if let Some(name) = name {
+            paths_by_name.entry(name).or_default().push(path);
+        }
+    }
+    let conflicts = paths_by_name
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(name, mut paths)| {
+            paths.sort_unstable();
+            let paths = paths
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name:?}: {paths}")
+        })
+        .collect::<Vec<_>>();
+    if conflicts.is_empty() {
+        if let Some(path) = renamed_member {
+            return Err(WorkspaceError::Parse(format!(
+                "workspace package name changed for {}; retry the command",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    Err(WorkspaceError::Parse(format!(
+        "duplicate workspace package names are not allowed: {}",
+        conflicts.join("; ")
+    )))
+}
+
+fn read_workspace_package_name_from_open_dir(
+    directory: &cap_std::fs::Dir,
+    display_path: &Path,
+) -> Result<Option<String>, WorkspaceError> {
+    let content = read_text_from_open_dir(
+        directory,
+        Path::new("package.json"),
+        display_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        false,
+    )?
+    .ok_or_else(|| WorkspaceError::NotFound(display_path.display().to_string()))?;
+    serde_json::from_str::<WorkspacePackageName>(lpm_common::strip_utf8_bom_str(&content))
+        .map(|package| package.name)
+        .map_err(|error| {
+            WorkspaceError::Parse(format!(
+                "failed to parse {}: {error}",
+                display_path.display()
+            ))
+        })
 }
 
 fn workspace_member_globs(
@@ -756,16 +1256,33 @@ fn discover_members_from_open_root(
     root_dir: &cap_std::fs::Dir,
     globs: &[String],
 ) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
-    let mut inclusions = Vec::new();
-    let mut exclusions = Vec::new();
-    for raw in globs {
-        if let Some(excluded) = raw.strip_prefix('!') {
-            exclusions.push(WorkspaceGlob::compile(root_path, excluded)?);
-        } else {
-            inclusions.push(WorkspaceGlob::compile(root_path, raw)?);
-        }
+    let (inclusions, exclusions) = compile_workspace_globs(root_path, globs)?;
+    let member_scan =
+        discover_member_paths_from_open_root(root_path, root_dir, &inclusions, &exclusions)?;
+    let mut members = Vec::with_capacity(member_scan.member_paths.len());
+    for relative in member_scan.member_paths {
+        let directory = open_relative_directory(root_dir, &relative)?.ok_or_else(|| {
+            WorkspaceError::NotFound(root_path.join(&relative).display().to_string())
+        })?;
+        let display_path = root_path.join(&relative).join("package.json");
+        let package =
+            read_package_json_from_open_dir(&directory, Path::new("package.json"), &display_path)?;
+        members.push(WorkspaceMember {
+            path: root_path.join(relative),
+            package,
+        });
     }
-    let mut members = std::collections::BTreeMap::new();
+    Ok(members)
+}
+
+fn discover_member_paths_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    inclusions: &[WorkspaceGlob],
+    exclusions: &[WorkspaceGlob],
+) -> Result<WorkspaceMemberScan, WorkspaceError> {
+    let mut members = std::collections::BTreeSet::new();
+    let mut directories = std::collections::BTreeSet::new();
     let match_options = glob::MatchOptions {
         case_sensitive: true,
         require_literal_separator: true,
@@ -791,29 +1308,32 @@ fn discover_members_from_open_root(
             let Some(directory) = open_relative_directory(root_dir, &relative)? else {
                 continue;
             };
+            directories.insert(relative.clone());
             if inclusion.matches_directory(&relative, match_options)
                 && !exclusions
                     .iter()
                     .any(|exclusion| exclusion.matches_relative_directory(&relative))
-                && !members.contains_key(&relative)
             {
                 let display_path = root_path.join(&relative).join("package.json");
-                match read_package_json_from_open_dir(
-                    &directory,
-                    Path::new("package.json"),
-                    &display_path,
-                ) {
-                    Ok(package) => {
-                        members.insert(
-                            relative.clone(),
-                            WorkspaceMember {
-                                path: root_path.join(&relative),
-                                package,
-                            },
-                        );
+                match directory.symlink_metadata("package.json") {
+                    Ok(metadata)
+                        if metadata.is_file() && !metadata_is_link_or_reparse(&metadata) =>
+                    {
+                        members.insert(relative.clone());
                     }
-                    Err(WorkspaceError::NotFound(_)) => {}
-                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        return Err(WorkspaceError::Io(format!(
+                            "workspace manifest {} is not a safe regular file",
+                            display_path.display()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(WorkspaceError::Io(format!(
+                            "failed to inspect {}: {error}",
+                            display_path.display()
+                        )));
+                    }
                 }
             }
             if inclusion
@@ -854,7 +1374,10 @@ fn discover_members_from_open_root(
             }
         }
     }
-    Ok(members.into_values().collect())
+    Ok(WorkspaceMemberScan {
+        member_paths: members.into_iter().collect(),
+        directory_paths: directories.into_iter().collect(),
+    })
 }
 
 fn open_relative_directory(

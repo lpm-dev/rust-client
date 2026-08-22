@@ -23,6 +23,9 @@
 
 use lpm_common::LpmError;
 
+const REGISTRY_OIDC_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+const REGISTRY_OIDC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Result of an OIDC token exchange against the LPM registry.
 #[derive(Debug, Clone)]
 pub struct OidcToken {
@@ -375,16 +378,104 @@ pub async fn exchange_publish_oidc_token(
     .await
 }
 
+pub(crate) fn build_registry_oidc_exchange_client() -> Result<reqwest::Client, LpmError> {
+    build_registry_oidc_exchange_client_with_timeout(REGISTRY_OIDC_TIMEOUT)
+}
+
+pub(crate) async fn exchange_publish_oidc_token_with_client_and_jwt(
+    client: &reqwest::Client,
+    registry_url: &str,
+    package_name: &str,
+    provider_jwt: &str,
+    publication_wait_timeout: Option<std::time::Duration>,
+) -> Result<OidcToken, LpmError> {
+    validate_registry_exchange_url(registry_url)?;
+    exchange_oidc_token_request_with_resolved_jwt(
+        client,
+        registry_url,
+        Some(package_name),
+        "publish",
+        publication_wait_timeout,
+        provider_jwt,
+    )
+    .await
+}
+
 async fn exchange_oidc_token_request(
     registry_url: &str,
     package_name: Option<&str>,
     scope: &str,
     publication_wait_timeout: Option<std::time::Duration>,
 ) -> Result<OidcToken, LpmError> {
+    exchange_oidc_token_request_with_timeout(
+        registry_url,
+        package_name,
+        scope,
+        publication_wait_timeout,
+        REGISTRY_OIDC_TIMEOUT,
+    )
+    .await
+}
+
+async fn exchange_oidc_token_request_with_timeout(
+    registry_url: &str,
+    package_name: Option<&str>,
+    scope: &str,
+    publication_wait_timeout: Option<std::time::Duration>,
+    request_timeout: std::time::Duration,
+) -> Result<OidcToken, LpmError> {
+    let client = build_registry_oidc_exchange_client_with_timeout(request_timeout)?;
+    exchange_oidc_token_request_with_client(
+        &client,
+        registry_url,
+        package_name,
+        scope,
+        publication_wait_timeout,
+    )
+    .await
+}
+
+fn build_registry_oidc_exchange_client_with_timeout(
+    request_timeout: std::time::Duration,
+) -> Result<reqwest::Client, LpmError> {
+    lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(request_timeout)
+        .build()
+        .map_err(|error| LpmError::Registry(format!("OIDC client build failed: {error}")))
+}
+
+async fn exchange_oidc_token_request_with_client(
+    client: &reqwest::Client,
+    registry_url: &str,
+    package_name: Option<&str>,
+    scope: &str,
+    publication_wait_timeout: Option<std::time::Duration>,
+) -> Result<OidcToken, LpmError> {
+    validate_registry_exchange_url(registry_url)?;
     let jwt = resolve_registry_exchange_jwt().await?;
 
+    exchange_oidc_token_request_with_resolved_jwt(
+        client,
+        registry_url,
+        package_name,
+        scope,
+        publication_wait_timeout,
+        &jwt,
+    )
+    .await
+}
+
+async fn exchange_oidc_token_request_with_resolved_jwt(
+    client: &reqwest::Client,
+    registry_url: &str,
+    package_name: Option<&str>,
+    scope: &str,
+    publication_wait_timeout: Option<std::time::Duration>,
+    provider_jwt: &str,
+) -> Result<OidcToken, LpmError> {
     let url = format!("{}/api/registry/-/token/oidc?scope={}", registry_url, scope);
-    let mut body = serde_json::json!({ "token": jwt });
+    let mut body = serde_json::json!({ "token": provider_jwt });
     if let Some(pkg) = package_name {
         body["package"] = serde_json::json!(pkg);
     }
@@ -392,9 +483,6 @@ async fn exchange_oidc_token_request(
         body["publicationWaitTimeoutSeconds"] = serde_json::json!(timeout.as_secs());
     }
 
-    let client = lpm_http::client_builder()
-        .build()
-        .map_err(|error| LpmError::Registry(format!("OIDC client build failed: {error}")))?;
     let response = client
         .post(&url)
         .json(&body)
@@ -407,20 +495,17 @@ async fn exchange_oidc_token_request(
             ))
         })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "unknown".to_string());
+    let status = response.status();
+    let body = lpm_http::read_body_capped(response, REGISTRY_OIDC_RESPONSE_MAX_BYTES)
+        .await
+        .map_err(|error| LpmError::Registry(format!("OIDC exchange response {error}")))?;
+    if !status.is_success() {
         return Err(LpmError::Registry(format!(
-            "OIDC exchange failed ({status}): {text}"
+            "OIDC exchange failed with HTTP {status}"
         )));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
+    let result: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| LpmError::Registry(format!("OIDC response parse error: {e}")))?;
 
     let token = result
@@ -454,6 +539,21 @@ async fn exchange_oidc_token_request(
         expires_at,
         publication_status,
     })
+}
+
+pub(crate) fn validate_registry_exchange_url(registry_url: &str) -> Result<(), LpmError> {
+    let parsed = reqwest::Url::parse(registry_url)
+        .map_err(|error| LpmError::Registry(format!("OIDC registry URL is invalid: {error}")))?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+    if scheme == "https"
+        || (scheme == "http" && parsed.host_str().is_some_and(url_host_is_loopback))
+    {
+        return Ok(());
+    }
+    Err(LpmError::Registry(format!(
+        "OIDC registry URL refused: only https:// or loopback http:// is accepted, got scheme={scheme} host={host}",
+    )))
 }
 
 fn parse_optional_oidc_timestamp(
@@ -514,6 +614,8 @@ mod tests {
     use super::*;
     use crate::test_env::ScopedEnv;
     use std::ffi::OsString;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Env vars we touch across these tests. Cleared at the start of each scope
     /// so leftover state from the surrounding shell can't leak in.
@@ -718,6 +820,128 @@ mod tests {
         assert!(
             msg.contains("aud: https://lpm.dev"),
             "error must document the GitLab audience: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_oidc_exchange_rejects_plain_http_non_loopback_before_network() {
+        let _environment = scoped(&[("LPM_OIDC_TOKEN", "registry-jwt-must-not-be-sent")]);
+
+        let error = exchange_oidc_token_request_with_timeout(
+            "http://192.0.2.1:4873",
+            Some("@lpm.dev/acme.package"),
+            "publish",
+            None,
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect_err("cleartext non-loopback exchange must be rejected")
+        .to_string();
+
+        assert!(
+            error.contains("refused") && error.contains("http"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_oidc_exchange_does_not_forward_jwt_across_origins() {
+        let jwt = "registry-jwt-must-stay-at-source";
+        let _environment = scoped(&[("LPM_OIDC_TOKEN", jwt)]);
+        let source = MockServer::start().await;
+        let sink = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/stolen"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "attacker-selected-token"
+            })))
+            .expect(0)
+            .mount(&sink)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/oidc"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/stolen", sink.uri())),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+
+        let result =
+            exchange_publish_oidc_token(&source.uri(), "@lpm.dev/acme.package", None).await;
+
+        assert!(result.is_err(), "OIDC exchange followed a redirect");
+        sink.verify().await;
+    }
+
+    #[tokio::test]
+    async fn registry_oidc_exchange_rejects_oversized_success_responses() {
+        let _environment = scoped(&[("LPM_OIDC_TOKEN", "registry-jwt")]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/oidc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 65 * 1024]))
+            .mount(&server)
+            .await;
+
+        let error = exchange_publish_oidc_token(&server.uri(), "@lpm.dev/acme.package", None)
+            .await
+            .expect_err("oversized OIDC response must fail")
+            .to_string();
+
+        assert!(error.contains("exceeds"), "wrong size error: {error}");
+    }
+
+    #[tokio::test]
+    async fn registry_oidc_exchange_error_does_not_echo_the_submitted_jwt() {
+        let jwt = "registry-jwt-must-not-appear-in-errors";
+        let _environment = scoped(&[("LPM_OIDC_TOKEN", jwt)]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/oidc"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(format!("invalid token: {jwt}")),
+            )
+            .mount(&server)
+            .await;
+
+        let error = exchange_publish_oidc_token(&server.uri(), "@lpm.dev/acme.package", None)
+            .await
+            .expect_err("rejected OIDC exchange must fail")
+            .to_string();
+
+        assert!(!error.contains(jwt), "OIDC error exposed the JWT: {error}");
+    }
+
+    #[tokio::test]
+    async fn registry_oidc_exchange_bounds_the_complete_request_time() {
+        let _environment = scoped(&[("LPM_OIDC_TOKEN", "registry-jwt")]);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/oidc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({"token": "too-late"})),
+            )
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let result = exchange_oidc_token_request_with_timeout(
+            &server.uri(),
+            Some("@lpm.dev/acme.package"),
+            "publish",
+            None,
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "OIDC request ignored its timeout",
         );
     }
 

@@ -10,13 +10,182 @@ use crate::commands::web_auth;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::NpmPublishConfig;
+use serde::de::{DeserializeSeed as _, IgnoredAny, MapAccess, Visitor};
 use std::time::Duration;
 
 const NPM_PUBLISH_RESPONSE_MAX_BYTES: usize = 10 * 1024 * 1024;
 const NPM_METADATA_RESPONSE_MAX_BYTES: usize = 100 * 1024 * 1024;
+const NPM_VERSION_DOCUMENT_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
+const NPM_PUBLISH_CLIENT_BUILD_MARKER_ENV: &str =
+    "LPM_INTERNAL_TEST_NPM_PUBLISH_CLIENT_BUILD_MARKER";
 
 /// Default npm registry URL.
 pub(crate) const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NpmPublishVersionPreflight {
+    Available,
+    AlreadyPublished,
+}
+
+#[derive(serde::Deserialize)]
+struct NpmPublishVersionSummary {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    deprecated: Option<serde_json::Value>,
+}
+
+struct NpmPublishPackumentEvaluation {
+    name: String,
+    requested_version: Option<Option<NpmPublishVersionSummary>>,
+    highest_stable_version: Option<lpm_semver::Version>,
+}
+
+struct NpmPublishPackumentSeed<'a> {
+    requested_version: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for NpmPublishPackumentSeed<'_> {
+    type Value = NpmPublishPackumentEvaluation;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(NpmPublishPackumentVisitor {
+            requested_version: self.requested_version,
+        })
+    }
+}
+
+struct NpmPublishPackumentVisitor<'a> {
+    requested_version: &'a str,
+}
+
+impl<'de> Visitor<'de> for NpmPublishPackumentVisitor<'_> {
+    type Value = NpmPublishPackumentEvaluation;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an npm packument object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut name = None;
+        let mut versions = None;
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(serde::de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value()?);
+                }
+                "versions" => {
+                    if versions.is_some() {
+                        return Err(serde::de::Error::duplicate_field("versions"));
+                    }
+                    versions = Some(map.next_value_seed(NpmPublishVersionsSeed {
+                        requested_version: self.requested_version,
+                    })?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let name = name.ok_or_else(|| serde::de::Error::missing_field("name"))?;
+        let versions = versions.ok_or_else(|| serde::de::Error::missing_field("versions"))?;
+        Ok(NpmPublishPackumentEvaluation {
+            name,
+            requested_version: versions.requested_version,
+            highest_stable_version: versions.highest_stable_version,
+        })
+    }
+}
+
+struct NpmPublishVersionsSeed<'a> {
+    requested_version: &'a str,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for NpmPublishVersionsSeed<'_> {
+    type Value = NpmPublishVersionsEvaluation;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(NpmPublishVersionsVisitor {
+            requested_version: self.requested_version,
+        })
+    }
+}
+
+struct NpmPublishVersionsEvaluation {
+    requested_version: Option<Option<NpmPublishVersionSummary>>,
+    highest_stable_version: Option<lpm_semver::Version>,
+}
+
+struct NpmPublishVersionsVisitor<'a> {
+    requested_version: &'a str,
+}
+
+impl<'de> Visitor<'de> for NpmPublishVersionsVisitor<'_> {
+    type Value = NpmPublishVersionsEvaluation;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an npm versions object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut requested_version = None;
+        let mut highest_stable_version = None;
+        while let Some(published_version) = map.next_key::<String>()? {
+            let summary = map.next_value::<Option<NpmPublishVersionSummary>>()?;
+            if published_version == self.requested_version {
+                if requested_version.is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate npm version entry {published_version}"
+                    )));
+                }
+                requested_version = Some(summary);
+                continue;
+            }
+            let is_deprecated = summary
+                .as_ref()
+                .and_then(|data| data.deprecated.as_ref())
+                .is_some_and(serde_json::Value::is_string);
+            if is_deprecated {
+                continue;
+            }
+            let Ok(version) = lpm_semver::Version::parse(&published_version) else {
+                continue;
+            };
+            if version.is_prerelease() {
+                continue;
+            }
+            if highest_stable_version
+                .as_ref()
+                .is_none_or(|highest| version > *highest)
+            {
+                highest_stable_version = Some(version);
+            }
+        }
+        Ok(NpmPublishVersionsEvaluation {
+            requested_version,
+            highest_stable_version,
+        })
+    }
+}
 
 /// Result of a single registry publish attempt.
 #[derive(Debug)]
@@ -293,13 +462,25 @@ pub fn resolve_npm_tag(npm_config: Option<&NpmPublishConfig>) -> String {
         .to_string()
 }
 
-pub(crate) async fn preflight_npm_publish_version(
+pub(crate) fn build_npm_publish_preflight_client() -> Result<reqwest::Client, LpmError> {
+    lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(60))
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
+        .build()
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to create npm metadata client: {error}"))
+        })
+}
+
+pub(crate) async fn preflight_npm_publish_version_with_client(
+    client: &reqwest::Client,
     token: &str,
     npm_name: &str,
     version: &str,
     tag_explicit: bool,
     registry_url: &str,
-) -> Result<(), LpmError> {
+) -> Result<NpmPublishVersionPreflight, LpmError> {
     let current = lpm_semver::Version::parse(version)?;
     if current.is_prerelease() && !tag_explicit {
         return Err(LpmError::Registry(
@@ -307,23 +488,23 @@ pub(crate) async fn preflight_npm_publish_version(
         ));
     }
 
-    assert!(
-        !token.starts_with("lpm_"),
-        "SECURITY: LPM token must never be sent to an npm-compatible registry"
-    );
-    let client = lpm_http::client_builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
-        .build()
-        .map_err(|error| {
-            LpmError::Registry(format!("failed to create npm metadata client: {error}"))
-        })?;
+    validate_npm_publish_credential(token)?;
+    validate_npm_registry_setting(registry_url, "npm publish preflight registry")?;
     let encoded_name = urlencoding::encode(npm_name);
-    let url = format!("{}/{encoded_name}", registry_url.trim_end_matches('/'));
+    let registry_url = registry_url.trim_end_matches('/');
+    let url = if tag_explicit {
+        let encoded_version = urlencoding::encode(version);
+        format!("{registry_url}/{encoded_name}/{encoded_version}")
+    } else {
+        format!("{registry_url}/{encoded_name}")
+    };
+    let accept = if tag_explicit {
+        "application/json"
+    } else {
+        "application/vnd.npm.install-v1+json"
+    };
     let response = web_auth::add_npm_web_auth_headers(
-        client
-            .get(url)
-            .header("accept", "application/vnd.npm.install-v1+json"),
+        client.get(url).header("accept", accept),
         web_auth::NPM_COMMAND_PUBLISH,
     )
     .bearer_auth(token)
@@ -337,9 +518,14 @@ pub(crate) async fn preflight_npm_publish_version(
     })?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(());
+        return Ok(NpmPublishVersionPreflight::Available);
     }
-    let body = lpm_http::read_body_capped(response, NPM_METADATA_RESPONSE_MAX_BYTES)
+    let response_cap = if tag_explicit {
+        NPM_VERSION_DOCUMENT_RESPONSE_MAX_BYTES
+    } else {
+        NPM_METADATA_RESPONSE_MAX_BYTES
+    };
+    let body = lpm_http::read_body_capped(response, response_cap)
         .await
         .map_err(|error| LpmError::Registry(format!("npm metadata preflight {error}")))?;
     if !status.is_success() {
@@ -347,13 +533,82 @@ pub(crate) async fn preflight_npm_publish_version(
             "npm metadata preflight failed with HTTP {status}"
         )));
     }
-    let metadata: serde_json::Value =
-        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body)).map_err(|error| {
+    let body = lpm_common::strip_utf8_bom_bytes(&body);
+    if tag_explicit {
+        let metadata: NpmPublishVersionSummary = serde_json::from_slice(body).map_err(|error| {
             LpmError::Registry(format!(
                 "npm metadata preflight returned invalid JSON: {error}"
             ))
         })?;
-    enforce_npm_version_policy(&metadata, npm_name, version, tag_explicit)
+        validate_npm_version_document_identity(&metadata, npm_name, version)?;
+        return Ok(NpmPublishVersionPreflight::AlreadyPublished);
+    }
+
+    let metadata = parse_npm_publish_packument(body, version).map_err(|error| {
+        LpmError::Registry(format!(
+            "npm metadata preflight returned invalid JSON: {error}"
+        ))
+    })?;
+    evaluate_npm_publish_packument(metadata, npm_name, version)
+}
+
+fn parse_npm_publish_packument(
+    body: &[u8],
+    requested_version: &str,
+) -> Result<NpmPublishPackumentEvaluation, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let metadata = NpmPublishPackumentSeed { requested_version }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(metadata)
+}
+
+fn evaluate_npm_publish_packument(
+    metadata: NpmPublishPackumentEvaluation,
+    npm_name: &str,
+    version: &str,
+) -> Result<NpmPublishVersionPreflight, LpmError> {
+    if metadata.name != npm_name {
+        return Err(unexpected_npm_metadata_identity(npm_name, &metadata.name));
+    }
+    if let Some(version_metadata) = metadata.requested_version {
+        let version_metadata = version_metadata.ok_or_else(|| {
+            LpmError::Registry(format!(
+                "npm metadata for {npm_name}@{version} contains an invalid version document"
+            ))
+        })?;
+        validate_npm_version_document_identity(&version_metadata, npm_name, version)?;
+        return Ok(NpmPublishVersionPreflight::AlreadyPublished);
+    }
+    reject_implicit_latest_downgrade(metadata.highest_stable_version.into_iter(), version)?;
+    Ok(NpmPublishVersionPreflight::Available)
+}
+
+fn validate_npm_publish_credential(token: &str) -> Result<(), LpmError> {
+    if token.starts_with("lpm_") {
+        return Err(LpmError::Registry(
+            "refusing an LPM credential for an npm-compatible registry".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn unexpected_npm_metadata_identity(expected: &str, actual: &str) -> LpmError {
+    LpmError::Registry(format!(
+        "npm metadata returned an unexpected package (expected '{expected}', received '{actual}')"
+    ))
+}
+
+fn validate_npm_version_document_identity(
+    metadata: &NpmPublishVersionSummary,
+    npm_name: &str,
+    version: &str,
+) -> Result<(), LpmError> {
+    if metadata.name.as_deref() != Some(npm_name) || metadata.version.as_deref() != Some(version) {
+        return Err(LpmError::Registry(format!(
+            "npm metadata returned an unexpected version identity for {npm_name}@{version}"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn enforce_npm_version_policy(
@@ -362,6 +617,13 @@ pub(crate) fn enforce_npm_version_policy(
     version: &str,
     tag_explicit: bool,
 ) -> Result<(), LpmError> {
+    let actual_name = metadata
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| LpmError::Registry("npm metadata is missing package identity".into()))?;
+    if actual_name != npm_name {
+        return Err(unexpected_npm_metadata_identity(npm_name, actual_name));
+    }
     let versions = metadata
         .get("versions")
         .and_then(serde_json::Value::as_object)
@@ -371,7 +633,18 @@ pub(crate) fn enforce_npm_version_policy(
             ))
         })?;
 
-    if versions.contains_key(version) {
+    if let Some(version_metadata) = versions.get(version) {
+        let actual_version_name = version_metadata
+            .get("name")
+            .and_then(serde_json::Value::as_str);
+        let actual_version = version_metadata
+            .get("version")
+            .and_then(serde_json::Value::as_str);
+        if actual_version_name != Some(npm_name) || actual_version != Some(version) {
+            return Err(LpmError::Registry(format!(
+                "npm metadata returned an unexpected version identity for {npm_name}@{version}"
+            )));
+        }
         return Err(LpmError::Registry(format!(
             "version {version} already exists on npm for {npm_name}"
         )));
@@ -387,25 +660,34 @@ pub(crate) fn enforce_npm_version_policy(
         return Ok(());
     }
 
-    let highest = versions
-        .iter()
-        .filter(|(_, data)| {
-            !data
-                .get("deprecated")
-                .is_some_and(serde_json::Value::is_string)
-        })
-        .filter_map(|(published_version, _)| lpm_semver::Version::parse(published_version).ok())
-        .filter(|published_version| !published_version.is_prerelease())
-        .max();
+    reject_implicit_latest_downgrade(
+        versions
+            .iter()
+            .filter(|(_, data)| {
+                !data
+                    .get("deprecated")
+                    .is_some_and(serde_json::Value::is_string)
+            })
+            .filter_map(|(published_version, _)| lpm_semver::Version::parse(published_version).ok())
+            .filter(|published_version| !published_version.is_prerelease()),
+        version,
+    )
+}
 
-    if let Some(highest) = highest
+fn reject_implicit_latest_downgrade(
+    published_versions: impl Iterator<Item = lpm_semver::Version>,
+    version: &str,
+) -> Result<(), LpmError> {
+    let current = lpm_semver::Version::parse(version)?;
+    if let Some(highest) = published_versions
+        .filter(|published_version| !published_version.is_prerelease())
+        .max()
         && highest >= current
     {
         return Err(LpmError::Registry(format!(
             "Cannot implicitly apply the \"latest\" tag because previously published version {highest} is higher than the new version {version}. Set publish.npm.tag, or use --tag with `lpm stage publish`."
         )));
     }
-
     Ok(())
 }
 
@@ -443,8 +725,55 @@ pub async fn publish_to_npm(
         json_output,
         yes,
         NpmPublishRuntime::production(),
+        None,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_to_npm_with_clients(
+    clients: &NpmPublishClients,
+    token: &str,
+    npm_name: &str,
+    version: &str,
+    version_data: &serde_json::Value,
+    tarball_data: &std::sync::Arc<Vec<u8>>,
+    tarball_hashes: &crate::commands::publish_common::TarballHashes,
+    provenance_attachment: Option<&NpmProvenanceAttachment>,
+    access: &str,
+    tag: &str,
+    registry_url: &str,
+    otp_preempt: bool,
+    json_output: bool,
+    yes: bool,
+) -> Result<NpmPublishResult, LpmError> {
+    publish_to_npm_impl(
+        token,
+        npm_name,
+        version,
+        version_data,
+        tarball_data,
+        tarball_hashes,
+        provenance_attachment,
+        access,
+        tag,
+        registry_url,
+        otp_preempt,
+        json_output,
+        yes,
+        NpmPublishRuntime::production(),
+        Some(clients),
+    )
+    .await
+}
+
+pub(crate) struct NpmPublishClients {
+    request: reqwest::Client,
+    web_auth: reqwest::Client,
+}
+
+pub(crate) fn build_npm_publish_clients() -> Result<NpmPublishClients, LpmError> {
+    build_npm_publish_clients_with_timeout(Duration::from_secs(600))
 }
 
 #[derive(Clone, Copy)]
@@ -495,14 +824,11 @@ async fn publish_to_npm_impl(
     json_output: bool,
     yes: bool,
     runtime: NpmPublishRuntime,
+    shared_clients: Option<&NpmPublishClients>,
 ) -> Result<NpmPublishResult, LpmError> {
     let start = std::time::Instant::now();
 
-    // S1: Credential isolation — assert no LPM token leaks to npm
-    assert!(
-        !token.starts_with("lpm_"),
-        "SECURITY: LPM token must never be sent to npm registry"
-    );
+    validate_npm_publish_credential(token)?;
 
     if !lpm_common::lpm_registry_url_is_accepted(registry_url) && !runtime.allow_http {
         return Err(LpmError::Registry(format!(
@@ -532,17 +858,15 @@ async fn publish_to_npm_impl(
     let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    let client = lpm_http::client_builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout)
-        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
-        .build()
-        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
-    let web_auth_client = lpm_http::client_builder()
-        .timeout(timeout)
-        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
-        .build()
-        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
+    let owned_clients;
+    let clients = if let Some(clients) = shared_clients {
+        clients
+    } else {
+        owned_clients = build_npm_publish_clients_with_timeout(timeout)?;
+        &owned_clients
+    };
+    let client = &clients.request;
+    let web_auth_client = &clients.web_auth;
 
     let encoded_name = urlencoding::encode(npm_name);
     let url = format!("{registry_url}/{encoded_name}");
@@ -557,12 +881,12 @@ async fn publish_to_npm_impl(
     }
 
     // First attempt
-    let mut req = npm_publish_request(&client, &url, &payload, token, timeout);
+    let mut req = npm_publish_request(client, &url, &payload, token, timeout);
     if let Some(code) = &otp_code {
         req = req.header("npm-otp", code);
     }
 
-    let response = execute_npm_publish_request(&client, req, &payload)
+    let response = execute_npm_publish_request(client, req, &payload)
         .await
         .map_err(|e| LpmError::Registry(format!("npm publish request failed: {e}")))?;
 
@@ -580,7 +904,7 @@ async fn publish_to_npm_impl(
             }
 
             let otp = web_auth::complete_web_auth_challenge(
-                &web_auth_client,
+                web_auth_client,
                 &challenge,
                 "publish",
                 json_output,
@@ -590,10 +914,10 @@ async fn publish_to_npm_impl(
             )
             .await?;
 
-            let retry_req = npm_publish_request(&client, &url, &payload, token, timeout)
-                .header("npm-otp", &otp);
+            let retry_req =
+                npm_publish_request(client, &url, &payload, token, timeout).header("npm-otp", &otp);
 
-            let retry_response = execute_npm_publish_request(&client, retry_req, &payload)
+            let retry_response = execute_npm_publish_request(client, retry_req, &payload)
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
@@ -616,10 +940,10 @@ async fn publish_to_npm_impl(
             let otp = prompt_npm_otp()?;
 
             // Retry with OTP header
-            let retry_req = npm_publish_request(&client, &url, &payload, token, timeout)
-                .header("npm-otp", &otp);
+            let retry_req =
+                npm_publish_request(client, &url, &payload, token, timeout).header("npm-otp", &otp);
 
-            let retry_response = execute_npm_publish_request(&client, retry_req, &payload)
+            let retry_response = execute_npm_publish_request(client, retry_req, &payload)
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
@@ -632,6 +956,33 @@ async fn publish_to_npm_impl(
     }
 
     handle_npm_response(response, npm_name, version, start).await
+}
+
+fn build_npm_publish_clients_with_timeout(
+    timeout: Duration,
+) -> Result<NpmPublishClients, LpmError> {
+    #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
+    if let Ok(path) = std::env::var(NPM_PUBLISH_CLIENT_BUILD_MARKER_ENV) {
+        use std::io::Write as _;
+        let mut marker = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(LpmError::Io)?;
+        writeln!(marker, "build").map_err(LpmError::Io)?;
+    }
+    let request = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
+    let web_auth = lpm_http::client_builder()
+        .timeout(timeout)
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
+    Ok(NpmPublishClients { request, web_auth })
 }
 
 fn npm_publish_request(
@@ -899,6 +1250,125 @@ mod tests {
         assert!(validate_npm_registry("http://registry.example.test/npm").is_err());
     }
 
+    #[tokio::test]
+    async fn publish_to_npm_rejects_an_lpm_credential_without_panicking() {
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
+
+        let error = publish_to_npm_impl(
+            "lpm_not_an_npm_token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            &tarball,
+            &hashes,
+            None,
+            "public",
+            "latest",
+            "http://127.0.0.1:9",
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+            None,
+        )
+        .await
+        .expect_err("an LPM credential must be rejected");
+
+        assert!(error.to_string().contains("refusing an LPM credential"));
+    }
+
+    #[tokio::test]
+    async fn explicit_tag_preflight_requests_an_exact_json_version_document() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plain-pkg/1.0.0"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "plain-pkg",
+                "version": "1.0.0"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = build_npm_publish_preflight_client().unwrap();
+
+        let outcome = preflight_npm_publish_version_with_client(
+            &client,
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            true,
+            &server.uri(),
+        )
+        .await
+        .expect("exact-version preflight must succeed");
+
+        assert_eq!(outcome, NpmPublishVersionPreflight::AlreadyPublished);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn implicit_tag_preflight_rejects_a_packument_without_versions() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "plain-pkg"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = build_npm_publish_preflight_client().unwrap();
+
+        let error = preflight_npm_publish_version_with_client(
+            &client,
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            false,
+            &server.uri(),
+        )
+        .await
+        .expect_err("a missing versions field must fail closed");
+
+        assert!(error.to_string().contains("versions"));
+        server.verify().await;
+    }
+
+    #[test]
+    fn implicit_packument_parser_retains_only_requested_and_highest_stable_versions() {
+        let metadata = parse_npm_publish_packument(
+            br#"{
+                "name":"plain-pkg",
+                "versions":{
+                    "1.0.0":{"name":"plain-pkg","version":"1.0.0"},
+                    "8.0.0":{"deprecated":"do not use"},
+                    "7.0.0-beta.1":{},
+                    "6.0.0":{},
+                    "invalid":{}
+                }
+            }"#,
+            "1.0.0",
+        )
+        .expect("parse compact npm packument evaluation");
+
+        assert_eq!(metadata.name, "plain-pkg");
+        let requested = metadata
+            .requested_version
+            .expect("requested version key")
+            .expect("requested version document");
+        assert_eq!(requested.name.as_deref(), Some("plain-pkg"));
+        assert_eq!(requested.version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            metadata
+                .highest_stable_version
+                .expect("highest stable version")
+                .to_string(),
+            "6.0.0"
+        );
+    }
+
     #[test]
     fn otp_header_detection() {
         use reqwest::header::HeaderMap;
@@ -944,6 +1414,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .expect("publish should succeed");
@@ -1005,6 +1476,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .expect("same-origin 307 should replay npm publish");
@@ -1081,6 +1553,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .expect("cross-origin 303 should complete without forwarding credentials");
@@ -1126,6 +1599,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .expect_err("oversized npm response must be rejected");
@@ -1163,6 +1637,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .expect("publish should succeed");
@@ -1224,6 +1699,7 @@ mod tests {
             false,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .expect("publish should complete after web-auth OTP retry");
@@ -1301,6 +1777,7 @@ mod tests {
             true,
             false,
             NpmPublishRuntime::test(),
+            None,
         )
         .await
         .unwrap_err();

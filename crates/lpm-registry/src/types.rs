@@ -946,7 +946,7 @@ pub struct PublishPreflightResponse {
     pub success: bool,
     pub name: String,
     pub version: String,
-    #[serde(default, rename = "packageExists")]
+    #[serde(rename = "packageExists")]
     pub package_exists: bool,
 }
 

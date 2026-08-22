@@ -2099,6 +2099,50 @@ async fn publish_npm_repo_configured_custom_registry_uses_registry_scoped_token(
 }
 
 #[tokio::test]
+async fn publish_npm_rejects_lpm_shaped_registry_tokens_without_panicking() {
+    let mock = MockRegistry::start().await;
+    let package = "lpm-shaped-token-package";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"{package}","version":"1.0.0","description":"token provenance test"}}"#
+    ));
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            "lpm_registry_scoped_but_unsafe",
+        ])
+        .output()
+        .expect("store LPM-shaped registry token");
+    assert!(login.status.success());
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("run publish with LPM-shaped registry token");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked at"),
+        "user-controlled token caused a panic: {stderr}",
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["results"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("refusing an LPM credential")),
+        "token rejection returned the wrong error: {envelope:#}",
+    );
+}
+
+#[tokio::test]
 async fn publish_npm_refuses_to_move_implicit_latest_to_a_lower_version() {
     let mock = MockRegistry::start().await;
     let package = "implicit-latest-downgrade";
@@ -2175,17 +2219,12 @@ async fn publish_npm_allows_a_lower_version_with_an_explicit_tag() {
     let mock = MockRegistry::start().await;
     let package = "explicit-maintenance-tag";
     Mock::given(method("GET"))
-        .and(path(format!("/{package}")))
+        .and(path(format!("/{package}/1.9.0")))
         .and(header(
             "authorization",
             format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
         ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "name": package,
-            "versions": {
-                "2.0.0": {"name": package, "version": "2.0.0"}
-            }
-        })))
+        .respond_with(ResponseTemplate::new(404))
         .expect(1)
         .mount(mock.server())
         .await;
