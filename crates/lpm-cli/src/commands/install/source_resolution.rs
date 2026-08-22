@@ -323,8 +323,11 @@ pub(super) fn prepare_install_routing_context(
     json_output: bool,
 ) -> Result<InstallRoutingContext, LpmError> {
     let setup_route_t = Instant::now();
-    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+    let mut route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    if let Some(overrides) = client.metadata_route_overrides() {
+        route_table = route_table.with_package_route_overrides(overrides);
+    }
     let setup_route_table_ms = setup_route_t.elapsed().as_millis();
 
     if !json_output {

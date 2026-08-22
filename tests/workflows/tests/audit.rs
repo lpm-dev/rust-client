@@ -11,7 +11,9 @@ use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json, make_tarball_with_files,
 };
-use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
+use support::{
+    TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry, lpm_with_registry_and_npm,
+};
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -111,6 +113,25 @@ fn run_audit_json(
         cmd.arg(arg);
     }
     cmd.output().expect("failed to spawn lpm audit --json")
+}
+
+fn run_audit_with_npm(
+    project: &TempProject,
+    mock: &MockRegistry,
+    extra_args: &[&str],
+    json: bool,
+) -> std::process::Output {
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+    let mut cmd = lpm_with_registry_and_npm(project, &mock.url());
+    cmd.env("LPM_OSV_URL", &osv_url);
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.arg("audit");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("failed to spawn lpm audit")
 }
 
 /// Mount `pkg@1.0.0` on the mock registry and install it into `project`.
@@ -251,7 +272,7 @@ async fn install_signature_fixture_project(
 
     mock.with_batch_metadata(batch).await;
 
-    lpm_with_registry(project, &mock.url())
+    lpm_with_registry_and_npm(project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -277,7 +298,7 @@ async fn audit_signatures_json_reports_verified_and_not_verified_packages() {
     let mock = MockRegistry::start().await;
     install_signature_fixture_project(&project, &mock, true).await;
 
-    let out = run_audit_json(&project, &mock, &["signatures"]);
+    let out = run_audit_with_npm(&project, &mock, &["signatures"], true);
     assert!(
         !out.status.success(),
         "audit signatures must exit non-zero when any registry package is not verified; \
@@ -333,7 +354,7 @@ async fn audit_signatures_human_reports_slim_summary_and_failed_rows() {
     let mock = MockRegistry::start().await;
     install_signature_fixture_project(&project, &mock, true).await;
 
-    let out = run_audit(&project, &mock, &["signatures"]);
+    let out = run_audit_with_npm(&project, &mock, &["signatures"], false);
     assert!(
         !out.status.success(),
         "audit signatures must exit non-zero when any registry package is not verified; \
@@ -368,7 +389,7 @@ async fn audit_signatures_verified_tree_exits_zero() {
     let mock = MockRegistry::start().await;
     install_signature_fixture_project(&project, &mock, false).await;
 
-    let out = run_audit(&project, &mock, &["signatures"]);
+    let out = run_audit_with_npm(&project, &mock, &["signatures"], false);
     assert!(
         out.status.success(),
         "audit signatures must exit zero when all registry packages verify; \

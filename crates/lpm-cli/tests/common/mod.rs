@@ -146,10 +146,12 @@ pub fn lpm_command_with_env(
         Some(url) => {
             command.env("LPM_REGISTRY_URL", url);
             command.env("LPM_NPM_ROUTE", "proxy");
+            command.env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", url);
         }
         None => {
             command.env_remove("LPM_REGISTRY_URL");
             command.env_remove("LPM_NPM_ROUTE");
+            command.env_remove("LPM_INTERNAL_TEST_NPM_REGISTRY_URL");
         }
     }
     for (key, value) in extra_env {
@@ -407,6 +409,11 @@ pub async fn mount_mock_registry(server: &MockServer, packages: &[MockPackage]) 
     for (name, metadata) in &metadata_map {
         Mock::given(method("GET"))
             .and(match_path(format!("/api/registry/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(match_path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
             .mount(server)
             .await;

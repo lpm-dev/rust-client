@@ -960,6 +960,12 @@ pub fn lpm_with_registry(project: &TempProject, registry_url: &str) -> assert_cm
     cmd
 }
 
+pub fn lpm_with_registry_and_npm(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
+    let mut cmd = lpm_with_registry(project, registry_url);
+    cmd.env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry_url);
+    cmd
+}
+
 /// Put a deterministic fake `node --version` at the front of `PATH`.
 pub fn configure_fake_node(
     command: &mut assert_cmd::Command,

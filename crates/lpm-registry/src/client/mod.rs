@@ -56,7 +56,9 @@ pub use self::url_gate::{
     GateDecision, evaluate_cached_url, is_http_url, is_https_url, is_localhost_url,
 };
 
-use self::auth::{apply_npmrc_auth, cert_pem_fingerprint, principal_fingerprint};
+use self::auth::{
+    apply_npmrc_auth, bearer_principal_fingerprint, cert_pem_fingerprint, principal_fingerprint,
+};
 use self::body::{
     MAX_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
     parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,

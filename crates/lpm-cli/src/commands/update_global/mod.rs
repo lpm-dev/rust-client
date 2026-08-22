@@ -41,13 +41,38 @@ use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
 };
 use crate::{install_ui, output};
+use futures::StreamExt;
 use lpm_common::color::Painted;
 use lpm_common::{
     LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock, with_exclusive_lock_async,
 };
-use lpm_global::{InstallReadyMarker, PackageSource, read_for, write_for, write_marker};
-use lpm_registry::RegistryClient;
+use lpm_global::{
+    GlobalManifest, InstallReadyMarker, PackageSource, read_for, write_for, write_marker,
+};
+use lpm_registry::{PackageMetadata, RegistryClient, UpstreamRoute};
 use lpm_semver::Version;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const GLOBAL_UPDATE_PLANNING_CONCURRENCY: usize = 4;
+
+fn update_failure_reason(error: &LpmError) -> String {
+    let LpmError::NotFound(detail) = error else {
+        return error.to_string();
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return "Not found".to_string();
+    }
+    if let Some(suffix) = detail.get("not found".len()..)
+        && detail
+            .get(.."not found".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("not found"))
+    {
+        return format!("Not found{suffix}");
+    }
+    format!("Not found: {detail}")
+}
 
 pub async fn run(
     client: &RegistryClient,
@@ -56,11 +81,13 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    let registry = client.clone_with_config();
+    let planning_registry = client.clone_with_config().without_metadata_memory_cache();
+    let install_registry = client.clone_with_metadata_memory_cache();
+    let manifest = read_for(&root)?;
 
     let targets = match package {
         Some(spec) => vec![parse_target(spec)?],
-        None => collect_all_targets(&root)?,
+        None => collect_all_targets(&manifest),
     };
 
     if targets.is_empty() {
@@ -81,14 +108,47 @@ pub async fn run(
         return Ok(());
     }
 
-    let mut plans: Vec<UpgradePlan> = Vec::new();
-    for target in &targets {
-        match plan_upgrade(&root, &registry, target, json_output).await {
+    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
+        &root.global_root(),
+        None,
+        false,
+        json_output,
+    )?;
+    let aliases_by_package = index_aliases_by_package(&manifest);
+    let manifest_ref = &manifest;
+    let planning_registry_ref = &planning_registry;
+    let release_age_policy_ref = &release_age_policy;
+    let aliases_by_package_ref = &aliases_by_package;
+    let planning = futures::stream::iter(targets.into_iter().enumerate().map(
+        move |(target_index, target)| async move {
+            let result = plan_upgrade(
+                manifest_ref,
+                planning_registry_ref,
+                &target,
+                release_age_policy_ref,
+                aliases_by_package_ref,
+            )
+            .await;
+            (target_index, target, result)
+        },
+    ))
+    .buffer_unordered(GLOBAL_UPDATE_PLANNING_CONCURRENCY);
+    futures::pin_mut!(planning);
+    let mut planned = Vec::with_capacity(manifest.packages.len());
+    while let Some(result) = planning.next().await {
+        planned.push(result);
+    }
+    planned.sort_by_key(|(target_index, _, _)| *target_index);
+
+    let mut plans = Vec::with_capacity(planned.len());
+    for (_, target, result) in planned {
+        match result {
             Ok(plan) => plans.push(plan),
-            Err(e) => {
+            Err(error) => {
+                let reason = update_failure_reason(&error);
                 if !json_output {
                     let name_safe = sanitize_for_terminal(&target.name);
-                    let reason_safe = sanitize_for_terminal(&e.to_string());
+                    let reason_safe = sanitize_for_terminal(&reason);
                     output::warn_line(install_ui::terminal_line!(
                         "planning {}: {}",
                         install_ui::bold(&name_safe),
@@ -98,8 +158,8 @@ pub async fn run(
                 // Continue planning other targets — one bad spec doesn't
                 // block the bulk update.
                 plans.push(UpgradePlan::PlanError {
-                    package: target.name.clone(),
-                    reason: e.to_string(),
+                    package: target.name,
+                    reason,
                 });
             }
         }
@@ -121,8 +181,23 @@ pub async fn run(
     let mut results: Vec<UpgradeResult> = Vec::new();
     for plan in plans {
         match plan {
-            UpgradePlan::Upgrade(prep) => {
-                match execute_upgrade(&root, &registry, prep, json_output).await {
+            UpgradePlan::Upgrade {
+                prep,
+                metadata,
+                route,
+            } => {
+                if !install_registry.seed_metadata_for_command(
+                    &prep.name,
+                    &route.upstream_route(),
+                    metadata,
+                ) {
+                    results.push(UpgradeResult::Failed {
+                        package: prep.name.clone(),
+                        reason: "failed to retain validated global-update metadata".to_string(),
+                    });
+                    continue;
+                }
+                match execute_upgrade(&root, &install_registry, prep, json_output).await {
                     Ok(out) => results.push(UpgradeResult::Upgraded(out)),
                     Err(e) => results.push(UpgradeResult::Failed {
                         package: e.0,
@@ -222,9 +297,8 @@ fn parse_target(spec: &str) -> Result<Target, LpmError> {
     Ok(Target { name, new_intent })
 }
 
-fn collect_all_targets(root: &LpmRoot) -> Result<Vec<Target>, LpmError> {
-    let manifest = read_for(root)?;
-    Ok(manifest
+fn collect_all_targets(manifest: &GlobalManifest) -> Vec<Target> {
+    manifest
         .packages
         .iter()
         .filter(|(_, entry)| entry.source != PackageSource::LocalLink)
@@ -232,7 +306,25 @@ fn collect_all_targets(root: &LpmRoot) -> Result<Vec<Target>, LpmError> {
             name: name.clone(),
             new_intent: None,
         })
-        .collect())
+        .collect()
+}
+
+fn index_aliases_by_package(manifest: &GlobalManifest) -> HashMap<String, serde_json::Value> {
+    let mut aliases_by_package: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+        HashMap::with_capacity(manifest.packages.len());
+    for (alias, entry) in &manifest.aliases {
+        aliases_by_package
+            .entry(entry.package.clone())
+            .or_default()
+            .insert(
+                alias.clone(),
+                serde_json::json!({"package": entry.package, "bin": entry.bin}),
+            );
+    }
+    aliases_by_package
+        .into_iter()
+        .map(|(package, aliases)| (package, serde_json::Value::Object(aliases)))
+        .collect()
 }
 
 // ─── Planning ────────────────────────────────────────────────────────
@@ -240,7 +332,11 @@ fn collect_all_targets(root: &LpmRoot) -> Result<Vec<Target>, LpmError> {
 #[derive(Debug, Clone)]
 enum UpgradePlan {
     /// Resolved version differs from the active one — full upgrade tx.
-    Upgrade(Box<UpgradePrep>),
+    Upgrade {
+        prep: Box<UpgradePrep>,
+        metadata: Arc<PackageMetadata>,
+        route: MetadataRoute,
+    },
     /// Resolved version is unchanged but the user typed a `<pkg>@<spec>`
     /// that produces a different `saved_spec` — manifest-only mutation
     /// that retunes the bulk-update tracking policy without touching
@@ -271,13 +367,35 @@ enum UpgradePlan {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataRoute {
+    Lpm,
+    PublicNpm,
+}
+
+impl MetadataRoute {
+    fn upstream_route(self) -> UpstreamRoute {
+        match self {
+            Self::Lpm => UpstreamRoute::LpmWorker,
+            Self::PublicNpm => UpstreamRoute::NpmDirect,
+        }
+    }
+
+    fn release_time_source(self) -> crate::release_age_selection::ReleaseTimeMetadataSource {
+        match self {
+            Self::Lpm => crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly,
+            Self::PublicNpm => crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect,
+        }
+    }
+}
+
 async fn plan_upgrade(
-    root: &LpmRoot,
+    manifest: &GlobalManifest,
     registry: &RegistryClient,
     target: &Target,
-    json_output: bool,
+    release_age_policy: &lpm_resolver::ResolverPolicy,
+    aliases_by_package: &HashMap<String, serde_json::Value>,
 ) -> Result<UpgradePlan, LpmError> {
-    let manifest = read_for(root)?;
     let active = manifest.packages.get(&target.name).ok_or_else(|| {
         LpmError::Script(format!(
             "'{}' is not globally installed. Run `lpm install -g {}` first.",
@@ -303,23 +421,40 @@ async fn plan_upgrade(
     };
 
     // Dispatch by name shape — same as install_global.
-    let metadata = if lpm_common::package_name::is_lpm_package(&target.name) {
-        let pkg_name = lpm_common::PackageName::parse(&target.name).map_err(|e| {
-            LpmError::Script(format!("invalid LPM package name '{}': {e}", target.name))
-        })?;
-        registry.get_package_metadata(&pkg_name).await?
-    } else {
-        registry.get_npm_package_metadata(&target.name).await?
+    let route = match active.source {
+        PackageSource::LpmDev => MetadataRoute::Lpm,
+        PackageSource::UpstreamNpm => MetadataRoute::PublicNpm,
+        PackageSource::LocalLink => unreachable!("local links returned above"),
     };
-
-    let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
-        &root.global_root(),
-        None,
-        false,
-        json_output,
-    )?;
+    let mut metadata = match route {
+        MetadataRoute::Lpm => {
+            let package = lpm_common::PackageName::parse(&target.name).map_err(|error| {
+                LpmError::Script(format!(
+                    "invalid LPM package name '{}': {error}",
+                    target.name
+                ))
+            })?;
+            registry
+                .revalidate_package_metadata_with_timings(&package)
+                .await?
+                .metadata
+        }
+        MetadataRoute::PublicNpm => {
+            registry
+                .revalidate_npm_metadata_direct_with_timings(&target.name)
+                .await?
+                .metadata
+        }
+    };
+    crate::release_age_selection::hydrate_release_times_if_needed(
+        registry,
+        &mut metadata,
+        release_age_policy,
+        route.release_time_source(),
+    )
+    .await?;
     let new_version_str =
-        pick_version_with_policy(&metadata, &intent, "global update", &release_age_policy)?;
+        pick_version_with_policy(&metadata, &intent, "global update", release_age_policy)?;
     let new_version = Version::parse(&new_version_str).map_err(|e| {
         LpmError::Script(format!(
             "registry returned unparseable version '{new_version_str}' for '{}': {e}",
@@ -327,6 +462,18 @@ async fn plan_upgrade(
         ))
     })?;
     ensure_registry_serves_version(&metadata, &new_version_str)?;
+    let current_version = Version::parse(&active.resolved).map_err(|error| {
+        LpmError::Script(format!(
+            "global manifest contains invalid resolved version '{}' for '{}': {error}",
+            active.resolved, target.name
+        ))
+    })?;
+    if target.new_intent.is_none() && new_version <= current_version {
+        return Ok(UpgradePlan::AlreadyCurrent {
+            package: target.name.clone(),
+            version: active.resolved.clone(),
+        });
+    }
 
     // Compute the new saved_spec before the already-current check; an
     // unchanged version can still need a manifest-only tracking rewrite.
@@ -388,34 +535,59 @@ async fn plan_upgrade(
             ))
         })?;
 
-    let source = if lpm_common::package_name::is_lpm_package(&target.name) {
-        PackageSource::LpmDev
-    } else {
-        PackageSource::UpstreamNpm
-    };
+    let source = active.source;
 
-    let alias_map: serde_json::Map<String, serde_json::Value> = manifest
-        .aliases
-        .iter()
-        .filter(|(_, e)| e.package == target.name)
-        .map(|(name, e)| {
-            (
-                name.clone(),
-                serde_json::json!({"package": e.package, "bin": e.bin}),
-            )
-        })
-        .collect();
+    let selected_metadata = Arc::new(compact_metadata_for_version(&metadata, &new_version_str)?);
+    Ok(UpgradePlan::Upgrade {
+        prep: Box::new(UpgradePrep {
+            name: target.name.clone(),
+            current_version: active.resolved.clone(),
+            new_version,
+            new_saved_spec,
+            new_integrity,
+            source,
+            prior_active_row_json,
+            prior_aliases_json: aliases_by_package
+                .get(&target.name)
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+        }),
+        metadata: selected_metadata,
+        route,
+    })
+}
 
-    Ok(UpgradePlan::Upgrade(Box::new(UpgradePrep {
-        name: target.name.clone(),
-        current_version: active.resolved.clone(),
-        new_version,
-        new_saved_spec,
-        new_integrity,
-        source,
-        prior_active_row_json,
-        prior_aliases_json: serde_json::Value::Object(alias_map),
-    })))
+fn compact_metadata_for_version(
+    metadata: &PackageMetadata,
+    version: &str,
+) -> Result<PackageMetadata, LpmError> {
+    let selected = metadata.version(version).cloned().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "registry selected missing version '{}@{version}'",
+            metadata.name
+        ))
+    })?;
+    let mut dist_tags = HashMap::with_capacity(1);
+    dist_tags.insert("latest".to_string(), version.to_string());
+    let mut versions = HashMap::with_capacity(1);
+    versions.insert(version.to_string(), selected);
+    let mut time = HashMap::with_capacity(1);
+    if let Some(published_at) = metadata.time.get(version) {
+        time.insert(version.to_string(), published_at.clone());
+    }
+    Ok(PackageMetadata {
+        name: metadata.name.clone(),
+        description: None,
+        modified: metadata.modified.clone(),
+        dist_tags,
+        versions,
+        time,
+        downloads: None,
+        distribution_mode: metadata.distribution_mode.clone(),
+        package_type: metadata.package_type.clone(),
+        latest_version: Some(version.to_string()),
+        ecosystem: metadata.ecosystem.clone(),
+    })
 }
 
 /// Infer a UserSaveIntent from a persisted saved_spec string. The
@@ -517,7 +689,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
         let entries: Vec<_> = plans
             .iter()
             .map(|p| match p {
-                UpgradePlan::Upgrade(prep) => serde_json::json!({
+                UpgradePlan::Upgrade { prep, .. } => serde_json::json!({
                     "package": prep.name,
                     "action": "upgrade",
                     "from": prep.current_version,
@@ -563,7 +735,7 @@ fn emit_dry_run(plans: &[UpgradePlan], json_output: bool) {
     let mut any_action = false;
     for plan in plans {
         match plan {
-            UpgradePlan::Upgrade(prep) => {
+            UpgradePlan::Upgrade { prep, .. } => {
                 any_action = true;
                 let name_safe = sanitize_for_terminal(&prep.name);
                 let current_safe = sanitize_for_terminal(&prep.current_version);

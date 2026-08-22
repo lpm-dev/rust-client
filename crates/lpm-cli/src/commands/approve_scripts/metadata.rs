@@ -131,6 +131,7 @@ pub(super) fn authorize_project_trust_write(
 /// individual packages to identity-only there would silently strip
 /// a layer of evidence the install path already captured.
 pub(super) async fn fetch_provenance_for_effective_set(
+    registry: &lpm_registry::RegistryClient,
     packages: &[BlockedPackage],
     policy: &crate::provenance_fetch::VerifyPolicy,
 ) -> HashMap<(String, String), ProvenanceStatus> {
@@ -138,7 +139,7 @@ pub(super) async fn fetch_provenance_for_effective_set(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone()))
         .collect();
-    crate::provenance_fetch::fetch_provenance_for_pkgs(&pkgs, policy).await
+    crate::provenance_fetch::fetch_provenance_for_pkgs(registry, &pkgs, policy).await
 }
 
 pub(super) fn runtime_verify_policy_with_source() -> (

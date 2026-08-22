@@ -8,7 +8,43 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_with_registry_and_npm};
+use wiremock::matchers::{method, path, path_regex, query_param};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+#[derive(Clone)]
+struct RecordDelayedOutdatedMetadataStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for RecordDelayedOutdatedMetadataStart {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record outdated metadata request start")
+            .push(std::time::Instant::now());
+        let name = request
+            .url
+            .path()
+            .strip_prefix("/api/registry/")
+            .unwrap_or_default();
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" },
+                    "1.1.0": { "name": name, "version": "1.1.0" }
+                },
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-01-01T00:00:00.000Z"
+                }
+            }))
+    }
+}
 
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
     use chrono::SecondsFormat;
@@ -117,7 +153,7 @@ async fn outdated_empty_deps_emits_empty_json_envelope() {
     let project = TempProject::empty(r#"{"name":"empty-outdated","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -131,6 +167,29 @@ async fn outdated_empty_deps_emits_empty_json_envelope() {
     assert_eq!(envelope["count"], serde_json::json!(0));
     assert_eq!(envelope["outdated_count"], serde_json::json!(0));
     assert_eq!(envelope["packages"], serde_json::json!([]));
+}
+
+#[test]
+fn outdated_rejects_a_corrupt_project_lockfile() {
+    let project = TempProject::empty(
+        r#"{"name":"corrupt-lock-outdated","version":"1.0.0","dependencies":{"@lpm.dev/acme.corrupt":"^1.0.0"}}"#,
+    );
+    project.write_file("lpm.lock", "this is not a lockfile");
+
+    let out = lpm(&project)
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated with corrupt lockfile");
+
+    assert!(!out.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid JSON error envelope");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("failed to read project lockfile")),
+        "error should identify the corrupt lockfile: {envelope:#}",
+    );
 }
 
 // ─── Behavior contracts ─────────────────────────────────────────────────
@@ -178,7 +237,7 @@ async fn outdated_reports_non_lpm_packages_by_default() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -219,6 +278,13 @@ async fn outdated_resolves_npm_aliases_through_their_canonical_package() {
         name: "strip-ansi".to_string(),
         version: "6.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
+        dependencies: vec!["strip-ansi@5.0.0".to_string()],
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "strip-ansi".to_string(),
+        version: "5.0.0".to_string(),
+        source: Some("registry+https://lpm.dev".to_string()),
         ..Default::default()
     });
     support::finalize_exact_lockfile_fixture(
@@ -248,7 +314,7 @@ async fn outdated_resolves_npm_aliases_through_their_canonical_package() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn outdated for npm alias");
@@ -272,6 +338,21 @@ async fn outdated_resolves_npm_aliases_through_their_canonical_package() {
             "section": "dependencies",
             "outdated": true,
         }),
+    );
+    let received_paths = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect::<Vec<_>>();
+    assert!(received_paths.iter().any(|path| path == "/strip-ansi"));
+    assert!(
+        !received_paths
+            .iter()
+            .any(|path| path == "/api/registry/strip-ansi"),
+        "the same-name transitive source must not override the exact public root: {received_paths:?}"
     );
 }
 
@@ -322,7 +403,7 @@ async fn outdated_treats_fresh_latest_as_up_to_date_when_current_version_is_matu
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -339,6 +420,64 @@ async fn outdated_treats_fresh_latest_as_up_to_date_when_current_version_is_matu
     assert_eq!(entry["wanted"], serde_json::json!("1.0.0"));
     assert_eq!(entry["latest"], serde_json::json!("1.0.0"));
     assert_eq!(entry["outdated"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn outdated_hydrates_missing_release_times_before_reporting() {
+    let package = "@lpm.dev/owner.hydrated-outdated";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"hydrated-outdated","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}},"lpm":{{"minimumReleaseAge":86400}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "1.1.0" },
+            "modified": iso8601_n_secs_ago(3_600),
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" },
+                "1.1.0": { "name": package, "version": "1.1.0" }
+            }
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(query_param("release_times", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "time": {
+                "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+                "1.1.0": iso8601_n_secs_ago(3_600)
+            }
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("run outdated with hydrated release times");
+    assert!(
+        output.status.success(),
+        "release-time hydration should produce a clean report\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid outdated envelope");
+    assert_eq!(envelope["outdated_count"], serde_json::json!(0));
+    assert_eq!(
+        envelope["packages"][0]["latest"],
+        serde_json::json!("1.0.0")
+    );
 }
 
 #[tokio::test]
@@ -366,7 +505,7 @@ async fn outdated_reports_npm_packages_installed_through_configured_lpm_registry
     )
     .await;
 
-    lpm_with_registry(&project, &mock.url())
+    lpm_with_registry_and_npm(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -376,7 +515,7 @@ async fn outdated_reports_npm_packages_installed_through_configured_lpm_registry
         .assert()
         .success();
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -446,7 +585,7 @@ async fn outdated_includes_dev_dependencies_by_default() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -488,7 +627,7 @@ async fn outdated_registry_only_lpm_skips_non_lpm_packages() {
     mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
         .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json", "--registry-only", "lpm"])
         .output()
         .expect("spawn lpm outdated --json --registry-only lpm");
@@ -517,7 +656,7 @@ async fn outdated_skips_private_named_packages_without_npm_public_source() {
     mock.with_package("ms", "9.9.9", &make_tarball("ms", "9.9.9"))
         .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -547,7 +686,7 @@ async fn outdated_metadata_lookup_failure_exits_nonzero_in_json_mode() {
 
     let mock = MockRegistry::start().await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -598,7 +737,7 @@ async fn outdated_reports_newer_version_for_outdated_lpm_dep() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -654,7 +793,7 @@ async fn outdated_human_output_uses_slim_completion() {
     )
     .await;
 
-    let output = lpm_with_registry(&project, &mock.url())
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated"])
         .output()
         .expect("spawn lpm outdated");
@@ -699,7 +838,7 @@ async fn outdated_reports_zero_when_installed_matches_latest() {
     let mock = MockRegistry::start().await;
     mount_lpm_package_latest(&mock, pkg, "1.4.2").await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");
@@ -718,6 +857,156 @@ async fn outdated_reports_zero_when_installed_matches_latest() {
     assert_eq!(entry["outdated"], serde_json::json!(false));
     assert_eq!(entry["current"], serde_json::json!("1.4.2"));
     assert_eq!(entry["latest"], serde_json::json!("1.4.2"));
+}
+
+#[tokio::test]
+async fn outdated_does_not_report_an_installed_version_above_the_registry_latest() {
+    let package = "@lpm.dev/owner.registry-rollback";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"registry-rollback","version":"1.0.0","dependencies":{{"{package}":"^2.0.0"}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "2.0.0");
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_package_latest(&mock, package, "1.9.0").await;
+
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for registry rollback");
+    assert!(
+        out.status.success(),
+        "registry rollback should remain a successful status check\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(envelope["outdated_count"], serde_json::json!(0));
+    assert_eq!(
+        envelope["packages"][0]["current"],
+        serde_json::json!("2.0.0")
+    );
+    assert_eq!(
+        envelope["packages"][0]["latest"],
+        serde_json::json!("1.9.0")
+    );
+    assert_eq!(
+        envelope["packages"][0]["outdated"],
+        serde_json::json!(false)
+    );
+}
+
+#[tokio::test]
+async fn outdated_rejects_a_latest_tag_that_points_to_a_missing_version() {
+    let package = "@lpm.dev/owner.dangling-latest";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"dangling-latest","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" }
+            },
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for dangling latest tag");
+    assert!(
+        !out.status.success(),
+        "dangling registry tags must not produce a clean report\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated failure envelope");
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert!(
+        envelope["unresolved"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("points to missing version '2.0.0'")),
+        "failure should identify the dangling tag: {envelope:#}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_runs_metadata_lookups_in_bounded_parallel_waves() {
+    const PACKAGE_COUNT: usize = 8;
+    let mut manifest_dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
+    let mut lockfile =
+        String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("@lpm.dev/owner.bounded-{index}");
+        manifest_dependencies.insert(name.clone(), serde_json::json!("^1.0.0"));
+        lockfile.push_str(&format!(
+            "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
+        ));
+    }
+    let project = TempProject::empty(
+        &serde_json::to_string(&serde_json::json!({
+            "name": "bounded-outdated",
+            "version": "1.0.0",
+            "dependencies": manifest_dependencies,
+        }))
+        .unwrap(),
+    );
+    project.write_file("lpm.lock", &lockfile);
+
+    let server = MockServer::start().await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/registry/@lpm\.dev/owner\.bounded-[0-9]+$",
+        ))
+        .respond_with(RecordDelayedOutdatedMetadataStart {
+            starts: std::sync::Arc::clone(&starts),
+            delay: std::time::Duration::from_millis(250),
+        })
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn bounded outdated check");
+    assert!(
+        out.status.success(),
+        "bounded outdated check should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let starts = starts.lock().expect("read metadata request starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let first = *starts.iter().min().unwrap();
+    let mut offsets = starts
+        .iter()
+        .map(|start| start.duration_since(first))
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert!(
+        offsets[3] < std::time::Duration::from_millis(150),
+        "the first four bounded slots did not start together: {offsets:?}"
+    );
+    assert!(
+        offsets[4] >= std::time::Duration::from_millis(200),
+        "more than four metadata requests ran in the first wave: {offsets:?}"
+    );
+    assert!(
+        offsets[7] < std::time::Duration::from_millis(450),
+        "the bounded scheduler did not refill promptly for the second wave: {offsets:?}"
+    );
 }
 
 // ─── JSON contract snapshot ─────────────────────────────────────────────
@@ -754,7 +1043,7 @@ async fn outdated_json_envelope_with_one_outdated_pkg_matches_snapshot() {
     )
     .await;
 
-    let out = lpm_with_registry(&project, &mock.url())
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["outdated", "--json"])
         .output()
         .expect("spawn lpm outdated --json");

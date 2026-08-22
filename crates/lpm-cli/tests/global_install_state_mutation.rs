@@ -257,6 +257,19 @@ async fn cli_global_update_upgrades_exact_install_and_preserves_user_range() {
         "global update --dry-run should print the plan on stderr. stderr={stderr:?}"
     );
 
+    let metadata_requests_before_execution = server
+        .received_requests()
+        .await
+        .expect("mock registry request log")
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.url.path(),
+                "/tool" | "/api/registry/tool" | "/api/registry/batch-metadata"
+            )
+        })
+        .count();
+
     let (status, stdout, stderr) = common::run_lpm(
         &cwd,
         &lpm_home,
@@ -272,6 +285,34 @@ async fn cli_global_update_upgrades_exact_install_and_preserves_user_range() {
         "global update human output must stay off stdout. stdout={stdout:?} stderr={stderr:?}"
     );
 
+    let metadata_requests_after_execution = server
+        .received_requests()
+        .await
+        .expect("mock registry request log");
+    let execution_metadata_requests = metadata_requests_after_execution
+        .iter()
+        .filter(|request| {
+            matches!(
+                request.url.path(),
+                "/tool" | "/api/registry/tool" | "/api/registry/batch-metadata"
+            )
+        })
+        .skip(metadata_requests_before_execution)
+        .map(|request| {
+            format!(
+                "{} {} {}",
+                request.method,
+                request.url.path(),
+                String::from_utf8_lossy(&request.body)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        execution_metadata_requests.len(),
+        1,
+        "global update planning and installation must share one root packument: {execution_metadata_requests:?}"
+    );
+
     let updated = read_package_row(&root, "tool");
     assert_eq!(updated.resolved, "1.1.0");
     assert_eq!(updated.saved_spec, "^1.0.0");
@@ -279,6 +320,26 @@ async fn cli_global_update_upgrades_exact_install_and_preserves_user_range() {
     assert!(
         root.install_root_for("tool", "1.1.0").exists(),
         "new install root should exist after update"
+    );
+    let expected_integrity = common::sri_for(&common::make_mock_tarball(
+        "tool",
+        "1.1.0",
+        &[("tool", "bin/tool.js")],
+    ));
+    assert_eq!(updated.integrity, expected_integrity);
+    let staged_lockfile = lpm_lockfile::Lockfile::read_from_file(
+        &root.install_root_for("tool", "1.1.0").join("lpm.lock"),
+    )
+    .expect("read staged global lockfile");
+    let staged = staged_lockfile
+        .packages
+        .iter()
+        .find(|entry| entry.name == "tool")
+        .expect("staged global package lock entry");
+    assert_eq!(staged.version, updated.resolved);
+    assert_eq!(
+        staged.integrity.as_deref(),
+        Some(updated.integrity.as_str())
     );
     assert!(artifacts_complete(&root.bin_dir(), "tool"));
     assert_shim_points_to(&root, "tool", "tool@1.1.0");

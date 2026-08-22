@@ -4,6 +4,12 @@ use lpm_resolver::{CanonicalKey, ReleaseTimeStatus, ResolverPolicy, TrustPolicyM
 use lpm_semver::{Version, VersionReq};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReleaseTimeMetadataSource {
+    NpmDirect,
+    WorkerOnly,
+}
+
 pub(crate) fn resolver_policy_for_project(
     project_dir: &Path,
     min_release_age_override: Option<u64>,
@@ -48,6 +54,7 @@ pub(crate) fn resolver_policy_for_project_with_excludes(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn latest_allowed_version(
     metadata: &PackageMetadata,
     policy: &ResolverPolicy,
@@ -57,6 +64,7 @@ pub(crate) fn latest_allowed_version(
     let latest = latest_tag.and_then(|version| Version::parse(version).ok());
     if let Some(latest_tag) = latest_tag
         && latest.is_some()
+        && metadata.versions.contains_key(latest_tag)
         && version_allowed_by_policy(&canonical, metadata, latest_tag, policy)
     {
         return Some(latest_tag.to_string());
@@ -76,13 +84,129 @@ pub(crate) fn latest_allowed_version_or_policy_error(
     metadata: &PackageMetadata,
     policy: &ResolverPolicy,
 ) -> Result<String, LpmError> {
+    Ok(allowed_version_index(metadata, policy)?.latest)
+}
+
+pub(crate) struct AllowedVersionIndex {
+    pub(crate) latest: String,
+    pub(crate) versions: Vec<Version>,
+}
+
+impl AllowedVersionIndex {
+    pub(crate) fn resolve_spec(
+        &self,
+        metadata: &PackageMetadata,
+        spec: &str,
+        policy: &ResolverPolicy,
+    ) -> Result<String, LpmError> {
+        let canonical = CanonicalKey::from_dep_name(&metadata.name);
+        if let Some(version) = metadata.dist_tags.get(spec) {
+            return if metadata.versions.contains_key(version)
+                && version_allowed_by_policy(&canonical, metadata, version, policy)
+            {
+                Ok(version.clone())
+            } else if !metadata.versions.contains_key(version) {
+                Err(LpmError::Script(format!(
+                    "registry tag '{spec}' for '{}' points to missing version '{version}'",
+                    metadata.name
+                )))
+            } else {
+                Err(policy_blocked_error(&canonical, metadata, version, policy))
+            };
+        }
+
+        if metadata.versions.contains_key(spec) {
+            return if version_allowed_by_policy(&canonical, metadata, spec, policy) {
+                Ok(spec.to_string())
+            } else {
+                Err(policy_blocked_error(&canonical, metadata, spec, policy))
+            };
+        }
+
+        let req = VersionReq::parse(spec).map_err(|e| {
+            LpmError::Script(format!("could not parse version token '{spec}': {e}"))
+        })?;
+        if let Some(version) = self
+            .versions
+            .iter()
+            .rev()
+            .find(|version| req.matches(version))
+        {
+            return Ok(version.to_string());
+        }
+
+        let mut available = parse_versions(metadata);
+        available.sort();
+        Err(LpmError::Script(format!(
+            "no version of '{}' satisfies '{}'. Available: {}",
+            metadata.name,
+            spec,
+            available
+                .iter()
+                .rev()
+                .take(5)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+}
+
+pub(crate) fn allowed_version_index(
+    metadata: &PackageMetadata,
+    policy: &ResolverPolicy,
+) -> Result<AllowedVersionIndex, LpmError> {
     let canonical = CanonicalKey::from_dep_name(&metadata.name);
-    if let Some(version) = latest_allowed_version(metadata, policy) {
-        return Ok(version);
+    let parsed_latest = if let Some(latest) = metadata.latest_version_tag() {
+        if !metadata.versions.contains_key(latest) {
+            return Err(LpmError::Script(format!(
+                "registry tag 'latest' for '{}' points to missing version '{latest}'",
+                metadata.name
+            )));
+        }
+        Some(Version::parse(latest).map_err(|error| {
+            LpmError::Script(format!(
+                "registry tag 'latest' for '{}' contains invalid version '{latest}': {error}",
+                metadata.name
+            ))
+        })?)
+    } else {
+        None
+    };
+
+    let mut versions = Vec::with_capacity(metadata.versions.len());
+    for version in metadata.versions.keys() {
+        let Ok(parsed) = Version::parse(version) else {
+            continue;
+        };
+        if version_allowed_by_policy(&canonical, metadata, version, policy) {
+            versions.push(parsed);
+        }
+    }
+    versions.sort();
+
+    let latest = metadata
+        .latest_version_tag()
+        .filter(|version| version_allowed_by_policy(&canonical, metadata, version, policy))
+        .map(str::to_string)
+        .or_else(|| {
+            versions
+                .iter()
+                .rev()
+                .find(|version| {
+                    parsed_latest
+                        .as_ref()
+                        .is_none_or(|latest| *version <= latest)
+                })
+                .map(ToString::to_string)
+        });
+    if let Some(latest) = latest {
+        return Ok(AllowedVersionIndex { latest, versions });
     }
 
     let candidate = metadata
         .latest_version_tag()
+        .filter(|version| metadata.versions.contains_key(*version))
         .and_then(|version| Version::parse(version).ok())
         .or_else(|| parse_versions(metadata).into_iter().max());
     let Some(candidate) = candidate else {
@@ -97,17 +221,51 @@ pub(crate) fn latest_allowed_version_or_policy_error(
     ))
 }
 
-pub(crate) fn allowed_version_strings(
-    metadata: &PackageMetadata,
+pub(crate) async fn hydrate_release_times_if_needed(
+    client: &lpm_registry::RegistryClient,
+    metadata: &mut PackageMetadata,
     policy: &ResolverPolicy,
-) -> Vec<String> {
+    source: ReleaseTimeMetadataSource,
+) -> Result<(), LpmError> {
     let canonical = CanonicalKey::from_dep_name(&metadata.name);
-    metadata
+    let missing_release_times = metadata
         .versions
         .keys()
-        .filter(|version| version_allowed_by_policy(&canonical, metadata, version, policy))
-        .cloned()
-        .collect()
+        .any(|version| !metadata.time.contains_key(version));
+    if !missing_release_times
+        || !policy.metadata_may_need_release_times(&canonical, metadata.modified.as_deref())
+    {
+        return Ok(());
+    }
+
+    let release_times = match source {
+        ReleaseTimeMetadataSource::NpmDirect => {
+            client
+                .get_npm_release_times_routed_full(
+                    &metadata.name,
+                    lpm_registry::UpstreamRoute::NpmDirect,
+                )
+                .await?
+        }
+        ReleaseTimeMetadataSource::WorkerOnly => {
+            client
+                .get_npm_release_times_proxy_only(&metadata.name)
+                .await?
+        }
+    };
+    metadata.time.extend(release_times.time);
+
+    if let Some(version) = metadata
+        .versions
+        .keys()
+        .find(|version| !metadata.time.contains_key(*version))
+    {
+        return Err(LpmError::Registry(format!(
+            "registry returned incomplete release-time metadata for '{}@{version}'",
+            metadata.name
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn resolve_version_spec_with_policy(
@@ -115,54 +273,15 @@ pub(crate) fn resolve_version_spec_with_policy(
     spec: &str,
     policy: &ResolverPolicy,
 ) -> Result<String, LpmError> {
-    let canonical = CanonicalKey::from_dep_name(&metadata.name);
     if let Some(version) = metadata.dist_tags.get(spec) {
+        let canonical = CanonicalKey::from_dep_name(&metadata.name);
         return if version_allowed_by_policy(&canonical, metadata, version, policy) {
             Ok(version.clone())
         } else {
             Err(policy_blocked_error(&canonical, metadata, version, policy))
         };
     }
-
-    if metadata.versions.contains_key(spec) {
-        return if version_allowed_by_policy(&canonical, metadata, spec, policy) {
-            Ok(spec.to_string())
-        } else {
-            Err(policy_blocked_error(&canonical, metadata, spec, policy))
-        };
-    }
-
-    let req = VersionReq::parse(spec)
-        .map_err(|e| LpmError::Script(format!("could not parse version token '{spec}': {e}")))?;
-    let mut versions = parse_versions(metadata);
-    if versions.is_empty() {
-        return Err(LpmError::Script(format!(
-            "registry returned no parseable versions for '{}'",
-            metadata.name
-        )));
-    }
-    versions.retain(|version| {
-        req.matches(version)
-            && version_allowed_by_policy(&canonical, metadata, &version.to_string(), policy)
-    });
-    if let Some(version) = versions.into_iter().max() {
-        return Ok(version.to_string());
-    }
-
-    let mut available = parse_versions(metadata);
-    available.sort();
-    Err(LpmError::Script(format!(
-        "no version of '{}' satisfies '{}'. Available: {}",
-        metadata.name,
-        spec,
-        available
-            .iter()
-            .rev()
-            .take(5)
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )))
+    allowed_version_index(metadata, policy)?.resolve_spec(metadata, spec, policy)
 }
 
 fn parse_versions(metadata: &PackageMetadata) -> Vec<Version> {
@@ -254,5 +373,40 @@ mod tests {
             latest_allowed_version(&metadata, &policy),
             Some("3.0.0".to_string())
         );
+    }
+
+    #[test]
+    fn latest_allowed_version_rejects_a_dangling_latest_tag() {
+        let metadata: PackageMetadata = serde_json::from_value(serde_json::json!({
+            "name": "dangling-latest",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": { "name": "dangling-latest", "version": "1.0.0" }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            latest_allowed_version(&metadata, &ResolverPolicy::default()),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn allowed_version_index_rejects_metadata_without_parseable_versions() {
+        let metadata: PackageMetadata = serde_json::from_value(serde_json::json!({
+            "name": "invalid-versions",
+            "versions": {
+                "not-semver": { "name": "invalid-versions", "version": "not-semver" }
+            }
+        }))
+        .unwrap();
+
+        let error = match allowed_version_index(&metadata, &ResolverPolicy::default()) {
+            Ok(_) => panic!("metadata without a semantic version must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no parseable versions"));
     }
 }

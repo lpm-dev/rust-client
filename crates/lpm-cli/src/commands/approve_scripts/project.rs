@@ -78,6 +78,7 @@ pub fn compute_effective_blocked_set<'a>(
 /// `list`: read-only listing of the blocked set. Mutually exclusive with
 /// `yes`. Cannot be combined with `package`.
 pub async fn run(
+    registry: &lpm_registry::RegistryClient,
     project_dir: &Path,
     package: Option<&str>,
     yes: bool,
@@ -95,6 +96,7 @@ pub async fn run(
     lpm_common::with_shared_lock_async(
         lock_path,
         run_under_store_lock(RunContext {
+            registry,
             project_dir,
             package,
             yes,
@@ -109,6 +111,7 @@ pub async fn run(
 }
 
 struct RunContext<'a> {
+    registry: &'a lpm_registry::RegistryClient,
     project_dir: &'a Path,
     package: Option<&'a str>,
     yes: bool,
@@ -121,6 +124,7 @@ struct RunContext<'a> {
 
 async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     let RunContext {
+        registry,
         project_dir,
         package,
         yes,
@@ -343,8 +347,12 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 runtime_sigstore_source,
             )?;
         }
-        let provenance_by_pkg =
-            fetch_provenance_for_effective_set(std::slice::from_ref(target), &verify_policy).await;
+        let provenance_by_pkg = fetch_provenance_for_effective_set(
+            registry,
+            std::slice::from_ref(target),
+            &verify_policy,
+        )
+        .await;
 
         let reviewed_by_prompt = !json_output && is_tty();
         let confirmed = if reviewed_by_prompt {
@@ -493,8 +501,12 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             runtime_sigstore_source,
         )?;
     }
-    let provenance_by_pkg =
-        fetch_provenance_for_effective_set(&effective_state.blocked_packages, &verify_policy).await;
+    let provenance_by_pkg = fetch_provenance_for_effective_set(
+        registry,
+        &effective_state.blocked_packages,
+        &verify_policy,
+    )
+    .await;
 
     // ── --yes (bulk approve) ────────────────────────────────────────
 

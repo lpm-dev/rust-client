@@ -361,6 +361,13 @@ async fn async_main() -> Result<()> {
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(session_registry_url.to_string())
         .with_insecure(cli.insecure);
+    #[cfg(debug_assertions)]
+    if let Some(npm_registry_url) = std::env::var("LPM_INTERNAL_TEST_NPM_REGISTRY_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+    {
+        client = client.with_npm_registry_url(npm_registry_url);
+    }
     if !unattended_mcp_serve {
         client = client.with_session(session.clone());
     }
@@ -2258,6 +2265,7 @@ async fn async_main() -> Result<()> {
                 // groups list + interactive review by top-level global,
                 // while persisted trust still remains per dependency row.
                 commands::approve_scripts::run_global(
+                    &client,
                     package.as_deref(),
                     yes,
                     list,
@@ -2278,6 +2286,7 @@ async fn async_main() -> Result<()> {
                 }
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
                 commands::approve_scripts::run(
+                    &client,
                     &cwd,
                     package.as_deref(),
                     yes,

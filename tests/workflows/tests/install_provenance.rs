@@ -25,7 +25,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
 use support::assertions;
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm_with_registry};
+use support::{TempProject, lpm_with_registry, lpm_with_registry_and_npm, write_signed_unlock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -835,7 +835,7 @@ async fn approve_scripts_refuses_under_deny_when_verifier_rejects_bundle() {
 
     // Install succeeds: default-deny on scripts means the scripted
     // package goes to the blocked set without running its postinstall.
-    let install_out = lpm_with_registry(&project, &mock.url())
+    let install_out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["install"])
         .output()
         .expect("spawn lpm install");
@@ -846,6 +846,7 @@ async fn approve_scripts_refuses_under_deny_when_verifier_rejects_bundle() {
         String::from_utf8_lossy(&install_out.stdout),
         String::from_utf8_lossy(&install_out.stderr),
     );
+    write_signed_unlock(&project, &["trust-bulk-approve"]);
 
     // Approve-scripts MUST refuse: the verifier rejects the served
     // bundle, the typed `LpmError::ProvenanceVerification` propagates,
@@ -859,15 +860,23 @@ async fn approve_scripts_refuses_under_deny_when_verifier_rejects_bundle() {
     // classifies as Red under the hand-curated blocklist). The
     // per-package path skips that gate, so the only refusal it can
     // emit is the verifier rejection we're pinning here.
-    let approve_out = lpm_with_registry(&project, &mock.url())
+    let approve_out = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["approve-scripts", dep])
         .output()
         .expect("spawn lpm approve-scripts <pkg>");
+    let request_paths: Vec<_> = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("recorded registry requests")
+        .into_iter()
+        .map(|request| request.url.path().to_string())
+        .collect();
 
     assert!(
         !approve_out.status.success(),
         "approve-scripts MUST refuse under default deny when the verifier rejects;\n\
-         stdout: {}\nstderr: {}",
+         stdout: {}\nstderr: {}\nrequests: {request_paths:?}",
         String::from_utf8_lossy(&approve_out.stdout),
         String::from_utf8_lossy(&approve_out.stderr),
     );

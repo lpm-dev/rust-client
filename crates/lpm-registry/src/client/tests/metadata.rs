@@ -279,8 +279,8 @@ async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
     assert_eq!(result.unwrap().name, npm_name);
 
     let cached = client
-        .read_cache_content(&format!("npm:{npm_name}"))
-        .expect("fallback result should be cached");
+        .read_cache_content(&client.npm_direct_metadata_cache_key(npm_name))
+        .expect("direct fallback result should be cached in the direct namespace");
     let metadata = RegistryClient::deserialize_cached_metadata(&cached.data)
         .expect("cached fallback metadata should deserialize");
     assert_eq!(metadata.name, npm_name);
@@ -366,6 +366,100 @@ async fn npm_proxy_metadata_refreshes_rejected_stored_session_before_direct_fall
     assert_eq!(metadata.name, package);
     worker.verify().await;
     npm.verify().await;
+}
+
+#[tokio::test]
+async fn npm_proxy_metadata_caches_success_under_refreshed_bearer_principal() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("create auth home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let package = "refresh-cache-principal";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer stale-metadata-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    mount_metadata_refresh(&worker).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .and(header("authorization", "Bearer rotated-metadata-access"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(package)))
+        .expect(1)
+        .mount(&worker)
+        .await;
+
+    let cache = tempfile::tempdir().expect("create metadata cache");
+    let client = refreshable_metadata_client(&worker, &npm, cache.path()).await;
+    let stale_key = client.npm_worker_metadata_cache_key(package).unwrap();
+
+    client
+        .get_npm_package_metadata_proxy_only(package)
+        .await
+        .expect("proxy metadata should refresh and retry");
+
+    let refreshed_key = client.npm_worker_metadata_cache_key(package).unwrap();
+    assert_ne!(stale_key, refreshed_key);
+    assert!(client.read_metadata_cache(&stale_key).is_none());
+    assert!(client.read_metadata_cache(&refreshed_key).is_some());
+}
+
+#[tokio::test]
+async fn batch_metadata_caches_success_under_refreshed_bearer_principal() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().expect("create auth home");
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let package = "refresh-batch-cache-principal";
+    let metadata: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(package)).expect("valid metadata JSON");
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(header("authorization", "Bearer stale-metadata-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    mount_metadata_refresh(&worker).await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(header("authorization", "Bearer rotated-metadata-access"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": { package: metadata },
+                })),
+        )
+        .expect(1)
+        .mount(&worker)
+        .await;
+
+    let cache = tempfile::tempdir().expect("create metadata cache");
+    let client = refreshable_metadata_client(&worker, &npm, cache.path()).await;
+    let stale_key = client.npm_worker_metadata_cache_key(package).unwrap();
+
+    client
+        .batch_metadata(&[package.to_string()])
+        .await
+        .expect("batch metadata should refresh and retry");
+
+    let refreshed_key = client.npm_worker_metadata_cache_key(package).unwrap();
+    assert_ne!(stale_key, refreshed_key);
+    assert!(client.read_metadata_cache(&stale_key).is_none());
+    assert!(client.read_metadata_cache(&refreshed_key).is_some());
 }
 
 #[tokio::test]
@@ -652,7 +746,7 @@ async fn npm_proxy_wrong_package_body_returns_registry_error_without_fallback() 
 
     assert!(
         client
-            .read_cache_content(&format!("npm:{npm_name}"))
+            .read_cache_content(&client.npm_worker_metadata_cache_key(npm_name).unwrap())
             .is_none(),
         "wrong-package proxy bodies should not be cached"
     );
@@ -695,6 +789,102 @@ async fn batch_metadata_json_keeps_valid_entries_when_some_are_malformed() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[valid_name].name, valid_name);
     assert!(!result.contains_key("broken-package"));
+}
+
+#[tokio::test]
+async fn non_deep_json_batch_ignores_and_does_not_cache_unrequested_packages() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let requested_name = "@lpm.dev/test.requested-json";
+    let unsolicited_name = "unrequested-public-package";
+    let requested: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(requested_name)).unwrap();
+    let unsolicited: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(unsolicited_name)).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "packages": {
+                        requested_name: requested,
+                        unsolicited_name: unsolicited,
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .batch_metadata(&[requested_name.to_string()])
+        .await
+        .expect("requested batch entry should still succeed");
+
+    assert_eq!(result.len(), 1);
+    assert!(result.contains_key(requested_name));
+    assert!(!result.contains_key(unsolicited_name));
+    assert!(
+        client
+            .read_metadata_cache(
+                &client
+                    .npm_worker_metadata_cache_key(unsolicited_name)
+                    .unwrap(),
+            )
+            .is_none(),
+        "an unrequested entry must not cross into the public npm cache namespace"
+    );
+}
+
+#[tokio::test]
+async fn non_deep_ndjson_batch_ignores_and_does_not_cache_unrequested_packages() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let requested_name = "@lpm.dev/test.requested-ndjson";
+    let unsolicited_name = "unrequested-ndjson-package";
+    let requested: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(requested_name)).unwrap();
+    let unsolicited: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(unsolicited_name)).unwrap();
+    let body = format!(
+        "{}\n{}\n",
+        serde_json::json!({"name": requested_name, "metadata": requested}),
+        serde_json::json!({"name": unsolicited_name, "metadata": unsolicited}),
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .batch_metadata(&[requested_name.to_string()])
+        .await
+        .expect("requested batch entry should still succeed");
+
+    assert_eq!(result.len(), 1);
+    assert!(result.contains_key(requested_name));
+    assert!(!result.contains_key(unsolicited_name));
+    assert!(
+        client
+            .read_metadata_cache(
+                &client
+                    .npm_worker_metadata_cache_key(unsolicited_name)
+                    .unwrap(),
+            )
+            .is_none(),
+        "an unrequested entry must not cross into the public npm cache namespace"
+    );
 }
 
 #[tokio::test]
@@ -825,7 +1015,9 @@ async fn batch_metadata_deep_sends_range_aware_package_specs_when_present() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[valid_name].name, valid_name);
     assert!(
-        client.read_metadata_cache("npm:vite").is_none(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("vite").unwrap())
+            .is_none(),
         "range-aware batch responses may be pruned and must not populate the full metadata cache"
     );
 }
@@ -891,7 +1083,9 @@ async fn batch_metadata_range_aware_stream_does_not_cache_pruned_packuments() {
             .is_none()
     );
     assert!(
-        client.read_metadata_cache("npm:vite").is_none(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("vite").unwrap())
+            .is_none(),
         "range-aware streamed responses may be pruned and must not populate the full metadata cache"
     );
 
@@ -957,7 +1151,9 @@ async fn batch_metadata_range_aware_ndjson_merges_duplicate_package_entries() {
         Some("5.6.2")
     );
     assert!(
-        client.read_metadata_cache("npm:chalk").is_none(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("chalk").unwrap())
+            .is_none(),
         "range-aware duplicate entries are partial and should not populate the full metadata cache"
     );
 
@@ -1082,7 +1278,11 @@ async fn batch_metadata_json_skips_mismatched_package_identity_and_does_not_cach
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm:{requested_name}"))
+            .read_metadata_cache(
+                &client
+                    .npm_worker_metadata_cache_key(requested_name)
+                    .unwrap(),
+            )
             .is_none(),
         "mismatched metadata should not poison the requested package cache"
     );
@@ -1213,7 +1413,9 @@ async fn batch_metadata_ndjson_parses_line_split_across_http_chunks() {
     assert_eq!(result.len(), 1);
     assert_eq!(result["kleur"].name, "kleur");
     assert!(
-        client.read_metadata_cache("npm:kleur").is_some(),
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key("kleur").unwrap())
+            .is_some(),
         "chunk-split NDJSON entries should still warm the metadata cache"
     );
 
@@ -1447,7 +1649,11 @@ async fn batch_metadata_ndjson_skips_mismatched_package_identity_and_does_not_ca
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm:{requested_name}"))
+            .read_metadata_cache(
+                &client
+                    .npm_worker_metadata_cache_key(requested_name)
+                    .unwrap(),
+            )
             .is_none(),
         "mismatched metadata should not poison the requested package cache"
     );
@@ -1478,6 +1684,353 @@ async fn batch_metadata_json_truncated_body_returns_parse_error() {
         result,
         Err(LpmError::Registry(message)) if message.contains("batch metadata") && message.contains("failed to parse JSON")
     ));
+}
+
+#[tokio::test]
+async fn lpm_metadata_rejects_a_response_for_another_package_without_caching_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let requested = "@lpm.dev/test.requested-identity";
+    let unexpected = "@lpm.dev/test.unexpected-identity";
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.requested-identity"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(unexpected)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .get_package_metadata(&PackageName::parse(requested).unwrap())
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::Registry(message))
+            if message.contains("unexpected package")
+                && message.contains(unexpected)
+                && message.contains(requested)
+    ));
+}
+
+#[tokio::test]
+async fn direct_npm_metadata_rejects_a_response_for_another_package_without_caching_it() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let requested = "requested-direct-identity";
+    let unexpected = "unexpected-direct-identity";
+
+    Mock::given(method("GET"))
+        .and(path("/requested-direct-identity"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(unexpected)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client.get_npm_metadata_direct(requested).await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::Registry(message))
+            if message.contains("unexpected package")
+                && message.contains(unexpected)
+                && message.contains(requested)
+    ));
+    assert!(
+        client
+            .read_metadata_cache(&client.npm_direct_metadata_cache_key(requested))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn direct_npm_metadata_empty_404_identifies_the_requested_package() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let name = "missing-direct-package";
+
+    Mock::given(method("GET"))
+        .and(path("/missing-direct-package"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client.get_npm_metadata_direct(name).await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::NotFound(detail)) if detail.contains(name)
+    ));
+}
+
+#[tokio::test]
+async fn public_and_proxy_only_metadata_caches_are_isolated() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_base_url(worker.uri())
+        .with_npm_registry_url(npm.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let name = "route-isolated-package";
+
+    Mock::given(method("GET"))
+        .and(path("/route-isolated-package"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "1.0.0")),
+        )
+        .expect(1)
+        .mount(&npm)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/route-isolated-package"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "2.0.0")),
+        )
+        .expect(1)
+        .mount(&worker)
+        .await;
+
+    let direct = client.get_npm_metadata_direct(name).await.unwrap();
+    let proxy = client
+        .get_npm_package_metadata_proxy_only(name)
+        .await
+        .unwrap();
+
+    assert_eq!(direct.latest_version_tag(), Some("1.0.0"));
+    assert_eq!(proxy.latest_version_tag(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn proxy_only_revalidation_does_not_accept_a_fresh_cached_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let worker = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_base_url(worker.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let name = "proxy-revalidation";
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "1.0.0")),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/proxy-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "2.0.0")),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&worker)
+        .await;
+
+    let cached = client
+        .get_npm_package_metadata_proxy_only(name)
+        .await
+        .unwrap();
+    let refreshed = client
+        .revalidate_npm_package_metadata_proxy_only(name)
+        .await
+        .unwrap();
+
+    assert_eq!(cached.latest_version_tag(), Some("1.0.0"));
+    assert_eq!(refreshed.latest_version_tag(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn direct_revalidation_does_not_accept_a_fresh_cached_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(npm.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let name = "direct-revalidation";
+
+    Mock::given(method("GET"))
+        .and(path("/direct-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "1.0.0")),
+        )
+        .with_priority(1)
+        .up_to_n_times(1)
+        .mount(&npm)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/direct-revalidation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "2.0.0")),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&npm)
+        .await;
+
+    let cached = client.get_npm_metadata_direct(name).await.unwrap();
+    let refreshed = client
+        .revalidate_npm_metadata_direct_with_timings(name)
+        .await
+        .unwrap()
+        .metadata;
+
+    assert_eq!(cached.latest_version_tag(), Some("1.0.0"));
+    assert_eq!(refreshed.latest_version_tag(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn proxy_only_release_times_never_fall_back_to_direct_npm() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let name = "private-release-times";
+    Mock::given(method("GET"))
+        .and(path("/api/registry/private-release-times"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/private-release-times"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "time": { "1.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .expect(0)
+        .mount(&npm)
+        .await;
+    let client = RegistryClient::new()
+        .with_base_url(worker.uri())
+        .with_npm_registry_url(npm.uri())
+        .with_cache_dir(None);
+
+    let result = client.get_npm_release_times_proxy_only(name).await;
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn lpm_metadata_cache_is_isolated_by_bearer_principal() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let name = "@lpm.dev/test.principal-cache";
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.principal-cache"))
+        .and(header("authorization", "Bearer principal-a"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "1.0.0")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.principal-cache"))
+        .and(header("authorization", "Bearer principal-b"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "2.0.0")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client_a = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("principal-a")
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let client_b = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("principal-b")
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let package = PackageName::parse(name).unwrap();
+
+    let first = client_a.get_package_metadata(&package).await.unwrap();
+    let second = client_b.get_package_metadata(&package).await.unwrap();
+
+    assert_eq!(first.latest_version_tag(), Some("1.0.0"));
+    assert_eq!(second.latest_version_tag(), Some("2.0.0"));
+}
+
+#[tokio::test]
+async fn lpm_metadata_cache_is_isolated_by_registry_origin() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let first_server = MockServer::start().await;
+    let second_server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let name = "@lpm.dev/test.origin-cache";
+
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.origin-cache"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "1.0.0")),
+        )
+        .expect(1)
+        .mount(&first_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.origin-cache"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(test_metadata_json_version(name, "2.0.0")),
+        )
+        .expect(1)
+        .mount(&second_server)
+        .await;
+
+    let first_client = RegistryClient::new()
+        .with_base_url(first_server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let second_client = RegistryClient::new()
+        .with_base_url(second_server.uri())
+        .with_cache_dir(Some(tmp.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let package = PackageName::parse(name).unwrap();
+
+    let first = first_client.get_package_metadata(&package).await.unwrap();
+    let second = second_client.get_package_metadata(&package).await.unwrap();
+
+    assert_eq!(first.latest_version_tag(), Some("1.0.0"));
+    assert_eq!(second.latest_version_tag(), Some("2.0.0"));
 }
 
 #[tokio::test]
@@ -1823,7 +2376,8 @@ async fn command_scoped_metadata_cache_keeps_direct_registry_origins_isolated() 
     Mock::given(method("GET"))
         .and(path(format!("/{package}")))
         .respond_with(
-            ResponseTemplate::new(200).set_body_string(test_metadata_json("first-registry-result")),
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_version(package, "1.0.0")),
         )
         .expect(1)
         .mount(&first_registry)
@@ -1832,7 +2386,7 @@ async fn command_scoped_metadata_cache_keeps_direct_registry_origins_isolated() 
         .and(path(format!("/{package}")))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_string(test_metadata_json("second-registry-result")),
+                .set_body_string(test_metadata_json_version(package, "2.0.0")),
         )
         .expect(1)
         .mount(&second_registry)
@@ -1850,8 +2404,8 @@ async fn command_scoped_metadata_cache_keeps_direct_registry_origins_isolated() 
     let first_result = first.get_npm_metadata_direct(package).await.unwrap();
     let second_result = second.get_npm_metadata_direct(package).await.unwrap();
 
-    assert_eq!(first_result.name, "first-registry-result");
-    assert_eq!(second_result.name, "second-registry-result");
+    assert_eq!(first_result.latest_version_tag(), Some("1.0.0"));
+    assert_eq!(second_result.latest_version_tag(), Some("2.0.0"));
 }
 
 #[tokio::test]
@@ -1909,7 +2463,7 @@ async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
     );
     assert!(
         client
-            .read_metadata_cache(&format!("npm-version:{pkg}@{version}"))
+            .read_metadata_cache(&client.npm_direct_version_metadata_cache_key(pkg, version))
             .is_some(),
         "version document should use a cache key separate from npm:{pkg}"
     );
@@ -2021,7 +2575,7 @@ async fn get_npm_version_metadata_direct_refetches_wrong_cached_version_document
         .with_synchronous_cache_writes(true);
     client.cache_dir = Some(tmp.path().to_path_buf());
     client.write_metadata_cache(
-        &format!("npm-version:{pkg}@{version}"),
+        &client.npm_direct_version_metadata_cache_key(pkg, version),
         &test_metadata("some-other-package"),
         None,
     );

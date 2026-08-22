@@ -53,7 +53,7 @@ mod prelude {
     };
     #[allow(unused_imports)]
     pub(super) use super::global::{
-        AggregateLookup, AggregateRowKey, GROUP_AUTO_THRESHOLD,
+        AggregateLookup, AggregateRowKey, ApprovalProvenanceContext, GROUP_AUTO_THRESHOLD,
         global_blocked_set_incomplete_error, group_remaining_rows_by_origin,
         lookup_aggregate_by_arg, print_global_list, rerun_next_step_json, run_global_bulk_yes,
         run_global_named, union_origins,

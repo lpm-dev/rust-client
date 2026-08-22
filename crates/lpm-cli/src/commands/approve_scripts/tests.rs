@@ -48,6 +48,27 @@ fn scoped_lpm_home_with_security(path: &Path) -> crate::test_env::ScopedEnv {
     crate::test_env::ScopedEnv::set(vars)
 }
 
+async fn run(
+    project_dir: &Path,
+    package: Option<&str>,
+    yes: bool,
+    list: bool,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let registry = lpm_registry::RegistryClient::new();
+    super::project::run(
+        &registry,
+        project_dir,
+        package,
+        yes,
+        list,
+        dry_run,
+        json_output,
+    )
+    .await
+}
+
 struct RawEnvRestore {
     key: &'static str,
     value: Option<OsString>,
@@ -2295,8 +2316,11 @@ async fn run_global_named_surfaces_bare_name_ambiguity_with_candidates() {
         "esbuild",
         false,
         true,
-        &policy,
-        EnforceMode::Deny,
+        ApprovalProvenanceContext::new(
+            &lpm_registry::RegistryClient::new(),
+            &policy,
+            EnforceMode::Deny,
+        ),
     )
     .await
     .unwrap_err();
@@ -2362,9 +2386,19 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
     };
     // JSON mode so no interactive prompts and output goes to stdout.
     let policy = deny_verify_policy();
-    run_global_bulk_yes(&root, &agg, false, true, &policy, EnforceMode::Deny)
-        .await
-        .unwrap();
+    run_global_bulk_yes(
+        &root,
+        &agg,
+        false,
+        true,
+        ApprovalProvenanceContext::new(
+            &lpm_registry::RegistryClient::new(),
+            &policy,
+            EnforceMode::Deny,
+        ),
+    )
+    .await
+    .unwrap();
     let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
     assert!(trust.trusted.contains_key("esbuild@0.25.1"));
     assert!(trust.trusted.contains_key("sharp@0.33.0"));
@@ -2391,8 +2425,11 @@ async fn run_global_named_approves_only_the_matched_row() {
         "sharp",
         false,
         true,
-        &policy,
-        EnforceMode::Deny,
+        ApprovalProvenanceContext::new(
+            &lpm_registry::RegistryClient::new(),
+            &policy,
+            EnforceMode::Deny,
+        ),
     )
     .await
     .unwrap();
@@ -2418,8 +2455,11 @@ async fn run_global_named_errors_for_unknown_package() {
         "ghost",
         false,
         true,
-        &policy,
-        EnforceMode::Deny,
+        ApprovalProvenanceContext::new(
+            &lpm_registry::RegistryClient::new(),
+            &policy,
+            EnforceMode::Deny,
+        ),
     )
     .await
     .unwrap_err();
@@ -2434,9 +2474,17 @@ async fn run_global_named_errors_for_unknown_package() {
 async fn run_global_rejects_list_plus_yes() {
     let tmp = std::env::temp_dir();
     let _env = scoped_lpm_home(&tmp);
-    let err = run_global(None, true, true, false, false, true)
-        .await
-        .unwrap_err();
+    let err = run_global(
+        &lpm_registry::RegistryClient::new(),
+        None,
+        true,
+        true,
+        false,
+        false,
+        true,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("conflicts with `--yes`"));
 }
 
@@ -2451,9 +2499,17 @@ async fn run_global_grouped_interactive_path_is_reachable() {
         vec![row("esbuild", "0.25.1", &["eslint"])],
     );
     let _env = scoped_lpm_home(tmp.path());
-    let err = run_global(None, false, false, true, false, true)
-        .await
-        .unwrap_err();
+    let err = run_global(
+        &lpm_registry::RegistryClient::new(),
+        None,
+        false,
+        false,
+        true,
+        false,
+        true,
+    )
+    .await
+    .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("needs a TTY for the interactive walk"));
 }
@@ -2660,8 +2716,11 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             "esbuild@0.25.1",
             false,
             true,
-            &policy,
-            EnforceMode::Deny,
+            ApprovalProvenanceContext::new(
+                &lpm_registry::RegistryClient::new(),
+                &policy,
+                EnforceMode::Deny,
+            ),
         )
         .await
     });
@@ -2674,8 +2733,11 @@ async fn global_named_approvals_do_not_clobber_each_other() {
             "sharp@0.33.0",
             false,
             true,
-            &policy,
-            EnforceMode::Deny,
+            ApprovalProvenanceContext::new(
+                &lpm_registry::RegistryClient::new(),
+                &policy,
+                EnforceMode::Deny,
+            ),
         )
         .await
     });

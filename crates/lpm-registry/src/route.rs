@@ -47,6 +47,7 @@ pub struct WorkspaceResolutionKey {
     default_registry: Option<String>,
     scope_registries: Vec<(String, String)>,
     credentialed_origins: Vec<(OriginKey, [u8; 32])>,
+    package_route_overrides: Vec<(String, RouteMode)>,
 }
 
 /// The concrete upstream selected for a single package.
@@ -122,6 +123,7 @@ impl RouteMode {
 pub struct RouteTable {
     mode: RouteMode,
     npmrc: Arc<NpmrcConfig>,
+    package_route_overrides: Arc<std::collections::HashMap<String, RouteMode>>,
 }
 
 impl RouteTable {
@@ -148,6 +150,7 @@ impl RouteTable {
         Ok(Self {
             mode,
             npmrc: Arc::new(npmrc),
+            package_route_overrides: Arc::new(std::collections::HashMap::new()),
         })
     }
 
@@ -161,7 +164,17 @@ impl RouteTable {
         Self {
             mode,
             npmrc: Arc::new(npmrc),
+            package_route_overrides: Arc::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Pin package routes that were already validated earlier in one command.
+    pub fn with_package_route_overrides(
+        mut self,
+        overrides: std::collections::HashMap<String, RouteMode>,
+    ) -> Self {
+        self.package_route_overrides = Arc::new(overrides);
+        self
     }
 
     /// Production builder: read `RouteMode` from env, walk the four
@@ -196,6 +209,9 @@ impl RouteTable {
     pub fn route_for_package(&self, name: &str) -> UpstreamRoute {
         if name.starts_with("@lpm.dev/") {
             return UpstreamRoute::LpmWorker;
+        }
+        if let Some(mode) = self.package_route_overrides.get(name) {
+            return mode.route_for_package(name);
         }
         if let Some(target) = self.npmrc_scope_target_for_package(name) {
             let auth = self.npmrc.auth_for_url(&target.base_url).cloned();
@@ -318,6 +334,12 @@ impl RouteTable {
                 .cmp(&right.0.host_lower)
                 .then_with(|| left.0.port.cmp(&right.0.port))
         });
+        let mut package_route_overrides = self
+            .package_route_overrides
+            .iter()
+            .map(|(name, mode)| (name.clone(), *mode))
+            .collect::<Vec<_>>();
+        package_route_overrides.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         Some(WorkspaceResolutionKey {
             mode: self.mode,
             default_registry: self
@@ -327,6 +349,7 @@ impl RouteTable {
                 .map(|target| target.base_url.to_string()),
             scope_registries,
             credentialed_origins,
+            package_route_overrides,
         })
     }
 
@@ -470,6 +493,26 @@ mod tests {
         );
         assert_eq!(
             RouteMode::Proxy.route_for_package("@types/node"),
+            UpstreamRoute::LpmWorker
+        );
+    }
+
+    #[test]
+    fn package_route_override_preserves_planning_source() {
+        let table = RouteTable::from_mode_only(RouteMode::Proxy).with_package_route_overrides(
+            std::collections::HashMap::from([("planned-public".to_string(), RouteMode::Direct)]),
+        );
+
+        assert_eq!(
+            table.route_for_package("planned-public"),
+            UpstreamRoute::NpmDirect
+        );
+        assert_eq!(
+            table.route_for_package("unplanned-proxy"),
+            UpstreamRoute::LpmWorker
+        );
+        assert_eq!(
+            table.route_for_package("@lpm.dev/owner.package"),
             UpstreamRoute::LpmWorker
         );
     }

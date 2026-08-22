@@ -159,6 +159,31 @@ pub(super) fn principal_fingerprint(
     format!("principal-{}", &hash[..16])
 }
 
+pub(super) fn bearer_principal_fingerprint(
+    bearer: Option<&str>,
+    identity_fp: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    let mut tagged = false;
+    if let Some(bearer) = bearer.filter(|value| !value.is_empty()) {
+        hasher.update(b"b:");
+        hasher.update(bearer.as_bytes());
+        tagged = true;
+    }
+    if let Some(identity_fp) = identity_fp {
+        hasher.update(b"i:");
+        hasher.update(identity_fp.as_bytes());
+        tagged = true;
+    }
+    if !tagged {
+        return "anon".to_string();
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    format!("principal-{}", &hash[..16])
+}
+
 /// SHA-256 truncated fingerprint of a cert PEM blob — used as the
 /// `identity_fp` input to [`principal_fingerprint`]. Hashing happens
 /// once at client-build time; the resulting `Arc<str>` rides along

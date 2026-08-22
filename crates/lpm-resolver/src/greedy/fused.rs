@@ -136,6 +136,60 @@ mod shared_metadata_concurrency_tests {
         assert!(result.is_ok());
         assert_eq!(telemetry.semaphore_wait_count.load(Ordering::Relaxed), 0);
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_memory_cache_hit_completes_without_metadata_permit() {
+        let package = "@lpm.dev/shared-memory-cache";
+        let metadata = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "name": package,
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": package,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/shared-memory-cache.tgz",
+                            "integrity": "sha512-shared-memory-cache"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_cache_dir(None)
+                .clone_with_metadata_memory_cache(),
+        );
+        assert!(client.seed_metadata_for_command(package, &UpstreamRoute::LpmWorker, metadata,));
+        let metadata_sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut jobs = MetadataFetchScheduler::new(Arc::clone(&metadata_sem));
+
+        spawn_metadata_fetch_job(&mut jobs, &dispatch, CanonicalKey::npm(package), false);
+        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            jobs.join_next()
+                .await
+                .expect("metadata job")
+                .expect("metadata task")
+        })
+        .await
+        .expect("memory-cache hit should not wait for a permit");
+
+        assert!(result.is_ok());
+        assert_eq!(telemetry.semaphore_wait_count.load(Ordering::Relaxed), 0);
+    }
 }
 
 struct FusedTreeProvider<'a> {
@@ -559,11 +613,8 @@ impl MetadataFetchScheduler {
         let policy = dispatch.policy.clone();
         if !dispatch.trace_metadata_fetches
             && let CanonicalKey::Npm { name } = &canonical
-            && matches!(
-                route_table.route_for_package(name),
-                UpstreamRoute::NpmDirect
-            )
-            && let Some(metadata) = client.npm_metadata_direct_memory_cache(name)
+            && let route = route_table.route_for_package(name)
+            && let Some(metadata) = client.npm_metadata_memory_cache(name, &route)
             && let Some(fetched) = parse_cached_metadata_for_resolver(
                 &metadata,
                 &canonical,
@@ -1245,6 +1296,34 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let mut worker_batch_stream_package_specs: Vec<(String, String)> = Vec::new();
     let mut worker_stream_can_batch_waiting = false;
     let mut worker_stream_waiting: AHashSet<CanonicalKey> = AHashSet::with_capacity(npm_fanout);
+
+    let mut seeded_root_names = AHashSet::with_capacity(state.root_deps.len());
+    for (local_name, range) in &state.root_deps {
+        let name = crate::ranges::parse_npm_alias(range)
+            .map_or_else(|| local_name.clone(), |alias| alias.target);
+        if !seeded_root_names.insert(name.clone()) {
+            continue;
+        }
+        let route = route_table.route_for_package(&name);
+        let Some(metadata) = client.npm_metadata_memory_cache(&name, &route) else {
+            continue;
+        };
+        let canonical = CanonicalKey::from_dep_name(&name);
+        let fetched = parse_fetched_metadata(
+            metadata.as_ref().clone(),
+            spec_tx.is_some(),
+            trace_metadata_fetches,
+        );
+        let FetchedMetadata {
+            speculation, info, ..
+        } = fetched;
+        insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), info);
+        if let (Some(tx), Some(speculation)) = (spec_tx.as_ref(), speculation)
+            && tx.try_send((canonical.to_string(), speculation)).is_ok()
+        {
+            tarball_dispatched_count += 1;
+        }
+    }
 
     // Pre-batch root deps routed through the LPM Worker in one round trip
     // before the main fetch loop. Without this, each such dep would

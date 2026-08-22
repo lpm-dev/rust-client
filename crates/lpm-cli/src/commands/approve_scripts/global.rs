@@ -8,6 +8,27 @@ use super::prelude::*;
 /// top-level globally-installed package instead of per-dep.
 pub const GROUP_AUTO_THRESHOLD: usize = 10;
 
+#[derive(Clone, Copy)]
+pub(super) struct ApprovalProvenanceContext<'a> {
+    registry: &'a lpm_registry::RegistryClient,
+    verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
+    runtime_enforce: crate::provenance_fetch::EnforceMode,
+}
+
+impl<'a> ApprovalProvenanceContext<'a> {
+    pub(super) fn new(
+        registry: &'a lpm_registry::RegistryClient,
+        verify_policy: &'a crate::provenance_fetch::VerifyPolicy,
+        runtime_enforce: crate::provenance_fetch::EnforceMode,
+    ) -> Self {
+        Self {
+            registry,
+            verify_policy,
+            runtime_enforce,
+        }
+    }
+}
+
 /// Global-scope approve-scripts entry point. Mirrors [`run`] but sources
 /// the blocked set from [`crate::global_blocked_set`] and persists
 /// approvals to `~/.lpm/global/trusted-dependencies.json` instead of
@@ -27,6 +48,7 @@ pub const GROUP_AUTO_THRESHOLD: usize = 10;
 /// when the effective set exceeds [`GROUP_AUTO_THRESHOLD`] and the caller
 /// didn't explicitly set it.
 pub async fn run_global(
+    registry: &lpm_registry::RegistryClient,
     package: Option<&str>,
     yes: bool,
     list: bool,
@@ -37,12 +59,13 @@ pub async fn run_global(
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
     lpm_common::with_shared_lock_async(
         lock_path,
-        run_global_under_store_lock(package, yes, list, group, dry_run, json_output),
+        run_global_under_store_lock(registry, package, yes, list, group, dry_run, json_output),
     )
     .await
 }
 
 async fn run_global_under_store_lock(
+    registry: &lpm_registry::RegistryClient,
     package: Option<&str>,
     yes: bool,
     list: bool,
@@ -145,6 +168,7 @@ async fn run_global_under_store_lock(
 
     let (verify_policy, runtime_sigstore_source) = runtime_verify_policy_with_source();
     let runtime_enforce = verify_policy.enforce;
+    let provenance = ApprovalProvenanceContext::new(registry, &verify_policy, runtime_enforce);
     if !dry_run {
         crate::security_approval::ensure_runtime_sigstore_posture_for_global(
             json_output,
@@ -155,29 +179,12 @@ async fn run_global_under_store_lock(
 
     // ── Named-package approval path ───────────────────────────────
     if let Some(arg) = package {
-        return run_global_named(
-            &root,
-            &aggregate,
-            arg,
-            dry_run,
-            json_output,
-            &verify_policy,
-            runtime_enforce,
-        )
-        .await;
+        return run_global_named(&root, &aggregate, arg, dry_run, json_output, provenance).await;
     }
 
     // ── Bulk-approve mode ─────────────────────────────────────────
     if yes {
-        return run_global_bulk_yes(
-            &root,
-            &aggregate,
-            dry_run,
-            json_output,
-            &verify_policy,
-            runtime_enforce,
-        )
-        .await;
+        return run_global_bulk_yes(&root, &aggregate, dry_run, json_output, provenance).await;
     }
 
     // ── Interactive walk ──────────────────────────────────────────
@@ -200,8 +207,7 @@ async fn run_global_under_store_lock(
         effective_group,
         dry_run,
         json_output,
-        &verify_policy,
-        runtime_enforce,
+        provenance,
     )
     .await
 }
@@ -443,8 +449,7 @@ pub(super) async fn run_global_bulk_yes(
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
     dry_run: bool,
     json_output: bool,
-    verify_policy: &crate::provenance_fetch::VerifyPolicy,
-    runtime_enforce: crate::provenance_fetch::EnforceMode,
+    provenance_context: ApprovalProvenanceContext<'_>,
 ) -> Result<(), LpmError> {
     // Refuse global `--yes` for any aggregate row classified outside
     // the green tier — parity with the project `--yes` gate. The gate
@@ -466,8 +471,12 @@ pub(super) async fn run_global_bulk_yes(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance =
-        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        provenance_context.registry,
+        &pairs,
+        provenance_context.verify_policy,
+    )
+    .await;
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
     // so a verifier rejection (which returns
@@ -480,7 +489,12 @@ pub(super) async fn run_global_bulk_yes(
     let mut row_snapshots: Vec<(usize, Option<ProvenanceSnapshot>)> =
         Vec::with_capacity(aggregate.rows.len());
     for (idx, row) in aggregate.rows.iter().enumerate() {
-        let snap = snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
+        let snap = snapshot_for_binding(
+            &provenance,
+            &row.name,
+            &row.version,
+            provenance_context.runtime_enforce,
+        )?;
         row_snapshots.push((idx, snap));
     }
 
@@ -619,8 +633,7 @@ pub(super) async fn run_global_named(
     arg: &str,
     dry_run: bool,
     json_output: bool,
-    verify_policy: &crate::provenance_fetch::VerifyPolicy,
-    runtime_enforce: crate::provenance_fetch::EnforceMode,
+    provenance_context: ApprovalProvenanceContext<'_>,
 ) -> Result<(), LpmError> {
     // Bare-name lookup must refuse silently-picking-first when multiple
     // rows match. Aggregate rows are deduped
@@ -667,9 +680,18 @@ pub(super) async fn run_global_named(
     // SILENT-DROP fix: `?` propagates a verifier rejection
     // BEFORE acquiring the lock, leaving any prior binding intact.
     let pairs = vec![(row.name.clone(), row.version.clone())];
-    let provenance =
-        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
-    let snap = snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        provenance_context.registry,
+        &pairs,
+        provenance_context.verify_policy,
+    )
+    .await;
+    let snap = snapshot_for_binding(
+        &provenance,
+        &row.name,
+        &row.version,
+        provenance_context.runtime_enforce,
+    )?;
 
     let lock_path = root.global_tx_lock();
     let root_for_body = root;
@@ -965,8 +987,7 @@ pub(super) async fn run_global_interactive(
     group: bool,
     dry_run: bool,
     _json_output: bool,
-    verify_policy: &crate::provenance_fetch::VerifyPolicy,
-    runtime_enforce: crate::provenance_fetch::EnforceMode,
+    provenance_context: ApprovalProvenanceContext<'_>,
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
 
@@ -979,8 +1000,12 @@ pub(super) async fn run_global_interactive(
         .iter()
         .map(|r| (r.name.clone(), r.version.clone()))
         .collect();
-    let provenance =
-        crate::provenance_fetch::fetch_provenance_for_pkgs(&pairs, verify_policy).await;
+    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
+        provenance_context.registry,
+        &pairs,
+        provenance_context.verify_policy,
+    )
+    .await;
 
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
@@ -1051,7 +1076,7 @@ pub(super) async fn run_global_interactive(
                             &provenance,
                             &row.name,
                             &row.version,
-                            runtime_enforce,
+                            provenance_context.runtime_enforce,
                         )?;
                         commit_global_approval(root, row, snap, dry_run).await?;
                         approved.push(*row);
@@ -1093,7 +1118,7 @@ pub(super) async fn run_global_interactive(
                                     &provenance,
                                     &row.name,
                                     &row.version,
-                                    runtime_enforce,
+                                    provenance_context.runtime_enforce,
                                 )?;
                                 commit_global_approval(root, row, snap, dry_run).await?;
                                 approved.push(row);
@@ -1177,8 +1202,12 @@ pub(super) async fn run_global_interactive(
         match choice {
             "approve" => {
                 // SILENT-DROP fix.
-                let snap =
-                    snapshot_for_binding(&provenance, &row.name, &row.version, runtime_enforce)?;
+                let snap = snapshot_for_binding(
+                    &provenance,
+                    &row.name,
+                    &row.version,
+                    provenance_context.runtime_enforce,
+                )?;
                 // per-row write goes through `commit_global_approval`,
                 // which acquires the global tx lock and re-reads trust
                 // from disk so the commit is race-safe against parallel

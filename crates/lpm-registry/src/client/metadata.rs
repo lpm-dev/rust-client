@@ -36,10 +36,53 @@ struct NdjsonBatchEntry {
     metadata: PackageMetadata,
 }
 
+#[derive(serde::Deserialize)]
+struct JsonBatchResponse {
+    packages: Option<LenientJsonBatchPackages>,
+}
+
+struct LenientJsonBatchPackages(Vec<(String, PackageMetadata)>);
+
+impl<'de> serde::Deserialize<'de> for LenientJsonBatchPackages {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PackagesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PackagesVisitor {
+            type Value = LenientJsonBatchPackages;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a map of package names to metadata")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut packages = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(name) = map.next_key::<String>()? {
+                    let value = map.next_value::<serde_json::Value>()?;
+                    if let Ok(metadata) = serde_json::from_value(value) {
+                        packages.push((name, metadata));
+                    }
+                }
+                Ok(LenientJsonBatchPackages(packages))
+            }
+        }
+
+        deserializer.deserialize_map(PackagesVisitor)
+    }
+}
+
 struct NdjsonBatchEntryStream {
     response: reqwest::Response,
     cache_entries: bool,
+    cache_principal: String,
+    allowed_names: Option<std::collections::HashSet<String>>,
     buffer: Vec<u8>,
+    consumed: usize,
     scan_from: usize,
     bytes_read: u64,
     chunks_read: u64,
@@ -51,7 +94,12 @@ struct NdjsonBatchEntryStream {
 }
 
 impl NdjsonBatchEntryStream {
-    fn new(response: reqwest::Response, cache_entries: bool) -> Result<Self, LpmError> {
+    fn new(
+        response: reqwest::Response,
+        cache_entries: bool,
+        cache_principal: String,
+        allowed_names: Option<std::collections::HashSet<String>>,
+    ) -> Result<Self, LpmError> {
         if let Some(declared) = response.content_length()
             && declared as usize > MAX_METADATA_BYTES
         {
@@ -62,7 +110,10 @@ impl NdjsonBatchEntryStream {
         Ok(Self {
             response,
             cache_entries,
+            cache_principal,
+            allowed_names,
             buffer: Vec::new(),
+            consumed: 0,
             scan_from: 0,
             bytes_read: 0,
             chunks_read: 0,
@@ -86,6 +137,7 @@ impl NdjsonBatchEntryStream {
                 self.record_finished();
                 return Ok(None);
             }
+            self.compact_consumed_buffer();
             match self.response.chunk().await {
                 Ok(None) => {
                     self.finished = true;
@@ -128,15 +180,15 @@ impl NdjsonBatchEntryStream {
     ) -> Result<Option<(String, PackageMetadata)>, LpmError> {
         loop {
             if self.finished {
-                if !self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                let remaining = &self.buffer[self.consumed..];
+                if !remaining.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    self.consumed = self.buffer.len();
                     return Ok(None);
                 }
-                let line_bytes = std::mem::take(&mut self.buffer);
-                let line = match std::str::from_utf8(&line_bytes) {
-                    Ok(line) => line,
-                    Err(_) => return Ok(None),
-                };
-                return Ok(self.parse_entry_line(client, line));
+                let start = self.consumed;
+                let end = self.buffer.len();
+                self.consumed = end;
+                return self.parse_entry_bytes(client, start, end, false);
             }
 
             let search_slice = &self.buffer[self.scan_from..];
@@ -145,50 +197,79 @@ impl NdjsonBatchEntryStream {
                 return Ok(None);
             };
             let newline_pos = self.scan_from + rel_pos;
-            let line = std::str::from_utf8(&self.buffer[..newline_pos])
-                .map_err(|e| LpmError::Registry(format!("NDJSON UTF-8 error: {e}")))?
-                .to_string();
-            self.buffer.drain(..newline_pos + 1);
-            self.scan_from = 0;
-            if line.is_empty() {
+            let line_start = self.consumed;
+            self.consumed = newline_pos + 1;
+            self.scan_from = self.consumed;
+            if line_start == newline_pos {
                 continue;
             }
-            if let Some(entry) = self.parse_entry_line(client, &line) {
+            if let Some(entry) = self.parse_entry_bytes(client, line_start, newline_pos, true)? {
                 return Ok(Some(entry));
             }
         }
     }
 
-    fn parse_entry_line(
+    fn compact_consumed_buffer(&mut self) {
+        if self.consumed == 0 {
+            return;
+        }
+        let remaining = self.buffer.len() - self.consumed;
+        self.buffer.copy_within(self.consumed.., 0);
+        self.buffer.truncate(remaining);
+        self.scan_from = self.scan_from.saturating_sub(self.consumed);
+        self.consumed = 0;
+    }
+
+    fn parse_entry_bytes(
         &mut self,
         client: &RegistryClient,
-        line: &str,
-    ) -> Option<(String, PackageMetadata)> {
+        start: usize,
+        end: usize,
+        invalid_utf8_is_error: bool,
+    ) -> Result<Option<(String, PackageMetadata)>, LpmError> {
         let parse_start = std::time::Instant::now();
+        let line = match std::str::from_utf8(&self.buffer[start..end]) {
+            Ok(line) => line,
+            Err(error) if invalid_utf8_is_error => {
+                return Err(LpmError::Registry(format!("NDJSON UTF-8 error: {error}")));
+            }
+            Err(_) => return Ok(None),
+        };
         let parsed: Option<NdjsonBatchEntry> = serde_json::from_str(line).ok();
         let parse_elapsed = parse_start.elapsed();
         self.json_parse_ns += parse_elapsed.as_nanos();
         crate::timing::record_parse(parse_elapsed);
 
-        let entry = parsed?;
+        let Some(entry) = parsed else {
+            return Ok(None);
+        };
         let name = entry.name;
         let meta = entry.metadata;
+        if self
+            .allowed_names
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&name))
+        {
+            tracing::debug!("skipping unrequested NDJSON metadata entry: {name}");
+            return Ok(None);
+        }
         if !batch_metadata_entry_matches_name(&name, &meta) {
             tracing::debug!(
                 "skipping NDJSON metadata entry with mismatched package name: requested {name}, metadata {}",
                 meta.name
             );
-            return None;
+            return Ok(None);
         }
 
         if self.cache_entries {
-            let cache_key = batch_metadata_cache_key(&name);
+            let cache_key =
+                client.batch_metadata_cache_key_for_principal(&name, &self.cache_principal);
             let write_start = std::time::Instant::now();
             client.write_metadata_cache(&cache_key, &meta, None);
             self.cache_write_ns += write_start.elapsed().as_nanos();
         }
         self.received += 1;
-        Some((name, meta))
+        Ok(Some((name, meta)))
     }
 
     fn record_finished(&mut self) {
@@ -247,12 +328,16 @@ impl BatchMetadataEntryStream<'_> {
         response: reqwest::Response,
         rpc_start: std::time::Instant,
         cache_entries: bool,
+        cache_principal: String,
+        allowed_names: Option<std::collections::HashSet<String>>,
     ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
         Ok(BatchMetadataEntryStream {
             client,
             inner: BatchMetadataEntryStreamInner::Ndjson(Box::new(NdjsonBatchEntryStream::new(
                 response,
                 cache_entries,
+                cache_principal,
+                allowed_names,
             )?)),
             rpc_start,
             rpc_recorded: false,
@@ -287,16 +372,8 @@ impl Drop for BatchMetadataEntryStream<'_> {
     }
 }
 
-fn batch_metadata_cache_key(name: &str) -> String {
-    if name.starts_with("@lpm.dev/") {
-        format!("lpm:{name}")
-    } else {
-        format!("npm:{name}")
-    }
-}
-
 fn batch_metadata_entry_matches_name(name: &str, meta: &PackageMetadata) -> bool {
-    meta.name == name || meta.versions.values().any(|version| version.name == name)
+    meta.name == name && meta.versions.values().all(|version| version.name == name)
 }
 
 fn merge_batch_package_metadata(existing: &mut PackageMetadata, incoming: PackageMetadata) {
@@ -340,6 +417,145 @@ fn highest_metadata_version(
 }
 
 impl RegistryClient {
+    fn metadata_cache_key_for_origin(
+        &self,
+        namespace: &str,
+        registry_url: &str,
+        name: &str,
+        bearer: Option<&str>,
+    ) -> String {
+        let principal =
+            bearer_principal_fingerprint(bearer, self.http.identity_fp_for_url(registry_url));
+        Self::metadata_cache_key_for_principal(namespace, registry_url, &principal, name)
+    }
+
+    fn metadata_cache_key_for_principal(
+        namespace: &str,
+        registry_url: &str,
+        principal: &str,
+        name: &str,
+    ) -> String {
+        use std::fmt::Write as _;
+
+        let mut key = String::with_capacity(
+            namespace.len() + registry_url.len() + principal.len() + name.len() + 32,
+        );
+        write!(key, "{namespace}:{}:", registry_url.len())
+            .expect("writing registry length to a String cannot fail");
+        key.push_str(registry_url);
+        key.push(':');
+        key.push_str(principal);
+        key.push(':');
+        key.push_str(name);
+        key
+    }
+
+    pub(super) fn lpm_metadata_cache_key(&self, name: &str) -> Result<String, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+        Ok(self.metadata_cache_key_for_origin("lpm", &self.base_url, name, bearer.as_deref()))
+    }
+
+    pub(super) fn npm_worker_metadata_cache_key(&self, name: &str) -> Result<String, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+        Ok(self.metadata_cache_key_for_origin(
+            "npm-worker",
+            &self.base_url,
+            name,
+            bearer.as_deref(),
+        ))
+    }
+
+    pub(super) fn npm_direct_metadata_cache_key(&self, name: &str) -> String {
+        self.metadata_cache_key_for_origin("npm-direct", &self.npm_registry_url, name, None)
+    }
+
+    pub(super) fn npm_direct_version_metadata_cache_key(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> String {
+        let mut document = String::with_capacity(name.len() + version.len() + 1);
+        document.push_str(name);
+        document.push('@');
+        document.push_str(version);
+        self.metadata_cache_key_for_origin(
+            "npm-direct-version",
+            &self.npm_registry_url,
+            &document,
+            None,
+        )
+    }
+
+    pub(super) fn npm_worker_full_metadata_cache_key(
+        &self,
+        name: &str,
+    ) -> Result<String, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+        Ok(self.metadata_cache_key_for_origin(
+            "npm-worker-full",
+            &self.base_url,
+            name,
+            bearer.as_deref(),
+        ))
+    }
+
+    pub(super) fn npm_direct_full_metadata_cache_key(&self, name: &str) -> String {
+        self.metadata_cache_key_for_origin("npm-direct-full", &self.npm_registry_url, name, None)
+    }
+
+    pub(super) fn npm_worker_release_times_cache_key(
+        &self,
+        name: &str,
+    ) -> Result<String, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+        Ok(self.metadata_cache_key_for_origin(
+            "npm-worker-release-times",
+            &self.base_url,
+            name,
+            bearer.as_deref(),
+        ))
+    }
+
+    pub(super) fn npm_direct_release_times_cache_key(&self, name: &str) -> String {
+        self.metadata_cache_key_for_origin(
+            "npm-direct-release-times",
+            &self.npm_registry_url,
+            name,
+            None,
+        )
+    }
+
+    pub(super) fn batch_metadata_cache_key(&self, name: &str) -> Option<String> {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired).ok()?;
+        let principal = bearer_principal_fingerprint(
+            bearer.as_deref(),
+            self.http.identity_fp_for_url(&self.base_url),
+        );
+        Some(self.batch_metadata_cache_key_for_principal(name, &principal))
+    }
+
+    fn batch_metadata_cache_key_for_principal(&self, name: &str, principal: &str) -> String {
+        if name.starts_with("@lpm.dev/") {
+            Self::metadata_cache_key_for_principal("lpm", &self.base_url, principal, name)
+        } else {
+            Self::metadata_cache_key_for_principal("npm-worker", &self.base_url, principal, name)
+        }
+    }
+
+    fn validate_package_metadata_identity(
+        requested_name: &str,
+        metadata: PackageMetadata,
+        source: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        if batch_metadata_entry_matches_name(requested_name, &metadata) {
+            return Ok(metadata);
+        }
+        Err(LpmError::Registry(format!(
+            "{source} returned metadata for unexpected package '{}' when requesting '{requested_name}'",
+            metadata.name
+        )))
+    }
+
     pub(super) fn apply_worker_metadata_http_version(
         &self,
         req: reqwest::RequestBuilder,
@@ -398,18 +614,32 @@ impl RegistryClient {
         req
     }
 
+    #[cfg(test)]
     pub(super) async fn build_worker_metadata_get(
         &self,
         url: &str,
     ) -> Result<reqwest::RequestBuilder, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+        self.build_worker_metadata_get_with_bearer(url, bearer.as_deref())
+            .await
+    }
+
+    async fn build_worker_metadata_get_with_bearer(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, LpmError> {
         if let Some(client) = self.worker_metadata_http3_client_for(url).await? {
             let mut req = client.get(url);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
+            if let Some(bearer) = bearer {
                 req = req.bearer_auth(bearer);
             }
             return Ok(Self::apply_http3_request_version(req));
         }
-        let req = self.build_get(url).await?;
+        let mut req = self.http.for_url(url).await?.get(url);
+        if let Some(bearer) = bearer {
+            req = req.bearer_auth(bearer);
+        }
         Ok(self.apply_worker_metadata_http_version(req, url))
     }
 
@@ -442,6 +672,15 @@ impl RegistryClient {
             .map(str::to_string)
     }
 
+    fn identify_empty_metadata_not_found(name: &str, error: LpmError) -> LpmError {
+        match error {
+            LpmError::NotFound(detail) if detail.trim().is_empty() => LpmError::NotFound(format!(
+                "package '{name}' was not found in the npm registry"
+            )),
+            error => error,
+        }
+    }
+
     fn validate_release_time_metadata(
         name: &str,
         metadata: ReleaseTimeMetadata,
@@ -458,10 +697,10 @@ impl RegistryClient {
     async fn cached_release_times_from_metadata_cache(
         &self,
         name: &str,
+        metadata_cache_key: &str,
     ) -> Option<ReleaseTimeMetadata> {
-        let metadata_cache_key = format!("npm:{name}");
         let (cached, _etag) = self
-            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&metadata_cache_key)
+            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(metadata_cache_key)
             .await?;
         (cached.matches_package(name) && !cached.time.is_empty()).then_some(cached)
     }
@@ -498,19 +737,34 @@ impl RegistryClient {
         Ok(response)
     }
 
-    async fn send_worker_metadata_get(
+    async fn send_worker_metadata_get_scoped(
         &self,
         url: &str,
         accept: Option<&str>,
-        cache_validator: Option<&CacheValidator>,
-    ) -> Result<reqwest::Response, LpmError> {
+        namespace: &str,
+        name: &str,
+        use_validator: bool,
+    ) -> Result<(reqwest::Response, String), LpmError> {
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
-            let mut request = self.build_worker_metadata_get(url).await?;
+            let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+            let cache_key = self.metadata_cache_key_for_origin(
+                namespace,
+                &self.base_url,
+                name,
+                bearer.as_deref(),
+            );
+            let cache_validator = use_validator
+                .then(|| self.read_cache_validator(&cache_key))
+                .flatten();
+            let mut request = self
+                .build_worker_metadata_get_with_bearer(url, bearer.as_deref())
+                .await?;
             if let Some(accept) = accept {
                 request = request.header("Accept", accept);
             }
-            let request = Self::apply_cached_etag(request, cache_validator);
-            self.send_package_metadata_request(request).await
+            let request = Self::apply_cached_etag(request, cache_validator.as_ref());
+            let response = self.send_package_metadata_request(request).await?;
+            Ok((response, cache_key))
         })
         .await
     }
@@ -570,8 +824,27 @@ impl RegistryClient {
         &self,
         package_names: &[String],
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        self.batch_metadata_inner(package_names, false, &[], false, &[], None)
-            .await
+        let mut metadata = std::collections::HashMap::with_capacity(package_names.len());
+        let mut missing = Vec::with_capacity(package_names.len());
+        let mut seen = std::collections::HashSet::with_capacity(package_names.len());
+        for name in package_names {
+            if !seen.insert(name.as_str()) {
+                continue;
+            }
+            match self.npm_metadata_memory_cache(name, &crate::UpstreamRoute::LpmWorker) {
+                Some(cached) if batch_metadata_entry_matches_name(name, &cached) => {
+                    metadata.insert(name.clone(), cached.as_ref().clone());
+                }
+                _ => missing.push(name.clone()),
+            }
+        }
+        if !missing.is_empty() {
+            metadata.extend(
+                self.batch_metadata_inner(&missing, false, &[], false, &[], None)
+                    .await?,
+            );
+        }
+        Ok(metadata)
     }
 
     /// Batch fetch with deep transitive resolution.
@@ -630,6 +903,35 @@ impl RegistryClient {
         package_specs: &[(String, String)],
         release_age_cutoff_unix: Option<i64>,
     ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
+        self.batch_metadata_entry_stream_inner(
+            package_names,
+            true,
+            release_age_package_names,
+            release_age_all_packages,
+            package_specs,
+            release_age_cutoff_unix,
+        )
+        .await
+    }
+
+    /// Stream one shallow Worker batch response without retaining all packuments.
+    pub async fn batch_metadata_stream(
+        &self,
+        package_names: &[String],
+    ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
+        self.batch_metadata_entry_stream_inner(package_names, false, &[], false, &[], None)
+            .await
+    }
+
+    async fn batch_metadata_entry_stream_inner(
+        &self,
+        package_names: &[String],
+        deep: bool,
+        release_age_package_names: &[String],
+        release_age_all_packages: bool,
+        package_specs: &[(String, String)],
+        release_age_cutoff_unix: Option<i64>,
+    ) -> Result<BatchMetadataEntryStream<'_>, LpmError> {
         if package_names.is_empty() {
             return Ok(BatchMetadataEntryStream::json(
                 self,
@@ -640,16 +942,17 @@ impl RegistryClient {
         self.record_batch_metadata_request_packages(package_names);
         let body = Self::batch_metadata_request_body(
             package_names,
-            true,
+            deep,
             release_age_package_names,
             release_age_all_packages,
             package_specs,
             release_age_cutoff_unix,
         );
         let cache_batch_entries = package_specs.is_empty();
+        let allowed_names = (!deep).then(|| package_names.iter().cloned().collect());
         let rpc_start = std::time::Instant::now();
-        let response = match self.send_batch_metadata_response(&body).await {
-            Ok(response) => response,
+        let (response, cache_principal) = match self.send_batch_metadata_response(&body).await {
+            Ok(result) => result,
             Err(error) => {
                 crate::timing::record_rpc(rpc_start.elapsed());
                 return Err(error);
@@ -663,10 +966,22 @@ impl RegistryClient {
             .to_string();
 
         if content_type.contains("application/x-ndjson") {
-            BatchMetadataEntryStream::ndjson(self, response, rpc_start, cache_batch_entries)
+            BatchMetadataEntryStream::ndjson(
+                self,
+                response,
+                rpc_start,
+                cache_batch_entries,
+                cache_principal,
+                allowed_names,
+            )
         } else {
             let map = match self
-                .parse_json_batch_with_cache(response, cache_batch_entries)
+                .parse_json_batch_with_cache(
+                    response,
+                    cache_batch_entries,
+                    &cache_principal,
+                    allowed_names.as_ref(),
+                )
                 .await
             {
                 Ok(map) => map,
@@ -706,8 +1021,9 @@ impl RegistryClient {
         );
 
         let rpc_start = std::time::Instant::now();
+        let allowed_names = (!deep).then(|| package_names.iter().cloned().collect());
         let result = async {
-            let response = self.send_batch_metadata_response(&body).await?;
+            let (response, cache_principal) = self.send_batch_metadata_response(&body).await?;
             let content_type = response
                 .headers()
                 .get("content-type")
@@ -716,11 +1032,21 @@ impl RegistryClient {
                 .to_string();
 
             if content_type.contains("application/x-ndjson") {
-                self.parse_ndjson_batch_with_cache(response, package_specs.is_empty())
-                    .await
+                self.parse_ndjson_batch_with_cache(
+                    response,
+                    package_specs.is_empty(),
+                    cache_principal,
+                    allowed_names,
+                )
+                .await
             } else {
-                self.parse_json_batch_with_cache(response, package_specs.is_empty())
-                    .await
+                self.parse_json_batch_with_cache(
+                    response,
+                    package_specs.is_empty(),
+                    &cache_principal,
+                    allowed_names.as_ref(),
+                )
+                .await
             }
         }
         .await;
@@ -792,19 +1118,25 @@ impl RegistryClient {
     async fn send_batch_metadata_response(
         &self,
         body: &serde_json::Value,
-    ) -> Result<reqwest::Response, LpmError> {
+    ) -> Result<(reqwest::Response, String), LpmError> {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+            let cache_principal = bearer_principal_fingerprint(
+                bearer.as_deref(),
+                self.http.identity_fp_for_url(&self.base_url),
+            );
             let mut req = self
                 .build_worker_metadata_post(&url)
                 .await?
                 .header("Accept", "application/x-ndjson")
                 .json(&body);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
+            if let Some(bearer) = bearer {
                 req = req.bearer_auth(bearer);
             }
             let req = self.apply_worker_metadata_http_version(req, &url);
-            self.send_package_metadata_request(req).await
+            let response = self.send_package_metadata_request(req).await?;
+            Ok((response, cache_principal))
         })
         .await
     }
@@ -816,9 +1148,12 @@ impl RegistryClient {
         &self,
         response: reqwest::Response,
         cache_entries: bool,
+        cache_principal: String,
+        allowed_names: Option<std::collections::HashSet<String>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
         let mut map = std::collections::HashMap::new();
-        let mut entries = NdjsonBatchEntryStream::new(response, cache_entries)?;
+        let mut entries =
+            NdjsonBatchEntryStream::new(response, cache_entries, cache_principal, allowed_names)?;
         while let Some((name, meta)) = entries.next(self).await? {
             match map.entry(name) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -837,32 +1172,36 @@ impl RegistryClient {
         &self,
         response: reqwest::Response,
         cache_entries: bool,
+        cache_principal: &str,
+        allowed_names: Option<&std::collections::HashSet<String>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
-        let result: serde_json::Value = parse_capped_metadata(response, "batch metadata").await?;
+        let response: JsonBatchResponse = parse_capped_metadata(response, "batch metadata").await?;
+        let packages = response
+            .packages
+            .ok_or_else(|| LpmError::Registry("batch response missing packages".into()))?
+            .0;
 
-        let packages_obj = result
-            .get("packages")
-            .and_then(|p| p.as_object())
-            .ok_or_else(|| LpmError::Registry("batch response missing packages".into()))?;
-
-        let mut map = std::collections::HashMap::new();
-        for (name, meta_value) in packages_obj {
-            if let Ok(meta) = serde_json::from_value::<PackageMetadata>(meta_value.clone()) {
-                if !batch_metadata_entry_matches_name(name, &meta) {
-                    continue;
-                }
-
-                if cache_entries {
-                    let cache_key = batch_metadata_cache_key(name);
-                    self.write_metadata_cache(&cache_key, &meta, None);
-                }
-                map.insert(name.clone(), meta);
+        let package_count = packages.len();
+        let mut map = std::collections::HashMap::with_capacity(packages.len());
+        for (name, meta) in packages {
+            if allowed_names.is_some_and(|allowed| !allowed.contains(&name)) {
+                tracing::debug!("skipping unrequested JSON metadata entry: {name}");
+                continue;
             }
+            if !batch_metadata_entry_matches_name(&name, &meta) {
+                continue;
+            }
+
+            if cache_entries {
+                let cache_key = self.batch_metadata_cache_key_for_principal(&name, cache_principal);
+                self.write_metadata_cache(&cache_key, &meta, None);
+            }
+            map.insert(name, meta);
         }
 
         tracing::debug!(
             "batch metadata (JSON): requested {}, received {}",
-            packages_obj.len(),
+            package_count,
             map.len()
         );
         Ok(map)
@@ -916,12 +1255,13 @@ impl RegistryClient {
     ) -> Result<TimedPackageMetadata, LpmError> {
         let scoped = name.scoped();
         crate::timing::record_metadata_request(&scoped);
-        let cache_key = format!("lpm:{scoped}");
+        let cache_key = self.lpm_metadata_cache_key(&scoped)?;
         let mut timings = PackageMetadataFetchTimings::default();
 
         let cache_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(&scoped, &cached)
         {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             timings.cache_hit = true;
@@ -937,7 +1277,9 @@ impl RegistryClient {
 
         let _flight = if cache_policy == MetadataCachePolicy::UseFresh {
             let flight = metadata_fetch_flight_guard(&cache_key).await;
-            if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+            if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+                && batch_metadata_entry_matches_name(&scoped, &cached)
+            {
                 timings.cache_hit = true;
                 tracing::debug!("metadata cache hit (coalesced): {scoped}");
                 return Ok(TimedPackageMetadata {
@@ -962,22 +1304,31 @@ impl RegistryClient {
         // gated; on 401 the recovery wrapper performs one silent
         // refresh + retry. The closure re-reads ETag + bearer each
         // attempt so the rotated token is used on retry.
-        let cache_key_ref = cache_key.as_str();
         let url_ref = url.as_str();
+        let scoped_ref = scoped.as_str();
         let initial_timings = timings;
         let result = self
             .execute_with_recovery(AuthPosture::AuthRequired, || {
                 let mut timings = initial_timings;
                 async move {
+                    let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
+                    let attempt_cache_key = self.metadata_cache_key_for_origin(
+                        "lpm",
+                        &self.base_url,
+                        scoped_ref,
+                        bearer.as_deref(),
+                    );
                     let validator_start = std::time::Instant::now();
                     let cache_validator = (cache_policy != MetadataCachePolicy::Reload)
-                        .then(|| self.read_cache_validator(cache_key_ref))
+                        .then(|| self.read_cache_validator(&attempt_cache_key))
                         .flatten();
                     timings.validator_read_ms = validator_start.elapsed().as_millis();
                     timings.cache_age_seconds = cache_validator
                         .as_ref()
                         .and_then(|validator| validator.age_seconds);
-                    let mut req = self.build_worker_metadata_get(url_ref).await?;
+                    let mut req = self
+                        .build_worker_metadata_get_with_bearer(url_ref, bearer.as_deref())
+                        .await?;
                     if let Some(etag) = cache_validator.as_ref().and_then(|c| c.etag.as_deref()) {
                         req = req.header("If-None-Match", etag);
                     }
@@ -991,7 +1342,9 @@ impl RegistryClient {
                     {
                         timings.not_modified = true;
                         let cache_304_start = std::time::Instant::now();
-                        if let Some(meta) = self.cached_metadata_after_304(cache_key_ref).await {
+                        if let Some(meta) = self.cached_metadata_after_304(&attempt_cache_key).await
+                            && batch_metadata_entry_matches_name(scoped_ref, &meta)
+                        {
                             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                             tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
                             return Ok(TimedPackageMetadata {
@@ -1004,7 +1357,11 @@ impl RegistryClient {
                         let retry_http_start = std::time::Instant::now();
                         response = self
                             .send_package_metadata_request(
-                                self.build_worker_metadata_get(url_ref).await?,
+                                self.build_worker_metadata_get_with_bearer(
+                                    url_ref,
+                                    bearer.as_deref(),
+                                )
+                                .await?,
                             )
                             .await?;
                         timings.http_ms = timings
@@ -1024,12 +1381,17 @@ impl RegistryClient {
                             &format!("get_package_metadata {url_ref}"),
                         )
                         .await?;
+                    let metadata = Self::validate_package_metadata_identity(
+                        scoped_ref,
+                        metadata,
+                        "LPM registry",
+                    )?;
                     timings.body_read_ms = body_timings.body_read_ms;
                     timings.json_decode_ms = body_timings.json_parse_ms;
                     timings.body_bytes = body_timings.body_bytes;
 
                     let cache_write_start = std::time::Instant::now();
-                    self.write_metadata_cache(cache_key_ref, &metadata, etag.as_deref());
+                    self.write_metadata_cache(&attempt_cache_key, &metadata, etag.as_deref());
                     timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
                     Ok(TimedPackageMetadata { metadata, timings })
                 }
@@ -1048,10 +1410,12 @@ impl RegistryClient {
     /// Supports ETag conditional requests for both proxy and direct npm paths.
     pub async fn get_npm_package_metadata(&self, name: &str) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
+        let cache_key = self.npm_worker_metadata_cache_key(name)?;
 
         // Tier 1: TTL-based cache hit
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: npm:{name}");
             return Ok(cached);
@@ -1059,7 +1423,9 @@ impl RegistryClient {
         crate::timing::record_metadata_cache_miss();
 
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
             tracing::debug!("metadata cache hit (coalesced): npm:{name}");
             return Ok(cached);
         }
@@ -1081,20 +1447,27 @@ impl RegistryClient {
 
         // Tier 2: Try LPM upstream proxy with conditional request
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
-        let cache_validator = self.read_cache_validator(&cache_key);
 
         match self
-            .send_worker_metadata_get(&proxy_url, None, cache_validator.as_ref())
+            .send_worker_metadata_get_scoped(&proxy_url, None, "npm-worker", name, true)
             .await
         {
-            Ok(mut response) => {
+            Ok((mut response, mut response_cache_key)) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                    if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
+                    if let Some(meta) = self.cached_metadata_after_304(&response_cache_key).await
+                        && batch_metadata_entry_matches_name(name, &meta)
+                    {
                         tracing::debug!("metadata cache revalidated (304): npm:{name}");
                         return finish!(Ok(meta));
                     }
-                    response = self
-                        .send_worker_metadata_get(&proxy_url, None, None)
+                    (response, response_cache_key) = self
+                        .send_worker_metadata_get_scoped(
+                            &proxy_url,
+                            None,
+                            "npm-worker",
+                            name,
+                            false,
+                        )
                         .await?;
                 }
 
@@ -1107,19 +1480,17 @@ impl RegistryClient {
                     )
                     .await
                     {
-                        // Verify we got the right package (not a routing error)
-                        if metadata.name == name
-                            || metadata.versions.values().any(|v| v.name == name)
-                        {
-                            tracing::debug!("fetched {name} via LPM upstream proxy");
-                            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-                            return finish!(Ok(metadata));
-                        }
-
-                        return finish!(Err(LpmError::Registry(format!(
-                            "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
-                            metadata.name
-                        ))));
+                        let metadata = match Self::validate_package_metadata_identity(
+                            name,
+                            metadata,
+                            "LPM npm proxy",
+                        ) {
+                            Ok(metadata) => metadata,
+                            Err(error) => return finish!(Err(error)),
+                        };
+                        tracing::debug!("fetched {name} via LPM upstream proxy");
+                        self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+                        return finish!(Ok(metadata));
                     }
                 }
             }
@@ -1139,6 +1510,14 @@ impl RegistryClient {
 
         // Tier 3: Fall back to public npm registry (no auth needed)
         // Use abbreviated packument to reduce payload by 50-90%
+        let direct_cache_key = self.npm_direct_metadata_cache_key(name);
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&direct_cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
+            crate::timing::record_metadata_cache_hit();
+            return finish!(Ok(cached));
+        }
+        let direct_cache_validator = self.read_cache_validator(&direct_cache_key);
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         tracing::debug!("fetching {name} from npm registry");
         let req = self
@@ -1147,13 +1526,15 @@ impl RegistryClient {
             .await?
             .get(&npm_url)
             .header("Accept", "application/vnd.npm.install-v1+json");
-        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let req = Self::apply_cached_etag(req, direct_cache_validator.as_ref());
         let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(metadata) = self.cached_metadata_after_304(&direct_cache_key).await
+                && batch_metadata_entry_matches_name(name, &metadata)
+            {
                 tracing::debug!("metadata cache revalidated (direct fallback 304): npm:{name}");
                 return finish!(Ok(metadata));
             }
@@ -1181,7 +1562,12 @@ impl RegistryClient {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
         };
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "direct npm fallback") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
+        self.write_metadata_cache(&direct_cache_key, &metadata, etag.as_deref());
         finish!(Ok(metadata))
     }
 
@@ -1221,13 +1607,14 @@ impl RegistryClient {
         cache_policy: MetadataCachePolicy,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
+        let cache_key = self.npm_direct_metadata_cache_key(name);
         let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
         let mut timings = PackageMetadataFetchTimings::default();
 
         let memory_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+            && batch_metadata_entry_matches_name(name, &cached)
         {
             timings.cache_read_ms = memory_read_start.elapsed().as_millis();
             timings.cache_hit = true;
@@ -1241,6 +1628,7 @@ impl RegistryClient {
         let cache_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
         {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             timings.cache_hit = true;
@@ -1258,6 +1646,7 @@ impl RegistryClient {
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
+            && batch_metadata_entry_matches_name(name, &cached)
         {
             timings.cache_hit = true;
             tracing::debug!("metadata memory cache hit (direct, coalesced): npm:{name}");
@@ -1269,6 +1658,7 @@ impl RegistryClient {
         let coalesced_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
         {
             timings.cache_read_ms = timings
                 .cache_read_ms
@@ -1319,13 +1709,15 @@ impl RegistryClient {
                 r
             }
             Err(e) => {
-                return finish!(Err(e));
+                return finish!(Err(Self::identify_empty_metadata_not_found(name, e)));
             }
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             timings.not_modified = true;
             let cache_304_start = std::time::Instant::now();
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await
+                && batch_metadata_entry_matches_name(name, &metadata)
+            {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                 tracing::debug!("metadata cache revalidated (direct 304): npm:{name}");
                 self.remember_metadata_for_command(&memory_cache_key, &metadata);
@@ -1348,7 +1740,7 @@ impl RegistryClient {
                     r
                 }
                 Err(e) => {
-                    return finish!(Err(e));
+                    return finish!(Err(Self::identify_empty_metadata_not_found(name, e)));
                 }
             };
         }
@@ -1362,6 +1754,11 @@ impl RegistryClient {
             Ok(parsed) => parsed,
             Err(e) => return finish!(Err(e)),
         };
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "direct npm registry") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
         timings.body_read_ms = body_timings.body_read_ms;
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
@@ -1378,11 +1775,13 @@ impl RegistryClient {
         version: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-version:{name}@{version}");
+        let cache_key = self.npm_direct_version_metadata_cache_key(name, version);
         let mut timings = PackageMetadataFetchTimings::default();
 
         let cache_read_start = std::time::Instant::now();
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             if package_metadata_matches_version_doc(name, version, &cached) {
                 timings.cache_hit = true;
@@ -1518,7 +1917,7 @@ impl RegistryClient {
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-full:{name}");
+        let cache_key = self.npm_worker_full_metadata_cache_key(name)?;
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit: npm-full:{name}");
@@ -1536,22 +1935,33 @@ impl RegistryClient {
         }
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
-        let cache_validator = self.read_cache_validator(&cache_key);
         match self
-            .send_worker_metadata_get(
+            .send_worker_metadata_get_scoped(
                 &proxy_url,
                 Some("application/json"),
-                cache_validator.as_ref(),
+                "npm-worker-full",
+                name,
+                true,
             )
             .await
         {
-            Ok(mut response) if response.status() == reqwest::StatusCode::NOT_MODIFIED => {
-                if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            Ok((mut response, mut response_cache_key))
+                if response.status() == reqwest::StatusCode::NOT_MODIFIED =>
+            {
+                if let Some(metadata) = self.cached_metadata_after_304(&response_cache_key).await
+                    && batch_metadata_entry_matches_name(name, &metadata)
+                {
                     tracing::debug!("metadata cache revalidated (full proxy 304): npm:{name}");
                     return finish!(Ok(metadata));
                 }
-                response = self
-                    .send_worker_metadata_get(&proxy_url, Some("application/json"), None)
+                (response, response_cache_key) = self
+                    .send_worker_metadata_get_scoped(
+                        &proxy_url,
+                        Some("application/json"),
+                        "npm-worker-full",
+                        name,
+                        false,
+                    )
                     .await
                     .inspect_err(|_error| {
                         crate::timing::record_rpc(rpc_start.elapsed());
@@ -1564,20 +1974,20 @@ impl RegistryClient {
                     )
                     .await
                     {
-                        if metadata.name == name
-                            || metadata.versions.values().any(|v| v.name == name)
-                        {
-                            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-                            return finish!(Ok(metadata));
-                        }
-                        return finish!(Err(LpmError::Registry(format!(
-                            "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
-                            metadata.name
-                        ))));
+                        let metadata = match Self::validate_package_metadata_identity(
+                            name,
+                            metadata,
+                            "LPM npm proxy",
+                        ) {
+                            Ok(metadata) => metadata,
+                            Err(error) => return finish!(Err(error)),
+                        };
+                        self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+                        return finish!(Ok(metadata));
                     }
                 }
             }
-            Ok(response) if response.status().is_success() => {
+            Ok((response, response_cache_key)) if response.status().is_success() => {
                 let etag = Self::response_etag(&response);
                 if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
                     response,
@@ -1585,14 +1995,16 @@ impl RegistryClient {
                 )
                 .await
                 {
-                    if metadata.name == name || metadata.versions.values().any(|v| v.name == name) {
-                        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-                        return finish!(Ok(metadata));
-                    }
-                    return finish!(Err(LpmError::Registry(format!(
-                        "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
-                        metadata.name
-                    ))));
+                    let metadata = match Self::validate_package_metadata_identity(
+                        name,
+                        metadata,
+                        "LPM npm proxy",
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(error) => return finish!(Err(error)),
+                    };
+                    self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+                    return finish!(Ok(metadata));
                 }
             }
             Ok(_) | Err(LpmError::NotFound(_)) => {}
@@ -1600,6 +2012,14 @@ impl RegistryClient {
             Err(error) => return finish!(Err(error)),
         }
 
+        let direct_cache_key = self.npm_direct_full_metadata_cache_key(name);
+        if let Some((cached, _etag)) = self.read_metadata_cache_async(&direct_cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
+            crate::timing::record_metadata_cache_hit();
+            return finish!(Ok(cached));
+        }
+        let direct_cache_validator = self.read_cache_validator(&direct_cache_key);
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         let req = self
             .http
@@ -1607,13 +2027,15 @@ impl RegistryClient {
             .await?
             .get(&npm_url)
             .header("Accept", "application/json");
-        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+        let req = Self::apply_cached_etag(req, direct_cache_validator.as_ref());
         let mut response = match self.send_package_metadata_request(req).await {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(metadata) = self.cached_metadata_after_304(&direct_cache_key).await
+                && batch_metadata_entry_matches_name(name, &metadata)
+            {
                 tracing::debug!(
                     "metadata cache revalidated (full direct fallback 304): npm:{name}"
                 );
@@ -1643,7 +2065,12 @@ impl RegistryClient {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
         };
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "direct npm registry") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
+        self.write_metadata_cache(&direct_cache_key, &metadata, etag.as_deref());
         finish!(Ok(metadata))
     }
 
@@ -1674,8 +2101,10 @@ impl RegistryClient {
         use_cache: bool,
     ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-full:{name}");
-        if use_cache && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+        let cache_key = self.npm_direct_full_metadata_cache_key(name);
+        if use_cache
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
         {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (direct): npm-full:{name}");
@@ -1708,7 +2137,9 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await
+                && batch_metadata_entry_matches_name(name, &metadata)
+            {
                 tracing::debug!("metadata cache revalidated (direct full 304): npm:{name}");
                 return finish!(Ok(metadata));
             }
@@ -1736,6 +2167,11 @@ impl RegistryClient {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
         };
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "direct npm registry") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
         self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
         finish!(Ok(metadata))
     }
@@ -1751,9 +2187,30 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<PackageMetadata, LpmError> {
+        self.get_npm_package_metadata_proxy_only_inner(name, MetadataCachePolicy::UseFresh)
+            .await
+    }
+
+    /// Revalidate Worker-proxy npm metadata without permitting public-npm fallback.
+    pub async fn revalidate_npm_package_metadata_proxy_only(
+        &self,
+        name: &str,
+    ) -> Result<PackageMetadata, LpmError> {
+        self.get_npm_package_metadata_proxy_only_inner(name, MetadataCachePolicy::Revalidate)
+            .await
+    }
+
+    async fn get_npm_package_metadata_proxy_only_inner(
+        &self,
+        name: &str,
+        cache_policy: MetadataCachePolicy,
+    ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm:{name}");
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
+        let cache_key = self.npm_worker_metadata_cache_key(name)?;
+        if cache_policy == MetadataCachePolicy::UseFresh
+            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && batch_metadata_entry_matches_name(name, &cached)
+        {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (proxy-only): npm:{name}");
             return Ok(cached);
@@ -1770,21 +2227,25 @@ impl RegistryClient {
         }
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
-        let cache_validator = self.read_cache_validator(&cache_key);
-        let mut response = match self
-            .send_worker_metadata_get(&proxy_url, None, cache_validator.as_ref())
+        let (mut response, mut response_cache_key) = match self
+            .send_worker_metadata_get_scoped(&proxy_url, None, "npm-worker", name, true)
             .await
         {
-            Ok(response) => response,
+            Ok(result) => result,
             Err(err) => return finish!(Err(err)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(meta) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(meta) = self.cached_metadata_after_304(&response_cache_key).await
+                && batch_metadata_entry_matches_name(name, &meta)
+            {
                 tracing::debug!("metadata cache revalidated (proxy-only 304): npm:{name}");
                 return finish!(Ok(meta));
             }
-            response = match self.send_worker_metadata_get(&proxy_url, None, None).await {
-                Ok(response) => response,
+            (response, response_cache_key) = match self
+                .send_worker_metadata_get_scoped(&proxy_url, None, "npm-worker", name, false)
+                .await
+            {
+                Ok(result) => result,
                 Err(err) => return finish!(Err(err)),
             };
         }
@@ -1803,19 +2264,13 @@ impl RegistryClient {
             Ok(metadata) => metadata,
             Err(err) => return finish!(Err(err)),
         };
-        if metadata.name == name
-            || metadata
-                .versions
-                .values()
-                .any(|version| version.name == name)
-        {
-            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-            return finish!(Ok(metadata));
-        }
-        finish!(Err(LpmError::Registry(format!(
-            "proxy returned metadata for unexpected package '{}' when requesting '{name}'",
-            metadata.name
-        ))))
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "LPM npm proxy") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
+        self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+        finish!(Ok(metadata))
     }
 
     /// Fetch npm metadata honoring an explicit upstream route.
@@ -1878,6 +2333,15 @@ impl RegistryClient {
                     .await
             }
         }
+    }
+
+    /// Fetch release-time metadata from the configured Worker without public fallback.
+    pub async fn get_npm_release_times_proxy_only(
+        &self,
+        name: &str,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
+        self.get_npm_package_release_times_full_inner(name, false)
+            .await
     }
 
     pub async fn get_npm_release_times_routed_full_with_timings(
@@ -1971,8 +2435,17 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
+        self.get_npm_package_release_times_full_inner(name, true)
+            .await
+    }
+
+    async fn get_npm_package_release_times_full_inner(
+        &self,
+        name: &str,
+        allow_direct_fallback: bool,
+    ) -> Result<ReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-release-times:{name}");
+        let cache_key = self.npm_worker_release_times_cache_key(name)?;
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
@@ -1981,7 +2454,7 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
-        let full_cache_key = format!("npm-full:{name}");
+        let full_cache_key = self.npm_worker_full_metadata_cache_key(name)?;
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
             .await
@@ -1991,14 +2464,17 @@ impl RegistryClient {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
-        if let Some(cached) = self.cached_release_times_from_metadata_cache(name).await {
+        let abbreviated_cache_key = self.npm_worker_metadata_cache_key(name)?;
+        if let Some(cached) = self
+            .cached_release_times_from_metadata_cache(name, &abbreviated_cache_key)
+            .await
+        {
             crate::timing::record_metadata_cache_hit();
             return Ok(cached);
         }
         crate::timing::record_metadata_cache_miss();
 
         let proxy_url = format!("{}/api/registry/{}?release_times=1", self.base_url, name);
-        let cache_validator = self.read_cache_validator(&cache_key);
         let rpc_start = std::time::Instant::now();
         macro_rules! finish {
             ($expr:expr) => {{
@@ -2009,24 +2485,32 @@ impl RegistryClient {
         }
 
         match self
-            .send_worker_metadata_get(
+            .send_worker_metadata_get_scoped(
                 &proxy_url,
                 Some("application/json"),
-                cache_validator.as_ref(),
+                "npm-worker-release-times",
+                name,
+                true,
             )
             .await
         {
-            Ok(mut response) => {
+            Ok((mut response, mut response_cache_key)) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                     if let Some(metadata) = self
-                        .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
+                        .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&response_cache_key)
                         .await
                         && metadata.matches_package(name)
                     {
                         return finish!(Ok(metadata));
                     }
-                    response = self
-                        .send_worker_metadata_get(&proxy_url, Some("application/json"), None)
+                    (response, response_cache_key) = self
+                        .send_worker_metadata_get_scoped(
+                            &proxy_url,
+                            Some("application/json"),
+                            "npm-worker-release-times",
+                            name,
+                            false,
+                        )
                         .await?;
                 }
 
@@ -2040,15 +2524,29 @@ impl RegistryClient {
                     {
                         let metadata = Self::validate_release_time_metadata(name, metadata)?;
                         if !metadata.time.is_empty() {
-                            self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+                            self.write_metadata_cache(
+                                &response_cache_key,
+                                &metadata,
+                                etag.as_deref(),
+                            );
                             return finish!(Ok(metadata));
                         }
                     }
                 }
             }
+            Err(error @ LpmError::NotFound(_)) if !allow_direct_fallback => {
+                return finish!(Err(error));
+            }
             Err(LpmError::NotFound(_)) => {}
-            Err(error) if Self::npm_proxy_can_fallback_to_direct(&error) => {}
+            Err(error)
+                if allow_direct_fallback && Self::npm_proxy_can_fallback_to_direct(&error) => {}
             Err(error) => return finish!(Err(error)),
+        }
+
+        if !allow_direct_fallback {
+            return finish!(Err(LpmError::Registry(format!(
+                "configured registry returned no usable release-time metadata for '{name}'"
+            ))));
         }
 
         crate::timing::record_rpc(rpc_start.elapsed());
@@ -2073,7 +2571,7 @@ impl RegistryClient {
         use_cache: bool,
     ) -> Result<TimedReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = format!("npm-release-times:{name}");
+        let cache_key = self.npm_direct_release_times_cache_key(name);
         let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
         let mut timings = PackageMetadataFetchTimings::default();
         let memory_read_start = std::time::Instant::now();
@@ -2102,7 +2600,7 @@ impl RegistryClient {
                     timings,
                 });
             }
-            let full_cache_key = format!("npm-full:{name}");
+            let full_cache_key = self.npm_direct_full_metadata_cache_key(name);
             if let Some((cached, _etag)) = self
                 .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
                 .await
@@ -2118,7 +2616,11 @@ impl RegistryClient {
                     timings,
                 });
             }
-            if let Some(cached) = self.cached_release_times_from_metadata_cache(name).await {
+            let abbreviated_cache_key = self.npm_direct_metadata_cache_key(name);
+            if let Some(cached) = self
+                .cached_release_times_from_metadata_cache(name, &abbreviated_cache_key)
+                .await
+            {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
@@ -2401,21 +2903,18 @@ impl RegistryClient {
         route: crate::UpstreamRoute,
     ) -> Option<crate::types::BlockedSetPackageMeta> {
         crate::timing::record_metadata_request(name);
-        // Fast path for standard npm routes whose cache key is `npm:{name}`.
-        // Custom routes use a principal-fingerprint key we can't reproduce here.
-        let is_standard_route = matches!(
-            route,
-            crate::UpstreamRoute::LpmWorker | crate::UpstreamRoute::NpmDirect
-        );
-        if is_standard_route {
-            let cache_key = format!("npm:{name}");
-            if let Some((meta, _)) =
+        let cache_key = match &route {
+            crate::UpstreamRoute::LpmWorker => self.npm_worker_metadata_cache_key(name).ok(),
+            crate::UpstreamRoute::NpmDirect => Some(self.npm_direct_metadata_cache_key(name)),
+            crate::UpstreamRoute::Custom { .. } => None,
+        };
+        if let Some(cache_key) = cache_key
+            && let Some((meta, _)) =
                 self.read_metadata_cache_as::<crate::types::BlockedSetPackageMeta>(&cache_key)
-            {
-                crate::timing::record_metadata_cache_hit();
-                tracing::debug!("blocked-set meta cache hit (minimal): {name}");
-                return Some(meta);
-            }
+        {
+            crate::timing::record_metadata_cache_hit();
+            tracing::debug!("blocked-set meta cache hit (minimal): {name}");
+            return Some(meta);
         }
         crate::timing::record_metadata_cache_miss();
 

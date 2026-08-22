@@ -3,6 +3,8 @@ use super::*;
 pub(super) type MetadataMemoryCache = Arc<std::sync::Mutex<HashMap<String, Arc<PackageMetadata>>>>;
 pub(super) type ReleaseTimeMemoryCache =
     Arc<std::sync::Mutex<HashMap<String, Arc<ReleaseTimeMetadata>>>>;
+pub(super) type MetadataRouteOverrides =
+    Arc<std::sync::Mutex<HashMap<String, crate::route::RouteMode>>>;
 
 /// Aggregate capacity retained by one file-backed compressed archive.
 #[derive(Debug)]
@@ -150,12 +152,17 @@ pub struct RegistryClient {
     /// `Mutex` acquire + `Vec` push per write — sub-µs vs the ms-scale
     /// `std::fs::write` it tracks.
     pub(super) pending_cache_writes: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Byte budget held by queued asynchronous metadata-cache buffers.
+    /// Cache writes are best-effort and are skipped when a cold metadata
+    /// burst would exceed this bound.
+    pub(super) pending_cache_write_bytes: Arc<tokio::sync::Semaphore>,
     /// Optional command-scoped immutable packument cache. Recursive
     /// workspace installs enable it on client clones so independent
     /// importer resolvers can reuse one parsed registry response without
     /// sharing resolver state.
     pub(super) metadata_memory_cache: Option<MetadataMemoryCache>,
     pub(super) release_time_memory_cache: Option<ReleaseTimeMemoryCache>,
+    pub(super) metadata_route_overrides: Option<MetadataRouteOverrides>,
     /// When set, `write_metadata_cache` runs the file write inline on the
     /// calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. Used by mock-server tests where
