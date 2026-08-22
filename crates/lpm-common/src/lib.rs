@@ -28,7 +28,8 @@ mod utf8_bom;
 #[cfg(unix)]
 pub use atomic_write::replace_symlink_atomic;
 pub use atomic_write::{
-    AtomicWriteOptions, write_file_atomic, write_file_atomic_with, write_file_atomic_with_options,
+    AtomicWriteOptions, write_file_atomic, write_file_atomic_in_dir_with, write_file_atomic_with,
+    write_file_atomic_with_options,
 };
 #[cfg(unix)]
 pub use bounded_read::permissions_are_owner_only;

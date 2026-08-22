@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,226 @@ where
         sync_parent(parent).map_err(E::from)?;
     }
     Ok(output)
+}
+
+/// Rewrite one file relative to a retained directory capability.
+///
+/// The destination must be a single file name. The temporary file and final
+/// replacement remain relative to `directory`, so renaming an ambient parent
+/// path cannot redirect the write outside the opened directory.
+pub fn write_file_atomic_in_dir_with<T, E>(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    write: impl FnOnce(&mut cap_std::fs::File) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<io::Error>,
+{
+    validate_relative_file_name(destination).map_err(E::from)?;
+    let exact_mode = capability_destination_mode(directory, destination).map_err(E::from)?;
+    let (temporary_name, mut temporary) =
+        create_capability_temporary(directory, exact_mode).map_err(E::from)?;
+
+    let result = (|| {
+        let output = write(&mut temporary)?;
+        if let Some(mode) = exact_mode {
+            set_capability_file_mode(&temporary, mode).map_err(E::from)?;
+        }
+        replace_capability_file(directory, &temporary_name, destination, temporary)
+            .map_err(E::from)?;
+        Ok(output)
+    })();
+    if result.is_err() {
+        let _ = directory.remove_file(&temporary_name);
+    }
+    result
+}
+
+fn validate_relative_file_name(name: &OsStr) -> io::Result<()> {
+    let path = Path::new(name);
+    let mut components = path.components();
+    if matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "atomic destination must be one relative file name: {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn capability_destination_mode(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+) -> io::Result<Option<u32>> {
+    use cap_std::fs::PermissionsExt as _;
+
+    match directory.symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions().mode() & 0o7777)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn capability_destination_mode(
+    _directory: &cap_std::fs::Dir,
+    _destination: &OsStr,
+) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
+fn create_capability_temporary(
+    directory: &cap_std::fs::Dir,
+    exact_mode: Option<u32>,
+) -> io::Result<(OsString, cap_std::fs::File)> {
+    use base64::Engine as _;
+
+    let mut last_collision = None;
+    for _ in 0..TEMP_CREATE_ATTEMPTS {
+        let mut random = [0u8; TEMP_RANDOM_BYTES];
+        getrandom::fill(&mut random).map_err(|error| {
+            io::Error::other(format!("failed to generate temporary file name: {error}"))
+        })?;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+        let name = OsString::from(format!(".lpm-{encoded}"));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+
+            options.mode(exact_mode.unwrap_or(0o666));
+        }
+        #[cfg(windows)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            use windows_sys::Win32::Storage::FileSystem::DELETE;
+
+            let _ = exact_mode;
+            options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = exact_mode;
+
+        match directory.open_with(&name, &options) {
+            Ok(file) => return Ok((name, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                last_collision = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_collision.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate an exclusive capability-relative temporary file",
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn set_capability_file_mode(file: &cap_std::fs::File, mode: u32) -> io::Result<()> {
+    use cap_std::fs::PermissionsExt as _;
+
+    file.set_permissions(cap_std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_capability_file_mode(_file: &cap_std::fs::File, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_capability_file(
+    directory: &cap_std::fs::Dir,
+    temporary_name: &OsStr,
+    destination: &OsStr,
+    temporary: cap_std::fs::File,
+) -> io::Result<()> {
+    let _temporary = temporary;
+    directory.rename(temporary_name, directory, destination)
+}
+
+#[cfg(windows)]
+fn replace_capability_file(
+    directory: &cap_std::fs::Dir,
+    _temporary_name: &OsStr,
+    destination: &OsStr,
+    temporary: cap_std::fs::File,
+) -> io::Result<()> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, RtlNtStatusToDosError,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let destination = destination.encode_wide().collect::<Vec<_>>();
+    let file_name_bytes = destination
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| io::Error::other("atomic destination file name is too long"))?;
+    let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
+        .checked_add(file_name_bytes)
+        .ok_or_else(|| io::Error::other("atomic rename data is too large"))?;
+    let mut storage = vec![0usize; info_bytes.div_ceil(size_of::<usize>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let info_bytes = u32::try_from(info_bytes)
+        .map_err(|_| io::Error::other("atomic rename data is too large"))?;
+    let file_name_bytes = u32::try_from(file_name_bytes)
+        .map_err(|_| io::Error::other("atomic destination file name is too long"))?;
+    unsafe {
+        // SAFETY: storage is aligned and sized for the variable-length rename record. Both
+        // handles remain open for each synchronous call, and the UTF-16 filename is copied in full.
+        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).RootDirectory = directory.as_raw_handle();
+        (*info).FileNameLength = file_name_bytes;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
+        if delay_ms != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let status = unsafe {
+            // SAFETY: `info` describes the initialized buffer above and both handles remain valid.
+            NtSetInformationFile(
+                temporary.as_raw_handle(),
+                &mut io_status,
+                info.cast(),
+                info_bytes,
+                FileRenameInformation,
+            )
+        };
+        if status >= 0 {
+            return Ok(());
+        }
+        let code = unsafe {
+            // SAFETY: `status` is the NTSTATUS returned by `NtSetInformationFile`.
+            RtlNtStatusToDosError(status)
+        };
+        let error = io::Error::from_raw_os_error(code as i32);
+        if !matches!(code, ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED) || delay_ms == 4_050 {
+            return Err(error);
+        }
+    }
+    Err(io::Error::other("atomic replacement retry loop exhausted"))
 }
 
 /// Atomically replace a Unix symlink path without a predictable staging name.
@@ -384,8 +605,65 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
 mod tests {
     #[cfg(unix)]
     use super::{AtomicWriteOptions, write_file_atomic_with_options};
-    use super::{create_temporary, write_file_atomic};
+    use super::{create_temporary, write_file_atomic, write_file_atomic_in_dir_with};
     use std::fs;
+    use std::io::{self, Write as _};
+
+    #[test]
+    fn capability_relative_atomic_write_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("graph.html"), b"before").unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        write_file_atomic_in_dir_with(&directory, "graph.html".as_ref(), |file| {
+            file.write_all(b"after")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(dir.path().join("graph.html")).unwrap(), b"after");
+    }
+
+    #[test]
+    fn capability_relative_atomic_write_cleans_its_temporary_after_callback_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        let result: io::Result<()> =
+            write_file_atomic_in_dir_with(&directory, "graph.html".as_ref(), |file| {
+                file.write_all(b"partial")?;
+                Err(io::Error::other("render failed"))
+            });
+
+        assert!(result.is_err());
+        assert!(!dir.path().join("graph.html").exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_relative_atomic_write_replaces_a_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        let destination = dir.path().join("graph.html");
+        fs::write(&sentinel, b"outside").unwrap();
+        symlink(&sentinel, &destination).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+
+        write_file_atomic_in_dir_with(&directory, "graph.html".as_ref(), |file| {
+            file.write_all(b"replacement")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert!(!fs::symlink_metadata(destination).unwrap().is_symlink());
+    }
 
     #[test]
     fn write_file_atomic_replaces_existing_file() {

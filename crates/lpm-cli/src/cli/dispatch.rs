@@ -2936,7 +2936,7 @@ async fn async_main() -> Result<()> {
                 package.as_deref(),
                 why.as_deref(),
                 &format,
-                depth,
+                depth.map(std::num::NonZeroUsize::get),
                 filter.as_deref(),
                 prod,
                 dev,

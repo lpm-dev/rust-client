@@ -302,6 +302,25 @@ impl DepGraph {
     }
 
     fn path_summary(&self, target_name: &str) -> PathSummary {
+        if let Some(path_counts) = self.acyclic_path_counts() {
+            let mut versions = HashSet::new();
+            let mut path_count = 0usize;
+            for (key, node) in &self.nodes {
+                if node.name != target_name {
+                    continue;
+                }
+                let reachable_paths = path_counts.get(key.as_str()).copied().unwrap_or(0);
+                if reachable_paths > 0 {
+                    path_count = path_count.saturating_add(reachable_paths);
+                    versions.insert(node.version.as_str());
+                }
+            }
+            return PathSummary {
+                path_count,
+                version_count: versions.len(),
+            };
+        }
+
         let mut versions = HashSet::new();
         let path_count = self.visit_paths(target_name, |path| {
             if let Some(node) = path.last().and_then(|key| self.nodes.get(*key)) {
@@ -314,6 +333,67 @@ impl DepGraph {
             path_count,
             version_count: versions.len(),
         }
+    }
+
+    fn acyclic_path_counts(&self) -> Option<HashMap<&str, usize>> {
+        let mut visiting = HashSet::with_capacity(self.nodes.len());
+        let mut visited = HashSet::with_capacity(self.nodes.len());
+        let mut postorder = Vec::with_capacity(self.nodes.len());
+
+        for root in &self.roots {
+            if !self.collect_acyclic_postorder(root, &mut visiting, &mut visited, &mut postorder) {
+                return None;
+            }
+        }
+
+        let mut path_counts: HashMap<&str, usize> = HashMap::with_capacity(postorder.len());
+        for root in &self.roots {
+            path_counts
+                .entry(root.as_str())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1usize);
+        }
+        for key in postorder.into_iter().rev() {
+            let current_count = path_counts.get(key).copied().unwrap_or(0);
+            if current_count == 0 {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(key) {
+                for dependency in &node.dependencies {
+                    path_counts
+                        .entry(dependency.as_str())
+                        .and_modify(|count| *count = count.saturating_add(current_count))
+                        .or_insert(current_count);
+                }
+            }
+        }
+        Some(path_counts)
+    }
+
+    fn collect_acyclic_postorder<'graph>(
+        &'graph self,
+        key: &'graph str,
+        visiting: &mut HashSet<&'graph str>,
+        visited: &mut HashSet<&'graph str>,
+        postorder: &mut Vec<&'graph str>,
+    ) -> bool {
+        if visited.contains(key) {
+            return true;
+        }
+        if !visiting.insert(key) {
+            return false;
+        }
+        if let Some(node) = self.nodes.get(key) {
+            for dependency in &node.dependencies {
+                if !self.collect_acyclic_postorder(dependency, visiting, visited, postorder) {
+                    return false;
+                }
+            }
+        }
+        visiting.remove(key);
+        visited.insert(key);
+        postorder.push(key);
+        true
     }
 
     fn visit_paths<'graph, F>(&'graph self, target_name: &str, visitor: F) -> usize
@@ -355,7 +435,7 @@ impl DepGraph {
         F: FnMut(&[&'graph str]) -> bool,
     {
         if current == target {
-            traversal.path_count += 1;
+            traversal.path_count = traversal.path_count.saturating_add(1);
             return (traversal.visitor)(&traversal.path);
         }
 
@@ -412,6 +492,8 @@ struct PathSummary {
 
 pub fn render_tree(graph: &DepGraph, use_color: bool) -> String {
     let mut output = String::new();
+    let mut expanded = HashSet::with_capacity(graph.nodes.len());
+    let mut visiting = HashSet::with_capacity(graph.stats.max_depth.max(1));
 
     let mut sorted_roots = graph.roots.clone();
     sorted_roots.sort();
@@ -425,7 +507,8 @@ pub fn render_tree(graph: &DepGraph, use_color: bool) -> String {
             is_last,
             1,
             use_color,
-            &mut HashSet::new(),
+            &mut expanded,
+            &mut visiting,
             &mut output,
         );
     }
@@ -460,7 +543,8 @@ fn render_tree_node(
     is_last: bool,
     depth: usize,
     use_color: bool,
-    visited: &mut HashSet<String>,
+    expanded: &mut HashSet<String>,
+    visiting: &mut HashSet<String>,
     output: &mut String,
 ) {
     let connector = if depth == 1 {
@@ -478,8 +562,12 @@ fn render_tree_node(
 
     let colored_label = render_tree_label(node, use_color);
 
-    let circular = if visited.contains(key) {
+    let circular = visiting.contains(key);
+    let shared = !circular && expanded.contains(key);
+    let marker = if circular {
         color_tree_meta(" (circular)", use_color)
+    } else if shared {
+        color_tree_meta(" (shared)", use_color)
     } else {
         String::new()
     };
@@ -489,13 +577,14 @@ fn render_tree_node(
         color_tree_meta(prefix, use_color),
         color_tree_meta(connector, use_color),
         colored_label,
-        circular
+        marker
     ));
 
-    if visited.contains(key) {
+    if circular || shared {
         return;
     }
-    visited.insert(key.to_string());
+    visiting.insert(key.to_string());
+    expanded.insert(key.to_string());
 
     let child_prefix = if depth == 1 {
         "".to_string()
@@ -515,12 +604,13 @@ fn render_tree_node(
             is_last_child,
             depth + 1,
             use_color,
-            visited,
+            expanded,
+            visiting,
             output,
         );
     }
 
-    visited.remove(key);
+    visiting.remove(key);
 }
 
 fn render_tree_label(node: &DepNode, use_color: bool) -> String {
@@ -2682,6 +2772,35 @@ mod tests {
         let path_count = graph.visit_paths("target", |_| true);
 
         assert_eq!(path_count, 2);
+    }
+
+    #[test]
+    fn path_summary_counts_reachable_same_name_targets_independently() {
+        let mut target_v1 = package("target", &["target@2.0.0"]);
+        target_v1.version = "1.0.0".into();
+        let mut target_v2 = package("target", &[]);
+        target_v2.version = "2.0.0".into();
+        let mut unreachable_target = package("target", &[]);
+        unreachable_target.version = "3.0.0".into();
+        let direct = HashSet::from(["entry".to_string()]);
+        let graph = DepGraph::from_lockfile(
+            &[
+                package("entry", &["target@1.0.0"]),
+                target_v1,
+                target_v2,
+                unreachable_target,
+            ],
+            &direct,
+            "app@1.0.0",
+        );
+
+        assert_eq!(
+            graph.path_summary("target"),
+            PathSummary {
+                path_count: 2,
+                version_count: 2,
+            }
+        );
     }
 
     #[test]

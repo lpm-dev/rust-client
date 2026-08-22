@@ -3,6 +3,7 @@ use crate::install_ui;
 use crate::overrides_state;
 use lpm_common::LpmError;
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -233,20 +234,22 @@ pub async fn run(
             print!("{}", graph_render::render_stats(&graph));
         }
         "html" => {
+            let output_directory = open_graph_output_directory(project_dir)?;
             let out_dir = project_dir.join(".lpm");
-            std::fs::create_dir_all(&out_dir)
-                .map_err(|e| LpmError::Script(format!("failed to create .lpm dir: {e}")))?;
             let out_path = out_dir.join("graph.html");
-            lpm_common::write_file_atomic_with(
-                &out_path,
-                lpm_common::AtomicWriteOptions::new(),
+            lpm_common::write_file_atomic_in_dir_with(
+                &output_directory,
+                OsStr::new("graph.html"),
                 |file| {
                     graph_render::write_html(file, &graph).map_err(|error| {
                         LpmError::Script(format!("failed to render graph HTML: {error}"))
                     })
                 },
             )?;
-            let html_size = std::fs::metadata(&out_path).map_err(LpmError::Io)?.len();
+            let html_size = output_directory
+                .metadata("graph.html")
+                .map_err(LpmError::Io)?
+                .len();
 
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Generated {} ({})",
@@ -274,6 +277,89 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn open_graph_output_directory(project_dir: &Path) -> Result<cap_std::fs::Dir, LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    let project_root =
+        cap_std::fs::Dir::open_ambient_dir(project_dir, cap_std::ambient_authority()).map_err(
+            |error| {
+                LpmError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open project directory {}: {error}",
+                        project_dir.display()
+                    ),
+                ))
+            },
+        )?;
+    let display = project_dir.join(".lpm");
+    let directory = match project_root.open_dir_nofollow(".lpm") {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match project_root.create_dir(".lpm") {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(LpmError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to create graph output directory {}: {error}",
+                            display.display()
+                        ),
+                    )));
+                }
+            }
+            project_root.open_dir_nofollow(".lpm").map_err(|error| {
+                LpmError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "refusing graph output directory that is not a real directory at {}: {error}",
+                        display.display()
+                    ),
+                ))
+            })?
+        }
+        Err(error) => {
+            return Err(LpmError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "refusing graph output directory that is not a real directory at {}: {error}",
+                    display.display()
+                ),
+            )));
+        }
+    };
+    let metadata = directory.dir_metadata().map_err(|error| {
+        LpmError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to inspect graph output directory {}: {error}",
+                display.display()
+            ),
+        ))
+    })?;
+    if !metadata.is_dir() || capability_metadata_is_link_or_reparse(&metadata) {
+        return Err(LpmError::Io(std::io::Error::other(format!(
+            "refusing graph output directory that is not a real directory at {}",
+            display.display()
+        ))));
+    }
+    Ok(directory)
+}
+
+#[cfg(not(windows))]
+fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_symlink()
+}
+
+#[cfg(windows)]
+fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 fn build_graph(
