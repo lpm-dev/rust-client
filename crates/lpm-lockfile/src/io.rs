@@ -38,16 +38,19 @@ impl Lockfile {
                 continue;
             }
             if root == project_root {
-                local = Some(Self::read_fast(&path).and_then(|lockfile| {
+                local = Some(read_authoritative_toml(&path).and_then(|content| {
+                    let lockfile = ValidatedLockfile::from_toml(&content)?;
                     Ok(ProjectLockfile {
                         path,
                         importer: ".".to_string(),
                         lockfile: lockfile.project_importer(".")?,
+                        content,
                     })
                 }));
                 continue;
             }
-            let lockfile = Self::read_fast(&path)?;
+            let content = read_authoritative_toml(&path)?;
+            let lockfile = ValidatedLockfile::from_toml(&content)?;
             let relative = project_root.strip_prefix(root).map_err(|error| {
                 LockfileError::Io(format!(
                     "failed to derive importer path below {}: {error}",
@@ -57,13 +60,14 @@ impl Lockfile {
             let Some(importer) = importer_path(relative) else {
                 continue;
             };
-            if !lockfile.importers.contains_key(&importer) {
+            if !lockfile.as_lockfile().importers.contains_key(&importer) {
                 continue;
             }
             return Ok(ProjectLockfile {
                 path,
                 lockfile: lockfile.project_importer(&importer)?,
                 importer,
+                content,
             });
         }
         if let Some(local) = local {
@@ -341,6 +345,8 @@ pub struct ProjectLockfile {
     pub path: PathBuf,
     pub importer: String,
     pub lockfile: Lockfile,
+    /// Exact authoritative TOML bytes decoded into this project view.
+    pub content: String,
 }
 
 fn importer_path(relative: &Path) -> Option<String> {

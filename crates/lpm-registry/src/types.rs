@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-const NPM_MISSING_SIGNATURE_TIME_CUTOFF: &str = "2015-01-01T00:00:00.000Z";
-
 /// Per-peer metadata as declared in a package's
 /// `peerDependenciesMeta` map. The npm spec is open-ended; today
 /// the resolver consumes only the `optional` flag (R5). Unknown
@@ -725,7 +723,11 @@ fn verify_registry_signature_key_not_expired(
     let Some(expires) = key.expires.as_deref() else {
         return Ok(());
     };
-    let published_at = published_at.unwrap_or(NPM_MISSING_SIGNATURE_TIME_CUTOFF);
+    let published_at = published_at.ok_or_else(|| {
+        lpm_common::LpmError::Registry(format!(
+            "{name}@{version} is missing publish timestamp required to validate registry signature key expiry"
+        ))
+    })?;
     let expires_time = parse_registry_signature_time(expires).ok_or_else(|| {
         lpm_common::LpmError::Registry(format!(
             "{name}@{version} registry signature key {} has invalid expires timestamp {expires}",
@@ -2118,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_signature_expiry_uses_cutoff_when_publish_time_missing() {
+    fn registry_signature_expiry_rejects_missing_publish_time() {
         let key = RegistrySigningKey {
             expires: Some("2025-01-29T00:00:00.000Z".to_string()),
             keyid: "SHA256:test".to_string(),
@@ -2127,7 +2129,10 @@ mod tests {
             key: String::new(),
         };
 
-        verify_registry_signature_key_not_expired("signed-pkg", "1.0.0", &key, None).unwrap();
+        let error = verify_registry_signature_key_not_expired("signed-pkg", "1.0.0", &key, None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("missing publish timestamp"));
     }
 
     /// `AttestationRef.provenance` is kept untyped so an unexpected

@@ -3631,6 +3631,7 @@ name = "lpm-migrate"
 version = "0.75.0"
 dependencies = [
  "glob",
+ "libc",
  "lpm-common",
  "lpm-lockfile",
  "serde",
@@ -3847,6 +3848,8 @@ name = "lpm-security"
 version = "0.75.0"
 dependencies = [
  "bytecount",
+ "cap-fs-ext",
+ "cap-std",
  "chrono",
  "criterion",
  "ignore",

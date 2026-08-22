@@ -388,6 +388,7 @@ async fn audit_signatures_verified_tree_exits_zero() {
     );
     let mock = MockRegistry::start().await;
     install_signature_fixture_project(&project, &mock, false).await;
+    let requests_before = mock.server().received_requests().await.unwrap().len();
 
     let out = run_audit_with_npm(&project, &mock, &["signatures"], false);
     assert!(
@@ -401,6 +402,104 @@ async fn audit_signatures_verified_tree_exits_zero() {
     assert!(
         stderr.contains("✓ Registry signatures verified · 1 verified"),
         "clean audit signatures must use slim success summary, got:\n{stderr}",
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests[requests_before..].iter().all(|request| {
+            request.method != wiremock::http::Method::GET || request.url.path() != "/signed-pkg"
+        }),
+        "audit signatures must use persisted lockfile evidence without hydrating package metadata"
+    );
+}
+
+#[tokio::test]
+async fn audit_signatures_does_not_skip_foreign_lpm_scope_from_an_npm_registry() {
+    let project = TempProject::empty(r#"{"name":"foreign-lpm-scope","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+
+    let package = "@lpm.dev/dependency-confusion";
+    let tarball = make_tarball(package, "1.0.0");
+    mock.with_package(package, "1.0.0", &tarball).await;
+    project.write_file(
+        "package-lock.json",
+        &format!(
+            r#"{{
+  "name": "foreign-lpm-scope",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {{
+    "": {{"name": "foreign-lpm-scope", "version": "1.0.0"}},
+    "node_modules/@lpm.dev/dependency-confusion": {{
+      "version": "1.0.0",
+      "resolved": "{}/tarballs/@lpm.dev/dependency-confusion/-/dependency-confusion-1.0.0.tgz",
+      "integrity": "{}"
+    }}
+  }}
+}}"#,
+            mock.url(),
+            compute_integrity(&tarball)
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "signatures"])
+        .output()
+        .expect("run audit signatures for a foreign @lpm.dev package");
+
+    assert!(
+        !output.status.success(),
+        "unsigned foreign @lpm.dev package must fail verification; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["scanned"], 1);
+    assert_eq!(envelope["skipped"], 0);
+    assert_eq!(envelope["not_verified"], 1);
+    assert_eq!(envelope["packages"][0]["reason"], "missing_signatures");
+}
+
+#[tokio::test]
+async fn audit_signatures_never_contacts_an_unconfigured_lockfile_origin() {
+    let project = TempProject::empty(r#"{"name":"foreign-origin","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file(
+        "package-lock.json",
+        &format!(
+            r#"{{
+  "name": "foreign-origin",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {{
+    "node_modules/private-package": {{
+      "version": "1.0.0",
+      "resolved": "{}/private-package/-/private-package-1.0.0.tgz",
+      "integrity": "sha512-test"
+    }}
+  }}
+}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "audit", "signatures"])
+        .output()
+        .expect("run signature audit with an unconfigured foreign origin");
+
+    assert!(
+        output.status.success(),
+        "unconfigured tarball origin must be treated as non-registry; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["scanned"], 1);
+    assert_eq!(envelope["skipped"], 1);
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "a lockfile-controlled origin must not receive metadata or signing-key requests"
     );
 }
 
@@ -459,6 +558,17 @@ fn mark_lockfile_package_as_public_npm(project: &TempProject, package: &str) {
         let importers = lockfile.importers.keys().cloned().collect::<Vec<_>>();
         for importer in importers {
             let mut projection = lockfile.project_importer(&importer).unwrap();
+            let roots = projection
+                .root_resolutions
+                .iter()
+                .map(|(local_name, root)| {
+                    (
+                        local_name.clone(),
+                        root.package.clone(),
+                        root.version.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
             let mut changed = false;
             for locked in &mut projection.packages {
                 if locked.name == package {
@@ -467,15 +577,40 @@ fn mark_lockfile_package_as_public_npm(project: &TempProject, package: &str) {
                 }
             }
             if changed {
+                let roots = roots
+                    .iter()
+                    .map(|(local_name, package_name, version)| {
+                        (local_name.as_str(), package_name.as_str(), version.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                support::finalize_exact_lockfile_fixture(&mut projection, &roots);
                 lockfile.replace_importer(&importer, projection).unwrap();
             }
         }
     } else {
+        let roots = lockfile
+            .root_resolutions
+            .iter()
+            .map(|(local_name, root)| {
+                (
+                    local_name.clone(),
+                    root.package.clone(),
+                    root.version.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         for locked in &mut lockfile.packages {
             if locked.name == package {
                 locked.source = Some("registry+https://registry.npmjs.org".to_string());
             }
         }
+        let roots = roots
+            .iter()
+            .map(|(local_name, package_name, version)| {
+                (local_name.as_str(), package_name.as_str(), version.as_str())
+            })
+            .collect::<Vec<_>>();
+        support::finalize_exact_lockfile_fixture(&mut lockfile, &roots);
     }
     lockfile
         .write_all(&lockfile_path)
@@ -620,6 +755,35 @@ async fn audit_info_only_dep_with_empty_osv_response_exits_zero() {
             && !stderr.contains("Run lpm audit --json"),
         "clean audit must not render the old verbose body, got:\n{stderr}",
     );
+}
+
+#[tokio::test]
+async fn audit_pnpm_v6_discovers_populated_registry_inventory() {
+    let project = TempProject::empty(r#"{"name":"pnpm-v6-audit","version":"1.0.0"}"#);
+    project.write_file(
+        "pnpm-lock.yaml",
+        r#"lockfileVersion: '6.0'
+packages:
+  /once@1.0.0:
+    resolution:
+      integrity: sha512-once
+      tarball: https://registry.npmjs.org/once/-/once-1.0.0.tgz
+"#,
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = run_audit_json(&project, &mock, &[]);
+
+    assert!(
+        output.status.success(),
+        "pnpm v6 audit must succeed for an empty OSV result; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["manager"], "pnpm");
+    assert_eq!(envelope["scanned"], 1);
 }
 
 #[tokio::test]
@@ -1282,6 +1446,126 @@ async fn audit_fix_aborts_without_overwriting_manifest_edits_made_during_plannin
         String::from_utf8_lossy(&out.stderr),
     );
     assert_eq!(project.read_file("package.json"), edited_manifest);
+}
+
+#[tokio::test]
+async fn audit_fix_aborts_when_the_lockfile_changes_during_planning() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-lockfile-drift","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(750))
+                .set_body_json(serde_json::json!({
+                    "results": [{"vulns": [osv_fixed_vuln(
+                        "GHSA-lockfile-drift",
+                        "vuln-pkg",
+                        "1.0.1"
+                    )]}]
+                })),
+        )
+        .mount(mock.server())
+        .await;
+
+    let original_manifest = project.read_file("package.json");
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()));
+    command.args(["--json", "audit", "fix"]);
+    let child = command.spawn().unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let planning_started = mock
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path() == "/v1/querybatch");
+        if planning_started {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit fix never reached OSV planning"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut replacement = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    replacement.packages[0].integrity = Some(support::VALID_TEST_INTEGRITY.to_string());
+    replacement.write_all(&lockfile_path).unwrap();
+    let replacement_bytes = std::fs::read(&lockfile_path).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "audit fix must abort when lpm.lock changes during planning; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("package.json"), original_manifest);
+    assert_eq!(std::fs::read(&lockfile_path).unwrap(), replacement_bytes);
+}
+
+#[tokio::test]
+async fn audit_fix_preserves_a_lockfile_replaced_after_workspace_capture() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-fix-late-lockfile-drift","version":"1.0.0","dependencies":{"vuln-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_vulnerable_direct_dep_with_fixed_version(&project, &mock).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{"vulns": [osv_fixed_vuln(
+                "GHSA-late-lockfile-drift",
+                "vuln-pkg",
+                "1.0.1"
+            )]}]
+        })))
+        .mount(mock.server())
+        .await;
+
+    let original_manifest = project.read_file("package.json");
+    let marker = project.path().join("audit-fix-snapshot-ready");
+    let resume = marker.with_extension("resume");
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()));
+    command.env("LPM_TEST_PAUSE_BEFORE_AUDIT_FIX_SNAPSHOT", &marker);
+    command.args(["--json", "audit", "fix"]);
+    let child = command.spawn().unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "audit fix never reached the transaction snapshot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let lockfile_path = project.path().join("lpm.lock");
+    let mut replacement = lpm_lockfile::Lockfile::read_fast(&lockfile_path).unwrap();
+    replacement.packages[0].integrity = Some(support::VALID_TEST_INTEGRITY.to_string());
+    replacement.write_all(&lockfile_path).unwrap();
+    let replacement_bytes = std::fs::read(&lockfile_path).unwrap();
+    std::fs::write(&resume, b"resume").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(
+        !output.status.success(),
+        "audit fix must reject late lpm.lock replacement; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("package.json"), original_manifest);
+    assert_eq!(std::fs::read(&lockfile_path).unwrap(), replacement_bytes);
 }
 
 #[tokio::test]

@@ -1,6 +1,8 @@
 //! Parser for pnpm-lock.yaml (v5, v6, and v9 formats).
 
-use crate::MigratedPackage;
+use crate::{
+    BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, read_lockfile_snapshot,
+};
 use lpm_common::LpmError;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -15,7 +17,9 @@ struct PnpmLockfile {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: serde_yaml::Value,
     #[serde(default)]
-    packages: HashMap<String, PnpmPackage>,
+    packages: BoundedMap<HashMap<String, PnpmPackage>, MAX_PACKAGES>,
+    #[serde(default)]
+    snapshots: BoundedMap<HashMap<String, PnpmSnapshot>, MAX_PACKAGES>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +42,14 @@ struct PnpmResolution {
     tarball: Option<String>,
 }
 
+#[derive(Default, Deserialize)]
+struct PnpmSnapshot {
+    #[serde(default)]
+    dependencies: HashMap<String, serde_yaml::Value>,
+    #[serde(default, rename = "optionalDependencies")]
+    optional_dependencies: HashMap<String, serde_yaml::Value>,
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -47,7 +59,7 @@ struct PnpmResolution {
 /// `version` is the lockfile major version detected by `detect`
 /// (5, 6, or 9 are the significant ones).
 pub fn parse(path: &Path, _version: u32) -> Result<Vec<MigratedPackage>, LpmError> {
-    let content = std::fs::read_to_string(path).map_err(LpmError::Io)?;
+    let content = read_lockfile_snapshot(path)?;
     parse_str(&content)
 }
 
@@ -56,11 +68,34 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
     let lockfile: PnpmLockfile = serde_yaml::from_str(content)
         .map_err(|e| LpmError::Script(format!("failed to parse pnpm-lock.yaml: {e}")))?;
 
-    let format = detect_format(&lockfile.lockfile_version);
+    let format = detect_format(&lockfile.lockfile_version)?;
+    enforce_package_limit(lockfile.packages.len())?;
+    enforce_package_limit(lockfile.snapshots.len())?;
 
-    let mut result = Vec::with_capacity(lockfile.packages.len());
+    let mut result = if format == PnpmFormat::V9 && !lockfile.snapshots.is_empty() {
+        parse_v9_snapshots(&lockfile.packages, &lockfile.snapshots)
+    } else {
+        parse_package_rows(&lockfile.packages, format)
+    };
 
-    for (key, pkg) in &lockfile.packages {
+    result.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.lockfile_key.cmp(&b.lockfile_key))
+    });
+
+    enforce_package_limit(result.len())?;
+    Ok(result)
+}
+
+fn parse_package_rows(
+    packages: &HashMap<String, PnpmPackage>,
+    format: PnpmFormat,
+) -> Vec<MigratedPackage> {
+    let mut result = Vec::with_capacity(packages.len());
+
+    for (key, pkg) in packages {
         // Skip workspace links and file references
         if let Some(ref res) = pkg.resolution
             && let Some(ref tarball) = res.tarball
@@ -71,7 +106,8 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
 
         let (name, version) = match format {
             PnpmFormat::V9 => parse_v9_key(key),
-            PnpmFormat::V5V6 => parse_v5_key(key),
+            PnpmFormat::V6 => parse_v6_key(key),
+            PnpmFormat::V5 => parse_v5_key(key),
         };
 
         if name.is_empty() || version.is_empty() {
@@ -98,6 +134,7 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         let is_optional = pkg.optional.unwrap_or(false);
 
         result.push(MigratedPackage {
+            lockfile_key: Some(key.clone()),
             name,
             version,
             resolved,
@@ -107,11 +144,60 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
             is_dev,
         });
     }
+    result
+}
 
-    // Sort for deterministic output
-    result.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.version.cmp(&b.version)));
+fn parse_v9_snapshots(
+    packages: &HashMap<String, PnpmPackage>,
+    snapshots: &HashMap<String, PnpmSnapshot>,
+) -> Vec<MigratedPackage> {
+    let mut result = Vec::with_capacity(snapshots.len());
+    for (key, snapshot) in snapshots {
+        let (name, version) = parse_v9_key(key);
+        if name.is_empty()
+            || version.is_empty()
+            || version.starts_with("link:")
+            || version.starts_with("file:")
+        {
+            tracing::debug!("skipping unparseable pnpm snapshot key: {key}");
+            continue;
+        }
+        let metadata_key = format!("{name}@{version}");
+        let metadata = packages.get(&metadata_key).or_else(|| packages.get(key));
+        if metadata.is_some_and(package_uses_local_resolution) {
+            continue;
+        }
+        let mut dependencies = extract_deps(&snapshot.dependencies);
+        dependencies.extend(extract_deps(&snapshot.optional_dependencies));
+        dependencies.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        dependencies.dedup();
 
-    Ok(result)
+        result.push(MigratedPackage {
+            lockfile_key: Some(key.clone()),
+            name,
+            version,
+            resolved: metadata
+                .and_then(|package| package.resolution.as_ref())
+                .and_then(|resolution| resolution.tarball.clone()),
+            integrity: metadata
+                .and_then(|package| package.resolution.as_ref())
+                .and_then(|resolution| resolution.integrity.clone()),
+            dependencies,
+            is_optional: metadata
+                .and_then(|package| package.optional)
+                .unwrap_or(false),
+            is_dev: metadata.and_then(|package| package.dev).unwrap_or(false),
+        });
+    }
+    result
+}
+
+fn package_uses_local_resolution(package: &PnpmPackage) -> bool {
+    package
+        .resolution
+        .as_ref()
+        .and_then(|resolution| resolution.tarball.as_deref())
+        .is_some_and(|tarball| tarball.starts_with("link:") || tarball.starts_with("file:"))
 }
 
 // ---------------------------------------------------------------------------
@@ -121,23 +207,40 @@ pub fn parse_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PnpmFormat {
     V9,
-    V5V6,
+    V6,
+    V5,
 }
 
 /// Determine lockfile format from the lockfileVersion value.
 ///
 /// v9 uses `'9.0'` (string); v5/v6 use a number like `5.4` or `'5.4'`.
 /// v9 also uses `name@version` keys; older uses `/name/version`.
-fn detect_format(version_value: &serde_yaml::Value) -> PnpmFormat {
+fn detect_format(version_value: &serde_yaml::Value) -> Result<PnpmFormat, LpmError> {
     let version_str = match version_value {
         serde_yaml::Value::Number(n) => n.as_f64().map(|f| f.to_string()),
         serde_yaml::Value::String(s) => Some(s.clone()),
         _ => None,
     };
 
-    match version_str {
-        Some(s) if s.starts_with('9') || s.starts_with("9.") => PnpmFormat::V9,
-        _ => PnpmFormat::V5V6,
+    let version = version_str.ok_or_else(|| {
+        LpmError::Script("pnpm-lock.yaml has a nonnumeric lockfileVersion".to_string())
+    })?;
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .ok_or_else(|| {
+            LpmError::Script(format!(
+                "pnpm-lock.yaml has an invalid lockfileVersion {version}"
+            ))
+        })?;
+    match major {
+        9 => Ok(PnpmFormat::V9),
+        6 => Ok(PnpmFormat::V6),
+        5 => Ok(PnpmFormat::V5),
+        _ => Err(LpmError::Script(format!(
+            "unsupported pnpm lockfile version {version}; supported major versions are 5, 6, and 9"
+        ))),
     }
 }
 
@@ -146,6 +249,13 @@ fn detect_format(version_value: &serde_yaml::Value) -> PnpmFormat {
 /// Split at the last `@` that is not at position 0.
 fn parse_v9_key(key: &str) -> (String, String) {
     split_at_last_at(clean_pnpm_key(key))
+}
+
+/// Parse v6 key: `/name@version` or `/@scope/name@version`.
+fn parse_v6_key(key: &str) -> (String, String) {
+    let stripped = key.strip_prefix('/').unwrap_or(key);
+    let base = stripped.split(['_', '(']).next().unwrap_or(stripped);
+    split_at_last_at(base)
 }
 
 /// Parse v5/v6 key: `/name/version` or `/@scope/name/version`.
@@ -182,6 +292,37 @@ fn parse_v5_key(key: &str) -> (String, String) {
 /// happen to carry peer-suffix metadata.
 pub fn clean_pnpm_key(key: &str) -> &str {
     key.split('(').next().unwrap_or(key)
+}
+
+/// Convert an exact pnpm lockfile instance key to its virtual-store
+/// directory name without discarding peer-context identity.
+pub fn virtual_store_directory_name(key: &str) -> Result<String, LpmError> {
+    let raw = key.strip_prefix('/').unwrap_or(key);
+    if raw.is_empty() || raw.contains('\0') || raw.contains('\\') {
+        return Err(LpmError::Script(format!(
+            "pnpm lockfile contains an unsafe package instance key: {key}"
+        )));
+    }
+    let last_segment = raw.rsplit('/').next().unwrap_or(raw);
+    let version_prefix = last_segment.split('_').next().unwrap_or(last_segment);
+    let normalized = if raw.contains('/') && !version_prefix.contains('@') {
+        let split = raw
+            .rfind('/')
+            .ok_or_else(|| LpmError::Script(format!("invalid pnpm package instance key: {key}")))?;
+        format!("{}@{}", &raw[..split], &raw[split + 1..])
+    } else {
+        raw.to_string()
+    };
+    let directory = normalized
+        .replace('/', "+")
+        .replace('(', "_")
+        .replace(')', "");
+    if directory.is_empty() || directory == "." || directory == ".." || directory.contains('/') {
+        return Err(LpmError::Script(format!(
+            "pnpm lockfile contains an unsafe package instance key: {key}"
+        )));
+    }
+    Ok(directory)
 }
 
 /// Split `"name@version"` at the last `@` that is not at position 0.
@@ -280,6 +421,79 @@ packages:
         let accepts = packages.iter().find(|p| p.name == "accepts").unwrap();
         assert_eq!(accepts.version, "1.3.8");
         assert_eq!(accepts.integrity.as_deref(), Some("sha512-abc"));
+    }
+
+    #[test]
+    fn parse_v6_at_delimited_keys_with_peer_contexts() {
+        let yaml = r#"
+lockfileVersion: '6.0'
+
+packages:
+  /accepts@1.3.8:
+    resolution: {integrity: sha512-accepts}
+  /@babel/core@7.24.0:
+    resolution: {integrity: sha512-babel}
+  /consumer@1.0.0_peer@2.0.0:
+    resolution: {integrity: sha512-consumer}
+"#;
+
+        let packages = parse_str(yaml).unwrap();
+
+        assert_eq!(packages.len(), 3);
+        assert!(
+            packages
+                .iter()
+                .any(|package| { package.name == "accepts" && package.version == "1.3.8" })
+        );
+        assert!(
+            packages
+                .iter()
+                .any(|package| { package.name == "@babel/core" && package.version == "7.24.0" })
+        );
+        assert!(
+            packages
+                .iter()
+                .any(|package| { package.name == "consumer" && package.version == "1.0.0" })
+        );
+    }
+
+    #[test]
+    fn parse_v9_uses_snapshot_instances_and_edges() {
+        let yaml = r#"
+lockfileVersion: '9.0'
+
+packages:
+  consumer@1.0.0:
+    resolution: {integrity: sha512-consumer}
+  left@1.0.0:
+    resolution: {integrity: sha512-left}
+  right@2.0.0:
+    resolution: {integrity: sha512-right}
+
+snapshots:
+  consumer@1.0.0(left@1.0.0):
+    dependencies:
+      left: 1.0.0
+  consumer@1.0.0(right@2.0.0):
+    dependencies:
+      right: 2.0.0
+  left@1.0.0: {}
+  right@2.0.0: {}
+"#;
+
+        let packages = parse_str(yaml).unwrap();
+        let consumers: Vec<_> = packages
+            .iter()
+            .filter(|package| package.name == "consumer")
+            .collect();
+
+        assert_eq!(consumers.len(), 2);
+        assert!(consumers.iter().any(|package| {
+            package.dependencies == vec![("left".to_string(), "1.0.0".to_string())]
+        }));
+        assert!(consumers.iter().any(|package| {
+            package.dependencies == vec![("right".to_string(), "2.0.0".to_string())]
+        }));
     }
 
     #[test]
@@ -521,7 +735,7 @@ packages:
     #[test]
     fn detect_format_v9() {
         assert_eq!(
-            detect_format(&serde_yaml::Value::String("9.0".to_string())),
+            detect_format(&serde_yaml::Value::String("9.0".to_string())).unwrap(),
             PnpmFormat::V9
         );
     }
@@ -529,7 +743,7 @@ packages:
     #[test]
     fn detect_format_v5() {
         let val: serde_yaml::Value = serde_yaml::from_str("5.4").unwrap();
-        assert_eq!(detect_format(&val), PnpmFormat::V5V6);
+        assert_eq!(detect_format(&val).unwrap(), PnpmFormat::V5);
     }
 
     #[test]
@@ -586,5 +800,40 @@ some-dep:
         let deps = extract_deps(&map);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], ("some-dep".to_string(), "2.1.0".to_string()));
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_future_lockfile_version() {
+        let error = parse_str(
+            r#"
+lockfileVersion: '10.0'
+packages:
+  future@1.0.0:
+    resolution: {integrity: sha512-future}
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported pnpm lockfile version")
+        );
+    }
+
+    #[test]
+    fn package_map_limit_is_enforced_before_the_overflow_value_is_decoded() {
+        use std::fmt::Write as _;
+
+        let mut lockfile = String::with_capacity(crate::MAX_PACKAGES * 14);
+        lockfile.push_str("lockfileVersion: '9.0'\npackages:\n");
+        for index in 0..crate::MAX_PACKAGES {
+            writeln!(lockfile, "  p{index}: {{}}").unwrap();
+        }
+        lockfile.push_str("  overflow: [\n");
+
+        let error = parse_str(&lockfile).unwrap_err();
+
+        assert!(error.to_string().contains("package map exceeds"));
     }
 }

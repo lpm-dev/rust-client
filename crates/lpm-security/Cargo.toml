@@ -11,6 +11,8 @@ description = "Security auditing, provenance verification, and trust policies fo
 lpm-common = { workspace = true }
 lpm-lockfile = { workspace = true }
 lpm-workspace = { path = "../lpm-workspace" }
+cap-fs-ext = { workspace = true }
+cap-std = "4.0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 strsim = { workspace = true }
