@@ -6,6 +6,12 @@ enum HttpTransportMode {
     WorkerMetadataHttp3,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HttpRedirectMode {
+    Automatic,
+    Manual,
+}
+
 impl RegistryClient {
     pub(super) fn worker_metadata_http3_enabled_from_env() -> bool {
         Self::worker_metadata_http3_enabled_for_lpm_http(std::env::var("LPM_HTTP").ok().as_deref())
@@ -130,6 +136,23 @@ impl RegistryClient {
             tls,
             identity,
             HttpTransportMode::Default,
+            HttpRedirectMode::Automatic,
+        )
+    }
+
+    pub(super) fn build_manual_redirect_http_client_with_tls_and_identity(
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> Result<reqwest::Client, LpmError> {
+        Self::build_http_client_with_tls_identity_and_transport(
+            connect_timeout,
+            read_timeout,
+            tls,
+            identity,
+            HttpTransportMode::Default,
+            HttpRedirectMode::Manual,
         )
     }
 
@@ -139,11 +162,15 @@ impl RegistryClient {
         tls: &TlsOverrides,
         identity: Option<reqwest::Identity>,
         transport: HttpTransportMode,
+        redirect: HttpRedirectMode,
     ) -> Result<reqwest::Client, LpmError> {
         let mut b = lpm_http::client_builder()
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
+        if redirect == HttpRedirectMode::Manual {
+            b = b.redirect(reqwest::redirect::Policy::none());
+        }
         if transport == HttpTransportMode::WorkerMetadataHttp3 {
             b = Self::apply_http3_prior_knowledge(b);
         } else if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
@@ -217,6 +244,7 @@ impl RegistryClient {
             tls,
             global_identity,
             HttpTransportMode::WorkerMetadataHttp3,
+            HttpRedirectMode::Automatic,
         )
     }
 
@@ -252,7 +280,18 @@ impl RegistryClient {
         }
         let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
         let policy_metadata_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
-        let http = HttpClients::from_default_clients(default_client, policy_metadata_client);
+        let manual_redirect_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            &TlsOverrides::default(),
+            None,
+        )
+        .expect("default TLS config never fails to build");
+        let http = HttpClients::from_default_clients(
+            default_client,
+            policy_metadata_client,
+            manual_redirect_client,
+        );
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
         // `None` here is a graceful degradation: if we can't even resolve a
@@ -491,11 +530,18 @@ impl RegistryClient {
             CONNECT_TIMEOUT,
             READ_TIMEOUT,
             tls,
+            default_identity.clone(),
+        )?;
+        let manual_redirect_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            tls,
             default_identity,
         )?;
         let default_cached = CachedClient {
             client: default_reqwest_client,
             policy_metadata_client,
+            manual_redirect_client,
             identity_fp: default_identity_fp,
         };
         // Eager per-origin builds — only for origins in the supplied set

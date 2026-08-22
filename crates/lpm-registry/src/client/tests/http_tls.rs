@@ -187,7 +187,7 @@ fn http_clients_eager_hit_overrides_default() {
 }
 
 #[tokio::test]
-async fn policy_metadata_dispatch_uses_its_dedicated_client() {
+async fn specialized_dispatch_uses_dedicated_policy_and_manual_redirect_clients() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -195,7 +195,7 @@ async fn policy_metadata_dispatch_uses_its_dedicated_client() {
     Mock::given(method("GET"))
         .and(path("/metadata"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -213,7 +213,15 @@ async fn policy_metadata_dispatch_uses_its_dedicated_client() {
         )]))
         .build()
         .expect("policy client");
-    let clients = HttpClients::from_default_clients(regular, policy);
+    let manual_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-lpm-pool"),
+            reqwest::header::HeaderValue::from_static("manual-redirect"),
+        )]))
+        .build()
+        .expect("manual redirect client");
+    let clients = HttpClients::from_default_clients(regular, policy, manual_redirect);
     let url = format!("{}/metadata", server.uri());
 
     clients
@@ -232,6 +240,14 @@ async fn policy_metadata_dispatch_uses_its_dedicated_client() {
         .send()
         .await
         .expect("policy response");
+    clients
+        .for_manual_redirect_url(&url)
+        .await
+        .expect("manual redirect dispatch")
+        .get(&url)
+        .send()
+        .await
+        .expect("manual redirect response");
 
     let requests = server.received_requests().await.expect("request recording");
     let pools: Vec<&str> = requests
@@ -244,7 +260,83 @@ async fn policy_metadata_dispatch_uses_its_dedicated_client() {
                 .expect("pool header")
         })
         .collect();
-    assert_eq!(pools, vec!["regular", "policy"]);
+    assert_eq!(pools, vec!["regular", "policy", "manual-redirect"]);
+}
+
+#[tokio::test]
+async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn cached_with_manual_origin(origin: &'static str) -> CachedClient {
+        let manual_redirect_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(reqwest::header::HeaderMap::from_iter([(
+                reqwest::header::HeaderName::from_static("x-manual-origin"),
+                reqwest::header::HeaderValue::from_static(origin),
+            )]))
+            .build()
+            .expect("manual redirect client");
+        CachedClient {
+            client: reqwest::Client::new(),
+            policy_metadata_client: reqwest::Client::new(),
+            manual_redirect_client,
+            identity_fp: None,
+        }
+    }
+
+    let target = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/capture"))
+        .and(header("x-manual-origin", "target"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/initial"))
+        .and(header("x-manual-origin", "source"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/capture", target.uri())),
+        )
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    let mut eager = HashMap::new();
+    eager.insert(
+        OriginKey::from_request_url(&source.uri()).unwrap(),
+        cached_with_manual_origin("source"),
+    );
+    eager.insert(
+        OriginKey::from_request_url(&target.uri()).unwrap(),
+        cached_with_manual_origin("target"),
+    );
+    let clients = HttpClients {
+        default: cached(reqwest::Client::new()),
+        eager,
+        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        tls_overrides: Arc::new(TlsOverrides::default()),
+        passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        per_origin_identity_fps: HashMap::new(),
+    };
+    let body = lpm_http::ReplayableRequestBody::from_bytes(b"body".to_vec());
+    let mut request = reqwest::Request::new(
+        reqwest::Method::PUT,
+        reqwest::Url::parse(&format!("{}/initial", source.uri())).unwrap(),
+    );
+    request.headers_mut().insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+
+    let response = lpm_http::send_with_replayable_redirects(&clients, request, Some(&body))
+        .await
+        .expect("redirect should use each origin's manual client");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
 }
 
 #[test]

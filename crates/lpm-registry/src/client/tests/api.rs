@@ -1,5 +1,9 @@
 use super::*;
 
+fn replayable_json(value: &serde_json::Value) -> lpm_http::ReplayableRequestBody {
+    lpm_http::ReplayableRequestBody::from_bytes(serde_json::to_vec(value).unwrap())
+}
+
 #[tokio::test]
 #[ignore = "requires network — run with --ignored"]
 async fn health_check_succeeds() {
@@ -518,17 +522,181 @@ async fn publish_package_treats_500_with_existing_version_as_success() {
         .mount(&server)
         .await;
 
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
     let result = client
-        .publish_package(
-            encoded_name,
-            &serde_json::json!({ "name": encoded_name }),
-            None,
-            0,
-        )
+        .publish_package(encoded_name, &payload, None, 0)
         .await
         .expect("publish should succeed when version exists after 500");
 
     assert_eq!(result["name"], encoded_name);
+}
+
+#[tokio::test]
+async fn publish_package_replays_the_exact_body_after_gateway_failure() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[derive(Clone)]
+    struct PublishRetryResponder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for PublishRetryResponder {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).set_body_string("temporary gateway failure")
+            } else {
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"success": true}))
+            }
+        }
+    }
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("publish-token");
+    let encoded_name = "@lpm.dev/test.replay";
+    let value = serde_json::json!({
+        "name": encoded_name,
+        "_attachments": {"archive.tgz": {"data": "cmVwbGF5"}}
+    });
+    let expected_body = serde_json::to_vec(&value).unwrap();
+    let expected_length = expected_body.len().to_string();
+    let payload = replayable_json(&value);
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/test.replay"))
+        .and(header("authorization", "Bearer publish-token"))
+        .respond_with(PublishRetryResponder {
+            calls: Arc::clone(&calls),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .publish_package(encoded_name, &payload, Some("123456"), 6)
+        .await
+        .expect("publish should succeed after the gateway retry");
+
+    assert_eq!(result["success"], true);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let requests = server.received_requests().await.unwrap();
+    let publish_requests = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT")
+        .collect::<Vec<_>>();
+    assert_eq!(publish_requests.len(), 2);
+    for request in publish_requests {
+        assert_eq!(request.body, expected_body);
+        assert_eq!(
+            request
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_length.as_str())
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("x-otp")
+                .and_then(|value| value.to_str().ok()),
+            Some("123456")
+        );
+    }
+}
+
+#[tokio::test]
+async fn publish_package_replays_put_body_and_length_across_same_origin_307() {
+    use wiremock::matchers::{body_bytes, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token");
+    let encoded_name = "@lpm.dev/test.redirect";
+    let value = serde_json::json!({
+        "name": encoded_name,
+        "_attachments": {"archive.tgz": {"data": "cmVkaXJlY3Q="}}
+    });
+    let expected_body = serde_json::to_vec(&value).unwrap();
+    let expected_length = expected_body.len().to_string();
+    let payload = replayable_json(&value);
+
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/test.redirect"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", "/redirected-publish"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/redirected-publish"))
+        .and(header("authorization", "Bearer publish-token"))
+        .and(header("x-otp", "123456"))
+        .and(header("content-length", expected_length.as_str()))
+        .and(body_bytes(expected_body))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .publish_package(encoded_name, &payload, Some("123456"), 8)
+        .await
+        .expect("same-origin 307 should replay the publish request");
+
+    assert_eq!(result["success"], true);
+}
+
+#[tokio::test]
+async fn publish_package_strips_bearer_and_otp_across_cross_origin_303() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/capture"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .expect(1)
+        .mount(&target)
+        .await;
+
+    let redirector = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/test.cross-origin"))
+        .respond_with(
+            ResponseTemplate::new(303)
+                .insert_header("location", format!("{}/capture", target.uri())),
+        )
+        .expect(1)
+        .mount(&redirector)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({
+        "name": "@lpm.dev/test.cross-origin"
+    }));
+    let result = RegistryClient::new()
+        .with_base_url(redirector.uri())
+        .with_token("publish-token")
+        .publish_package("@lpm.dev/test.cross-origin", &payload, Some("123456"), 0)
+        .await
+        .expect("cross-origin 303 should complete without forwarding credentials");
+
+    assert_eq!(result["success"], true);
+    let requests = target.received_requests().await.unwrap();
+    let redirected = requests.first().expect("redirect target request");
+    assert!(redirected.headers.get("authorization").is_none());
+    assert!(redirected.headers.get("x-otp").is_none());
+    assert!(redirected.headers.get("npm-otp").is_none());
 }
 
 #[tokio::test]
@@ -580,13 +748,9 @@ async fn publish_package_returns_http_500_when_version_missing_after_500() {
         .mount(&server)
         .await;
 
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
     let result = client
-        .publish_package(
-            encoded_name,
-            &serde_json::json!({ "name": encoded_name }),
-            None,
-            0,
-        )
+        .publish_package(encoded_name, &payload, None, 0)
         .await;
 
     assert!(matches!(

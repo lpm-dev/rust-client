@@ -297,9 +297,14 @@ fn rcgen_pem() -> Vec<u8> {
 /// principal_fingerprint (that's its own test), so identity_fp
 /// stays None.
 fn cached(client: reqwest::Client) -> CachedClient {
+    let manual_redirect_client = lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build redirect-disabled test client");
     CachedClient {
         policy_metadata_client: client.clone(),
         client,
+        manual_redirect_client,
         identity_fp: None,
     }
 }

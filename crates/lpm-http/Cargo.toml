@@ -8,11 +8,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+bytes = "1"
+futures = { workspace = true }
 reqwest = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 syn = { version = "2", features = ["full", "visit"] }
-tokio = { workspace = true }
+wiremock = "0.6"
 
 [lints]
 workspace = true

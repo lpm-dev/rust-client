@@ -227,7 +227,7 @@ pub(crate) async fn stage_publish(
     npm_name: &str,
     version: &str,
     version_data: &serde_json::Value,
-    tarball_data: &[u8],
+    tarball_data: &std::sync::Arc<Vec<u8>>,
     tarball_hashes: &crate::commands::publish_common::TarballHashes,
     provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
@@ -255,7 +255,7 @@ async fn stage_publish_impl(
     npm_name: &str,
     version: &str,
     version_data: &serde_json::Value,
-    tarball_data: &[u8],
+    tarball_data: &std::sync::Arc<Vec<u8>>,
     tarball_hashes: &crate::commands::publish_common::TarballHashes,
     provenance_attachment: Option<&NpmProvenanceAttachment>,
     access: &str,
@@ -278,26 +278,27 @@ async fn stage_publish_impl(
             tag: Some(tag),
             provenance_attachment,
         },
-    );
+    )?;
     let tarball_mb = tarball_data.len() as u64 / (1024 * 1024);
     let timeout = Duration::from_secs(std::cmp::min(60 + tarball_mb * 2, 600));
-    let client = stage_http_client(timeout)?;
+    let client = stage_manual_redirect_http_client(timeout)?;
     let url = endpoint_url(
         registry_url,
         &format!("-/stage/package/{}", urlencoding::encode(npm_name)),
     );
 
-    let response = web_auth::add_npm_web_auth_headers(client.post(url), NPM_COMMAND_STAGE)
-        .json(&payload)
+    let request = web_auth::add_npm_web_auth_headers(client.post(url), NPM_COMMAND_STAGE)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CONTENT_LENGTH, payload.len())
+        .timeout(timeout)
+        .body(payload.request_body())
         .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| {
-            LpmError::Registry(format!(
-                "npm stage publish request failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to build npm stage request: {e}")))?;
+    let response =
+        lpm_http::send_with_replayable_redirects(&client, request, Some(payload.replayable()))
+            .await
+            .map_err(|e| LpmError::Registry(format!("npm stage publish request failed: {e}")))?;
 
     let status = response.status();
     let body = response_json_or_empty(response).await;
@@ -559,15 +560,20 @@ async fn stage_otp_mutation(
     runtime: NpmStageRuntime,
 ) -> Result<serde_json::Value, LpmError> {
     validate_npm_stage_registry(registry_url)?;
-    let client = stage_http_client(Duration::from_secs(60))?;
-    let response = send_stage_mutation(&client, token, registry_url, route, method.clone(), otp)
-        .await
-        .map_err(|e| {
-            LpmError::Registry(format!(
-                "{action} request failed: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
+    let timeout = Duration::from_secs(60);
+    let client = stage_http_client(timeout)?;
+    let mutation_client = stage_manual_redirect_http_client(timeout)?;
+    let response = send_stage_mutation(
+        &mutation_client,
+        token,
+        registry_url,
+        route,
+        method.clone(),
+        otp,
+        timeout,
+    )
+    .await
+    .map_err(|e| LpmError::Registry(format!("{action} request failed: {e}")))?;
     let status = response.status();
     let headers = response.headers().clone();
 
@@ -594,15 +600,17 @@ async fn stage_otp_mutation(
                 runtime.web_auth_poll_interval,
             )
             .await?;
-            let retry =
-                send_stage_mutation(&client, token, registry_url, route, method, Some(&otp))
-                    .await
-                    .map_err(|e| {
-                        LpmError::Registry(format!(
-                            "{action} retry failed: {}",
-                            lpm_http::display_error(&e)
-                        ))
-                    })?;
+            let retry = send_stage_mutation(
+                &mutation_client,
+                token,
+                registry_url,
+                route,
+                method,
+                Some(&otp),
+                timeout,
+            )
+            .await
+            .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
             return stage_mutation_response(action, retry).await;
         }
 
@@ -618,15 +626,17 @@ async fn stage_otp_mutation(
             }
 
             let otp = prompt_npm_otp()?;
-            let retry =
-                send_stage_mutation(&client, token, registry_url, route, method, Some(&otp))
-                    .await
-                    .map_err(|e| {
-                        LpmError::Registry(format!(
-                            "{action} retry failed: {}",
-                            lpm_http::display_error(&e)
-                        ))
-                    })?;
+            let retry = send_stage_mutation(
+                &mutation_client,
+                token,
+                registry_url,
+                route,
+                method,
+                Some(&otp),
+                timeout,
+            )
+            .await
+            .map_err(|e| LpmError::Registry(format!("{action} retry failed: {e}")))?;
             return stage_mutation_response(action, retry).await;
         }
 
@@ -645,7 +655,8 @@ async fn send_stage_mutation(
     route: &str,
     method: Method,
     otp: Option<&str>,
-) -> Result<reqwest::Response, reqwest::Error> {
+    timeout: Duration,
+) -> Result<reqwest::Response, lpm_http::ReplayableRequestError<std::convert::Infallible>> {
     let mut request = web_auth::add_npm_web_auth_headers(
         client.request(method, endpoint_url(registry_url, route)),
         NPM_COMMAND_STAGE,
@@ -654,7 +665,11 @@ async fn send_stage_mutation(
     if let Some(code) = otp {
         request = request.header("npm-otp", code);
     }
-    request.send().await
+    let request = request
+        .timeout(timeout)
+        .build()
+        .map_err(lpm_http::ReplayableRequestError::request)?;
+    lpm_http::send_with_replayable_redirects(client, request, None).await
 }
 
 async fn stage_mutation_response(
@@ -674,6 +689,15 @@ async fn stage_mutation_response(
 
 fn stage_http_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
     lpm_http::client_builder()
+        .timeout(timeout)
+        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
+        .build()
+        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))
+}
+
+fn stage_manual_redirect_http_client(timeout: Duration) -> Result<reqwest::Client, LpmError> {
+    lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
@@ -893,13 +917,15 @@ mod tests {
             data: r#"{"mediaType":"application/vnd.dev.sigstore.bundle+json;version=0.2"}"#.into(),
         };
 
+        let tarball = std::sync::Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
         let result = stage_publish_impl(
             "npm-token",
             "plain-pkg",
             "1.0.0",
             &serde_json::json!({"name": "plain-pkg", "version": "1.0.0"}),
-            b"fake-tarball",
-            &crate::commands::publish_common::compute_hashes(b"fake-tarball"),
+            &tarball,
+            &hashes,
             Some(&provenance),
             "public",
             "latest",
@@ -919,5 +945,102 @@ mod tests {
         assert_eq!(attachment["content_type"], provenance.media_type.as_ref());
         assert_eq!(attachment["data"], provenance.data.as_ref());
         assert_eq!(attachment["length"], provenance.data.len());
+    }
+
+    #[tokio::test]
+    async fn stage_publish_replays_exact_post_body_across_same_origin_307() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/stage/package/plain-pkg"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/redirected-stage"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/redirected-stage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "stageId": "stage-redirected"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tarball = std::sync::Arc::new(b"redirected-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
+        let result = stage_publish_impl(
+            "npm-token",
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({"name": "plain-pkg", "version": "1.0.0"}),
+            &tarball,
+            &hashes,
+            None,
+            "public",
+            "latest",
+            &server.uri(),
+        )
+        .await
+        .expect("same-origin 307 should replay staged publish");
+
+        assert_eq!(result.stage_id, "stage-redirected");
+        let requests = server.received_requests().await.unwrap();
+        let stage_requests = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .collect::<Vec<_>>();
+        assert_eq!(stage_requests.len(), 2);
+        assert_eq!(stage_requests[0].body, stage_requests[1].body);
+        assert_eq!(
+            stage_requests[1]
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(stage_requests[1].body.len().to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_mutation_strips_bearer_and_otp_across_cross_origin_303() {
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/capture"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true
+            })))
+            .expect(1)
+            .mount(&target)
+            .await;
+
+        let redirector = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/stage/stage-id/approve"))
+            .respond_with(
+                ResponseTemplate::new(303)
+                    .insert_header("location", format!("{}/capture", target.uri())),
+            )
+            .expect(1)
+            .mount(&redirector)
+            .await;
+
+        let result = stage_otp_mutation(
+            "npm-token",
+            &redirector.uri(),
+            "-/stage/stage-id/approve",
+            Method::POST,
+            "approve staged package",
+            Some("123456"),
+            false,
+            false,
+            NpmStageRuntime::production(),
+        )
+        .await
+        .expect("cross-origin 303 should complete without forwarding credentials");
+
+        assert_eq!(result["success"], true);
+        let requests = target.received_requests().await.unwrap();
+        let redirected = requests.first().expect("redirect target request");
+        assert!(redirected.headers.get("authorization").is_none());
+        assert!(redirected.headers.get("x-otp").is_none());
+        assert!(redirected.headers.get("npm-otp").is_none());
     }
 }

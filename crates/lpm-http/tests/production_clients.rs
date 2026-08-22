@@ -262,11 +262,20 @@ fn production_reqwest_clients_use_shared_or_no_follow_redirect_policy() {
     let mut violations = Vec::new();
 
     for path in sources {
-        if path.starts_with(&shared_source) || is_test_source(&path) {
+        if is_test_source(&path) {
             continue;
         }
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        if source.contains(".default_headers(") {
+            violations.push(format!(
+                "{}: default headers can bypass redirect sanitization",
+                path.strip_prefix(&root).unwrap_or(&path).display()
+            ));
+        }
+        if path.starts_with(&shared_source) {
+            continue;
+        }
         let syntax = syn::parse_file(&source)
             .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
         let mut aliases = ReqwestAliases::default();
@@ -287,7 +296,7 @@ fn production_reqwest_clients_use_shared_or_no_follow_redirect_policy() {
 
     assert!(
         violations.is_empty(),
-        "production reqwest constructors must use lpm-http or explicitly apply Policy::none():\n{}",
+        "production reqwest constructors must use lpm-http or explicitly apply Policy::none(), and must not configure default headers:\n{}",
         violations.join("\n")
     );
 }

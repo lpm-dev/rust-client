@@ -3535,9 +3535,14 @@ dependencies = [
 name = "lpm-http"
 version = "0.75.0"
 dependencies = [
+ "base64",
+ "bytes",
+ "futures",
  "reqwest",
+ "serde_json",
  "syn 2.0.117",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
