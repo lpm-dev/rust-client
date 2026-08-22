@@ -210,6 +210,8 @@ fn is_authored_skill_namespace_path(path: &Path) -> bool {
 /// padding, metadata, and end markers.
 pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
 
+pub(crate) const MAX_COMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+
 pub(crate) const MAX_PUBLISH_ARCHIVE_ENTRIES: usize = 100_000;
 
 pub(crate) const MAX_PUBLISH_ARCHIVE_PATH_DEPTH: usize = 256;
@@ -365,10 +367,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
     before_file_collection: impl FnOnce(),
     mut before_candidate_open: impl FnMut(&str),
 ) -> Result<PreparedTarball, LpmError> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
     use std::borrow::Cow;
-    use std::io::Write;
 
     let project_source_root = Arc::new(TarballSourceRoot {
         path: canonical_root.to_path_buf(),
@@ -463,7 +462,6 @@ fn prepare_tarball_with_source_root_and_open_hook(
         ));
     }
 
-    let mut tar_data = Vec::new();
     let mut accumulated: u64 = 0;
     let mut files = Vec::with_capacity(candidates.len());
     let mut readme: Option<(usize, String)> = None;
@@ -491,9 +489,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
             scan.files_scanned += file_scan.files_scanned;
         }
     }
-    {
-        let limited = ArchiveSizeWriter::new(&mut tar_data, max_archive_bytes);
-        let mut builder = tar::Builder::new(limited);
+    let (gzipped, ()) = write_gzipped_tar(max_archive_bytes, |builder| {
         let mut open_source_root: Option<(Arc<TarballSourceRoot>, Dir)> = None;
 
         for candidate in candidates {
@@ -612,13 +608,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
             });
         }
 
-        builder.finish().map_err(LpmError::Io)?;
-    }
-
-    // Gzip compress
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&tar_data)?;
-    let gzipped = encoder.finish()?;
+        Ok(())
+    })?;
 
     Ok(PreparedTarball {
         data: gzipped,
@@ -628,19 +619,40 @@ fn prepare_tarball_with_source_root_and_open_hook(
     })
 }
 
+#[derive(Clone, Copy)]
+enum ArchiveSizeKind {
+    Tar,
+    Gzip,
+}
+
 struct ArchiveSizeWriter<W> {
     inner: W,
     written: u64,
     limit: u64,
+    kind: ArchiveSizeKind,
 }
 
 impl<W> ArchiveSizeWriter<W> {
-    fn new(inner: W, limit: u64) -> Self {
+    fn tar(inner: W, limit: u64) -> Self {
         Self {
             inner,
             written: 0,
             limit,
+            kind: ArchiveSizeKind::Tar,
         }
+    }
+
+    fn gzip(inner: W, limit: u64) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+            kind: ArchiveSizeKind::Gzip,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
     }
 }
 
@@ -648,10 +660,17 @@ impl<W: std::io::Write> std::io::Write for ArchiveSizeWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let requested = buffer.len() as u64;
         if requested > self.limit.saturating_sub(self.written) {
-            return Err(std::io::Error::other(format!(
-                "publish archive exceeds the {}-byte limit after tar headers, padding, and end markers",
-                self.limit
-            )));
+            let message = match self.kind {
+                ArchiveSizeKind::Tar => format!(
+                    "publish archive exceeds the {}-byte limit after tar headers, padding, and end markers",
+                    self.limit
+                ),
+                ArchiveSizeKind::Gzip => format!(
+                    "compressed publish tarball exceeds the {}-byte limit",
+                    self.limit
+                ),
+            };
+            return Err(std::io::Error::other(message));
         }
         let written = self.inner.write(buffer)?;
         self.written = self.written.saturating_add(written as u64);
@@ -661,6 +680,38 @@ impl<W: std::io::Write> std::io::Write for ArchiveSizeWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+type PublishGzipEncoder = flate2::write::GzEncoder<ArchiveSizeWriter<Vec<u8>>>;
+type PublishTarBuilder<'a> = tar::Builder<ArchiveSizeWriter<&'a mut PublishGzipEncoder>>;
+
+fn write_gzipped_tar<T>(
+    max_archive_bytes: u64,
+    write_entries: impl FnOnce(&mut PublishTarBuilder<'_>) -> Result<T, LpmError>,
+) -> Result<(Vec<u8>, T), LpmError> {
+    write_gzipped_tar_with_limits(
+        max_archive_bytes,
+        MAX_COMPRESSED_TARBALL_BYTES,
+        write_entries,
+    )
+}
+
+fn write_gzipped_tar_with_limits<T>(
+    max_archive_bytes: u64,
+    max_compressed_bytes: u64,
+    write_entries: impl FnOnce(&mut PublishTarBuilder<'_>) -> Result<T, LpmError>,
+) -> Result<(Vec<u8>, T), LpmError> {
+    let compressed = ArchiveSizeWriter::gzip(Vec::with_capacity(64 * 1024), max_compressed_bytes);
+    let mut encoder = flate2::write::GzEncoder::new(compressed, flate2::Compression::default());
+    let result = {
+        let limited = ArchiveSizeWriter::tar(&mut encoder, max_archive_bytes);
+        let mut builder = tar::Builder::new(limited);
+        let result = write_entries(&mut builder)?;
+        builder.finish().map_err(LpmError::Io)?;
+        result
+    };
+    let compressed = encoder.finish().map_err(LpmError::Io)?;
+    Ok((compressed.into_inner(), result))
 }
 
 fn push_tarball_candidate(
@@ -2359,31 +2410,16 @@ pub(crate) fn rewrite_tarball_name_for_publish(
         return Ok(None);
     }
 
-    use flate2::Compression;
     use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
-    use std::io::{Read, Write};
 
-    // Decompress
-    let mut decoder = GzDecoder::new(tarball_data);
-    let mut tar_data = Vec::new();
-    decoder
-        .read_to_end(&mut tar_data)
-        .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
-
-    // Read tar entries, patch package.json, rebuild
-    let mut new_tar_data = Vec::new();
     let mut secret_scan =
         scan_secrets.then(lpm_security::behavioral::secrets::SecretScanResult::default);
     let mut secret_scan_budget =
         scan_secrets.then(lpm_security::behavioral::secrets::SecretScanBudget::for_operation);
     let mut package_json_size = None;
-    {
-        let limited = ArchiveSizeWriter::new(&mut new_tar_data, MAX_UNCOMPRESSED_TARBALL_BYTES);
-        let mut builder = tar::Builder::new(limited);
-
+    let (gzipped, ()) = write_gzipped_tar(MAX_UNCOMPRESSED_TARBALL_BYTES, |builder| {
         lpm_extractor::visit_tar_archive(
-            tar_data.as_slice(),
+            GzDecoder::new(tarball_data),
             publish_tar_read_limits(),
             |mut entry| {
                 let path = entry.path().to_string_lossy().to_string();
@@ -2429,17 +2465,11 @@ pub(crate) fn rewrite_tarball_name_for_publish(
                 Ok(std::ops::ControlFlow::<()>::Continue(()))
             },
         )?;
-
-        builder.finish().map_err(LpmError::Io)?;
-    }
+        Ok(())
+    })?;
     let package_json_size = package_json_size.ok_or_else(|| {
         LpmError::Registry("publish tarball is missing package/package.json".into())
     })?;
-
-    // Recompress
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&new_tar_data)?;
-    let gzipped = encoder.finish()?;
 
     let hashes = std::sync::Arc::new(compute_hashes(&gzipped));
     Ok(Some(RewrittenTarball {
@@ -2534,22 +2564,12 @@ pub fn rewrite_workspace_deps_in_tarball(
     tarball_data: &[u8],
     workspace: &lpm_workspace::Workspace,
 ) -> Result<Vec<u8>, LpmError> {
-    use flate2::Compression;
     use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
-    use std::io::{Read, Write};
-
-    // First pass: check if any rewriting is needed by reading the tarball's package.json
-    let mut decoder = GzDecoder::new(tarball_data);
-    let mut tar_data = Vec::new();
-    decoder
-        .read_to_end(&mut tar_data)
-        .map_err(|e| LpmError::Registry(format!("failed to decompress tarball: {e}")))?;
 
     let rewritten_package_json = {
         let mut rewritten = None;
         lpm_extractor::visit_tar_archive(
-            tar_data.as_slice(),
+            GzDecoder::new(tarball_data),
             publish_tar_read_limits(),
             |mut entry| {
                 if entry.path() == Path::new("package/package.json") {
@@ -2568,14 +2588,9 @@ pub fn rewrite_workspace_deps_in_tarball(
         return Ok(tarball_data.to_vec());
     };
 
-    // Rewrite: decompress → patch → recompress
-    let mut new_tar_data = Vec::new();
-    {
-        let limited = ArchiveSizeWriter::new(&mut new_tar_data, MAX_UNCOMPRESSED_TARBALL_BYTES);
-        let mut builder = tar::Builder::new(limited);
-
+    let (gzipped, ()) = write_gzipped_tar(MAX_UNCOMPRESSED_TARBALL_BYTES, |builder| {
         lpm_extractor::visit_tar_archive(
-            tar_data.as_slice(),
+            GzDecoder::new(tarball_data),
             publish_tar_read_limits(),
             |mut entry| {
                 let path = entry.path().to_string_lossy().to_string();
@@ -2597,14 +2612,8 @@ pub fn rewrite_workspace_deps_in_tarball(
                 Ok(std::ops::ControlFlow::<()>::Continue(()))
             },
         )?;
-
-        builder.finish().map_err(LpmError::Io)?;
-    }
-
-    // Recompress
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&new_tar_data)?;
-    let gzipped = encoder.finish()?;
+        Ok(())
+    })?;
 
     Ok(gzipped)
 }
@@ -3138,6 +3147,29 @@ mod tests {
         assert!(
             error.to_string().contains("archive") && error.to_string().contains("1024"),
             "expected archive-size limit error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn gzip_writer_rejects_compressed_output_above_limit() {
+        let payload: Vec<u8> = (0..4096).map(|index| (index * 31) as u8).collect();
+        let error = write_gzipped_tar_with_limits(u64::MAX, 64, |builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/payload.bin", payload.as_slice())
+                .map_err(LpmError::Io)?;
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("compressed publish tarball exceeds the 64-byte limit"),
+            "unexpected compressed-limit error: {error}"
         );
     }
 
