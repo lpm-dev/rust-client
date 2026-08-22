@@ -1,15 +1,15 @@
-use crate::commands::install::select_locked_package_for_requested_spec;
+use crate::commands::install::requested_range_for_locked_lookup;
 use crate::commands::manifest_metadata::{
     ManifestMetadata, extract_manifest_metadata, read_installed_manifest_metadata, read_json_file,
 };
 use crate::install_ui;
 use clap::ValueEnum;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, PackageInstanceId, sanitize_terminal_inline};
 use lpm_lockfile::{LockedPackage, Lockfile};
 use lpm_resolver::specifier::Specifier;
 use lpm_security::behavioral::manifest::license_expression_is_copyleft;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ValueEnum)]
@@ -277,12 +277,13 @@ fn emit_human(inventory: &LicenseInventory, summary: &PolicySummary) {
     );
     println!("{:-<42} {:-<12} {:-<10} {:-<1}", "", "", "", "");
     for package in &inventory.packages {
+        let license_expression = sanitize_terminal_inline(&package.license_expression);
         println!(
             "{:<42} {:<12} {:<10} {}",
             truncate_cell(&package.name, 42),
             truncate_cell(&package.version, 12),
             package.scope,
-            package.license_expression
+            license_expression
         );
     }
 
@@ -405,23 +406,35 @@ fn package_scopes_by_lockfile_index(
     root_json: &Value,
     lockfile: &Lockfile,
 ) -> Vec<Option<LicenseScope>> {
-    let version_index = package_version_index(&lockfile.packages);
-    let adjacency = package_adjacency(&lockfile.packages, &version_index);
+    let indexes = PackageIndexes::new(&lockfile.packages);
+    let adjacency = package_adjacency(&lockfile.packages, &indexes);
     let root_seeds = root_dependency_seeds(root_json);
     let mut scopes = vec![None; lockfile.packages.len()];
     let mut queue = VecDeque::new();
+    let exact_roots = lockfile
+        .root_resolutions
+        .values()
+        .any(|resolution| resolution.instance_id.is_some());
 
     for (local_name, (spec, scope)) in root_seeds {
         let target_name = root_dependency_target_name(&local_name, &spec, lockfile);
-        let Some(package) = select_locked_package_for_requested_spec(lockfile, &target_name, &spec)
-        else {
-            continue;
-        };
-        let Some(package_index) = lockfile
-            .packages
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate, package))
-        else {
+        let exact_index = lockfile
+            .root_resolutions
+            .get(&local_name)
+            .and_then(|resolution| {
+                (resolution.package == target_name)
+                    .then_some(resolution.instance_id)
+                    .flatten()
+                    .and_then(|instance_id| indexes.by_instance.get(&instance_id).copied())
+            });
+        let package_index = exact_index.or_else(|| {
+            if exact_roots {
+                None
+            } else {
+                indexes.select_legacy(&target_name, &spec)
+            }
+        });
+        let Some(package_index) = package_index else {
             continue;
         };
         if set_package_scope(&mut scopes, package_index, scope) {
@@ -454,21 +467,76 @@ fn set_package_scope(
     false
 }
 
-fn package_version_index(packages: &[LockedPackage]) -> BTreeMap<(String, String), Vec<usize>> {
-    let mut index: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
-    for (package_index, package) in packages.iter().enumerate() {
-        index
-            .entry((package.name.clone(), package.version.clone()))
-            .or_default()
-            .push(package_index);
-    }
-    index
+struct PackageIndexes<'a> {
+    packages: &'a [LockedPackage],
+    by_instance: HashMap<PackageInstanceId, usize>,
+    by_name: HashMap<&'a str, Vec<usize>>,
+    by_pin: HashMap<(&'a str, &'a str), Vec<usize>>,
 }
 
-fn package_adjacency(
-    packages: &[LockedPackage],
-    version_index: &BTreeMap<(String, String), Vec<usize>>,
-) -> Vec<Vec<usize>> {
+impl<'a> PackageIndexes<'a> {
+    fn new(packages: &'a [LockedPackage]) -> Self {
+        let mut by_instance = HashMap::with_capacity(packages.len());
+        let mut by_name = HashMap::with_capacity(packages.len());
+        let mut by_pin = HashMap::with_capacity(packages.len());
+        for (index, package) in packages.iter().enumerate() {
+            if let Some(instance_id) = package.instance_id {
+                by_instance.insert(instance_id, index);
+            }
+            by_name
+                .entry(package.name.as_str())
+                .or_insert_with(Vec::new)
+                .push(index);
+            by_pin
+                .entry((package.name.as_str(), package.version.as_str()))
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
+        Self {
+            packages,
+            by_instance,
+            by_name,
+            by_pin,
+        }
+    }
+
+    fn select_legacy(&self, target: &str, requested_spec: &str) -> Option<usize> {
+        let candidates = self.by_name.get(target)?;
+        let requested_range = requested_range_for_locked_lookup(requested_spec)
+            .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+        let mut best_satisfying = None;
+        let mut best_any = None;
+
+        for &index in candidates {
+            let version_text = &self.packages[index].version;
+            let Ok(version) = lpm_resolver::NpmVersion::parse(version_text) else {
+                continue;
+            };
+            if best_any
+                .as_ref()
+                .is_none_or(|(best, _): &(lpm_resolver::NpmVersion, usize)| version > *best)
+            {
+                best_any = Some((version.clone(), index));
+            }
+            if requested_range
+                .as_ref()
+                .is_some_and(|range| range.satisfies(&version))
+                && best_satisfying
+                    .as_ref()
+                    .is_none_or(|(best, _): &(lpm_resolver::NpmVersion, usize)| version > *best)
+            {
+                best_satisfying = Some((version, index));
+            }
+        }
+
+        best_satisfying
+            .map(|(_, index)| index)
+            .or_else(|| best_any.map(|(_, index)| index))
+            .or_else(|| candidates.first().copied())
+    }
+}
+
+fn package_adjacency(packages: &[LockedPackage], indexes: &PackageIndexes<'_>) -> Vec<Vec<usize>> {
     let mut adjacency = Vec::with_capacity(packages.len());
     for package in packages {
         let alias_targets = package
@@ -477,21 +545,50 @@ fn package_adjacency(
             .map(|[local, target]| (local.as_str(), target.as_str()))
             .collect::<BTreeMap<_, _>>();
         let mut children = BTreeSet::new();
-        for dep in package.dependencies.iter().chain(package.peers.iter()) {
-            let Some((local_name, version)) = split_dependency_pin(dep) else {
-                continue;
-            };
-            let target_name = alias_targets
-                .get(local_name.as_str())
-                .copied()
-                .unwrap_or(local_name.as_str());
-            if let Some(indices) = version_index.get(&(target_name.to_string(), version)) {
-                children.extend(indices.iter().copied());
-            }
+        if package.dependency_targets.is_empty() {
+            add_legacy_edges(
+                &mut children,
+                &package.dependencies,
+                &alias_targets,
+                indexes,
+            );
+        } else {
+            add_exact_edges(&mut children, package.dependency_targets.values(), indexes);
+        }
+        if package.peer_targets.is_empty() {
+            add_legacy_edges(&mut children, &package.peers, &alias_targets, indexes);
+        } else {
+            add_exact_edges(&mut children, package.peer_targets.values(), indexes);
         }
         adjacency.push(children.into_iter().collect());
     }
     adjacency
+}
+
+fn add_exact_edges<'a>(
+    children: &mut BTreeSet<usize>,
+    targets: impl Iterator<Item = &'a PackageInstanceId>,
+    indexes: &PackageIndexes<'_>,
+) {
+    children
+        .extend(targets.filter_map(|instance_id| indexes.by_instance.get(instance_id).copied()));
+}
+
+fn add_legacy_edges(
+    children: &mut BTreeSet<usize>,
+    edges: &[String],
+    alias_targets: &BTreeMap<&str, &str>,
+    indexes: &PackageIndexes<'_>,
+) {
+    for edge in edges {
+        let Some((local_name, version)) = split_dependency_pin(edge) else {
+            continue;
+        };
+        let target_name = alias_targets.get(local_name).copied().unwrap_or(local_name);
+        if let Some(targets) = indexes.by_pin.get(&(target_name, version)) {
+            children.extend(targets.iter().copied());
+        }
+    }
 }
 
 fn root_dependency_seeds(root_json: &Value) -> BTreeMap<String, (String, LicenseScope)> {
@@ -553,19 +650,18 @@ fn root_dependency_target_name(local_name: &str, spec: &str, lockfile: &Lockfile
     local_name.to_string()
 }
 
-fn split_dependency_pin(input: &str) -> Option<(String, String)> {
+fn split_dependency_pin(input: &str) -> Option<(&str, &str)> {
     let at = input.rfind('@')?;
     if at == 0 || at + 1 >= input.len() {
         return None;
     }
-    let name = input[..at].to_string();
-    let version = input[at + 1..].to_string();
-    Some((name, version))
+    Some((&input[..at], &input[at + 1..]))
 }
 
 fn truncate_cell(value: &str, width: usize) -> String {
+    let value = sanitize_terminal_inline(value);
     if value.chars().count() <= width {
-        return value.to_string();
+        return value.into_owned();
     }
     let mut out = value
         .chars()
