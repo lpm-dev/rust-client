@@ -7,7 +7,19 @@
 //! - **Quality/security warnings**: Surface registry-side analysis during install.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use cap_fs_ext::OpenOptionsExt as _;
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::fs::{Dir, OpenOptions};
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{CallExpression, Expression, ImportExpression};
+use oxc_ast_visit::Visit;
+use oxc_ast_visit::walk::{walk_call_expression, walk_import_expression};
+use oxc_parser::Parser;
+use oxc_span::SourceType;
 
 // ─── Source Scanner ────────────────────────────────────────────────
 
@@ -37,51 +49,124 @@ pub struct SourceImport {
 /// its own package and its imports are checked against its own manifest,
 /// not the parent's.
 ///
+/// Callers that need to distinguish incomplete analysis from an empty scan
+/// must use [`scan_source_imports_checked`].
+///
 /// Target: < 100ms for a typical project (~500 source files).
 pub fn scan_source_imports(project_dir: &Path) -> Vec<SourceImport> {
-    let aliases = ProjectAliases::load(project_dir);
-    let mut imports = Vec::new();
-    let src_dirs = find_source_dirs(project_dir);
-
-    for dir in &src_dirs {
-        let is_root = dir == project_dir;
-        scan_dir(dir, &aliases, is_root, &mut imports);
-    }
-
-    imports
+    scan_source_imports_checked(project_dir).unwrap_or_default()
 }
 
-/// Find directories likely to contain source code.
-///
-/// Returns the conventional source-tree roots if they exist
-/// (`src/`, `app/`, `pages/`, `components/`, `lib/`). When none exist,
-/// falls back to the project root itself; the boundary check in
-/// [`scan_dir`] keeps descent inside the current package.
-fn find_source_dirs(project_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+const SOURCE_SCAN_MAX_FILES: usize = 10_000;
+const SOURCE_SCAN_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SOURCE_SCAN_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const SOURCE_SCAN_MAX_DEPTH: usize = 64;
+const SOURCE_SCAN_MAX_IMPORTS: usize = 100_000;
+const SOURCE_SCAN_MAX_ENTRIES: usize = 100_000;
 
-    for candidate in ["src", "app", "pages", "components", "lib"] {
-        let path = project_dir.join(candidate);
-        if path.is_dir() {
-            dirs.push(path);
+#[derive(Clone, Copy)]
+struct SourceScanLimits {
+    max_files: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_depth: usize,
+    max_imports: usize,
+    max_entries: usize,
+}
+
+impl Default for SourceScanLimits {
+    fn default() -> Self {
+        Self {
+            max_files: SOURCE_SCAN_MAX_FILES,
+            max_file_bytes: SOURCE_SCAN_MAX_FILE_BYTES,
+            max_total_bytes: SOURCE_SCAN_MAX_TOTAL_BYTES,
+            max_depth: SOURCE_SCAN_MAX_DEPTH,
+            max_imports: SOURCE_SCAN_MAX_IMPORTS,
+            max_entries: SOURCE_SCAN_MAX_ENTRIES,
         }
     }
+}
 
-    if dirs.is_empty() {
-        dirs.push(project_dir.to_path_buf());
+/// Scan source imports and fail if traversal, parsing, or a safety budget
+/// prevents a complete result.
+pub fn scan_source_imports_checked(project_dir: &Path) -> io::Result<Vec<SourceImport>> {
+    scan_source_imports_with_limits(project_dir, SourceScanLimits::default())
+}
+
+fn scan_source_imports_with_limits(
+    project_dir: &Path,
+    limits: SourceScanLimits,
+) -> io::Result<Vec<SourceImport>> {
+    let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())
+        .map_err(|source| scan_io_error("open project directory", project_dir, source))?;
+    let aliases = ProjectAliases::load(project_dir);
+    let mut state = SourceScanState {
+        project_dir,
+        aliases: &aliases,
+        limits,
+        files: 0,
+        total_bytes: 0,
+        entries: 0,
+        imports: Vec::with_capacity(128),
+        parser_allocator: Allocator::default(),
+    };
+    let mut found_source_root = false;
+
+    for candidate in ["src", "app", "pages", "components", "lib"] {
+        let metadata = match project.symlink_metadata(candidate) {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(scan_io_error(
+                    "inspect source directory",
+                    &project_dir.join(candidate),
+                    source,
+                ));
+            }
+        };
+        if metadata.is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let directory = project.open_dir_nofollow(candidate).map_err(|source| {
+            scan_io_error(
+                "open source directory without following links",
+                &project_dir.join(candidate),
+                source,
+            )
+        })?;
+        found_source_root = true;
+        scan_dir(&directory, Path::new(candidate), false, 0, &mut state)?;
     }
 
-    dirs
+    if !found_source_root {
+        scan_dir(&project, Path::new(""), true, 0, &mut state)?;
+    }
+
+    Ok(state.imports)
+}
+
+struct SourceScanState<'a> {
+    project_dir: &'a Path,
+    aliases: &'a ProjectAliases,
+    limits: SourceScanLimits,
+    files: usize,
+    total_bytes: u64,
+    entries: usize,
+    imports: Vec<SourceImport>,
+    parser_allocator: Allocator,
 }
 
 /// Recursively scan a directory for source files.
 ///
-/// `is_root` is true only for the initial entry into the project — at
-/// the root we ignore the project's own `package.json` (it's the manifest
-/// we're checking *against*, not a boundary). Every subdirectory that
-/// contains its own `package.json` is treated as a separate package and
-/// skipped: descent never crosses a package boundary.
-fn scan_dir(dir: &Path, aliases: &ProjectAliases, is_root: bool, imports: &mut Vec<SourceImport>) {
+/// At the project root, its own `package.json` is the manifest being checked,
+/// not a boundary. Every nested directory containing `package.json` is opaque.
+fn scan_dir(
+    directory: &Dir,
+    relative_dir: &Path,
+    is_project_root: bool,
+    depth: usize,
+    state: &mut SourceScanState<'_>,
+) -> io::Result<()> {
     static SKIP_DIRS: &[&str] = &[
         "node_modules",
         ".lpm",
@@ -96,31 +181,78 @@ fn scan_dir(dir: &Path, aliases: &ProjectAliases, is_root: bool, imports: &mut V
         ".svn",
     ];
 
-    // Boundary: a subdirectory with its own package.json is its own
-    // package — don't scan it as part of the parent.
-    if !is_root && dir.join("package.json").is_file() {
-        return;
+    let display_dir = state.project_dir.join(relative_dir);
+    if !is_project_root {
+        match directory.symlink_metadata("package.json") {
+            Ok(_) => return Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(scan_io_error(
+                    "inspect nested package boundary",
+                    &display_dir.join("package.json"),
+                    source,
+                ));
+            }
+        }
+    }
+    if depth > state.limits.max_depth {
+        return Err(scan_limit_error(
+            "directory depth",
+            state.limits.max_depth,
+            &display_dir,
+        ));
     }
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let entries = directory
+        .entries()
+        .map_err(|source| scan_io_error("read source directory", &display_dir, source))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|source| scan_io_error("read source directory entry", &display_dir, source))?;
+        state.entries = state.entries.checked_add(1).ok_or_else(|| {
+            scan_limit_error(
+                "directory entry count",
+                state.limits.max_entries,
+                &display_dir,
+            )
+        })?;
+        if state.entries > state.limits.max_entries {
+            return Err(scan_limit_error(
+                "directory entry count",
+                state.limits.max_entries,
+                &display_dir,
+            ));
+        }
 
-    for entry in entries.flatten() {
-        let path = entry.path();
         let name = entry.file_name();
+        let path = relative_dir.join(&name);
+        let display_path = state.project_dir.join(&path);
         let name_str = name.to_string_lossy();
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|source| scan_io_error("inspect source entry", &display_path, source))?;
 
-        if path.is_dir() {
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
             if SKIP_DIRS.contains(&name_str.as_ref()) || name_str.starts_with('.') {
                 continue;
             }
-            scan_dir(&path, aliases, false, imports);
-        } else if path.is_file() && is_runtime_source_file(&path) {
-            scan_file(&path, aliases, imports);
+            let child = directory.open_dir_nofollow(&name).map_err(|source| {
+                scan_io_error(
+                    "open source directory without following links",
+                    &display_path,
+                    source,
+                )
+            })?;
+            scan_dir(&child, &path, false, depth + 1, state)?;
+        } else if metadata.is_file() && is_runtime_source_file(&path) {
+            scan_file(directory, &name, &path, metadata.len(), state)?;
         }
     }
+
+    Ok(())
 }
 
 fn is_runtime_source_file(path: &Path) -> bool {
@@ -136,7 +268,7 @@ fn is_runtime_source_file(path: &Path) -> bool {
 
     matches!(
         path.extension().and_then(|e| e.to_str()).unwrap_or(""),
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
     )
 }
 
@@ -147,87 +279,237 @@ fn is_runtime_source_file(path: &Path) -> bool {
 /// - `import "specifier"` (side-effect imports)
 /// - `require("specifier")`
 /// - `import("specifier")` (dynamic imports)
-fn scan_file(path: &Path, aliases: &ProjectAliases, imports: &mut Vec<SourceImport>) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
+fn scan_file(
+    directory: &Dir,
+    file_name: &std::ffi::OsStr,
+    relative_path: &Path,
+    expected_bytes: u64,
+    state: &mut SourceScanState<'_>,
+) -> io::Result<()> {
+    let display_path = state.project_dir.join(relative_path);
+    if expected_bytes > state.limits.max_file_bytes {
+        return Err(scan_limit_error(
+            "per-file byte",
+            state.limits.max_file_bytes,
+            &display_path,
+        ));
+    }
+    state.files = state
+        .files
+        .checked_add(1)
+        .ok_or_else(|| scan_limit_error("file count", state.limits.max_files, &display_path))?;
+    if state.files > state.limits.max_files {
+        return Err(scan_limit_error(
+            "file count",
+            state.limits.max_files,
+            &display_path,
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = directory.open_with(file_name, &options).map_err(|source| {
+        scan_io_error(
+            "open source file without following links",
+            &display_path,
+            source,
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| scan_io_error("inspect opened source file", &display_path, source))?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source path is not a safe regular file at {}",
+                display_path.display()
+            ),
+        ));
+    }
+    let opened_bytes = metadata.len();
+    if opened_bytes > state.limits.max_file_bytes {
+        return Err(scan_limit_error(
+            "per-file byte",
+            state.limits.max_file_bytes,
+            &display_path,
+        ));
+    }
+    if state
+        .total_bytes
+        .checked_add(opened_bytes)
+        .is_none_or(|bytes| bytes > state.limits.max_total_bytes)
+    {
+        return Err(scan_limit_error(
+            "aggregate byte",
+            state.limits.max_total_bytes,
+            &display_path,
+        ));
+    }
+    let content = lpm_common::read_text_file_capped_from_open_file_with_known_size(
+        file.into_std(),
+        &display_path,
+        state.limits.max_file_bytes,
+        opened_bytes,
+    )
+    .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+    let content_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    state.total_bytes = state
+        .total_bytes
+        .checked_add(content_bytes)
+        .ok_or_else(|| {
+            scan_limit_error(
+                "aggregate byte",
+                state.limits.max_total_bytes,
+                &display_path,
+            )
+        })?;
+    if state.total_bytes > state.limits.max_total_bytes {
+        return Err(scan_limit_error(
+            "aggregate byte",
+            state.limits.max_total_bytes,
+            &display_path,
+        ));
+    }
+
+    let source_type = SourceType::from_path(relative_path).map_err(|source| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "failed to determine source type for {}: {source}",
+                display_path.display()
+            ),
+        )
+    })?;
+    let parsed = Parser::new(&state.parser_allocator, &content, source_type).parse();
+    if let Some(error) = parsed.errors.first() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "failed to parse source file {}: {error}",
+                display_path.display()
+            ),
+        ));
+    }
+
+    let mut found = Vec::with_capacity(
+        parsed.module_record.requested_modules.len() + parsed.module_record.dynamic_imports.len(),
+    );
+    for (specifier, occurrences) in &parsed.module_record.requested_modules {
+        for occurrence in occurrences {
+            found.push((occurrence.statement_span.start, specifier.to_string()));
+        }
+    }
+    let mut runtime_imports = RuntimeImportCollector {
+        imports: Vec::with_capacity(parsed.module_record.dynamic_imports.len()),
     };
+    runtime_imports.visit_program(&parsed.program);
+    found.extend(runtime_imports.imports);
+    found.sort_unstable_by_key(|(offset, _)| *offset);
+    drop(parsed);
+    state.parser_allocator.reset();
 
-    let mut in_block_comment = false;
+    let line_index = LineIndex::new(&content);
+    for (offset, specifier) in found {
+        record_source_import(
+            specifier,
+            &display_path,
+            line_index.line_number(offset),
+            state,
+        )?;
+    }
 
-    for (line_idx, line) in content.lines().enumerate() {
-        if in_block_comment {
-            if line.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
+    Ok(())
+}
+
+struct RuntimeImportCollector {
+    imports: Vec<(u32, String)>,
+}
+
+impl<'a> Visit<'a> for RuntimeImportCollector {
+    fn visit_call_expression(&mut self, expression: &CallExpression<'a>) {
+        if let Some(specifier) = expression.common_js_require() {
+            self.imports
+                .push((expression.span.start, specifier.value.to_string()));
         }
-        if line.trim_start().starts_with("/*") {
-            if !line.contains("*/") {
-                in_block_comment = true;
-            }
-            continue;
+        walk_call_expression(self, expression);
+    }
+
+    fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
+        if let Expression::StringLiteral(specifier) = &expression.source {
+            self.imports
+                .push((expression.span.start, specifier.value.to_string()));
         }
-
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("//") {
-            continue;
-        }
-
-        for specifier in extract_specifiers(trimmed) {
-            // Relative / absolute file paths — always local.
-            if specifier.starts_with('.') || specifier.starts_with('/') {
-                continue;
-            }
-            // User-declared bundler/TS path aliases — local files.
-            if aliases.matches(&specifier) {
-                continue;
-            }
-            // Structurally-invalid package shapes (empty scope, URL
-            // schemes, leading `~`/`#`, etc.) — skip silently.
-            let Some(package_name) = extract_package_name(&specifier) else {
-                continue;
-            };
-
-            imports.push(SourceImport {
-                specifier: specifier.clone(),
-                file: path.to_path_buf(),
-                line: line_idx + 1,
-                package_name: Some(package_name),
-            });
-        }
+        walk_import_expression(self, expression);
     }
 }
 
-/// Extract import/require specifiers from a line of code.
-fn extract_specifiers(line: &str) -> Vec<String> {
-    let mut specifiers = Vec::new();
+struct LineIndex {
+    newlines: Vec<u32>,
+}
 
-    for keyword in ["from ", "import(", "require(", "import "] {
-        if !line.contains(keyword) {
-            continue;
-        }
-
-        let after_keyword = match line.find(keyword) {
-            Some(pos) => &line[pos + keyword.len()..],
-            None => continue,
-        };
-
-        for quote in ['"', '\'', '`'] {
-            if let Some(q1) = after_keyword.find(quote) {
-                let after_q1 = &after_keyword[q1 + 1..];
-                if let Some(q2) = after_q1.find(quote) {
-                    let spec = &after_q1[..q2];
-                    if !spec.is_empty() && !spec.contains(' ') {
-                        specifiers.push(spec.to_string());
-                    }
-                }
+impl LineIndex {
+    fn new(content: &str) -> Self {
+        let mut newlines = Vec::with_capacity(content.len() / 40);
+        for (offset, byte) in content.bytes().enumerate() {
+            if byte == b'\n' {
+                newlines.push(u32::try_from(offset).unwrap_or(u32::MAX));
             }
         }
+        Self { newlines }
     }
 
-    specifiers
+    fn line_number(&self, offset: u32) -> usize {
+        self.newlines.partition_point(|newline| *newline < offset) + 1
+    }
+}
+
+fn record_source_import(
+    specifier: String,
+    path: &Path,
+    line: usize,
+    state: &mut SourceScanState<'_>,
+) -> io::Result<()> {
+    if specifier.starts_with('.') || specifier.starts_with('/') || state.aliases.matches(&specifier)
+    {
+        return Ok(());
+    }
+    let Some(package_name) = extract_package_name(&specifier) else {
+        return Ok(());
+    };
+    if state.imports.len() >= state.limits.max_imports {
+        return Err(scan_limit_error(
+            "import finding",
+            state.limits.max_imports,
+            path,
+        ));
+    }
+    state.imports.push(SourceImport {
+        specifier,
+        file: path.to_path_buf(),
+        line,
+        package_name: Some(package_name),
+    });
+    Ok(())
+}
+
+fn scan_io_error(action: &str, path: &Path, source: io::Error) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        format!("failed to {action} at {}: {source}", path.display()),
+    )
+}
+
+fn scan_limit_error(kind: &str, limit: impl std::fmt::Display, path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "source scan {kind} limit of {limit} exceeded at {}",
+            path.display()
+        ),
+    )
 }
 
 /// Extract the package name from an import specifier, returning `None`
@@ -1203,6 +1485,196 @@ mod tests {
             !specifiers.contains("react"),
             "declaration files are type-only and must not contribute runtime import warnings"
         );
+    }
+
+    #[test]
+    fn scan_source_imports_includes_mts_and_cts_runtime_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::write(root.join("module.mts"), r#"import "esm-package";"#).unwrap();
+        std::fs::write(root.join("module.cts"), r#"require("commonjs-package");"#).unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+
+        assert!(specifiers.contains("esm-package"));
+        assert!(specifiers.contains("commonjs-package"));
+    }
+
+    #[test]
+    fn scan_source_imports_finds_multiline_and_repeated_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::write(
+            root.join("app.js"),
+            r#"
+            import {
+                first
+            } from "multiline-package";
+            import "first-package"; import "second-package";
+            "#,
+        )
+        .unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+
+        assert!(specifiers.contains("multiline-package"));
+        assert!(specifiers.contains("first-package"));
+        assert!(specifiers.contains("second-package"));
+    }
+
+    #[test]
+    fn scan_source_imports_ignores_import_syntax_inside_comments_and_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::write(
+            root.join("app.js"),
+            r#"
+            const value = 1; // require("line-comment-package")
+            const text = "import('string-package')";
+            /* require("block-comment-package"); */
+            import "real-package";
+            console.log(value, text);
+            "#,
+        )
+        .unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+
+        assert_eq!(specifiers, HashSet::from(["real-package"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_source_imports_does_not_follow_file_or_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"root"}"#).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/local.js"), r#"import "local-package";"#).unwrap();
+        std::fs::write(
+            outside.path().join("outside.js"),
+            r#"import "outside-file-package";"#,
+        )
+        .unwrap();
+        std::fs::create_dir(outside.path().join("tree")).unwrap();
+        std::fs::write(
+            outside.path().join("tree/index.js"),
+            r#"import "outside-directory-package";"#,
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("outside.js"),
+            root.join("src/linked.js"),
+        )
+        .unwrap();
+        symlink(outside.path().join("tree"), root.join("src/linked-tree")).unwrap();
+
+        let imports = scan_source_imports(root);
+        let specifiers: HashSet<&str> = imports.iter().map(|i| i.specifier.as_str()).collect();
+
+        assert!(specifiers.contains("local-package"));
+        assert!(!specifiers.contains("outside-file-package"));
+        assert!(!specifiers.contains("outside-directory-package"));
+    }
+
+    fn restrictive_scan_limits() -> SourceScanLimits {
+        SourceScanLimits {
+            max_files: 100,
+            max_file_bytes: 1024,
+            max_total_bytes: 4096,
+            max_depth: 16,
+            max_imports: 100,
+            max_entries: 1000,
+        }
+    }
+
+    #[test]
+    fn source_scan_rejects_file_counts_above_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/one.js"), "export default 1;").unwrap();
+        std::fs::write(root.join("src/two.js"), "export default 2;").unwrap();
+        let mut limits = restrictive_scan_limits();
+        limits.max_files = 1;
+
+        let error = scan_source_imports_with_limits(root, limits).unwrap_err();
+
+        assert!(error.to_string().contains("file count"));
+    }
+
+    #[test]
+    fn source_scan_rejects_individual_files_above_the_byte_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/index.js"),
+            r#"import "package-with-a-long-name";"#,
+        )
+        .unwrap();
+        let mut limits = restrictive_scan_limits();
+        limits.max_file_bytes = 16;
+
+        let error = scan_source_imports_with_limits(root, limits).unwrap_err();
+
+        assert!(error.to_string().contains("per-file byte"));
+    }
+
+    #[test]
+    fn source_scan_rejects_aggregate_source_bytes_above_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/one.js"), "export default 123456;").unwrap();
+        std::fs::write(root.join("src/two.js"), "export default 123456;").unwrap();
+        let mut limits = restrictive_scan_limits();
+        limits.max_total_bytes = 30;
+
+        let error = scan_source_imports_with_limits(root, limits).unwrap_err();
+
+        assert!(error.to_string().contains("aggregate byte"));
+    }
+
+    #[test]
+    fn source_scan_rejects_directory_depth_above_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/one/two")).unwrap();
+        std::fs::write(root.join("src/one/two/index.js"), "export default 1;").unwrap();
+        let mut limits = restrictive_scan_limits();
+        limits.max_depth = 1;
+
+        let error = scan_source_imports_with_limits(root, limits).unwrap_err();
+
+        assert!(error.to_string().contains("directory depth"));
+    }
+
+    #[test]
+    fn source_scan_rejects_import_findings_above_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/index.js"),
+            r#"import "first-package"; import "second-package";"#,
+        )
+        .unwrap();
+        let mut limits = restrictive_scan_limits();
+        limits.max_imports = 1;
+
+        let error = scan_source_imports_with_limits(root, limits).unwrap_err();
+
+        assert!(error.to_string().contains("import finding"));
     }
 
     #[test]
