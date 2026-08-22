@@ -441,7 +441,15 @@ pub(super) async fn with_project_install_lock<F, T>(
 where
     F: Future<Output = Result<T, LpmError>>,
 {
-    let canonical_root = project_root.canonicalize().map_err(LpmError::Io)?;
+    let canonical_root = project_root.canonicalize().map_err(|error| {
+        LpmError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to resolve project lock root {}: {error}",
+                project_root.display()
+            ),
+        ))
+    })?;
     if let Ok(active_root) = ACTIVE_PROJECT_INSTALL_ROOT.try_with(Clone::clone) {
         if active_root != canonical_root {
             return Err(LpmError::Script(format!(
@@ -454,8 +462,17 @@ where
     }
 
     let project_directory =
-        cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())
-            .map_err(LpmError::Io)?;
+        cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority()).map_err(
+            |error| {
+                LpmError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open project lock root {}: {error}",
+                        canonical_root.display()
+                    ),
+                ))
+            },
+        )?;
     let lock_directory =
         lpm_common::ProjectLockDirectory::open_or_create(&project_directory, &canonical_root)?;
     let transaction = ACTIVE_PROJECT_INSTALL_ROOT.scope(canonical_root.clone(), async {
