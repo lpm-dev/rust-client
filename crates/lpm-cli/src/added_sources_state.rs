@@ -409,16 +409,16 @@ pub fn copy_file_atomic_with_digest(source: &Path, destination: &Path) -> Result
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
-pub fn resolve_manifest_path(project_dir: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_dir.join(path)
-    }
-}
-
 pub fn resolve_tracked_manifest_path(
     project_dir: &Path,
+    manifest_path: &Path,
+) -> Result<PathBuf, LpmError> {
+    let project = project_dir.canonicalize().map_err(LpmError::Io)?;
+    resolve_tracked_manifest_path_from_root(&project, manifest_path)
+}
+
+pub fn resolve_tracked_manifest_path_from_root(
+    canonical_project: &Path,
     manifest_path: &Path,
 ) -> Result<PathBuf, LpmError> {
     if manifest_path.as_os_str().is_empty()
@@ -441,8 +441,7 @@ pub fn resolve_tracked_manifest_path(
         )));
     }
 
-    let project = project_dir.canonicalize().map_err(LpmError::Io)?;
-    let destination = project.join(manifest_path);
+    let destination = canonical_project.join(manifest_path);
     match std::fs::symlink_metadata(&destination) {
         Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() => {
             return Err(LpmError::Registry(format!(
@@ -455,46 +454,40 @@ pub fn resolve_tracked_manifest_path(
         Err(error) => return Err(LpmError::Io(error)),
     }
 
-    let mut existing_parent = destination.parent().ok_or_else(|| {
+    let destination_parent = destination.parent().ok_or_else(|| {
         LpmError::Registry(format!(
             "added-source destination has no parent: {}",
             destination.display()
         ))
     })?;
-    while !existing_parent.exists() {
-        existing_parent = existing_parent.parent().ok_or_else(|| {
+    let relative_parent = destination_parent
+        .strip_prefix(canonical_project)
+        .map_err(|_| {
             LpmError::Registry(format!(
-                "added-source destination has no existing parent: {}",
+                "added-source destination resolves outside the project: {}",
                 destination.display()
             ))
         })?;
-    }
-    let canonical_parent = existing_parent.canonicalize().map_err(LpmError::Io)?;
-    if !canonical_parent.starts_with(&project) {
-        return Err(LpmError::Registry(format!(
-            "added-source destination resolves outside the project: {}",
-            destination.display()
-        )));
+    let mut current = canonical_project.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_dir() => {
+                return Err(LpmError::Registry(format!(
+                    "added-source destination has a linked or non-directory parent: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(LpmError::Io(error)),
+        }
     }
     Ok(destination)
 }
 
 pub fn display_manifest_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-pub fn read_state(project_dir: &Path) -> Result<Option<AddedSourcesState>, LpmError> {
-    if ensure_state_directory(project_dir, false)?.is_none() {
-        return Ok(None);
-    }
-    let path = state_path(project_dir);
-    ensure_regular_or_missing(&path, "added-source state")?;
-    let bytes =
-        match lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        };
-    parse_state(&path, &bytes).map(Some)
 }
 
 pub fn load_state_with_snapshot(
@@ -571,10 +564,6 @@ fn parse_state(path: &Path, bytes: &[u8]) -> Result<AddedSourcesState, LpmError>
         .map_err(|error| LpmError::Registry(format!("failed to parse {}: {error}", path.display())))
 }
 
-pub fn load_state(project_dir: &Path) -> Result<AddedSourcesState, LpmError> {
-    Ok(read_state(project_dir)?.unwrap_or_default())
-}
-
 pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), LpmError> {
     let path = state_path(project_dir);
     if state.packages.is_empty() {
@@ -634,7 +623,7 @@ mod tests {
         );
 
         write_state(dir.path(), &state).unwrap();
-        let loaded = load_state(dir.path()).unwrap();
+        let loaded = load_state_with_snapshot(dir.path()).unwrap().0;
 
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
         let record = loaded.package("source-pkg").unwrap();
@@ -655,12 +644,31 @@ mod tests {
         )
         .unwrap();
 
-        let state = load_state(dir.path()).unwrap();
+        let state = load_state_with_snapshot(dir.path()).unwrap().0;
         let file = &state.package("source-pkg").unwrap().files[Path::new("Foo.tsx")];
 
         assert_eq!(state.schema_version, SCHEMA_VERSION);
         assert!(file.installed_digest.is_none());
         assert!(file.action.is_none());
+    }
+
+    #[test]
+    fn tracked_manifest_paths_reject_absolute_and_parent_relative_entries() {
+        let dir = tempdir().unwrap();
+
+        assert!(resolve_tracked_manifest_path(dir.path(), Path::new("../outside.ts")).is_err());
+        assert!(resolve_tracked_manifest_path(dir.path(), Path::new("/outside.ts")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_manifest_paths_reject_linked_parents_inside_the_project() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/source.ts"), b"source\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("linked")).unwrap();
+
+        assert!(resolve_tracked_manifest_path(dir.path(), Path::new("linked/source.ts")).is_err());
     }
 
     #[test]

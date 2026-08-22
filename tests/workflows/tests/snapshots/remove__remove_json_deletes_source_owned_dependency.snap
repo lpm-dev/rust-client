@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/remove.rs
+expression: envelope
+---
+{
+  "success": true,
+  "package": "source-pkg",
+  "removed": [],
+  "dependenciesRemoved": [
+    "dep"
+  ]
+}
