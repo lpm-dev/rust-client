@@ -40,6 +40,8 @@ pub(in crate::commands::audit) fn print_json_report(
             serde_json::json!({
                 "name": r.name,
                 "version": r.version,
+                "instance_id": r.instance_id.map(|instance_id| instance_id.to_string()),
+                "path": r.path,
                 "quality_score": r.quality_score,
                 "issues": r.issues.iter().map(|i| {
                     serde_json::json!({

@@ -6554,6 +6554,79 @@ async fn verbose_npm_only_install_reports_noncritical_finding_details() {
     );
 }
 
+#[tokio::test]
+async fn install_security_summary_ignores_forged_store_analysis_sidecars() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_with_files(
+        "forged-analysis-sidecar",
+        "1.0.0",
+        &[(
+            "danger.js",
+            b"module.exports = eval(process.env.LPM_INPUT);\n",
+        )],
+    );
+    mock.with_package("forged-analysis-sidecar", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"forged-analysis-host","version":"1.0.0","dependencies":{"forged-analysis-sidecar":"1.0.0"}}"#,
+    );
+
+    let first = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("install behavioral fixture");
+    assert!(
+        first.status.success(),
+        "fixture install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+
+    let store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let object_dir = store
+        .paths()
+        .object_dir(&compute_integrity(&tarball))
+        .unwrap();
+    let mut forged = lpm_security::behavioral::read_cached_analysis(&object_dir)
+        .expect("install must create an analysis sidecar");
+    assert!(
+        forged.source.eval,
+        "fixture sidecar must initially detect eval"
+    );
+    forged.source.eval = false;
+    lpm_security::behavioral::write_cached_analysis(&object_dir, &forged)
+        .expect("forge a current-schema clean sidecar");
+    std::fs::remove_file(project.path().join(".lpm/install-hash"))
+        .expect("force the warm lockfile path through the post-install summary");
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .expect("run warm install with forged analysis sidecar");
+    assert!(
+        second.status.success(),
+        "warm install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        combined.contains("eval()"),
+        "the summary must derive findings from live package bytes, not the forged sidecar:\n{combined}",
+    );
+}
+
 async fn mount_info_only_behavioral_package(mock: &MockRegistry, name: &str) {
     let tarball = make_tarball_from_pkg_json(
         serde_json::json!({
@@ -6612,10 +6685,14 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(combined.contains("Behavioral metadata · 1 package · 2 signals"));
+    assert!(
+        combined.contains("Behavioral metadata · 1 package · 3 signals"),
+        "verbose install omitted Info behavioral metadata:\n{combined}",
+    );
     assert!(combined.contains("environment-variable access"));
     assert!(combined.contains("URL literals"));
-    assert!(combined.contains("lpm query \":env,:url-strings\""));
+    assert!(combined.contains("trivial package"));
+    assert!(combined.contains("lpm query \":env,:url-strings,:trivial\""));
     assert!(!combined.contains("lpm query \":critical\""));
     assert!(!combined.contains("Security summary"));
 }

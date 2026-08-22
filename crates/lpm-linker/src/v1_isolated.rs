@@ -453,8 +453,11 @@ pub fn link_one_package(
     // fast path — the package is materialized there from a prior install
     // run, just not freshly relinked.
     let materialized = MaterializedPackage {
+        instance_id: None,
         name: target.name.clone(),
         version: target.version.clone(),
+        analysis_source: (target.materialization == Materialization::DirectorySource)
+            .then(|| target.store_path.clone()),
         destination: pkg_nm.clone(),
     };
 

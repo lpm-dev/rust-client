@@ -1,150 +1,445 @@
-//! Project-level audit cache (`.lpm/audit-cache.json`).
+//! Authenticated behavioral-analysis cache for one project.
 //!
-//! Stores behavioral analysis results per package instance so that
-//! subsequent `lpm audit` runs are near-instant when nothing changed.
-//!
-//! Cache invalidation:
-//! - Global: `cache_version` or `behavioral_schema_version` mismatch → full re-scan
-//! - Per-entry: `integrity` hash mismatch → re-scan that package only
-//! - Quick check: lockfile mtime vs cache mtime (skip all comparisons if lockfile is older)
+//! Cache files live below `LPM_HOME/cache/metadata/audit/`, outside the
+//! repository, and carry an HMAC generated from an owner-only local key.
+//! Entries are also bound to the current analyzer-input fingerprint.
+//! The key excludes repository-supplied state and other user accounts from
+//! cache authority; code already running as the same OS user can read it.
 
+use hmac::{Hmac, Mac};
 use lpm_security::behavioral::PackageAnalysis;
+use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::{self, Write};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use super::discovery::DiscoveredPackage;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Current cache format version. Bump when the cache structure changes.
-/// v2: added `dependencies` field to CacheEntry for dependency edge graph.
-/// v3: added a per-entry timestamp that newer readers ignore because advisory
-/// freshness is enforced independently of source-analysis reuse.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 5;
+const CACHE_SECRET_BYTES: usize = 32;
+const CACHE_SECRET_FILE_MAX_BYTES: u64 = 128;
+const SIGNATURE_HEX_BYTES: usize = 64;
+const SIGNATURE_PREFIX: &[u8] = b"{\"signature\":\"";
+const PAYLOAD_PREFIX: &[u8] = b"\",\"payload\":";
+const PAYLOAD_OFFSET: u64 =
+    (SIGNATURE_PREFIX.len() + SIGNATURE_HEX_BYTES + PAYLOAD_PREFIX.len()) as u64;
 
-/// Project audit cache, stored at `.lpm/audit-cache.json`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectAuditCache {
-    pub cache_version: u32,
-    pub behavioral_schema_version: u32,
-    pub manager: String,
-    /// Keyed by package path (e.g., "node_modules/react").
-    pub entries: HashMap<String, CacheEntry>,
+    cache_version: u32,
+    behavioral_schema_version: u32,
+    manager: String,
+    project_id: String,
+    entries: BTreeMap<String, CacheEntry>,
+    analyses: BTreeMap<String, Arc<PackageAnalysis>>,
+    #[serde(skip)]
+    dirty: bool,
 }
 
-/// A single cached analysis entry.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CacheEntry {
-    pub name: String,
-    pub version: String,
-    pub integrity: Option<String>,
-    pub analysis: PackageAnalysis,
-    /// Direct dependencies: (name, exact_version).
-    /// Used by `lpm query` for `>` combinator traversal without re-parsing the lockfile.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dependencies: Vec<(String, String)>,
+struct CacheEntry {
+    name: String,
+    version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance_id: Option<lpm_common::PackageInstanceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patch_sha256: Option<String>,
+    input_fingerprint: String,
+}
+
+struct CacheContext {
+    project_id: String,
+    cache_path: PathBuf,
+    secret_path: PathBuf,
 }
 
 impl ProjectAuditCache {
-    /// Create a new empty cache.
-    pub fn new(manager: &str) -> Self {
-        Self {
+    pub fn new(project_root: &Path, manager: &str) -> Option<Self> {
+        let context = CacheContext::for_project(project_root)?;
+        Some(Self {
             cache_version: CACHE_VERSION,
             behavioral_schema_version: lpm_security::behavioral::SCHEMA_VERSION,
             manager: manager.to_string(),
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Read cache from disk. Returns None if missing, corrupt, or stale.
-    pub fn read(project_root: &Path) -> Option<Self> {
-        let path = cache_path(project_root);
-        let content =
-            lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-                .ok()??;
-        let cache: Self = serde_json::from_slice(&content).ok()?;
-
-        // Check versions — stale cache requires full re-scan
-        if cache.cache_version != CACHE_VERSION {
-            tracing::debug!(
-                "cache version {} != current {CACHE_VERSION}, discarding",
-                cache.cache_version
-            );
-            return None;
-        }
-        if cache.behavioral_schema_version != lpm_security::behavioral::SCHEMA_VERSION {
-            tracing::debug!(
-                "behavioral schema version {} != current {}, discarding",
-                cache.behavioral_schema_version,
-                lpm_security::behavioral::SCHEMA_VERSION
-            );
-            return None;
-        }
-
-        Some(cache)
-    }
-
-    /// Write cache to disk. Creates `.lpm/` directory if needed.
-    pub fn write(&self, project_root: &Path) -> Result<(), std::io::Error> {
-        let path = cache_path(project_root);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        lpm_common::write_file_atomic_with(&path, lpm_common::AtomicWriteOptions::new(), |file| {
-            let mut writer = CappedWriter::new(
-                file,
-                lpm_common::STATE_FILE_SIZE_CAP_BYTES,
-                "audit cache exceeds the state-file size limit",
-            );
-            serde_json::to_writer_pretty(&mut writer, self).map_err(|error| {
-                io::Error::new(
-                    error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData),
-                    error,
-                )
-            })
+            project_id: context.project_id,
+            entries: BTreeMap::new(),
+            analyses: BTreeMap::new(),
+            dirty: false,
         })
     }
 
-    /// Look up a cached entry. Returns the analysis if the integrity matches.
-    ///
-    /// M61: cache hits REQUIRE matching integrity on both sides. The
-    /// pre-fix degraded mode (any side missing integrity → "trust the
-    /// cache") allowed a malicious repo to ship a committed
-    /// `.lpm/audit-cache.json` alongside packages whose lockfile entries
-    /// were scrubbed of SRI. Any arm with `None` on either side
-    /// returns `None` (cache miss).
-    ///
-    pub fn get(&self, path: &str, integrity: Option<&str>) -> Option<&PackageAnalysis> {
-        let entry = self.entries.get(path)?;
-
-        match (integrity, &entry.integrity) {
-            (Some(new), Some(cached)) if new == cached => {}
-            _ => return None,
+    pub fn read(project_root: &Path, manager: &str) -> Option<Self> {
+        let context = CacheContext::for_project(project_root)?;
+        let secret = read_cache_secret(&context.secret_path)?;
+        let mut cache = match read_signed_cache(&context.cache_path, &secret) {
+            Ok(cache) => cache,
+            Err(error) => {
+                tracing::debug!("discarding invalid behavioral analysis cache: {error}");
+                return None;
+            }
+        };
+        if cache.cache_version != CACHE_VERSION {
+            return None;
+        }
+        if cache.behavioral_schema_version != lpm_security::behavioral::SCHEMA_VERSION {
+            return None;
+        }
+        if cache.manager != manager || cache.project_id != context.project_id {
+            return None;
+        }
+        if cache
+            .analyses
+            .values()
+            .any(|analysis| analysis.version != lpm_security::behavioral::SCHEMA_VERSION)
+            || cache.entries.values().any(|entry| {
+                entry.input_fingerprint.is_empty()
+                    || !cache.analyses.contains_key(&entry.input_fingerprint)
+            })
+        {
+            tracing::debug!("discarding unauthenticated behavioral analysis cache");
+            return None;
         }
 
-        Some(&entry.analysis)
+        cache.dirty = false;
+        Some(cache)
     }
 
-    /// Insert or update a cache entry.
+    pub fn write(&mut self, project_root: &Path) -> Result<(), std::io::Error> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let context = CacheContext::for_project(project_root).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot resolve audit cache context",
+            )
+        })?;
+        if self.project_id != context.project_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audit cache project identity changed",
+            ));
+        }
+        if let Some(parent) = context.cache_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let secret = get_or_create_cache_secret(&context.secret_path)?;
+        lpm_common::write_file_atomic_with(
+            &context.cache_path,
+            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+            |file| {
+                let signature = {
+                    let mut writer = CappedWriter::new(
+                        file,
+                        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+                        "audit cache exceeds the state-file size limit",
+                    );
+                    writer.write_all(SIGNATURE_PREFIX)?;
+                    writer.write_all(&[b'0'; SIGNATURE_HEX_BYTES])?;
+                    writer.write_all(PAYLOAD_PREFIX)?;
+                    let signature = {
+                        let mut mac = HmacSha256::new_from_slice(&secret)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                        {
+                            let payload = PayloadWriter::new(&mut writer, &mut mac);
+                            let mut buffered = BufWriter::with_capacity(64 * 1024, payload);
+                            serde_json::to_writer(&mut buffered, self).map_err(json_io_error)?;
+                            buffered.flush()?;
+                        }
+                        hex::encode(mac.finalize().into_bytes())
+                    };
+                    writer.write_all(b"}")?;
+                    writer.flush()?;
+                    signature
+                };
+                file.seek(SeekFrom::Start(SIGNATURE_PREFIX.len() as u64))?;
+                file.write_all(signature.as_bytes())
+            },
+        )?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn get(
+        &self,
+        key: &str,
+        package: &DiscoveredPackage,
+        input_fingerprint: &str,
+    ) -> Option<Arc<PackageAnalysis>> {
+        let entry = self.entries.get(key)?;
+        if entry.name != package.name
+            || entry.version != package.version
+            || entry.instance_id != package.instance_id
+            || entry.integrity.as_deref() != package.integrity.as_deref()
+            || entry.patch_sha256.as_deref() != package.patch_sha256.as_deref()
+            || entry.input_fingerprint != input_fingerprint
+        {
+            return None;
+        }
+        self.analyses.get(&entry.input_fingerprint).map(Arc::clone)
+    }
+
+    pub fn has_candidate(&self, key: &str, package: &DiscoveredPackage) -> bool {
+        self.entries.get(key).is_some_and(|entry| {
+            entry.name == package.name
+                && entry.version == package.version
+                && entry.instance_id == package.instance_id
+                && entry.integrity.as_deref() == package.integrity.as_deref()
+                && entry.patch_sha256.as_deref() == package.patch_sha256.as_deref()
+                && !entry.input_fingerprint.is_empty()
+                && self.analyses.contains_key(&entry.input_fingerprint)
+        })
+    }
+
     pub fn insert(
         &mut self,
-        path: String,
-        name: String,
-        version: String,
-        integrity: Option<String>,
-        analysis: PackageAnalysis,
-        dependencies: Vec<(String, String)>,
+        key: String,
+        package: &DiscoveredPackage,
+        input_fingerprint: String,
+        analysis: Arc<PackageAnalysis>,
     ) {
+        self.analyses
+            .entry(input_fingerprint.clone())
+            .or_insert(analysis);
         self.entries.insert(
-            path,
+            key,
             CacheEntry {
-                name,
-                version,
-                integrity,
-                analysis,
-                dependencies,
+                name: package.name.clone(),
+                version: package.version.clone(),
+                instance_id: package.instance_id,
+                integrity: package.integrity.clone(),
+                patch_sha256: package.patch_sha256.clone(),
+                input_fingerprint,
             },
         );
+        self.dirty = true;
+    }
+
+    pub fn retain_active(&mut self, active: &HashSet<&str>) {
+        let previous_len = self.entries.len();
+        self.entries.retain(|key, _| active.contains(key.as_str()));
+        let previous_analyses = self.analyses.len();
+        let referenced: HashSet<&str> = self
+            .entries
+            .values()
+            .map(|entry| entry.input_fingerprint.as_str())
+            .collect();
+        self.analyses
+            .retain(|fingerprint, _| referenced.contains(fingerprint.as_str()));
+        self.dirty |=
+            self.entries.len() != previous_len || self.analyses.len() != previous_analyses;
+    }
+}
+
+impl CacheContext {
+    fn for_project(project_root: &Path) -> Option<Self> {
+        let canonical = project_root.canonicalize().ok()?;
+        let project_id = format!(
+            "{:x}",
+            Sha256::digest(canonical.as_os_str().as_encoded_bytes())
+        );
+        let lpm_root = lpm_common::LpmRoot::from_env().ok()?;
+        let root = lpm_root.cache_metadata().join("audit");
+        Some(Self {
+            cache_path: root.join("projects").join(format!("{project_id}.json")),
+            secret_path: root.join("analysis-cache.key"),
+            project_id,
+        })
+    }
+}
+
+fn json_io_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(
+        error.io_error_kind().unwrap_or(io::ErrorKind::InvalidData),
+        error,
+    )
+}
+
+fn read_signed_cache(path: &Path, secret: &[u8]) -> io::Result<ProjectAuditCache> {
+    let mut file = open_cache_file_nofollow(path)?;
+    let file_len = file.metadata()?.len();
+    let minimum_len = PAYLOAD_OFFSET.saturating_add(2);
+    if file_len < minimum_len || file_len > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "behavioral analysis cache has an invalid size",
+        ));
+    }
+    let mut prefix = vec![0u8; PAYLOAD_OFFSET as usize];
+    file.read_exact(&mut prefix)?;
+    if &prefix[..SIGNATURE_PREFIX.len()] != SIGNATURE_PREFIX
+        || &prefix[SIGNATURE_PREFIX.len() + SIGNATURE_HEX_BYTES..] != PAYLOAD_PREFIX
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "behavioral analysis cache has invalid framing",
+        ));
+    }
+    let signature_start = SIGNATURE_PREFIX.len();
+    let signature = hex::decode(&prefix[signature_start..signature_start + SIGNATURE_HEX_BYTES])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let payload_len = file_len - PAYLOAD_OFFSET - 1;
+    let mac = HmacSha256::new_from_slice(secret)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let (cache, mac) = {
+        let reader = MacReader::new(Read::by_ref(&mut file).take(payload_len), mac);
+        let mut buffered = BufReader::with_capacity(64 * 1024, reader);
+        let cache = serde_json::from_reader(&mut buffered).map_err(json_io_error)?;
+        let (payload, mac) = buffered.into_inner().into_parts();
+        if payload.limit() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "behavioral analysis cache payload ended early",
+            ));
+        }
+        (cache, mac)
+    };
+    let mut suffix = [0u8; 1];
+    file.read_exact(&mut suffix)?;
+    if suffix != [b'}'] || mac.verify_slice(&signature).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "behavioral analysis cache signature is invalid",
+        ));
+    }
+    Ok(cache)
+}
+
+fn open_cache_file_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "behavioral analysis cache is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+struct MacReader<R> {
+    inner: R,
+    mac: HmacSha256,
+}
+
+impl<R> MacReader<R> {
+    fn new(inner: R, mac: HmacSha256) -> Self {
+        Self { inner, mac }
+    }
+
+    fn into_parts(self) -> (R, HmacSha256) {
+        (self.inner, self.mac)
+    }
+}
+
+impl<R: Read> Read for MacReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.mac.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+struct PayloadWriter<'a, 'b> {
+    inner: &'a mut CappedWriter<'b>,
+    mac: &'a mut HmacSha256,
+}
+
+impl<'a, 'b> PayloadWriter<'a, 'b> {
+    fn new(inner: &'a mut CappedWriter<'b>, mac: &'a mut HmacSha256) -> Self {
+        Self { inner, mac }
+    }
+}
+
+impl Write for PayloadWriter<'_, '_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.mac.update(&buffer[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn read_cache_secret(path: &Path) -> Option<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
+    }
+    let encoded =
+        lpm_common::read_text_file_capped_nofollow(path, CACHE_SECRET_FILE_MAX_BYTES).ok()?;
+    let secret = hex::decode(encoded.trim()).ok()?;
+    (secret.len() == CACHE_SECRET_BYTES).then_some(secret)
+}
+
+fn get_or_create_cache_secret(path: &Path) -> io::Result<Vec<u8>> {
+    if let Some(secret) = read_cache_secret(path) {
+        return Ok(secret);
+    }
+    if path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "behavioral analysis cache key is invalid or has unsafe permissions",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut secret = [0u8; CACHE_SECRET_BYTES];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut secret)
+        .map_err(io::Error::other)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(hex::encode(secret).as_bytes())?;
+            file.sync_all()?;
+            Ok(secret.to_vec())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_cache_secret(path)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "concurrently created behavioral analysis cache key is invalid",
+                )
+            }),
+        Err(error) => Err(error),
     }
 }
 
@@ -182,19 +477,13 @@ impl Write for CappedWriter<'_> {
     }
 }
 
-fn cache_path(project_root: &Path) -> PathBuf {
-    project_root.join(".lpm").join("audit-cache.json")
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::discovery::ScanMode;
     use super::*;
     use lpm_security::behavioral::PackageAnalysis;
 
     fn empty_analysis() -> PackageAnalysis {
-        // Build the cheapest possible PackageAnalysis for the cache-
-        // lookup tests. Substruct defaults are derived; the parent
-        // struct is not, so we name the fields explicitly.
         PackageAnalysis {
             version: lpm_security::behavioral::SCHEMA_VERSION,
             analyzed_at: "1970-01-01T00:00:00Z".into(),
@@ -205,180 +494,352 @@ mod tests {
         }
     }
 
-    /// Both integrity hashes present and matching → cache hit.
-    #[test]
-    fn get_returns_entry_on_integrity_match() {
-        let mut cache = ProjectAuditCache::new("npm");
+    fn package(integrity: Option<&str>, patch_sha256: Option<&str>) -> DiscoveredPackage {
+        DiscoveredPackage {
+            name: "react".into(),
+            version: "18.0.0".into(),
+            instance_id: None,
+            path: "node_modules/react".into(),
+            integrity: integrity.map(str::to_string),
+            patch_sha256: patch_sha256.map(str::to_string),
+            resolved_url: None,
+            local_source_dir: None,
+            scan_mode: ScanMode::FullLocal,
+            is_dev: false,
+            is_optional: false,
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn scoped_lpm_home(path: &Path) -> crate::test_env::ScopedEnv {
+        crate::test_env::ScopedEnv::set([("LPM_HOME", path.as_os_str().to_owned())])
+    }
+
+    fn populated_cache(project: &Path, package: &DiscoveredPackage) -> ProjectAuditCache {
+        let mut cache = ProjectAuditCache::new(project, "npm").unwrap();
         cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
-            Some("sha512-cachehash".into()),
-            empty_analysis(),
-            vec![],
+            package.analysis_key(),
+            package,
+            "sha256-input".into(),
+            Arc::new(empty_analysis()),
         );
+        cache
+    }
+
+    #[test]
+    fn matching_package_identity_and_input_reuse_analysis() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), Some("sha256-patch"));
+        let cache = populated_cache(project.path(), &package);
+
         assert!(
             cache
-                .get("node_modules/react", Some("sha512-cachehash"))
+                .get(&package.analysis_key(), &package, "sha256-input")
                 .is_some()
         );
     }
 
-    /// Both integrity hashes present but different → re-scan.
     #[test]
-    fn get_returns_none_on_integrity_mismatch() {
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
-            Some("sha512-cachehash".into()),
-            empty_analysis(),
-            vec![],
+    fn changed_base_integrity_patch_or_input_rejects_entry() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let original = package(Some("sha512-source"), Some("sha256-patch"));
+        let cache = populated_cache(project.path(), &original);
+        let changed_integrity = package(Some("sha512-other"), Some("sha256-patch"));
+        let changed_patch = package(Some("sha512-source"), Some("sha256-other"));
+
+        assert!(
+            cache
+                .get(&original.analysis_key(), &changed_integrity, "sha256-input")
+                .is_none()
         );
         assert!(
             cache
-                .get("node_modules/react", Some("sha512-different"))
+                .get(&original.analysis_key(), &changed_patch, "sha256-input")
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&original.analysis_key(), &original, "sha256-other")
                 .is_none()
         );
     }
 
-    /// M61: discovered-side missing integrity (lockfile scrubbed of
-    /// SRI / node_modules fallback) MUST refuse the cached entry.
-    /// Pre-fix this returned `Some(analysis)` from the cache, letting
-    /// a hostile committed cache short-circuit fresh behavioral
-    /// scanning for packages whose integrity was deliberately omitted.
     #[test]
-    fn get_returns_none_when_discovered_integrity_missing() {
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
-            Some("sha512-cachehash".into()),
-            empty_analysis(),
-            vec![],
-        );
+    fn authenticated_cache_round_trip_preserves_analysis() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        cache.write(project.path()).unwrap();
+
+        let loaded = ProjectAuditCache::read(project.path(), "npm").unwrap();
         assert!(
-            cache.get("node_modules/react", None).is_none(),
-            "discovered-side None must NOT trust the cache — that was the M61 hole"
+            loaded
+                .get(&package.analysis_key(), &package, "sha256-input")
+                .is_some()
         );
     }
 
-    /// Cached-side missing integrity (entry written under an older
-    /// release that didn't record SRI) is also treated as miss. Forces
-    /// a re-scan that re-populates the entry with the new SRI field.
     #[test]
-    fn get_returns_none_when_cached_integrity_missing() {
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
-            None,
-            empty_analysis(),
-            vec![],
-        );
-        assert!(
-            cache
-                .get("node_modules/react", Some("sha512-discovered"))
-                .is_none()
-        );
-    }
+    fn cache_payload_omits_discovery_dependency_edges() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut package = package(Some("sha512-source"), None);
+        package.dependencies = vec![("scheduler".into(), "1.0.0".into())];
+        let cache = populated_cache(project.path(), &package);
+        let payload = serde_json::to_value(cache).unwrap();
 
-    /// Both sides None — also a miss. Symmetric with the other arms;
-    /// pre-fix this also collapsed to "trust the cache".
-    #[test]
-    fn get_returns_none_when_both_integrities_missing() {
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
-            None,
-            empty_analysis(),
-            vec![],
-        );
-        assert!(cache.get("node_modules/react", None).is_none());
+        assert!(!payload.to_string().contains("dependencies"));
     }
 
     #[test]
-    fn matching_integrity_reuses_analysis_despite_legacy_timestamp() {
-        let mut cache = ProjectAuditCache::new("npm");
-        cache.insert(
-            "node_modules/react".into(),
-            "react".into(),
-            "18.0.0".into(),
-            Some("sha512-cachehash".into()),
-            empty_analysis(),
-            vec![],
-        );
-        let mut serialized = serde_json::to_value(cache).unwrap();
-        serialized["entries"]["node_modules/react"]["cachedAtUnixSecs"] = 0.into();
-        let cache: ProjectAuditCache = serde_json::from_value(serialized).unwrap();
+    fn tampered_payload_is_rejected() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        cache.write(project.path()).unwrap();
+        let context = CacheContext::for_project(project.path()).unwrap();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&context.cache_path).unwrap()).unwrap();
+        document["payload"]["manager"] = "forged".into();
+        std::fs::write(&context.cache_path, serde_json::to_vec(&document).unwrap()).unwrap();
 
-        assert!(
-            cache
-                .get("node_modules/react", Some("sha512-cachehash"))
-                .is_some(),
-            "advisory freshness must not expire integrity-keyed source analysis"
+        assert!(ProjectAuditCache::read(project.path(), "npm").is_none());
+    }
+
+    #[test]
+    fn manager_and_embedded_schema_must_match() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        cache.write(project.path()).unwrap();
+        assert!(ProjectAuditCache::read(project.path(), "pnpm").is_none());
+
+        let mut cache = ProjectAuditCache::read(project.path(), "npm").unwrap();
+        Arc::make_mut(cache.analyses.values_mut().next().unwrap()).version += 1;
+        cache.dirty = true;
+        cache.write(project.path()).unwrap();
+        assert!(ProjectAuditCache::read(project.path(), "npm").is_none());
+    }
+
+    #[test]
+    fn identical_input_fingerprints_share_one_cached_analysis() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let first = package(Some("sha512-source"), None);
+        let mut second = first.clone();
+        second.name = "react-alias".into();
+        second.path = "node_modules/react-alias".into();
+        let mut cache = populated_cache(project.path(), &first);
+        cache.insert(
+            second.analysis_key(),
+            &second,
+            "sha256-input".into(),
+            Arc::new(empty_analysis()),
+        );
+
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.analyses.len(), 1);
+
+        cache.write(project.path()).unwrap();
+        let loaded = ProjectAuditCache::read(project.path(), "npm").unwrap();
+        let first_analysis = loaded
+            .get(&first.analysis_key(), &first, "sha256-input")
+            .unwrap();
+        let second_analysis = loaded
+            .get(&second.analysis_key(), &second, "sha256-input")
+            .unwrap();
+        assert!(Arc::ptr_eq(&first_analysis, &second_analysis));
+    }
+
+    #[test]
+    fn cache_copied_to_another_project_is_rejected() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let first_project = tempfile::tempdir().unwrap();
+        let second_project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(first_project.path(), &package);
+        cache.write(first_project.path()).unwrap();
+        let first_context = CacheContext::for_project(first_project.path()).unwrap();
+        let second_context = CacheContext::for_project(second_project.path()).unwrap();
+        std::fs::create_dir_all(second_context.cache_path.parent().unwrap()).unwrap();
+        std::fs::copy(first_context.cache_path, second_context.cache_path).unwrap();
+
+        assert!(ProjectAuditCache::read(second_project.path(), "npm").is_none());
+    }
+
+    #[test]
+    fn unchanged_cache_write_preserves_existing_bytes() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        cache.write(project.path()).unwrap();
+        let path = CacheContext::for_project(project.path())
+            .unwrap()
+            .cache_path;
+        let before = std::fs::read(&path).unwrap();
+        #[cfg(unix)]
+        let before_metadata = std::fs::metadata(&path).unwrap();
+
+        let mut loaded = ProjectAuditCache::read(project.path(), "npm").unwrap();
+        loaded.write(project.path()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let after_metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(after_metadata.ino(), before_metadata.ino());
+            assert_eq!(after_metadata.mtime(), before_metadata.mtime());
+            assert_eq!(after_metadata.mtime_nsec(), before_metadata.mtime_nsec());
+        }
+    }
+
+    #[test]
+    fn stale_entries_are_pruned() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let first = package(Some("sha512-first"), None);
+        let mut second = package(Some("sha512-second"), None);
+        second.path = "node_modules/second".into();
+        second.name = "second".into();
+        let mut cache = populated_cache(project.path(), &first);
+        cache.insert(
+            second.analysis_key(),
+            &second,
+            "sha256-second".into(),
+            Arc::new(empty_analysis()),
+        );
+        cache.write(project.path()).unwrap();
+
+        let mut loaded = ProjectAuditCache::read(project.path(), "npm").unwrap();
+        let first_key = first.analysis_key();
+        loaded.retain_active(&HashSet::from([first_key.as_str()]));
+        loaded.write(project.path()).unwrap();
+        let loaded = ProjectAuditCache::read(project.path(), "npm").unwrap();
+        assert_eq!(
+            loaded.entries.keys().cloned().collect::<Vec<_>>(),
+            vec![first_key]
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_replaces_destination_symlink_without_touching_target() {
-        use std::os::unix::fs::symlink;
+    fn cache_key_and_cache_file_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
 
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
         let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(outside.path(), b"sentinel").unwrap();
-        std::fs::create_dir(project.path().join(".lpm")).unwrap();
-        let cache_path = cache_path(project.path());
-        symlink(outside.path(), &cache_path).unwrap();
-
-        ProjectAuditCache::new("npm").write(project.path()).unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        cache.write(project.path()).unwrap();
+        let context = CacheContext::for_project(project.path()).unwrap();
 
         assert_eq!(
             (
-                std::fs::read(outside.path()).unwrap(),
-                std::fs::symlink_metadata(cache_path)
+                std::fs::metadata(context.secret_path)
                     .unwrap()
-                    .file_type()
-                    .is_symlink(),
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                std::fs::metadata(context.cache_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
             ),
-            (b"sentinel".to_vec(), false),
-            "cache replacement must not follow a destination symlink"
+            (0o600, 0o600)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_cache_key_permissions_reject_reads_and_writes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        cache.write(project.path()).unwrap();
+        let context = CacheContext::for_project(project.path()).unwrap();
+        std::fs::set_permissions(&context.secret_path, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        assert!(ProjectAuditCache::read(project.path(), "npm").is_none());
+        cache.dirty = true;
+        assert!(cache.write(project.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_write_replaces_destination_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let package = package(Some("sha512-source"), None);
+        let mut cache = populated_cache(project.path(), &package);
+        let context = CacheContext::for_project(project.path()).unwrap();
+        std::fs::create_dir_all(context.cache_path.parent().unwrap()).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"sentinel").unwrap();
+        symlink(outside.path(), &context.cache_path).unwrap();
+
+        cache.write(project.path()).unwrap();
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"sentinel");
+        assert!(
+            !std::fs::symlink_metadata(context.cache_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
     #[test]
-    fn oversized_write_preserves_previous_readable_cache() {
+    fn oversized_write_preserves_previous_authenticated_cache() {
+        let lpm_home = tempfile::tempdir().unwrap();
+        let _env = scoped_lpm_home(lpm_home.path());
         let project = tempfile::tempdir().unwrap();
-        let previous = ProjectAuditCache::new("npm");
+        let original_package = package(Some("sha512-source"), None);
+        let mut previous = populated_cache(project.path(), &original_package);
         previous.write(project.path()).unwrap();
-        let cache_path = cache_path(project.path());
+        let cache_path = CacheContext::for_project(project.path())
+            .unwrap()
+            .cache_path;
         let previous_bytes = std::fs::read(&cache_path).unwrap();
 
-        let mut oversized = ProjectAuditCache::new("npm");
+        let mut oversized = ProjectAuditCache::new(project.path(), "npm").unwrap();
         let mut analysis = empty_analysis();
         analysis.analyzed_at = "x".repeat(lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize);
+        let oversized_package = package(Some("sha512-oversized"), None);
         oversized.insert(
-            "node_modules/oversized".into(),
-            "oversized".into(),
-            "1.0.0".into(),
-            Some("sha512-cachehash".into()),
-            analysis,
-            vec![],
+            oversized_package.analysis_key(),
+            &oversized_package,
+            "sha256-oversized".into(),
+            Arc::new(analysis),
         );
 
         let result = oversized.write(project.path());
-        let previous_preserved = std::fs::read(cache_path).unwrap() == previous_bytes;
-
-        assert_eq!(
-            (result.is_err(), previous_preserved),
-            (true, true),
-            "an over-cap cache must fail before replacing the prior cache"
-        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(cache_path).unwrap(), previous_bytes);
     }
 }

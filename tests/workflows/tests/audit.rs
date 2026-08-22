@@ -12,7 +12,8 @@ use support::mock_registry::{
     make_tarball_from_pkg_json, make_tarball_with_files,
 };
 use support::{
-    TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry, lpm_with_registry_and_npm,
+    TempProject, VALID_TEST_INTEGRITY, lpm, lpm_spawnable_with_registry, lpm_with_registry,
+    lpm_with_registry_and_npm,
 };
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -132,6 +133,139 @@ fn run_audit_with_npm(
         cmd.arg(arg);
     }
     cmd.output().expect("failed to spawn lpm audit")
+}
+
+fn run_audit_json_v2(project: &TempProject, mock: &MockRegistry) -> std::process::Output {
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+    lpm_with_registry(project, &mock.url())
+        .env("LPM_OSV_URL", osv_url)
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["--json", "audit"])
+        .output()
+        .expect("failed to spawn lpm --json audit against the v2 store")
+}
+
+#[cfg(unix)]
+fn seed_v2_audit_link(
+    project: &TempProject,
+    name: &str,
+    graph_suffix: &str,
+    integrity: &str,
+    source: &str,
+) -> std::path::PathBuf {
+    let store_root = project.home().join(".lpm/store/v2");
+    let safe_name = name.replace(['/', '\\'], "+");
+    let link_dir = store_root
+        .join("links")
+        .join(format!("{safe_name}@1.0.0+{graph_suffix}"));
+    let package_dir = link_dir.join("node_modules").join(name);
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "license": "MIT",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(package_dir.join("index.js"), source).unwrap();
+
+    let store = lpm_store::v2::Store::at(&store_root);
+    let object_dir = store.paths().object_dir(integrity).unwrap();
+    std::fs::create_dir_all(&object_dir).unwrap();
+    std::fs::write(
+        object_dir.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "license": "MIT",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(object_dir.join("index.js"), source).unwrap();
+
+    std::fs::write(
+        link_dir.join(".lpm-link-meta.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "graph_key": format!("{name}@1.0.0+{graph_suffix}"),
+            "graph_key_digest_hex": graph_suffix.repeat(4),
+            "name": name,
+            "version": "1.0.0",
+            "source_sri": integrity,
+            "object_path": "objects/fixture",
+            "deps": [],
+            "platform": { "os": "darwin", "cpu": "arm64", "libc": null },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_referenced_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    package_dir
+}
+
+fn write_duplicate_instance_lpm_lockfile(
+    project: &TempProject,
+    package_name: &str,
+    integrity_a: &str,
+    integrity_b: &str,
+) -> [lpm_common::PackageInstanceId; 2] {
+    use std::collections::BTreeMap;
+
+    let source = "registry+https://registry.npmjs.org";
+    let id_a =
+        lpm_common::PackageInstanceId::derive(package_name, "1.0.0", source, "root/source-a");
+    let id_b =
+        lpm_common::PackageInstanceId::derive(package_name, "1.0.0", source, "root/source-b");
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("pubgrub");
+    for (instance_id, integrity) in [(id_a, integrity_a), (id_b, integrity_b)] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: package_name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            integrity: Some(integrity.to_string()),
+            ..Default::default()
+        });
+    }
+    lockfile.root_resolutions = BTreeMap::from([
+        (
+            "source-a".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(id_a),
+                package: package_name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        ),
+        (
+            "source-b".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(id_b),
+                package: package_name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source.to_string()),
+            },
+        ),
+    ]);
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: BTreeMap::from([
+                ("source-a".to_string(), "1.0.0".to_string()),
+                ("source-b".to_string(), "1.0.0".to_string()),
+            ]),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+    [id_a, id_b]
 }
 
 /// Mount `pkg@1.0.0` on the mock registry and install it into `project`.
@@ -2370,6 +2504,580 @@ async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_json_keeps_same_coordinate_instances_and_source_paths_separate() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(
+        r#"{"name":"audit-instance-host","version":"1.0.0","dependencies":{"source-a":"1.0.0","source-b":"1.0.0"}}"#,
+    );
+    let source_a = "registry+https://lpm.dev";
+    let source_b = source_a;
+    let package_name = "@lpm.dev/test.duplicate";
+    let integrity = compute_integrity(b"shared-source");
+    let id_a =
+        lpm_common::PackageInstanceId::derive(package_name, "1.0.0", source_a, "root/source-a");
+    let id_b =
+        lpm_common::PackageInstanceId::derive(package_name, "1.0.0", source_b, "root/source-b");
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("pubgrub");
+    for (instance_id, source) in [(id_a, source_a), (id_b, source_b)] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            instance_id: Some(instance_id),
+            name: package_name.to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+            integrity: Some(integrity.clone()),
+            ..Default::default()
+        });
+    }
+    lockfile.root_resolutions = BTreeMap::from([
+        (
+            "source-a".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(id_a),
+                package: package_name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source_a.to_string()),
+            },
+        ),
+        (
+            "source-b".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(id_b),
+                package: package_name.to_string(),
+                version: "1.0.0".to_string(),
+                source: Some(source_b.to_string()),
+            },
+        ),
+    ]);
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: BTreeMap::from([
+                ("source-a".to_string(), "1.0.0".to_string()),
+                ("source-b".to_string(), "1.0.0".to_string()),
+            ]),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+
+    let package_a = seed_v2_audit_link(
+        &project,
+        package_name,
+        "aaaaaaaaaaaaaaaa",
+        &integrity,
+        "module.exports = () => eval('source-a')\n",
+    );
+    let package_b = seed_v2_audit_link(
+        &project,
+        package_name,
+        "bbbbbbbbbbbbbbbb",
+        &integrity,
+        "require('child_process').exec('echo source-b')\n",
+    );
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+    symlink(&package_a, project.path().join("node_modules/source-a")).unwrap();
+    symlink(&package_b, project.path().join("node_modules/source-b")).unwrap();
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    let index = lpm_store::V2BaselineIndex::for_project(project.path(), &root);
+    let digest_a = index
+        .graph_digest_for_package_dir(&project.path().join("node_modules/source-a"))
+        .unwrap();
+    let digest_b = index
+        .graph_digest_for_package_dir(&project.path().join("node_modules/source-b"))
+        .unwrap();
+    assert_ne!(digest_a, digest_b);
+    assert_eq!(
+        index.lookup_by_graph_digest(digest_a).unwrap().package_dir,
+        package_a
+    );
+    assert_eq!(
+        index.lookup_by_graph_digest(digest_b).unwrap().package_dir,
+        package_b
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": package_name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": package_name,
+                "version": "1.0.0",
+                "_qualityScore": 10,
+                "dependencies": {},
+            }
+        }
+    })])
+    .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["--json", "audit"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "audit JSON must parse: {error}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        });
+    let mut packages = report["packages"].as_array().unwrap().clone();
+    packages.sort_by(|left, right| {
+        left["instance_id"]
+            .as_str()
+            .cmp(&right["instance_id"].as_str())
+    });
+
+    assert_eq!(packages.len(), 2, "{report}");
+    let expected_ids = [id_a.to_string(), id_b.to_string()];
+    let expected_paths = [
+        package_a.to_string_lossy().into_owned(),
+        package_b.to_string_lossy().into_owned(),
+    ];
+    for package in &packages {
+        assert!(
+            expected_ids.contains(&package["instance_id"].as_str().unwrap().to_string()),
+            "{package}",
+        );
+        assert!(
+            expected_paths.contains(&package["path"].as_str().unwrap().to_string()),
+            "{package}",
+        );
+    }
+    let issue_sets = packages
+        .iter()
+        .map(|package| package["issues"].to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        issue_sets
+            .iter()
+            .all(|issues| issues.contains("low quality score")),
+        "{report}",
+    );
+    assert!(
+        issue_sets.iter().any(|issues| issues.contains("eval()")),
+        "{report}",
+    );
+    assert!(
+        issue_sets
+            .iter()
+            .any(|issues| issues.contains("child processes")),
+        "{report}",
+    );
+}
+
+#[tokio::test]
+async fn audit_json_merges_registry_and_local_findings_for_each_foreign_instance() {
+    let project = TempProject::empty(
+        r#"{"name":"foreign-instance-host","version":"1.0.0","dependencies":{"parent-a":"1.0.0","parent-b":"1.0.0"}}"#,
+    );
+    let package_name = "@lpm.dev/test.duplicate";
+    let path_a = "node_modules/parent-a/node_modules/@lpm.dev/test.duplicate";
+    let path_b = "node_modules/parent-b/node_modules/@lpm.dev/test.duplicate";
+    project.write_file(
+        "package-lock.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "foreign-instance-host",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": {
+                    "name": "foreign-instance-host",
+                    "version": "1.0.0",
+                    "dependencies": { "parent-a": "1.0.0", "parent-b": "1.0.0" }
+                },
+                "node_modules/parent-a": {
+                    "name": "parent-a",
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/parent-a/-/parent-a-1.0.0.tgz",
+                    "dependencies": { package_name: "1.0.0" }
+                },
+                "node_modules/parent-b": {
+                    "name": "parent-b",
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/parent-b/-/parent-b-1.0.0.tgz",
+                    "dependencies": { package_name: "1.0.0" }
+                },
+                path_a: {
+                    "name": package_name,
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/@lpm.dev/test.duplicate/-/test.duplicate-1.0.0.tgz"
+                },
+                path_b: {
+                    "name": package_name,
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/@lpm.dev/test.duplicate/-/test.duplicate-1.0.0.tgz"
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    project.write_file(
+        &format!("{path_a}/package.json"),
+        &format!(r#"{{"name":"{package_name}","version":"1.0.0"}}"#),
+    );
+    project.write_file(
+        &format!("{path_a}/index.js"),
+        "module.exports = () => eval('source-a')\n",
+    );
+    project.write_file(
+        &format!("{path_b}/package.json"),
+        &format!(r#"{{"name":"{package_name}","version":"1.0.0"}}"#),
+    );
+    project.write_file(
+        &format!("{path_b}/index.js"),
+        "require('child_process').exec('echo source-b')\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": package_name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": package_name,
+                "version": "1.0.0",
+                "_qualityScore": 10,
+                "dependencies": {}
+            }
+        }
+    })])
+    .await;
+
+    let output = run_audit_json_v2(&project, &mock);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "audit JSON must parse: {error}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        });
+    let packages = report["packages"].as_array().unwrap();
+
+    assert_eq!(packages.len(), 2, "{report}");
+    for expected_path in [path_a, path_b] {
+        let package = packages
+            .iter()
+            .find(|package| package["path"] == expected_path)
+            .unwrap_or_else(|| panic!("missing {expected_path}: {report}"));
+        assert!(
+            package["issues"].to_string().contains("low quality score"),
+            "{package}"
+        );
+    }
+    let issue_sets = packages
+        .iter()
+        .map(|package| package["issues"].to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        issue_sets.iter().any(|issues| issues.contains("eval()")),
+        "{report}"
+    );
+    assert!(
+        issue_sets
+            .iter()
+            .any(|issues| issues.contains("child processes")),
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_does_not_fall_back_to_an_ambiguous_store_entry_for_an_exact_instance() {
+    let project = TempProject::empty(
+        r#"{"name":"missing-links-host","version":"1.0.0","dependencies":{"source-a":"1.0.0","source-b":"1.0.0"}}"#,
+    );
+    let package_name = "duplicate-source";
+    let integrity = compute_integrity(b"shared-source");
+    write_duplicate_instance_lpm_lockfile(&project, package_name, &integrity, &integrity);
+    seed_v2_audit_link(
+        &project,
+        package_name,
+        "aaaaaaaaaaaaaaaa",
+        &integrity,
+        "module.exports = () => eval('source-a')\n",
+    );
+    seed_v2_audit_link(
+        &project,
+        package_name,
+        "bbbbbbbbbbbbbbbb",
+        &integrity,
+        "require('child_process').exec('echo source-b')\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let output = run_audit_json_v2(&project, &mock);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(report["packages"], serde_json::json!([]), "{report}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_rejects_project_links_wired_to_the_wrong_locked_integrity() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(
+        r#"{"name":"swapped-links-host","version":"1.0.0","dependencies":{"source-a":"1.0.0","source-b":"1.0.0"}}"#,
+    );
+    let package_name = "duplicate-source";
+    let integrity_a = compute_integrity(b"source-a");
+    let integrity_b = compute_integrity(b"source-b");
+    let [id_a, id_b] =
+        write_duplicate_instance_lpm_lockfile(&project, package_name, &integrity_a, &integrity_b);
+    let package_a = seed_v2_audit_link(
+        &project,
+        package_name,
+        "aaaaaaaaaaaaaaaa",
+        &integrity_a,
+        "module.exports = () => eval('source-a')\n",
+    );
+    let package_b = seed_v2_audit_link(
+        &project,
+        package_name,
+        "bbbbbbbbbbbbbbbb",
+        &integrity_b,
+        "require('child_process').exec('echo source-b')\n",
+    );
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+    symlink(&package_b, project.path().join("node_modules/source-a")).unwrap();
+    symlink(&package_a, project.path().join("node_modules/source-b")).unwrap();
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let output = run_audit_json_v2(&project, &mock);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let packages = report["packages"].as_array().unwrap();
+    assert_eq!(packages.len(), 2, "{report}");
+    let package_a_report = packages
+        .iter()
+        .find(|package| package["instance_id"] == id_a.to_string())
+        .unwrap();
+    let package_b_report = packages
+        .iter()
+        .find(|package| package["instance_id"] == id_b.to_string())
+        .unwrap();
+    assert_eq!(
+        package_a_report["path"],
+        package_a.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        package_b_report["path"],
+        package_b.to_string_lossy().as_ref()
+    );
+    assert!(package_a_report["issues"].to_string().contains("eval()"));
+    assert!(
+        package_b_report["issues"]
+            .to_string()
+            .contains("child processes")
+    );
+}
+
+#[tokio::test]
+async fn audit_scans_v1_materialized_bytes_for_a_patched_package() {
+    use sha2::Digest as _;
+
+    let project = TempProject::empty(
+        r#"{"name":"patched-host","version":"1.0.0","dependencies":{"patched-pkg":"1.0.0"}}"#,
+    );
+    let package = "patched-pkg";
+    let version = "1.0.0";
+    let patch_bytes = b"fixture patch bytes";
+    let patch_digest = format!("sha256-{:x}", sha2::Sha256::digest(patch_bytes));
+    project.write_file(
+        "patches/patched-pkg.patch",
+        std::str::from_utf8(patch_bytes).unwrap(),
+    );
+
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("pubgrub");
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: package.to_string(),
+        version: version.to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        integrity: Some(VALID_TEST_INTEGRITY.to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(package, package, version)]);
+    let patch = lpm_lockfile::LockfilePatch {
+        path: "patches/patched-pkg.patch".to_string(),
+        sha256: patch_digest,
+        original_integrity: VALID_TEST_INTEGRITY.to_string(),
+    };
+    lockfile
+        .patches
+        .insert(format!("{package}@{version}"), patch.clone());
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([(
+                package.to_string(),
+                version.to_string(),
+            )]),
+            patches: std::collections::BTreeMap::from([(format!("{package}@{version}"), patch)]),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    let pristine = lpm_store::PackageStore::from_root(&root).package_dir(package, version);
+    std::fs::create_dir_all(&pristine).unwrap();
+    std::fs::write(
+        pristine.join("package.json"),
+        r#"{"name":"patched-pkg","version":"1.0.0","license":"MIT"}"#,
+    )
+    .unwrap();
+    std::fs::write(pristine.join("index.js"), "module.exports = 1\n").unwrap();
+    std::fs::write(pristine.join(".integrity"), VALID_TEST_INTEGRITY).unwrap();
+    seed_node_modules_package(
+        &project,
+        package,
+        &[("index.js", "module.exports = () => eval('patched')\n")],
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let osv_url = format!("{}/v1/querybatch", mock.url());
+    let output = lpm(&project)
+        .env("LPM_STORE_VERSION", "v1")
+        .env("LPM_OSV_URL", osv_url)
+        .args(["audit", "--fail-on=behavior"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "patched eval must fail behavioral policy\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn audit_scans_nested_v1_materialized_bytes_for_a_patched_version_conflict() {
+    use sha2::Digest as _;
+
+    let project = TempProject::empty(
+        r#"{"name":"patched-conflict-host","version":"1.0.0","dependencies":{"parent-pkg":"1.0.0","shared-pkg":"2.0.0"}}"#,
+    );
+    let patch_bytes = b"nested fixture patch bytes";
+    let patch_digest = format!("sha256-{:x}", sha2::Sha256::digest(patch_bytes));
+    project.write_file(
+        "patches/shared-pkg.patch",
+        std::str::from_utf8(patch_bytes).unwrap(),
+    );
+
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("pubgrub");
+    for (name, version, dependencies) in [
+        ("parent-pkg", "1.0.0", vec!["shared-pkg@1.0.0".to_string()]),
+        ("shared-pkg", "1.0.0", Vec::new()),
+        ("shared-pkg", "2.0.0", Vec::new()),
+    ] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some(VALID_TEST_INTEGRITY.to_string()),
+            dependencies,
+            ..Default::default()
+        });
+    }
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[
+            ("parent-pkg", "parent-pkg", "1.0.0"),
+            ("shared-pkg", "shared-pkg", "2.0.0"),
+        ],
+    );
+    let patch = lpm_lockfile::LockfilePatch {
+        path: "patches/shared-pkg.patch".to_string(),
+        sha256: patch_digest,
+        original_integrity: VALID_TEST_INTEGRITY.to_string(),
+    };
+    lockfile
+        .patches
+        .insert("shared-pkg@1.0.0".to_string(), patch.clone());
+    lockfile.importers.insert(
+        ".".to_string(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([
+                ("parent-pkg".to_string(), "1.0.0".to_string()),
+                ("shared-pkg".to_string(), "2.0.0".to_string()),
+            ]),
+            patches: std::collections::BTreeMap::from([("shared-pkg@1.0.0".to_string(), patch)]),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    let store = lpm_store::PackageStore::from_root(&root);
+    for (name, version) in [
+        ("parent-pkg", "1.0.0"),
+        ("shared-pkg", "1.0.0"),
+        ("shared-pkg", "2.0.0"),
+    ] {
+        let pristine = store.package_dir(name, version);
+        std::fs::create_dir_all(&pristine).unwrap();
+        std::fs::write(
+            pristine.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}","license":"MIT"}}"#),
+        )
+        .unwrap();
+        std::fs::write(pristine.join("index.js"), "module.exports = 1\n").unwrap();
+        std::fs::write(pristine.join(".integrity"), VALID_TEST_INTEGRITY).unwrap();
+    }
+
+    seed_node_modules_package(
+        &project,
+        "parent-pkg",
+        &[("index.js", "module.exports = require('shared-pkg')\n")],
+    );
+    project.write_file(
+        "node_modules/shared-pkg/package.json",
+        r#"{"name":"shared-pkg","version":"2.0.0","license":"MIT"}"#,
+    );
+    project.write_file("node_modules/shared-pkg/index.js", "module.exports = 2\n");
+    project.write_file(
+        "node_modules/parent-pkg/node_modules/shared-pkg/package.json",
+        r#"{"name":"shared-pkg","version":"1.0.0","license":"MIT"}"#,
+    );
+    project.write_file(
+        "node_modules/parent-pkg/node_modules/shared-pkg/index.js",
+        "module.exports = () => eval('nested-patched')\n",
+    );
+
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![], vec![], vec![]]).await;
+    let output = lpm(&project)
+        .env("LPM_STORE_VERSION", "v1")
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["audit", "--fail-on=behavior"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "nested patched eval must fail behavioral policy\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// `--fail-on=behavior` must also fire on CRITICAL behavioral findings
 /// (obfuscation or protestware). Critical and
 /// high go through different branches of `should_fail`; this case
@@ -2560,8 +3268,7 @@ async fn audit_private_package_without_license_does_not_emit_no_license_flag() {
 ///
 /// Captured fields: `success`, `manager`, `scanned`, `vulnerabilities[]`
 /// (with `package`, `version`, `id`, `summary`, `severity`), `counts`,
-/// `packages[]`. Dynamic test-port URLs aren't in the audit envelope,
-/// so no redactions are needed.
+/// `packages[]`. Exact instance IDs and materialized paths are redacted.
 #[tokio::test]
 async fn audit_json_envelope_with_one_vuln_matches_snapshot() {
     let project = TempProject::empty(
@@ -2591,7 +3298,10 @@ async fn audit_json_envelope_with_one_vuln_matches_snapshot() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("audit --json stdout must be valid JSON: {e}\n---\n{stdout}"));
 
-    insta::assert_json_snapshot!("audit_json_envelope_one_vuln", envelope);
+    insta::assert_json_snapshot!("audit_json_envelope_one_vuln", envelope, {
+        ".packages[].instance_id" => "[INSTANCE_ID]",
+        ".packages[].path" => "[PACKAGE_PATH]",
+    });
 }
 
 // ─── `audit --secrets` (hardcoded-secret scanner) ────────────────────

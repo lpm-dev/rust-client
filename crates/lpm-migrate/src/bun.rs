@@ -194,12 +194,7 @@ fn parse_binary_lockfile(
     snapshot.flush().map_err(LpmError::Io)?;
     drop(input);
 
-    let timeout = if cfg!(test) {
-        Duration::from_millis(500)
-    } else {
-        BUN_CONVERSION_TIMEOUT
-    };
-    let output = run_bun_converter(snapshot.path(), timeout)?;
+    let output = run_bun_converter(snapshot.path(), BUN_CONVERSION_TIMEOUT)?;
     parse_json_str(&output)
 }
 
@@ -684,12 +679,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("bun.lockb");
             std::fs::write(&path, b"bounded input").unwrap();
-            let started = std::time::Instant::now();
 
-            let error = parse_selected(&path).unwrap_err();
+            let error = run_bun_converter(&path, Duration::from_millis(500)).unwrap_err();
 
-            assert!(started.elapsed() < std::time::Duration::from_secs(1));
-            assert!(error.to_string().contains("timed out"));
+            assert!(error.to_string().contains("timed out after 0.5 seconds"));
         });
     }
 
@@ -722,10 +715,8 @@ mod tests {
                 }
                 let parsed_path = path.clone();
                 let parser = std::thread::spawn(move || parse_selected(&parsed_path));
-                for _ in 0..500 {
-                    if marker.exists() {
-                        break;
-                    }
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !marker.exists() && !parser.is_finished() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 assert!(marker.exists(), "fake Bun converter did not start");

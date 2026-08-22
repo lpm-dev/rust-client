@@ -5,7 +5,7 @@ use crate::platform::create_symlink_or_junction;
 use crate::platform::validate_cmd_path;
 #[cfg(unix)]
 use crate::platform::{make_bin_target_executable, relative_symlink_target_from_parent};
-use crate::types::{LinkResult, LinkTarget, MaterializedPackage};
+use crate::types::{LinkResult, LinkTarget, Materialization, MaterializedPackage};
 use crate::validation::{
     ensure_child_dir, ensure_project_node_modules_dir, filter_node_modules_entry_name,
     is_valid_self_ref_name, validate_bin_name, validate_bin_target,
@@ -424,8 +424,11 @@ pub fn link_packages_hoisted(
             // the early-continue so the patch pass sees both freshly-
             // linked and already-existing entries.
             materialized.push(MaterializedPackage {
+                instance_id: None,
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
+                analysis_source: (pkg.materialization == Materialization::DirectorySource)
+                    .then(|| pkg.store_path.clone()),
                 destination: target_dir.clone(),
             });
 
@@ -460,8 +463,11 @@ pub fn link_packages_hoisted(
             // the early-continue. Both nested-shape branches (under
             // hoisted parent AND under .lpm/nested) flow through here.
             materialized.push(MaterializedPackage {
+                instance_id: None,
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
+                analysis_source: (pkg.materialization == Materialization::DirectorySource)
+                    .then(|| pkg.store_path.clone()),
                 destination: nested_dir.clone(),
             });
 
@@ -500,8 +506,11 @@ pub fn link_packages_hoisted(
         for (name, &pkg_idx) in &hoisted {
             let pkg = &packages[pkg_idx];
             materialized.push(MaterializedPackage {
+                instance_id: None,
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
+                analysis_source: (pkg.materialization == Materialization::DirectorySource)
+                    .then(|| pkg.store_path.clone()),
                 destination: node_modules.join(name),
             });
         }
@@ -513,8 +522,11 @@ pub fn link_packages_hoisted(
                 layout.hoisted_nested_root()
             };
             materialized.push(MaterializedPackage {
+                instance_id: None,
                 name: pkg.name.clone(),
                 version: pkg.version.clone(),
+                analysis_source: (pkg.materialization == Materialization::DirectorySource)
+                    .then(|| pkg.store_path.clone()),
                 destination: parent_nm.join(&pkg.name),
             });
         }

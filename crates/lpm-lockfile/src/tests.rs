@@ -5104,6 +5104,57 @@ fn read_for_project_returns_the_nearest_workspace_importer_projection() {
 }
 
 #[test]
+fn read_for_project_represents_an_unlisted_workspace_root_as_an_empty_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let member = directory.path().join("packages/app");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"root","version":"1.0.0","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
+        .unwrap();
+    union
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let member_view = Lockfile::read_for_project(&member).unwrap();
+    let workspace_root = member_view.workspace_root.unwrap();
+    assert_eq!(workspace_root.root, directory.path());
+    assert!(workspace_root.lockfile.packages.is_empty());
+
+    let root_view = Lockfile::read_for_project(directory.path()).unwrap();
+    assert_eq!(root_view.importer, ".");
+    assert!(root_view.lockfile.packages.is_empty());
+}
+
+#[test]
+fn read_for_project_preserves_a_standalone_lockfile_without_importer_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut lockfile = legacy_lockfile();
+    lockfile.add_package(LockedPackage {
+        name: "standalone-dependency".to_string(),
+        version: "1.0.0".to_string(),
+        ..LockedPackage::default()
+    });
+    lockfile
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+
+    let project_view = Lockfile::read_for_project(directory.path()).unwrap();
+
+    assert_eq!(project_view.lockfile.packages, lockfile.packages);
+}
+
+#[test]
 fn read_for_project_anchors_nested_directories_at_the_nearest_manifest() {
     let directory = tempfile::tempdir().unwrap();
     let member = directory.path().join("packages/app");

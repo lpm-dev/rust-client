@@ -160,22 +160,16 @@ pub(super) fn validate_store_graph_compatibility(
         return Ok(());
     }
 
-    let mut instance_by_artifact: HashMap<lpm_lockfile::PackageKey, lpm_common::PackageInstanceId> =
+    let mut instance_by_coordinate: HashMap<(&str, &str), lpm_common::PackageInstanceId> =
         HashMap::with_capacity(packages.len());
     for package in packages {
         let Some(instance_id) = package.instance_id else {
             continue;
         };
-        let source = package.source_kind().map_err(|error| {
-            LpmError::Registry(format!(
-                "legacy store graph validation: invalid source for {}@{}: {error}",
-                package.name, package.version
-            ))
-        })?;
-        let artifact =
-            lpm_lockfile::PackageKey::new(&package.name, &package.version, source.source_id());
-        if let Some(existing) = instance_by_artifact.insert(artifact, instance_id)
-            && existing != instance_id
+        if let Some(existing) = instance_by_coordinate.insert(
+            (package.name.as_str(), package.version.as_str()),
+            instance_id,
+        ) && existing != instance_id
         {
             return Err(LpmError::Registry(format!(
                 "legacy store v1 cannot safely link multiple dependency contexts for {}@{}; unset LPM_STORE_VERSION or set LPM_STORE_VERSION=v2",

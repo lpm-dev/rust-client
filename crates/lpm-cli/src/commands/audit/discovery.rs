@@ -8,11 +8,12 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lpm_common::LpmError;
+use sha2::{Digest as _, Sha256};
 
 /// How a discovered package can be scanned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,8 @@ pub struct DiscoveredPackage {
     pub name: String,
     /// Exact resolved version.
     pub version: String,
+    /// Exact LPM graph instance, when the lockfile provides one.
+    pub instance_id: Option<lpm_common::PackageInstanceId>,
     /// Path relative to project root (e.g., "node_modules/react").
     /// For LPM store packages this is the lockfile key.
     pub path: String,
@@ -44,6 +47,8 @@ pub struct DiscoveredPackage {
     pub patch_sha256: Option<String>,
     /// Tarball resolved URL. Used for private registry detection.
     pub resolved_url: Option<String>,
+    /// Canonical source directory for `file:` and `link:` dependencies.
+    pub local_source_dir: Option<PathBuf>,
     /// How this package can be scanned.
     pub scan_mode: ScanMode,
     /// Whether this is a dev dependency.
@@ -54,6 +59,33 @@ pub struct DiscoveredPackage {
     /// Extracted from lockfile dependency edges. Used by the query engine
     /// for `>` combinator traversal (e.g., `lpm query :eval > :network`).
     pub dependencies: Vec<(String, String)>,
+}
+
+impl DiscoveredPackage {
+    pub(crate) fn analysis_key(&self) -> String {
+        if let Some(instance_id) = self.instance_id {
+            return format!("instance:{instance_id}");
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"lpm-audit-package-fallback-v1\0");
+        for value in [
+            Some(self.path.as_str()),
+            Some(self.name.as_str()),
+            Some(self.version.as_str()),
+            self.integrity.as_deref(),
+            self.patch_sha256.as_deref(),
+            self.local_source_dir.as_deref().and_then(Path::to_str),
+        ] {
+            match value {
+                Some(value) => {
+                    hasher.update((value.len() as u64).to_le_bytes());
+                    hasher.update(value.as_bytes());
+                }
+                None => hasher.update(u64::MAX.to_le_bytes()),
+            }
+        }
+        format!("fallback:{:x}", hasher.finalize())
+    }
 }
 
 /// Which package manager produced the inventory.
@@ -97,6 +129,64 @@ pub struct DiscoveryResult {
     pub packages: Vec<DiscoveredPackage>,
     pub(super) lpm_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
     pub(super) lpm_lockfile_content: Option<Arc<[u8]>>,
+    pub(crate) workspace_root: Option<WorkspaceRootDiscovery>,
+}
+
+pub(crate) struct WorkspaceRootDiscovery {
+    pub(crate) project_root: PathBuf,
+    pub(crate) lockfile: Arc<lpm_lockfile::Lockfile>,
+}
+
+impl DiscoveryResult {
+    pub(crate) fn retained_lpm_lockfile(&self) -> Option<&lpm_lockfile::Lockfile> {
+        self.lpm_lockfile.as_deref()
+    }
+
+    pub(crate) fn include_workspace_root_graph(&mut self) {
+        let Some(workspace) = self.workspace_root.as_ref() else {
+            return;
+        };
+        let mut existing_keys: HashSet<_> = self
+            .packages
+            .iter()
+            .map(DiscoveredPackage::analysis_key)
+            .collect();
+        self.packages.extend(
+            lpm_discovered_packages(&workspace.project_root, &workspace.lockfile)
+                .into_iter()
+                .filter(|package| existing_keys.insert(package.analysis_key())),
+        );
+        if let Some(lockfile) = self.lpm_lockfile.as_mut() {
+            let lockfile = Arc::make_mut(lockfile);
+            let mut existing_keys: HashSet<_> = lockfile
+                .packages
+                .iter()
+                .map(|package| {
+                    (
+                        package.instance_id,
+                        package.name.clone(),
+                        package.version.clone(),
+                        package.source.clone(),
+                    )
+                })
+                .collect();
+            lockfile.packages.extend(
+                workspace
+                    .lockfile
+                    .packages
+                    .iter()
+                    .filter(|package| {
+                        existing_keys.insert((
+                            package.instance_id,
+                            package.name.clone(),
+                            package.version.clone(),
+                            package.source.clone(),
+                        ))
+                    })
+                    .cloned(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,25 +205,37 @@ thread_local! {
 ///    (most recently modified lockfile wins when multiple exist)
 /// 3. Falls back to walking `node_modules/` (degraded mode)
 pub fn discover_packages(start_dir: &Path) -> Result<DiscoveryResult, LpmError> {
-    discover_packages_with_options(start_dir, false)
+    discover_packages_with_options(start_dir, false, false)
 }
 
 pub(super) fn discover_packages_retaining_lpm_lockfile(
     start_dir: &Path,
 ) -> Result<DiscoveryResult, LpmError> {
-    discover_packages_with_options(start_dir, true)
+    discover_packages_with_options(start_dir, true, true)
+}
+
+pub(super) fn discover_packages_retaining_parsed_lpm_lockfile(
+    start_dir: &Path,
+) -> Result<DiscoveryResult, LpmError> {
+    discover_packages_with_options(start_dir, true, false)
 }
 
 fn discover_packages_with_options(
     start_dir: &Path,
     retain_lpm_lockfile: bool,
+    retain_lpm_lockfile_content: bool,
 ) -> Result<DiscoveryResult, LpmError> {
     // Walk up to find a lockfile
     let mut current = start_dir.to_path_buf();
     loop {
         // 1. lpm.lock — always highest priority (LPM-managed project)
         if current.join("lpm.lock").exists() {
-            return discover_from_lpm_lock(start_dir, &current, retain_lpm_lockfile);
+            return discover_from_lpm_lock(
+                start_dir,
+                &current,
+                retain_lpm_lockfile,
+                retain_lpm_lockfile_content,
+            );
         }
 
         // 2. Foreign lockfiles — use lpm-migrate's mtime-based detection.
@@ -175,27 +277,67 @@ fn discover_from_lpm_lock(
     start_dir: &Path,
     project_root: &Path,
     retain_lockfile: bool,
+    retain_lockfile_content: bool,
 ) -> Result<DiscoveryResult, LpmError> {
     let target_root =
         lpm_workspace::find_project_root(start_dir).unwrap_or_else(|| start_dir.to_path_buf());
-    let (lockfile_path, lockfile, lpm_lockfile_content) = if retain_lockfile {
-        let project = lpm_lockfile::Lockfile::read_for_project(&target_root)
-            .map_err(|e| LpmError::Registry(format!("failed to read lpm.lock: {e}")))?;
+    let (lockfile_path, lockfile, lpm_lockfile_content, workspace_root) = if retain_lockfile {
+        let project = lpm_lockfile::Lockfile::read_for_project(&target_root).map_err(|e| {
+            LpmError::Registry(format!(
+                "failed to read retained lpm.lock view for {}: {e}",
+                target_root.display()
+            ))
+        })?;
+        let workspace_root = project
+            .workspace_root
+            .map(|workspace| WorkspaceRootDiscovery {
+                project_root: workspace.root,
+                lockfile: Arc::new(workspace.lockfile),
+            });
         (
             project.path,
             project.lockfile,
-            Some(Arc::<[u8]>::from(project.content.into_bytes())),
+            retain_lockfile_content.then(|| Arc::<[u8]>::from(project.content.into_bytes())),
+            workspace_root,
         )
     } else {
         (
             project_root.join("lpm.lock"),
-            crate::commands::install::workspace_lockfile::read_project(&target_root)
-                .map_err(|e| LpmError::Registry(format!("failed to read lpm.lock: {e}")))?,
+            crate::commands::install::workspace_lockfile::read_project(&target_root).map_err(
+                |e| {
+                    LpmError::Registry(format!(
+                        "failed to read active lpm.lock view for {}: {e}",
+                        target_root.display()
+                    ))
+                },
+            )?,
+            None,
             None,
         )
     };
 
-    let packages = lockfile
+    let packages = lpm_discovered_packages(&target_root, &lockfile);
+
+    let lpm_lockfile = retain_lockfile.then(|| Arc::new(lockfile));
+    Ok(DiscoveryResult {
+        manager: ManagerKind::Lpm,
+        lockfile_path: Some(lockfile_path),
+        project_root: target_root,
+        is_degraded: false,
+        is_yarn_pnp: false,
+        packages,
+        lpm_lockfile,
+        lpm_lockfile_content,
+        workspace_root,
+    })
+}
+
+fn lpm_discovered_packages(
+    project_root: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> Vec<DiscoveredPackage> {
+    let project_paths = resolve_lpm_project_paths(project_root, lockfile);
+    lockfile
         .packages
         .iter()
         .map(|p| {
@@ -219,33 +361,150 @@ fn discover_from_lpm_lock(
                 .patches
                 .get(&selector)
                 .map(|patch| patch.sha256.clone());
+            let local_source_dir = p
+                .source
+                .as_deref()
+                .and_then(|source| lpm_lockfile::Source::parse(source).ok())
+                .and_then(|source| match source {
+                    lpm_lockfile::Source::Directory { path }
+                    | lpm_lockfile::Source::Link { path } => {
+                        project_root.join(path).canonicalize().ok()
+                    }
+                    _ => None,
+                });
 
             DiscoveredPackage {
                 name: p.name.clone(),
                 version: p.version.clone(),
-                path: format!("node_modules/{}", p.name),
+                instance_id: p.instance_id,
+                path: p
+                    .instance_id
+                    .and_then(|instance_id| project_paths.get(&instance_id).cloned())
+                    .unwrap_or_else(|| format!("node_modules/{}", p.name)),
                 integrity: p.integrity.clone(),
                 patch_sha256,
                 resolved_url: None,
+                local_source_dir,
                 scan_mode: ScanMode::RegistryAndStore,
                 is_dev: false,
                 is_optional: false,
                 dependencies,
             }
         })
-        .collect();
+        .collect()
+}
 
-    let lpm_lockfile = retain_lockfile.then(|| Arc::new(lockfile));
-    Ok(DiscoveryResult {
-        manager: ManagerKind::Lpm,
-        lockfile_path: Some(lockfile_path),
-        project_root: target_root,
-        is_degraded: false,
-        is_yarn_pnp: false,
-        packages,
-        lpm_lockfile,
-        lpm_lockfile_content,
-    })
+fn resolve_lpm_project_paths(
+    project_root: &Path,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> HashMap<lpm_common::PackageInstanceId, String> {
+    let Ok(canonical_root) = project_root.canonicalize() else {
+        return HashMap::new();
+    };
+    let packages_by_instance: HashMap<_, _> = lockfile
+        .packages
+        .iter()
+        .filter_map(|package| {
+            package
+                .instance_id
+                .map(|instance_id| (instance_id, package))
+        })
+        .collect();
+    let mut absolute_paths = HashMap::with_capacity(packages_by_instance.len());
+    let mut to_visit = VecDeque::new();
+
+    for (local_name, resolution) in &lockfile.root_resolutions {
+        let Some(instance_id) = resolution.instance_id else {
+            continue;
+        };
+        let Some(package) = packages_by_instance.get(&instance_id) else {
+            continue;
+        };
+        let candidate = canonical_root.join("node_modules").join(local_name);
+        let Some(path) = matching_project_package_path(&candidate, &canonical_root, package) else {
+            continue;
+        };
+        if absolute_paths.insert(instance_id, path.clone()).is_none() {
+            to_visit.push_back((instance_id, path));
+        }
+    }
+
+    while let Some((instance_id, package_path)) = to_visit.pop_front() {
+        let Some(package) = packages_by_instance.get(&instance_id) else {
+            continue;
+        };
+        for (local_name, target_id) in package
+            .dependency_targets
+            .iter()
+            .chain(&package.peer_targets)
+        {
+            if absolute_paths.contains_key(target_id) {
+                continue;
+            }
+            let Some(target) = packages_by_instance.get(target_id) else {
+                continue;
+            };
+            let Some(path) =
+                resolve_node_modules_target(&package_path, &canonical_root, local_name, target)
+            else {
+                continue;
+            };
+            absolute_paths.insert(*target_id, path.clone());
+            to_visit.push_back((*target_id, path));
+        }
+    }
+
+    absolute_paths
+        .into_iter()
+        .filter_map(|(instance_id, path)| {
+            let relative = path.strip_prefix(&canonical_root).ok()?;
+            Some((instance_id, relative.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+fn resolve_node_modules_target(
+    package_path: &Path,
+    project_root: &Path,
+    local_name: &str,
+    target: &lpm_lockfile::LockedPackage,
+) -> Option<PathBuf> {
+    let mut current = Some(package_path);
+    while let Some(directory) = current {
+        if !directory.starts_with(project_root) {
+            break;
+        }
+        let candidate = directory.join("node_modules").join(local_name);
+        if let Some(path) = matching_project_package_path(&candidate, project_root, target) {
+            return Some(path);
+        }
+        if directory == project_root {
+            break;
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+fn matching_project_package_path(
+    candidate: &Path,
+    project_root: &Path,
+    target: &lpm_lockfile::LockedPackage,
+) -> Option<PathBuf> {
+    let canonical = candidate.canonicalize().ok()?;
+    if !canonical.starts_with(project_root) || !canonical.is_dir() {
+        return None;
+    }
+    let manifest = lpm_common::read_text_file_capped(
+        &canonical.join("package.json"),
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).ok()?;
+    (manifest.get("name").and_then(serde_json::Value::as_str) == Some(target.name.as_str())
+        && manifest.get("version").and_then(serde_json::Value::as_str)
+            == Some(target.version.as_str()))
+    .then_some(canonical)
 }
 
 // ─── npm (package-lock.json) ────────────────────────────────────────────────
@@ -269,6 +528,7 @@ fn discover_from_npm_lockfile(
         packages,
         lpm_lockfile: None,
         lpm_lockfile_content: None,
+        workspace_root: None,
     })
 }
 
@@ -294,6 +554,7 @@ fn discover_from_pnpm_lockfile(
         packages,
         lpm_lockfile: None,
         lpm_lockfile_content: None,
+        workspace_root: None,
     })
 }
 
@@ -321,10 +582,12 @@ fn discover_from_yarn_lockfile(
                 DiscoveredPackage {
                     name: package.name,
                     version: package.version,
+                    instance_id: None,
                     path,
                     integrity: package.integrity,
                     patch_sha256: None,
                     resolved_url: package.resolved,
+                    local_source_dir: None,
                     scan_mode: ScanMode::OsvOnly,
                     is_dev: package.is_dev,
                     is_optional: package.is_optional,
@@ -345,6 +608,7 @@ fn discover_from_yarn_lockfile(
         packages,
         lpm_lockfile: None,
         lpm_lockfile_content: None,
+        workspace_root: None,
     })
 }
 
@@ -374,6 +638,7 @@ fn discover_from_bun_lockfile(
         packages,
         lpm_lockfile: None,
         lpm_lockfile_content: None,
+        workspace_root: None,
     })
 }
 
@@ -419,6 +684,7 @@ fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
         packages,
         lpm_lockfile: None,
         lpm_lockfile_content: None,
+        workspace_root: None,
     }
 }
 
@@ -639,10 +905,12 @@ fn read_package_from_node_modules(
         DiscoveredPackage {
             name: canonical_name,
             version,
+            instance_id: None,
             path,
             integrity: None,
             patch_sha256: None,
             resolved_url: None,
+            local_source_dir: None,
             scan_mode: ScanMode::FullLocal,
             is_dev: false,            // Can't determine without lockfile
             is_optional: false,       // Can't determine without lockfile
@@ -726,10 +994,12 @@ where
         packages.push(DiscoveredPackage {
             name,
             version,
+            instance_id: None,
             path,
             integrity,
             patch_sha256: None,
             resolved_url: resolved,
+            local_source_dir: None,
             scan_mode,
             is_dev,
             is_optional,
@@ -1332,45 +1602,6 @@ version = "6.14.0"
             .expect("my-pkg not found");
         // missing-pkg is not in node_modules, so it should be filtered out
         assert!(pkg.dependencies.is_empty());
-    }
-
-    #[test]
-    fn cache_stores_and_retrieves_dependencies() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let mut cache = super::super::cache::ProjectAuditCache::new("npm");
-        let analysis = lpm_security::behavioral::PackageAnalysis {
-            version: lpm_security::behavioral::SCHEMA_VERSION,
-            analyzed_at: "T00:00:00Z".to_string(),
-            source: Default::default(),
-            supply_chain: Default::default(),
-            manifest: Default::default(),
-            meta: Default::default(),
-        };
-        let deps = vec![
-            ("accepts".to_string(), "1.3.8".to_string()),
-            ("qs".to_string(), "6.14.0".to_string()),
-        ];
-
-        cache.insert(
-            "node_modules/express".to_string(),
-            "express".to_string(),
-            "4.22.1".to_string(),
-            Some("sha512-abc".to_string()),
-            analysis,
-            deps.clone(),
-        );
-
-        // Write and read back
-        cache.write(dir.path()).unwrap();
-        let loaded =
-            super::super::cache::ProjectAuditCache::read(dir.path()).expect("cache should load");
-
-        let entry = loaded
-            .entries
-            .get("node_modules/express")
-            .expect("entry should exist");
-        assert_eq!(entry.dependencies, deps);
     }
 
     #[test]

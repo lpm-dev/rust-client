@@ -44,6 +44,31 @@ pub enum Selector {
     },
 }
 
+impl Selector {
+    /// Return whether matching requires dependency or parent relationships.
+    pub fn needs_dependency_graph(&self) -> bool {
+        match self {
+            Self::DirectChild { .. } => true,
+            Self::And(parts) | Self::Or(parts) => parts.iter().any(Self::needs_dependency_graph),
+            Self::Not(inner) => inner.needs_dependency_graph(),
+            Self::PseudoClass(_) | Self::Id(_) => false,
+        }
+    }
+
+    /// Return whether the selector refers to the owning workspace root.
+    pub fn uses_workspace_root(&self) -> bool {
+        match self {
+            Self::PseudoClass(PseudoClass::WorkspaceRoot) => true,
+            Self::And(parts) | Self::Or(parts) => parts.iter().any(Self::uses_workspace_root),
+            Self::Not(inner) => inner.uses_workspace_root(),
+            Self::DirectChild { parent, child } => {
+                parent.uses_workspace_root() || child.uses_workspace_root()
+            }
+            Self::PseudoClass(_) | Self::Id(_) => false,
+        }
+    }
+}
+
 /// Group a behavioral tag belongs to. The 23 tags split across three
 /// groups: source-behavior tags (what the code does), supply-chain
 /// tags (what the artifact looks like), and manifest tags (what
@@ -941,6 +966,8 @@ pub enum GraphKeyMode {
     Name,
     /// Keys are instance paths (e.g., `"node_modules/express"`). Used by npm/pnpm/yarn/bun.
     Path,
+    /// Keys are exact LPM package-instance identities.
+    Instance,
 }
 
 /// Dependency graph for evaluating `>` combinators.
@@ -977,6 +1004,17 @@ pub struct DepGraphEntry<'a> {
 }
 
 impl<'a> DepGraph<'a> {
+    /// Create an empty graph for selectors that do not inspect relationships.
+    pub fn empty() -> Self {
+        Self {
+            key_mode: GraphKeyMode::Path,
+            children: HashMap::new(),
+            parents: HashMap::new(),
+            root_deps: HashSet::new(),
+            workspace_root_deps: HashSet::new(),
+        }
+    }
+
     /// Build a dependency graph from lockfile packages and root dependencies.
     ///
     /// Uses package name as the graph key (no instance support).
@@ -1015,6 +1053,85 @@ impl<'a> DepGraph<'a> {
 
         Self {
             key_mode: GraphKeyMode::Name,
+            children,
+            parents,
+            root_deps,
+            workspace_root_deps: HashSet::new(),
+        }
+    }
+
+    /// Build an exact-instance graph from a current LPM lockfile.
+    pub fn from_lpm_instances(
+        packages: &[lpm_lockfile::LockedPackage],
+        package_keys: &[&'a str],
+        root_resolutions: &lpm_lockfile::RootResolutions,
+    ) -> Self {
+        let key_by_instance: HashMap<_, _> = packages
+            .iter()
+            .zip(package_keys.iter().copied())
+            .filter_map(|(package, key)| package.instance_id.map(|id| (id, key)))
+            .collect();
+        let needs_coordinate_fallback = packages.iter().any(|package| {
+            package.instance_id.is_none()
+                || !package.dependencies.is_empty() && package.dependency_targets.is_empty()
+        }) || root_resolutions
+            .values()
+            .any(|resolution| resolution.instance_id.is_none());
+        let mut keys_by_coords: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        if needs_coordinate_fallback {
+            for (package, key) in packages.iter().zip(package_keys.iter().copied()) {
+                keys_by_coords
+                    .entry((&package.name, &package.version))
+                    .or_default()
+                    .push(key);
+            }
+        }
+
+        let mut children = HashMap::with_capacity(packages.len());
+        let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (package, key) in packages.iter().zip(package_keys.iter().copied()) {
+            let dependencies = if package.dependency_targets.is_empty() {
+                package
+                    .dependencies
+                    .iter()
+                    .filter_map(|dependency| {
+                        let at = dependency.rfind('@')?;
+                        keys_by_coords
+                            .get(&(&dependency[..at], &dependency[at + 1..]))
+                            .and_then(|keys| keys.first().copied())
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                package
+                    .dependency_targets
+                    .values()
+                    .filter_map(|instance_id| key_by_instance.get(instance_id).copied())
+                    .collect::<Vec<_>>()
+            };
+            for dependency in &dependencies {
+                parents.entry(dependency).or_default().push(key);
+            }
+            if !dependencies.is_empty() {
+                children.insert(key, dependencies);
+            }
+        }
+
+        let root_deps = root_resolutions
+            .values()
+            .filter_map(|resolution| {
+                resolution
+                    .instance_id
+                    .and_then(|instance_id| key_by_instance.get(&instance_id).copied())
+                    .or_else(|| {
+                        keys_by_coords
+                            .get(&(resolution.package.as_str(), resolution.version.as_str()))
+                            .and_then(|keys| keys.first().copied())
+                    })
+            })
+            .collect();
+
+        Self {
+            key_mode: GraphKeyMode::Instance,
             children,
             parents,
             root_deps,
@@ -1165,27 +1282,41 @@ pub fn matches(
     graph: &DepGraph<'_>,
     all_packages: &HashMap<&str, PackageContext<'_>>,
 ) -> bool {
+    let graph_key = match graph.key_mode {
+        GraphKeyMode::Name => pkg.name,
+        GraphKeyMode::Path | GraphKeyMode::Instance => pkg.path,
+    };
+    matches_with_key(selector, pkg, graph_key, graph, all_packages)
+}
+
+/// Evaluate a selector with an explicitly supplied graph identity.
+pub fn matches_with_key(
+    selector: &Selector,
+    pkg: &PackageContext<'_>,
+    graph_key: &str,
+    graph: &DepGraph<'_>,
+    all_packages: &HashMap<&str, PackageContext<'_>>,
+) -> bool {
     match selector {
         Selector::PseudoClass(pc) => matches_pseudo_class(*pc, pkg),
         Selector::Id(id) => matches_id(id, pkg),
         Selector::And(parts) => {
             // Empty And = wildcard (*), always true
-            parts.is_empty() || parts.iter().all(|s| matches(s, pkg, graph, all_packages))
+            parts.is_empty()
+                || parts
+                    .iter()
+                    .all(|selector| matches_with_key(selector, pkg, graph_key, graph, all_packages))
         }
-        Selector::Or(parts) => parts.iter().any(|s| matches(s, pkg, graph, all_packages)),
-        Selector::Not(inner) => !matches(inner, pkg, graph, all_packages),
+        Selector::Or(parts) => parts
+            .iter()
+            .any(|selector| matches_with_key(selector, pkg, graph_key, graph, all_packages)),
+        Selector::Not(inner) => !matches_with_key(inner, pkg, graph_key, graph, all_packages),
         Selector::DirectChild { parent, child } => {
             // The current package must match `child`, and at least one
             // of its parents in the graph must match `parent`.
-            if !matches(child, pkg, graph, all_packages) {
+            if !matches_with_key(child, pkg, graph_key, graph, all_packages) {
                 return false;
             }
-
-            // Graph key: determined by the graph's key mode
-            let graph_key = match graph.key_mode {
-                GraphKeyMode::Name => pkg.name,
-                GraphKeyMode::Path => pkg.path,
-            };
 
             // Check if parent is :root or :workspace-root
             if matches!(
@@ -1202,7 +1333,7 @@ pub fn matches(
             if let Some(parent_keys) = graph.parents.get(graph_key) {
                 parent_keys.iter().any(|parent_key| {
                     if let Some(parent_pkg) = all_packages.get(parent_key) {
-                        matches(parent, parent_pkg, graph, all_packages)
+                        matches_with_key(parent, parent_pkg, parent_key, graph, all_packages)
                     } else {
                         false
                     }
@@ -1707,6 +1838,19 @@ mod tests {
                 child: Box::new(Selector::PseudoClass(PseudoClass::Eval)),
             }
         );
+    }
+
+    #[test]
+    fn selector_planning_detects_only_required_graph_and_workspace_state() {
+        let simple = parse_selector(":eval,:network").unwrap();
+        let dependency = parse_selector(":root > :eval").unwrap();
+        let workspace = parse_selector(":not(:workspace-root > :eval)").unwrap();
+
+        assert!(!simple.needs_dependency_graph());
+        assert!(dependency.needs_dependency_graph());
+        assert!(!dependency.uses_workspace_root());
+        assert!(workspace.needs_dependency_graph());
+        assert!(workspace.uses_workspace_root());
     }
 
     // ─── Matching tests ──────────────────────────────────────────────────
@@ -2861,5 +3005,123 @@ mod tests {
             matches(&sel2, qs_ref, &graph, &all),
             "#leftpad > #qs must match even with non-empty path"
         );
+    }
+
+    #[test]
+    fn lpm_instance_graph_keeps_same_coordinate_children_attached_to_exact_parents() {
+        use std::collections::BTreeMap;
+
+        let parent_a_id = lpm_common::PackageInstanceId::derive(
+            "parent-a",
+            "1.0.0",
+            "registry+npm",
+            "root/parent-a",
+        );
+        let parent_b_id = lpm_common::PackageInstanceId::derive(
+            "parent-b",
+            "1.0.0",
+            "registry+npm",
+            "root/parent-b",
+        );
+        let child_a_id = lpm_common::PackageInstanceId::derive(
+            "shared",
+            "1.0.0",
+            "registry+npm",
+            "parent-a/shared",
+        );
+        let child_b_id = lpm_common::PackageInstanceId::derive(
+            "shared",
+            "1.0.0",
+            "registry+npm",
+            "parent-b/shared",
+        );
+        let packages = vec![
+            lpm_lockfile::LockedPackage {
+                instance_id: Some(parent_a_id),
+                name: "parent-a".into(),
+                version: "1.0.0".into(),
+                dependencies: vec!["shared@1.0.0".into()],
+                dependency_targets: BTreeMap::from([("shared".into(), child_a_id)]),
+                ..Default::default()
+            },
+            lpm_lockfile::LockedPackage {
+                instance_id: Some(parent_b_id),
+                name: "parent-b".into(),
+                version: "1.0.0".into(),
+                dependencies: vec!["shared@1.0.0".into()],
+                dependency_targets: BTreeMap::from([("shared".into(), child_b_id)]),
+                ..Default::default()
+            },
+            lpm_lockfile::LockedPackage {
+                instance_id: Some(child_a_id),
+                name: "shared".into(),
+                version: "1.0.0".into(),
+                ..Default::default()
+            },
+            lpm_lockfile::LockedPackage {
+                instance_id: Some(child_b_id),
+                name: "shared".into(),
+                version: "1.0.0".into(),
+                ..Default::default()
+            },
+        ];
+        let keys = ["parent-a-key", "parent-b-key", "child-a-key", "child-b-key"];
+        let roots = BTreeMap::from([
+            (
+                "parent-a".into(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(parent_a_id),
+                    package: "parent-a".into(),
+                    version: "1.0.0".into(),
+                    source: None,
+                },
+            ),
+            (
+                "parent-b".into(),
+                lpm_lockfile::LockedRootResolution {
+                    instance_id: Some(parent_b_id),
+                    package: "parent-b".into(),
+                    version: "1.0.0".into(),
+                    source: None,
+                },
+            ),
+        ]);
+        let graph = DepGraph::from_lpm_instances(&packages, &keys, &roots);
+        let contexts = packages
+            .iter()
+            .map(|package| PackageContext {
+                name: &package.name,
+                version: &package.version,
+                path: "",
+                analysis: None,
+                has_scripts: false,
+                is_built: false,
+                is_vulnerable: false,
+                is_deprecated: false,
+                is_root: false,
+                is_workspace_root_dep: false,
+            })
+            .collect::<Vec<_>>();
+        let all = keys
+            .iter()
+            .copied()
+            .zip(contexts.iter().map(|context| PackageContext { ..*context }))
+            .collect::<HashMap<_, _>>();
+        let selector = parse_selector("#parent-a > #shared").unwrap();
+
+        assert!(matches_with_key(
+            &selector,
+            &contexts[2],
+            keys[2],
+            &graph,
+            &all,
+        ));
+        assert!(!matches_with_key(
+            &selector,
+            &contexts[3],
+            keys[3],
+            &graph,
+            &all,
+        ));
     }
 }

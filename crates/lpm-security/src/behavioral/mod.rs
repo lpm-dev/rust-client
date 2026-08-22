@@ -32,8 +32,9 @@ pub mod supply_chain;
 
 use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use source::SourceTags;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use supply_chain::SupplyChainTags;
@@ -192,21 +193,32 @@ pub fn analyze_package_with_timings(
 /// file is opened without following links, so concurrent path replacement
 /// cannot redirect the scan outside that root.
 pub fn analyze_package_from_open_dir(package_dir: &cap_std::fs::Dir) -> PackageAnalysis {
-    let mut source_files = Vec::new();
+    analyze_package_from_open_dir_with_fingerprint(package_dir).0
+}
+
+/// Analyze a descriptor-rooted package and fingerprint the exact bytes used.
+///
+/// The fingerprint is unavailable when discovery or any selected input read
+/// fails. The returned partial analysis remains usable for the current
+/// command, but callers must not persist it for later reuse.
+pub fn analyze_package_from_open_dir_with_fingerprint(
+    package_dir: &cap_std::fs::Dir,
+) -> (PackageAnalysis, Option<String>) {
+    let mut source_files = CapSourceFiles::new();
     let mut discovery_limit_reached = false;
-    collect_cap_source_files(
+    let discovery_complete = collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
         &mut source_files,
         &mut discovery_limit_reached,
-    );
-    source_files.sort_unstable();
-    let mut file_result = if source_files.len() >= 20 {
-        analyze_cap_files_parallel(package_dir, &source_files)
-    } else {
-        analyze_cap_files_sequential(package_dir, &source_files)
-    };
-    file_result.meta.limit_reached |= discovery_limit_reached;
+    )
+    .is_ok();
+    let source_files = source_files.into_sorted_vec();
+    let (source_files, prefix_limit_reached) = cap_scan_prefix(&source_files);
+    let (mut file_result, mut fingerprint, runtime_limit_reached) =
+        analyze_cap_files_with_fingerprint(package_dir, source_files, discovery_complete);
+    file_result.meta.limit_reached |=
+        discovery_limit_reached || prefix_limit_reached || runtime_limit_reached;
     let mut supply_chain_tags = file_result.supply_chain;
     if file_result.meta.files_scanned > 0 {
         supply_chain_tags.trivial =
@@ -218,41 +230,124 @@ pub fn analyze_package_from_open_dir(package_dir: &cap_std::fs::Dir) -> PackageA
     let mut meta = file_result.meta;
     meta.url_domains = url_domains;
 
-    let manifest_tags = analyze_package_manifest_from_open_dir(package_dir);
-    PackageAnalysis {
+    let manifest_tags = match read_package_manifest_from_open_dir(package_dir) {
+        Ok(Some((size, content))) => {
+            if let Some(hasher) = fingerprint.as_mut() {
+                hash_fingerprint_record_digest(
+                    hasher,
+                    b"package.json",
+                    size,
+                    content.len() as u64,
+                    Sha256::digest(&content).into(),
+                );
+            }
+            analyze_package_manifest_bytes(&content)
+        }
+        Ok(None) => {
+            if let Some(hasher) = fingerprint.as_mut() {
+                hasher.update(b"package.json\0missing\0");
+            }
+            ManifestTags::default()
+        }
+        Err(_) => {
+            fingerprint = None;
+            ManifestTags::default()
+        }
+    };
+    let analysis = PackageAnalysis {
         version: SCHEMA_VERSION,
         analyzed_at: chrono::Utc::now().to_rfc3339(),
         source: file_result.source,
         supply_chain: supply_chain_tags,
         manifest: manifest_tags,
         meta,
-    }
+    };
+    let fingerprint = fingerprint.map(|mut hasher| {
+        hasher.update(b"limits\0");
+        hasher.update([u8::from(
+            discovery_limit_reached || prefix_limit_reached || runtime_limit_reached,
+        )]);
+        format!("sha256-{:x}", hasher.finalize())
+    });
+    (analysis, fingerprint)
 }
 
-fn collect_cap_source_files(
+/// Hash the exact package inputs that can affect behavioral analysis.
+///
+/// The walk uses the same path, file-count, file-size, and total-byte policy as
+/// [`analyze_package_from_open_dir`]. Symlinks and ignored paths do not
+/// participate because the analyzer does not read them. Any unexpected I/O
+/// error prevents cache reuse instead of authenticating a partial snapshot.
+pub fn package_input_fingerprint_from_open_dir(
+    package_dir: &cap_std::fs::Dir,
+) -> std::io::Result<String> {
+    let mut files = CapSourceFiles::new();
+    let mut discovery_limit_reached = false;
+    collect_cap_fingerprint_files(
+        package_dir,
+        Path::new(""),
+        &mut files,
+        &mut discovery_limit_reached,
+    )?;
+    let files = files.into_sorted_vec();
+    let (files, total_limit_reached) = cap_scan_prefix(&files);
+
+    let mut hasher = new_fingerprint_hasher();
+    let mut planned_bytes = 0u64;
+    let mut runtime_limit_reached = false;
+    for source_file in files {
+        let (file, size) = open_cap_source_file(package_dir, &source_file.path)?;
+        let file_bytes = planned_scan_bytes(size);
+        if planned_bytes.saturating_add(file_bytes) > MAX_TOTAL_SCAN_BYTES {
+            runtime_limit_reached = true;
+            break;
+        }
+        planned_bytes += file_bytes;
+        let (bytes_read, content_digest) = digest_cap_source_file(file, size)?;
+        hash_fingerprint_record_digest(
+            &mut hasher,
+            source_file.path.as_os_str().as_encoded_bytes(),
+            size,
+            bytes_read,
+            content_digest,
+        );
+    }
+
+    match digest_package_manifest_from_open_dir(package_dir)? {
+        Some((size, bytes_read, digest)) => {
+            hash_fingerprint_record_digest(&mut hasher, b"package.json", size, bytes_read, digest)
+        }
+        None => hasher.update(b"package.json\0missing\0"),
+    }
+
+    hasher.update(b"limits\0");
+    hasher.update([u8::from(
+        discovery_limit_reached || total_limit_reached || runtime_limit_reached,
+    )]);
+
+    Ok(format!("sha256-{:x}", hasher.finalize()))
+}
+
+fn new_fingerprint_hasher() -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-behavioral-input-v2\0");
+    hasher.update(SCHEMA_VERSION.to_le_bytes());
+    hasher
+}
+
+fn collect_cap_fingerprint_files(
     directory: &cap_std::fs::Dir,
     relative_dir: &Path,
-    files: &mut Vec<std::path::PathBuf>,
+    files: &mut CapSourceFiles,
     limit_reached: &mut bool,
-) {
+) -> std::io::Result<()> {
     use cap_fs_ext::DirExt as _;
 
-    let Ok(entries) = directory.entries() else {
-        return;
-    };
-    for entry in entries {
-        if files.len() >= MAX_FILES_PER_PACKAGE {
-            *limit_reached = true;
-            return;
-        }
-        let Ok(entry) = entry else {
-            continue;
-        };
+    for entry in directory.entries()? {
+        let entry = entry?;
         let name = entry.file_name();
         let relative = relative_dir.join(&name);
-        let Ok(metadata) = directory.symlink_metadata(&name) else {
-            continue;
-        };
+        let metadata = directory.symlink_metadata(&name)?;
         if metadata.is_symlink() {
             continue;
         }
@@ -260,39 +355,109 @@ fn collect_cap_source_files(
             if !PackageAnalyzer::should_scan_directory(&relative) {
                 continue;
             }
-            let Ok(child) = directory.open_dir_nofollow(&name) else {
-                continue;
-            };
-            collect_cap_source_files(&child, &relative, files, limit_reached);
+            let child = directory.open_dir_nofollow(&name)?;
+            collect_cap_fingerprint_files(&child, &relative, files, limit_reached)?;
         } else if metadata.is_file() && PackageAnalyzer::should_scan(&relative, metadata.len()) {
-            files.push(relative);
+            let candidate = CapSourceFile {
+                path: relative,
+                size: metadata.len(),
+            };
+            *limit_reached |= files.insert(candidate);
+        }
+    }
+    Ok(())
+}
+
+fn hash_fingerprint_record_digest(
+    hasher: &mut Sha256,
+    path: &[u8],
+    size: u64,
+    bytes_read: u64,
+    content_digest: [u8; 32],
+) {
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path);
+    hasher.update(size.to_le_bytes());
+    hasher.update(bytes_read.to_le_bytes());
+    hasher.update(content_digest);
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CapSourceFile {
+    path: std::path::PathBuf,
+    size: u64,
+}
+
+enum CapSourceFiles {
+    Collecting(Vec<CapSourceFile>),
+    Limited(BinaryHeap<CapSourceFile>),
+}
+
+impl CapSourceFiles {
+    fn new() -> Self {
+        Self::Collecting(Vec::new())
+    }
+
+    fn insert(&mut self, candidate: CapSourceFile) -> bool {
+        match self {
+            Self::Collecting(files) if files.len() < MAX_FILES_PER_PACKAGE => {
+                files.push(candidate);
+                false
+            }
+            Self::Collecting(files) => {
+                let mut collected = std::mem::take(files);
+                collected.shrink_to_fit();
+                let mut limited = BinaryHeap::from(collected);
+                if limited.peek().is_some_and(|largest| candidate < *largest) {
+                    limited.pop();
+                    limited.push(candidate);
+                }
+                *self = Self::Limited(limited);
+                true
+            }
+            Self::Limited(files) => {
+                if files.peek().is_some_and(|largest| candidate < *largest) {
+                    files.pop();
+                    files.push(candidate);
+                }
+                true
+            }
+        }
+    }
+
+    fn into_sorted_vec(self) -> Vec<CapSourceFile> {
+        match self {
+            Self::Collecting(mut files) => {
+                files.sort_unstable();
+                files
+            }
+            Self::Limited(files) => files.into_sorted_vec(),
         }
     }
 }
 
-fn analyze_cap_single_file(
-    package_dir: &cap_std::fs::Dir,
-    relative_path: &Path,
-    comment_buf: &mut Vec<u8>,
-) -> Option<FileAnalysisResult> {
-    let (file, size) = open_cap_source_file(package_dir, relative_path).ok()?;
-    let filename = relative_path.file_name()?.to_str()?;
-    if size > MAX_FILE_SIZE {
-        let mut file = file.into_std();
-        let sample =
-            read_oversized_source_sample_from_open_file(&mut file, size).unwrap_or_default();
-        return Some(analyze_oversized_source_sample(
-            relative_path,
-            size,
-            &sample,
-            comment_buf,
-        ));
+fn cap_scan_prefix(files: &[CapSourceFile]) -> (&[CapSourceFile], bool) {
+    let mut planned_bytes = 0u64;
+    for (index, file) in files.iter().enumerate() {
+        let file_bytes = planned_scan_bytes(file.size);
+        if planned_bytes.saturating_add(file_bytes) > MAX_TOTAL_SCAN_BYTES {
+            return (&files[..index], true);
+        }
+        planned_bytes += file_bytes;
     }
-    let bytes =
-        lpm_common::read_file_capped_from_open_file(file.into_std(), relative_path, MAX_FILE_SIZE)
-            .ok()?
-            .0;
-    Some(analyze_bytes_with_scratch(filename, &bytes, comment_buf))
+    (files, false)
+}
+
+fn planned_scan_bytes(size: u64) -> u64 {
+    if size <= MAX_FILE_SIZE {
+        return size;
+    }
+    let chunk = (OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES as u64).min(size);
+    if size.saturating_sub(chunk) > chunk {
+        chunk.saturating_mul(2).saturating_add(1)
+    } else {
+        chunk
+    }
 }
 
 fn open_cap_source_file(
@@ -337,98 +502,253 @@ fn open_cap_source_file(
     Ok((file, metadata.len()))
 }
 
-fn analyze_cap_files_sequential(
-    package_dir: &cap_std::fs::Dir,
-    files: &[std::path::PathBuf],
-) -> AccumulatedResult {
-    let mut source_tags = SourceTags::default();
-    let mut supply_chain_tags = SupplyChainTags::default();
-    let mut meta = AnalysisMeta::default();
-    let mut all_url_domains = Vec::new();
-    let mut total_code_lines = 0usize;
-    let mut total_export_count = 0usize;
-    let mut comment_buf = Vec::new();
-
-    for relative_path in files {
-        if let Some(result) = analyze_cap_single_file(package_dir, relative_path, &mut comment_buf)
-        {
-            if meta.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
-                meta.limit_reached = true;
-                break;
-            }
-            accumulate_result(
-                &mut source_tags,
-                &mut supply_chain_tags,
-                &mut all_url_domains,
-                &mut total_code_lines,
-                &mut total_export_count,
-                &mut meta,
-                result,
-            );
-        }
-    }
-    AccumulatedResult {
-        source: source_tags,
-        supply_chain: supply_chain_tags,
-        url_domains: all_url_domains,
-        total_code_lines,
-        total_export_count,
-        meta,
-    }
+struct OpenCapSourceFile {
+    path: std::path::PathBuf,
+    file: cap_std::fs::File,
+    size: u64,
 }
 
-fn analyze_cap_files_parallel(
-    package_dir: &cap_std::fs::Dir,
-    files: &[std::path::PathBuf],
-) -> AccumulatedResult {
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+struct ScannedCapSourceFile {
+    path: std::path::PathBuf,
+    size: u64,
+    bytes_read: u64,
+    content_digest: [u8; 32],
+    analysis: Option<FileAnalysisResult>,
+}
 
-    let files_scanned = AtomicUsize::new(0);
-    let bytes_scanned = AtomicU64::new(0);
-    let results: Vec<FileAnalysisResult> = files
-        .par_iter()
-        .map_init(Vec::new, |comment_buf, relative_path| {
-            if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
-                || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES
-            {
-                return None;
+fn analyze_open_cap_source_file(
+    source_file: OpenCapSourceFile,
+    comment_buf: &mut Vec<u8>,
+) -> std::io::Result<ScannedCapSourceFile> {
+    let mut file = source_file.file.into_std();
+    let bytes = if source_file.size > MAX_FILE_SIZE {
+        read_oversized_source_sample_from_open_file(&mut file, source_file.size)?
+    } else {
+        lpm_common::read_file_capped_from_open_file(file, &source_file.path, MAX_FILE_SIZE)
+            .map_err(std::io::Error::other)?
+            .0
+    };
+    let analysis = source_file
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|filename| {
+            if source_file.size > MAX_FILE_SIZE {
+                analyze_oversized_source_sample(
+                    &source_file.path,
+                    source_file.size,
+                    &bytes,
+                    comment_buf,
+                )
+            } else {
+                analyze_bytes_with_scratch(filename, &bytes, comment_buf)
             }
-            let result = analyze_cap_single_file(package_dir, relative_path, comment_buf)?;
-            files_scanned.fetch_add(result.files_scanned, Ordering::Relaxed);
-            bytes_scanned.fetch_add(result.bytes_scanned, Ordering::Relaxed);
-            Some(result)
-        })
-        .filter_map(|result| result)
-        .collect();
+        });
+    Ok(ScannedCapSourceFile {
+        path: source_file.path,
+        size: source_file.size,
+        bytes_read: bytes.len() as u64,
+        content_digest: Sha256::digest(&bytes).into(),
+        analysis,
+    })
+}
+
+fn analyze_cap_files_with_fingerprint(
+    package_dir: &cap_std::fs::Dir,
+    files: &[CapSourceFile],
+    fingerprint_valid: bool,
+) -> (AccumulatedResult, Option<Sha256>, bool) {
+    use rayon::prelude::*;
 
     let mut source_tags = SourceTags::default();
     let mut supply_chain_tags = SupplyChainTags::default();
+    let mut meta = AnalysisMeta::default();
     let mut all_url_domains = Vec::new();
     let mut total_code_lines = 0usize;
     let mut total_export_count = 0usize;
-    let mut meta = AnalysisMeta::default();
-    for result in results {
-        accumulate_result(
-            &mut source_tags,
-            &mut supply_chain_tags,
-            &mut all_url_domains,
-            &mut total_code_lines,
-            &mut total_export_count,
-            &mut meta,
-            result,
-        );
+    let mut fingerprint = fingerprint_valid.then(new_fingerprint_hasher);
+    let mut planned_bytes = 0u64;
+    let mut actual_bytes = 0u64;
+    let mut runtime_limit_reached = false;
+    let batch_size = if files.len() >= 20 {
+        rayon::current_num_threads()
+            .saturating_mul(2)
+            .clamp(20, 128)
+    } else {
+        files.len().max(1)
+    };
+
+    'batches: for batch in files.chunks(batch_size) {
+        let mut opened = Vec::with_capacity(batch.len());
+        for source_file in batch {
+            let (file, size) = match open_cap_source_file(package_dir, &source_file.path) {
+                Ok(opened) => opened,
+                Err(_) => {
+                    fingerprint = None;
+                    continue;
+                }
+            };
+            let file_bytes = planned_scan_bytes(size);
+            if planned_bytes.saturating_add(file_bytes) > MAX_TOTAL_SCAN_BYTES {
+                runtime_limit_reached = true;
+                break;
+            }
+            planned_bytes += file_bytes;
+            opened.push(OpenCapSourceFile {
+                path: source_file.path.clone(),
+                file,
+                size,
+            });
+        }
+
+        let results: Vec<std::io::Result<ScannedCapSourceFile>> = if opened.len() >= 20 {
+            opened
+                .into_par_iter()
+                .map_init(Vec::new, |comment_buf, source_file| {
+                    analyze_open_cap_source_file(source_file, comment_buf)
+                })
+                .collect()
+        } else {
+            let mut comment_buf = Vec::new();
+            opened
+                .into_iter()
+                .map(|source_file| analyze_open_cap_source_file(source_file, &mut comment_buf))
+                .collect()
+        };
+
+        for scanned in results {
+            let scanned = match scanned {
+                Ok(scanned) => scanned,
+                Err(_) => {
+                    fingerprint = None;
+                    continue;
+                }
+            };
+            if actual_bytes.saturating_add(scanned.bytes_read) > MAX_TOTAL_SCAN_BYTES {
+                runtime_limit_reached = true;
+                break 'batches;
+            }
+            actual_bytes += scanned.bytes_read;
+            if let Some(hasher) = fingerprint.as_mut() {
+                hash_fingerprint_record_digest(
+                    hasher,
+                    scanned.path.as_os_str().as_encoded_bytes(),
+                    scanned.size,
+                    scanned.bytes_read,
+                    scanned.content_digest,
+                );
+            }
+            if let Some(result) = scanned.analysis {
+                accumulate_result(
+                    &mut source_tags,
+                    &mut supply_chain_tags,
+                    &mut all_url_domains,
+                    &mut total_code_lines,
+                    &mut total_export_count,
+                    &mut meta,
+                    result,
+                );
+            }
+        }
+        if runtime_limit_reached {
+            break;
+        }
     }
-    meta.limit_reached |= files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
-        || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES;
-    AccumulatedResult {
-        source: source_tags,
-        supply_chain: supply_chain_tags,
-        url_domains: all_url_domains,
-        total_code_lines,
-        total_export_count,
-        meta,
+    meta.limit_reached |= runtime_limit_reached;
+    (
+        AccumulatedResult {
+            source: source_tags,
+            supply_chain: supply_chain_tags,
+            url_domains: all_url_domains,
+            total_code_lines,
+            total_export_count,
+            meta,
+        },
+        fingerprint,
+        runtime_limit_reached,
+    )
+}
+
+fn digest_cap_source_file(file: cap_std::fs::File, size: u64) -> std::io::Result<(u64, [u8; 32])> {
+    if size > MAX_FILE_SIZE {
+        let mut file = file.into_std();
+        let sample = read_oversized_source_sample_from_open_file(&mut file, size)?;
+        return Ok((sample.len() as u64, Sha256::digest(&sample).into()));
     }
+
+    let mut file = file.into_std().take(MAX_FILE_SIZE.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes_read = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        if bytes_read > MAX_FILE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source file grew beyond the scan limit while fingerprinting",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((bytes_read, hasher.finalize().into()))
+}
+
+fn digest_package_manifest_from_open_dir(
+    package_dir: &cap_std::fs::Dir,
+) -> std::io::Result<Option<(u64, u64, [u8; 32])>> {
+    let (file, size) = match open_cap_source_file(package_dir, Path::new("package.json")) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let limit = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES;
+    if size > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "package.json exceeds the configuration file size limit",
+        ));
+    }
+    let mut file = file.into_std().take(limit.saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes_read = 0u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        if bytes_read > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "package.json grew beyond the configuration file size limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Some((size, bytes_read, hasher.finalize().into())))
+}
+
+fn read_package_manifest_from_open_dir(
+    package_dir: &cap_std::fs::Dir,
+) -> std::io::Result<Option<(u64, Vec<u8>)>> {
+    let (file, size) = match open_cap_source_file(package_dir, Path::new("package.json")) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let content = lpm_common::read_file_capped_from_open_file(
+        file.into_std(),
+        Path::new("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(std::io::Error::other)?
+    .0;
+    Ok(Some((size, content)))
 }
 
 /// Intermediate result from scanning a single file. Public so the
@@ -910,21 +1230,10 @@ fn analyze_package_manifest(package_dir: &Path) -> ManifestTags {
     analyze_package_manifest_content(&content)
 }
 
-fn analyze_package_manifest_from_open_dir(package_dir: &cap_std::fs::Dir) -> ManifestTags {
-    let Ok((file, _)) = open_cap_source_file(package_dir, Path::new("package.json")) else {
-        return ManifestTags::default();
-    };
-    let Ok((content, _)) = lpm_common::read_file_capped_from_open_file(
-        file.into_std(),
-        Path::new("package.json"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) else {
-        return ManifestTags::default();
-    };
-    let Ok(content) = std::str::from_utf8(&content) else {
-        return ManifestTags::default();
-    };
-    analyze_package_manifest_content(content)
+fn analyze_package_manifest_bytes(content: &[u8]) -> ManifestTags {
+    std::str::from_utf8(content)
+        .map(analyze_package_manifest_content)
+        .unwrap_or_default()
 }
 
 fn analyze_package_manifest_content(content: &str) -> ManifestTags {
@@ -1221,10 +1530,10 @@ pub fn read_cached_analysis(package_dir: &Path) -> Option<PackageAnalysis> {
         lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()??;
     let analysis: PackageAnalysis = serde_json::from_slice(&content).ok()?;
 
-    // Check schema version — re-analyze if outdated
-    if analysis.version < SCHEMA_VERSION {
+    // Check schema version — re-analyze unless semantics match exactly.
+    if analysis.version != SCHEMA_VERSION {
         tracing::debug!(
-            "cached analysis version {} < current {SCHEMA_VERSION}, needs re-analysis",
+            "cached analysis version {} != current {SCHEMA_VERSION}, needs re-analysis",
             analysis.version
         );
         return None;
@@ -1439,6 +1748,100 @@ mod tests {
         capability_json["analyzedAt"] = serde_json::Value::Null;
 
         assert_eq!(capability_json, path_json);
+    }
+
+    #[test]
+    fn fused_capability_analysis_fingerprints_the_bytes_it_analyzes() {
+        let package = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"fused","version":"1.0.0","license":"MIT"}"#,
+                ),
+                ("index.js", "eval('same bytes');\n"),
+                ("ignored.txt", "this file does not affect analysis"),
+            ],
+        );
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let (analysis, fused_fingerprint) =
+            analyze_package_from_open_dir_with_fingerprint(&directory);
+        let standalone_fingerprint = package_input_fingerprint_from_open_dir(&directory).unwrap();
+
+        assert!(analysis.source.eval);
+        assert_eq!(
+            fused_fingerprint.as_deref(),
+            Some(standalone_fingerprint.as_str())
+        );
+
+        fs::write(package.path().join("index.js"), "module.exports = 1;\n").unwrap();
+        assert_ne!(
+            package_input_fingerprint_from_open_dir(&directory).unwrap(),
+            standalone_fingerprint
+        );
+    }
+
+    #[test]
+    fn warm_fingerprint_rejects_a_manifest_larger_than_the_configuration_cap() {
+        let package = tempfile::tempdir().unwrap();
+        let manifest = std::fs::File::create(package.path().join("package.json")).unwrap();
+        manifest
+            .set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let error = package_input_fingerprint_from_open_dir(&directory).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn capability_scan_prefix_is_deterministic_at_the_package_byte_limit() {
+        let files = (0..30)
+            .map(|index| CapSourceFile {
+                path: format!("source-{index:02}.js").into(),
+                size: MAX_FILE_SIZE,
+            })
+            .collect::<Vec<_>>();
+
+        let (selected, limit_reached) = cap_scan_prefix(&files);
+
+        assert!(limit_reached);
+        assert_eq!(selected.len(), 25);
+        assert_eq!(selected[0].path, Path::new("source-00.js"));
+        assert_eq!(selected[24].path, Path::new("source-24.js"));
+    }
+
+    #[test]
+    fn capability_file_limit_selects_lexicographically_first_paths() {
+        let package = tempfile::tempdir().unwrap();
+        for index in (0..=MAX_FILES_PER_PACKAGE).rev() {
+            fs::write(
+                package.path().join(format!("source-{index:05}.js")),
+                "module.exports = 1;\n",
+            )
+            .unwrap();
+        }
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+        let mut files = CapSourceFiles::new();
+        let mut limit_reached = false;
+
+        collect_cap_fingerprint_files(&directory, Path::new(""), &mut files, &mut limit_reached)
+            .unwrap();
+        let files = files.into_sorted_vec();
+
+        assert!(limit_reached);
+        assert_eq!(files.len(), MAX_FILES_PER_PACKAGE);
+        assert_eq!(files.first().unwrap().path, Path::new("source-00000.js"));
+        assert_eq!(files.last().unwrap().path, Path::new("source-04999.js"));
     }
 
     #[cfg(unix)]
@@ -1760,6 +2163,17 @@ mod tests {
 			r#"{"version":1,"analyzedAt":"2026-01-01T00:00:00Z","source":{},"supplyChain":{},"manifest":{},"meta":{}}"#,
 		)
 		.unwrap();
+
+        assert!(read_cached_analysis(dir.path()).is_none());
+    }
+
+    #[test]
+    fn cache_future_version_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".lpm-security.json");
+        let mut analysis = analyze_package(dir.path());
+        analysis.version = SCHEMA_VERSION + 1;
+        fs::write(&path, serde_json::to_vec(&analysis).unwrap()).unwrap();
 
         assert!(read_cached_analysis(dir.path()).is_none());
     }

@@ -25,6 +25,8 @@ expression: envelope
     {
       "name": "snap-pkg",
       "version": "1.0.0",
+      "instance_id": "[INSTANCE_ID]",
+      "path": "[PACKAGE_PATH]",
       "quality_score": null,
       "issues": [
         {
