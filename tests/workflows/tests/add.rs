@@ -29,7 +29,8 @@ mod support;
 use serde_json::json;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{
-    TempProject, lpm_with_registry, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
+    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm_spawnable_with_registry, lpm_with_registry,
+    wait_for_lock_contention, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
 
 /// Assemble a source-package tarball: `lpm.config.json` at the root
@@ -143,6 +144,53 @@ async fn mount_release_age_source_dependency(mock: &MockRegistry) {
         &[("1.0.0", mature_tarball), ("1.1.0", fresh_tarball)],
     )
     .await;
+}
+
+#[tokio::test]
+async fn add_rewrites_imports_relative_to_the_detected_alias_mapping_base() {
+    let mock = MockRegistry::start().await;
+    let package = "mapped-buyer-alias-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "importAlias": "@/",
+            "files": [{"src": "Button.ts"}, {"src": "util.ts"}]
+        }),
+        &[
+            (
+                "Button.ts",
+                b"import { util } from '@/util';\nexport { util };\n",
+            ),
+            ("util.ts", b"export const util = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "src/components",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    assert!(
+        project
+            .read_file("src/components/Button.ts")
+            .contains("from '@/components/util'")
+    );
 }
 
 // ─── Test 1: happy path ─────────────────────────────────────────────
@@ -803,6 +851,10 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
         !project.file_exists("components/Baz.tsx"),
         "source file copied during the failed run must be deleted on rollback"
     );
+    assert!(
+        !project.path().join("components").exists(),
+        "failed add must remove directories it created"
+    );
 }
 
 // ─── security + non-interactive + npm-simple paths ───
@@ -1024,7 +1076,7 @@ async fn add_rejects_relative_dotdot_dest_and_creates_no_external_directory() {
     let entries_after = snapshot_dir_entries(project.path());
     let unexpected: Vec<_> = entries_after
         .difference(&entries_before)
-        .filter(|n| n.as_str() != "src")
+        .filter(|n| !matches!(n.as_str(), "src" | ".lpm"))
         .collect();
     assert!(
         unexpected.is_empty(),
@@ -1337,4 +1389,1510 @@ async fn add_simple_npm_pkg_json_envelope_includes_external_imports_and_npm_name
         !externals.contains(&"./utils"),
         "relative imports must not appear in external_imports; got {externals:?}"
     );
+}
+
+#[tokio::test]
+async fn add_rejects_source_selector_that_escapes_extraction() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_source_pkg_tarball(
+        "source-selector-escape",
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "../package.json", "dest": "stolen.json"}]
+        }),
+        &[("Safe.ts", b"export const safe = true;\n")],
+    );
+    mock.with_package("source-selector-escape", "1.0.0", &tarball)
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", "source-selector-escape", "--yes", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists("components/stolen.json"));
+}
+
+#[tokio::test]
+async fn add_rejects_package_without_integrity_metadata() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-integrity-source";
+    let tarball = make_simple_npm_tarball(package, "1.0.0");
+    let metadata = json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": package,
+                "version": "1.0.0",
+                "dist": {"tarball": mock.tarball_url(package, "1.0.0")}
+            }
+        },
+        "time": {"1.0.0": "2025-01-01T00:00:00.000Z"}
+    });
+    mock.with_package_metadata(package, "1.0.0", &tarball, metadata)
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--path",
+            "src/copied",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("integrity"));
+    assert!(!project.file_exists("src/copied/index.js"));
+}
+
+#[tokio::test]
+async fn add_rejects_target_path_outside_project() {
+    let mock = MockRegistry::start().await;
+    let package = "outside-target-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Safe.ts"}]}),
+        &[("Safe.ts", b"export const safe = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let outside_name = format!(
+        "outside-target-source-{}",
+        project.path().file_name().unwrap().to_string_lossy()
+    );
+    let outside = project.path().parent().unwrap().join(&outside_name);
+    let outside_argument = format!("../{outside_name}");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--path",
+            &outside_argument,
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!outside.exists());
+}
+
+#[tokio::test]
+async fn add_dry_run_rejects_destination_parent_reference() {
+    let mock = MockRegistry::start().await;
+    let package = "dry-run-traversal-source";
+    let tarball = make_traversal_tarball(package, "1.0.0", "../../escaped.txt");
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--dry-run",
+            "--json",
+            "--path",
+            "src/copied",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+}
+
+#[tokio::test]
+async fn add_dry_run_rejects_an_existing_file_as_the_target_directory() {
+    let mock = MockRegistry::start().await;
+    let package = "dry-run-file-target-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("occupied", "not a directory\n");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "occupied",
+            "--yes",
+            "--dry-run",
+            "--json",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(project.read_file("occupied"), "not a directory\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_dry_run_rejects_a_destination_link_outside_the_target_directory() {
+    let mock = MockRegistry::start().await;
+    let package = "dry-run-linked-parent-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Source.ts", "dest": "linked/Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join("target")).unwrap();
+    std::fs::create_dir_all(project.path().join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", project.path().join("target/linked")).unwrap();
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "target",
+            "--yes",
+            "--dry-run",
+            "--json",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .failure();
+
+    assert!(!project.file_exists("elsewhere/Source.ts"));
+}
+
+#[tokio::test]
+async fn add_dry_run_no_install_deps_reports_zero_planned_dependencies() {
+    let mock = MockRegistry::start().await;
+    let package = "dry-run-no-deps-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": ["dep@1.0.0"]}},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--dry-run",
+            "--json",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["dependencies_count"], 0);
+}
+
+#[tokio::test]
+async fn add_dry_run_simple_package_reports_no_automatic_dependencies() {
+    let mock = MockRegistry::start().await;
+    let package = "dry-run-simple-source";
+    let tarball = make_tarball_from_pkg_json(
+        json!({
+            "name": package,
+            "version": "1.0.0",
+            "dependencies": {"runtime-leaf": "1.0.0"}
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--dry-run",
+            "--json",
+            "--path",
+            "src/copied",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["dependencies_count"], 0);
+}
+
+#[tokio::test]
+async fn add_dry_run_rejects_declared_dependencies_without_project_manifest() {
+    let mock = MockRegistry::start().await;
+    let package = "dry-run-needs-manifest";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": ["runtime-leaf@1.0.0"]}},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty("");
+    std::fs::remove_file(project.path().join("package.json")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--dry-run",
+            "--json",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists("components/Source.ts"));
+}
+
+#[tokio::test]
+async fn add_json_with_declared_dependency_emits_one_document() {
+    let mock = MockRegistry::start().await;
+    let package = "json-dependency-source";
+    let dependency = "json-source-dependency";
+    let source_tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &source_tarball).await;
+    let dep_tarball =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dep_metadata = mock.package_metadata(dependency, "1.0.0", &dep_tarball);
+    mock.with_package(dependency, "1.0.0", &dep_tarball).await;
+    mock.with_batch_metadata(vec![dep_metadata]).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--json",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("stdout must contain one JSON document: {error}"));
+    assert_eq!(json["dependencies_installed"], 1);
+}
+
+#[tokio::test]
+async fn add_noninteractive_required_config_without_default_fails() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-required-config-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"variant": {"type": "string", "required": true}},
+            "files": [{"src": "Source.ts", "include": "when", "condition": {"variant": "a"}}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--json", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("variant"),
+        "unexpected output: {combined}"
+    );
+    assert!(!project.file_exists("components/Source.ts"));
+}
+
+#[tokio::test]
+async fn add_rejects_inline_config_values_outside_the_package_schema_before_mutation() {
+    let mock = MockRegistry::start().await;
+    let package = "invalid-inline-config-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {
+                "enabled": {"type": "boolean"},
+                "variant": {"type": "select", "options": ["a", "b"]},
+                "features": {"type": "select", "multiSelect": true, "options": ["x", "y"]}
+            },
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+
+    for query in [
+        "enabled=maybe",
+        "variant=unknown",
+        "features=x,unknown",
+        "undeclared=value",
+    ] {
+        let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                &format!("{package}?{query}"),
+                "--yes",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .failure();
+        assert!(!project.file_exists("components/Source.ts"));
+        assert!(!project.file_exists(".lpm/added-sources.json"));
+    }
+}
+
+#[tokio::test]
+async fn add_noninteractive_optional_defaults_select_only_the_authored_outputs() {
+    let mock = MockRegistry::start().await;
+    let package = "optional-default-config-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {
+                "variant": {"type": "select", "required": false, "options": ["a", "b"], "default": "a"}
+            },
+            "files": [
+                {"src": "A.ts", "include": "when", "condition": {"variant": "a"}},
+                {"src": "B.ts", "include": "when", "condition": {"variant": "b"}}
+            ]
+        }),
+        &[
+            ("A.ts", b"export const variant = 'a';\n"),
+            ("B.ts", b"export const variant = 'b';\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-install-deps", "--no-skills"])
+        .assert()
+        .success();
+
+    assert!(project.file_exists("components/A.ts"));
+    assert!(!project.file_exists("components/B.ts"));
+}
+
+#[tokio::test]
+async fn add_top_level_package_respects_minimum_release_age() {
+    let mock = MockRegistry::start().await;
+    let package = "release-age-top-level-source";
+    let mature = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Version.ts"}]}),
+        &[("Version.ts", b"export const version = 'mature';\n")],
+    );
+    let fresh = make_source_pkg_tarball(
+        package,
+        "1.1.0",
+        json!({"ecosystem": "js", "files": [{"src": "Version.ts"}]}),
+        &[("Version.ts", b"export const version = 'fresh';\n")],
+    );
+    let metadata = json!({
+        "name": package,
+        "dist-tags": {"latest": "1.1.0"},
+        "versions": {
+            "1.0.0": {"name": package, "version": "1.0.0", "dist": {"tarball": mock.tarball_url(package, "1.0.0"), "integrity": compute_integrity(&mature)}},
+            "1.1.0": {"name": package, "version": "1.1.0", "dist": {"tarball": mock.tarball_url(package, "1.1.0"), "integrity": compute_integrity(&fresh)}}
+        },
+        "time": {
+            "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+            "1.1.0": iso8601_n_secs_ago(3_600)
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[("1.0.0", mature), ("1.1.0", fresh)],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","lpm":{"minimumReleaseAge":86400}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        project.read_file("components/Version.ts"),
+        "export const version = 'mature';\n"
+    );
+}
+
+#[tokio::test]
+async fn add_does_not_duplicate_dependency_declared_in_dev_dependencies() {
+    let mock = MockRegistry::start().await;
+    let package = "cross-section-source";
+    let dependency = "cross-section-dependency";
+    let source_tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &source_tarball).await;
+    let dep_tarball =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dep_metadata = mock.package_metadata(dependency, "1.0.0", &dep_tarball);
+    mock.with_package(dependency, "1.0.0", &dep_tarball).await;
+    mock.with_batch_metadata(vec![dep_metadata]).await;
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"host","version":"1.0.0","dependencies":{{}},"devDependencies":{{"{dependency}":"1.0.0"}}}}"#
+    ));
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-skills", "--no-editor-setup"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(manifest["dependencies"].get(dependency).is_none());
+    assert_eq!(manifest["devDependencies"][dependency], "1.0.0");
+}
+
+#[tokio::test]
+async fn add_package_skill_fetch_failure_is_nonfatal_and_json_stays_valid() {
+    let mock = MockRegistry::start().await;
+    let package = "@lpm.dev/owner.widget";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Widget.ts"}]}),
+        &[("Widget.ts", b"export const widget = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    mock.with_package_skills_error_for_version("owner.widget", "1.0.0", 500)
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["success"], true);
+    assert!(
+        json["warnings"]
+            .as_array()
+            .is_some_and(|warnings| !warnings.is_empty())
+    );
+    assert!(project.file_exists("components/Widget.ts"));
+}
+
+#[tokio::test]
+async fn add_records_installed_digest_and_original_backup_for_forced_overwrite() {
+    use sha2::{Digest, Sha256};
+
+    let mock = MockRegistry::start().await;
+    let package = "overwrite-provenance-source";
+    let installed = b"export const value = 'installed';\n";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", installed)],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("components/Source.ts", "original project bytes\n");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let file = &state["packages"][package]["files"]["components/Source.ts"];
+    assert_eq!(state["schema_version"], 2);
+    assert_eq!(file["action"], "overwrite");
+    assert_eq!(
+        file["installed_digest"],
+        format!("sha256-{}", hex::encode(Sha256::digest(installed)))
+    );
+    let backup_path = file["backup_path"].as_str().expect("overwrite backup path");
+    assert_eq!(project.read_file(backup_path), "original project bytes\n");
+    assert_eq!(
+        file["backup_digest"],
+        format!(
+            "sha256-{}",
+            hex::encode(Sha256::digest(b"original project bytes\n"))
+        )
+    );
+}
+
+#[tokio::test]
+async fn add_repeat_after_installed_file_deletion_preserves_original_backup() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-repeat-overwrite-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const installed = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("components/Source.ts", "original project bytes\n");
+
+    for run in 0..2 {
+        if run == 1 {
+            std::fs::remove_file(project.path().join("components/Source.ts")).unwrap();
+        }
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                package,
+                "--yes",
+                "--force",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+    }
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let file = &state["packages"][package]["files"]["components/Source.ts"];
+    assert_eq!(file["action"], "overwrite");
+    let backup_path = file["backup_path"].as_str().expect("overwrite backup path");
+    assert_eq!(project.read_file(backup_path), "original project bytes\n");
+}
+
+#[tokio::test]
+async fn add_new_version_replaces_unchanged_created_and_overwritten_outputs() {
+    let mock = MockRegistry::start().await;
+    let package = "managed-output-update-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const version = 1;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const version = 2;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let created_project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let overwritten_project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    overwritten_project.write_file("components/Source.ts", "original project bytes\n");
+
+    lpm_with_registry(&created_project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    lpm_with_registry(&overwritten_project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    for project in [&created_project, &overwritten_project] {
+        lpm_with_registry(project, &mock.url())
+            .args([
+                "add",
+                &format!("{package}@2.0.0"),
+                "--yes",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+        assert_eq!(
+            project.read_file("components/Source.ts"),
+            "export const version = 2;\n"
+        );
+    }
+
+    let overwritten_state: serde_json::Value =
+        serde_json::from_str(&overwritten_project.read_file(".lpm/added-sources.json")).unwrap();
+    let overwritten_file = &overwritten_state["packages"][package]["files"]["components/Source.ts"];
+    assert_eq!(overwritten_file["action"], "overwrite");
+    let backup_path = overwritten_file["backup_path"]
+        .as_str()
+        .expect("overwrite backup path");
+    assert_eq!(
+        overwritten_project.read_file(backup_path),
+        "original project bytes\n"
+    );
+}
+
+#[tokio::test]
+async fn add_new_version_restores_original_when_a_dropped_overwrite_is_missing() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-dropped-overwrite-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Old.ts"}]}),
+        &[("Old.ts", b"export const installed = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "New.ts"}]}),
+        &[("New.ts", b"export const next = true;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("components/Old.ts", "original project bytes\n");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let first_state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let backup_path = first_state["packages"][package]["files"]["components/Old.ts"]["backup_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(project.path().join("components/Old.ts")).unwrap();
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@2.0.0"),
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        project.read_file("components/Old.ts"),
+        "original project bytes\n"
+    );
+    assert!(!project.file_exists(&backup_path));
+    let final_state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert!(
+        final_state["packages"][package]["files"]
+            .get("components/Old.ts")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn add_rejects_a_tampered_backup_before_restoring_a_dropped_overwrite() {
+    let mock = MockRegistry::start().await;
+    let package = "tampered-backup-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Old.ts"}]}),
+        &[("Old.ts", b"export const installed = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "New.ts"}]}),
+        &[("New.ts", b"export const next = true;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("components/Old.ts", "original project bytes\n");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let backup_path = state["packages"][package]["files"]["components/Old.ts"]["backup_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    project.write_file(&backup_path, "tampered backup bytes\n");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@2.0.0"),
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("backup integrity"));
+
+    assert_eq!(
+        project.read_file("components/Old.ts"),
+        "export const installed = true;\n"
+    );
+    assert_eq!(project.read_file(&backup_path), "tampered backup bytes\n");
+    assert!(!project.file_exists("components/New.ts"));
+}
+
+#[tokio::test]
+async fn add_new_version_removes_unchanged_outputs_dropped_by_the_package() {
+    let mock = MockRegistry::start().await;
+    let package = "versioned-output-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Old.ts"}]}),
+        &[("Old.ts", b"export const old = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "New.ts"}]}),
+        &[("New.ts", b"export const new = true;\n")],
+    );
+    let metadata = json!({
+        "name": package,
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {
+            "1.0.0": {"name": package, "version": "1.0.0", "dist": {"tarball": mock.tarball_url(package, "1.0.0"), "integrity": compute_integrity(&first)}},
+            "2.0.0": {"name": package, "version": "2.0.0", "dist": {"tarball": mock.tarball_url(package, "2.0.0"), "integrity": compute_integrity(&second)}}
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        metadata,
+        &[("1.0.0", first), ("2.0.0", second)],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    for spec in [format!("{package}@1.0.0"), format!("{package}@2.0.0")] {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", &spec, "--yes", "--no-install-deps", "--no-skills"])
+            .assert()
+            .success();
+    }
+
+    assert!(!project.file_exists("components/Old.ts"));
+    assert!(project.file_exists("components/New.ts"));
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let files = state["packages"][package]["files"].as_object().unwrap();
+    assert!(!files.contains_key("components/Old.ts"));
+    assert!(files.contains_key("components/New.ts"));
+}
+
+#[tokio::test]
+async fn add_new_version_removes_unchanged_dependency_dropped_by_the_package() {
+    let mock = MockRegistry::start().await;
+    let package = "versioned-dependency-source";
+    let dependency = "versioned-dependency-leaf";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({
+            "ecosystem": "js",
+            "dependencies": {},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    let source_metadata = mock
+        .mount_full_package_metadata_routes(
+            package,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(first)),
+                ("2.0.0", json!({}), Some(second)),
+            ],
+        )
+        .await;
+    let dependency_tarball =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dependency_metadata = mock.package_metadata(dependency, "1.0.0", &dependency_tarball);
+    mock.with_package(dependency, "1.0.0", &dependency_tarball)
+        .await;
+    mock.with_batch_metadata(vec![source_metadata, dependency_metadata])
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    for spec in [format!("{package}@1.0.0"), format!("{package}@2.0.0")] {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(manifest["dependencies"].get(dependency).is_none());
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert!(
+        state["packages"][package]["dependencies"]
+            .get(dependency)
+            .is_none()
+    );
+    assert!(!project.read_file("lpm.lock").contains(dependency));
+}
+
+#[tokio::test]
+async fn add_new_version_updates_an_unchanged_dependency_owned_by_the_package() {
+    let mock = MockRegistry::start().await;
+    let package = "updated-dependency-source";
+    let dependency = "updated-dependency-leaf";
+    let source_tarball = |version: &str, dependency_version: &str| {
+        make_source_pkg_tarball(
+            package,
+            version,
+            json!({
+                "ecosystem": "js",
+                "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+                "dependencies": {"enabled": {"true": [format!("{dependency}@{dependency_version}")] }},
+                "files": [{"src": "Source.ts"}]
+            }),
+            &[("Source.ts", b"export const source = true;\n")],
+        )
+    };
+    let first = source_tarball("1.0.0", "1.0.0");
+    let second = source_tarball("2.0.0", "2.0.0");
+    let source_metadata = json!({
+        "name": package,
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {
+            "1.0.0": {"name": package, "version": "1.0.0", "dist": {"tarball": mock.tarball_url(package, "1.0.0"), "integrity": compute_integrity(&first)}},
+            "2.0.0": {"name": package, "version": "2.0.0", "dist": {"tarball": mock.tarball_url(package, "2.0.0"), "integrity": compute_integrity(&second)}}
+        }
+    });
+    mock.with_package_metadata_and_tarballs(
+        package,
+        source_metadata.clone(),
+        &[("1.0.0", first), ("2.0.0", second)],
+    )
+    .await;
+    let dependency_v1 =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dependency_v2 =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "2.0.0"}), &[]);
+    let dependency_metadata = mock
+        .mount_full_package_metadata_routes(
+            dependency,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(dependency_v1)),
+                ("2.0.0", json!({}), Some(dependency_v2)),
+            ],
+        )
+        .await;
+    mock.with_batch_metadata(vec![source_metadata, dependency_metadata])
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    for spec in [format!("{package}@1.0.0"), format!("{package}@2.0.0")] {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["dependencies"][dependency], "2.0.0");
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let ownership = &state["packages"][package]["dependencies"][dependency];
+    assert_eq!(ownership["spec"], "2.0.0");
+    assert_eq!(ownership["inserted"], true);
+    assert!(project.read_file("lpm.lock").contains("2.0.0"));
+}
+
+#[tokio::test]
+async fn add_transfers_dependency_cleanup_ownership_until_the_last_source_drops_it() {
+    let mock = MockRegistry::start().await;
+    let first_package = "first-shared-dependency-source";
+    let second_package = "second-shared-dependency-source";
+    let dependency = "shared-dependency-leaf";
+    let source_tarball = |package: &str, version: &str, include_dependency: bool| {
+        let config = if include_dependency {
+            json!({
+                "ecosystem": "js",
+                "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+                "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+                "files": [{"src": "Source.ts", "dest": format!("{package}.ts")}]
+            })
+        } else {
+            json!({
+                "ecosystem": "js",
+                "dependencies": {},
+                "files": [{"src": "Source.ts", "dest": format!("{package}.ts")}]
+            })
+        };
+        make_source_pkg_tarball(
+            package,
+            version,
+            config,
+            &[("Source.ts", b"export const source = true;\n")],
+        )
+    };
+
+    let first_v1 = source_tarball(first_package, "1.0.0", true);
+    let first_v2 = source_tarball(first_package, "2.0.0", false);
+    let second_v1 = source_tarball(second_package, "1.0.0", true);
+    let second_v2 = source_tarball(second_package, "2.0.0", false);
+    let first_metadata = mock
+        .mount_full_package_metadata_routes(
+            first_package,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(first_v1)),
+                ("2.0.0", json!({}), Some(first_v2)),
+            ],
+        )
+        .await;
+    let second_metadata = mock
+        .mount_full_package_metadata_routes(
+            second_package,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(second_v1)),
+                ("2.0.0", json!({}), Some(second_v2)),
+            ],
+        )
+        .await;
+    let dependency_tarball =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dependency_metadata = mock
+        .mount_full_package_metadata_routes(
+            dependency,
+            "1.0.0",
+            &[("1.0.0", json!({}), Some(dependency_tarball))],
+        )
+        .await;
+    mock.with_batch_metadata(vec![first_metadata, second_metadata, dependency_metadata])
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    for spec in [
+        format!("{first_package}@1.0.0"),
+        format!("{second_package}@1.0.0"),
+        format!("{first_package}@2.0.0"),
+    ] {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+    }
+
+    let manifest_after_first_drop: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest_after_first_drop["dependencies"][dependency],
+        "1.0.0"
+    );
+    let state_after_first_drop: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert_eq!(
+        state_after_first_drop["packages"][second_package]["dependencies"][dependency]["inserted"],
+        true
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{second_package}@2.0.0"),
+            "--yes",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let final_manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(final_manifest["dependencies"].get(dependency).is_none());
+    assert!(!project.read_file("lpm.lock").contains(dependency));
+}
+
+#[tokio::test]
+async fn add_records_dependency_requirement_and_insertion_ownership() {
+    let mock = MockRegistry::start().await;
+    let package = "dependency-provenance-source";
+    let dependency = "dependency-provenance-leaf";
+    let source_tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &source_tarball).await;
+    let dependency_tarball =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dependency_metadata = mock.package_metadata(dependency, "1.0.0", &dependency_tarball);
+    mock.with_package(dependency, "1.0.0", &dependency_tarball)
+        .await;
+    mock.with_batch_metadata(vec![dependency_metadata]).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-skills", "--no-editor-setup"])
+        .assert()
+        .success();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let requirement = &state["packages"][package]["dependencies"][dependency];
+    assert_eq!(requirement["spec"], "1.0.0");
+    assert_eq!(requirement["section"], "dependencies");
+    assert_eq!(requirement["inserted"], true);
+}
+
+#[tokio::test]
+async fn add_repeat_preserves_dependency_insertion_ownership() {
+    let mock = MockRegistry::start().await;
+    let package = "repeat-dependency-owner";
+    let dependency = "repeat-dependency-leaf";
+    let source_tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &source_tarball).await;
+    let dependency_tarball =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dependency_metadata = mock.package_metadata(dependency, "1.0.0", &dependency_tarball);
+    mock.with_package(dependency, "1.0.0", &dependency_tarball)
+        .await;
+    mock.with_batch_metadata(vec![dependency_metadata]).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    for _ in 0..2 {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", package, "--yes", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+    }
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert_eq!(
+        state["packages"][package]["dependencies"][dependency]["inserted"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn add_waits_for_the_project_install_lock_before_mutating_source_state() {
+    let mock = MockRegistry::start().await;
+    let package = "add-lock-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the project install lock");
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let marker_path = project.home().join("add-lock-contention");
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env(LOCK_CONTENTION_MARKER_ENV, &marker_path);
+    command.args(["add", package, "--yes", "--no-install-deps", "--no-skills"]);
+    let mut child = command.spawn().expect("spawn contending add");
+
+    wait_for_lock_contention(&mut child, &marker_path, &lock_path);
+    assert!(
+        child.try_wait().expect("inspect contending add").is_none(),
+        "add must wait while another transaction owns the project install lock"
+    );
+    assert!(!project.file_exists("components/Source.ts"));
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+    drop(transaction_lock);
+
+    let output = child.wait_with_output().expect("finish contending add");
+    assert!(
+        output.status.success(),
+        "add failed after lock release\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn add_rejects_a_workspace_that_appears_while_waiting_for_the_lock() {
+    let mock = MockRegistry::start().await;
+    let package = "workspace-appeared-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold the project install lock");
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let marker_path = project.home().join("add-workspace-appeared");
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env(LOCK_CONTENTION_MARKER_ENV, &marker_path);
+    command.args(["add", package, "--yes", "--no-install-deps", "--no-skills"]);
+    let mut child = command.spawn().expect("spawn contending add");
+
+    wait_for_lock_contention(&mut child, &marker_path, &lock_path);
+    project.write_file(
+        "package.json",
+        r#"{"name":"host","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    drop(transaction_lock);
+
+    let output = child.wait_with_output().expect("finish contending add");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("appeared while waiting"));
+    assert!(!project.file_exists("components/Source.ts"));
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+}
+
+#[tokio::test]
+async fn add_refuses_a_forged_backup_path_before_deleting_outside_files() {
+    let mock = MockRegistry::start().await;
+    let package = "forged-backup-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), b"outside sentinel").unwrap();
+    project.write_file(
+        ".lpm/added-sources.json",
+        &serde_json::to_string_pretty(&json!({
+            "schema_version": 2,
+            "packages": {
+                package: {
+                    "files": {
+                        "components/Source.ts": {
+                            "source": "Source.ts",
+                            "installed_digest": "sha256-stale",
+                            "action": "overwrite",
+                            "backup_path": outside.path(),
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside sentinel");
+    assert!(!project.file_exists("components/Source.ts"));
+}
+
+#[tokio::test]
+async fn add_rejects_semantically_duplicate_destinations_before_copying() {
+    let mock = MockRegistry::start().await;
+    let package = "duplicate-destination-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [
+                {"src": "One.ts", "dest": "Alias.ts"},
+                {"src": "Two.ts", "dest": "./Alias.ts"}
+            ]
+        }),
+        &[
+            ("One.ts", b"export const one = true;\n"),
+            ("Two.ts", b"export const two = true;\n"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists("components/Alias.ts"));
+}
+
+#[tokio::test]
+async fn add_reserves_project_lpm_state_namespace_from_source_delivery() {
+    let mock = MockRegistry::start().await;
+    let package = "reserved-state-destination-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Payload.txt", "dest": ".lpm/managed.txt"}]
+        }),
+        &[("Payload.txt", b"package controlled")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            ".",
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists(".lpm/managed.txt"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_reserves_project_lpm_state_namespace_through_a_symlink_alias() {
+    let mock = MockRegistry::start().await;
+    let package = "linked-reserved-state-destination-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Payload.txt", "dest": "state-link/managed.txt"}]
+        }),
+        &[("Payload.txt", b"package controlled")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+    std::os::unix::fs::symlink(".lpm", project.path().join("state-link")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            ".",
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists(".lpm/managed.txt"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_refuses_a_linked_project_lpm_directory() {
+    let mock = MockRegistry::start().await;
+    let package = "linked-lpm-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.path().join(".lpm")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-install-deps", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists("components/Source.ts"));
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
 }

@@ -1,8 +1,22 @@
 use crate::{install_ui, output};
+use futures::{StreamExt, TryStreamExt};
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{RegistryClient, RouteTable};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub(super) struct DependencyRequirement {
+    pub name: String,
+    pub spec: String,
+    pub section: String,
+    pub inserted: bool,
+}
+
+pub(super) struct DependencyOutcome {
+    pub requirements: Vec<DependencyRequirement>,
+    pub inserted: Vec<(String, String)>,
+}
 
 /// Collect every dependency the source package would install into the
 /// consumer's `package.json`, in stable insertion order with duplicates
@@ -30,7 +44,7 @@ use std::path::{Path, PathBuf};
 /// list. Without this shared spine, a config-aware package whose
 /// `lpm.config.json#dependencies` was empty but whose `package.json`
 /// carried real deps would silently disagree across the three surfaces.
-fn collect_source_pkg_deps(
+pub(super) fn collect_source_pkg_deps(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
@@ -54,11 +68,13 @@ fn collect_source_pkg_deps(
     // the "explicit user input wins" rule, which here means the
     // first declaration the author wrote).
     let mut deps: Vec<(String, crate::save_spec::UserSaveIntent)> = Vec::new();
+    let mut seen = HashSet::new();
     let push_if_new = |deps: &mut Vec<(String, crate::save_spec::UserSaveIntent)>,
+                       seen: &mut HashSet<String>,
                        raw: &str|
      -> Result<(), LpmError> {
         let (name, intent) = crate::save_spec::parse_user_save_intent(raw)?;
-        if !deps.iter().any(|(existing, _)| existing == &name) {
+        if seen.insert(name.clone()) {
             deps.push((name, intent));
         }
         Ok(())
@@ -74,17 +90,11 @@ fn collect_source_pkg_deps(
                 continue;
             }
 
-            let selected_values: Vec<&str> = if config_value.contains(',') {
-                config_value.split(',').map(|v| v.trim()).collect()
-            } else {
-                vec![config_value]
-            };
-
-            for value in &selected_values {
-                if let Some(arr) = dep_map.get(*value).and_then(|d| d.as_array()) {
+            for value in config_value.split(',').map(str::trim) {
+                if let Some(arr) = dep_map.get(value).and_then(|d| d.as_array()) {
                     for dep in arr {
                         if let Some(raw) = dep.as_str() {
-                            push_if_new(&mut deps, raw)?;
+                            push_if_new(&mut deps, &mut seen, raw)?;
                         }
                     }
                 }
@@ -116,7 +126,7 @@ fn collect_source_pkg_deps(
                             Some(v) if !v.is_empty() => format!("{name}@{v}"),
                             _ => name.clone(),
                         };
-                        push_if_new(&mut deps, &raw)?;
+                        push_if_new(&mut deps, &mut seen, &raw)?;
                     }
                 }
             }
@@ -130,7 +140,8 @@ fn collect_source_pkg_deps(
 ///
 /// Returns `collect_source_pkg_deps(...).len()` so dry-run preview and
 /// `--no-install-deps` skip-count agree with the install path.
-pub(super) fn count_dependencies(
+#[cfg(test)]
+fn count_dependencies(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     extract_dir: &Path,
@@ -138,43 +149,19 @@ pub(super) fn count_dependencies(
     Ok(collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?.len())
 }
 
-/// Refuse to copy a deps-declaring source package into a project with no
-/// `package.json`.
-///
-/// Without a manifest, the dep entries the source declares have
-/// nowhere to land — the user would end up with copied source files
-/// importing packages they can't install. Block the run before any
-/// side effect with a remediation hint pointing at `lpm init` /
-/// `npm init -y`.
-///
-/// Gates (must all hold to fire):
-/// - `!no_install_deps`: the user explicitly opting out of dep
-///   install acknowledges they'll handle it themselves; respect that.
-/// - `lpm_config.is_some()`: simple-path tarballs (no
-///   `lpm.config.json`) intentionally skip auto-install; the
-///   bare-imports notice surfaces what the user needs.
-/// - `!project_dir/package.json exists`: the actual blocking
-///   condition — no manifest to mutate.
-/// - `collect_source_pkg_deps(...).len() > 0`: a deps-free source
-///   package (just files, no imports) is safe to land in a no-
-///   manifest project.
+/// Reject dependency installation when the project has no package manifest.
 pub(super) fn preflight_no_manifest_with_deps(
     project_dir: &Path,
-    extract_dir: &Path,
-    lpm_config: &Option<serde_json::Value>,
-    inline_config: &HashMap<String, String>,
     no_install_deps: bool,
+    planned_dependency_count: usize,
 ) -> Result<(), LpmError> {
     if no_install_deps {
-        return Ok(());
-    }
-    if lpm_config.is_none() {
         return Ok(());
     }
     if project_dir.join("package.json").exists() {
         return Ok(());
     }
-    if collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?.is_empty() {
+    if planned_dependency_count == 0 {
         return Ok(());
     }
 
@@ -295,25 +282,28 @@ fn resolve_source_dependency_version(
 /// `effective_pm` is pre-resolved at the call site (handles
 /// `--pm auto`) so this function picks dispatch arms by exact match
 /// without re-running detection.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dependency delivery requires explicit registry, policy, output, and install context"
+)]
 pub(super) async fn handle_dependencies(
     client: &RegistryClient,
     route_table: &RouteTable,
     project_dir: &Path,
-    extract_dir: &Path,
-    lpm_config: &Option<serde_json::Value>,
-    inline_config: &HashMap<String, String>,
-    ecosystem: &str,
+    entries: &[(String, crate::save_spec::UserSaveIntent)],
+    exclusively_owned: &HashMap<String, crate::added_sources_state::AddedSourceDependency>,
+    _ecosystem: &str,
     _yes: bool,
     json_output: bool,
     no_engine_strict: bool,
     install_lpm_skills: bool,
     effective_pm: &str,
-) -> Result<Vec<(String, String)>, LpmError> {
-    let entries = collect_source_pkg_deps(lpm_config, inline_config, extract_dir)?;
-
+) -> Result<DependencyOutcome, LpmError> {
     if entries.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DependencyOutcome {
+            requirements: Vec::new(),
+            inserted: Vec::new(),
+        });
     }
 
     if !json_output {
@@ -327,36 +317,30 @@ pub(super) async fn handle_dependencies(
         json_output,
     )?;
 
-    // Resolve a policy-allowed version for each Bare / DistTag entry up-front,
-    // dispatching per-package through `RouteTable`. The walker's
-    // three-arm pattern (LPM batch / npm fan-out / custom registries)
-    // is overkill for the typical < 10 source-package deps; serial
-    // routed fetches are simpler and the bound is small enough that
-    // wall time is dominated by network setup, not parallelism.
-    let mut resolved: HashMap<String, lpm_semver::Version> = HashMap::new();
-    for (name, intent) in &entries {
+    // Bounded routed fetches retain per-package registry policy without
+    // serializing metadata latency or retaining unbounded responses.
+    const METADATA_CONCURRENCY: usize = 8;
+    let resolver_policy = &resolver_policy;
+    let resolved_pairs = futures::stream::iter(entries.iter().filter_map(|(name, intent)| {
         let tag = match intent {
-            crate::save_spec::UserSaveIntent::DistTag(t) => t.as_str(),
+            crate::save_spec::UserSaveIntent::DistTag(tag) => tag.as_str(),
             crate::save_spec::UserSaveIntent::Bare => "latest",
-            _ => continue,
+            _ => return None,
         };
-
-        // `@lpm.dev/*` packages take the LPM-direct metadata route —
-        // same call the source package itself uses at the top of
-        // `add::run`. Everything else (npm-published, private-
-        // registry-declared via .npmrc) goes through
-        // `get_npm_metadata_routed`, which dispatches by the route
-        // table to the correct upstream.
-        let pkg_meta = if name.starts_with("@lpm.dev/") {
-            let pkg = PackageName::parse(name).map_err(|e| {
-                LpmError::Registry(format!("invalid @lpm.dev/* dep name '{name}': {e}"))
-            })?;
-            client.get_package_metadata(&pkg).await.map_err(|e| {
+        Some((name.as_str(), intent, tag))
+    }))
+    .map(|(name, intent, tag)| async move {
+        let package_metadata = if name.starts_with("@lpm.dev/") {
+            let package = PackageName::parse(name).map_err(|error| {
                 LpmError::Registry(format!(
-                    "could not resolve '{name}' against lpm.dev: {e}. \
-                     Pin an explicit version (e.g., \"{name}@^1.0\") in the source \
-                     package's lpm.config.json#dependencies, or run `lpm login` to \
-                     authenticate."
+                    "invalid @lpm.dev/* dependency name '{name}': {error}"
+                ))
+            })?;
+            client.get_package_metadata(&package).await.map_err(|error| {
+                LpmError::Registry(format!(
+                    "could not resolve '{name}' against lpm.dev: {error}. Pin an explicit version \
+                     (for example, \"{name}@^1.0\") in lpm.config.json#dependencies, or run \
+                     `lpm login` to authenticate."
                 ))
             })?
         } else {
@@ -364,33 +348,40 @@ pub(super) async fn handle_dependencies(
             client
                 .get_npm_metadata_routed(name, route)
                 .await
-                .map_err(|e| {
+                .map_err(|error| {
                     LpmError::Registry(format!(
-                        "could not resolve '{name}' against the registry: {e}. \
-                         Either the package doesn't exist there or your auth \
-                         doesn't grant access. Pin an explicit version \
-                         (e.g., \"{name}@^1.0\") in the source package's \
+                        "could not resolve '{name}' against the registry: {error}. The package \
+                         may not exist there or your authentication may not grant access. Pin an \
+                         explicit version (for example, \"{name}@^1.0\") in \
                          lpm.config.json#dependencies."
                     ))
                 })?
         };
-        let resolved_version_str =
-            resolve_source_dependency_version(&pkg_meta, intent, &resolver_policy).map_err(
-                |e| LpmError::Registry(format!("resolving '{name}@{tag}' against registry: {e}")),
+        let resolved_version =
+            resolve_source_dependency_version(&package_metadata, intent, resolver_policy).map_err(
+                |error| {
+                    LpmError::Registry(format!(
+                        "resolving '{name}@{tag}' against registry: {error}"
+                    ))
+                },
             )?;
-        let version = lpm_semver::Version::parse(&resolved_version_str).map_err(|e| {
+        let version = lpm_semver::Version::parse(&resolved_version).map_err(|error| {
             LpmError::Registry(format!(
-                "registry returned non-semver version '{resolved_version_str}' for '{name}': {e}"
+                "registry returned non-semver version '{resolved_version}' for '{name}': {error}"
             ))
         })?;
-        resolved.insert(name.clone(), version);
-    }
+        Ok::<_, LpmError>((name.to_string(), version))
+    })
+    .buffered(METADATA_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+    let resolved = HashMap::from_iter(resolved_pairs);
 
     // Build the (name, spec_to_write) list using the shared save-spec
     // decision helper. Honors `~/.lpm/config.toml` + `./lpm.toml` save
     // policy — same precedence chain `lpm install <pkg>` uses.
     let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
-    let decisions = build_save_decisions(&entries, &resolved, save_config)?;
+    let decisions = build_save_decisions(entries, &resolved, save_config)?;
 
     let pkg_json_path = project_dir.join("package.json");
 
@@ -402,8 +393,10 @@ pub(super) async fn handle_dependencies(
         output::warn(
             "no package.json found -- dependencies not installed. Run `lpm install` manually.",
         );
-        let _ = ecosystem;
-        return Ok(Vec::new());
+        return Ok(DependencyOutcome {
+            requirements: Vec::new(),
+            inserted: Vec::new(),
+        });
     }
 
     // Mutate `package.json` with the resolved specs. The caller's
@@ -412,6 +405,8 @@ pub(super) async fn handle_dependencies(
     // without `commit()`, restoring every snapshotted path (manifest,
     // LPM lockfiles, the selected PM's lockfile, every Step-8 dest
     // file) and invalidating `.lpm/install-hash`.
+    let mut requirements = Vec::with_capacity(decisions.len());
+    let mut inserted = Vec::with_capacity(decisions.len());
     {
         let content = lpm_common::read_text_file_capped(
             &pkg_json_path,
@@ -421,20 +416,76 @@ pub(super) async fn handle_dependencies(
         let mut doc: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
-        let deps = doc.as_object_mut().and_then(|o| {
-            o.entry("dependencies")
+        let object = doc.as_object_mut().ok_or_else(|| {
+            LpmError::Registry("package.json root must be a JSON object".to_string())
+        })?;
+        for (name, desired_spec) in &decisions {
+            let existing = [
+                "dependencies",
+                "devDependencies",
+                "optionalDependencies",
+                "peerDependencies",
+            ]
+            .into_iter()
+            .find_map(|section| {
+                object
+                    .get(section)
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|dependencies| dependencies.get(name))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|spec| (section.to_string(), spec.to_string()))
+            });
+            if let Some((section, spec)) = existing {
+                if exclusively_owned
+                    .get(name)
+                    .is_some_and(|previous| previous.section == section && previous.spec == spec)
+                {
+                    object
+                        .get_mut(&section)
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("existing dependency section was validated above")
+                        .insert(
+                            name.clone(),
+                            serde_json::Value::String(desired_spec.clone()),
+                        );
+                    if spec != *desired_spec {
+                        inserted.push((name.clone(), desired_spec.clone()));
+                    }
+                    requirements.push(DependencyRequirement {
+                        name: name.clone(),
+                        spec: desired_spec.clone(),
+                        section,
+                        inserted: true,
+                    });
+                    continue;
+                }
+                requirements.push(DependencyRequirement {
+                    name: name.clone(),
+                    spec,
+                    section,
+                    inserted: false,
+                });
+                continue;
+            }
+
+            object
+                .entry("dependencies")
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
-        });
-
-        if let Some(deps) = deps {
-            for (name, spec) in &decisions {
-                // "do not rewrite existing entries on bare
-                // reinstall" semantics: if the consumer already pinned
-                // a range for this dep, we keep theirs.
-                deps.entry(name.clone())
-                    .or_insert_with(|| serde_json::Value::String(spec.clone()));
-            }
+                .ok_or_else(|| {
+                    LpmError::Registry("package.json dependencies must be an object".to_string())
+                })?
+                .insert(
+                    name.clone(),
+                    serde_json::Value::String(desired_spec.clone()),
+                );
+            inserted.push((name.clone(), desired_spec.clone()));
+            requirements.push(DependencyRequirement {
+                name: name.clone(),
+                spec: desired_spec.clone(),
+                section: "dependencies".to_string(),
+                inserted: true,
+            });
         }
 
         let updated = serde_json::to_string_pretty(&doc)
@@ -449,11 +500,36 @@ pub(super) async fn handle_dependencies(
     // `.lpm/install-hash`. Warning and continuing here would leave users with a
     // half-applied manifest the trailing install never finished
     // filling in.
+    refresh_dependency_install(
+        client,
+        project_dir,
+        json_output,
+        no_engine_strict,
+        install_lpm_skills,
+        effective_pm,
+    )
+    .await?;
+
+    Ok(DependencyOutcome {
+        requirements,
+        inserted,
+    })
+}
+
+pub(super) async fn refresh_dependency_install(
+    client: &RegistryClient,
+    project_dir: &Path,
+    json_output: bool,
+    no_engine_strict: bool,
+    install_lpm_skills: bool,
+    effective_pm: &str,
+) -> Result<(), LpmError> {
     match effective_pm {
         "lpm" => {
             // Use the injected client so post-add `lpm install` carries
             // the selected registry and shared session.
-            crate::commands::install::run_with_options(
+            let lpm_root = lpm_common::LpmRoot::from_env()?;
+            crate::commands::install::run_with_options_with_lpm_root(
                 client,
                 project_dir,
                 json_output,
@@ -493,6 +569,9 @@ pub(super) async fn handle_dependencies(
                 false, // audit_after_install: internal pipeline never runs audit
                 false, // timing: add does not expose install's --timing flag
                 &[],
+                false, // the enclosing add command owns stdout reporting
+                json_output,
+                lpm_root,
             )
             .await
             .map_err(|e| {
@@ -502,16 +581,17 @@ pub(super) async fn handle_dependencies(
             })?;
         }
         pm_name @ ("npm" | "pnpm" | "yarn" | "bun") => {
-            let status = std::process::Command::new(pm_name)
-                .arg("install")
-                .current_dir(project_dir)
-                .status()
-                .map_err(|e| {
-                    LpmError::Script(format!(
-                        "{pm_name} install failed to spawn: {e}. \
+            let mut command = std::process::Command::new(pm_name);
+            command.arg("install").current_dir(project_dir);
+            if json_output {
+                command.stdout(std::process::Stdio::null());
+            }
+            let status = command.status().map_err(|e| {
+                LpmError::Script(format!(
+                    "{pm_name} install failed to spawn: {e}. \
                          package.json + lockfile rolled back to pre-add state."
-                    ))
-                })?;
+                ))
+            })?;
             if !status.success() {
                 return Err(LpmError::Script(format!(
                     "{pm_name} install exited with non-zero status. \
@@ -526,11 +606,7 @@ pub(super) async fn handle_dependencies(
         }
     }
 
-    // Trailing install succeeded — return Ok and let the caller commit
-    // the wider tx after the bare-imports notice.
-    let _ = ecosystem; // Ecosystem used for future per-ecosystem dep handling
-
-    Ok(decisions)
+    Ok(())
 }
 
 /// Lockfile paths to snapshot for the selected package manager.
@@ -545,17 +621,29 @@ pub(super) async fn handle_dependencies(
 /// `lpm.lockb` are already snapshotted by the caller) and for unknown
 /// values (the dispatch arm errors on those before any tx mutation).
 pub(super) fn pm_lockfile_paths(pm: &str, project_dir: &Path) -> Vec<PathBuf> {
-    match pm {
-        "npm" => vec![project_dir.join("package-lock.json")],
-        "pnpm" => vec![project_dir.join("pnpm-lock.yaml")],
-        "yarn" => vec![project_dir.join("yarn.lock")],
-        // bun ships both binary (`.lockb`, default) and text (`.lock`,
-        // newer) formats depending on version. Snapshot both as
-        // optional so whichever bun writes is rolled back; the absent
-        // one's snapshot records `None` and is a no-op on rollback.
-        "bun" => vec![project_dir.join("bun.lock"), project_dir.join("bun.lockb")],
-        _ => Vec::new(),
+    let names: &[&str] = match pm {
+        "npm" => &["package-lock.json", "npm-shrinkwrap.json"],
+        "pnpm" => &["pnpm-lock.yaml"],
+        "yarn" => &["yarn.lock"],
+        "bun" => &["bun.lock", "bun.lockb"],
+        _ => return Vec::new(),
+    };
+    let mut roots = Vec::with_capacity(2);
+    roots.push(project_dir.to_path_buf());
+    if let Some(workspace) = lpm_workspace::discover_workspace(project_dir)
+        .ok()
+        .flatten()
+        && workspace.root != project_dir
+    {
+        roots.push(workspace.root);
     }
+    let mut paths = Vec::with_capacity(roots.len() * names.len());
+    for root in roots {
+        for name in names {
+            paths.push(root.join(name));
+        }
+    }
+    paths
 }
 
 #[cfg(test)]
@@ -1173,22 +1261,9 @@ mod tests {
         #[test]
         fn preflight_errors_when_config_json_declares_deps_and_no_manifest() {
             let project = tempfile::tempdir().unwrap();
-            let extract = tempfile::tempdir().unwrap();
-            let lpm_config = serde_json::json!({
-                "dependencies": {
-                    "icons": { "lucide": ["lucide-react"] }
-                }
-            });
-            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            let err = preflight_no_manifest_with_deps(
-                project.path(),
-                extract.path(),
-                &Some(lpm_config),
-                &inline,
-                false,
-            )
-            .expect_err("preflight must hard-error");
+            let err = preflight_no_manifest_with_deps(project.path(), false, 1)
+                .expect_err("preflight must hard-error");
 
             let msg = format!("{err}");
             assert!(
@@ -1222,15 +1297,12 @@ mod tests {
             .unwrap();
 
             let lpm_config = serde_json::json!({ "ecosystem": "js", "files": [] });
+            let planned =
+                collect_source_pkg_deps(&Some(lpm_config), &HashMap::new(), extract.path())
+                    .unwrap();
 
-            let err = preflight_no_manifest_with_deps(
-                project.path(),
-                extract.path(),
-                &Some(lpm_config),
-                &HashMap::new(),
-                false,
-            )
-            .expect_err("preflight must catch legacy-fallback deps too");
+            let err = preflight_no_manifest_with_deps(project.path(), false, planned.len())
+                .expect_err("preflight must catch legacy-fallback deps too");
             assert!(format!("{err}").contains("lpm init"));
         }
 
@@ -1238,22 +1310,9 @@ mod tests {
         fn preflight_passes_when_consumer_has_package_json() {
             let project = tempfile::tempdir().unwrap();
             std::fs::write(project.path().join("package.json"), "{}").unwrap();
-            let extract = tempfile::tempdir().unwrap();
-            let lpm_config = serde_json::json!({
-                "dependencies": {
-                    "icons": { "lucide": ["lucide-react"] }
-                }
-            });
-            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            preflight_no_manifest_with_deps(
-                project.path(),
-                extract.path(),
-                &Some(lpm_config),
-                &inline,
-                false,
-            )
-            .expect("manifest exists, preflight must pass");
+            preflight_no_manifest_with_deps(project.path(), false, 1)
+                .expect("manifest exists, preflight must pass");
         }
 
         #[test]
@@ -1262,17 +1321,9 @@ mod tests {
             // no dep declarations) is safe to land in a no-manifest
             // project — bare imports surface separately.
             let project = tempfile::tempdir().unwrap();
-            let extract = tempfile::tempdir().unwrap();
-            let lpm_config = serde_json::json!({ "ecosystem": "js", "files": [] });
 
-            preflight_no_manifest_with_deps(
-                project.path(),
-                extract.path(),
-                &Some(lpm_config),
-                &HashMap::new(),
-                false,
-            )
-            .expect("no deps + no manifest must pass");
+            preflight_no_manifest_with_deps(project.path(), false, 0)
+                .expect("no deps + no manifest must pass");
         }
 
         #[test]
@@ -1281,22 +1332,9 @@ mod tests {
             // they accept responsibility for the consequences.
             // Preflight respects that and lets the run proceed.
             let project = tempfile::tempdir().unwrap();
-            let extract = tempfile::tempdir().unwrap();
-            let lpm_config = serde_json::json!({
-                "dependencies": {
-                    "icons": { "lucide": ["lucide-react"] }
-                }
-            });
-            let inline = HashMap::from([("icons".to_string(), "lucide".to_string())]);
 
-            preflight_no_manifest_with_deps(
-                project.path(),
-                extract.path(),
-                &Some(lpm_config),
-                &inline,
-                true, // no_install_deps
-            )
-            .expect("--no-install-deps must bypass preflight");
+            preflight_no_manifest_with_deps(project.path(), true, 1)
+                .expect("--no-install-deps must bypass preflight");
         }
 
         #[test]
@@ -1306,16 +1344,9 @@ mod tests {
             // The bare-imports notice surfaces what the user needs. Preflight has
             // nothing to enforce here.
             let project = tempfile::tempdir().unwrap();
-            let extract = tempfile::tempdir().unwrap();
 
-            preflight_no_manifest_with_deps(
-                project.path(),
-                extract.path(),
-                &None,
-                &HashMap::new(),
-                false,
-            )
-            .expect("simple-path with no lpm.config.json must pass");
+            preflight_no_manifest_with_deps(project.path(), false, 0)
+                .expect("simple-path with no lpm.config.json must pass");
         }
 
         // ── pm_lockfile_paths ─────────────────────────────────────────
@@ -1339,7 +1370,36 @@ mod tests {
         fn pm_lockfile_paths_npm_returns_package_lock() {
             let dir = tempfile::tempdir().unwrap();
             let paths = pm_lockfile_paths("npm", dir.path());
-            assert_eq!(paths, vec![dir.path().join("package-lock.json")]);
+            assert_eq!(
+                paths,
+                vec![
+                    dir.path().join("package-lock.json"),
+                    dir.path().join("npm-shrinkwrap.json"),
+                ]
+            );
+        }
+
+        #[test]
+        fn pm_lockfile_paths_include_workspace_root_lockfiles() {
+            let directory = tempfile::tempdir().unwrap();
+            let member = directory.path().join("packages/app");
+            std::fs::create_dir_all(&member).unwrap();
+            std::fs::write(
+                directory.path().join("package.json"),
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#,
+            )
+            .unwrap();
+            std::fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+            let paths = pm_lockfile_paths("pnpm", &member);
+
+            assert_eq!(
+                paths,
+                vec![
+                    member.join("pnpm-lock.yaml"),
+                    directory.path().join("pnpm-lock.yaml"),
+                ]
+            );
         }
 
         #[test]

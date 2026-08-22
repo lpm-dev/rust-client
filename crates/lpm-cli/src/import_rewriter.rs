@@ -5,47 +5,20 @@
 //! imports between installed files are also resolved through the src→dest
 //! mapping to keep internal references correct.
 //!
-//! Mirrors the JS CLI's `import-rewriter.js` logic:
-//!   - Per-file context (fileSrcPath, fileDestPath) for relative resolution
-//!   - Relative imports resolved via src dir + srcToDestMap
-//!   - Author alias imports resolved via src file set + srcToDestMap
-//!   - Buyer alias applied to rewritten specifiers
-//!   - External/bare specifiers left unchanged
+//! The path-resolution contract matches the JavaScript CLI.
 
 use std::collections::{HashMap, HashSet};
 
 /// File extensions to try when resolving import paths.
-const EXTENSIONS: &[&str] = &[".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"];
+const EXTENSIONS: &[&str] = &[".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"];
 
-/// Classification of an import specifier.
-///
-/// D4 (anti-drift contract): both `rewrite_imports` and the
-/// sibling `collect_bare_specifiers` must agree on what counts as
-/// "bare" / "external." Encoding the decision in this enum + the
-/// `classify_specifier` function below means there's exactly ONE place
-/// to update if the classification rules change (e.g., adding `node:`
-/// or `data:` schemes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpecifierKind {
-    /// `./foo`, `../bar` — resolved against the src dir + buyer's
-    /// dest dir for in-package imports.
     Relative,
-    /// Author's path alias prefix (e.g., `@/lib/utils` when the
-    /// author's `lpm.config.json#importAlias` is `@/`).
     AuthorAlias,
-    /// External / bare specifier (`react`, `next/link`, `@scope/pkg`).
-    /// In the rewriter these are left unchanged; in
-    /// `collect_bare_specifiers` they're collected so the simple-path
-    /// `lpm add` flow can tell the user which deps to install.
     Bare,
 }
 
-/// Classify a specifier according to its prefix.
-///
-/// `author_alias` is `Some(prefix)` when the author's
-/// `lpm.config.json#importAlias` is set, e.g. `Some("@/")`. When it's
-/// `None`, no specifier is classified as `AuthorAlias` — anything
-/// non-relative is `Bare`.
 fn classify_specifier(specifier: &str, author_alias: Option<&str>) -> SpecifierKind {
     if specifier.starts_with("./") || specifier.starts_with("../") {
         return SpecifierKind::Relative;
@@ -71,7 +44,11 @@ fn classify_specifier(specifier: &str, author_alias: Option<&str>) -> SpecifierK
 /// * `dest_files` - Set of all destination file paths
 ///
 /// Returns the rewritten content, or None if no changes were made.
-#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rewriting requires explicit source, destination, alias, and index context"
+)]
 pub fn rewrite_imports(
     content: &str,
     file_src_path: &str,
@@ -79,187 +56,139 @@ pub fn rewrite_imports(
     author_alias: Option<&str>,
     buyer_alias: Option<&str>,
     src_to_dest: &HashMap<String, String>,
-    src_files: &HashSet<String>,
+    _src_files: &HashSet<String>,
     dest_files: &HashSet<String>,
 ) -> Option<String> {
-    // Only rewrite if we have aliases to work with
-    if author_alias.is_none() && buyer_alias.is_none() {
-        return None;
-    }
+    let borrowed_map = src_to_dest
+        .iter()
+        .map(|(source, destination)| (source.as_str(), destination.as_str()))
+        .collect();
+    let borrowed_destinations = dest_files.iter().map(String::as_str).collect();
+    rewrite_imports_indexed(
+        content,
+        file_src_path,
+        file_dest_path,
+        author_alias,
+        buyer_alias,
+        &borrowed_map,
+        &borrowed_destinations,
+    )
+}
 
-    let file_src_dir = dirname(file_src_path);
-    let file_dest_dir = dirname(file_dest_path);
+pub fn rewrite_imports_indexed(
+    content: &str,
+    file_src_path: &str,
+    file_dest_path: &str,
+    author_alias: Option<&str>,
+    buyer_alias: Option<&str>,
+    src_to_dest: &HashMap<&str, &str>,
+    dest_files: &HashSet<&str>,
+) -> Option<String> {
+    let file_src_path = normalize_separators(file_src_path);
+    let file_dest_path = normalize_separators(file_dest_path);
+    let file_src_dir = dirname(&file_src_path);
+    let file_dest_dir = dirname(&file_dest_path);
 
-    let mut result = String::with_capacity(content.len());
-    let mut changed = false;
-    let mut in_block_comment = false;
-
-    for line in content.lines() {
-        // Track block comments
-        if in_block_comment {
-            if line.contains("*/") {
-                in_block_comment = false;
-            }
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-        if line.contains("/*") && !line.contains("*/") {
-            in_block_comment = true;
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        // Skip single-line comments
-        let trimmed = line.trim();
-        if trimmed.starts_with("//") {
-            result.push_str(line);
-            result.push('\n');
-            continue;
-        }
-
-        // Check for import/require patterns
-        if let Some(rewritten) = try_rewrite_line(
-            line,
+    let mut replacements = Vec::new();
+    visit_code_specifier_ranges(content, |range| {
+        let specifier = &content[range.clone()];
+        if let Some(new_specifier) = resolve_and_rewrite(
+            specifier,
             &file_src_dir,
             &file_dest_dir,
             author_alias,
             buyer_alias,
             src_to_dest,
-            src_files,
             dest_files,
         ) {
-            result.push_str(&rewritten);
-            result.push('\n');
-            changed = true;
-        } else {
-            result.push_str(line);
-            result.push('\n');
+            replacements.push((range, new_specifier));
         }
+    });
+    if replacements.is_empty() {
+        return None;
     }
 
-    if changed { Some(result) } else { None }
-}
-
-/// Try to rewrite import specifiers in a single line.
-#[allow(clippy::too_many_arguments)]
-fn try_rewrite_line(
-    line: &str,
-    file_src_dir: &str,
-    file_dest_dir: &str,
-    author_alias: Option<&str>,
-    buyer_alias: Option<&str>,
-    src_to_dest: &HashMap<String, String>,
-    src_files: &HashSet<String>,
-    dest_files: &HashSet<String>,
-) -> Option<String> {
-    let import_keywords = ["from ", "import(", "require("];
-    let mut result = line.to_string();
-    let mut any_change = false;
-
-    for keyword in &import_keywords {
-        if !line.contains(keyword) {
+    let extra: usize = replacements
+        .iter()
+        .map(|(range, replacement)| replacement.len().saturating_sub(range.len()))
+        .sum();
+    let mut result = String::with_capacity(content.len() + extra);
+    let mut copied = 0;
+    for (range, replacement) in replacements {
+        if range.start < copied {
             continue;
         }
-
-        // Find the specifier between quotes
-        for quote in ['"', '\''] {
-            if let Some(start) = line.find(keyword) {
-                let after_keyword = &line[start + keyword.len()..];
-                if let Some(q1) = after_keyword.find(quote) {
-                    let after_q1 = &after_keyword[q1 + 1..];
-                    if let Some(q2) = after_q1.find(quote) {
-                        let specifier = &after_q1[..q2];
-
-                        if let Some(new_specifier) = resolve_and_rewrite(
-                            specifier,
-                            file_src_dir,
-                            file_dest_dir,
-                            author_alias,
-                            buyer_alias,
-                            src_to_dest,
-                            src_files,
-                            dest_files,
-                        ) {
-                            result = result.replacen(specifier, &new_specifier, 1);
-                            any_change = true;
-                        }
-                    }
-                }
-            }
-        }
+        result.push_str(&content[copied..range.start]);
+        result.push_str(&replacement);
+        copied = range.end;
     }
-
-    if any_change { Some(result) } else { None }
+    result.push_str(&content[copied..]);
+    Some(result)
 }
 
-/// Resolve a specifier and compute its rewritten form.
-///
-/// Steps:
-/// 1. Identify specifier type via [`classify_specifier`] (D4 anti-drift
-///    contract — same classifier feeds [`collect_bare_specifiers`]).
-/// 2. Resolve to a destination file path.
-/// 3. Compute new specifier using buyer alias.
-#[allow(clippy::too_many_arguments)]
+fn normalize_separators(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.as_bytes().contains(&b'\\') {
+        std::borrow::Cow::Owned(path.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
 fn resolve_and_rewrite(
     specifier: &str,
     file_src_dir: &str,
     file_dest_dir: &str,
     author_alias: Option<&str>,
     buyer_alias: Option<&str>,
-    src_to_dest: &HashMap<String, String>,
-    src_files: &HashSet<String>,
-    dest_files: &HashSet<String>,
+    src_to_dest: &HashMap<&str, &str>,
+    dest_files: &HashSet<&str>,
 ) -> Option<String> {
     match classify_specifier(specifier, author_alias) {
         SpecifierKind::Relative => {
-            // Resolve against src directory, then map to dest
             let resolved_src = normalize_path(&join_path(file_src_dir, specifier));
-            if let Some(src_match) = try_resolve_file(&resolved_src, src_files)
-                && let Some(dest_path) = src_to_dest.get(&src_match)
+            if let Some(src_match) = try_resolve_map_key(&resolved_src, src_to_dest)
+                && let Some(dest_path) = src_to_dest.get(src_match)
             {
-                return compute_new_specifier(dest_path, file_dest_dir, buyer_alias);
+                return compute_new_specifier(
+                    dest_path,
+                    file_dest_dir,
+                    buyer_alias,
+                    Some(specifier),
+                );
             }
 
-            // Fallback: resolve against dest directory directly
             let resolved_dest = normalize_path(&join_path(file_dest_dir, specifier));
-            if let Some(dest_match) = try_resolve_file(&resolved_dest, dest_files) {
-                return compute_new_specifier(&dest_match, file_dest_dir, buyer_alias);
+            if let Some(dest_match) = try_resolve_set(&resolved_dest, dest_files) {
+                return compute_new_specifier(
+                    dest_match,
+                    file_dest_dir,
+                    buyer_alias,
+                    Some(specifier),
+                );
             }
 
             None
         }
 
         SpecifierKind::AuthorAlias => {
-            // SAFETY: `classify_specifier` returned `AuthorAlias` only
-            // if `author_alias.is_some()` and the specifier strips that
-            // prefix, so this `expect` cannot panic.
-            let alias = author_alias.expect("AuthorAlias kind implies author_alias.is_some()");
-            let path = specifier
-                .strip_prefix(alias)
-                .expect("AuthorAlias kind implies specifier starts_with(alias)");
+            let alias = author_alias?;
+            let path = specifier.strip_prefix(alias)?;
 
-            // Look up in src file set, then map to dest
-            if let Some(src_match) = try_resolve_file(path, src_files)
-                && let Some(dest_path) = src_to_dest.get(&src_match)
+            if let Some(src_match) = try_resolve_map_key(path, src_to_dest)
+                && let Some(dest_path) = src_to_dest.get(src_match)
             {
-                return compute_new_specifier(dest_path, file_dest_dir, buyer_alias);
+                return compute_new_specifier(dest_path, file_dest_dir, buyer_alias, None);
             }
 
-            // Fallback: try in dest file set directly
-            if try_resolve_file(path, dest_files).is_some() {
-                // If buyer has same alias, no change needed
+            if try_resolve_set(path, dest_files).is_some() {
                 if buyer_alias == author_alias {
                     return None;
                 }
-                // Simple alias swap
                 if let Some(b_alias) = buyer_alias {
                     return Some(format!("{b_alias}{path}"));
                 }
             }
 
-            // If buyer has a different alias, swap even without file resolution
             if buyer_alias != author_alias
                 && let Some(b_alias) = buyer_alias
             {
@@ -269,102 +198,256 @@ fn resolve_and_rewrite(
             None
         }
 
-        // Bare specifier (react, next/link, @scope/pkg) — external,
-        // leave unchanged. `collect_bare_specifiers` picks these up
-        // separately for the simple-path "deps you'll need" notice.
         SpecifierKind::Bare => None,
     }
 }
 
-/// Collect every bare/external import specifier from a source file.
-///
-/// D4 — sibling to [`rewrite_imports`]. Used by `lpm add`'s
-/// simple path (no `lpm.config.json`) to print "Source uses external
-/// imports: react, lodash, …\n  Make sure these are in your project's
-/// dependencies." Anti-drift: shares [`classify_specifier`] with the
-/// rewriter so "bare" means the same thing in both places.
-///
-/// Walks the file line-by-line with the same comment-skipping rules as
-/// the rewriter (single-line `//`, multi-line `/* */`). Recognizes the
-/// same import-statement shapes (`from "…"`, `import("…")`,
-/// `require("…")`).
-///
-/// `author_alias` is the author's `lpm.config.json#importAlias` if
-/// known. When the simple-path consumer doesn't have access to one
-/// (the typical case for arbitrary npm packages without
-/// `lpm.config.json`), pass `None` — anything non-relative is then
-/// classified `Bare` and surfaced.
+/// Collects bare imports using the same lexer and classifier as rewriting.
 pub fn collect_bare_specifiers(content: &str, author_alias: Option<&str>) -> HashSet<String> {
     let mut bare = HashSet::new();
-    let mut in_block_comment = false;
-
-    for line in content.lines() {
-        if in_block_comment {
-            if line.contains("*/") {
-                in_block_comment = false;
-            }
-            continue;
+    visit_code_specifier_ranges(content, |range| {
+        let specifier = &content[range];
+        if classify_specifier(specifier, author_alias) == SpecifierKind::Bare {
+            bare.insert(specifier.to_string());
         }
-        if line.contains("/*") && !line.contains("*/") {
-            in_block_comment = true;
-            continue;
-        }
-        if line.trim_start().starts_with("//") {
-            continue;
-        }
-
-        for spec in line_specifiers(line) {
-            if classify_specifier(spec, author_alias) == SpecifierKind::Bare {
-                bare.insert(spec.to_string());
-            }
-        }
-    }
+    });
 
     bare
 }
 
-/// Find every import-style specifier on a single line.
-///
-/// Recognizes `from "…"`, `import("…")`, `require("…")` with either
-/// quote style. Iterates ALL occurrences (so a line with two
-/// `require()` calls yields both). Used by [`collect_bare_specifiers`].
-///
-/// The pre-existing rewriter has its own simpler scan in `try_rewrite_line`
-/// that finds only the first occurrence per (keyword, quote) pair.
-/// That limitation is preserved for now to avoid a behavior change in
-/// the rewriter; the collector deliberately does NOT inherit it
-/// because surfacing "make sure react is in your deps" is incomplete
-/// if a single line's second `require("react")` is silently dropped.
-fn line_specifiers(line: &str) -> Vec<&str> {
-    let import_keywords = ["from ", "import(", "require("];
-    let mut out = Vec::new();
-    for keyword in &import_keywords {
-        let mut search_from = 0;
-        while let Some(rel) = line[search_from..].find(keyword) {
-            let kw_start = search_from + rel;
-            let after_kw = &line[kw_start + keyword.len()..];
-            // Take the FIRST quote (single or double) that opens the
-            // specifier — and the matching close-quote of the same kind.
-            let first_double = after_kw.find('"');
-            let first_single = after_kw.find('\'');
-            let (open_idx, quote) = match (first_double, first_single) {
-                (Some(d), Some(s)) if d < s => (d, '"'),
-                (Some(_), Some(s)) => (s, '\''),
-                (Some(d), None) => (d, '"'),
-                (None, Some(s)) => (s, '\''),
-                (None, None) => {
-                    search_from = kw_start + keyword.len();
-                    continue;
-                }
-            };
-            let after_open = &after_kw[open_idx + 1..];
-            if let Some(close_idx) = after_open.find(quote) {
-                out.push(&after_open[..close_idx]);
+fn visit_code_specifier_ranges(content: &str, mut visit: impl FnMut(std::ops::Range<usize>)) {
+    visit_code_ranges(content.as_bytes(), 0, false, &mut visit);
+}
+
+fn visit_code_ranges(
+    bytes: &[u8],
+    mut index: usize,
+    stop_at_closing_brace: bool,
+    visit: &mut impl FnMut(std::ops::Range<usize>),
+) -> usize {
+    let mut nested_braces = 0_usize;
+    let mut regex_allowed = true;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted(bytes, index);
+                regex_allowed = false;
             }
-            search_from = kw_start + keyword.len();
+            b'`' => {
+                index = visit_template_literal(bytes, index, visit);
+                regex_allowed = false;
+            }
+            b'/' if bytes[index..].starts_with(b"//") => {
+                index = bytes[index..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(bytes.len(), |offset| index + offset + 1);
+            }
+            b'/' if bytes[index..].starts_with(b"/*") => {
+                index = bytes[index + 2..]
+                    .windows(2)
+                    .position(|window| window == b"*/")
+                    .map_or(bytes.len(), |offset| index + offset + 4);
+            }
+            b'/' if regex_allowed => {
+                index = skip_regex(bytes, index);
+                regex_allowed = false;
+            }
+            b'/' => {
+                index += 1;
+                regex_allowed = true;
+            }
+            b'{' => {
+                nested_braces += 1;
+                index += 1;
+                regex_allowed = true;
+            }
+            b'}' if stop_at_closing_brace && nested_braces == 0 => return index + 1,
+            b'}' => {
+                nested_braces = nested_braces.saturating_sub(1);
+                index += 1;
+                regex_allowed = false;
+            }
+            byte if is_identifier_start(byte) => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() && is_identifier_byte(bytes[index]) {
+                    index += 1;
+                }
+                let keyword = &bytes[start..index];
+                index = match keyword {
+                    b"from" => visit_quoted_after(bytes, index, false, visit),
+                    b"import" | b"require" => visit_quoted_after(bytes, index, true, visit),
+                    _ => index,
+                };
+                regex_allowed = keyword_allows_regex(keyword);
+            }
+            byte if byte.is_ascii_digit() => {
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric()
+                        || matches!(bytes[index], b'.' | b'_' | b'$'))
+                {
+                    index += 1;
+                }
+                regex_allowed = false;
+            }
+            b'+' | b'-' if bytes.get(index + 1) == bytes.get(index) => {
+                index += 2;
+                regex_allowed = false;
+            }
+            byte => {
+                index += 1;
+                if !byte.is_ascii_whitespace() {
+                    regex_allowed = punctuation_allows_regex(byte);
+                }
+            }
         }
     }
-    out
+    bytes.len()
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$')
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn keyword_allows_regex(keyword: &[u8]) -> bool {
+    matches!(
+        keyword,
+        b"return"
+            | b"throw"
+            | b"case"
+            | b"delete"
+            | b"void"
+            | b"typeof"
+            | b"instanceof"
+            | b"in"
+            | b"of"
+            | b"yield"
+            | b"await"
+            | b"new"
+            | b"else"
+            | b"do"
+    )
+}
+
+fn punctuation_allows_regex(byte: u8) -> bool {
+    !matches!(byte, b')' | b']' | b'.')
+}
+
+fn skip_trivia(bytes: &[u8], mut index: usize) -> usize {
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes[index..].starts_with(b"//") {
+            index = bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |offset| index + offset + 1);
+        } else if bytes[index..].starts_with(b"/*") {
+            index = bytes[index + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+                .map_or(bytes.len(), |offset| index + offset + 4);
+        } else {
+            return index;
+        }
+    }
+}
+
+fn visit_quoted_after(
+    bytes: &[u8],
+    mut index: usize,
+    allow_parentheses: bool,
+    visit: &mut impl FnMut(std::ops::Range<usize>),
+) -> usize {
+    index = skip_trivia(bytes, index);
+    if allow_parentheses && bytes.get(index) == Some(&b'(') {
+        index = skip_trivia(bytes, index + 1);
+    }
+    let Some(&quote @ (b'\'' | b'"')) = bytes.get(index) else {
+        return index.max(1);
+    };
+    let start = index + 1;
+    index = start;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == quote {
+            visit(start..index);
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn visit_template_literal(
+    bytes: &[u8],
+    start: usize,
+    visit: &mut impl FnMut(std::ops::Range<usize>),
+) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(bytes.len()),
+            b'`' => return index + 1,
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                index = visit_code_ranges(bytes, index + 2, true, visit);
+            }
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn skip_quoted(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if bytes[index] == quote {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn skip_regex(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    let mut in_character_class = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(bytes.len()),
+            b'[' => {
+                in_character_class = true;
+                index += 1;
+            }
+            b']' => {
+                in_character_class = false;
+                index += 1;
+            }
+            b'/' if !in_character_class => {
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+                    index += 1;
+                }
+                return index;
+            }
+            b'\n' | b'\r' => return index,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// Compute the new import specifier for a resolved internal file.
@@ -373,67 +456,114 @@ fn line_specifiers(line: &str) -> Vec<&str> {
 /// (relative imports already work when file structure is preserved).
 fn compute_new_specifier(
     resolved_dest_path: &str,
-    _file_dest_dir: &str,
+    file_dest_dir: &str,
     buyer_alias: Option<&str>,
+    original_relative: Option<&str>,
 ) -> Option<String> {
     let clean_path = strip_import_extension(resolved_dest_path);
 
     if let Some(alias) = buyer_alias {
-        let a = if alias.ends_with('/') {
-            alias.to_string()
-        } else {
-            format!("{alias}/")
-        };
-        return Some(format!("{a}{clean_path}"));
+        let needs_separator = !alias.ends_with('/');
+        let mut specifier =
+            String::with_capacity(alias.len() + usize::from(needs_separator) + clean_path.len());
+        specifier.push_str(alias);
+        if needs_separator {
+            specifier.push('/');
+        }
+        specifier.push_str(&clean_path);
+        return Some(specifier);
     }
 
-    // No buyer alias — no rewrite needed
+    if let Some(original) = original_relative {
+        let original_target = normalize_path(&join_path(file_dest_dir, original));
+        if strip_import_extension(&original_target) == clean_path {
+            return None;
+        }
+    }
+
+    Some(relative_import_specifier(file_dest_dir, &clean_path))
+}
+
+fn relative_import_specifier(from_dir: &str, target: &str) -> String {
+    let from_parts = || from_dir.split('/').filter(|part| !part.is_empty());
+    let target_parts = || target.split('/').filter(|part| !part.is_empty());
+    let common = from_parts()
+        .zip(target_parts())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let from_count = from_parts().count();
+    let mut result = String::with_capacity(from_dir.len() + target.len() + 3);
+    for _ in common..from_count {
+        result.push_str("../");
+    }
+    if common == from_count {
+        result.push_str("./");
+    }
+    for (index, part) in target_parts().skip(common).enumerate() {
+        if index > 0 {
+            result.push('/');
+        }
+        result.push_str(part);
+    }
+    result
+}
+
+fn try_resolve<'a>(
+    candidate: &str,
+    mut lookup: impl FnMut(&str) -> Option<&'a str>,
+) -> Option<&'a str> {
+    let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
+    if let Some(path) = lookup(candidate) {
+        return Some(path);
+    }
+
+    let mut scratch = String::with_capacity(candidate.len() + "/index".len() + 4);
+    for ext in EXTENSIONS {
+        scratch.clear();
+        scratch.push_str(candidate);
+        scratch.push_str(ext);
+        if let Some(path) = lookup(&scratch) {
+            return Some(path);
+        }
+    }
+
+    for ext in EXTENSIONS {
+        scratch.clear();
+        scratch.push_str(candidate);
+        scratch.push_str("/index");
+        scratch.push_str(ext);
+        if let Some(path) = lookup(&scratch) {
+            return Some(path);
+        }
+    }
+
     None
 }
 
-/// Find a path in a file set, trying various extensions.
+fn try_resolve_map_key<'a>(candidate: &str, files: &HashMap<&'a str, &str>) -> Option<&'a str> {
+    try_resolve(candidate, |path| {
+        files.get_key_value(path).map(|(key, _)| *key)
+    })
+}
+
+fn try_resolve_set<'a>(candidate: &str, files: &HashSet<&'a str>) -> Option<&'a str> {
+    try_resolve(candidate, |path| files.get(path).copied())
+}
+
+#[cfg(test)]
 fn try_resolve_file(candidate: &str, files: &HashSet<String>) -> Option<String> {
-    // Normalize: remove leading ./
-    let candidate = candidate.strip_prefix("./").unwrap_or(candidate);
-
-    // Exact match
-    if files.contains(candidate) {
-        return Some(candidate.to_string());
-    }
-
-    // Try with extensions
-    for ext in EXTENSIONS {
-        let with_ext = format!("{candidate}{ext}");
-        if files.contains(&with_ext) {
-            return Some(with_ext);
-        }
-    }
-
-    // Try index files
-    for ext in EXTENSIONS {
-        let index = format!("{candidate}/index{ext}");
-        if files.contains(&index) {
-            return Some(index);
-        }
-    }
-
-    None
+    let borrowed = files.iter().map(String::as_str).collect();
+    try_resolve_set(candidate, &borrowed).map(str::to_string)
 }
 
 /// Strip file extension for import paths. Also strips /index suffixes.
 fn strip_import_extension(path: &str) -> String {
-    // Strip /index.ext first
-    for ext in EXTENSIONS {
-        let suffix = format!("/index{ext}");
-        if path.ends_with(&suffix) {
-            return path[..path.len() - suffix.len()].to_string();
-        }
-    }
-
-    // Strip plain extension
     for ext in EXTENSIONS {
         if let Some(stripped) = path.strip_suffix(ext) {
-            return stripped.to_string();
+            return stripped
+                .strip_suffix("/index")
+                .unwrap_or(stripped)
+                .to_string();
         }
     }
 
@@ -505,6 +635,8 @@ mod tests {
         let mut files = HashSet::new();
         files.insert("lib/utils.js".to_string());
         files.insert("components/Button/index.tsx".to_string());
+        files.insert("modern/esm.mts".to_string());
+        files.insert("modern/cjs.cts".to_string());
 
         assert_eq!(
             try_resolve_file("lib/utils", &files),
@@ -519,6 +651,14 @@ mod tests {
             Some("components/Button/index.tsx".to_string())
         );
         assert_eq!(try_resolve_file("missing", &files), None);
+        assert_eq!(
+            try_resolve_file("modern/esm", &files),
+            Some("modern/esm.mts".to_string())
+        );
+        assert_eq!(
+            try_resolve_file("modern/cjs", &files),
+            Some("modern/cjs.cts".to_string())
+        );
     }
 
     #[test]
@@ -631,8 +771,6 @@ import Link from "next/link"
         assert!(result.is_none());
     }
 
-    // ── classify_specifier (D4 anti-drift contract) ─────────
-
     #[test]
     fn classify_relative_imports() {
         assert_eq!(
@@ -709,12 +847,6 @@ require("../also-local");
 
     #[test]
     fn collect_bare_specifiers_skips_line_and_multiline_comments() {
-        // Note: inline block comments on a SINGLE line (`/* ... */`)
-        // are NOT recognized by either `rewrite_imports` or
-        // `collect_bare_specifiers` — the collector inherits the
-        // rewriter's pre-existing line-anchored block-comment scan
-        // (D4 anti-drift). Flagging that as a known limitation rather
-        // than diverging here. See `line_specifiers` doc.
         let src = r#"
 // import { fake } from "should-be-skipped";
 import { real } from "react";
@@ -727,6 +859,43 @@ import { hidden } from "also-also-skipped";
         assert!(bare.contains("react"));
         assert!(!bare.contains("should-be-skipped"));
         assert!(!bare.contains("also-also-skipped"));
+    }
+
+    #[test]
+    fn collect_bare_specifiers_ignores_inline_block_comment_imports() {
+        let source = r#"/* require("comment-only") */ const real = require("react");"#;
+
+        let bare = collect_bare_specifiers(source, None);
+
+        assert_eq!(bare, HashSet::from(["react".to_string()]));
+    }
+
+    #[test]
+    fn rewrite_imports_leaves_inline_block_comment_specifiers_unchanged() {
+        let src_to_dest = HashMap::from([
+            ("fake.ts".to_string(), "moved/fake.ts".to_string()),
+            ("real.ts".to_string(), "moved/real.ts".to_string()),
+        ]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+        let content = r#"/* require("@/fake") */ const real = require("@/real");"#;
+
+        let rewritten = rewrite_imports(
+            content,
+            "entry.ts",
+            "entry.ts",
+            Some("@/"),
+            Some("#/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("the executable import must be rewritten");
+
+        assert_eq!(
+            rewritten,
+            r##"/* require("@/fake") */ const real = require("#/moved/real");"##
+        );
     }
 
     #[test]
@@ -773,5 +942,255 @@ import { c } from "react";
         let src = "const x = 5;\nfunction foo() { return 42; }\n";
         let bare = collect_bare_specifiers(src, None);
         assert!(bare.is_empty());
+    }
+
+    #[test]
+    fn rewrite_imports_updates_every_same_line_occurrence() {
+        let src_to_dest = HashMap::from([
+            ("src/a.ts".to_string(), "moved/a.ts".to_string()),
+            ("src/b.ts".to_string(), "moved/b.ts".to_string()),
+        ]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+        let content = r#"const a = require("./a"); const b = require("./b");"#;
+
+        let rewritten = rewrite_imports(
+            content,
+            "src/index.ts",
+            "moved/index.ts",
+            Some("@/"),
+            Some("@/components/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("both relative imports must be rewritten");
+
+        assert_eq!(
+            rewritten,
+            r#"const a = require("@/components/moved/a"); const b = require("@/components/moved/b");"#
+        );
+    }
+
+    #[test]
+    fn rewrite_imports_preserves_crlf_and_final_newline_state() {
+        let src_to_dest = HashMap::from([("src/a.ts".to_string(), "moved/a.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+        let content = "import a from \"./a\";\r\nexport { a };";
+
+        let rewritten = rewrite_imports(
+            content,
+            "src/index.ts",
+            "moved/index.ts",
+            Some("@/"),
+            Some("@/components/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("relative import must be rewritten");
+
+        assert_eq!(
+            rewritten,
+            "import a from \"@/components/moved/a\";\r\nexport { a };"
+        );
+    }
+
+    #[test]
+    fn rewrite_imports_accepts_windows_logical_path_separators() {
+        let src_to_dest = HashMap::from([("src/util.ts".to_string(), "moved/util.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            "import util from \"./util\";",
+            "src\\index.ts",
+            "moved\\index.ts",
+            Some("@/"),
+            Some("@/components/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("Windows logical paths must resolve");
+
+        assert_eq!(rewritten, "import util from \"@/components/moved/util\";");
+    }
+
+    #[test]
+    fn rewrite_imports_ignores_import_syntax_inside_string_literals() {
+        let src_to_dest = HashMap::from([("src/util.ts".to_string(), "moved/util.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+        let content = r#"const example = 'require("@/src/util")';"#;
+
+        let rewritten = rewrite_imports(
+            content,
+            "src/index.ts",
+            "moved/index.ts",
+            Some("@/"),
+            Some("#/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        );
+
+        assert!(rewritten.is_none());
+    }
+
+    #[test]
+    fn collect_bare_specifiers_ignores_import_syntax_inside_string_literals() {
+        let content = r#"const example = 'require("not-a-dependency")';"#;
+
+        assert!(collect_bare_specifiers(content, None).is_empty());
+    }
+
+    #[test]
+    fn rewrite_imports_without_buyer_alias_converts_author_alias_to_relative() {
+        let src_to_dest = HashMap::from([
+            (
+                "src/index.ts".to_string(),
+                "components/index.ts".to_string(),
+            ),
+            ("src/util.ts".to_string(), "lib/util.ts".to_string()),
+        ]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            r#"import util from "@/src/util";"#,
+            "src/index.ts",
+            "components/index.ts",
+            Some("@/"),
+            None,
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("author alias must be replaced");
+
+        assert_eq!(rewritten, r#"import util from "../lib/util";"#);
+    }
+
+    #[test]
+    fn rewrite_imports_without_alias_repairs_relocated_relative_import() {
+        let src_to_dest = HashMap::from([
+            (
+                "src/index.ts".to_string(),
+                "components/index.ts".to_string(),
+            ),
+            ("src/util.ts".to_string(), "lib/util.ts".to_string()),
+        ]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            r#"import util from "./util";"#,
+            "src/index.ts",
+            "components/index.ts",
+            None,
+            None,
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("relocated relative import must be repaired");
+
+        assert_eq!(rewritten, r#"import util from "../lib/util";"#);
+    }
+
+    #[test]
+    fn rewrite_imports_updates_side_effect_imports() {
+        let src_to_dest = HashMap::from([
+            (
+                "src/index.ts".to_string(),
+                "components/index.ts".to_string(),
+            ),
+            ("src/polyfill.ts".to_string(), "lib/polyfill.ts".to_string()),
+        ]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            r#"import "./polyfill";"#,
+            "src/index.ts",
+            "components/index.ts",
+            None,
+            None,
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("side-effect import must be repaired");
+
+        assert_eq!(rewritten, r#"import "../lib/polyfill";"#);
+    }
+
+    #[test]
+    fn rewrite_imports_scans_executable_template_interpolations() {
+        let src_to_dest = HashMap::from([("util.ts".to_string(), "shared/util.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            r#"const value = `literal require("@/util") ${require("@/util")}`;"#,
+            "index.ts",
+            "components/index.ts",
+            Some("@/"),
+            Some("@/app/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("template interpolation import must be rewritten");
+
+        assert_eq!(
+            rewritten,
+            r#"const value = `literal require("@/util") ${require("@/app/shared/util")}`;"#
+        );
+    }
+
+    #[test]
+    fn rewrite_imports_does_not_scan_regex_literals_after_keywords() {
+        let src_to_dest = HashMap::from([("util.ts".to_string(), "shared/util.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            "function pattern() { return /require(\"alias:util\")/; }\nconst util = require(\"alias:util\");",
+            "index.ts",
+            "components/index.ts",
+            Some("alias:"),
+            Some("app:"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("real require must be rewritten");
+
+        assert!(rewritten.contains(r#"return /require("alias:util")/"#));
+        assert!(rewritten.contains(r#"require("app:/shared/util")"#));
+    }
+
+    #[test]
+    fn rewrite_imports_allows_comments_between_call_tokens() {
+        let src_to_dest = HashMap::from([("util.ts".to_string(), "shared/util.ts".to_string())]);
+        let src_files = src_to_dest.keys().cloned().collect();
+        let dest_files = src_to_dest.values().cloned().collect();
+
+        let rewritten = rewrite_imports(
+            r#"const util = require /* loader */ ( /* path */ "@/util" );"#,
+            "index.ts",
+            "components/index.ts",
+            Some("@/"),
+            Some("@/app/"),
+            &src_to_dest,
+            &src_files,
+            &dest_files,
+        )
+        .expect("comment-separated require must be rewritten");
+
+        assert!(rewritten.contains(r#""@/app/shared/util""#));
     }
 }

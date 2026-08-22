@@ -1,22 +1,65 @@
 use lpm_common::LpmError;
 use std::path::{Path, PathBuf};
 
+pub(super) fn validate_source_delivery_namespace(
+    project_root_canonical: &Path,
+    destination: &Path,
+) -> Result<(), LpmError> {
+    let relative = destination
+        .strip_prefix(project_root_canonical)
+        .map_err(|_| {
+            LpmError::Registry(format!(
+                "source delivery destination is outside the project: {}",
+                destination.display()
+            ))
+        })?;
+    if relative.components().next().is_some_and(|component| {
+        matches!(component, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".lpm"))
+    }) {
+        return Err(LpmError::Registry(format!(
+            "source delivery cannot write into the reserved .lpm state directory: {}",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn portable_destination_identity(path: &Path) -> String {
+    let mut identity = String::new();
+    for component in path.components() {
+        if !identity.is_empty() {
+            identity.push('/');
+        }
+        identity.extend(
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .chars()
+                .flat_map(char::to_lowercase),
+        );
+    }
+    identity
+}
+
 /// Validate that all extracted file paths stay within the target directory.
 ///
 /// Prevents malicious tarballs from writing outside the extraction directory
 /// using `../` or symlink tricks.
 pub(super) fn validate_extracted_paths(
     files: &[PathBuf],
-    target_dir: &Path,
+    _target_dir: &Path,
 ) -> Result<(), LpmError> {
-    let target_canonical = target_dir
-        .canonicalize()
-        .unwrap_or_else(|_| target_dir.to_path_buf());
-
     for file in files {
-        let resolved = target_dir.join(file);
-        let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-        if !canonical.starts_with(&target_canonical) {
+        if file.is_absolute()
+            || file.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
             return Err(LpmError::Registry(format!(
                 "path traversal detected: '{}' escapes target directory",
                 file.display()
@@ -133,7 +176,7 @@ pub(super) fn resolve_safe_dest_validate(
     // Refuse to overwrite/follow an existing symlink at the
     // destination itself. `symlink_metadata` does NOT follow links.
     if let Ok(meta) = std::fs::symlink_metadata(&dest)
-        && meta.file_type().is_symlink()
+        && lpm_common::is_symlink_or_junction(&meta)
     {
         return Err(LpmError::Registry(format!(
             "destination '{}' is a symlink; refusing to write through it",
@@ -164,7 +207,9 @@ pub(super) fn resolve_safe_dest_validate(
             }
         }
     };
-    if !canonical_existing_ancestor.starts_with(target_root_canonical) {
+    if !canonical_existing_ancestor.starts_with(target_root_canonical)
+        && !target_root_canonical.starts_with(&canonical_existing_ancestor)
+    {
         return Err(LpmError::Registry(format!(
             "path containment violation: '{}' resolves outside target '{}'",
             dest.display(),
@@ -499,7 +544,7 @@ mod tests {
             assert_eq!(
                 final_dest,
                 canonical_target.join("foo.tsx"),
-                "final dest must be canonical-pinned, got {final_dest:?}"
+                "final dest must use the canonical parent, got {final_dest:?}"
             );
             assert!(
                 !final_dest.to_string_lossy().contains("aliased"),

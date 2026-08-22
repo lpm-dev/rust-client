@@ -15,7 +15,7 @@ pub(super) fn is_runtime_source_text_file(path: &Path) -> bool {
 
     matches!(
         path.extension().and_then(|e| e.to_str()).unwrap_or(""),
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs"
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
     )
 }
 
@@ -53,14 +53,156 @@ pub(super) fn json_value_to_config_string(value: &serde_json::Value) -> Option<S
     }
 }
 
+pub(super) fn resolve_noninteractive_required_config(
+    config: &serde_json::Value,
+    values: &mut HashMap<String, String>,
+) -> Result<(), LpmError> {
+    let Some(schema) = config
+        .get("configSchema")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    for (key, field) in schema {
+        if values.contains_key(key) {
+            continue;
+        }
+        let required = field
+            .get("required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let resolved = config
+            .get("defaultConfig")
+            .and_then(|defaults| defaults.get(key))
+            .and_then(json_value_to_config_string)
+            .or_else(|| field.get("default").and_then(json_value_to_config_string))
+            .or_else(|| {
+                if !required {
+                    return None;
+                }
+                (field.get("type").and_then(serde_json::Value::as_str) == Some("boolean"))
+                    .then(|| "false".to_string())
+            })
+            .or_else(|| {
+                if !required {
+                    return None;
+                }
+                let options = field.get("options")?.as_array()?;
+                (options.len() == 1).then(|| {
+                    options[0]
+                        .as_str()
+                        .or_else(|| options[0].get("value").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                })?
+            });
+        if let Some(value) = resolved.filter(|value| !value.is_empty()) {
+            values.insert(key.clone(), value);
+        } else if required {
+            return Err(LpmError::Registry(format!(
+                "required configuration '{key}' has no default; provide it in the package spec as '?{key}=value'"
+            )));
+        }
+    }
+    validate_declared_config_values(config, values)
+}
+
+pub(super) fn validate_declared_config_values(
+    config: &serde_json::Value,
+    values: &mut HashMap<String, String>,
+) -> Result<(), LpmError> {
+    let Some(schema) = config
+        .get("configSchema")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    for key in values.keys() {
+        if !schema.contains_key(key) {
+            return Err(LpmError::Registry(format!(
+                "configuration '{key}' is not declared by this package"
+            )));
+        }
+    }
+
+    let mut unset = Vec::new();
+    for (key, value) in values.iter_mut() {
+        let field = &schema[key];
+        let required = field
+            .get("required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let field_type = field
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("string");
+        if value.is_empty() {
+            if required {
+                return Err(LpmError::Registry(format!(
+                    "required configuration '{key}' cannot be empty"
+                )));
+            }
+            unset.push(key.clone());
+            continue;
+        }
+
+        match field_type {
+            "boolean" if value != "true" && value != "false" => {
+                return Err(LpmError::Registry(format!(
+                    "configuration '{key}' must be 'true' or 'false', got '{value}'"
+                )));
+            }
+            "select" => {
+                let options = field
+                    .get("options")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| {
+                        option
+                            .as_str()
+                            .or_else(|| option.get("value").and_then(serde_json::Value::as_str))
+                    })
+                    .collect::<HashSet<_>>();
+                let multi = field
+                    .get("multiSelect")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let selections = value.split(',').map(str::trim).collect::<Vec<_>>();
+                if !multi && selections.len() != 1 {
+                    return Err(LpmError::Registry(format!(
+                        "configuration '{key}' accepts one selection"
+                    )));
+                }
+                if let Some(invalid) = selections
+                    .iter()
+                    .find(|selection| selection.is_empty() || !options.contains(**selection))
+                {
+                    return Err(LpmError::Registry(format!(
+                        "configuration '{key}' has invalid selection '{invalid}'"
+                    )));
+                }
+                if multi {
+                    *value = selections.join(",");
+                }
+            }
+            _ => {}
+        }
+    }
+    for key in unset {
+        values.remove(&key);
+    }
+    Ok(())
+}
+
 /// Filter files using lpm.config.json `files` array with condition evaluation.
 pub(super) fn filter_config_files(
     extract_dir: &Path,
     files_rules: &[serde_json::Value],
     config: &HashMap<String, String>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, LpmError> {
     let provided_params: HashSet<&str> = config.keys().map(|k| k.as_str()).collect();
     let mut result = Vec::new();
+    let source_index = index_source_files(extract_dir)?;
 
     for rule in files_rules {
         let src_pattern = rule.get("src").and_then(|v| v.as_str()).unwrap_or("");
@@ -108,78 +250,126 @@ pub(super) fn filter_config_files(
         }
 
         // Expand src pattern to actual file paths
-        let expanded = expand_src_pattern(extract_dir, src_pattern);
+        validate_source_selector(src_pattern)?;
+        let src_pattern = normalize_logical_path(src_pattern);
+        let expanded = expand_src_pattern(&source_index, &src_pattern);
 
         // Compute the base directory of the src pattern (strip trailing /** or /*)
         let pattern_base = src_pattern.trim_end_matches("/**").trim_end_matches("/*");
 
         let multi_file = expanded.len() > 1;
-        for path in expanded {
-            if !path.is_file() {
-                continue;
-            }
-            if let Ok(rel) = path.strip_prefix(extract_dir) {
-                let src_rel = rel.to_string_lossy().to_string();
-                let dest_rel = if let Some(d) = &dest {
-                    if d.ends_with('/') {
-                        format!(
-                            "{}{}",
-                            d,
-                            rel.file_name().unwrap_or_default().to_string_lossy()
-                        )
-                    } else if multi_file {
-                        // Multiple files: maintain structure relative to glob base
-                        // JS CLI: path.relative(baseSrc, srcFile) then path.join(dest, relFromBase)
-                        let base_path = extract_dir.join(pattern_base);
-                        let rel_from_base = path.strip_prefix(&base_path).unwrap_or(rel);
-                        format!(
-                            "{}/{}",
-                            d.trim_end_matches('/'),
-                            rel_from_base.to_string_lossy()
-                        )
-                    } else {
-                        d.clone()
-                    }
+        for (path, src_rel) in expanded {
+            let dest_rel = if let Some(d) = &dest {
+                if d.ends_with('/') {
+                    format!(
+                        "{}{}",
+                        d,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )
+                } else if multi_file {
+                    // Matches the JS CLI's range-target directory layout.
+                    let rel_from_base = src_rel
+                        .strip_prefix(pattern_base)
+                        .and_then(|value| value.strip_prefix('/'))
+                        .unwrap_or(&src_rel);
+                    format!("{}/{}", d.trim_end_matches('/'), rel_from_base)
                 } else {
-                    src_rel.clone()
-                };
-                result.push((src_rel, dest_rel));
-            }
+                    d.clone()
+                }
+            } else {
+                src_rel.clone()
+            };
+            result.push((src_rel, dest_rel));
         }
     }
 
-    result
+    Ok(result)
 }
 
-/// Expand a src pattern from lpm.config.json to actual file paths.
-///
-/// Matches the JS CLI's `expandSrcGlob` behaviour:
-///   - Exact paths: `"lib/utils.js"` → check existence
-///   - Recursive wildcard: `"components/dialog/**"` → walk directory tree
-///   - Single-dir wildcard: `"styles/*.css"` → regex match in one directory
-///
-/// The `glob` crate's `**` only matches directories, NOT files, so we must
-/// handle `/**` ourselves with a recursive walk (same as the JS CLI does).
-fn expand_src_pattern(extract_dir: &Path, pattern: &str) -> Vec<PathBuf> {
-    // No wildcard → exact path check
-    if !pattern.contains('*') {
-        let full_path = extract_dir.join(pattern);
-        if full_path.exists() {
-            return vec![full_path];
+struct IndexedSourceFile {
+    absolute: PathBuf,
+    logical: String,
+}
+
+fn normalize_logical_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn validate_source_selector(pattern: &str) -> Result<(), LpmError> {
+    let path = Path::new(pattern);
+    if pattern.is_empty() || path.is_absolute() {
+        return Err(LpmError::Registry(format!(
+            "source selector '{pattern}' must be a non-empty relative path"
+        )));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(LpmError::Registry(format!(
+            "source selector '{pattern}' contains a parent, root, or drive component"
+        )));
+    }
+    Ok(())
+}
+
+fn index_source_files(extract_dir: &Path) -> Result<Vec<IndexedSourceFile>, LpmError> {
+    fn visit(
+        extract_dir: &Path,
+        dir: &Path,
+        files: &mut Vec<IndexedSourceFile>,
+    ) -> Result<(), LpmError> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                visit(extract_dir, &path, files)?;
+            } else if metadata.is_file()
+                && let Ok(relative) = path.strip_prefix(extract_dir)
+            {
+                let logical = normalize_logical_path(&relative.to_string_lossy());
+                files.push(IndexedSourceFile {
+                    absolute: path,
+                    logical,
+                });
+            }
         }
-        return vec![];
+        Ok(())
     }
 
-    // Recursive wildcard: "dir/**"
+    let mut files = Vec::new();
+    visit(extract_dir, extract_dir, &mut files)?;
+    Ok(files)
+}
+
+fn expand_src_pattern<'a>(
+    files: &'a [IndexedSourceFile],
+    pattern: &str,
+) -> Vec<(&'a Path, String)> {
+    if !pattern.contains('*') {
+        return files
+            .iter()
+            .filter(|file| file.logical == pattern)
+            .map(|file| (file.absolute.as_path(), file.logical.clone()))
+            .collect();
+    }
+
     if let Some(base) = pattern.strip_suffix("/**") {
-        // strip "/**"
-        let base_dir = extract_dir.join(base);
-        if !base_dir.is_dir() {
-            return vec![];
-        }
-        let mut results = Vec::new();
-        collect_files_recursive(&base_dir, &mut results);
-        return results;
+        let prefix = format!("{}/", base.trim_end_matches('/'));
+        return files
+            .iter()
+            .filter(|file| file.logical.starts_with(&prefix))
+            .map(|file| (file.absolute.as_path(), file.logical.clone()))
+            .collect();
     }
 
     // Single-directory wildcard: "dir/*.ext" or "*.md"
@@ -190,92 +380,50 @@ fn expand_src_pattern(extract_dir: &Path, pattern: &str) -> Vec<PathBuf> {
     };
 
     if file_part.contains('*') {
-        let full_dir = if dir_part == "." {
-            extract_dir.to_path_buf()
-        } else {
-            extract_dir.join(dir_part)
-        };
-        if !full_dir.is_dir() {
-            return vec![];
-        }
-
-        let mut results = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&full_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file()
-                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && glob_simple_match(file_part, name)
-                {
-                    results.push(path);
-                }
-            }
-        }
-        return results;
+        return files
+            .iter()
+            .filter(|file| {
+                let (file_dir, name) = file
+                    .logical
+                    .rsplit_once('/')
+                    .map_or((".", file.logical.as_str()), |(dir, name)| (dir, name));
+                file_dir == dir_part && glob_simple_match(file_part, name)
+            })
+            .map(|file| (file.absolute.as_path(), file.logical.clone()))
+            .collect();
     }
 
     // Fallback: treat as exact path
-    let full_path = extract_dir.join(pattern);
-    if full_path.exists() {
-        vec![full_path]
-    } else {
-        vec![]
-    }
+    Vec::new()
 }
 
 /// Match a filename against a simple glob pattern (supports `*` only).
 ///
 /// Examples: `"*.css"` matches `"style.css"`, `"*.*"` matches `"foo.bar"`.
 fn glob_simple_match(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    // Split pattern on '*' and check that all parts appear in order
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.is_empty() {
-        return pattern == name;
-    }
-    let mut pos = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            // First part must be a prefix
-            if !name.starts_with(part) {
-                return false;
-            }
-            pos = part.len();
-        } else if i == parts.len() - 1 {
-            // Last part must be a suffix
-            if !name[pos..].ends_with(part) {
-                return false;
-            }
-            pos = name.len();
+    let pattern = pattern.as_bytes();
+    let name = name.as_bytes();
+    let (mut p, mut n, mut star, mut retry) = (0, 0, None, 0);
+    while n < name.len() {
+        if p < pattern.len() && pattern[p] == name[n] {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = n;
+        } else if let Some(star_index) = star {
+            retry += 1;
+            n = retry;
+            p = star_index + 1;
         } else {
-            match name[pos..].find(part) {
-                Some(idx) => pos += idx + part.len(),
-                None => return false,
-            }
+            return false;
         }
     }
-    true
-}
-
-/// Recursively collect all files in a directory.
-fn collect_files_recursive(dir: &Path, results: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, results);
-        } else if path.is_file() {
-            results.push(path);
-        }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
     }
+    p == pattern.len()
 }
 
 /// Collect source files, checking package.json#lpm.source first (legacy fallback),
@@ -293,11 +441,22 @@ pub(super) fn collect_source_with_fallback(
             .and_then(|l| l.get("source"))
             .and_then(|s| s.as_str())
     {
+        validate_source_selector(source_dir)?;
         let source_path = extract_dir.join(source_dir);
+        let source_path = source_path.canonicalize().map_err(|error| {
+            LpmError::Registry(format!("invalid lpm.source '{source_dir}': {error}"))
+        })?;
+        let extract_canonical = extract_dir.canonicalize()?;
+        if !source_path.starts_with(&extract_canonical) {
+            return Err(LpmError::Registry(format!(
+                "lpm.source '{source_dir}' resolves outside the extracted package"
+            )));
+        }
         if source_path.is_dir() {
             let mut files = Vec::new();
-            collect_dir_no_skip(&source_path, &source_path, &mut files)?;
+            collect_dir_no_skip(&source_path, &extract_canonical, &source_path, &mut files)?;
             if !files.is_empty() {
+                files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
                 return Ok(files);
             }
         } else if source_path.is_file() {
@@ -306,7 +465,11 @@ pub(super) fn collect_source_with_fallback(
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            return Ok(vec![(name.clone(), name)]);
+            let src = source_path
+                .strip_prefix(&extract_canonical)
+                .map(|path| normalize_logical_path(&path.to_string_lossy()))
+                .map_err(|_| LpmError::Registry("lpm.source escaped extraction".into()))?;
+            return Ok(vec![(src, name)]);
         }
     }
 
@@ -318,19 +481,29 @@ pub(super) fn collect_source_with_fallback(
 /// Used for lpm.source directories where we want everything.
 fn collect_dir_no_skip(
     dir: &Path,
-    root: &Path,
+    extract_root: &Path,
+    dest_root: &Path,
     files: &mut Vec<(String, String)>,
 ) -> Result<(), LpmError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_dir_no_skip(&path, root, files)?;
-        } else if path.is_file()
-            && let Ok(rel) = path.strip_prefix(root)
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_dir_no_skip(&path, extract_root, dest_root, files)?;
+        } else if metadata.is_file()
+            && let (Ok(src_rel), Ok(dest_rel)) = (
+                path.strip_prefix(extract_root),
+                path.strip_prefix(dest_root),
+            )
         {
-            let rel_str = rel.to_string_lossy().to_string();
-            files.push((rel_str.clone(), rel_str));
+            files.push((
+                normalize_logical_path(&src_rel.to_string_lossy()),
+                normalize_logical_path(&dest_rel.to_string_lossy()),
+            ));
         }
     }
     Ok(())
@@ -340,6 +513,7 @@ fn collect_dir_no_skip(
 fn collect_all_source_files(extract_dir: &Path) -> Result<Vec<(String, String)>, LpmError> {
     let mut files = Vec::new();
     collect_dir(extract_dir, extract_dir, &mut files)?;
+    files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
 
@@ -362,7 +536,7 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
                 continue;
             }
             if let Ok(rel) = path.strip_prefix(root) {
-                let rel_str = rel.to_string_lossy().to_string();
+                let rel_str = normalize_logical_path(&rel.to_string_lossy());
                 files.push((rel_str.clone(), rel_str));
             }
         }
@@ -372,6 +546,130 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn runtime_source_detection_includes_modern_typescript_modules() {
+        for path in ["module.mts", "module.cts"] {
+            assert!(is_runtime_source_text_file(Path::new(path)), "{path}");
+        }
+        for path in ["module.d.mts", "module.d.cts"] {
+            assert!(!is_runtime_source_text_file(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn fallback_source_collection_is_lexically_ordered() {
+        let extract = tempfile::tempdir().unwrap();
+        std::fs::write(extract.path().join("z.ts"), "z").unwrap();
+        std::fs::create_dir(extract.path().join("z-dir")).unwrap();
+        std::fs::write(extract.path().join("z-dir/b.ts"), "b").unwrap();
+        std::fs::write(extract.path().join("a.ts"), "a").unwrap();
+        std::fs::create_dir(extract.path().join("a-dir")).unwrap();
+        std::fs::write(extract.path().join("a-dir/c.ts"), "c").unwrap();
+
+        let files = collect_all_source_files(extract.path()).unwrap();
+        let paths = files
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["a-dir/c.ts", "a.ts", "z-dir/b.ts", "z.ts"]);
+    }
+
+    #[test]
+    fn noninteractive_config_rejects_values_outside_the_declared_schema() {
+        let config = json!({
+            "configSchema": {
+                "enabled": {"type": "boolean"},
+                "variant": {"type": "select", "options": ["a", "b"]},
+                "features": {"type": "select", "multiSelect": true, "options": ["x", "y"]}
+            }
+        });
+        for (key, value) in [
+            ("enabled", "maybe"),
+            ("variant", "unknown"),
+            ("features", "x,unknown"),
+            ("undeclared", "value"),
+        ] {
+            let mut values = HashMap::from([(key.to_string(), value.to_string())]);
+            let error = resolve_noninteractive_required_config(&config, &mut values)
+                .expect_err("invalid inline configuration must fail");
+            assert!(error.to_string().contains(key), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn noninteractive_config_applies_defaults_to_optional_fields() {
+        let config = json!({
+            "configSchema": {
+                "variant": {"type": "select", "options": ["a", "b"], "default": "a"},
+                "features": {"type": "select", "multiSelect": true, "options": ["x", "y"], "default": "y"}
+            }
+        });
+        let mut values = HashMap::new();
+
+        resolve_noninteractive_required_config(&config, &mut values).unwrap();
+
+        assert_eq!(values.get("variant").map(String::as_str), Some("a"));
+        assert_eq!(values.get("features").map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn config_source_parent_reference_cannot_select_file_outside_extraction() {
+        let outer = tempfile::tempdir().unwrap();
+        let extract = outer.path().join("package");
+        std::fs::create_dir(&extract).unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "secret").unwrap();
+
+        let error = filter_config_files(
+            &extract,
+            &[json!({"src": "../secret.txt", "dest": "copied.txt"})],
+            &HashMap::new(),
+        )
+        .expect_err("parent source selector must be rejected");
+
+        assert!(
+            error.to_string().contains("parent"),
+            "unexpected source-selector error: {error}"
+        );
+    }
+
+    #[test]
+    fn nested_legacy_source_directory_keeps_extraction_relative_source_paths() {
+        let extract = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(extract.path().join("src/components")).unwrap();
+        std::fs::write(
+            extract.path().join("package.json"),
+            r#"{"lpm":{"source":"src/components"}}"#,
+        )
+        .unwrap();
+        std::fs::write(extract.path().join("src/components/Button.tsx"), "button").unwrap();
+
+        assert_eq!(
+            collect_source_with_fallback(extract.path()).unwrap(),
+            vec![("src/components/Button.tsx".into(), "Button.tsx".into())]
+        );
+    }
+
+    #[test]
+    fn nested_legacy_source_file_keeps_extraction_relative_source_path() {
+        let extract = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(extract.path().join("src/components")).unwrap();
+        std::fs::write(
+            extract.path().join("package.json"),
+            r#"{"lpm":{"source":"src/components/Button.tsx"}}"#,
+        )
+        .unwrap();
+        std::fs::write(extract.path().join("src/components/Button.tsx"), "button").unwrap();
+
+        assert_eq!(
+            collect_source_with_fallback(extract.path()).unwrap(),
+            vec![("src/components/Button.tsx".into(), "Button.tsx".into())]
+        );
+    }
+
     // ── lpm.config.json value coercion (json_value_to_config_string) ───
     //
     // The wire contract for `lpm.config.json` accepts both the natural
@@ -498,7 +796,8 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": true},
             })];
-            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")]));
+            let out =
+                filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")])).unwrap();
             assert_eq!(out.len(), 1, "native-bool condition must match: {out:?}");
         }
 
@@ -510,7 +809,8 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": true},
             })];
-            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "false")]));
+            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "false")]))
+                .unwrap();
             assert!(out.is_empty(), "must exclude on opposite value: {out:?}");
         }
 
@@ -524,7 +824,8 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": "true"},
             })];
-            let out = filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")]));
+            let out =
+                filter_config_files(dir.path(), &rules, &config(&[("withTests", "true")])).unwrap();
             assert_eq!(out.len(), 1, "legacy string condition must match: {out:?}");
         }
 
@@ -539,7 +840,7 @@ mod tests {
                 "include": "when",
                 "condition": {"withTests": true},
             })];
-            let out = filter_config_files(dir.path(), &rules, &HashMap::new());
+            let out = filter_config_files(dir.path(), &rules, &HashMap::new()).unwrap();
             assert_eq!(
                 out.len(),
                 1,

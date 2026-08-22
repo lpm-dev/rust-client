@@ -84,6 +84,18 @@ pub(crate) fn latest_allowed_version_or_policy_error(
     metadata: &PackageMetadata,
     policy: &ResolverPolicy,
 ) -> Result<String, LpmError> {
+    if let Some(latest) = metadata.latest_version_tag()
+        && Version::parse(latest).is_ok()
+        && metadata.versions.contains_key(latest)
+        && version_allowed_by_policy(
+            &CanonicalKey::from_dep_name(&metadata.name),
+            metadata,
+            latest,
+            policy,
+        )
+    {
+        return Ok(latest.to_string());
+    }
     Ok(allowed_version_index(metadata, policy)?.latest)
 }
 

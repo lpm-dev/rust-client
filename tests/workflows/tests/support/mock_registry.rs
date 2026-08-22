@@ -358,7 +358,7 @@ impl MockRegistry {
                 })),
             )
             .with_priority(1)
-            .expect(1)
+            .expect(1..)
             .mount(&self.server)
             .await;
         self

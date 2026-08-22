@@ -1,11 +1,28 @@
-use super::dependencies::count_dependencies;
-use super::project::detect_framework;
 use super::target::AddTarget;
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
+
+#[derive(Serialize)]
+struct DryRunFile<'a> {
+    path: &'a str,
+    action: &'static str,
+}
+
+#[derive(Serialize)]
+struct DryRunOutput<'a> {
+    success: bool,
+    dry_run: bool,
+    package: String,
+    version: &'a str,
+    target: String,
+    files: Vec<DryRunFile<'a>>,
+    dependencies_count: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Dry-run mode
@@ -23,10 +40,11 @@ pub(super) fn handle_dry_run(
     lpm_config: &Option<serde_json::Value>,
     inline_config: &HashMap<String, String>,
     _ecosystem: &str,
-    extract_dir: &Path,
     json_output: bool,
+    no_install_deps: bool,
+    planned_dependency_count: usize,
 ) -> Result<(), LpmError> {
-    let mut file_actions = Vec::new();
+    let mut file_actions = Vec::with_capacity(files.len());
 
     for (_src_rel, dest_rel) in files {
         let dest_target = target_dir.join(dest_rel);
@@ -36,33 +54,40 @@ pub(super) fn handle_dry_run(
         } else {
             "create"
         };
-        file_actions.push((dest_rel.clone(), action));
+        file_actions.push((dest_rel.as_str(), action));
     }
 
     // Count dependencies that would be installed
-    let dep_count = count_dependencies(lpm_config, inline_config, extract_dir)?;
+    let dep_count = if no_install_deps || lpm_config.is_none() {
+        0
+    } else {
+        planned_dependency_count
+    };
 
     if json_output {
-        let files_json: Vec<serde_json::Value> = file_actions
+        let files = file_actions
             .iter()
-            .map(|(path, action)| {
-                serde_json::json!({
-                    "path": path,
-                    "action": action,
-                })
-            })
+            .map(|(path, action)| DryRunFile { path, action })
             .collect();
-
-        let json = serde_json::json!({
-            "success": true,
-            "dry_run": true,
-            "package": add_target.json_name(),
-            "version": version,
-            "target": target_dir.strip_prefix(project_dir).unwrap_or(target_dir).display().to_string(),
-            "files": files_json,
-            "dependencies_count": dep_count,
-        });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        let output = DryRunOutput {
+            success: true,
+            dry_run: true,
+            package: add_target.json_name(),
+            version,
+            target: target_dir
+                .strip_prefix(project_dir)
+                .unwrap_or(target_dir)
+                .display()
+                .to_string(),
+            files,
+            dependencies_count: dep_count,
+        };
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        serde_json::to_writer_pretty(&mut stdout, &output).map_err(|error| {
+            LpmError::Registry(format!("failed to serialize add dry-run output: {error}"))
+        })?;
+        stdout.write_all(b"\n").map_err(LpmError::Io)?;
     } else {
         eprintln!("\n  Dry run -- no files will be modified.\n");
         let target = target_dir
@@ -123,9 +148,10 @@ pub(super) fn print_add_project_structure(
     target_dir: &Path,
     buyer_alias: &Option<String>,
     ecosystem: &str,
+    framework: &str,
 ) {
     install_ui::phase("Detecting project structure");
-    add_detail("Framework:", &framework_label(project_dir, ecosystem));
+    add_detail("Framework:", &framework_label(ecosystem, framework));
     let install_path = target_dir
         .strip_prefix(project_dir)
         .unwrap_or(target_dir)
@@ -148,12 +174,12 @@ fn add_detail(label: &str, value: &str) {
     ));
 }
 
-fn framework_label(project_dir: &Path, ecosystem: &str) -> String {
+fn framework_label(ecosystem: &str, framework: &str) -> String {
     if ecosystem == "swift" {
         return "Swift".to_string();
     }
 
-    match detect_framework(project_dir).as_str() {
+    match framework {
         "next-app" => "Next.js app router",
         "next-pages" => "Next.js pages router",
         "vite" => "Vite",
