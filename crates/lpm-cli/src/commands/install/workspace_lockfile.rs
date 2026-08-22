@@ -591,6 +591,40 @@ where
     with_project_install_lock(&workspace_root, transaction).await
 }
 
+pub(crate) async fn scope_member_project_mutation<F, T>(
+    project_dir: &Path,
+    future: F,
+) -> Result<T, LpmError>
+where
+    F: Future<Output = Result<T, LpmError>>,
+{
+    let future = Box::pin(future);
+    if ACTIVE_TRANSACTION.try_with(|_| ()).is_ok()
+        || ACTIVE_PROJECT_INSTALL_ROOT.try_with(|_| ()).is_ok()
+    {
+        return future.await;
+    }
+
+    let initial_workspace = discover_workspace(project_dir)?;
+    let lock_root = initial_workspace.as_ref().map_or_else(
+        || project_dir.to_path_buf(),
+        |workspace| workspace.root.clone(),
+    );
+    let expected_workspace_root = initial_workspace.map(|workspace| workspace.root);
+    let transaction = async {
+        let current_workspace_root =
+            discover_workspace(project_dir)?.map(|workspace| workspace.root);
+        if current_workspace_root != expected_workspace_root {
+            return Err(workspace_changed_while_waiting(
+                expected_workspace_root.as_deref().unwrap_or(project_dir),
+                current_workspace_root.as_deref(),
+            ));
+        }
+        future.await
+    };
+    with_project_install_lock(&lock_root, transaction).await
+}
+
 pub(crate) async fn scope_workspace_mutation<F, T>(
     cwd: &Path,
     project_dirs: &[PathBuf],

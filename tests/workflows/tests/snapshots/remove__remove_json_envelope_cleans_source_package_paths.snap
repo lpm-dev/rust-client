@@ -7,7 +7,7 @@ expression: envelope
   "success": true,
   "package": "owner.widget",
   "removed": [
-    ".lpm/skills/owner.widget/",
-    "components/widget/"
+    "components/widget/index.ts",
+    ".lpm/skills/owner.widget/"
   ]
 }
