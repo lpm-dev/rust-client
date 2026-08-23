@@ -36,14 +36,56 @@ use crate::provenance_bundle::{
     AttestationUrlPolicy, FetchBundleError, NpmArtifactExpectation, ProvenanceHttpClient,
     fetch_bundle_bytes, parse_sigstore_bundle, read_cache, verify_bundle_or_err, write_cache,
 };
+use futures::StreamExt;
 use lpm_common::LpmError;
 use lpm_registry::AttestationRef;
 use lpm_workspace::{ProvenanceSnapshot, ProvenanceStatus};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+const PROVENANCE_BATCH_CONCURRENCY: usize = 8;
+
+pub(crate) type ProvenanceArtifactKey = (String, String, Option<String>);
+
+#[cfg(test)]
+thread_local! {
+    static PROVENANCE_BATCH_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_provenance_batch_call_count() {
+    PROVENANCE_BATCH_CALL_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn provenance_batch_call_count() -> usize {
+    PROVENANCE_BATCH_CALL_COUNT.get()
+}
+
+fn unique_package_artifacts(pkgs: &[ProvenanceArtifactKey]) -> Vec<ProvenanceArtifactKey> {
+    let mut seen = HashSet::with_capacity(pkgs.len());
+    let mut unique = Vec::with_capacity(pkgs.len());
+    for (name, version, integrity) in pkgs {
+        if seen.insert((name.as_str(), version.as_str(), integrity.as_deref())) {
+            unique.push((name.clone(), version.clone(), integrity.clone()));
+        }
+    }
+    unique
+}
+
+async fn collect_bounded<F, T>(futures: impl IntoIterator<Item = F>) -> Vec<T>
+where
+    F: Future<Output = T>,
+{
+    futures::stream::iter(futures)
+        .buffer_unordered(PROVENANCE_BATCH_CONCURRENCY)
+        .collect()
+        .await
+}
 
 /// Canonicalized policy for the
 /// `--ignore-provenance-drift[-all]` override flags on `lpm install`.
@@ -910,11 +952,14 @@ pub(crate) fn map_fetch_result_to_status(
 /// case (no network call); the on-disk attestation cache under
 /// `~/.lpm/cache/metadata/attestations/` (7-day TTL) covers repeated
 /// approvals across runs.
-pub async fn fetch_provenance_for_pkgs(
+pub async fn fetch_provenance_for_artifacts(
     registry: &lpm_registry::RegistryClient,
-    pkgs: &[(String, String)],
+    pkgs: &[ProvenanceArtifactKey],
     verify_policy: &VerifyPolicy,
-) -> HashMap<(String, String), ProvenanceStatus> {
+) -> HashMap<ProvenanceArtifactKey, ProvenanceStatus> {
+    #[cfg(test)]
+    PROVENANCE_BATCH_CALL_COUNT.with(|count| count.set(count.get() + 1));
+
     let cache_root = match lpm_common::paths::LpmRoot::from_env() {
         Ok(root) => root.cache_metadata_attestations(),
         Err(_) => {
@@ -939,74 +984,108 @@ pub async fn fetch_provenance_for_pkgs(
     let http_ref = &http;
     let verify_policy_ref = verify_policy;
 
-    let futures = pkgs.iter().map(move |(name, version)| async move {
-        // lpm vs npm dispatch by name prefix mirrors
-        // `install.rs::build_blocked_set_metadata`.
-        let (meta, registry_url) = if name.starts_with("@lpm.dev/") {
-            match lpm_common::PackageName::parse(name) {
-                Ok(pkg_name) => (
-                    registry.get_package_metadata(&pkg_name).await.ok(),
-                    registry.base_url(),
-                ),
-                Err(_) => (None, registry.base_url()),
+    let unique = unique_package_artifacts(pkgs);
+    let futures = unique
+        .into_iter()
+        .map(move |(name, version, expected_integrity)| async move {
+            let artifact_key = || (name.clone(), version.clone(), expected_integrity.clone());
+            // lpm vs npm dispatch by name prefix mirrors
+            // `install.rs::build_blocked_set_metadata`.
+            let (meta_result, registry_url) = if name.starts_with("@lpm.dev/") {
+                match lpm_common::PackageName::parse(&name) {
+                    Ok(pkg_name) => (
+                        registry.get_package_metadata(&pkg_name).await,
+                        registry.base_url(),
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            pkg = %name,
+                            version = %version,
+                            "cannot parse package name for provenance lookup: {error}"
+                        );
+                        return (artifact_key(), ProvenanceStatus::TransportDegraded);
+                    }
+                }
+            } else {
+                (
+                    registry.get_npm_package_metadata(&name).await,
+                    registry.npm_registry_url(),
+                )
+            };
+            let meta = match meta_result {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(
+                        pkg = %name,
+                        version = %version,
+                        "registry metadata lookup degraded during provenance capture: {error}"
+                    );
+                    return (artifact_key(), ProvenanceStatus::TransportDegraded);
+                }
+            };
+            let Some(version_meta) = meta.versions.get(&version) else {
+                return (artifact_key(), ProvenanceStatus::TransportDegraded);
+            };
+            let attestation_ref = version_meta
+                .dist
+                .as_ref()
+                .and_then(|d| d.attestations.clone());
+            let registry_integrity =
+                lpm_registry::VersionMetadata::integrity_or_shasum(version_meta)
+                    .map(std::borrow::Cow::into_owned);
+            if let (Some(expected), Some(registry_value)) =
+                (expected_integrity.as_deref(), registry_integrity.as_deref())
+                && expected != registry_value
+            {
+                return (
+                    artifact_key(),
+                    ProvenanceStatus::VerificationRejected {
+                        reason: "registry metadata integrity does not match the reviewed artifact"
+                            .into(),
+                    },
+                );
             }
-        } else {
-            (
-                registry.get_npm_package_metadata(name).await.ok(),
-                registry.npm_registry_url(),
-            )
-        };
-        let attestation_ref = meta
-            .as_ref()
-            .and_then(|m| m.versions.get(version))
-            .and_then(|v| v.dist.as_ref())
-            .and_then(|d| d.attestations.clone());
-        let integrity = meta
-            .as_ref()
-            .and_then(|m| m.versions.get(version))
-            .and_then(lpm_registry::VersionMetadata::integrity_or_shasum)
-            .map(std::borrow::Cow::into_owned);
+            let verification_integrity = expected_integrity
+                .as_deref()
+                .or(registry_integrity.as_deref());
 
-        // Skip path: operator opted out of cryptographic
-        // verification for this name (CLI flag) OR fleet-wide
-        // (`EnforceMode::Off`). Pull the bytes through the legacy
-        // identity-only parser and land the snapshot as
-        // `Unverified` so the binding records the operator's
-        // downgrade explicitly instead of falsely claiming
-        // verification.
-        if verify_policy_ref.should_skip_verification_for(name) {
-            let raw = fetch_unverified_snapshot(
+            // Skip path: operator opted out of cryptographic
+            // verification for this name (CLI flag) OR fleet-wide
+            // (`EnforceMode::Off`). Pull the bytes through the legacy
+            // identity-only parser and land the snapshot as
+            // `Unverified` so the binding records the operator's
+            // downgrade explicitly instead of falsely claiming
+            // verification.
+            if verify_policy_ref.should_skip_verification_for(&name) {
+                let raw = fetch_unverified_snapshot(
+                    http_ref,
+                    registry_url,
+                    &name,
+                    &version,
+                    attestation_ref.as_ref(),
+                )
+                .await;
+                let status = relabel_skip_status_for_enforce_mode(raw, verify_policy_ref.enforce);
+                return (artifact_key(), status);
+            }
+
+            let raw = fetch_provenance_snapshot(
                 http_ref,
-                registry_url,
-                name,
-                version,
-                attestation_ref.as_ref(),
+                cache_root_ref,
+                ProvenanceFetchRequest::new(
+                    registry_url,
+                    &name,
+                    &version,
+                    verification_integrity,
+                    attestation_ref.as_ref(),
+                ),
+                None,
             )
             .await;
-            let status = relabel_skip_status_for_enforce_mode(raw, verify_policy_ref.enforce);
-            return ((name.clone(), version.clone()), status);
-        }
-
-        let raw = fetch_provenance_snapshot(
-            http_ref,
-            cache_root_ref,
-            ProvenanceFetchRequest::new(
-                registry_url,
-                name,
-                version,
-                integrity.as_deref(),
-                attestation_ref.as_ref(),
-            ),
-            None,
-        )
-        .await;
-        let status = map_fetch_result_to_status(name, version, raw);
-        ((name.clone(), version.clone()), status)
-    });
-    futures::future::join_all(futures)
-        .await
-        .into_iter()
-        .collect()
+            let status = map_fetch_result_to_status(&name, &version, raw);
+            (artifact_key(), status)
+        });
+    collect_bounded(futures).await.into_iter().collect()
 }
 
 /// Re-label a [`ProvenanceStatus`] produced by the skip path so the
@@ -1140,9 +1219,61 @@ pub async fn fetch_unverified_snapshot(
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     const TEST_INTEGRITY: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const AXIOS_1_14_0_INTEGRITY: &str = "sha512-3Y8yrqLSwjuzpXuZ0oIYZ/XGgLwUIBU3uLvbcpb0pidD9ctpShJd43KSlEEkVQg6DS0G9NKyzOvBfUtDKEyHvQ==";
+
+    #[test]
+    fn provenance_batch_deduplicates_package_artifacts_in_first_seen_order() {
+        let packages = vec![
+            ("alpha".into(), "1.0.0".into(), Some("sha512-a".into())),
+            ("beta".into(), "2.0.0".into(), None),
+            ("alpha".into(), "1.0.0".into(), Some("sha512-a".into())),
+            ("alpha".into(), "1.0.0".into(), Some("sha512-b".into())),
+        ];
+
+        assert_eq!(
+            unique_package_artifacts(&packages),
+            vec![
+                ("alpha".into(), "1.0.0".into(), Some("sha512-a".into())),
+                ("beta".into(), "2.0.0".into(), None),
+                ("alpha".into(), "1.0.0".into(), Some("sha512-b".into())),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_batch_never_polls_more_than_eight_fetches_concurrently() {
+        struct ActiveGuard(Arc<AtomicUsize>);
+
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let futures = (0..PROVENANCE_BATCH_CONCURRENCY * 3).map(|index| {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            async move {
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now_active, Ordering::SeqCst);
+                let _guard = ActiveGuard(active);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                index
+            }
+        });
+
+        let completed = collect_bounded(futures).await;
+
+        assert_eq!(completed.len(), PROVENANCE_BATCH_CONCURRENCY * 3);
+        assert_eq!(peak.load(Ordering::SeqCst), PROVENANCE_BATCH_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn provenance_config_defaults_preserve_approved_best_effort_behavior() {

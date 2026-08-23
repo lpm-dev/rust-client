@@ -11,7 +11,72 @@
 //! [`tests/workflows/tests/approve_scripts.rs`].
 
 use assert_cmd::Command;
+use hmac::{Hmac, Mac};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+#[derive(Clone, Serialize)]
+struct FixtureBuildState {
+    state_version: u32,
+    blocked_set_fingerprint: String,
+    captured_at: String,
+    blocked_packages: Vec<FixtureBlockedPackage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authentication_tag: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct FixtureBlockedPackage {
+    name: String,
+    version: String,
+    integrity: Option<String>,
+    script_hash: Option<String>,
+    phases_present: Vec<String>,
+    binding_drift: bool,
+    static_tier: &'static str,
+}
+
+fn write_signed_build_state(project: &TempDir, home: &TempDir) {
+    let fingerprint_input = b"scripted-pkg@1.0.0|||green\0";
+    let fingerprint = format!("sha256-{:x}", Sha256::digest(fingerprint_input));
+    let mut state = FixtureBuildState {
+        state_version: 1,
+        blocked_set_fingerprint: fingerprint,
+        captured_at: "2026-05-01T00:00:00Z".into(),
+        blocked_packages: vec![FixtureBlockedPackage {
+            name: "scripted-pkg".into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            script_hash: None,
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: "green",
+        }],
+        authentication_tag: None,
+    };
+
+    let secret = [0x5a_u8; 32];
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).expect("valid HMAC key length");
+    mac.update(&serde_json::to_vec(&state).expect("serialize unsigned build state"));
+    state.authentication_tag = Some(hex::encode(mac.finalize().into_bytes()));
+
+    let lpm_dir = project.path().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).expect("mkdir project .lpm");
+    std::fs::write(
+        lpm_dir.join("build-state.json"),
+        serde_json::to_string_pretty(&state).expect("serialize signed build state"),
+    )
+    .expect("seed signed build-state.json");
+
+    let security_dir = home.path().join(".lpm/security");
+    std::fs::create_dir_all(&security_dir).expect("mkdir security state");
+    std::fs::write(
+        security_dir.join("build-state-secret.hex"),
+        format!("{}\n", hex::encode(secret)),
+    )
+    .expect("seed build-state signing secret");
+}
 
 /// Build a `lpm-rs` Command in an isolated HOME with a seeded
 /// build-state.json containing one blocked package — so
@@ -27,31 +92,7 @@ fn lpm_isolated() -> (Command, TempDir, TempDir) {
     )
     .expect("seed package.json");
 
-    // Seed a minimal build-state.json so approve-scripts has a non-empty
-    // blocked set to walk; the TTY/JSON guards below the discovery
-    // branch can only fire when there's something to approve.
-    let lpm_dir = project.path().join(".lpm");
-    std::fs::create_dir_all(&lpm_dir).expect("mkdir .lpm");
-    let build_state = serde_json::json!({
-        "state_version": 1,
-        "blocked_set_fingerprint": "sha256-fixture",
-        "captured_at": "2026-05-01T00:00:00Z",
-        "blocked_packages": [
-            {
-                "name": "scripted-pkg",
-                "version": "1.0.0",
-                "integrity": null,
-                "script_hash": null,
-                "phases_present": ["postinstall"],
-                "binding_drift": false
-            }
-        ]
-    });
-    std::fs::write(
-        lpm_dir.join("build-state.json"),
-        serde_json::to_string_pretty(&build_state).unwrap(),
-    )
-    .expect("seed build-state.json");
+    write_signed_build_state(&project, &home);
 
     let mut cmd = Command::cargo_bin("lpm-rs").expect("lpm-rs binary");
     cmd.current_dir(project.path());

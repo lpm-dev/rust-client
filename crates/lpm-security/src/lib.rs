@@ -209,12 +209,24 @@ impl SecurityPolicy {
             .matches_strict(name, version, integrity, script_hash)
     }
 
-    /// Look up the rich binding for a specific `name@version` so the
-    /// capability-hash enforcement path can inspect
+    /// Look up the unambiguous rich binding for a specific coordinate so
+    /// the capability-hash enforcement path can inspect
     /// [`TrustedDependencyBinding::capability_hash`]. Returns `None`
-    /// for legacy-bare-name approvals and for packages with no approval.
+    /// for legacy approvals, missing approvals, or conflicting artifacts.
     pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
         self.trusted_dependencies.get_binding(name, version)
+    }
+
+    /// Look up the binding that matches one exact artifact tuple.
+    pub fn get_binding_for_artifact(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<&TrustedDependencyBinding> {
+        self.trusted_dependencies
+            .binding_for_artifact(name, version, integrity, script_hash)
     }
 
     /// Check if a package was published too recently.

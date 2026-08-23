@@ -30,6 +30,7 @@
 //! file and atomic replacement. A crash mid-write leaves the previous state
 //! file intact rather than producing a half-written file the reader chokes on.
 
+use hmac::{Hmac, Mac};
 use lpm_common::LpmError;
 use lpm_security::{
     SecurityPolicy, TrustMatch, script_hash::compute_script_hash_with_phase_bodies,
@@ -37,6 +38,8 @@ use lpm_security::{
 };
 use lpm_store::PackageStore;
 use lpm_workspace::ProvenanceSnapshot;
+#[cfg(not(test))]
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -113,6 +116,12 @@ pub struct BuildState {
     /// the install that wrote this file. Sorted by `(name, version)` for
     /// deterministic fingerprinting.
     pub blocked_packages: Vec<BlockedPackage>,
+
+    /// HMAC over every other serialized field, keyed by machine-local state
+    /// outside the project. Approval flows require it before trusting any
+    /// captured tier or artifact metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication_tag: Option<String>,
 
     /// M3: audit trail for `--ignore-provenance-drift[-all]`. Set to
     /// `Some(...)` when the install that wrote this state file had a
@@ -273,7 +282,57 @@ pub fn read_build_state(project_dir: &Path) -> Option<BuildState> {
         );
         return None;
     }
+    if state.authentication_tag.is_some() && !verify_build_state_authentication(&state).ok()? {
+        tracing::warn!(
+            path = %path.display(),
+            "build-state authentication failed; treating state as missing"
+        );
+        return None;
+    }
     Some(state)
+}
+
+/// Read build state for an approval decision. Unlike the compatibility reader,
+/// this refuses unsigned legacy state and surfaces authentication failures.
+pub fn read_build_state_for_approval(project_dir: &Path) -> Result<Option<BuildState>, LpmError> {
+    let path = build_state_path(project_dir);
+    let Some(bytes) =
+        lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let state: BuildState = serde_json::from_slice(&bytes).map_err(|error| {
+        LpmError::SecurityApprovalStore(format!(
+            "{} is malformed and cannot authorize script approvals: {error}",
+            path.display(),
+        ))
+    })?;
+    if state.state_version > BUILD_STATE_VERSION {
+        return Err(LpmError::SecurityApprovalStore(format!(
+            "{} was written by a newer lpm; reinstall before approving scripts",
+            path.display(),
+        )));
+    }
+    if state.authentication_tag.is_none() {
+        return Err(LpmError::SecurityApprovalStore(format!(
+            "{} is unsigned legacy state; run `lpm install` to recapture it before approving scripts",
+            path.display(),
+        )));
+    }
+    if !verify_build_state_authentication(&state)? {
+        return Err(LpmError::SecurityApprovalStore(format!(
+            "{} failed authentication; possible tampering. Run `lpm install` to recapture the blocked set",
+            path.display(),
+        )));
+    }
+    let expected_fingerprint = compute_blocked_set_fingerprint(&state.blocked_packages);
+    if state.blocked_set_fingerprint != expected_fingerprint {
+        return Err(LpmError::SecurityApprovalStore(format!(
+            "{} has an invalid blocked-set fingerprint; run `lpm install` to recapture it",
+            path.display(),
+        )));
+    }
+    Ok(Some(state))
 }
 
 /// Atomically write `state` to `<project_dir>/.lpm/build-state.json`.
@@ -286,7 +345,12 @@ pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), L
     std::fs::create_dir_all(&lpm_dir).map_err(LpmError::Io)?;
 
     let target = build_state_path(project_dir);
-    let json = serde_json::to_string_pretty(state)
+    let mut authenticated = state.clone();
+    authenticated.blocked_set_fingerprint =
+        compute_blocked_set_fingerprint(&authenticated.blocked_packages);
+    authenticated.authentication_tag = None;
+    authenticated.authentication_tag = Some(sign_build_state(&authenticated)?);
+    let json = serde_json::to_string_pretty(&authenticated)
         .map_err(|e| LpmError::Registry(format!("failed to serialize build state: {e}")))?;
     lpm_common::write_file_atomic(&target, format!("{json}\n")).map_err(|e| {
         LpmError::Io(std::io::Error::new(
@@ -301,6 +365,138 @@ pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), L
     Ok(())
 }
 
+type BuildStateHmac = Hmac<Sha256>;
+const BUILD_STATE_SECRET_BYTES: usize = 32;
+
+fn build_state_payload(state: &BuildState) -> Result<Vec<u8>, LpmError> {
+    let mut payload = state.clone();
+    payload.authentication_tag = None;
+    serde_json::to_vec(&payload).map_err(LpmError::from)
+}
+
+fn sign_build_state(state: &BuildState) -> Result<String, LpmError> {
+    let secret = get_or_create_build_state_secret()?;
+    let mut mac = BuildStateHmac::new_from_slice(&secret)
+        .map_err(|error| LpmError::Registry(format!("build-state signer init failed: {error}")))?;
+    mac.update(&build_state_payload(state)?);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_build_state_authentication(state: &BuildState) -> Result<bool, LpmError> {
+    let Some(tag) = state.authentication_tag.as_deref() else {
+        return Ok(false);
+    };
+    let expected = match hex::decode(tag) {
+        Ok(expected) => expected,
+        Err(_) => return Ok(false),
+    };
+    let Some(secret) = read_build_state_secret()? else {
+        return Err(LpmError::SecurityApprovalStore(
+            "build-state signing secret is missing; reinstall before approving scripts".into(),
+        ));
+    };
+    let mut mac = BuildStateHmac::new_from_slice(&secret)
+        .map_err(|error| LpmError::Registry(format!("build-state signer init failed: {error}")))?;
+    mac.update(&build_state_payload(state)?);
+    Ok(mac.verify_slice(&expected).is_ok())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the test double preserves the fallible production signature"
+)]
+fn read_build_state_secret() -> Result<Option<Vec<u8>>, LpmError> {
+    Ok(Some(vec![0x5a; BUILD_STATE_SECRET_BYTES]))
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the test double preserves the fallible production signature"
+)]
+fn get_or_create_build_state_secret() -> Result<Vec<u8>, LpmError> {
+    Ok(vec![0x5a; BUILD_STATE_SECRET_BYTES])
+}
+
+#[cfg(not(test))]
+fn build_state_secret_path() -> Result<PathBuf, LpmError> {
+    Ok(lpm_common::LpmRoot::from_env()?
+        .root()
+        .join("security")
+        .join("build-state-secret.hex"))
+}
+
+#[cfg(not(test))]
+fn read_build_state_secret() -> Result<Option<Vec<u8>>, LpmError> {
+    let path = build_state_secret_path()?;
+    let raw = match lpm_common::read_text_file_capped_nofollow(&path, 256) {
+        Ok(raw) => raw,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => {
+            return Err(LpmError::SecurityApprovalStore(format!(
+                "failed to read build-state signing secret {}: {error}",
+                path.display(),
+            )));
+        }
+    };
+    let secret = hex::decode(raw.trim()).map_err(|error| {
+        LpmError::SecurityApprovalStore(format!(
+            "build-state signing secret {} is corrupt: {error}",
+            path.display(),
+        ))
+    })?;
+    if secret.len() != BUILD_STATE_SECRET_BYTES {
+        return Err(LpmError::SecurityApprovalStore(format!(
+            "build-state signing secret {} has the wrong length",
+            path.display(),
+        )));
+    }
+    Ok(Some(secret))
+}
+
+#[cfg(not(test))]
+fn get_or_create_build_state_secret() -> Result<Vec<u8>, LpmError> {
+    if let Some(secret) = read_build_state_secret()? {
+        return Ok(secret);
+    }
+    let path = build_state_secret_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut secret = [0_u8; BUILD_STATE_SECRET_BYTES];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut secret)
+        .map_err(|error| {
+            LpmError::SecurityApprovalStore(format!(
+                "failed to generate build-state signing secret: {error}"
+            ))
+        })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            writeln!(file, "{}", hex::encode(secret))?;
+            file.sync_all()?;
+            Ok(secret.to_vec())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_build_state_secret()?.ok_or_else(|| {
+                LpmError::SecurityApprovalStore(
+                    "build-state signing secret disappeared during creation".into(),
+                )
+            })
+        }
+        Err(error) => Err(LpmError::Io(error)),
+    }
+}
+
 /// Compute the deterministic fingerprint over a slice of blocked packages.
 ///
 /// **Determinism contract:** the fingerprint MUST be stable across:
@@ -309,7 +505,7 @@ pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), L
 /// - Different versions of `serde_json` (we don't serialize through it)
 ///
 /// The hash input format is one line per package, NUL-terminated:
-///   `<name>@<version>|<integrity-or-empty>|<script_hash-or-empty>\x00`
+///   `<name>@<version>|<integrity-or-empty>|<script_hash-or-empty>|<tier>\x00`
 /// sorted by `(name, version)` ascending. The output is `sha256-<hex>`
 /// to match the script_hash format.
 pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
@@ -317,11 +513,18 @@ pub fn compute_blocked_set_fingerprint(packages: &[BlockedPackage]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{}@{}|{}|{}",
+                "{}@{}|{}|{}|{}",
                 p.name,
                 p.version,
                 p.integrity.as_deref().unwrap_or(""),
                 p.script_hash.as_deref().unwrap_or(""),
+                match p.static_tier {
+                    Some(StaticTier::Green) => "green",
+                    Some(StaticTier::Amber) => "amber",
+                    Some(StaticTier::AmberLlm) => "amber-llm",
+                    Some(StaticTier::Red) => "red",
+                    None => "unclassified",
+                },
             )
         })
         .collect();
@@ -628,7 +831,12 @@ fn compute_blocked_packages_with_metadata_and_baseline(
                 // with CapabilityNotApproved downstream — no remediation
                 // path for the user.
                 TrustMatch::Strict => {
-                    let binding = policy.trusted_dependencies.get_binding(name, version);
+                    let binding = policy.trusted_dependencies.binding_for_artifact(
+                        name,
+                        version,
+                        integrity.as_deref(),
+                        Some(&script_hash),
+                    );
                     if requested_capabilities
                         .requires_review_despite_strict_match(user_bound, binding)
                     {
@@ -912,6 +1120,7 @@ pub(crate) fn capture_blocked_set_after_install_with_options(
         blocked_set_fingerprint: fingerprint,
         captured_at: current_rfc3339(),
         blocked_packages: blocked,
+        authentication_tag: None,
         drift_ignore_override: None,
     };
 
@@ -1233,6 +1442,7 @@ mod tests {
             blocked_set_fingerprint: fingerprint,
             captured_at: "T00:00:00Z".to_string(),
             blocked_packages: packages,
+            authentication_tag: None,
             drift_ignore_override: None,
         }
     }
@@ -1337,6 +1547,74 @@ mod tests {
         let recovered = read_build_state(dir.path()).expect("must read back");
         assert_eq!(recovered.state_version, original.state_version);
         assert_eq!(recovered.blocked_packages.len(), 1);
+    }
+
+    #[test]
+    fn read_build_state_for_approval_accepts_authenticated_state() {
+        let dir = tempdir().unwrap();
+        let state = make_state(vec![make_blocked(
+            "native-addon",
+            "1.0.0",
+            Some("sha512-artifact"),
+            Some("sha256-script"),
+        )]);
+        write_build_state(dir.path(), &state).unwrap();
+
+        let recovered = read_build_state_for_approval(dir.path())
+            .unwrap()
+            .expect("authenticated state must authorize approval review");
+
+        assert!(recovered.authentication_tag.is_some());
+        assert_eq!(
+            recovered.blocked_set_fingerprint,
+            compute_blocked_set_fingerprint(&recovered.blocked_packages),
+        );
+    }
+
+    #[test]
+    fn read_build_state_for_approval_rejects_unsigned_state() {
+        let dir = tempdir().unwrap();
+        let state = make_state(vec![make_blocked(
+            "native-addon",
+            "1.0.0",
+            Some("sha512-artifact"),
+            Some("sha256-script"),
+        )]);
+        fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        fs::write(
+            build_state_path(dir.path()),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let error = read_build_state_for_approval(dir.path())
+            .expect_err("unsigned project-controlled state must not authorize approvals");
+        assert!(error.to_string().contains("unsigned legacy state"));
+    }
+
+    #[test]
+    fn read_build_state_rejects_tier_metadata_changed_after_capture() {
+        let dir = tempdir().unwrap();
+        let mut blocked = make_blocked(
+            "native-addon",
+            "1.0.0",
+            Some("sha512-artifact"),
+            Some("sha256-script"),
+        );
+        blocked.static_tier = Some(StaticTier::Amber);
+        let mut state = make_state(vec![blocked]);
+        state.blocked_set_fingerprint = compute_blocked_set_fingerprint(&state.blocked_packages);
+        write_build_state(dir.path(), &state).unwrap();
+
+        let path = build_state_path(dir.path());
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        tampered["blocked_packages"][0]["static_tier"] = serde_json::json!("green");
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let error = read_build_state_for_approval(dir.path())
+            .expect_err("tier metadata must be authenticated before approve-scripts trusts it");
+        assert!(error.to_string().contains("failed authentication"));
     }
 
     // ── write_build_state ────────────────────────────────────────────
@@ -2667,9 +2945,8 @@ mod tests {
         // Because compute_blocked_packages_with_metadata skips any
         // package without at least one present phase body, every
         // emitted BlockedPackage must have Some(_) for static_tier.
-        // This locks in the "None means pre-P2 state, never fresh
-        // state" contract that `blocked_to_json` and approve-scripts
-        // UI rely on.
+        // This locks in the "None means legacy or incomplete state, never
+        // fresh state" contract that approval policy relies on.
         let project = tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
         let store = lpm_store::PackageStore::at(project.path().join("store"));

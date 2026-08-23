@@ -1261,8 +1261,12 @@ pub(super) async fn run_online_fetch_phase(
                     }
                     continue;
                 }
-                let provenance_reference =
-                    trusted.provenance_reference_for_candidate(&p.name, &p.version);
+                let provenance_reference = trusted.provenance_reference_for_candidate(
+                    &p.name,
+                    &p.version,
+                    p.integrity.as_deref(),
+                    None,
+                );
                 if provenance_reference.is_none()
                     && !verification_scope.verifies_all()
                     && !trust_no_downgrade

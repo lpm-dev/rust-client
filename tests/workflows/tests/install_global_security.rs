@@ -1088,10 +1088,10 @@ fn uninstall_fail_safe_when_other_install_lockfile_missing() {
     );
 }
 
-/// Pre-classification legacy state still attempts a live global trust
-/// write, so workflow coverage stops at the approval boundary.
+/// Pre-classification state cannot prove the package passed the static gate,
+/// so non-interactive bulk approval must fail closed.
 #[test]
-fn approve_scripts_global_yes_none_tier_legacy_state_requires_security_approval() {
+fn approve_scripts_global_yes_refuses_unclassified_state() {
     let project = TempProject::empty(r#"{ "name": "global-security-test", "version": "0.0.0" }"#);
     seed_global_manifest_and_blocked_state_with_tier(
         &project, "eslint", "9.24.0", "esbuild", "0.25.1",
@@ -1102,5 +1102,26 @@ fn approve_scripts_global_yes_none_tier_legacy_state_requires_security_approval(
         .args(["--json", "approve-scripts", "--global", "--yes"])
         .output()
         .expect("spawn lpm approve-scripts --global --yes");
-    assert_security_approval_scope(&out, "trust-bulk-approve");
+    assert!(
+        !out.status.success(),
+        "unclassified state must not reach the trust-write approval boundary"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("--yes refuses")
+            && combined.contains("esbuild@0.25.1")
+            && combined.contains("unclassified"),
+        "refusal must identify the unclassified package: {combined}"
+    );
+    assert!(
+        !project
+            .home()
+            .join(".lpm/global/trusted-dependencies.json")
+            .exists(),
+        "unclassified state must not create global trust"
+    );
 }

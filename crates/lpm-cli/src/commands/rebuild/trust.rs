@@ -244,8 +244,8 @@ pub(crate) fn evaluate_trust(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> TrustReason {
+    let script_hash = compute_script_hash(package_dir);
     let candidate = evaluate_trust_unsuspended(
-        package_dir,
         name,
         version,
         integrity,
@@ -254,6 +254,7 @@ pub(crate) fn evaluate_trust(
         project_dir,
         effective_policy,
         advisor_approvals,
+        script_hash.as_deref(),
     );
     let after_force = if force_security_floor && candidate.is_trusted() {
         TrustReason::SuspendedByForceFloor
@@ -285,7 +286,7 @@ pub(crate) fn evaluate_trust(
     // None) and missing bindings both fail this check, collapsing
     // into CapabilityNotApproved — which 6d's UX surfaces as a
     // distinct reason from Untrusted.
-    match policy.get_binding(name, version) {
+    match policy.get_binding_for_artifact(name, version, integrity, script_hash.as_deref()) {
         Some(binding) if requested_capabilities.is_approved_by(binding) => after_force,
         _ => TrustReason::CapabilityNotApproved,
     }
@@ -298,7 +299,6 @@ pub(crate) fn evaluate_trust(
 /// which is strictly a decorator applied by the outer function.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn evaluate_trust_unsuspended(
-    package_dir: &Path,
     name: &str,
     version: &str,
     integrity: Option<&str>,
@@ -309,9 +309,9 @@ pub(super) fn evaluate_trust_unsuspended(
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
+    script_hash: Option<&str>,
 ) -> TrustReason {
-    let script_hash = compute_script_hash(package_dir);
-    let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash.as_deref());
+    let strict = policy.can_run_scripts_strict(name, version, integrity, script_hash);
     match strict {
         TrustMatch::Strict => return TrustReason::StrictBinding,
         TrustMatch::LegacyNameOnly => return TrustReason::LegacyName,

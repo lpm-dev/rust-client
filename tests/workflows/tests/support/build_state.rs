@@ -37,7 +37,123 @@
 //! to recompute the hash, so the two stay in lockstep.
 
 use super::TempProject;
+use hmac::{Hmac, Mac};
+use lpm_common::ProvenanceSnapshot;
+use lpm_security::triage::StaticTier;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+type BuildStateHmac = Hmac<Sha256>;
+
+const BUILD_STATE_SECRET: [u8; 32] = [0x5a; 32];
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FixtureBuildState {
+    state_version: u32,
+    blocked_set_fingerprint: String,
+    captured_at: String,
+    blocked_packages: Vec<FixtureBlockedPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authentication_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drift_ignore_override: Option<FixtureDriftIgnoreAuditRecord>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FixtureDriftIgnoreAuditRecord {
+    mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    names: Vec<String>,
+    honoured_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FixtureBlockedPackage {
+    name: String,
+    version: String,
+    integrity: Option<String>,
+    script_hash: Option<String>,
+    phases_present: Vec<String>,
+    binding_drift: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    static_tier: Option<StaticTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance_at_capture: Option<ProvenanceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    behavioral_tags_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    behavioral_tags: Option<Vec<String>>,
+}
+
+fn blocked_set_fingerprint(packages: &[FixtureBlockedPackage]) -> String {
+    let mut keys = Vec::with_capacity(packages.len());
+    for package in packages {
+        let tier = match package.static_tier {
+            Some(StaticTier::Green) => "green",
+            Some(StaticTier::Amber) => "amber",
+            Some(StaticTier::AmberLlm) => "amber-llm",
+            Some(StaticTier::Red) => "red",
+            None => "unclassified",
+        };
+        keys.push(format!(
+            "{}@{}|{}|{}|{}",
+            package.name,
+            package.version,
+            package.integrity.as_deref().unwrap_or(""),
+            package.script_hash.as_deref().unwrap_or(""),
+            tier,
+        ));
+    }
+    keys.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    for key in keys {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256-{}", hex::encode(hasher.finalize()))
+}
+
+fn write_build_state_secret(project: &TempProject) {
+    let security_dir = project.home().join(".lpm/security");
+    std::fs::create_dir_all(&security_dir).expect("create workflow security state directory");
+    let path = security_dir.join("build-state-secret.hex");
+    std::fs::write(&path, format!("{}\n", hex::encode(BUILD_STATE_SECRET)))
+        .expect("write workflow build-state signing secret");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict workflow build-state signing secret");
+    }
+}
+
+pub fn authenticate_build_state_file(project: &TempProject, path: &Path) {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let mut state: FixtureBuildState = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    state.blocked_set_fingerprint = blocked_set_fingerprint(&state.blocked_packages);
+    state.authentication_tag = None;
+
+    let mut mac = BuildStateHmac::new_from_slice(&BUILD_STATE_SECRET)
+        .expect("workflow build-state signing secret has a valid length");
+    mac.update(&serde_json::to_vec(&state).expect("serialize unsigned workflow build state"));
+    state.authentication_tag = Some(hex::encode(mac.finalize().into_bytes()));
+
+    let json = serde_json::to_string_pretty(&state).expect("serialize signed workflow build state");
+    std::fs::write(path, format!("{json}\n"))
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+    write_build_state_secret(project);
+}
+
+pub fn authenticate_project_build_state(project: &TempProject) {
+    authenticate_build_state_file(project, &project.path().join(".lpm/build-state.json"));
+}
 
 /// Minimal store-dir layout for one fake postinstall-emitting package.
 /// Mirrors what `lpm install` would have left in the store after a
@@ -101,6 +217,7 @@ pub fn seed_blocked_build_state_with_real_hash(
 }}"#
     );
     project.write_file(".lpm/build-state.json", &body);
+    authenticate_project_build_state(project);
     real_hash
 }
 
@@ -181,6 +298,8 @@ pub fn seed_global_install_blocked_state_with_tier(
     ]
 }}"#
     );
-    std::fs::write(install_lpm.join("build-state.json"), body).unwrap();
+    let build_state_path = install_lpm.join("build-state.json");
+    std::fs::write(&build_state_path, body).unwrap();
+    authenticate_build_state_file(project, &build_state_path);
     install_lpm
 }

@@ -46,17 +46,17 @@ pub(super) fn approval_metadata_from_blocked(
 
 /// Build approval metadata, preserving any prior verified
 /// `provenance_at_approval` if the incoming snapshot is `None` and
-/// an existing exact-version binding carries one.
+/// an existing exact-artifact binding carries one.
 ///
-/// Why: `TrustedDependencies::approve_with_metadata` unconditionally
-/// overwrites the rich-map entry for `name@version`. Under Warn /
+/// Why: `TrustedDependencies::approve_with_metadata` updates the rich-map
+/// entry for the same artifact. Under Warn /
 /// Off, [`snapshot_for_binding_with_mode`] returns `Ok(None)` on
 /// `VerificationRejected` so the approval can proceed without the
 /// new verifier observation. If the user had previously approved
-/// the SAME exact version under Deny (with a verified snapshot
+/// the same exact artifact under Deny (with a verified snapshot
 /// recorded), a naive re-approval would silently clear that
 /// snapshot, permanently disarming drift detection for that exact
-/// version. Preserving the prior value keeps the drift reference
+/// artifact. Preserving the prior value keeps the drift reference
 /// intact while the new approval still goes through.
 ///
 /// The preservation only fires when the *new* snapshot is `None`.
@@ -70,7 +70,12 @@ pub(super) fn approval_metadata_preserving_existing_provenance(
 ) -> ApprovalMetadata {
     let mut meta = approval_metadata_from_blocked(blocked, capability_hash, incoming);
     if meta.provenance_at_approval.is_none()
-        && let Some(existing) = trusted.binding_for_exact_version(&blocked.name, &blocked.version)
+        && let Some(existing) = trusted.binding_for_artifact(
+            &blocked.name,
+            &blocked.version,
+            blocked.integrity.as_deref(),
+            blocked.script_hash.as_deref(),
+        )
         && let Some(prior) = existing.provenance_at_approval.clone()
     {
         meta.provenance_at_approval = Some(prior);
@@ -100,6 +105,26 @@ pub(super) fn authorize_project_trust_write(
     }
 }
 
+pub(super) async fn commit_project_trust_write(
+    project_dir: &Path,
+    pkg_json_path: &Path,
+    reviewed_manifest_text: &str,
+    manifest: &mut serde_json::Value,
+    trusted: &TrustedDependencies,
+    json_output: bool,
+    reviewed_by_prompt: bool,
+) -> Result<(), LpmError> {
+    crate::commands::install::workspace_lockfile::scope_member_project_mutation(
+        project_dir,
+        async {
+            ensure_manifest_unchanged(pkg_json_path, reviewed_manifest_text)?;
+            authorize_project_trust_write(project_dir, trusted, json_output, reviewed_by_prompt)?;
+            write_back(pkg_json_path, reviewed_manifest_text, manifest, trusted)
+        },
+    )
+    .await
+}
+
 /// Fetch attestation snapshots for an effective
 /// blocked set at approval time.
 ///
@@ -116,7 +141,7 @@ pub(super) fn authorize_project_trust_write(
 /// binding) as its reference.
 ///
 /// delegates to
-/// [`crate::provenance_fetch::fetch_provenance_for_pkgs`], the
+/// [`crate::provenance_fetch::fetch_provenance_for_artifacts`], the
 /// single source of truth shared with the global-scope approve path
 /// (`lpm approve-scripts --global`). This wrapper keeps the
 /// `BlockedPackage` shape callers used pre-existing working unchanged.
@@ -134,12 +159,12 @@ pub(super) async fn fetch_provenance_for_effective_set(
     registry: &lpm_registry::RegistryClient,
     packages: &[BlockedPackage],
     policy: &crate::provenance_fetch::VerifyPolicy,
-) -> HashMap<(String, String), ProvenanceStatus> {
-    let pkgs: Vec<(String, String)> = packages
+) -> HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus> {
+    let pkgs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = packages
         .iter()
-        .map(|p| (p.name.clone(), p.version.clone()))
+        .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    crate::provenance_fetch::fetch_provenance_for_pkgs(registry, &pkgs, policy).await
+    crate::provenance_fetch::fetch_provenance_for_artifacts(registry, &pkgs, policy).await
 }
 
 pub(super) fn runtime_verify_policy_with_source() -> (
@@ -182,27 +207,48 @@ pub(super) fn runtime_verify_policy_with_source() -> (
 /// Non-rejection statuses (`Verified`, `Absent`, `TransportDegraded`)
 /// project identically under both modes — the mode only affects the
 /// rejection arm.
-pub(super) fn snapshot_for_binding(
-    provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
-    name: &str,
-    version: &str,
-    mode: crate::provenance_fetch::EnforceMode,
-) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    snapshot_for_binding_with_mode(provenance_by_pkg, name, version, mode)
-}
-
-/// Pure variant of [`snapshot_for_binding`] that takes the
-/// [`EnforceMode`] explicitly, for unit tests that don't want to
-/// mutate process-global env state.
+/// Pure coordinate-keyed variant for unit tests of enforcement-mode behavior.
+#[cfg(test)]
 pub(super) fn snapshot_for_binding_with_mode(
     provenance_by_pkg: &HashMap<(String, String), ProvenanceStatus>,
     name: &str,
     version: &str,
     mode: crate::provenance_fetch::EnforceMode,
 ) -> Result<Option<ProvenanceSnapshot>, LpmError> {
-    let status = match provenance_by_pkg.get(&(name.to_string(), version.to_string())) {
-        Some(s) => s.clone(),
-        None => return Ok(None),
+    snapshot_status_for_binding(
+        provenance_by_pkg.get(&(name.to_string(), version.to_string())),
+        name,
+        version,
+        mode,
+    )
+}
+
+pub(super) fn snapshot_for_artifact_binding(
+    provenance_by_artifact: &HashMap<
+        crate::provenance_fetch::ProvenanceArtifactKey,
+        ProvenanceStatus,
+    >,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    mode: crate::provenance_fetch::EnforceMode,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    let key = (
+        name.to_string(),
+        version.to_string(),
+        integrity.map(ToOwned::to_owned),
+    );
+    snapshot_status_for_binding(provenance_by_artifact.get(&key), name, version, mode)
+}
+
+fn snapshot_status_for_binding(
+    status: Option<&ProvenanceStatus>,
+    name: &str,
+    version: &str,
+    mode: crate::provenance_fetch::EnforceMode,
+) -> Result<Option<ProvenanceSnapshot>, LpmError> {
+    let Some(status) = status.cloned() else {
+        return Ok(None);
     };
 
     // Warn / Off short-circuit on VerificationRejected: log loudly but

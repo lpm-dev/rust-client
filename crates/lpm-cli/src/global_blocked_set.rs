@@ -32,7 +32,9 @@
 //! [`warn_if_blocked_after_install`] to emit a banner pointing at
 //! `lpm approve-scripts --global`.
 
-use crate::build_state::{BlockedPackage, BuildState, build_state_path, read_build_state};
+use crate::build_state::{
+    BlockedPackage, BuildState, build_state_path, read_build_state_for_approval,
+};
 use lpm_common::{LpmError, LpmRoot};
 use lpm_global::{GlobalManifest, GlobalTrustMatch, GlobalTrustedDependencies, read_for};
 use lpm_security::triage::StaticTier;
@@ -237,7 +239,7 @@ pub fn aggregate_with_manifest_and_trust(
 /// (schema version mismatch is also `None`). The aggregate caller
 /// reports this as an "unreadable origin" rather than a hard error.
 fn read_build_state_for_install(install_root: &std::path::Path) -> Option<BuildState> {
-    read_build_state(install_root)
+    read_build_state_for_approval(install_root).ok().flatten()
 }
 
 fn read_global_manifest_or_empty(root: &LpmRoot) -> Result<GlobalManifest, LpmError> {
@@ -296,6 +298,7 @@ mod tests {
             blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked),
             captured_at: Utc::now().to_rfc3339(),
             blocked_packages: blocked,
+            authentication_tag: None,
             drift_ignore_override: None,
         };
         crate::build_state::write_build_state(&install_root, &state).unwrap();
@@ -552,34 +555,22 @@ mod tests {
     fn aggregate_reads_static_tier_from_disk_json() {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
-        let install_root = root.global_root().join("installs/eslint@9.24.0");
-        let lpm_dir = install_root.join(".lpm");
-        std::fs::create_dir_all(&lpm_dir).unwrap();
-        std::fs::write(
-            lpm_dir.join("build-state.json"),
-            br#"{
-    "state_version": 1,
-    "blocked_set_fingerprint": "sha256-fixture",
-    "captured_at": "2026-04-22T00:00:00Z",
-    "blocked_packages": [
-        {
-            "name": "esbuild",
-            "version": "0.25.1",
-            "integrity": "sha512-fixture",
-            "script_hash": "sha256-fixture",
-            "phases_present": ["postinstall"],
-            "binding_drift": false,
-            "static_tier": "amber"
-        }
-    ]
-}"#,
-        )
-        .unwrap();
-        let mut manifest = GlobalManifest::default();
-        manifest.packages.insert(
-            "eslint".into(),
-            pkg_entry("installs/eslint@9.24.0", "9.24.0"),
+        let rel_root = seed_install_with_blocked(
+            &root,
+            "eslint",
+            "9.24.0",
+            vec![blocked_tiered(
+                "esbuild",
+                "0.25.1",
+                Some("sha512-fixture"),
+                Some("sha256-fixture"),
+                StaticTier::Amber,
+            )],
         );
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("eslint".into(), pkg_entry(&rel_root, "9.24.0"));
         lpm_global::write_for(&root, &manifest).unwrap();
 
         let agg = aggregate_blocked_across_globals(&root).unwrap();

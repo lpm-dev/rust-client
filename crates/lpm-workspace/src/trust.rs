@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// "trustedDependencies": ["esbuild", "sharp"]
 /// ```
 ///
-/// **Rich** (version-bound map):
+/// **Rich** (version- and artifact-bound map):
 ///
 /// ```json
 /// "trustedDependencies": {
@@ -22,6 +22,10 @@ use std::collections::HashMap;
 ///   }
 /// }
 /// ```
+///
+/// The first artifact at a coordinate uses `name@version`. If distinct
+/// artifacts share that coordinate, later entries use
+/// `name@version#artifact-id` so neither approval replaces the other.
 ///
 /// ## Migration semantics (read-permissive, write-strict)
 ///
@@ -44,9 +48,9 @@ pub enum TrustedDependencies {
     /// version, integrity, or script hash binding. The strict gate accepts
     /// these as `LegacyNameOnly` matches with a deprecation warning.
     Legacy(Vec<String>),
-    /// Rich form: `{"esbuild@0.25.1": {integrity, scriptHash}}`. The key
-    /// is `name@version`; the value is the integrity + scriptHash binding
-    /// metadata.
+    /// Rich form: `{"esbuild@0.25.1": {integrity, scriptHash}}`. Keys are
+    /// `name@version` or `name@version#artifact-id`; values contain the
+    /// integrity and script-hash binding metadata.
     Rich(HashMap<String, TrustedDependencyBinding>),
 }
 
@@ -236,18 +240,32 @@ pub enum TrustMatch {
 }
 
 impl TrustedDependencies {
-    /// Trust-store key format used by the Rich variant: `"name@version"`.
-    /// Centralized so any new code path produces the same key without
-    /// re-implementing the format.
+    /// Base trust-store key for a package coordinate: `"name@version"`.
+    /// Artifact-qualified siblings append `#artifact-id` when multiple
+    /// artifacts share the coordinate.
     pub fn rich_key(name: &str, version: &str) -> String {
         format!("{name}@{version}")
+    }
+
+    fn artifact_key(
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> String {
+        format!(
+            "{}#{}",
+            Self::rich_key(name, version),
+            lpm_common::artifact_binding_id(integrity, script_hash),
+        )
     }
 
     /// Strict trust query — the default gate for `lpm rebuild`.
     ///
     /// Returns:
-    /// - [`TrustMatch::Strict`] if the Rich variant has a `name@version`
-    ///   entry whose stored `integrity` and `script_hash` BOTH equal the
+    /// - [`TrustMatch::Strict`] if the Rich variant has a coordinate-matching
+    ///   base or artifact-qualified entry whose stored `integrity` and
+    ///   `script_hash` BOTH equal the
     ///   queried values. `None` on either side counts as "no constraint" —
     ///   intentional for the legacy-upgrade path where a Rich entry was
     ///   inserted before the binding fields were known.
@@ -276,8 +294,8 @@ impl TrustedDependencies {
     /// user-authored decision in the manifest, distinct from the
     /// auto-generated `@*` sentinel.
     ///
-    /// **Lookup precedence:** concrete `name@version` Rich keys are the
-    /// only Rich-form keys that participate in the strict trust decision.
+    /// **Lookup precedence:** concrete base and artifact-qualified Rich keys
+    /// are the only Rich-form keys that participate in the strict decision.
     /// `name@*` sentinels are still walked by [`Self::contains_name_lenient`]
     /// for non-trust-decision use cases (e.g., the deprecation warning).
     pub fn matches_strict(
@@ -296,36 +314,30 @@ impl TrustedDependencies {
                 }
             }
             TrustedDependencies::Rich(map) => {
-                // Concrete `name@version` is the only Rich-form key that
-                // participates in the strict trust decision. A `name@*`
+                // Concrete coordinate keys are the only Rich-form keys that
+                // participate in the strict trust decision. A `name@*`
                 // sentinel is an auto-generated migration marker; honoring
                 // it here would auto-trust every future version of the
                 // package under the inherited name-only approval. See the
                 // method docstring for the cross-version trust laundering
                 // rationale.
-                let concrete_key = Self::rich_key(name, version);
-                if let Some(stored) = map.get(&concrete_key) {
-                    // Field-by-field check. A None field on either side is
-                    // a wildcard — only mismatches between two SET values
-                    // count as drift. Legacy-upgrade-friendly contract.
-                    let integrity_drift = matches!(
-                        (stored.integrity.as_deref(), integrity),
-                        (Some(s), Some(q)) if s != q
-                    );
-                    let script_hash_drift = matches!(
-                        (stored.script_hash.as_deref(), script_hash),
-                        (Some(s), Some(q)) if s != q
-                    );
-
-                    if integrity_drift || script_hash_drift {
-                        return TrustMatch::BindingDrift {
-                            stored: Box::new(stored.clone()),
-                        };
+                let mut candidates: Vec<_> = map
+                    .iter()
+                    .filter(|(key, _)| rich_key_matches_coordinate(key, name, version))
+                    .collect();
+                candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+                for (_, stored) in &candidates {
+                    if binding_matches_query(stored, integrity, script_hash) {
+                        return TrustMatch::Strict;
                     }
-                    return TrustMatch::Strict;
                 }
-
-                TrustMatch::NotTrusted
+                candidates
+                    .first()
+                    .map_or(TrustMatch::NotTrusted, |(_, stored)| {
+                        TrustMatch::BindingDrift {
+                            stored: Box::new((*stored).clone()),
+                        }
+                    })
             }
         }
     }
@@ -346,7 +358,7 @@ impl TrustedDependencies {
         }
     }
 
-    /// Look up the rich binding for a specific `name@version`.
+    /// Look up the unambiguous rich binding for a specific coordinate.
     ///
     /// Used by the capability-hash enforcement path to obtain the
     /// [`TrustedDependencyBinding`] whose
@@ -354,18 +366,14 @@ impl TrustedDependencies {
     /// `lpm_cli::capability::CapabilitySet::is_approved_by`.
     ///
     /// Lookup precedence mirrors [`Self::matches_strict`]:
-    /// - Rich entries: only the concrete `{name}@{version}` key matches.
-    ///   `name@*` migration sentinels are NOT considered a binding source
-    ///   for capability decisions — same cross-version trust laundering
-    ///   rationale as [`Self::matches_strict`].
+    /// - Rich entries: base and artifact-qualified keys for the concrete
+    ///   coordinate participate. Conflicting artifacts return `None`.
+    ///   `name@*` migration sentinels are not a binding source.
     /// - Legacy entries: returns `None` — the legacy form has no binding.
     ///   Callers treat `None` as "legacy approval, no capability hash stored,"
     ///   which collapses via `is_approved_by` to the baseline-only semantic.
     pub fn get_binding(&self, name: &str, version: &str) -> Option<&TrustedDependencyBinding> {
-        match self {
-            TrustedDependencies::Legacy(_) => None,
-            TrustedDependencies::Rich(map) => map.get(&Self::rich_key(name, version)),
-        }
+        self.binding_for_exact_version(name, version)
     }
 
     /// Iterate over (name, optional binding). Legacy entries yield `None`
@@ -379,9 +387,8 @@ impl TrustedDependencies {
             TrustedDependencies::Rich(map) => Box::new(map.iter().map(|(k, v)| {
                 // For Rich entries, the user-facing "name" is the part
                 // BEFORE the `@version` so callers can group by package.
-                let name = k
-                    .rfind('@')
-                    .map_or_else(|| k.clone(), |at| k[..at].to_string());
+                let name =
+                    parse_rich_key(k).map_or_else(|| k.clone(), |(name, _)| name.to_string());
                 (name, Some(v))
             })),
         }
@@ -445,9 +452,10 @@ impl TrustedDependencies {
     }
 
     /// Insert a new approval entry, upgrading the variant to Rich if
-    /// needed. The key is `name@version`; an existing entry for the same
-    /// key is OVERWRITTEN (the new binding wins). Returns whether the
-    /// previous entry existed.
+    /// needed. The first artifact uses `name@version`; a distinct artifact
+    /// at the same coordinate uses `name@version#artifact-id`. Re-approving
+    /// the same artifact overwrites its prior binding. Returns whether an
+    /// entry for that artifact previously existed.
     ///
     /// Metadata-agnostic variant — persists `provenance_at_approval`,
     /// `behavioral_tags_hash`, and `behavioral_tags` as `None`. Production
@@ -475,7 +483,7 @@ impl TrustedDependencies {
         )
     }
 
-    /// Insert / overwrite an approval entry with the install-time-captured
+    /// Insert or overwrite one artifact approval with the install-time-captured
     /// metadata bundle. Equivalent to [`Self::approve`] but carries provenance,
     /// behavioral-tag hash, and capability-hash fields through to the binding so
     /// subsequent installs can compare against them.
@@ -495,21 +503,35 @@ impl TrustedDependencies {
         let TrustedDependencies::Rich(map) = self else {
             unreachable!("upgrade_to_rich left us in Rich state")
         };
-        let key = Self::rich_key(name, version);
-        map.insert(
-            key,
-            TrustedDependencyBinding {
-                integrity: meta.integrity,
-                script_hash: meta.script_hash,
-                provenance_at_approval: meta.provenance_at_approval,
-                behavioral_tags_hash: meta.behavioral_tags_hash,
-                behavioral_tags: meta.behavioral_tags,
-                // `None` is valid: baseline approval with no extras requested.
-                // The match rule interprets `None` as "approved baseline only."
-                capability_hash: meta.capability_hash,
-            },
-        )
-        .is_some()
+        let binding = TrustedDependencyBinding {
+            integrity: meta.integrity,
+            script_hash: meta.script_hash,
+            provenance_at_approval: meta.provenance_at_approval,
+            behavioral_tags_hash: meta.behavioral_tags_hash,
+            behavioral_tags: meta.behavioral_tags,
+            capability_hash: meta.capability_hash,
+        };
+        let existing_key = map.iter().find_map(|(key, existing)| {
+            (rich_key_matches_coordinate(key, name, version)
+                && same_artifact_binding(existing, &binding))
+            .then(|| key.clone())
+        });
+        let replaced = existing_key.is_some();
+        let key = existing_key.unwrap_or_else(|| {
+            let base = Self::rich_key(name, version);
+            if map.contains_key(&base) {
+                Self::artifact_key(
+                    name,
+                    version,
+                    binding.integrity.as_deref(),
+                    binding.script_hash.as_deref(),
+                )
+            } else {
+                base
+            }
+        });
+        map.insert(key, binding);
+        replaced
     }
 
     /// Find the provenance-bearing approval entry for this package name whose
@@ -540,9 +562,10 @@ impl TrustedDependencies {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
-        map.iter()
+        let version = map
+            .iter()
             .filter_map(|(key, binding)| {
-                let (n, v) = key.rsplit_once('@')?;
+                let (n, v) = parse_rich_key(key)?;
                 if n == name && binding.provenance_at_approval.is_some() {
                     Some((v, binding))
                 } else {
@@ -550,14 +573,22 @@ impl TrustedDependencies {
                 }
             })
             .max_by(|(v1, _), (v2, _)| compare_version_strings(v1, v2))
+            .map(|(version, _)| version)?;
+        let binding = unambiguous_binding_for_coordinate(map, name, version)?;
+        binding
+            .provenance_at_approval
+            .is_some()
+            .then_some((version, binding))
     }
 
     /// Find the provenance snapshot that should be used to evaluate
     /// drift for a concrete candidate version.
     ///
-    /// Exact rich bindings win. If `package.json` already carries
-    /// `name@candidate_version`, that binding is the user's approval
-    /// record for this candidate and no other version may override it.
+    /// An exact rich binding for the candidate artifact wins. If multiple
+    /// artifacts share a name and version, the most specific unambiguous
+    /// integrity and script-hash match is the only eligible reference.
+    /// This prevents one artifact from inheriting another artifact's
+    /// publisher identity.
     /// When no exact binding exists, use the greatest approved version
     /// lower than the candidate so upgrades still compare against the
     /// most recent prior approval.
@@ -565,30 +596,48 @@ impl TrustedDependencies {
         &self,
         name: &str,
         candidate_version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
     ) -> Option<(&str, &TrustedDependencyBinding)> {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
 
-        let mut has_exact_binding = false;
-        for (key, binding) in map {
-            let Some((n, v)) = key.rsplit_once('@') else {
-                continue;
-            };
-            if n == name && v == candidate_version {
-                has_exact_binding = true;
-                if binding.provenance_at_approval.is_some() {
-                    return Some((v, binding));
-                }
+        let exact: Vec<_> = map
+            .iter()
+            .filter_map(|(key, binding)| {
+                let (candidate_name, version) = parse_rich_key(key)?;
+                (candidate_name == name && version == candidate_version)
+                    .then_some((key, version, binding))
+            })
+            .collect();
+        if !exact.is_empty() {
+            let mut matching: Vec<_> = exact
+                .into_iter()
+                .filter_map(|(key, version, binding)| {
+                    artifact_match_specificity(binding, integrity, script_hash)
+                        .map(|specificity| (specificity, key, version, binding))
+                })
+                .collect();
+            matching.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+            let best = matching.first()?;
+            if matching
+                .get(1)
+                .is_some_and(|next| next.0 == best.0 && next.3 != best.3)
+            {
+                return None;
             }
-        }
-        if has_exact_binding {
-            return None;
+            return best
+                .3
+                .provenance_at_approval
+                .is_some()
+                .then_some((best.2, best.3));
         }
 
-        map.iter()
+        let version = map
+            .iter()
             .filter_map(|(key, binding)| {
-                let (n, v) = key.rsplit_once('@')?;
+                let (n, v) = parse_rich_key(key)?;
                 if n == name
                     && v != "*"
                     && version_string_precedes(v, candidate_version)
@@ -600,6 +649,12 @@ impl TrustedDependencies {
                 }
             })
             .max_by(|(v1, _), (v2, _)| compare_version_strings(v1, v2))
+            .map(|(version, _)| version)?;
+        let binding = unambiguous_binding_for_coordinate(map, name, version)?;
+        binding
+            .provenance_at_approval
+            .is_some()
+            .then_some((version, binding))
     }
 
     /// Find the approved binding for this package name whose version is the
@@ -626,9 +681,10 @@ impl TrustedDependencies {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
-        map.iter()
+        let version = map
+            .iter()
             .filter_map(|(key, binding)| {
-                let (n, v) = key.rsplit_once('@')?;
+                let (n, v) = parse_rich_key(key)?;
                 // Skip the `@*` legacy preserve key: it's a migration
                 // sentinel, not a real approval, and `*` would out-sort
                 // every concrete version under lex-max (`*` > any
@@ -641,16 +697,13 @@ impl TrustedDependencies {
                 }
             })
             .max_by(|(v1, _), (v2, _)| compare_version_strings(v1, v2))
+            .map(|(version, _)| version)?;
+        unambiguous_binding_for_coordinate(map, name, version).map(|binding| (version, binding))
     }
 
-    /// Look up an existing rich-form binding by exact `name@version`
-    /// key. Returns `None` on Legacy state or when no entry matches.
-    ///
-    /// Used by the approval write path's provenance-preservation
-    /// logic: when a re-approval would overwrite a prior verified
-    /// snapshot with `None` (Warn-mode + verifier rejection), the
-    /// caller substitutes the prior `provenance_at_approval` rather
-    /// than silently clearing the drift reference.
+    /// Look up the unambiguous rich-form binding for an exact coordinate.
+    /// Base and artifact-qualified keys participate. Returns `None` for
+    /// legacy state, no match, or conflicting artifacts at the coordinate.
     pub fn binding_for_exact_version(
         &self,
         name: &str,
@@ -659,12 +712,43 @@ impl TrustedDependencies {
         let TrustedDependencies::Rich(map) = self else {
             return None;
         };
-        let key = Self::rich_key(name, version);
-        map.get(&key)
+        unambiguous_binding_for_coordinate(map, name, version)
     }
 
-    /// Remove an approval entry by exact `name@version` key. Returns
-    /// `true` if the entry existed and was removed.
+    /// Look up the binding that authorizes one exact artifact tuple.
+    pub fn binding_for_artifact(
+        &self,
+        name: &str,
+        version: &str,
+        integrity: Option<&str>,
+        script_hash: Option<&str>,
+    ) -> Option<&TrustedDependencyBinding> {
+        let TrustedDependencies::Rich(map) = self else {
+            return None;
+        };
+        let mut candidates: Vec<_> = map
+            .iter()
+            .filter_map(|(key, binding)| {
+                if !rich_key_matches_coordinate(key, name, version) {
+                    return None;
+                }
+                artifact_match_specificity(binding, integrity, script_hash)
+                    .map(|specificity| (specificity, key, binding))
+            })
+            .collect();
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        let best = candidates.first()?;
+        if candidates
+            .get(1)
+            .is_some_and(|next| next.0 == best.0 && next.2 != best.2)
+        {
+            return None;
+        }
+        Some(best.2)
+    }
+
+    /// Remove every base or artifact-qualified approval at an exact
+    /// coordinate. Returns `true` if at least one entry was removed.
     ///
     /// Does NOT touch Legacy entries — revoking from a Legacy `Vec<String>`
     /// is a separate concern that callers should handle by upgrading
@@ -673,11 +757,77 @@ impl TrustedDependencies {
         match self {
             TrustedDependencies::Legacy(_) => false,
             TrustedDependencies::Rich(map) => {
-                let key = Self::rich_key(name, version);
-                map.remove(&key).is_some()
+                let previous_len = map.len();
+                map.retain(|key, _| !rich_key_matches_coordinate(key, name, version));
+                map.len() != previous_len
             }
         }
     }
+}
+
+fn parse_rich_key(key: &str) -> Option<(&str, &str)> {
+    let coordinate = key
+        .split_once('#')
+        .map_or(key, |(coordinate, _)| coordinate);
+    coordinate.rsplit_once('@')
+}
+
+fn rich_key_matches_coordinate(key: &str, name: &str, version: &str) -> bool {
+    matches!(parse_rich_key(key), Some((candidate_name, candidate_version)) if candidate_name == name && candidate_version == version)
+}
+
+fn binding_matches_query(
+    binding: &TrustedDependencyBinding,
+    integrity: Option<&str>,
+    script_hash: Option<&str>,
+) -> bool {
+    !matches!(
+        (binding.integrity.as_deref(), integrity),
+        (Some(stored), Some(queried)) if stored != queried
+    ) && !matches!(
+        (binding.script_hash.as_deref(), script_hash),
+        (Some(stored), Some(queried)) if stored != queried
+    )
+}
+
+fn artifact_match_specificity(
+    binding: &TrustedDependencyBinding,
+    integrity: Option<&str>,
+    script_hash: Option<&str>,
+) -> Option<u8> {
+    if !binding_matches_query(binding, integrity, script_hash) {
+        return None;
+    }
+    let integrity_match =
+        u8::from(binding.integrity.is_some() && binding.integrity.as_deref() == integrity);
+    let script_hash_match =
+        u8::from(binding.script_hash.is_some() && binding.script_hash.as_deref() == script_hash);
+    Some(integrity_match + script_hash_match)
+}
+
+fn same_artifact_binding(
+    left: &TrustedDependencyBinding,
+    right: &TrustedDependencyBinding,
+) -> bool {
+    left.integrity == right.integrity && left.script_hash == right.script_hash
+}
+
+fn unambiguous_binding_for_coordinate<'a>(
+    map: &'a HashMap<String, TrustedDependencyBinding>,
+    name: &str,
+    version: &str,
+) -> Option<&'a TrustedDependencyBinding> {
+    let mut selected: Option<&TrustedDependencyBinding> = None;
+    for (key, binding) in map {
+        if !rich_key_matches_coordinate(key, name, version) {
+            continue;
+        }
+        if selected.is_some_and(|existing| existing != binding) {
+            return None;
+        }
+        selected = Some(binding);
+    }
+    selected
 }
 
 fn parse_version_for_order(version: &str) -> Option<lpm_semver::Version> {
@@ -970,21 +1120,183 @@ mod tests {
     }
 
     #[test]
-    fn approve_overwrites_existing_entry_with_same_key() {
-        let mut td = rich_with("esbuild@0.25.1", Some("sha512-old"), Some("sha256-old"));
-        let was_present = td.approve(
+    fn approve_with_metadata_updates_an_existing_artifact_binding() {
+        let mut td = rich_with("esbuild@0.25.1", Some("sha512-e"), Some("sha256-s"));
+        let was_present = td.approve_with_metadata(
             "esbuild",
             "0.25.1",
-            Some("sha512-new".to_string()),
-            Some("sha256-new".to_string()),
+            ApprovalMetadata {
+                integrity: Some("sha512-e".into()),
+                script_hash: Some("sha256-s".into()),
+                behavioral_tags_hash: Some("sha256-tags".into()),
+                ..ApprovalMetadata::default()
+            },
         );
         assert!(was_present);
         let TrustedDependencies::Rich(map) = &td else {
             panic!("expected Rich");
         };
         let binding = map.get("esbuild@0.25.1").unwrap();
-        assert_eq!(binding.integrity.as_deref(), Some("sha512-new"));
-        assert_eq!(binding.script_hash.as_deref(), Some("sha256-new"));
+        assert_eq!(binding.behavioral_tags_hash.as_deref(), Some("sha256-tags"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn approvals_retain_distinct_artifacts_with_the_same_name_and_version() {
+        let mut trusted = TrustedDependencies::default();
+        trusted.approve(
+            "native-addon",
+            "1.0.0",
+            Some("sha512-artifact-a".into()),
+            Some("sha256-script-a".into()),
+        );
+        trusted.approve(
+            "native-addon",
+            "1.0.0",
+            Some("sha512-artifact-b".into()),
+            Some("sha256-script-b".into()),
+        );
+        let serialized = serde_json::to_vec(&trusted).unwrap();
+        let trusted: TrustedDependencies = serde_json::from_slice(&serialized).unwrap();
+
+        assert_eq!(trusted.len(), 2);
+        assert_eq!(
+            trusted.matches_strict(
+                "native-addon",
+                "1.0.0",
+                Some("sha512-artifact-a"),
+                Some("sha256-script-a"),
+            ),
+            TrustMatch::Strict,
+        );
+        assert_eq!(
+            trusted.matches_strict(
+                "native-addon",
+                "1.0.0",
+                Some("sha512-artifact-b"),
+                Some("sha256-script-b"),
+            ),
+            TrustMatch::Strict,
+        );
+    }
+
+    #[test]
+    fn binding_for_artifact_prefers_specific_binding_over_wildcard_binding() {
+        let wildcard = TrustedDependencyBinding {
+            capability_hash: Some("sha256-wildcard-capabilities".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let specific = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact-b".into()),
+            script_hash: Some("sha256-script-b".into()),
+            capability_hash: Some("sha256-specific-capabilities".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0".into(), wildcard);
+        map.insert("native-addon@1.0.0#artifact-b".into(), specific);
+        let trusted = TrustedDependencies::Rich(map);
+
+        let binding = trusted
+            .binding_for_artifact(
+                "native-addon",
+                "1.0.0",
+                Some("sha512-artifact-b"),
+                Some("sha256-script-b"),
+            )
+            .expect("the specific artifact binding must be selected");
+
+        assert_eq!(
+            binding.capability_hash.as_deref(),
+            Some("sha256-specific-capabilities"),
+        );
+    }
+
+    #[test]
+    fn binding_for_artifact_rejects_conflicting_duplicate_artifact_bindings() {
+        let first = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact".into()),
+            script_hash: Some("sha256-script".into()),
+            capability_hash: Some("sha256-capabilities-a".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let second = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact".into()),
+            script_hash: Some("sha256-script".into()),
+            capability_hash: Some("sha256-capabilities-b".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0".into(), first);
+        map.insert("native-addon@1.0.0#duplicate".into(), second);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .binding_for_artifact(
+                    "native-addon",
+                    "1.0.0",
+                    Some("sha512-artifact"),
+                    Some("sha256-script"),
+                )
+                .is_none(),
+            "conflicting equal-specificity bindings must fail closed",
+        );
+    }
+
+    #[test]
+    fn binding_for_exact_version_returns_a_single_qualified_artifact_binding() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact".into()),
+            script_hash: Some("sha256-script".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0#artifact".into(), binding);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .binding_for_exact_version("native-addon", "1.0.0")
+                .is_some(),
+            "a sole qualified artifact is the unambiguous exact-version binding",
+        );
+    }
+
+    #[test]
+    fn binding_for_exact_version_rejects_distinct_artifacts_at_one_coordinate() {
+        let first = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact-a".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let second = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact-b".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0".into(), first);
+        map.insert("native-addon@1.0.0#artifact-b".into(), second);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .binding_for_exact_version("native-addon", "1.0.0")
+                .is_none(),
+            "coordinate-only lookup must fail closed when artifacts differ",
+        );
+    }
+
+    #[test]
+    fn get_binding_returns_a_single_qualified_artifact_binding() {
+        let binding = TrustedDependencyBinding {
+            integrity: Some("sha512-artifact".into()),
+            ..TrustedDependencyBinding::default()
+        };
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0#artifact".into(), binding);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(trusted.get_binding("native-addon", "1.0.0").is_some());
     }
 
     /// Legacy `@*` preserve keys remain visible to lenient lookup but do
@@ -1413,7 +1725,7 @@ mod tests {
         let trusted = TrustedDependencies::Rich(map);
 
         let (version, binding) = trusted
-            .provenance_reference_for_candidate("esbuild", "0.25.12")
+            .provenance_reference_for_candidate("esbuild", "0.25.12", None, None)
             .expect("exact approval is the drift reference");
 
         assert_eq!(version, "0.25.12");
@@ -1423,6 +1735,75 @@ mod tests {
                 .as_ref()
                 .map(|snapshot| snapshot.present),
             Some(false),
+        );
+    }
+
+    #[test]
+    fn provenance_reference_for_candidate_does_not_cross_same_coordinate_artifacts() {
+        let mut primary = trusted_dep_binding_no_provenance();
+        primary.integrity = Some("sha512-artifact-b".into());
+        primary.script_hash = Some("sha256-script-b".into());
+        let mut other = trusted_dep_binding_with_provenance("github:attacker/fork");
+        other.integrity = Some("sha512-artifact-a".into());
+        other.script_hash = Some("sha256-script-a".into());
+
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0".into(), primary);
+        map.insert("native-addon@1.0.0#artifact-a".into(), other);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .provenance_reference_for_candidate(
+                    "native-addon",
+                    "1.0.0",
+                    Some("sha512-artifact-b"),
+                    Some("sha256-script-b"),
+                )
+                .is_none(),
+            "the primary artifact without provenance must not inherit another artifact's publisher identity",
+        );
+    }
+
+    #[test]
+    fn provenance_reference_for_candidate_rejects_ambiguous_prior_artifacts() {
+        let mut first = trusted_dep_binding_with_provenance("github:example/first");
+        first.integrity = Some("sha512-artifact-a".into());
+        first.script_hash = Some("sha256-script-a".into());
+        let mut second = trusted_dep_binding_with_provenance("github:example/second");
+        second.integrity = Some("sha512-artifact-b".into());
+        second.script_hash = Some("sha256-script-b".into());
+
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0".into(), first);
+        map.insert("native-addon@1.0.0#artifact-b".into(), second);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .provenance_reference_for_candidate("native-addon", "2.0.0", None, None)
+                .is_none(),
+            "an upgrade must not inherit an arbitrary publisher from ambiguous prior artifacts",
+        );
+    }
+
+    #[test]
+    fn latest_binding_for_name_rejects_ambiguous_prior_artifacts() {
+        let mut first = trusted_dep_binding_no_provenance();
+        first.integrity = Some("sha512-artifact-a".into());
+        let mut second = trusted_dep_binding_no_provenance();
+        second.integrity = Some("sha512-artifact-b".into());
+
+        let mut map = HashMap::new();
+        map.insert("native-addon@1.0.0".into(), first);
+        map.insert("native-addon@1.0.0#artifact-b".into(), second);
+        let trusted = TrustedDependencies::Rich(map);
+
+        assert!(
+            trusted
+                .latest_binding_for_name("native-addon", "2.0.0")
+                .is_none(),
+            "version-diff output must not describe an arbitrary prior artifact",
         );
     }
 
@@ -1437,7 +1818,7 @@ mod tests {
 
         assert!(
             trusted
-                .provenance_reference_for_candidate("esbuild", "0.25.12")
+                .provenance_reference_for_candidate("esbuild", "0.25.12", None, None)
                 .is_none(),
             "a future approved version must not be used as the drift reference for an older candidate",
         );
@@ -1457,7 +1838,7 @@ mod tests {
         let trusted = TrustedDependencies::Rich(map);
 
         let (version, binding) = trusted
-            .provenance_reference_for_candidate("axios", "1.11.0")
+            .provenance_reference_for_candidate("axios", "1.11.0", None, None)
             .expect("prior approval is the drift reference");
 
         assert_eq!(version, "1.10.0");

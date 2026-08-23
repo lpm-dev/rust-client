@@ -4053,6 +4053,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "scrypt",
+ "serde",
  "serde_json",
  "sha2",
  "tar",

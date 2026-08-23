@@ -63,14 +63,17 @@ mod prelude {
     pub(super) use super::manifest::find_blocked_by_arg;
     #[allow(unused_imports)]
     pub(super) use super::manifest::{
-        BlockedLookup, extract_trusted_dependencies, lookup_blocked_by_arg, write_back,
+        BlockedLookup, blocked_artifact_selector, ensure_manifest_unchanged,
+        extract_trusted_dependencies, lookup_blocked_by_arg, write_back,
     };
+    #[cfg(test)]
+    pub(super) use super::metadata::snapshot_for_binding_with_mode;
     #[allow(unused_imports)]
     pub(super) use super::metadata::{
         SCHEMA_VERSION, approval_metadata_from_blocked,
         approval_metadata_preserving_existing_provenance, authorize_project_trust_write,
-        fetch_provenance_for_effective_set, runtime_verify_policy_with_source,
-        snapshot_for_binding, snapshot_for_binding_with_mode,
+        commit_project_trust_write, fetch_provenance_for_effective_set,
+        runtime_verify_policy_with_source, snapshot_for_artifact_binding,
     };
     #[allow(unused_imports)]
     pub(super) use super::project::{InteractiveChoice, compute_effective_blocked_set, run};

@@ -3,6 +3,34 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
 
+/// Stable identifier for one lifecycle-script trust binding.
+///
+/// The identifier is content-derived from the two artifact dimensions that
+/// authorize script execution. It lets trust stores retain two distinct
+/// artifacts published under the same package name and version without
+/// relying on map insertion order.
+pub fn artifact_binding_id(integrity: Option<&str>, script_hash: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"lpm-artifact-binding-v1\0");
+    for value in [integrity, script_hash] {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update(b"\0");
+    }
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// Resolver-local identity for one exact node in a completed dependency graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResolutionNodeId(u32);
@@ -150,6 +178,24 @@ mod tests {
         assert_ne!(left, right);
         assert!(PackageInstanceId::parse(&left.to_string()).is_ok());
         assert!(PackageInstanceId::parse(&left.to_string().to_uppercase()).is_err());
+    }
+
+    #[test]
+    fn artifact_binding_id_changes_with_each_trust_dimension() {
+        let baseline = artifact_binding_id(Some("sha512-a"), Some("sha256-script-a"));
+        assert_eq!(baseline.len(), 64);
+        assert_ne!(
+            baseline,
+            artifact_binding_id(Some("sha512-b"), Some("sha256-script-a"))
+        );
+        assert_ne!(
+            baseline,
+            artifact_binding_id(Some("sha512-a"), Some("sha256-script-b"))
+        );
+        assert_eq!(
+            baseline,
+            artifact_binding_id(Some("sha512-a"), Some("sha256-script-a"))
+        );
     }
 
     #[test]

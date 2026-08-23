@@ -8,6 +8,30 @@ use super::prelude::*;
 /// top-level globally-installed package instead of per-dep.
 pub const GROUP_AUTO_THRESHOLD: usize = 10;
 
+#[cfg(test)]
+thread_local! {
+    static GLOBAL_TRUST_WRITE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_global_trust_write_count() {
+    GLOBAL_TRUST_WRITE_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn global_trust_write_count() -> usize {
+    GLOBAL_TRUST_WRITE_COUNT.get()
+}
+
+fn write_global_trust(
+    root: &lpm_common::LpmRoot,
+    trust: &lpm_global::GlobalTrustedDependencies,
+) -> Result<(), LpmError> {
+    #[cfg(test)]
+    GLOBAL_TRUST_WRITE_COUNT.with(|count| count.set(count.get() + 1));
+    lpm_global::trusted_deps::write_for(root, trust)
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ApprovalProvenanceContext<'a> {
     registry: &'a lpm_registry::RegistryClient,
@@ -466,17 +490,21 @@ pub(super) async fn run_global_bulk_yes(
     // `ProvenanceStatus::TransportDegraded`; a verifier rejection
     // surfaces as `VerificationRejected` (SILENT-DROP fix)
     // and refuses the approval below.
-    let pairs: Vec<(String, String)> = aggregate
+    let pairs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = aggregate
         .rows
         .iter()
-        .map(|r| (r.name.clone(), r.version.clone()))
+        .map(|r| (r.name.clone(), r.version.clone(), r.integrity.clone()))
         .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
-        provenance_context.registry,
-        &pairs,
-        provenance_context.verify_policy,
-    )
-    .await;
+    let provenance = if dry_run {
+        HashMap::new()
+    } else {
+        crate::provenance_fetch::fetch_provenance_for_artifacts(
+            provenance_context.registry,
+            &pairs,
+            provenance_context.verify_policy,
+        )
+        .await
+    };
 
     // Resolve each row's binding snapshot BEFORE entering the tx lock
     // so a verifier rejection (which returns
@@ -489,10 +517,11 @@ pub(super) async fn run_global_bulk_yes(
     let mut row_snapshots: Vec<(usize, Option<ProvenanceSnapshot>)> =
         Vec::with_capacity(aggregate.rows.len());
     for (idx, row) in aggregate.rows.iter().enumerate() {
-        let snap = snapshot_for_binding(
+        let snap = snapshot_for_artifact_binding(
             &provenance,
             &row.name,
             &row.version,
+            row.integrity.as_deref(),
             provenance_context.runtime_enforce,
         )?;
         row_snapshots.push((idx, snap));
@@ -524,7 +553,7 @@ pub(super) async fn run_global_bulk_yes(
                 json_output,
                 crate::security_approval::ApprovalSource::CliFlag,
             )?;
-            lpm_global::trusted_deps::write_for(root_for_body, &trust)?;
+            write_global_trust(root_for_body, &trust)?;
         }
         Ok(())
     })
@@ -557,7 +586,9 @@ pub(super) async fn run_global_bulk_yes(
                     "integrity": r.integrity,
                     "script_hash": r.script_hash,
                 });
-                if let Some(status) = provenance.get(&(r.name.clone(), r.version.clone())) {
+                if let Some(status) =
+                    provenance.get(&(r.name.clone(), r.version.clone(), r.integrity.clone()))
+                {
                     let (verified, rejection_reason) = status.to_json_verified();
                     let mut prov = serde_json::Map::new();
                     prov.insert("verified".into(), verified);
@@ -662,13 +693,13 @@ pub(super) async fn run_global_named(
             // deterministic regardless of row order.
             let mut keys: Vec<String> = candidates
                 .iter()
-                .map(|r| format!("{}@{}", r.name, r.version))
+                .map(|row| aggregate_artifact_selector(row))
                 .collect();
             keys.sort();
             keys.dedup();
             return Err(LpmError::Script(format!(
                 "package '{arg}' is ambiguous in the global blocked set — {} rows match. \
-                 Re-run with `name@version` to disambiguate. Candidates: {}",
+                 Re-run with an artifact-qualified candidate to disambiguate. Candidates: {}",
                 candidates.len(),
                 keys.join(", "),
             )));
@@ -679,17 +710,22 @@ pub(super) async fn run_global_named(
     // network response doesn't block parallel `--global` invocations.
     // SILENT-DROP fix: `?` propagates a verifier rejection
     // BEFORE acquiring the lock, leaving any prior binding intact.
-    let pairs = vec![(row.name.clone(), row.version.clone())];
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
-        provenance_context.registry,
-        &pairs,
-        provenance_context.verify_policy,
-    )
-    .await;
-    let snap = snapshot_for_binding(
+    let pairs = vec![(row.name.clone(), row.version.clone(), row.integrity.clone())];
+    let provenance = if dry_run {
+        HashMap::new()
+    } else {
+        crate::provenance_fetch::fetch_provenance_for_artifacts(
+            provenance_context.registry,
+            &pairs,
+            provenance_context.verify_policy,
+        )
+        .await
+    };
+    let snap = snapshot_for_artifact_binding(
         &provenance,
         &row.name,
         &row.version,
+        row.integrity.as_deref(),
         provenance_context.runtime_enforce,
     )?;
 
@@ -715,7 +751,7 @@ pub(super) async fn run_global_named(
                 json_output,
                 crate::security_approval::ApprovalSource::CliFlag,
             )?;
-            lpm_global::trusted_deps::write_for(root_for_body, &trust)?;
+            write_global_trust(root_for_body, &trust)?;
         }
         Ok(())
     })
@@ -737,7 +773,9 @@ pub(super) async fn run_global_named(
             "integrity": row.integrity,
             "script_hash": row.script_hash,
         });
-        if let Some(status) = provenance.get(&(row.name.clone(), row.version.clone())) {
+        if let Some(status) =
+            provenance.get(&(row.name.clone(), row.version.clone(), row.integrity.clone()))
+        {
             let (verified, rejection_reason) = status.to_json_verified();
             let mut prov = serde_json::Map::new();
             prov.insert("verified".into(), verified);
@@ -796,15 +834,9 @@ pub(super) async fn run_global_named(
 /// - `Match` — exactly one row matches. Approve it.
 /// - `NotFound` — zero rows match the given arg. Caller surfaces
 ///   NotFound with a hint toward `--list`.
-/// - `Ambiguous` — a BARE NAME matched multiple rows (different
-///   versions, or same name@version with drifted bindings across
-///   install roots). Caller surfaces a Script error listing the
-///   candidates so the user can re-run with `name@version`.
-///
-/// `name@version` form cannot be ambiguous by construction — dedup in
-/// the aggregator is keyed by `(name, version, integrity, script_hash)`,
-/// so two rows with the same `name@version` imply different bindings
-/// and that IS the disambiguation signal we want to preserve.
+/// - `Ambiguous` — a bare name or coordinate matched multiple rows.
+///   Caller lists artifact-qualified candidates so the user can re-run
+///   with `name@version#artifact-id` when a coordinate is not unique.
 #[derive(Debug)]
 pub(super) enum AggregateLookup<'a> {
     Match(&'a crate::global_blocked_set::AggregateBlockedRow),
@@ -820,7 +852,12 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
     rows: &'a [crate::global_blocked_set::AggregateBlockedRow],
     arg: &str,
 ) -> AggregateLookup<'a> {
-    if let Some((name, version)) = arg.rsplit_once('@')
+    let (coordinate_arg, artifact_qualifier) = arg
+        .rsplit_once('#')
+        .map_or((arg, None), |(coordinate, qualifier)| {
+            (coordinate, (!qualifier.is_empty()).then_some(qualifier))
+        });
+    if let Some((name, version)) = coordinate_arg.rsplit_once('@')
         && !name.is_empty()
     {
         // name@version form: collect ALL matches (different bindings
@@ -828,7 +865,12 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
         // multiple → Ambiguous; zero → NotFound.
         let matches: Vec<&crate::global_blocked_set::AggregateBlockedRow> = rows
             .iter()
-            .filter(|r| r.name == name && r.version == version)
+            .filter(|row| {
+                row.name == name
+                    && row.version == version
+                    && artifact_qualifier
+                        .is_none_or(|qualifier| aggregate_artifact_matches(row, qualifier))
+            })
             .collect();
         match matches.as_slice() {
             [] => AggregateLookup::NotFound,
@@ -838,9 +880,12 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
             },
         }
     } else {
+        if artifact_qualifier.is_some() {
+            return AggregateLookup::NotFound;
+        }
         // Bare name: collect ALL matches. Multiple = ambiguous.
         let matches: Vec<&crate::global_blocked_set::AggregateBlockedRow> =
-            rows.iter().filter(|r| r.name == arg).collect();
+            rows.iter().filter(|r| r.name == coordinate_arg).collect();
         match matches.as_slice() {
             [] => AggregateLookup::NotFound,
             [single] => AggregateLookup::Match(single),
@@ -849,6 +894,25 @@ pub(super) fn lookup_aggregate_by_arg<'a>(
             },
         }
     }
+}
+
+fn aggregate_artifact_matches(
+    row: &crate::global_blocked_set::AggregateBlockedRow,
+    qualifier: &str,
+) -> bool {
+    row.integrity.as_deref() == Some(qualifier)
+        || row.script_hash.as_deref() == Some(qualifier)
+        || lpm_common::artifact_binding_id(row.integrity.as_deref(), row.script_hash.as_deref())
+            == qualifier
+}
+
+fn aggregate_artifact_selector(row: &crate::global_blocked_set::AggregateBlockedRow) -> String {
+    format!(
+        "{}@{}#{}",
+        row.name,
+        row.version,
+        lpm_common::artifact_binding_id(row.integrity.as_deref(), row.script_hash.as_deref(),),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -927,60 +991,72 @@ pub(super) fn print_origin_group_card(
     println!();
 }
 
-/// Commit a single approval to `~/.lpm/global/trusted-dependencies.json`
-/// under the global tx lock. Reads the on-disk file, inserts the
-/// row's binding (with provenance fetched outside this critical
-/// section), and writes back atomically. Skipped under `--dry-run`.
-///
-/// **Lock order:** caller (interactive walk) holds `store_lock`
-/// (outer shared); this function takes `global_tx_lock` (inner
-/// exclusive). Do not invert.
-///
-/// Re-reading inside the lock — rather than relying on a long-lived
-/// in-memory copy seeded before the prompt loop — is what makes the
-/// interactive walk race-safe against parallel `approve-scripts
-/// --global` invocations.
-pub(super) async fn commit_global_approval(
+pub(super) async fn commit_global_approval_batch(
     root: &lpm_common::LpmRoot,
-    row: &crate::global_blocked_set::AggregateBlockedRow,
-    snap: Option<lpm_common::ProvenanceSnapshot>,
+    rows: &[&crate::global_blocked_set::AggregateBlockedRow],
     dry_run: bool,
+    provenance_context: ApprovalProvenanceContext<'_>,
 ) -> Result<(), LpmError> {
+    if dry_run || rows.is_empty() {
+        return Ok(());
+    }
+    let snapshots = fetch_global_approval_snapshots(rows, provenance_context).await?;
     let lock_path = root.global_tx_lock();
     lpm_common::with_exclusive_lock_async(lock_path, async move {
         let mut trust = lpm_global::trusted_deps::read_for(root)?;
-        trust.insert_binding(
-            &row.name,
-            &row.version,
-            lpm_global::TrustedDependencyBinding {
-                integrity: row.integrity.clone(),
-                script_hash: row.script_hash.clone(),
-                provenance_at_approval: snap,
-            },
-        );
-        if !dry_run {
-            crate::security_approval::ensure_global_trust_candidate_authorized_from_trust(
-                root,
-                &trust,
-                false,
-                crate::security_approval::ApprovalSource::CliFlag,
-            )?;
-            lpm_global::trusted_deps::write_for(root, &trust)?;
+        for (row, snapshot) in rows.iter().zip(snapshots) {
+            trust.insert_binding(
+                &row.name,
+                &row.version,
+                lpm_global::TrustedDependencyBinding {
+                    integrity: row.integrity.clone(),
+                    script_hash: row.script_hash.clone(),
+                    provenance_at_approval: snapshot,
+                },
+            );
         }
-        Ok(())
+        crate::security_approval::ensure_global_trust_candidate_authorized_from_trust(
+            root,
+            &trust,
+            false,
+            crate::security_approval::ApprovalSource::CliFlag,
+        )?;
+        write_global_trust(root, &trust)
     })
     .await
+}
+
+async fn fetch_global_approval_snapshots(
+    rows: &[&crate::global_blocked_set::AggregateBlockedRow],
+    provenance_context: ApprovalProvenanceContext<'_>,
+) -> Result<Vec<Option<lpm_common::ProvenanceSnapshot>>, LpmError> {
+    let pairs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = rows
+        .iter()
+        .map(|row| (row.name.clone(), row.version.clone(), row.integrity.clone()))
+        .collect();
+    let provenance = crate::provenance_fetch::fetch_provenance_for_artifacts(
+        provenance_context.registry,
+        &pairs,
+        provenance_context.verify_policy,
+    )
+    .await;
+    rows.iter()
+        .map(|row| {
+            snapshot_for_artifact_binding(
+                &provenance,
+                &row.name,
+                &row.version,
+                row.integrity.as_deref(),
+                provenance_context.runtime_enforce,
+            )
+        })
+        .collect()
 }
 
 /// Interactive walk. Flat mode prompts one aggregate row at a time.
 /// Grouped mode prompts by top-level global first, but still records
 /// approvals as individual dependency binding rows.
 ///
-/// provenance is pre-fetched for the full aggregate before
-/// the prompt loop so per-decision writes don't pay HTTP latency
-/// while the lock is held. The per-decision writes go through
-/// [`commit_global_approval`], which takes `global_tx_lock` so each
-/// per-row commit is serialized against parallel `--global` flows.
 pub(super) async fn run_global_interactive(
     root: &lpm_common::LpmRoot,
     aggregate: &crate::global_blocked_set::AggregateBlockedSet,
@@ -991,24 +1067,9 @@ pub(super) async fn run_global_interactive(
 ) -> Result<(), LpmError> {
     use crate::prompt::prompt_err;
 
-    // pre-fetch provenance for every aggregate row in one
-    // parallel batch BEFORE the prompt loop. Cheap (~5–10 packages
-    // typical) and the on-disk attestation cache absorbs repeats. Keeps
-    // the per-decision tx-lock window bounded to a read-modify-write.
-    let pairs: Vec<(String, String)> = aggregate
-        .rows
-        .iter()
-        .map(|r| (r.name.clone(), r.version.clone()))
-        .collect();
-    let provenance = crate::provenance_fetch::fetch_provenance_for_pkgs(
-        provenance_context.registry,
-        &pairs,
-        provenance_context.verify_policy,
-    )
-    .await;
-
     let mut approved: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
     let mut skipped: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
+    let mut pending_approvals: Vec<&crate::global_blocked_set::AggregateBlockedRow> = Vec::new();
 
     println!();
     output::info_line(install_ui::terminal_line!(
@@ -1023,130 +1084,145 @@ pub(super) async fn run_global_interactive(
             std::collections::HashSet::new();
         let mut quit_early = false;
 
-        loop {
-            let grouped = group_remaining_rows_by_origin(aggregate, &decided);
-            let Some((origin, rows)) = grouped.into_iter().next() else {
-                break;
-            };
+        let grouped = group_remaining_rows_by_origin(aggregate, &decided);
+        'groups: for (origin, candidate_rows) in grouped {
+            let rows: Vec<_> = candidate_rows
+                .into_iter()
+                .filter(|row| !decided.contains(&AggregateRowKey::from_row(row)))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            loop {
+                print_origin_group_card(&origin, &rows);
+                let prompt = install_ui::terminal_line!(
+                    "How would you like to review blocked deps for {}?",
+                    &origin,
+                )
+                .to_string();
+                let choice = match cliclack::select(prompt)
+                    .item("approve_all", "Approve all for this global", "")
+                    .item("review", "Review individually", "")
+                    .item("skip_all", "Skip all for now", "")
+                    .item("quit", "Quit — stop here; approved rows kept", "")
+                    .initial_value("review")
+                    .interact()
+                {
+                    Ok(choice) => choice,
+                    Err(error) => {
+                        commit_global_approval_batch(
+                            root,
+                            &pending_approvals,
+                            dry_run,
+                            provenance_context,
+                        )
+                        .await?;
+                        return Err(prompt_err(error));
+                    }
+                };
 
-            print_origin_group_card(&origin, &rows);
-            let prompt = install_ui::terminal_line!(
-                "How would you like to review blocked deps for {}?",
-                &origin,
-            )
-            .to_string();
-            let choice: &str = cliclack::select(prompt)
-                .item("approve_all", "Approve all for this global", "")
-                .item("review", "Review individually", "")
-                .item("skip_all", "Skip all for now", "")
-                .item("quit", "Quit — stop here; approved rows kept", "")
-                .initial_value("review")
-                .interact()
-                .map_err(prompt_err)?;
-
-            match choice {
-                "approve_all" => {
-                    // Tier-gate parity with `--yes`. If any row in
-                    // THIS group carries a non-green tier, refuse the
-                    // bulk-approve action: surface the same refusal
-                    // error project --yes prints, then loop back to the
-                    // same group's menu so the user explicitly re-
-                    // chooses Review / Skip / Quit. Leaving the group's
-                    // rows out of `decided` is what re-enters this
-                    // group on the next loop iteration — flat-mode has
-                    // no equivalent because flat-mode is already
-                    // per-package review.
-                    //
-                    // The grouped approve-all shortcut must use the same
-                    // tier gate as non-interactive global bulk approval.
-                    if let Err(gate_err) = enforce_tiered_yes_gate(&rows, GateScope::Global) {
-                        output::warn(&gate_err.to_string());
-                        // Fall through to the loop tail; same group is
-                        // re-displayed with the menu so the user can
-                        // pick Review individually instead.
-                        continue;
-                    }
-                    for row in &rows {
-                        // SILENT-DROP fix: a verifier
-                        // rejection on any row in this group aborts
-                        // the entire `approve_all` action with a clear
-                        // error, leaving any prior bindings for the
-                        // remaining rows untouched.
-                        let snap = snapshot_for_binding(
-                            &provenance,
-                            &row.name,
-                            &row.version,
-                            provenance_context.runtime_enforce,
-                        )?;
-                        commit_global_approval(root, row, snap, dry_run).await?;
-                        approved.push(*row);
-                        decided.insert(AggregateRowKey::from_row(row));
-                    }
-                }
-                "skip_all" => {
-                    for row in &rows {
-                        skipped.push(*row);
-                        decided.insert(AggregateRowKey::from_row(row));
-                    }
-                }
-                "review" => {
-                    for row in rows {
-                        let key = AggregateRowKey::from_row(row);
-                        if decided.contains(&key) {
+                match choice {
+                    "approve_all" => {
+                        // Tier-gate parity with `--yes`. If any row in
+                        // THIS group carries a non-green tier, refuse the
+                        // bulk-approve action: surface the same refusal
+                        // error project --yes prints, then loop back to the
+                        // same group's menu so the user explicitly re-
+                        // chooses Review / Skip / Quit. Leaving the group's
+                        // rows out of `decided` is what re-enters this
+                        // group on the next loop iteration — flat-mode has
+                        // no equivalent because flat-mode is already
+                        // per-package review.
+                        //
+                        // The grouped approve-all shortcut must use the same
+                        // tier gate as non-interactive global bulk approval.
+                        if let Err(gate_err) = enforce_tiered_yes_gate(&rows, GateScope::Global) {
+                            output::warn(&gate_err.to_string());
+                            // Fall through to the loop tail; same group is
+                            // re-displayed with the menu so the user can
+                            // pick Review individually instead.
                             continue;
                         }
-
-                        print_aggregate_card(row);
-                        let prompt = install_ui::terminal_line!(
-                            "{} @ {} — approve?",
-                            &row.name,
-                            &row.version,
-                        )
-                        .to_string();
-                        let row_choice: &str = cliclack::select(prompt)
-                            .item("approve", "Approve", "")
-                            .item("skip", "Skip", "")
-                            .item("quit", "Quit — stop here; approved rows kept", "")
-                            .initial_value("approve")
-                            .interact()
-                            .map_err(prompt_err)?;
-
-                        match row_choice {
-                            "approve" => {
-                                // SILENT-DROP fix.
-                                let snap = snapshot_for_binding(
-                                    &provenance,
-                                    &row.name,
-                                    &row.version,
-                                    provenance_context.runtime_enforce,
-                                )?;
-                                commit_global_approval(root, row, snap, dry_run).await?;
-                                approved.push(row);
-                                decided.insert(key);
-                            }
-                            "skip" => {
-                                skipped.push(row);
-                                decided.insert(key);
-                            }
-                            "quit" => {
-                                quit_early = true;
-                                break;
-                            }
-                            _ => unreachable!(),
+                        for row in &rows {
+                            pending_approvals.push(*row);
+                            approved.push(*row);
+                            decided.insert(AggregateRowKey::from_row(row));
                         }
+                        break;
                     }
-                }
-                "quit" => {
-                    quit_early = true;
-                }
-                _ => unreachable!(),
-            }
+                    "skip_all" => {
+                        for row in &rows {
+                            skipped.push(*row);
+                            decided.insert(AggregateRowKey::from_row(row));
+                        }
+                        break;
+                    }
+                    "review" => {
+                        for row in rows {
+                            let key = AggregateRowKey::from_row(row);
+                            if decided.contains(&key) {
+                                continue;
+                            }
 
+                            print_aggregate_card(row);
+                            let prompt = install_ui::terminal_line!(
+                                "{} @ {} — approve?",
+                                &row.name,
+                                &row.version,
+                            )
+                            .to_string();
+                            let row_choice = match cliclack::select(prompt)
+                                .item("approve", "Approve", "")
+                                .item("skip", "Skip", "")
+                                .item("quit", "Quit — stop here; approved rows kept", "")
+                                .initial_value("approve")
+                                .interact()
+                            {
+                                Ok(choice) => choice,
+                                Err(error) => {
+                                    commit_global_approval_batch(
+                                        root,
+                                        &pending_approvals,
+                                        dry_run,
+                                        provenance_context,
+                                    )
+                                    .await?;
+                                    return Err(prompt_err(error));
+                                }
+                            };
+
+                            match row_choice {
+                                "approve" => {
+                                    pending_approvals.push(row);
+                                    approved.push(row);
+                                    decided.insert(key);
+                                }
+                                "skip" => {
+                                    skipped.push(row);
+                                    decided.insert(key);
+                                }
+                                "quit" => {
+                                    quit_early = true;
+                                    break;
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        break;
+                    }
+                    "quit" => {
+                        quit_early = true;
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
             if quit_early {
-                break;
+                break 'groups;
             }
         }
 
+        commit_global_approval_batch(root, &pending_approvals, dry_run, provenance_context).await?;
         println!();
         if dry_run {
             output::info(&format!(
@@ -1191,30 +1267,24 @@ pub(super) async fn run_global_interactive(
         print_aggregate_card(row);
         let prompt =
             install_ui::terminal_line!("{} @ {} — approve?", &row.name, &row.version).to_string();
-        let choice: &str = cliclack::select(prompt)
+        let choice = match cliclack::select(prompt)
             .item("approve", "Approve", "")
             .item("skip", "Skip", "")
             .item("quit", "Quit — stop here; approved rows kept", "")
             .initial_value("approve")
             .interact()
-            .map_err(prompt_err)?;
+        {
+            Ok(choice) => choice,
+            Err(error) => {
+                commit_global_approval_batch(root, &pending_approvals, dry_run, provenance_context)
+                    .await?;
+                return Err(prompt_err(error));
+            }
+        };
 
         match choice {
             "approve" => {
-                // SILENT-DROP fix.
-                let snap = snapshot_for_binding(
-                    &provenance,
-                    &row.name,
-                    &row.version,
-                    provenance_context.runtime_enforce,
-                )?;
-                // per-row write goes through `commit_global_approval`,
-                // which acquires the global tx lock and re-reads trust
-                // from disk so the commit is race-safe against parallel
-                // `approve-scripts --global` invocations. Ctrl+C mid-walk
-                // still preserves earlier rows because each was committed
-                // atomically.
-                commit_global_approval(root, row, snap, dry_run).await?;
+                pending_approvals.push(row);
                 approved.push(row);
             }
             "skip" => skipped.push(row),
@@ -1222,6 +1292,7 @@ pub(super) async fn run_global_interactive(
             _ => unreachable!(),
         }
     }
+    commit_global_approval_batch(root, &pending_approvals, dry_run, provenance_context).await?;
     println!();
     if dry_run {
         output::info(&format!(
@@ -1237,10 +1308,6 @@ pub(super) async fn run_global_interactive(
             skipped.len(),
             aggregate.rows.len() - approved.len() - skipped.len(),
         ));
-        // See `commit_global_approval`'s grouped-mode counterpart:
-        // `emit_rerun_hint_stderr` owns the empty-origins fallback,
-        // so guarding here would silently drop that prose when a row
-        // legitimately has no origin metadata.
         let origins = union_origins(approved.iter().copied());
         emit_rerun_hint_stderr(&origins);
     } else {

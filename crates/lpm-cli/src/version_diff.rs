@@ -864,6 +864,36 @@ pub fn blocked_to_json_with_provenance(
         &std::collections::HashMap<(String, String), lpm_common::ProvenanceStatus>,
     >,
 ) -> serde_json::Value {
+    let status =
+        provenance_by_pkg.and_then(|map| map.get(&(blocked.name.clone(), blocked.version.clone())));
+    blocked_to_json_with_provenance_status(blocked, trusted, status)
+}
+
+pub fn blocked_to_json_with_artifact_provenance(
+    blocked: &crate::build_state::BlockedPackage,
+    trusted: &lpm_workspace::TrustedDependencies,
+    provenance_by_artifact: Option<
+        &std::collections::HashMap<
+            crate::provenance_fetch::ProvenanceArtifactKey,
+            lpm_common::ProvenanceStatus,
+        >,
+    >,
+) -> serde_json::Value {
+    let status = provenance_by_artifact.and_then(|map| {
+        map.get(&(
+            blocked.name.clone(),
+            blocked.version.clone(),
+            blocked.integrity.clone(),
+        ))
+    });
+    blocked_to_json_with_provenance_status(blocked, trusted, status)
+}
+
+fn blocked_to_json_with_provenance_status(
+    blocked: &crate::build_state::BlockedPackage,
+    trusted: &lpm_workspace::TrustedDependencies,
+    provenance_status: Option<&lpm_common::ProvenanceStatus>,
+) -> serde_json::Value {
     let version_diff = match trusted.latest_binding_for_name(&blocked.name, &blocked.version) {
         None => serde_json::Value::Null,
         Some((prior_version, binding)) => {
@@ -881,9 +911,7 @@ pub fn blocked_to_json_with_provenance(
         "static_tier": blocked.static_tier,
         "version_diff": version_diff,
     });
-    if let Some(map) = provenance_by_pkg
-        && let Some(status) = map.get(&(blocked.name.clone(), blocked.version.clone()))
-    {
+    if let Some(status) = provenance_status {
         let (verified, rejection_reason) = status.to_json_verified();
         let mut prov = serde_json::Map::new();
         prov.insert("verified".into(), verified);
