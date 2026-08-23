@@ -8,7 +8,10 @@
 mod support;
 
 use serde_json::json;
-use support::{TempProject, assertions, lpm, write_signed_unlock};
+use support::{
+    LOCK_CONTENTION_MARKER_ENV, TempProject, assertions, lpm, lpm_spawnable,
+    wait_for_lock_contention, write_signed_unlock,
+};
 
 fn write_pkg_with_trust(project: &TempProject, trusted: serde_json::Value) {
     let pkg = json!({
@@ -615,6 +618,67 @@ fn trust_prune_yes_removes_stale_entries_and_preserves_active_ones() {
     assert!(
         !trusted.contains_key("removed-pkg@1.0.0"),
         "stale entry must be pruned, got: {trusted:?}"
+    );
+}
+
+#[test]
+fn trust_prune_waits_for_the_project_lock_and_preserves_newer_manifest_edits() {
+    let project = TempProject::empty(r#"{}"#);
+
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "removed-pkg@1.0.0": { "integrity": "sha512-r" }
+        }),
+    );
+    write_lockfile(&project, &[("esbuild", "0.25.1")]);
+
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path)
+        .expect("hold the project install transaction lock");
+    let marker_path = project.home().join("trust-prune-lock-contention");
+    let mut command = lpm_spawnable(&project);
+    command
+        .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
+        .args(["trust", "prune", "--yes", "--json"]);
+    let mut child = command.spawn().expect("spawn contending trust prune");
+
+    wait_for_lock_contention(&mut child, &marker_path, &lock_path);
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&json!({
+            "name": "trust-test",
+            "version": "1.0.0",
+            "scripts": { "test": "newer-edit" },
+            "lpm": {
+                "trustedDependencies": {
+                    "removed-pkg@1.0.0": { "integrity": "sha512-r" }
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    drop(transaction_lock);
+
+    let output = child
+        .wait_with_output()
+        .expect("finish contending trust prune");
+    assert!(
+        output.status.success(),
+        "trust prune failed after lock release:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["scripts"]["test"], json!("newer-edit"));
+    assert!(
+        manifest["lpm"]["trustedDependencies"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty),
+        "the stale entry must be removed without resurrecting the concurrently revoked entry: {manifest}"
     );
 }
 
