@@ -8,19 +8,25 @@ use crate::commands::registry_reads::{
 use crate::install_ui;
 use crate::provenance_fetch;
 use clap::ValueEnum;
+use futures::stream::{self, StreamExt as _};
 use lpm_common::provenance::{ProvenanceSnapshot, ProvenanceStatus};
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::{LpmError, LpmRoot, PackageInstanceId};
 use lpm_lockfile::{LockedPackage, Lockfile};
 use lpm_registry::{RegistryClient, UpstreamRoute};
+use serde::ser::{SerializeMap as _, SerializeSeq as _};
+use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ffi::OsString;
+use std::io::BufWriter;
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 const CYCLONEDX_SPEC_VERSION: &str = "1.7";
 const SPDX_SPEC_VERSION: &str = "SPDX-2.3";
 const SBOM_SCHEMA_VERSION: u32 = 1;
+const REGISTRY_ENRICHMENT_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SbomFormat {
@@ -48,10 +54,27 @@ struct SbomComponent {
     bom_ref: String,
     spdx_id: String,
     purl: String,
-    scope: &'static str,
+    scope: ComponentScope,
     metadata: ManifestMetadata,
     patch: Option<PatchMetadata>,
     provenance: Option<ProvenanceMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ComponentScope {
+    Excluded,
+    Optional,
+    Required,
+}
+
+impl ComponentScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Excluded => "excluded",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -89,11 +112,7 @@ pub async fn run(
     let root_json = read_json_file(&package_json_path)?;
     let document = build_document(client, project_dir, root_json, lockfile, registry).await?;
     print_sbom_summary(project_dir, &document, format, output);
-    let value = match format {
-        SbomFormat::Cyclonedx => render_cyclonedx(&document),
-        SbomFormat::Spdx => render_spdx(&document),
-    };
-    emit_sbom(&value, output)?;
+    emit_sbom(project_dir, &document, format, output)?;
 
     install_ui::done_untrusted(metadata_inclusion_line(&document));
     let verb = if output.is_some() { "wrote" } else { "printed" };
@@ -195,7 +214,6 @@ async fn build_document(
         .to_string();
     let root_metadata = extract_manifest_metadata(&root_json);
     let patch_metadata = read_patch_metadata(&lockfile);
-    let direct_scopes = root_dependency_scopes(&root_json);
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let local_metadata = read_installed_manifest_metadata(project_dir, &lockfile.packages)?;
@@ -214,6 +232,12 @@ async fn build_document(
         registry,
     )
     .await?;
+    let component_scopes = component_scopes(
+        &root_json,
+        &lockfile.packages,
+        &lockfile.root_resolutions,
+        &lockfile.root_aliases,
+    );
 
     let mut source_index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for package in &lockfile.packages {
@@ -229,10 +253,14 @@ async fn build_document(
 
     let mut components = Vec::with_capacity(lockfile.packages.len());
     let mut component_refs = BTreeSet::new();
-    for package in lockfile.packages {
+    let mut refs_by_instance = HashMap::with_capacity(lockfile.packages.len());
+    for (index, package) in lockfile.packages.into_iter().enumerate() {
         let key = package_metadata_key(&package);
         let bom_ref = bom_ref_for_package(&package);
         component_refs.insert(bom_ref.clone());
+        if let Some(instance_id) = package.instance_id {
+            refs_by_instance.insert(instance_id, bom_ref.clone());
+        }
         let mut metadata = ManifestMetadata::default();
         if let Some(local) = local_metadata.get(&package) {
             metadata.merge_missing(local.clone());
@@ -243,10 +271,6 @@ async fn build_document(
 
         let selector = format!("{}@{}", package.name, package.version);
         let patch = patch_metadata.get(&selector).cloned();
-        let scope = direct_scopes
-            .get(&package.name)
-            .copied()
-            .unwrap_or("required");
 
         components.push(SbomComponent {
             spdx_id: spdx_id_for_package(&package),
@@ -254,15 +278,25 @@ async fn build_document(
             provenance: provenance_metadata.get(&key).cloned(),
             package,
             bom_ref,
-            scope,
+            scope: component_scopes[index],
             metadata,
             patch,
         });
     }
     components.sort_by(|left, right| left.bom_ref.cmp(&right.bom_ref));
 
-    let root_dependency_refs = root_dependency_refs(&root_json, &source_index);
-    let dependencies = dependency_graph(&components, &source_index, &component_refs);
+    let root_dependency_refs = root_dependency_refs(
+        &root_json,
+        &lockfile.root_resolutions,
+        &source_index,
+        &refs_by_instance,
+    );
+    let dependencies = dependency_graph(
+        &components,
+        &source_index,
+        &component_refs,
+        &refs_by_instance,
+    );
 
     Ok(SbomDocument {
         root_name,
@@ -325,27 +359,44 @@ async fn fetch_registry_metadata(
     let names = registry_packages
         .iter()
         .map(|package| package.name.clone())
-        .collect::<Vec<_>>();
-    let context = prepare_routed_read_context(client, project_dir, &names, true)?;
+        .collect::<BTreeSet<_>>();
+    let route_names = names.iter().cloned().collect::<Vec<_>>();
+    let context = prepare_routed_read_context(client, project_dir, &route_names, true)?;
     let mut by_key = BTreeMap::new();
 
-    let mut fetched = BTreeMap::new();
-    for package in registry_packages {
-        if !fetched.contains_key(&package.name) {
-            let fetched_metadata = fetch_routed_package_metadata(&context, &package.name)
-                .await
-                .ok();
-            fetched.insert(package.name.clone(), fetched_metadata);
+    let fetched_results = stream::iter(names.into_iter().map(|name| {
+        let context = &context;
+        async move {
+            let result = fetch_routed_package_metadata(context, &name).await;
+            (name, result)
         }
-        let Some((routed_package, metadata)) = fetched
-            .get(&package.name)
-            .and_then(|metadata| metadata.as_ref())
-        else {
-            continue;
-        };
-        let Some(version) = metadata.versions.get(&package.version) else {
-            continue;
-        };
+    }))
+    .buffer_unordered(REGISTRY_ENRICHMENT_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut fetched = BTreeMap::new();
+    for (name, result) in fetched_results {
+        let metadata = result.map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to fetch registry metadata for {name}: {error}"
+            ))
+        })?;
+        fetched.insert(name, metadata);
+    }
+
+    for package in registry_packages {
+        let (routed_package, metadata) = fetched.get(&package.name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "registry metadata was not fetched for {}",
+                package.name
+            ))
+        })?;
+        let version = metadata.versions.get(&package.version).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "registry metadata for {} does not include locked version {}",
+                package.name, package.version
+            ))
+        })?;
         let value = serde_json::to_value(version)
             .map_err(|e| LpmError::Registry(format!("failed to serialize metadata: {e}")))?;
         by_key.insert(
@@ -380,6 +431,7 @@ async fn collect_provenance_metadata(
         let http = crate::provenance_bundle::ProvenanceHttpClient::build().map_err(|error| {
             LpmError::Network(format!("failed to build provenance HTTP client: {error}"))
         })?;
+        let mut requests = BTreeMap::new();
         for package in packages {
             if locked_registry_source(package).is_none() {
                 continue;
@@ -388,24 +440,37 @@ async fn collect_provenance_metadata(
             let Some(metadata) = registry_metadata.get(&key) else {
                 continue;
             };
-            let status = provenance_fetch::map_fetch_result_to_status(
-                &package.name,
-                &package.version,
-                provenance_fetch::fetch_provenance_snapshot(
-                    &http,
-                    &cache_root,
-                    provenance_fetch::ProvenanceFetchRequest::new(
-                        &metadata.registry_url,
-                        &package.name,
-                        &package.version,
-                        package.integrity.as_deref(),
-                        metadata.attestation_ref.as_ref(),
-                    ),
-                    None,
-                )
-                .await,
-            );
-            out.insert(key, provenance_from_status(status));
+            requests.entry(key).or_insert((package, metadata));
+        }
+        let results = stream::iter(requests.into_iter().map(|(key, (package, metadata))| {
+            let http = &http;
+            let cache_root = &cache_root;
+            async move {
+                let status = provenance_fetch::map_fetch_result_to_status(
+                    &package.name,
+                    &package.version,
+                    provenance_fetch::fetch_provenance_snapshot(
+                        http,
+                        cache_root,
+                        provenance_fetch::ProvenanceFetchRequest::new(
+                            &metadata.registry_url,
+                            &package.name,
+                            &package.version,
+                            package.integrity.as_deref(),
+                            metadata.attestation_ref.as_ref(),
+                        ),
+                        None,
+                    )
+                    .await,
+                );
+                (key, provenance_from_status(status))
+            }
+        }))
+        .buffer_unordered(REGISTRY_ENRICHMENT_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for (key, provenance) in results {
+            out.insert(key, provenance);
         }
         return Ok(out);
     }
@@ -513,27 +578,16 @@ fn read_patch_metadata(lockfile: &Lockfile) -> BTreeMap<String, PatchMetadata> {
     out
 }
 
-fn render_cyclonedx(document: &SbomDocument) -> Value {
-    let root_ref = "lpm:root";
-    let mut dependencies = Vec::with_capacity(document.dependencies.len() + 1);
-    dependencies.push(json!({
-        "ref": root_ref,
-        "dependsOn": document.root_dependency_refs,
-    }));
-    for (reference, depends_on) in &document.dependencies {
-        dependencies.push(json!({
-            "ref": reference,
-            "dependsOn": depends_on,
-        }));
-    }
+struct CyclonedxDocument<'a>(&'a SbomDocument);
 
-    json!({
-        "$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json",
-        "bomFormat": "CycloneDX",
-        "specVersion": CYCLONEDX_SPEC_VERSION,
-        "serialNumber": document_serial("cyclonedx", document),
-        "version": 1,
-        "metadata": {
+impl Serialize for CyclonedxDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let document = self.0;
+        let root_ref = "lpm:root";
+        let metadata = json!({
             "timestamp": document.generated_at,
             "tools": {
                 "components": [{
@@ -547,10 +601,57 @@ fn render_cyclonedx(document: &SbomDocument) -> Value {
                 property("lpm:sbom:schemaVersion", SBOM_SCHEMA_VERSION.to_string()),
                 property("lpm:sbom:source", "lpm.lock"),
             ],
-        },
-        "components": document.components.iter().map(cyclonedx_component).collect::<Vec<_>>(),
-        "dependencies": dependencies,
-    })
+        });
+
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("$schema", "http://cyclonedx.org/schema/bom-1.7.schema.json")?;
+        map.serialize_entry("bomFormat", "CycloneDX")?;
+        map.serialize_entry("specVersion", CYCLONEDX_SPEC_VERSION)?;
+        map.serialize_entry("serialNumber", &document_serial("cyclonedx", document))?;
+        map.serialize_entry("version", &1)?;
+        map.serialize_entry("metadata", &metadata)?;
+        map.serialize_entry("components", &CyclonedxComponents(&document.components))?;
+        map.serialize_entry("dependencies", &CyclonedxDependencies(document))?;
+        map.end()
+    }
+}
+
+struct CyclonedxComponents<'a>(&'a [SbomComponent]);
+
+impl Serialize for CyclonedxComponents<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for component in self.0 {
+            sequence.serialize_element(&cyclonedx_component(component))?;
+        }
+        sequence.end()
+    }
+}
+
+struct CyclonedxDependencies<'a>(&'a SbomDocument);
+
+impl Serialize for CyclonedxDependencies<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let document = self.0;
+        let mut sequence = serializer.serialize_seq(Some(document.dependencies.len() + 1))?;
+        sequence.serialize_element(&json!({
+            "ref": "lpm:root",
+            "dependsOn": document.root_dependency_refs,
+        }))?;
+        for (reference, depends_on) in &document.dependencies {
+            sequence.serialize_element(&json!({
+                "ref": reference,
+                "dependsOn": depends_on,
+            }))?;
+        }
+        sequence.end()
+    }
 }
 
 fn cyclonedx_root_component(document: &SbomDocument, bom_ref: &str) -> Value {
@@ -572,7 +673,7 @@ fn cyclonedx_component(component: &SbomComponent) -> Value {
         "name": component.package.name,
         "version": component.package.version,
         "purl": component.purl,
-        "scope": component.scope,
+        "scope": component.scope.as_str(),
     });
     merge_cyclonedx_metadata(&mut value, &component.metadata);
 
@@ -691,69 +792,102 @@ fn add_external_reference(value: &mut Value, kind: &str, url: &str) {
     }
 }
 
-fn render_spdx(document: &SbomDocument) -> Value {
-    let root_spdx_id = "SPDXRef-RootPackage";
-    let mut packages = Vec::with_capacity(document.components.len() + 1);
-    packages.push(spdx_root_package(document, root_spdx_id));
-    for component in &document.components {
-        packages.push(spdx_package(component));
-    }
+struct SpdxDocument<'a>(&'a SbomDocument);
 
-    let mut relationships = Vec::new();
-    relationships.push(json!({
-        "spdxElementId": "SPDXRef-DOCUMENT",
-        "relationshipType": "DESCRIBES",
-        "relatedSpdxElement": root_spdx_id,
-    }));
-    for dependency in &document.root_dependency_refs {
-        if let Some(component) = document
+impl Serialize for SpdxDocument<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let document = self.0;
+        let components_by_ref = document
             .components
             .iter()
-            .find(|component| &component.bom_ref == dependency)
-        {
-            relationships.push(json!({
-                "spdxElementId": root_spdx_id,
-                "relationshipType": "DEPENDS_ON",
-                "relatedSpdxElement": component.spdx_id,
-            }));
-        }
-    }
-    for (reference, depends_on) in &document.dependencies {
-        let Some(component) = document
-            .components
-            .iter()
-            .find(|component| &component.bom_ref == reference)
-        else {
-            continue;
-        };
-        for dependency in depends_on {
-            if let Some(target) = document
-                .components
-                .iter()
-                .find(|component| &component.bom_ref == dependency)
-            {
-                relationships.push(json!({
-                    "spdxElementId": component.spdx_id,
-                    "relationshipType": "DEPENDS_ON",
-                    "relatedSpdxElement": target.spdx_id,
-                }));
-            }
-        }
-    }
-
-    json!({
-        "spdxVersion": SPDX_SPEC_VERSION,
-        "dataLicense": "CC0-1.0",
-        "SPDXID": "SPDXRef-DOCUMENT",
-        "name": document.root_name,
-        "documentNamespace": document_namespace(document),
-        "creationInfo": {
+            .map(|component| (component.bom_ref.as_str(), component))
+            .collect::<HashMap<_, _>>();
+        let creation_info = json!({
             "created": document.generated_at,
             "creators": [format!("Tool: lpm-rs-{}", crate::build_version::version())],
-        },
-        "packages": packages,
-        "relationships": relationships,
-    })
+        });
+
+        let mut map = serializer.serialize_map(Some(8))?;
+        map.serialize_entry("spdxVersion", SPDX_SPEC_VERSION)?;
+        map.serialize_entry("dataLicense", "CC0-1.0")?;
+        map.serialize_entry("SPDXID", "SPDXRef-DOCUMENT")?;
+        map.serialize_entry("name", &document.root_name)?;
+        map.serialize_entry("documentNamespace", &document_namespace(document))?;
+        map.serialize_entry("creationInfo", &creation_info)?;
+        map.serialize_entry("packages", &SpdxPackages(document))?;
+        map.serialize_entry(
+            "relationships",
+            &SpdxRelationships {
+                document,
+                components_by_ref: &components_by_ref,
+            },
+        )?;
+        map.end()
+    }
+}
+
+struct SpdxPackages<'a>(&'a SbomDocument);
+
+impl Serialize for SpdxPackages<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let document = self.0;
+        let mut sequence = serializer.serialize_seq(Some(document.components.len() + 1))?;
+        sequence.serialize_element(&spdx_root_package(document, "SPDXRef-RootPackage"))?;
+        for component in &document.components {
+            sequence.serialize_element(&spdx_package(component))?;
+        }
+        sequence.end()
+    }
+}
+
+struct SpdxRelationships<'a> {
+    document: &'a SbomDocument,
+    components_by_ref: &'a HashMap<&'a str, &'a SbomComponent>,
+}
+
+impl Serialize for SpdxRelationships<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let root_spdx_id = "SPDXRef-RootPackage";
+        let mut sequence = serializer.serialize_seq(None)?;
+        sequence.serialize_element(&json!({
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relationshipType": "DESCRIBES",
+            "relatedSpdxElement": root_spdx_id,
+        }))?;
+        for dependency in &self.document.root_dependency_refs {
+            if let Some(component) = self.components_by_ref.get(dependency.as_str()) {
+                sequence.serialize_element(&json!({
+                    "spdxElementId": root_spdx_id,
+                    "relationshipType": "DEPENDS_ON",
+                    "relatedSpdxElement": component.spdx_id,
+                }))?;
+            }
+        }
+        for (reference, depends_on) in &self.document.dependencies {
+            let Some(component) = self.components_by_ref.get(reference.as_str()) else {
+                continue;
+            };
+            for dependency in depends_on {
+                if let Some(target) = self.components_by_ref.get(dependency.as_str()) {
+                    sequence.serialize_element(&json!({
+                        "spdxElementId": component.spdx_id,
+                        "relationshipType": "DEPENDS_ON",
+                        "relatedSpdxElement": target.spdx_id,
+                    }))?;
+                }
+            }
+        }
+        sequence.end()
+    }
 }
 
 fn spdx_root_package(document: &SbomDocument, spdx_id: &str) -> Value {
@@ -844,10 +978,28 @@ fn dependency_graph(
     components: &[SbomComponent],
     source_index: &BTreeMap<(String, String), Vec<String>>,
     component_refs: &BTreeSet<String>,
+    refs_by_instance: &HashMap<PackageInstanceId, String>,
 ) -> BTreeMap<String, Vec<String>> {
     let mut graph = BTreeMap::new();
     for component in components {
         let mut refs = BTreeSet::new();
+        let exact_targets = component
+            .package
+            .dependency_targets
+            .values()
+            .chain(component.package.peer_targets.values());
+        if !component.package.dependency_targets.is_empty()
+            || !component.package.peer_targets.is_empty()
+        {
+            for target in exact_targets {
+                if let Some(target_ref) = refs_by_instance.get(target) {
+                    refs.insert(target_ref.clone());
+                }
+            }
+            graph.insert(component.bom_ref.clone(), refs.into_iter().collect());
+            continue;
+        }
+
         let alias_targets = component
             .package
             .alias_dependencies
@@ -881,48 +1033,197 @@ fn dependency_graph(
 
 fn root_dependency_refs(
     root_json: &Value,
+    root_resolutions: &lpm_lockfile::RootResolutions,
     source_index: &BTreeMap<(String, String), Vec<String>>,
+    refs_by_instance: &HashMap<PackageInstanceId, String>,
 ) -> Vec<String> {
-    let scopes = root_dependency_scopes(root_json);
     let mut out = BTreeSet::new();
-    for name in scopes.keys() {
-        for ((package_name, _version), refs) in source_index {
-            if package_name == name
-                && let Some(reference) = refs.first()
-            {
-                out.insert(reference.clone());
+    for resolution in root_resolutions.values() {
+        if let Some(reference) = resolution
+            .instance_id
+            .and_then(|instance_id| refs_by_instance.get(&instance_id))
+        {
+            out.insert(reference.clone());
+            continue;
+        }
+        if let Some(reference) = source_index
+            .get(&(resolution.package.clone(), resolution.version.clone()))
+            .and_then(|refs| refs.first())
+        {
+            out.insert(reference.clone());
+        }
+    }
+    if root_resolutions.is_empty() {
+        for name in root_dependency_scopes(root_json).keys() {
+            for ((package_name, _version), refs) in source_index {
+                if package_name == name
+                    && let Some(reference) = refs.first()
+                {
+                    out.insert(reference.clone());
+                }
             }
         }
     }
     out.into_iter().collect()
 }
 
-fn root_dependency_scopes(root_json: &Value) -> BTreeMap<String, &'static str> {
+fn component_scopes(
+    root_json: &Value,
+    packages: &[LockedPackage],
+    root_resolutions: &lpm_lockfile::RootResolutions,
+    root_aliases: &BTreeMap<String, String>,
+) -> Vec<ComponentScope> {
+    let root_scopes = root_dependency_scopes(root_json);
+    let mut by_instance = HashMap::with_capacity(packages.len());
+    let mut by_coordinates: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    for (index, package) in packages.iter().enumerate() {
+        if let Some(instance_id) = package.instance_id {
+            by_instance.insert(instance_id, index);
+        }
+        by_coordinates
+            .entry((&package.name, &package.version))
+            .or_default()
+            .push(index);
+    }
+
+    let mut scopes = vec![None; packages.len()];
+    let mut pending = VecDeque::with_capacity(packages.len());
+    for (local_name, resolution) in root_resolutions {
+        let scope = root_scopes
+            .get(local_name)
+            .copied()
+            .unwrap_or(ComponentScope::Required);
+        let target_index = resolution
+            .instance_id
+            .and_then(|instance_id| by_instance.get(&instance_id).copied())
+            .or_else(|| {
+                by_coordinates
+                    .get(&(resolution.package.as_str(), resolution.version.as_str()))
+                    .and_then(|indices| indices.first().copied())
+            });
+        if let Some(target_index) = target_index {
+            promote_component_scope(&mut scopes, &mut pending, target_index, scope);
+        }
+    }
+    if root_resolutions.is_empty() {
+        for (local_name, scope) in &root_scopes {
+            let target_name = root_aliases.get(local_name).unwrap_or(local_name);
+            if let Some(target_index) = by_coordinates
+                .iter()
+                .find(|((name, _), _)| *name == target_name.as_str())
+                .and_then(|(_, indices)| indices.first().copied())
+            {
+                promote_component_scope(&mut scopes, &mut pending, target_index, *scope);
+            }
+        }
+    }
+
+    while let Some(package_index) = pending.pop_front() {
+        let package = &packages[package_index];
+        let scope = scopes[package_index].unwrap_or(ComponentScope::Required);
+        let exact_targets = package
+            .dependency_targets
+            .values()
+            .chain(package.peer_targets.values());
+        if !package.dependency_targets.is_empty() || !package.peer_targets.is_empty() {
+            for target_id in exact_targets {
+                let Some(target_index) = by_instance.get(target_id).copied() else {
+                    continue;
+                };
+                let inherited = inherited_component_scope(scope, &packages[target_index]);
+                promote_component_scope(&mut scopes, &mut pending, target_index, inherited);
+            }
+            continue;
+        }
+
+        let alias_targets = package
+            .alias_dependencies
+            .iter()
+            .map(|[local, target]| (local.as_str(), target.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        for dependency in package.dependencies.iter().chain(&package.peers) {
+            let Some((local_name, version)) = split_dependency_pin(dependency) else {
+                continue;
+            };
+            let target_name = alias_targets
+                .get(local_name.as_str())
+                .copied()
+                .unwrap_or(local_name.as_str());
+            let Some(target_index) = by_coordinates
+                .get(&(target_name, version.as_str()))
+                .and_then(|indices| indices.first().copied())
+            else {
+                continue;
+            };
+            let inherited = inherited_component_scope(scope, &packages[target_index]);
+            promote_component_scope(&mut scopes, &mut pending, target_index, inherited);
+        }
+    }
+
+    scopes
+        .into_iter()
+        .map(|scope| scope.unwrap_or(ComponentScope::Required))
+        .collect()
+}
+
+fn inherited_component_scope(scope: ComponentScope, target: &LockedPackage) -> ComponentScope {
+    if scope == ComponentScope::Required && target.optional {
+        ComponentScope::Optional
+    } else {
+        scope
+    }
+}
+
+fn promote_component_scope(
+    scopes: &mut [Option<ComponentScope>],
+    pending: &mut VecDeque<usize>,
+    index: usize,
+    scope: ComponentScope,
+) {
+    if scopes[index].is_none_or(|existing| scope > existing) {
+        scopes[index] = Some(scope);
+        pending.push_back(index);
+    }
+}
+
+fn root_dependency_scopes(root_json: &Value) -> BTreeMap<String, ComponentScope> {
     let mut scopes = BTreeMap::new();
-    collect_dependency_scope(root_json, "dependencies", "required", &mut scopes, false);
+    collect_dependency_scope(
+        root_json,
+        "dependencies",
+        ComponentScope::Required,
+        &mut scopes,
+        false,
+    );
     collect_dependency_scope(
         root_json,
         "peerDependencies",
-        "required",
+        ComponentScope::Required,
         &mut scopes,
         false,
     );
     collect_dependency_scope(
         root_json,
         "optionalDependencies",
-        "optional",
+        ComponentScope::Optional,
         &mut scopes,
         true,
     );
-    collect_dependency_scope(root_json, "devDependencies", "excluded", &mut scopes, true);
+    collect_dependency_scope(
+        root_json,
+        "devDependencies",
+        ComponentScope::Excluded,
+        &mut scopes,
+        true,
+    );
     scopes
 }
 
 fn collect_dependency_scope(
     root_json: &Value,
     section: &str,
-    scope: &'static str,
-    scopes: &mut BTreeMap<String, &'static str>,
+    scope: ComponentScope,
+    scopes: &mut BTreeMap<String, ComponentScope>,
     only_if_absent: bool,
 ) {
     let Some(deps) = root_json.get(section).and_then(Value::as_object) else {
@@ -961,6 +1262,10 @@ fn bom_ref_for_package(package: &LockedPackage) -> String {
     hasher.update(package.version.as_bytes());
     hasher.update([0]);
     hasher.update(package.source.as_deref().unwrap_or("").as_bytes());
+    if let Some(instance_id) = package.instance_id {
+        hasher.update([0]);
+        hasher.update(instance_id.as_bytes());
+    }
     let digest = hex::encode(hasher.finalize());
     format!(
         "lpm:component:{}@{}:{}",
@@ -977,6 +1282,10 @@ fn spdx_id_for_package(package: &LockedPackage) -> String {
     hasher.update(package.version.as_bytes());
     hasher.update([0]);
     hasher.update(package.source.as_deref().unwrap_or("").as_bytes());
+    if let Some(instance_id) = package.instance_id {
+        hasher.update([0]);
+        hasher.update(instance_id.as_bytes());
+    }
     let digest = hex::encode(hasher.finalize());
     format!(
         "SPDXRef-Package-{}-{}-{}",
@@ -1055,20 +1364,181 @@ fn pseudo_uuid(kind: &str, document: &SbomDocument) -> String {
     )
 }
 
-fn emit_sbom(value: &Value, output: Option<&Path>) -> Result<(), LpmError> {
-    let body = serde_json::to_string_pretty(value)
-        .map_err(|e| LpmError::Registry(format!("failed to serialize SBOM: {e}")))?;
+fn emit_sbom(
+    project_dir: &Path,
+    document: &SbomDocument,
+    format: SbomFormat,
+    output: Option<&Path>,
+) -> Result<(), LpmError> {
     if let Some(path) = output {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
-        }
-        std::fs::write(path, format!("{body}\n")).map_err(LpmError::Io)?;
+        let output_path = normalized_output_path(project_dir, path)?;
+        let (directory, file_name) = open_output_parent(&output_path)?;
+        let file = open_output_file_nofollow(&directory, &file_name)?;
+        write_sbom_json(BufWriter::new(file), document, format)?;
     } else {
-        println!("{body}");
+        let stdout = std::io::stdout();
+        write_sbom_json(BufWriter::new(stdout.lock()), document, format)?;
     }
     Ok(())
+}
+
+fn write_sbom_json(
+    mut writer: impl std::io::Write,
+    document: &SbomDocument,
+    format: SbomFormat,
+) -> Result<(), LpmError> {
+    let result = match format {
+        SbomFormat::Cyclonedx => {
+            serde_json::to_writer_pretty(&mut writer, &CyclonedxDocument(document))
+        }
+        SbomFormat::Spdx => serde_json::to_writer_pretty(&mut writer, &SpdxDocument(document)),
+    };
+    result.map_err(|error| LpmError::Registry(format!("failed to serialize SBOM: {error}")))?;
+    std::io::Write::write_all(&mut writer, b"\n").map_err(LpmError::Io)?;
+    std::io::Write::flush(&mut writer).map_err(LpmError::Io)
+}
+
+fn normalized_output_path(project_dir: &Path, output: &Path) -> Result<PathBuf, LpmError> {
+    let path = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        project_dir.join(output)
+    };
+    if !path.is_absolute() {
+        return Err(LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SBOM output path is not absolute: {}", path.display()),
+        )));
+    }
+
+    let mut normalized = PathBuf::with_capacity(path.as_os_str().len());
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(LpmError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "SBOM output escapes the filesystem root: {}",
+                            path.display()
+                        ),
+                    )));
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn open_output_parent(path: &Path) -> Result<(cap_std::fs::Dir, OsString), LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            LpmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("SBOM output has no file name: {}", path.display()),
+            ))
+        })?
+        .to_os_string();
+    let parent_path = path.parent().ok_or_else(|| {
+        LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SBOM output has no parent: {}", path.display()),
+        ))
+    })?;
+    let root = parent_path
+        .ancestors()
+        .last()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .ok_or_else(|| {
+            LpmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("SBOM output has no filesystem root: {}", path.display()),
+            ))
+        })?;
+    let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+        .map_err(LpmError::Io)?;
+    let relative_parent = parent_path.strip_prefix(root).map_err(|error| {
+        LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "invalid SBOM output parent {}: {error}",
+                parent_path.display()
+            ),
+        ))
+    })?;
+    for component in relative_parent.components() {
+        let Component::Normal(name) = component else {
+            return Err(LpmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe SBOM output parent: {}", parent_path.display()),
+            )));
+        };
+        directory = match directory.open_dir_nofollow(name) {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(LpmError::Io(error)),
+                }
+                directory.open_dir_nofollow(name).map_err(LpmError::Io)?
+            }
+            Err(error) => return Err(LpmError::Io(error)),
+        };
+        let metadata = directory.dir_metadata().map_err(LpmError::Io)?;
+        if !metadata.is_dir() || capability_metadata_is_link_or_reparse(&metadata) {
+            return Err(LpmError::Io(std::io::Error::other(format!(
+                "refusing linked SBOM output parent at {}",
+                parent_path.display()
+            ))));
+        }
+    }
+    Ok((directory, file_name))
+}
+
+fn open_output_file_nofollow(
+    directory: &cap_std::fs::Dir,
+    file_name: &std::ffi::OsStr,
+) -> Result<cap_std::fs::File, LpmError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(file_name, &options)
+        .map_err(LpmError::Io)?;
+    let metadata = file.metadata().map_err(LpmError::Io)?;
+    if !metadata.is_file() || capability_metadata_is_link_or_reparse(&metadata) {
+        return Err(LpmError::Io(std::io::Error::other(
+            "refusing SBOM output that is not a regular file",
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_symlink()
+}
+
+#[cfg(windows)]
+fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(test)]
