@@ -54,6 +54,7 @@ pub struct PullResponse {
     pub encrypted_blob: Option<String>,
     pub wrapped_key: Option<String>,
     pub version: Option<i32>,
+    pub crypto_version: Option<i32>,
     pub error: Option<String>,
 }
 
@@ -186,7 +187,7 @@ pub async fn push_raw(
 ) -> Result<PushResponse, SyncError> {
     let secrets_json = secrets_json.to_string();
 
-    let (encrypted_blob, wrapped_key) = crypto::encrypt_vault_for_sync(&secrets_json)?;
+    let (encrypted_blob, wrapped_key) = crypto::encrypt_vault_for_sync(&secrets_json, vault_id)?;
     let client = sync_http_client_builder()
         .timeout(sync_request_timeout(std::time::Duration::from_secs(30)))
         .build()
@@ -199,6 +200,7 @@ pub async fn push_raw(
     let mut body = serde_json::json!({
         "encryptedBlob": encrypted_blob,
         "wrappedKey": wrapped_key,
+        "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
     });
     if let Some(v) = expected_version {
         body["expectedVersion"] = serde_json::json!(v);
@@ -283,8 +285,15 @@ pub async fn pull(
         .ok_or("server returned no encrypted data")?;
     let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
     let version = result.version.unwrap_or(0);
+    let crypto_version = result.crypto_version.unwrap_or(1);
 
-    let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
+    let result = crypto::decrypt_vault_from_sync(
+        auth_token,
+        &encrypted_blob,
+        &wrapped_key,
+        vault_id,
+        crypto_version,
+    )?;
     let secrets_json = &result.plaintext;
 
     if result.needs_reencrypt {
@@ -369,8 +378,15 @@ async fn pull_raw_with_migration(
         .ok_or("server returned no encrypted data")?;
     let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
     let version = result.version.unwrap_or(0);
+    let crypto_version = result.crypto_version.unwrap_or(1);
 
-    let result = crypto::decrypt_vault_from_sync(auth_token, &encrypted_blob, &wrapped_key)?;
+    let result = crypto::decrypt_vault_from_sync(
+        auth_token,
+        &encrypted_blob,
+        &wrapped_key,
+        vault_id,
+        crypto_version,
+    )?;
 
     if migrate_legacy && result.needs_reencrypt {
         attempt_legacy_reencrypt_push(
@@ -405,7 +421,7 @@ async fn attempt_legacy_reencrypt_push(
 ) {
     tracing::info!("migrating vault {vault_id} to stored wrapping key");
 
-    let (new_blob, new_wrapped) = match crypto::encrypt_vault_for_sync(secrets_json) {
+    let (new_blob, new_wrapped) = match crypto::encrypt_vault_for_sync(secrets_json, vault_id) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(
@@ -434,6 +450,7 @@ async fn attempt_legacy_reencrypt_push(
     let body = serde_json::json!({
         "encryptedBlob": new_blob,
         "wrappedKey": new_wrapped,
+        "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
         "expectedVersion": version,
     });
 
@@ -922,7 +939,8 @@ mod tests {
         })
         .to_string();
         let (encrypted_blob, wrapped_key) =
-            crypto::encrypt_vault_for_sync(&secrets_json).expect("vault payload should encrypt");
+            crypto::encrypt_vault_for_sync(&secrets_json, "vault-123")
+                .expect("vault payload should encrypt");
 
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-123/sync"))
@@ -931,7 +949,8 @@ mod tests {
                 serde_json::json!({
                     "encryptedBlob": encrypted_blob,
                     "wrappedKey": wrapped_key,
-                    "version": 7
+                    "version": 7,
+                    "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION
                 }),
                 "auth-token",
             ))
