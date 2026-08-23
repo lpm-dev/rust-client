@@ -545,27 +545,6 @@ fn compute_blocked_packages_with_metadata_and_baseline(
     // builds hit this path more heavily).
     let per_pkg =
         |(name, version, integrity): &(String, String, Option<String>)| -> Option<BlockedPackage> {
-            // Advisor-approved packages are
-            // EXCLUDED from the blocked set entirely. They executed
-            // their scripts via the AdvisorApprovedThisRun trust path
-            // during this install's autoBuild, so listing them as
-            // "still blocked" would emit stale UI + JSON. Keyed on
-            // the full triple so two sources of the same coord don't
-            // cross-approve.
-            // M29: the approval key includes a script_bundle_hash
-            // slot. The capture path doesn't carry the bodies here;
-            // today every approved package has exactly one bundle hash
-            // per `(name, version, integrity)` triple (whole-package
-            // classification) so an iter+match-on-three-fields is
-            // unambiguous. A future per-phase classification refactor
-            // would tighten this to a full 4-tuple lookup.
-            if let Some(set) = extras.advisor_approvals
-                && set
-                    .iter()
-                    .any(|(n, v, i, _)| n == name && v == version && i == integrity)
-            {
-                return None;
-            }
             if let Some(set) = extras.execution_exclusions
                 && set.contains(&(name.clone(), version.clone(), integrity.clone()))
             {
@@ -577,6 +556,20 @@ fn compute_blocked_packages_with_metadata_and_baseline(
             let script_data = compute_script_hash_with_phase_bodies(&pkg_dir)?;
             let script_hash = script_data.hash;
             let phase_bodies = script_data.phase_bodies;
+            if let Some(set) = extras.advisor_approvals {
+                let script_bundle_hash =
+                    crate::triage_advisor_session::compute_script_bundle_hash(&phase_bodies);
+                if set.iter().any(
+                    |(approved_name, approved_version, approved_integrity, hash)| {
+                        approved_name == name
+                            && approved_version == version
+                            && approved_integrity == integrity
+                            && hash == &script_bundle_hash
+                    },
+                ) {
+                    return None;
+                }
+            }
             let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
             // Classify each present phase and aggregate
@@ -2482,7 +2475,7 @@ mod tests {
     //                       from the persisted blocked set ──────────
 
     #[test]
-    fn slice1_advisor_approved_amber_excluded_from_blocked_set() {
+    fn advisor_approved_matching_script_bundle_is_excluded_from_blocked_set() {
         // A package the advisor approves this run must NOT appear in the
         // blocked set written to `.lpm/build-state.json`. Without
         // this, post-install JSON + the "remain blocked after auto-
@@ -2516,13 +2509,14 @@ mod tests {
         assert_eq!(blocked_without_approval.len(), 1);
         assert_eq!(blocked_without_approval[0].name, "amber-pkg");
 
-        // With the matching triple in the approval set: EXCLUDED.
+        // With the matching approval key: EXCLUDED.
+        let phase_bodies = vec![("postinstall".to_string(), "node install.js".to_string())];
         let mut approvals = std::collections::HashSet::new();
         approvals.insert((
             "amber-pkg".to_string(),
             "1.0.0".to_string(),
             Some("sha512-test-integrity".to_string()),
-            String::new(),
+            crate::triage_advisor_session::compute_script_bundle_hash(&phase_bodies),
         ));
         let blocked_with_approval = compute_blocked_packages_with_metadata(
             &store,
@@ -2540,6 +2534,50 @@ mod tests {
                 .iter()
                 .map(|b| &b.name)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn advisor_approval_for_other_script_bundle_does_not_exclude_blocked_package() {
+        let project = tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+        let store = lpm_store::PackageStore::at(project.path().join("store"));
+        store_pkg_with_scripts(
+            &store,
+            "amber-pkg",
+            "1.0.0",
+            &serde_json::json!({"postinstall": "node changed.js"}),
+        );
+        let installed = vec![(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-test-integrity".to_string()),
+        )];
+        let approved_phase_bodies =
+            vec![("postinstall".to_string(), "node original.js".to_string())];
+        let approvals = std::collections::HashSet::from([(
+            "amber-pkg".to_string(),
+            "1.0.0".to_string(),
+            Some("sha512-test-integrity".to_string()),
+            crate::triage_advisor_session::compute_script_bundle_hash(&approved_phase_bodies),
+        )]);
+
+        let blocked = compute_blocked_packages_with_metadata(
+            &store,
+            &installed,
+            &empty_policy(),
+            &BlockedSetMetadata::default(),
+            &crate::capability::CapabilitySet::default(),
+            &crate::capability::UserBound::default(),
+            Some(&approvals),
+        );
+
+        assert_eq!(
+            blocked
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["amber-pkg"]
         );
     }
 

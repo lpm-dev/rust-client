@@ -204,10 +204,10 @@ fn validation_hash(
         }
     }
     for path in host_package_state_paths().iter().map(Path::new) {
-        hash_metadata_tree(path, &mut hasher)?;
+        hash_path_metadata(path, &mut hasher)?;
     }
     for path in pkg_config_paths {
-        hash_metadata_tree(path, &mut hasher)?;
+        hash_directory_entry_metadata(path, &mut hasher)?;
     }
     for cellar in [
         Path::new("/opt/homebrew/Cellar"),
@@ -229,42 +229,49 @@ fn validation_hash(
         .map(|(_, value)| PathBuf::from(value))
         .or_else(dirs::home_dir)
     {
-        hash_metadata_tree(&home.join(".node-gyp"), &mut hasher)?;
+        hash_node_gyp_metadata(&home.join(".node-gyp"), &mut hasher)?;
         hash_rustup_metadata(&home.join(".rustup"), &mut hasher)?;
     }
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
-fn hash_metadata_tree(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
-    hasher.update(b"metadata-tree-v1\0");
-    hash_os_path(hasher, root);
-    let root_metadata = match std::fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            hasher.update(b"absent\x1e");
-            return Ok(());
-        }
+fn hash_directory_entry_metadata(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    hasher.update(b"directory-entry-metadata-v1\0");
+    hash_path_metadata(root, hasher)?;
+    let mut entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    hash_metadata_record(hasher, &root_metadata);
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return Ok(());
+    entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        hash_os_path(hasher, Path::new(&entry.file_name()));
+        hash_path_metadata(&entry.path(), hasher)?;
     }
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let mut entries = std::fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let path = entry.path();
-            hash_os_path(hasher, path.strip_prefix(root).unwrap_or(&path));
-            let metadata = std::fs::symlink_metadata(&path)?;
-            hash_metadata_record(hasher, &metadata);
-            if metadata.file_type().is_symlink() {
-                hash_os_path(hasher, &std::fs::read_link(path)?);
-            } else if metadata.is_dir() {
-                pending.push(path);
-            }
-            hasher.update(b"\x1e");
+    Ok(())
+}
+
+fn hash_node_gyp_metadata(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
+    hasher.update(b"node-gyp-metadata-v1\0");
+    hash_path_metadata(root, hasher)?;
+    let mut versions = match std::fs::read_dir(root) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    versions.sort_unstable_by_key(std::fs::DirEntry::file_name);
+    for version in versions {
+        if !version.file_type()?.is_dir() {
+            continue;
+        }
+        hash_os_path(hasher, Path::new(&version.file_name()));
+        for relative in [
+            "installVersion",
+            "common.gypi",
+            "include/node/node_version.h",
+            "include/node/config.gypi",
+        ] {
+            hash_path_metadata(&version.path().join(relative), hasher)?;
         }
     }
     Ok(())

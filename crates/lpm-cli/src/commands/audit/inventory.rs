@@ -57,7 +57,7 @@ pub(crate) fn build_project_v2_baseline_index(
     }
 }
 
-fn build_instance_baselines(
+pub(crate) fn build_instance_baselines(
     project_dir: &Path,
     index: &lpm_store::V2BaselineIndex,
     lockfile: &lpm_lockfile::Lockfile,

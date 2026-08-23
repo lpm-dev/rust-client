@@ -3,7 +3,8 @@ use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
 use lpm_store::{V2BaselineIndex, find_installed_package_baseline_indexed};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 pub(super) const BUILD_MARKER: &str = ".lpm-built";
@@ -17,39 +18,65 @@ pub(super) fn package_baseline_dir_indexed(
     find_installed_package_baseline_indexed(index, lpm_root, name, version).map(|b| b.package_dir)
 }
 
-pub(super) fn read_lifecycle_scripts(pkg_json_path: &Path) -> Option<HashMap<String, String>> {
+pub(super) fn read_lifecycle_scripts(
+    pkg_json_path: &Path,
+) -> Result<Option<HashMap<String, String>>, lpm_common::LpmError> {
     let content =
-        lpm_common::read_file_capped(pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
+        lpm_common::read_file_capped(pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
 
     // Fast byte pre-scan: if "scripts" never appears as a JSON key, the
     // result is always None — skip the full parse.
     const SCRIPTS_KEY: &[u8] = b"\"scripts\"";
     if !content.windows(SCRIPTS_KEY.len()).any(|w| w == SCRIPTS_KEY) {
-        return None;
+        serde_json::from_slice::<serde::de::IgnoredAny>(&content).map_err(|error| {
+            lpm_common::LpmError::Store(format!(
+                "installed manifest {} is malformed: {error}",
+                pkg_json_path.display()
+            ))
+        })?;
+        return Ok(None);
     }
 
-    let parsed: serde_json::Value = serde_json::from_slice(&content).ok()?;
-    let scripts = parsed.get("scripts")?.as_object()?;
+    let parsed: serde_json::Value = serde_json::from_slice(&content).map_err(|error| {
+        lpm_common::LpmError::Store(format!(
+            "installed manifest {} is malformed: {error}",
+            pkg_json_path.display()
+        ))
+    })?;
+    let Some(scripts_value) = parsed.get("scripts") else {
+        return Ok(None);
+    };
+    let scripts = scripts_value.as_object().ok_or_else(|| {
+        lpm_common::LpmError::Store(format!(
+            "installed manifest {} has a non-object scripts field",
+            pkg_json_path.display()
+        ))
+    })?;
 
     let mut lifecycle = HashMap::new();
     for phase in EXECUTED_INSTALL_PHASES {
-        if let Some(cmd) = scripts
-            .get(*phase)
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            lifecycle.insert((*phase).to_string(), cmd.to_string());
+        if let Some(value) = scripts.get(*phase) {
+            let cmd = value.as_str().ok_or_else(|| {
+                lpm_common::LpmError::Store(format!(
+                    "installed manifest {} has a non-string {phase} script",
+                    pkg_json_path.display()
+                ))
+            })?;
+            if !cmd.is_empty() {
+                lifecycle.insert((*phase).to_string(), cmd.to_string());
+            }
         }
     }
 
     if lifecycle.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(lifecycle)
+        Ok(Some(lifecycle))
     }
 }
 
 pub(super) struct ScriptablePackage {
+    pub(super) instance_id: Option<lpm_common::PackageInstanceId>,
     pub(super) name: String,
     pub(super) version: String,
     pub(super) integrity: Option<String>,
@@ -103,6 +130,23 @@ pub(super) struct BuildCacheMetrics {
 }
 
 impl BuildCacheMetrics {
+    pub(super) fn merge(&mut self, other: Self) {
+        self.eligible += other.eligible;
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.bypassed += other.bypassed;
+        self.local_state_hits += other.local_state_hits;
+        self.scripts_avoided += other.scripts_avoided;
+        self.restored_bytes += other.restored_bytes;
+        self.lifecycle_ms_avoided += other.lifecycle_ms_avoided;
+        self.preparation_ms += other.preparation_ms;
+        self.key_ms += other.key_ms;
+        self.lookup_ms += other.lookup_ms;
+        self.restore_ms += other.restore_ms;
+        self.rematerialize_ms += other.rematerialize_ms;
+        self.publish_ms += other.publish_ms;
+    }
+
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "eligible": self.eligible,
@@ -251,87 +295,135 @@ pub(super) fn widen_to_build_by_policy(
     }
 }
 
+#[cfg(test)]
 pub(super) fn toposort_packages<'a>(
     packages: Vec<&'a ScriptablePackage>,
     lockfile: &lpm_lockfile::Lockfile,
 ) -> Vec<&'a ScriptablePackage> {
+    package_build_layers(packages, lockfile)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+pub(super) fn package_build_layers<'a>(
+    packages: Vec<&'a ScriptablePackage>,
+    lockfile: &lpm_lockfile::Lockfile,
+) -> Vec<Vec<&'a ScriptablePackage>> {
+    if packages.is_empty() {
+        return Vec::new();
+    }
     if packages.len() <= 1 {
-        return packages;
+        return vec![packages];
     }
 
-    // Build a set of names we're building
-    let build_set: HashSet<&str> = packages.iter().map(|p| p.name.as_str()).collect();
+    let selected_by_instance = packages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, package)| package.instance_id.map(|id| (id, index)))
+        .collect::<HashMap<_, _>>();
+    let locked_by_instance = lockfile
+        .packages
+        .iter()
+        .filter_map(|package| package.instance_id.map(|id| (id, package)))
+        .collect::<HashMap<_, _>>();
+    let mut in_degree = vec![0_usize; packages.len()];
+    let mut dependents = vec![Vec::<usize>::new(); packages.len()];
+    let mut edges = HashSet::new();
 
-    // Build adjacency: for each package, which of the other build-set packages depend on it?
-    // Edge: dep_name → pkg_name (dep must be built before pkg)
-    let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
-
-    for name in &build_set {
-        in_degree.insert(name, 0);
-    }
-
-    for lp in &lockfile.packages {
-        if !build_set.contains(lp.name.as_str()) {
+    for (consumer_index, package) in packages.iter().enumerate() {
+        if let Some(instance_id) = package.instance_id
+            && let Some(locked) = locked_by_instance.get(&instance_id)
+        {
+            for target in locked
+                .dependency_targets
+                .values()
+                .chain(locked.peer_targets.values())
+            {
+                if let Some(&dependency_index) = selected_by_instance.get(target)
+                    && dependency_index != consumer_index
+                    && edges.insert((dependency_index, consumer_index))
+                {
+                    in_degree[consumer_index] += 1;
+                    dependents[dependency_index].push(consumer_index);
+                }
+            }
             continue;
         }
-        for dep_ref in &lp.dependencies {
-            if let Some(at) = dep_ref.rfind('@') {
-                let dep_name = &dep_ref[..at];
-                if build_set.contains(dep_name) {
-                    // lp.name depends on dep_name → dep_name must come first
-                    *in_degree.entry(lp.name.as_str()).or_insert(0) += 1;
-                    dependents
-                        .entry(dep_name)
-                        .or_default()
-                        .push(lp.name.as_str());
+
+        let Some(locked) = lockfile.packages.iter().find(|candidate| {
+            candidate.instance_id.is_none()
+                && candidate.name == package.name
+                && candidate.version == package.version
+                && candidate.integrity == package.integrity
+        }) else {
+            continue;
+        };
+        for dependency in locked.dependencies.iter().chain(&locked.peers) {
+            let Some((local_name, version)) = dependency.rsplit_once('@') else {
+                continue;
+            };
+            let target_name = locked
+                .alias_dependencies
+                .iter()
+                .find(|alias| alias[0] == local_name)
+                .map_or(local_name, |alias| alias[1].as_str());
+            for (dependency_index, candidate) in packages.iter().enumerate() {
+                if candidate.name == target_name
+                    && candidate.version == version
+                    && dependency_index != consumer_index
+                    && edges.insert((dependency_index, consumer_index))
+                {
+                    in_degree[consumer_index] += 1;
+                    dependents[dependency_index].push(consumer_index);
                 }
             }
         }
     }
 
-    // Kahn's algorithm
-    let mut queue: VecDeque<&str> = in_degree
-        .iter()
-        .filter(|(_, deg)| **deg == 0)
-        .map(|(&name, _)| name)
-        .collect();
-
-    // Sort the initial queue for deterministic output
-    let mut q_vec: Vec<&str> = queue.drain(..).collect();
-    q_vec.sort();
-    queue.extend(q_vec);
-
-    let mut sorted_names: Vec<&str> = Vec::with_capacity(packages.len());
-
-    while let Some(name) = queue.pop_front() {
-        sorted_names.push(name);
-        if let Some(deps) = dependents.get(name) {
-            for &dep in deps {
-                if let Some(deg) = in_degree.get_mut(dep) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(dep);
-                    }
+    let queue_key = |index: usize| {
+        let package = packages[index];
+        (
+            package.name.as_str(),
+            package.version.as_str(),
+            package.instance_id,
+            package.store_path.as_path(),
+            index,
+        )
+    };
+    let mut queue = BinaryHeap::new();
+    for (index, degree) in in_degree.iter().enumerate() {
+        if *degree == 0 {
+            queue.push(Reverse(queue_key(index)));
+        }
+    }
+    let mut layers = Vec::new();
+    let mut emitted = vec![false; packages.len()];
+    while !queue.is_empty() {
+        let mut layer = Vec::with_capacity(queue.len());
+        while let Some(Reverse((_, _, _, _, index))) = queue.pop() {
+            emitted[index] = true;
+            layer.push(index);
+        }
+        for &index in &layer {
+            for &dependent in &dependents[index] {
+                in_degree[dependent] -= 1;
+                if in_degree[dependent] == 0 {
+                    queue.push(Reverse(queue_key(dependent)));
                 }
             }
         }
+        layers.push(layer);
     }
 
-    // Any remaining packages (cycles or not in lockfile) — append at the end
-    for name in &build_set {
-        if !sorted_names.contains(name) {
-            sorted_names.push(name);
-        }
-    }
-
-    // Map sorted names back to package references
-    let pkg_by_name: HashMap<&str, &ScriptablePackage> =
-        packages.iter().map(|p| (p.name.as_str(), *p)).collect();
-
-    sorted_names
-        .iter()
-        .filter_map(|name| pkg_by_name.get(name).copied())
+    let mut cyclic = (0..packages.len())
+        .filter(|&index| !emitted[index])
+        .collect::<Vec<_>>();
+    cyclic.sort_unstable_by_key(|&index| queue_key(index));
+    layers.extend(cyclic.into_iter().map(|index| vec![index]));
+    layers
+        .into_iter()
+        .map(|layer| layer.into_iter().map(|index| packages[index]).collect())
         .collect()
 }
 
