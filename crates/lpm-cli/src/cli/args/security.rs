@@ -178,8 +178,9 @@ pub(crate) struct McpArgs {
 
 #[derive(Args)]
 pub(crate) struct ApproveScriptsArgs {
-    /// Approve a specific package directly. Accepts `name` or
-    /// `name@version`. Skips the interactive walk for that package.
+    /// Approve a specific package directly. Accepts `name`, `name@version`,
+    /// or `name@version#artifact-id`. The qualified form disambiguates
+    /// distinct artifacts at one coordinate. Skips the interactive walk.
     pub(crate) package: Option<String>,
 
     /// Bulk-approve every blocked package without per-package review.

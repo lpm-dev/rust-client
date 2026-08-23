@@ -20,9 +20,7 @@ pub(super) enum GateScope {
 pub(super) trait TieredRow {
     /// `name@version` for the refusal error's per-row listing.
     fn display_id(&self) -> String;
-    /// `Some(tier)` when classification ran, `None` for legacy /
-    /// pre-classification state (passes through; see the call-site
-    /// comments for the rationale).
+    /// `Some(tier)` when classification ran, `None` for unclassified state.
     fn static_tier(&self) -> Option<lpm_security::triage::StaticTier>;
 }
 
@@ -60,10 +58,7 @@ impl<T: TieredRow + ?Sized> TieredRow for &T {
 /// — enforce the `--yes` refusal contract.
 ///
 /// Given the **effective** blocked-set that `--yes` would approve,
-/// return `Err` if any entry carries an explicit non-green static
-/// tier (`Amber`, `AmberLlm`, `Red`). `Green` and `None` pass through;
-/// see the gate-site comment at the callsite for the `None`-means-
-/// pre-P2-state pass-through rationale.
+/// return `Err` unless every entry carries an explicit green tier.
 ///
 /// Pure so it's unit-testable without an end-to-end `run()`
 /// invocation. The callsite threads the returned `LpmError` up and
@@ -83,12 +78,7 @@ pub(super) fn enforce_tiered_yes_gate<R: TieredRow>(
 
     let refusals: Vec<&R> = blocked
         .iter()
-        .filter(|bp| {
-            matches!(
-                bp.static_tier(),
-                Some(StaticTier::Amber | StaticTier::AmberLlm | StaticTier::Red)
-            )
-        })
+        .filter(|bp| !matches!(bp.static_tier(), Some(StaticTier::Green)))
         .collect();
 
     if refusals.is_empty() {
@@ -102,7 +92,7 @@ pub(super) fn enforce_tiered_yes_gate<R: TieredRow>(
     let detail = refusals
         .iter()
         .map(|bp| {
-            let tier_text = bp.static_tier().map_or("unknown tier", tier_label_text);
+            let tier_text = bp.static_tier().map_or("unclassified", tier_label_text);
             format!("    {}  [{}]", bp.display_id(), tier_text)
         })
         .collect::<Vec<_>>()

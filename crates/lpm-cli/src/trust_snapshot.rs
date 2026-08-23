@@ -75,7 +75,8 @@ pub struct TrustSnapshot {
     /// Used by the `lpm trust diff` command for "added since <date>"
     /// messaging, not by the diff-computation logic itself.
     pub captured_at: String,
-    /// Bindings keyed by `"name@version"` in deterministic
+    /// Bindings keyed by the raw trust key (`"name@version"` or
+    /// `"name@version#artifact-id"`) in deterministic
     /// lexicographic order (thanks to `BTreeMap`), so JSON on-disk
     /// is diff-stable across installs that don't change the set.
     pub bindings: BTreeMap<String, SnapshotEntry>,
@@ -86,17 +87,17 @@ impl TrustSnapshot {
     /// into snapshot shape.
     ///
     /// **Keying:** the snapshot uses the raw map key from
-    /// `TrustedDependencies::Rich` (format `"name@version"`, per
-    /// `TrustedDependencies::rich_key`) so the diff is
-    /// version-granular. Legacy bare-name entries use the bare name
+    /// `TrustedDependencies::Rich` (base format `"name@version"` with an
+    /// optional `#artifact-id`) so the diff is artifact-granular. Legacy
+    /// bare-name entries use the bare name
     /// as-is (no `@version`) and project to an empty binding — same
     /// semantic the strict gate assigns them (`LegacyNameOnly`).
     ///
     /// Note we pattern-match on the enum directly rather than calling
     /// `TrustedDependencies::iter`: the public `iter` normalizes the
     /// key to the name-portion only (stripping `@version`), which
-    /// would collapse all versions of the same package into one
-    /// snapshot key and defeat version-granular diff.
+    /// would collapse all versions and artifacts of the same package into
+    /// one snapshot key and defeat artifact-granular diff.
     ///
     /// The returned snapshot's `captured_at` is set to NOW. Callers
     /// are expected to persist it via [`write_snapshot`] after a
@@ -287,8 +288,8 @@ mod tests {
     #[test]
     fn capture_legacy_bare_names_keep_name_only_key() {
         // Legacy `trustedDependencies: ["esbuild", "sharp"]` projects
-        // to bindings with empty binding payloads. The `name@version`
-        // key semantic follows `TrustedDependencies::iter()`; legacy
+        // to bindings with empty binding payloads. The raw-key semantic
+        // follows `TrustedDependencies::iter()`; legacy
         // entries iterate as `(name, None)` and we use the bare name
         // as the key for the snapshot.
         let td = TrustedDependencies::Legacy(vec!["esbuild".to_string(), "sharp".to_string()]);

@@ -22,7 +22,8 @@ mod support;
 use std::path::PathBuf;
 use support::assertions;
 use support::build_state::{
-    seed_blocked_build_state_with_real_hash, seed_global_install_blocked_state_with_real_hash,
+    authenticate_project_build_state, seed_blocked_build_state_with_real_hash,
+    seed_global_install_blocked_state_with_real_hash,
 };
 use support::{TempProject, lpm, write_signed_unlock};
 
@@ -62,6 +63,7 @@ fn write_empty_build_state(project: &TempProject) {
     "blocked_packages": []
 }"#,
     );
+    authenticate_project_build_state(project);
 }
 
 #[test]
@@ -776,6 +778,7 @@ fn write_blocked_build_state_with_drift(
         }}"#
     );
     project.write_file(".lpm/build-state.json", &body);
+    authenticate_project_build_state(project);
 }
 
 /// Write `package.json` with a `trustedDependencies` rich entry for
@@ -1165,6 +1168,7 @@ fn write_build_state_audit(project: &TempProject, entries: &[(&str, &str, &str, 
         ".lpm/build-state.json",
         &serde_json::to_string_pretty(&state).unwrap(),
     );
+    authenticate_project_build_state(project);
 }
 
 fn assert_security_approval_scope(out: &std::process::Output, expected_scope: &str) {

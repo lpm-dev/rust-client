@@ -332,13 +332,14 @@ fn approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_
         workflow_ref: Some("refs/tags/v1.0.0".into()),
         attestation_cert_sha256: Some("sha256-leaf-prior".into()),
     };
+    let blocked = make_blocked("acme-widget", "1.0.0");
     let mut trusted = TrustedDependencies::default();
     trusted.approve_with_metadata(
         "acme-widget",
         "1.0.0",
         ApprovalMetadata {
-            integrity: Some("sha512-prior".into()),
-            script_hash: Some("sha256-prior".into()),
+            integrity: blocked.integrity.clone(),
+            script_hash: blocked.script_hash.clone(),
             provenance_at_approval: Some(prior_snap),
             behavioral_tags_hash: None,
             behavioral_tags: None,
@@ -346,7 +347,6 @@ fn approval_metadata_preserving_existing_provenance_preserves_prior_snapshot_on_
         },
     );
 
-    let blocked = make_blocked("acme-widget", "1.0.0");
     let meta = approval_metadata_preserving_existing_provenance(&trusted, &blocked, None, None);
     let preserved = meta
         .provenance_at_approval
@@ -453,11 +453,21 @@ fn make_blocked_tiered(
 }
 
 fn write_state(project_dir: &Path, blocked: Vec<BlockedPackage>) {
+    let blocked = blocked
+        .into_iter()
+        .map(|mut package| {
+            if package.static_tier.is_none() {
+                package.static_tier = Some(lpm_security::triage::StaticTier::Green);
+            }
+            package
+        })
+        .collect();
     let state = BuildState {
         state_version: BUILD_STATE_VERSION,
         blocked_set_fingerprint: "sha256-test".to_string(),
         captured_at: "T00:00:00Z".to_string(),
         blocked_packages: blocked,
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     crate::build_state::write_build_state(project_dir, &state).unwrap();
@@ -468,6 +478,18 @@ fn write_default_manifest(dir: &Path) {
         &dir.join("package.json"),
         &serde_json::json!({"name": "test", "version": "0.0.0"}),
     );
+}
+
+#[test]
+fn malformed_trusted_dependencies_is_not_treated_as_an_empty_trust_list() {
+    let manifest = serde_json::json!({
+        "name": "test",
+        "lpm": { "trustedDependencies": 42 }
+    });
+
+    let error = extract_trusted_dependencies(&manifest)
+        .expect_err("malformed trustedDependencies must fail instead of defaulting to empty");
+    assert!(error.to_string().contains("trustedDependencies"));
 }
 
 // ── Argument validation ─────────────────────────────────────────
@@ -526,6 +548,62 @@ async fn approve_scripts_with_empty_blocked_set_succeeds_silently() {
     // --list mode with empty blocked set should succeed
     let result = run(dir.path(), None, false, true, false, true).await;
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn empty_effective_set_does_not_build_baseline_or_fetch_provenance() {
+    let sandbox = tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let project = sandbox.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let _env = scoped_lpm_home_with_security(&home);
+    write_default_manifest(&project);
+    write_state(&project, vec![]);
+    project::reset_baseline_index_build_count();
+    crate::provenance_fetch::reset_provenance_batch_call_count();
+
+    run(&project, None, false, true, false, true).await.unwrap();
+
+    assert_eq!(project::baseline_index_build_count(), 0);
+    assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+}
+
+#[tokio::test]
+async fn yes_dry_run_does_not_build_baseline_or_fetch_provenance() {
+    let sandbox = tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let project = sandbox.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let _env = scoped_lpm_home_with_security(&home);
+    write_default_manifest(&project);
+    write_state(&project, vec![make_blocked("esbuild", "0.25.1")]);
+    project::reset_baseline_index_build_count();
+    crate::provenance_fetch::reset_provenance_batch_call_count();
+
+    run(&project, None, true, false, true, true).await.unwrap();
+
+    assert_eq!(project::baseline_index_build_count(), 0);
+    assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+}
+
+#[tokio::test]
+async fn noninteractive_named_dry_run_does_not_build_baseline_or_fetch_provenance() {
+    let sandbox = tempdir().unwrap();
+    let home = sandbox.path().join("home");
+    let project = sandbox.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let _env = scoped_lpm_home_with_security(&home);
+    write_default_manifest(&project);
+    write_state(&project, vec![make_blocked("esbuild", "0.25.1")]);
+    project::reset_baseline_index_build_count();
+    crate::provenance_fetch::reset_provenance_batch_call_count();
+
+    run(&project, Some("esbuild"), false, false, true, true)
+        .await
+        .unwrap();
+
+    assert_eq!(project::baseline_index_build_count(), 0);
+    assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
 }
 
 // ── --list mode ─────────────────────────────────────────────────
@@ -763,6 +841,21 @@ async fn find_blocked_by_arg_handles_scoped_names_with_at_in_scope() {
     assert_eq!(by_plain.unwrap().name, "plain");
 }
 
+#[test]
+fn lookup_blocked_by_arg_selects_one_same_coordinate_artifact_by_integrity() {
+    let mut first = make_blocked("native-addon", "1.0.0");
+    first.integrity = Some("sha512-artifact-a".into());
+    let mut second = make_blocked("native-addon", "1.0.0");
+    second.integrity = Some("sha512-artifact-b".into());
+    let blocked = vec![first, second];
+
+    let hit = match lookup_blocked_by_arg(&blocked, "native-addon@1.0.0#sha512-artifact-b") {
+        BlockedLookup::Match(blocked) => blocked,
+        other => panic!("expected artifact-qualified selector to match, got {other:?}"),
+    };
+    assert_eq!(hit.integrity.as_deref(), Some("sha512-artifact-b"));
+}
+
 // ── Atomic write semantics ──────────────────────────────────────
 
 #[tokio::test]
@@ -786,6 +879,61 @@ async fn approve_scripts_writes_atomic_via_temp_file_rename() {
             "tempfile leaked: {s}"
         );
     }
+}
+
+#[test]
+fn write_back_refuses_to_overwrite_a_manifest_changed_after_review() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("package.json");
+    let original = serde_json::json!({"name": "test", "version": "1.0.0"});
+    write_manifest(&path, &original);
+    let reviewed_text = std::fs::read_to_string(&path).unwrap();
+
+    let changed = serde_json::json!({
+        "name": "test",
+        "version": "1.0.0",
+        "dependencies": {"left-pad": "1.3.0"}
+    });
+    write_manifest(&path, &changed);
+
+    let mut reviewed = original;
+    let mut trusted = TrustedDependencies::default();
+    trusted.approve(
+        "native-addon",
+        "1.0.0",
+        Some("sha512-native-addon-integrity".into()),
+        Some("sha256-native-addon-script".into()),
+    );
+
+    let error = write_back(&path, &reviewed_text, &mut reviewed, &trusted)
+        .expect_err("a stale reviewed manifest must not overwrite a newer edit");
+    assert!(error.to_string().contains("changed while approve-scripts"));
+    assert_eq!(read_manifest(&path), changed);
+}
+
+#[test]
+fn write_back_refuses_to_overwrite_a_manifest_reformatted_after_review() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("package.json");
+    let original_text = "{\n  \"name\": \"test\",\n  \"version\": \"1.0.0\"\n}\n";
+    std::fs::write(&path, original_text).unwrap();
+    let mut reviewed: serde_json::Value = serde_json::from_str(original_text).unwrap();
+
+    let reformatted = r#"{"version":"1.0.0","name":"test"}"#;
+    std::fs::write(&path, reformatted).unwrap();
+
+    let mut trusted = TrustedDependencies::default();
+    trusted.approve(
+        "native-addon",
+        "1.0.0",
+        Some("sha512-native-addon-integrity".into()),
+        Some("sha256-native-addon-script".into()),
+    );
+
+    let error = write_back(&path, original_text, &mut reviewed, &trusted)
+        .expect_err("a reformatted manifest must count as a concurrent edit");
+    assert!(error.to_string().contains("changed while approve-scripts"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), reformatted);
 }
 
 // ── Schema versioning ───────────────────────────────────────────
@@ -952,28 +1100,23 @@ fn yes_gate_allows_all_green() {
 }
 
 #[test]
-fn yes_gate_allows_none_tiered_legacy_state() {
-    // Pre-P2 persisted state carries static_tier = None. The
-    // gate must pass `None` through to preserve existing --yes
-    // muscle memory during a → upgrade; the next install
-    // will recapture the state with real tiers.
+fn yes_gate_refuses_none_tiered_state() {
     let blocked = vec![make_blocked("esbuild", "0.25.1")];
     assert!(blocked[0].static_tier.is_none());
     assert!(
-        enforce_tiered_yes_gate(&blocked, GateScope::Project).is_ok(),
-        "None static_tier (pre-P2 legacy state) must pass through \
-             the --yes gate"
+        enforce_tiered_yes_gate(&blocked, GateScope::Project).is_err(),
+        "unclassified state must require per-package review"
     );
 }
 
 #[test]
-fn yes_gate_allows_mixed_green_and_none() {
+fn yes_gate_refuses_mixed_green_and_none() {
     use lpm_security::triage::StaticTier;
     let blocked = vec![
         make_blocked_tiered("fresh-green", "1.0.0", StaticTier::Green),
         make_blocked("legacy", "1.0.0"),
     ];
-    assert!(enforce_tiered_yes_gate(&blocked, GateScope::Project).is_ok());
+    assert!(enforce_tiered_yes_gate(&blocked, GateScope::Project).is_err());
 }
 
 #[test]
@@ -1026,19 +1169,19 @@ fn yes_gate_refuses_mix_and_lists_only_refusals() {
     // Refusals listed.
     assert!(msg.contains("risky-a@1.0.0"), "got: {msg}");
     assert!(msg.contains("risky-b@3.0.0"), "got: {msg}");
-    // Count accurate (2 refusals, not 4).
+    // Count accurate (three refusals, not the whole set).
     assert!(
-        msg.contains("2 package(s)"),
+        msg.contains("3 package(s)"),
         "count must reflect only refusals, not the whole set; got: {msg}"
     );
-    // Green and None entries NOT listed as refusals.
+    // Green is safe; unclassified state is a refusal.
     assert!(
         !msg.contains("safe-a@1.0.0"),
         "green must not be listed: {msg}"
     );
     assert!(
-        !msg.contains("legacy@2.0.0"),
-        "None-tier must not be listed: {msg}"
+        msg.contains("legacy@2.0.0"),
+        "unclassified package must be listed: {msg}"
     );
 }
 
@@ -1109,14 +1252,12 @@ fn yes_gate_global_allows_all_green_aggregate() {
 }
 
 #[test]
-fn yes_gate_global_passes_through_none_tier_legacy_state() {
-    // Pre-classification aggregate rows (e.g. fixtures or older
-    // per-install state predating the static_tier field) must
-    // continue through. Parity with the project gate's pass-through
-    // contract.
+fn yes_gate_global_refuses_none_tier_state() {
     let rows = vec![agg_row_no_tier("legacy", "1.0.0")];
     assert!(rows[0].static_tier.is_none());
-    assert!(enforce_tiered_yes_gate(&rows, GateScope::Global).is_ok());
+    let error = enforce_tiered_yes_gate(&rows, GateScope::Global)
+        .expect_err("unclassified state must require per-package review");
+    assert!(error.to_string().contains("unclassified"));
 }
 
 #[test]
@@ -1633,27 +1774,30 @@ async fn e2e_yes_approves_all_green_and_does_not_refuse() {
 }
 
 #[tokio::test]
-async fn e2e_yes_passes_through_when_static_tier_is_none_legacy_state() {
+async fn e2e_yes_refuses_when_static_tier_is_none() {
     let _security_backend = ensure_security_test_backend();
-    // Pre-P2 upgrade path: if the persisted BuildState predates
-    // (static_tier = None on every entry), --yes must still
-    // work so upgrading LPM doesn't silently break existing
-    // agent/CI flows. The next fresh install will recapture
-    // tiers and from then on the gate applies.
     let project = tempdir().unwrap();
     write_default_manifest(project.path());
-    // Craft a state file manually with static_tier = None,
-    // bypassing the fresh capture path that would populate it.
-    write_state(project.path(), vec![make_blocked("legacy-pkg", "1.0.0")]);
+    let blocked = vec![make_blocked("legacy-pkg", "1.0.0")];
+    let state = BuildState {
+        state_version: BUILD_STATE_VERSION,
+        blocked_set_fingerprint: build_state::compute_blocked_set_fingerprint(&blocked),
+        captured_at: "T00:00:00Z".into(),
+        blocked_packages: blocked,
+        authentication_tag: None,
+        drift_ignore_override: None,
+    };
+    build_state::write_build_state(project.path(), &state).unwrap();
 
-    run(project.path(), None, true, false, false, true)
+    let error = run(project.path(), None, true, false, false, true)
         .await
-        .expect("--yes against None-tiered (legacy) state must succeed");
+        .expect_err("--yes must refuse unclassified state");
+    assert!(error.to_string().contains("unclassified"));
 
     let manifest = read_manifest(&project.path().join("package.json"));
     assert!(
-        manifest["lpm"]["trustedDependencies"]["legacy-pkg@1.0.0"].is_object(),
-        "legacy-state entry must be approved on --yes pass-through",
+        manifest["lpm"]["trustedDependencies"].is_null(),
+        "refusal must leave trustedDependencies unchanged",
     );
 }
 
@@ -1713,6 +1857,7 @@ fn compute_effective_blocked_set_removes_strict_matches() {
             make_blocked("esbuild", "0.25.1"),
             make_blocked("sharp", "0.33.0"),
         ],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     // esbuild approved strictly, sharp not.
@@ -1747,6 +1892,7 @@ fn compute_effective_blocked_set_removes_legacy_name_only_matches() {
         blocked_set_fingerprint: "sha256-test".into(),
         captured_at: "T00:00:00Z".into(),
         blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     let trusted = TrustedDependencies::Legacy(vec!["esbuild".into()]);
@@ -1776,6 +1922,7 @@ fn compute_effective_blocked_set_keeps_drifted_entries() {
         blocked_set_fingerprint: "sha256-test".into(),
         captured_at: "T00:00:00Z".into(),
         blocked_packages: vec![blocked],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     let mut map = std::collections::HashMap::new();
@@ -1811,6 +1958,7 @@ fn compute_effective_blocked_set_keeps_not_trusted_entries() {
         blocked_set_fingerprint: "sha256-test".into(),
         captured_at: "T00:00:00Z".into(),
         blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     let trusted = TrustedDependencies::default();
@@ -1837,6 +1985,7 @@ fn compute_effective_blocked_set_keeps_package_blocked_under_at_star_sentinel() 
         blocked_set_fingerprint: "sha256-test".into(),
         captured_at: "T00:00:00Z".into(),
         blocked_packages: vec![make_blocked("esbuild", "0.25.1")],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     // Simulate post-upgrade state: legacy esbuild → esbuild@* sentinel
@@ -2032,12 +2181,8 @@ async fn approve_scripts_list_reports_nothing_when_all_persisted_blocked_are_alr
     );
 }
 
-/// **AUDIT REGRESSION ():** drift overrides "already approved".
-/// If the persisted state shows a script_hash that drifts from the
-/// stored binding, the package MUST appear in the effective blocked
-/// set (this is the whole point of script-hash binding).
 #[tokio::test]
-async fn approve_scripts_yes_does_not_skip_packages_with_binding_drift() {
+async fn approve_scripts_yes_retains_old_artifact_and_approves_drifted_artifact() {
     let _security_backend = ensure_security_test_backend();
     let dir = tempdir().unwrap();
     // State file claims script_hash = sha256-NEW
@@ -2063,18 +2208,22 @@ async fn approve_scripts_yes_does_not_skip_packages_with_binding_drift() {
         }),
     );
 
-    // --yes should re-approve esbuild with the NEW script_hash from
-    // the state file because the binding drifted.
     run(dir.path(), None, true, false, false, true)
         .await
         .unwrap();
 
     let after = read_manifest(&dir.path().join("package.json"));
-    let binding = &after["lpm"]["trustedDependencies"]["esbuild@0.25.1"];
+    let trusted = extract_trusted_dependencies(&after).unwrap();
     assert_eq!(
-        binding["scriptHash"], "sha256-NEW",
-        "drift must trigger re-approval with the new script hash"
+        trusted.matches_strict(
+            "esbuild",
+            "0.25.1",
+            Some("sha512-esbuild-integrity"),
+            Some("sha256-NEW"),
+        ),
+        TrustMatch::Strict,
     );
+    assert_eq!(trusted.len(), 2);
 }
 
 // ── --json mode emits exactly one JSON payload ──
@@ -2131,10 +2280,7 @@ fn row(name: &str, version: &str, origins: &[&str]) -> AggregateBlockedRow {
         script_hash: Some(format!("sha256-{name}{version}")),
         phases_present: vec!["postinstall".into()],
         binding_drift: false,
-        // Default to None tier — legacy / pre-classification state.
-        // Tests that exercise the global tier gate construct rows
-        // with an explicit tier via [`row_tiered`] below.
-        static_tier: None,
+        static_tier: Some(lpm_security::triage::StaticTier::Green),
         origins: origins.iter().map(|s| (*s).to_string()).collect(),
     }
 }
@@ -2165,11 +2311,7 @@ fn seed_global_manifest_with_blocked(
             script_hash: row.script_hash,
             phases_present: row.phases_present,
             binding_drift: row.binding_drift,
-            // fields default to None when constructing
-            // from the `ApproveRow` test helper. The row type
-            // doesn't carry tier/provenance/etc. yet; when later
-            // phases need them, extend `ApproveRow` in lockstep.
-            static_tier: None,
+            static_tier: row.static_tier,
             provenance_at_capture: None,
             published_at: None,
             behavioral_tags_hash: None,
@@ -2182,6 +2324,7 @@ fn seed_global_manifest_with_blocked(
         blocked_set_fingerprint: compute_blocked_set_fingerprint(&blocked_packages),
         captured_at: Utc::now().to_rfc3339(),
         blocked_packages,
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     crate::build_state::write_build_state(&install_root, &state).unwrap();
@@ -2273,6 +2416,21 @@ fn lookup_aggregate_by_arg_is_ambiguous_when_name_at_version_matches_multiple_bi
         }
         other => panic!("expected Ambiguous across distinct bindings: {other:?}"),
     }
+}
+
+#[test]
+fn lookup_aggregate_by_arg_selects_one_same_coordinate_artifact_by_integrity() {
+    let mut first = row("esbuild", "0.25.1", &["eslint"]);
+    first.integrity = Some("sha512-A".into());
+    let mut second = row("esbuild", "0.25.1", &["typescript"]);
+    second.integrity = Some("sha512-B".into());
+    let rows = vec![first, second];
+
+    let hit = match lookup_aggregate_by_arg(&rows, "esbuild@0.25.1#sha512-B") {
+        AggregateLookup::Match(row) => row,
+        other => panic!("expected artifact-qualified selector to match, got {other:?}"),
+    };
+    assert_eq!(hit.integrity.as_deref(), Some("sha512-B"));
 }
 
 #[test]
@@ -2402,6 +2560,137 @@ async fn run_global_bulk_yes_writes_each_row_to_trust_file() {
     let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
     assert!(trust.trusted.contains_key("esbuild@0.25.1"));
     assert!(trust.trusted.contains_key("sharp@0.33.0"));
+}
+
+#[tokio::test]
+async fn global_bulk_tier_refusal_does_not_fetch_provenance() {
+    let tmp = tempdir().unwrap();
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let aggregate = AggregateBlockedSet {
+        rows: vec![agg_row_tiered(
+            "playwright",
+            "1.48.0",
+            lpm_security::triage::StaticTier::Amber,
+        )],
+        unreadable_origins: vec![],
+    };
+    let policy = deny_verify_policy();
+    crate::provenance_fetch::reset_provenance_batch_call_count();
+
+    run_global_bulk_yes(
+        &root,
+        &aggregate,
+        false,
+        true,
+        ApprovalProvenanceContext::new(
+            &lpm_registry::RegistryClient::new(),
+            &policy,
+            EnforceMode::Deny,
+        ),
+    )
+    .await
+    .expect_err("amber bulk approval must be refused");
+
+    assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+}
+
+#[tokio::test]
+async fn global_interactive_quit_without_approvals_skips_fetch_and_write() {
+    let tmp = tempdir().unwrap();
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let policy = deny_verify_policy();
+    crate::provenance_fetch::reset_provenance_batch_call_count();
+    global::reset_global_trust_write_count();
+
+    global::commit_global_approval_batch(
+        &root,
+        &[],
+        false,
+        ApprovalProvenanceContext::new(
+            &lpm_registry::RegistryClient::new(),
+            &policy,
+            EnforceMode::Deny,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 0);
+    assert_eq!(global::global_trust_write_count(), 0);
+}
+
+#[tokio::test]
+async fn global_interactive_approvals_commit_in_one_trust_write() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let root = lpm_common::LpmRoot::from_dir(tmp.path());
+    let rows = [
+        row("esbuild", "0.25.1", &["eslint"]),
+        row("sharp", "0.33.0", &["typescript"]),
+    ];
+    let row_refs: Vec<_> = rows.iter().collect();
+    let policy = deny_verify_policy();
+    let registry = lpm_registry::RegistryClient::new()
+        .with_npm_registry_url("http://127.0.0.1:9")
+        .with_cache_dir(None);
+    crate::provenance_fetch::reset_provenance_batch_call_count();
+    global::reset_global_trust_write_count();
+
+    global::commit_global_approval_batch(
+        &root,
+        &row_refs,
+        false,
+        ApprovalProvenanceContext::new(&registry, &policy, EnforceMode::Deny),
+    )
+    .await
+    .unwrap();
+
+    let trust = lpm_global::trusted_deps::read_for(&root).unwrap();
+    assert_eq!(trust.trusted.len(), 2);
+    assert_eq!(crate::provenance_fetch::provenance_batch_call_count(), 1);
+    assert_eq!(global::global_trust_write_count(), 1);
+}
+
+#[tokio::test]
+async fn provenance_batch_keeps_distinct_same_coordinate_artifacts_separate() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let registry = lpm_registry::RegistryClient::new()
+        .with_npm_registry_url("http://127.0.0.1:9")
+        .with_cache_dir(None);
+    let mut first = make_blocked("native-addon", "1.0.0");
+    first.integrity = Some("sha512-artifact-a".into());
+    let mut second = make_blocked("native-addon", "1.0.0");
+    second.integrity = Some("sha512-artifact-b".into());
+
+    let provenance =
+        fetch_provenance_for_effective_set(&registry, &[first, second], &deny_verify_policy())
+            .await;
+
+    assert_eq!(
+        provenance.len(),
+        2,
+        "distinct artifact integrities need independent verification results",
+    );
+}
+
+#[tokio::test]
+async fn provenance_batch_treats_registry_transport_failure_as_degraded() {
+    let tmp = tempdir().unwrap();
+    let _env = scoped_lpm_home_with_security(tmp.path());
+    let registry = lpm_registry::RegistryClient::new()
+        .with_npm_registry_url("http://127.0.0.1:9")
+        .with_cache_dir(None);
+    let blocked = make_blocked("native-addon", "1.0.0");
+
+    let provenance =
+        fetch_provenance_for_effective_set(&registry, &[blocked], &deny_verify_policy()).await;
+    let status = provenance
+        .values()
+        .next()
+        .expect("the attempted artifact must have a provenance status");
+
+    assert_eq!(status, &ProvenanceStatus::TransportDegraded);
 }
 
 /// Named-package approval writes exactly ONE entry to the trust
@@ -2590,6 +2879,7 @@ fn capability_widening_row_stays_in_effective_blocked_set() {
             behavioral_tags_hash: None,
             behavioral_tags: None,
         }],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     // Strict match: script-hash approved with no capability_hash.
@@ -2645,6 +2935,7 @@ fn baseline_request_drops_strict_matched_row() {
             behavioral_tags_hash: None,
             behavioral_tags: None,
         }],
+        authentication_tag: None,
         drift_ignore_override: None,
     };
     let mut map = std::collections::HashMap::new();

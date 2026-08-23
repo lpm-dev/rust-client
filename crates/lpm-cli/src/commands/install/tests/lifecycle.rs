@@ -196,6 +196,7 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
                     behavioral_tags: None,
                 },
             ],
+            authentication_tag: None,
             drift_ignore_override: None,
         },
     )
@@ -439,6 +440,7 @@ fn bc_with_tiers(green: usize, amber: usize, red: usize) -> crate::build_state::
             captured_at: "unused-in-test".into(),
             blocked_packages: packages,
             blocked_set_fingerprint: "unused-in-test".into(),
+            authentication_tag: None,
             drift_ignore_override: None,
         },
         previous_fingerprint: None,
@@ -637,6 +639,7 @@ fn bc_with_blocked(
             captured_at: "unused-in-test".into(),
             blocked_packages: packages,
             blocked_set_fingerprint: "unused-in-test".into(),
+            authentication_tag: None,
             drift_ignore_override: None,
         },
         previous_fingerprint: None,

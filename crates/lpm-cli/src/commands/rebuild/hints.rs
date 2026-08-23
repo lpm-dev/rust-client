@@ -136,7 +136,12 @@ pub(crate) fn scriptable_package_rows(
         // they're already untrusted.
         let capability_blocks_trust = if base_trusted {
             let binding = if strict_trust {
-                policy.get_binding(name, version)
+                policy.get_binding_for_artifact(
+                    name,
+                    version,
+                    integrity.as_deref(),
+                    script_hash.as_deref(),
+                )
             } else {
                 None // scope-trust has no binding to bind a hash to
             };

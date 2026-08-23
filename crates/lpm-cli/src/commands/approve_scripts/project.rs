@@ -1,5 +1,20 @@
 use super::prelude::*;
 
+#[cfg(test)]
+thread_local! {
+    static BASELINE_INDEX_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_baseline_index_build_count() {
+    BASELINE_INDEX_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn baseline_index_build_count() -> usize {
+    BASELINE_INDEX_BUILD_COUNT.get()
+}
+
 /// Filter the persisted build-state's blocked set against the current
 /// `trustedDependencies` and return only the entries that are STILL
 /// blocked.
@@ -54,7 +69,12 @@ pub fn compute_effective_blocked_set<'a>(
                 // gate also passes — i.e., no widening requested
                 // OR the binding's capability_hash covers it.
                 TrustMatch::Strict => {
-                    let binding = trusted.get_binding(&bp.name, &bp.version);
+                    let binding = trusted.binding_for_artifact(
+                        &bp.name,
+                        &bp.version,
+                        bp.integrity.as_deref(),
+                        bp.script_hash.as_deref(),
+                    );
                     requested_capabilities.requires_review_despite_strict_match(user_bound, binding)
                 }
                 TrustMatch::LegacyNameOnly => {
@@ -175,7 +195,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         ));
     }
 
-    let state = match build_state::read_build_state(project_dir) {
+    let state = match build_state::read_build_state_for_approval(project_dir)? {
         Some(s) => s,
         None => {
             return Err(LpmError::NotFound(
@@ -197,7 +217,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
         .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
-    let mut trusted = extract_trusted_dependencies(&manifest);
+    let mut trusted = extract_trusted_dependencies(&manifest)?;
 
     // ── capability request + hash ────────
     //
@@ -274,15 +294,23 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         blocked_set_fingerprint: state.blocked_set_fingerprint.clone(),
         captured_at: state.captured_at.clone(),
         blocked_packages: effective,
+        authentication_tag: state.authentication_tag.clone(),
         drift_ignore_override: None,
     };
-    let baseline_index = crate::commands::audit::inventory::build_project_v2_baseline_index(
-        project_dir,
-        &lpm_root,
-        store_version,
-        None,
-        None,
-    );
+    let baseline_index = std::cell::OnceCell::new();
+    let load_baseline_index = || {
+        baseline_index.get_or_init(|| {
+            #[cfg(test)]
+            BASELINE_INDEX_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+            crate::commands::audit::inventory::build_project_v2_baseline_index(
+                project_dir,
+                &lpm_root,
+                store_version,
+                None,
+                None,
+            )
+        })
+    };
 
     // Resolve the operator's provenance policy before branching. The
     // side-effectful posture check and provenance fetch happen only after a
@@ -328,33 +356,18 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             BlockedLookup::Ambiguous { candidates } => {
                 let mut keys: Vec<String> = candidates
                     .iter()
-                    .map(|blocked| format!("{}@{}", blocked.name, blocked.version))
+                    .map(|blocked| blocked_artifact_selector(blocked))
                     .collect();
                 keys.sort();
                 keys.dedup();
                 return Err(LpmError::Script(format!(
                     "package '{arg}' is ambiguous in the blocked set — {} rows match. \
-                     Re-run with `name@version` to disambiguate. Candidates: {}",
+                     Re-run with an artifact-qualified candidate to disambiguate. Candidates: {}",
                     candidates.len(),
                     keys.join(", "),
                 )));
             }
         };
-
-        if !dry_run {
-            crate::security_approval::ensure_runtime_sigstore_posture(
-                project_dir,
-                json_output,
-                runtime_enforce,
-                runtime_sigstore_source,
-            )?;
-        }
-        let provenance_by_pkg = fetch_provenance_for_effective_set(
-            registry,
-            std::slice::from_ref(target),
-            &verify_policy,
-        )
-        .await;
 
         let reviewed_by_prompt = !json_output && is_tty();
         let confirmed = if reviewed_by_prompt {
@@ -363,7 +376,12 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             // alongside the regular card when this is an UPDATE
             // (prior binding under same name exists). No-op for
             // first-time review.
-            print_version_diff_card_for_blocked(target, &trusted, Some(&baseline_index), &lpm_root);
+            print_version_diff_card_for_blocked(
+                target,
+                &trusted,
+                Some(load_baseline_index()),
+                &lpm_root,
+            );
             let prompt = if trusted
                 .latest_binding_for_name(&target.name, &target.version)
                 .is_some()
@@ -381,19 +399,38 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             true
         };
 
-        if confirmed {
+        let provenance_by_pkg = if confirmed {
+            if !dry_run {
+                crate::security_approval::ensure_runtime_sigstore_posture(
+                    project_dir,
+                    json_output,
+                    runtime_enforce,
+                    runtime_sigstore_source,
+                )?;
+            }
+            let provenance_by_pkg = if dry_run {
+                HashMap::new()
+            } else {
+                fetch_provenance_for_effective_set(
+                    registry,
+                    std::slice::from_ref(target),
+                    &verify_policy,
+                )
+                .await
+            };
             // write-path: carry install-time provenance + behavioral-tag captures
             // into the binding so subsequent installs can compare against them
             // (drift rule + version diff).
             //
-            // SILENT-DROP fix: `snapshot_for_binding` returns
+            // SILENT-DROP fix: `snapshot_for_artifact_binding` returns
             // `Err(LpmError::ProvenanceVerification(_))` when the
             // verifier rejected the bundle, refusing the approval
             // rather than blanking `provenance_at_approval`.
-            let snap = snapshot_for_binding(
+            let snap = snapshot_for_artifact_binding(
                 &provenance_by_pkg,
                 &target.name,
                 &target.version,
+                target.integrity.as_deref(),
                 runtime_enforce,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
@@ -409,14 +446,18 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             // the user sees "would approve X" with the same JSON
             // envelope shape as a live run.
             if !dry_run {
-                authorize_project_trust_write(
+                commit_project_trust_write(
                     project_dir,
+                    &pkg_json_path,
+                    &manifest_text,
+                    &mut manifest,
                     &trusted,
                     json_output,
                     reviewed_by_prompt,
-                )?;
-                write_back(&pkg_json_path, &mut manifest, &trusted)?;
+                )
+                .await?;
             }
+            provenance_by_pkg
         } else {
             // skip path: nothing to record besides the count (typed-out
             // here to avoid an unused mut warning if we never push)
@@ -429,10 +470,10 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 false,
                 dry_run,
                 json_output,
-                Some(&provenance_by_pkg),
+                None,
             );
             return Ok(());
-        }
+        };
 
         print_summary(
             &effective_state,
@@ -485,7 +526,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             &trusted,
             dry_run,
             json_output,
-            Some(&baseline_index),
+            Some(load_baseline_index()),
             &lpm_root,
         );
         return Ok(());
@@ -495,42 +536,37 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     let mut approved: Vec<&BlockedPackage> = Vec::new();
     let mut skipped: Vec<&BlockedPackage> = Vec::new();
 
-    if !dry_run {
-        crate::security_approval::ensure_runtime_sigstore_posture(
-            project_dir,
-            json_output,
-            runtime_enforce,
-            runtime_sigstore_source,
-        )?;
-    }
-    let provenance_by_pkg = fetch_provenance_for_effective_set(
-        registry,
-        &effective_state.blocked_packages,
-        &verify_policy,
-    )
-    .await;
-
     // ── --yes (bulk approve) ────────────────────────────────────────
 
     if yes {
-        // — refuse bulk approval when any
-        // effective-blocked entry is classified outside the green
-        // tier. Gate runs BEFORE `emit_yes_warning_banner` so we
+        // Bulk approval requires every effective-blocked entry to carry an
+        // explicit green tier. The gate runs before `emit_yes_warning_banner` so we
         // don't emit success-shaped human + tracing output and then
         // abort — that sequence would corrupt log aggregators and
         // mislead the user about whether the operation ran.
         //
-        // Refusal is restricted to EXPLICIT non-green tiers:
-        // - Some(Amber) / Some(AmberLlm) / Some(Red) → refuse.
-        // - Some(Green) → allowed in bulk (still requires explicit
-        //   --yes; auto-execution is, gated on the sandbox).
-        // - None → pass-through to today's behavior. `None` means
-        //   the persisted blocked state was written by a pre-P2 LPM
-        //   that never classified the package; breaking those
-        //   existing `--yes` flows before the next install
-        //   recaptures the state would be a silent→P2 upgrade
-        //   regression.
+        // Green is allowed in bulk; amber, red, and unclassified entries
+        // require per-package review.
         enforce_tiered_yes_gate(&effective_state.blocked_packages, GateScope::Project)?;
+
+        if !dry_run {
+            crate::security_approval::ensure_runtime_sigstore_posture(
+                project_dir,
+                json_output,
+                runtime_enforce,
+                runtime_sigstore_source,
+            )?;
+        }
+        let provenance_by_pkg = if dry_run {
+            HashMap::new()
+        } else {
+            fetch_provenance_for_effective_set(
+                registry,
+                &effective_state.blocked_packages,
+                &verify_policy,
+            )
+            .await
+        };
 
         emit_yes_warning_banner(effective_state.blocked_packages.len(), json_output);
         for blocked in &effective_state.blocked_packages {
@@ -539,10 +575,11 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             // rejection so the trust binding is NOT overwritten with
             // `None` (which would silently disarm drift detection on
             // every subsequent install).
-            let snap = snapshot_for_binding(
+            let snap = snapshot_for_artifact_binding(
                 &provenance_by_pkg,
                 &blocked.name,
                 &blocked.version,
+                blocked.integrity.as_deref(),
                 runtime_enforce,
             )?;
             let meta = approval_metadata_preserving_existing_provenance(
@@ -556,8 +593,16 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         }
         // Short-circuit under `--dry-run`.
         if !dry_run {
-            authorize_project_trust_write(project_dir, &trusted, json_output, false)?;
-            write_back(&pkg_json_path, &mut manifest, &trusted)?;
+            commit_project_trust_write(
+                project_dir,
+                &pkg_json_path,
+                &manifest_text,
+                &mut manifest,
+                &trusted,
+                json_output,
+                false,
+            )
+            .await?;
         }
         print_summary(
             &effective_state,
@@ -616,7 +661,12 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         // render the version-diff card for
         // updates (no-op when no prior binding exists for the same
         // package name).
-        print_version_diff_card_for_blocked(blocked, &trusted, Some(&baseline_index), &lpm_root);
+        print_version_diff_card_for_blocked(
+            blocked,
+            &trusted,
+            Some(load_baseline_index()),
+            &lpm_root,
+        );
 
         // branch the Select on whether this is
         // a first-time review or an update. The two branches share
@@ -681,7 +731,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                 }
                 None => match choice {
                     InteractiveChoice::View => {
-                        print_full_script(blocked, Some(&baseline_index), &lpm_root);
+                        print_full_script(blocked, Some(load_baseline_index()), &lpm_root);
                         // Loop back: rebuild Select and re-prompt
                         continue;
                     }
@@ -719,6 +769,35 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         return Ok(());
     }
 
+    if !dry_run && !approved.is_empty() {
+        crate::security_approval::ensure_runtime_sigstore_posture(
+            project_dir,
+            json_output,
+            runtime_enforce,
+            runtime_sigstore_source,
+        )?;
+    }
+    let approved_pairs: Vec<crate::provenance_fetch::ProvenanceArtifactKey> = approved
+        .iter()
+        .map(|blocked| {
+            (
+                blocked.name.clone(),
+                blocked.version.clone(),
+                blocked.integrity.clone(),
+            )
+        })
+        .collect();
+    let provenance_by_pkg = if dry_run || approved_pairs.is_empty() {
+        HashMap::new()
+    } else {
+        crate::provenance_fetch::fetch_provenance_for_artifacts(
+            registry,
+            &approved_pairs,
+            &verify_policy,
+        )
+        .await
+    };
+
     // Apply approvals (atomic single write)
     for blocked in &approved {
         // write-path — see the direct-approve branch earlier for the rationale.
@@ -726,14 +805,15 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         // to record an approval rather than blanking the prior
         // `provenance_at_approval` and disarming drift checks.
         // Warn-mode preservation: when the snapshot is `None` but a
-        // prior verified snapshot exists for the exact same version,
+        // prior verified snapshot exists for the exact same artifact,
         // preserve it rather than overwriting with `None` —
         // otherwise a re-approval under Warn would silently clear
         // the prior reference and disarm drift detection.
-        let snap = snapshot_for_binding(
+        let snap = snapshot_for_artifact_binding(
             &provenance_by_pkg,
             &blocked.name,
             &blocked.version,
+            blocked.integrity.as_deref(),
             runtime_enforce,
         )?;
         let meta = approval_metadata_preserving_existing_provenance(
@@ -748,8 +828,16 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     // still feed into `print_summary` so the agent sees the would-approve
     // count.
     if !approved.is_empty() && !dry_run {
-        authorize_project_trust_write(project_dir, &trusted, json_output, true)?;
-        write_back(&pkg_json_path, &mut manifest, &trusted)?;
+        commit_project_trust_write(
+            project_dir,
+            &pkg_json_path,
+            &manifest_text,
+            &mut manifest,
+            &trusted,
+            json_output,
+            true,
+        )
+        .await?;
     }
 
     print_summary(

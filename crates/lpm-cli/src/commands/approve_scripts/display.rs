@@ -347,8 +347,10 @@ pub(super) fn print_summary(
     // that have no map in scope (the read-only `--list` path bypasses
     // it entirely; the per-package named approval path uses the
     // single-entry helper directly). When `Some(_)`, the map's keys
-    // are the same `(name, version)` pairs as the blocked set.
-    provenance_by_pkg: Option<&HashMap<(String, String), ProvenanceStatus>>,
+    // are the same `(name, version, integrity)` tuples as the blocked set.
+    provenance_by_pkg: Option<
+        &HashMap<crate::provenance_fetch::ProvenanceArtifactKey, ProvenanceStatus>,
+    >,
 ) {
     if json_output {
         let mut warnings: Vec<serde_json::Value> = Vec::new();
@@ -404,8 +406,8 @@ pub(super) fn print_summary(
             // (`verified: true | "skipped" | false | null |
             // "verification_rejected"`). Additive — older agents
             // that don't expect the key remain readable.
-            "approved": approved.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
-            "skipped": skipped.iter().map(|b| crate::version_diff::blocked_to_json_with_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
+            "approved": approved.iter().map(|b| crate::version_diff::blocked_to_json_with_artifact_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
+            "skipped": skipped.iter().map(|b| crate::version_diff::blocked_to_json_with_artifact_provenance(b, trusted, provenance_by_pkg)).collect::<Vec<_>>(),
             "warnings": warnings,
             "errors": [],
         });

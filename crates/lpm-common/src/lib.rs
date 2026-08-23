@@ -48,7 +48,7 @@ pub use error::{
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
 pub use lpm_json::{LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError, update_lpm_json};
-pub use package_instance::{PackageInstanceId, ResolutionNodeId};
+pub use package_instance::{PackageInstanceId, ResolutionNodeId, artifact_binding_id};
 pub use package_name::PackageName;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,

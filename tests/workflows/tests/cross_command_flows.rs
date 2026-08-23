@@ -18,6 +18,7 @@ mod support;
 
 use std::path::PathBuf;
 use support::assertions;
+use support::build_state::authenticate_project_build_state;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{TempProject, lpm, lpm_with_registry};
 
@@ -441,6 +442,7 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
             }}"#
         ),
     );
+    authenticate_project_build_state(&project);
 
     // Step 2: rebuild #1 under deny — scripted-pkg is NOT in
     // trustedDependencies. The rebuild selector filters it out, so
