@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
+use aho_corasick::AhoCorasick;
 use glob::Pattern;
 use lpm_common::{LpmError, write_file_atomic};
 use lpm_registry::RegistryClient;
@@ -10,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::commands::install::{FrozenLockfileMode, InstallOmitPolicy};
 use crate::install_ui;
-use crate::intelligence::{SourceImport, node_builtin_package_names, scan_source_imports};
+use crate::intelligence::{SourceImport, node_builtin_package_names, scan_source_imports_checked};
 
 const DEPENDENCY_SECTIONS: [DependencySection; 4] = [
     DependencySection {
@@ -177,17 +178,7 @@ pub async fn run(
         )
         .await?;
         if !removed.is_empty() {
-            let refreshed_text = lpm_common::read_text_file_capped(
-                &manifest_path,
-                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-            )?;
-            manifest = serde_json::from_str(&refreshed_text).map_err(|error| {
-                LpmError::Registry(format!(
-                    "failed to parse package.json at {} after tidy --fix: {error}",
-                    manifest_path.display()
-                ))
-            })?;
-            analysis = analyze_project(project_dir, &manifest, &config)?;
+            analysis.remove_findings_resolved_by(&removed);
         }
     }
 
@@ -238,6 +229,19 @@ struct Analysis {
     imported_count: usize,
 }
 
+impl Analysis {
+    fn remove_findings_resolved_by(&mut self, removed: &[RemovedDependency]) {
+        let removed_keys: HashSet<(&str, &str)> = removed
+            .iter()
+            .map(|dependency| (dependency.section, dependency.name.as_str()))
+            .collect();
+        self.unused.retain(|dependency| {
+            !removed_keys.contains(&(dependency.section, dependency.name.as_str()))
+        });
+        self.declared_count -= removed.len();
+    }
+}
+
 fn analyze_project(
     project_dir: &Path,
     manifest: &Value,
@@ -245,22 +249,32 @@ fn analyze_project(
 ) -> Result<Analysis, LpmError> {
     let declared = collect_declared_dependencies(manifest);
     let workspace_names = collect_workspace_member_names(project_dir, manifest)?;
-    let imports = filtered_imports(project_dir, config);
+    let imports = filtered_imports(project_dir, config)?;
     let import_usage = ImportUsage::from_imports(imports);
     let script_tokens = collect_script_tokens(manifest);
     let script_bins =
-        collect_installed_bin_names(project_dir, declared.iter().map(|entry| &entry.name));
-    let config_text = read_known_config_text(project_dir);
-    let installed = collect_installed_packages(project_dir);
+        collect_installed_bin_names(project_dir, declared.iter().map(|entry| &entry.name))?;
+    let config_text = read_known_config_text(project_dir)?;
+    let has_config_text = !config_text.is_empty();
+    let config_usage = config_dependency_usage(&declared, &config_text)?;
+    drop(config_text);
+    let installed = collect_installed_packages(project_dir)?;
     let mut ignored = Vec::new();
 
     let mut used = import_usage.used_packages.clone();
     absorb_type_package_usage(&mut used, &import_usage);
 
     let mut unused = Vec::new();
-    for entry in &declared {
+    for (index, entry) in declared.iter().enumerate() {
         let name = &entry.name;
-        if dependency_is_used(name, &used, &script_tokens, &script_bins, &config_text) {
+        if dependency_is_used(
+            name,
+            &used,
+            &script_tokens,
+            &script_bins,
+            config_usage[index],
+            has_config_text,
+        ) {
             continue;
         }
         if let Some(pattern) = config.match_unused(name) {
@@ -407,14 +421,18 @@ impl ImportUsage {
     }
 }
 
-fn filtered_imports(project_dir: &Path, config: &TidyConfig) -> Vec<SourceImport> {
-    scan_source_imports(project_dir)
+fn filtered_imports(
+    project_dir: &Path,
+    config: &TidyConfig,
+) -> Result<Vec<SourceImport>, LpmError> {
+    Ok(scan_source_imports_checked(project_dir)
+        .map_err(LpmError::Io)?
         .into_iter()
         .filter(|import| {
             let rel = relative_display(project_dir, &import.file);
             config.match_path(&rel).is_none()
         })
-        .collect()
+        .collect())
 }
 
 fn absorb_type_package_usage(used: &mut BTreeSet<String>, import_usage: &ImportUsage) {
@@ -445,12 +463,13 @@ fn dependency_is_used(
     imported: &BTreeSet<String>,
     script_tokens: &BTreeSet<String>,
     script_bins: &HashMap<String, BTreeSet<String>>,
-    config_text: &str,
+    mentioned_in_config: bool,
+    has_config_text: bool,
 ) -> bool {
     imported.contains(name)
         || script_mentions_dependency(name, script_tokens, script_bins)
-        || config_mentions_dependency(name, config_text)
-        || conservative_dev_tool_keep(name, script_tokens, config_text)
+        || mentioned_in_config
+        || conservative_dev_tool_keep(name, script_tokens, has_config_text)
 }
 
 fn script_mentions_dependency(
@@ -466,9 +485,26 @@ fn script_mentions_dependency(
     {
         return true;
     }
-    fallback_bin_names(name)
-        .into_iter()
-        .any(|bin| script_tokens.contains(&bin))
+    fallback_bin_is_used(name, script_tokens)
+}
+
+fn fallback_bin_is_used(name: &str, script_tokens: &BTreeSet<String>) -> bool {
+    let unscoped = name
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once('/'))
+        .map_or(name, |(_, unscoped)| unscoped);
+    if script_tokens.contains(unscoped) {
+        return true;
+    }
+    match name {
+        "typescript" => script_tokens.contains("tsc") || script_tokens.contains("tsserver"),
+        "webpack-cli" => script_tokens.contains("webpack"),
+        "@biomejs/biome" => script_tokens.contains("biome"),
+        "@angular/cli" => script_tokens.contains("ng"),
+        "@nestjs/cli" => script_tokens.contains("nest"),
+        "@sveltejs/kit" => script_tokens.contains("svelte-kit"),
+        _ => false,
+    }
 }
 
 fn fallback_bin_names(name: &str) -> BTreeSet<String> {
@@ -505,22 +541,56 @@ fn fallback_bin_names(name: &str) -> BTreeSet<String> {
     bins
 }
 
-fn config_mentions_dependency(name: &str, config_text: &str) -> bool {
-    if config_text.contains(name) {
-        return true;
+fn config_dependency_usage(
+    declared: &[DeclaredDependency],
+    config_text: &str,
+) -> Result<Vec<bool>, LpmError> {
+    let mut usage = vec![false; declared.len()];
+    if declared.is_empty() || config_text.is_empty() {
+        return Ok(usage);
     }
-    if let Some((_scope, unscoped)) = name.strip_prefix('@').and_then(|rest| rest.split_once('/')) {
-        return config_text.contains(unscoped);
+
+    let mut pattern_indices: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, dependency) in declared.iter().enumerate() {
+        if !dependency.name.is_empty() {
+            pattern_indices
+                .entry(dependency.name.as_str())
+                .or_default()
+                .push(index);
+        }
+        if let Some((_, unscoped)) = dependency
+            .name
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once('/'))
+            && !unscoped.is_empty()
+        {
+            pattern_indices.entry(unscoped).or_default().push(index);
+        }
     }
-    false
+    if pattern_indices.is_empty() {
+        return Ok(usage);
+    }
+
+    let (patterns, indices): (Vec<&str>, Vec<Vec<usize>>) = pattern_indices.into_iter().unzip();
+    let matcher = AhoCorasick::new(patterns.iter().copied()).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to prepare tidy config dependency matching: {error}"
+        ))
+    })?;
+    for matched in matcher.find_overlapping_iter(config_text) {
+        for index in &indices[matched.pattern().as_usize()] {
+            usage[*index] = true;
+        }
+    }
+    Ok(usage)
 }
 
 fn conservative_dev_tool_keep(
     name: &str,
     script_tokens: &BTreeSet<String>,
-    config_text: &str,
+    has_config_text: bool,
 ) -> bool {
-    if script_tokens.is_empty() && config_text.is_empty() {
+    if script_tokens.is_empty() && !has_config_text {
         return false;
     }
     name.starts_with("eslint-")
@@ -617,27 +687,33 @@ fn token_is_assignment(token: &str) -> bool {
 fn collect_installed_bin_names<'a>(
     project_dir: &Path,
     package_names: impl Iterator<Item = &'a String>,
-) -> HashMap<String, BTreeSet<String>> {
+) -> Result<HashMap<String, BTreeSet<String>>, LpmError> {
     let mut bins = HashMap::new();
     for name in package_names {
         let manifest = project_dir
             .join("node_modules")
             .join(name)
             .join("package.json");
-        let Ok(content) =
-            lpm_common::read_text_file_capped(&manifest, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        else {
-            continue;
+        let content = match lpm_common::read_text_file_capped(
+            &manifest,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
         };
-        let Ok(value) = serde_json::from_str::<Value>(&content) else {
-            continue;
-        };
+        let value = serde_json::from_str::<Value>(&content).map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to parse installed package manifest {} while analyzing scripts: {error}",
+                manifest.display()
+            ))
+        })?;
         let Some(package_bins) = bin_names_from_manifest(&value, name) else {
             continue;
         };
         bins.insert(name.clone(), package_bins);
     }
-    bins
+    Ok(bins)
 }
 
 fn bin_names_from_manifest(value: &Value, package_name: &str) -> Option<BTreeSet<String>> {
@@ -651,7 +727,7 @@ fn bin_names_from_manifest(value: &Value, package_name: &str) -> Option<BTreeSet
     }
 }
 
-fn read_known_config_text(project_dir: &Path) -> String {
+fn read_known_config_text(project_dir: &Path) -> Result<String, LpmError> {
     static CONFIG_FILES: &[&str] = &[
         ".babelrc",
         ".eslintrc",
@@ -685,27 +761,63 @@ fn read_known_config_text(project_dir: &Path) -> String {
         "webpack.config.js",
     ];
 
-    let mut text = String::new();
+    const MAX_TOTAL_CONFIG_BYTES: usize = 64 * 1024 * 1024;
+
+    let mut text = String::with_capacity(8192);
     for file in CONFIG_FILES {
-        if let Ok(content) = lpm_common::read_text_file_capped(
-            &project_dir.join(file),
+        let path = project_dir.join(file);
+        let content = match lpm_common::read_text_file_capped(
+            &path,
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         ) {
-            text.push_str(&content);
-            text.push('\n');
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let next_len = text
+            .len()
+            .checked_add(content.len())
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "known tidy config files exceed the {MAX_TOTAL_CONFIG_BYTES}-byte aggregate limit"
+                ))
+            })?;
+        if next_len > MAX_TOTAL_CONFIG_BYTES {
+            return Err(LpmError::Registry(format!(
+                "known tidy config files exceed the {MAX_TOTAL_CONFIG_BYTES}-byte aggregate limit at {}",
+                path.display()
+            )));
         }
+        text.push_str(&content);
+        text.push('\n');
     }
-    text
+    Ok(text)
 }
 
-fn collect_installed_packages(project_dir: &Path) -> HashSet<String> {
+fn collect_installed_packages(project_dir: &Path) -> Result<HashSet<String>, LpmError> {
     let mut packages = HashSet::new();
     let node_modules = project_dir.join("node_modules");
-    let Ok(entries) = std::fs::read_dir(&node_modules) else {
-        return packages;
+    let entries = match std::fs::read_dir(&node_modules) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(packages),
+        Err(source) => {
+            return Err(LpmError::Io(tidy_io_error(
+                "read installed package directory",
+                &node_modules,
+                source,
+            )));
+        }
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            LpmError::Io(tidy_io_error(
+                "read installed package entry",
+                &node_modules,
+                source,
+            ))
+        })?;
         let path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -714,10 +826,27 @@ fn collect_installed_packages(project_dir: &Path) -> HashSet<String> {
             continue;
         }
         if name.starts_with('@') {
-            let Ok(scoped) = std::fs::read_dir(path) else {
+            let file_type = entry.file_type().map_err(|source| {
+                LpmError::Io(tidy_io_error(
+                    "inspect installed package scope",
+                    &path,
+                    source,
+                ))
+            })?;
+            if file_type.is_symlink() || !file_type.is_dir() {
                 continue;
-            };
-            for child in scoped.flatten() {
+            }
+            let scoped = std::fs::read_dir(&path).map_err(|source| {
+                LpmError::Io(tidy_io_error("read installed package scope", &path, source))
+            })?;
+            for child in scoped {
+                let child = child.map_err(|source| {
+                    LpmError::Io(tidy_io_error(
+                        "read installed scoped package entry",
+                        &path,
+                        source,
+                    ))
+                })?;
                 if let Some(child_name) = child.file_name().to_str() {
                     packages.insert(format!("{name}/{child_name}"));
                 }
@@ -727,7 +856,7 @@ fn collect_installed_packages(project_dir: &Path) -> HashSet<String> {
         }
     }
 
-    packages
+    Ok(packages)
 }
 
 fn collect_workspace_member_names(
@@ -754,18 +883,23 @@ fn collect_workspace_member_names(
         let paths = glob::glob(&glob_pattern).map_err(|error| {
             LpmError::Registry(format!("invalid workspace glob `{glob_pattern}`: {error}"))
         })?;
-        for path in paths.flatten() {
+        for path in paths {
+            let path = path.map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to enumerate workspace glob `{glob_pattern}`: {error}"
+                ))
+            })?;
             if path == project_dir.join("package.json") {
                 continue;
             }
-            let Ok(content) =
-                lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&content) else {
-                continue;
-            };
+            let content =
+                lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
+            let value = serde_json::from_str::<Value>(&content).map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to parse workspace package manifest {} during tidy analysis: {error}",
+                    path.display()
+                ))
+            })?;
             if let Some(name) = value.get("name").and_then(Value::as_str) {
                 names.insert(name.to_string());
             }
@@ -773,6 +907,13 @@ fn collect_workspace_member_names(
     }
 
     Ok(names)
+}
+
+fn tidy_io_error(action: &str, path: &Path, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        source.kind(),
+        format!("failed to {action} at {}: {source}", path.display()),
+    )
 }
 
 async fn apply_fix(
@@ -1117,6 +1258,80 @@ mod tests {
     #[test]
     fn fallback_bin_names_include_common_typescript_binary() {
         assert!(fallback_bin_names("typescript").contains("tsc"));
+    }
+
+    #[test]
+    fn config_dependency_usage_preserves_overlapping_and_scoped_matches() {
+        let dependencies = [
+            DeclaredDependency {
+                name: "foo".to_string(),
+                section: DEPENDENCY_SECTIONS[0],
+                spec: "1.0.0".to_string(),
+            },
+            DeclaredDependency {
+                name: "foobar".to_string(),
+                section: DEPENDENCY_SECTIONS[0],
+                spec: "1.0.0".to_string(),
+            },
+            DeclaredDependency {
+                name: "@scope/plugin".to_string(),
+                section: DEPENDENCY_SECTIONS[1],
+                spec: "1.0.0".to_string(),
+            },
+        ];
+
+        let usage = config_dependency_usage(&dependencies, "use foobar and plugin").unwrap();
+
+        assert_eq!(usage, vec![true, true, true]);
+    }
+
+    #[test]
+    fn resolved_removals_update_analysis_without_discarding_unchanged_evidence() {
+        let mut analysis = Analysis {
+            unused: vec![
+                UnusedDependency {
+                    name: "removed".to_string(),
+                    section: "dependencies",
+                    spec: "1.0.0".to_string(),
+                    fixable: true,
+                    reason: String::new(),
+                },
+                UnusedDependency {
+                    name: "peer-contract".to_string(),
+                    section: "peerDependencies",
+                    spec: "1.0.0".to_string(),
+                    fixable: false,
+                    reason: String::new(),
+                },
+            ],
+            phantoms: vec![PhantomDependency {
+                name: "phantom".to_string(),
+                file: "src/index.js".to_string(),
+                line: 1,
+                import_count: 1,
+                available_via: None,
+            }],
+            ignored: vec![IgnoredFinding {
+                kind: "unused",
+                name: "ignored".to_string(),
+                reason: String::new(),
+            }],
+            declared_count: 3,
+            imported_count: 1,
+        };
+
+        analysis.remove_findings_resolved_by(&[RemovedDependency {
+            name: "removed".to_string(),
+            section: "dependencies",
+            spec: "1.0.0".to_string(),
+        }]);
+
+        assert_eq!(analysis.declared_count, 2);
+        assert_eq!(analysis.unused.len(), 1);
+        assert_eq!(analysis.unused[0].name, "peer-contract");
+        assert_eq!(analysis.phantoms.len(), 1);
+        assert_eq!(analysis.ignored.len(), 1);
+        assert_eq!(analysis.imported_count, 1);
     }
 
     #[test]

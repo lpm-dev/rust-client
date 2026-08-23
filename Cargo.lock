@@ -3329,6 +3329,7 @@ name = "lpm-cli"
 version = "0.75.0"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "assert_cmd",
  "async-trait",
  "axum",
@@ -3396,6 +3397,11 @@ dependencies = [
  "objc2-local-authentication",
  "open",
  "owo-colors",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_parser",
+ "oxc_span",
  "p256",
  "p384",
  "pathdiff",

@@ -112,6 +112,109 @@ fn tidy_json_envelope_reports_unused_and_phantom_findings() {
     });
 }
 
+#[test]
+fn tidy_recognizes_multiline_and_repeated_same_line_imports() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "tidy-import-shapes",
+  "version": "1.0.0",
+  "dependencies": {
+    "multiline-package": "1.0.0",
+    "first-package": "1.0.0",
+    "second-package": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file(
+        "src/index.js",
+        r#"import {
+  value
+} from "multiline-package";
+import "first-package"; import "second-package";
+console.log(value);
+"#,
+    );
+
+    let output = lpm(&project)
+        .args(["tidy", "--json"])
+        .output()
+        .expect("failed to run lpm tidy --json");
+
+    assert!(
+        output.status.success(),
+        "every imported dependency must be retained\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn tidy_ignores_import_syntax_inside_comments_and_strings() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "tidy-comment-imports",
+  "version": "1.0.0"
+}"#,
+    );
+    project.write_file(
+        "src/index.js",
+        r#"const value = 1; // require("line-comment-package")
+const text = "import('string-package')";
+/* import "block-comment-package"; */
+console.log(value, text);
+"#,
+    );
+
+    let output = lpm(&project)
+        .args(["tidy", "--json"])
+        .output()
+        .expect("failed to run lpm tidy --json");
+
+    assert!(
+        output.status.success(),
+        "comments and strings must not create phantom dependencies\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tidy_fix_preserves_manifest_when_a_source_file_cannot_be_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "tidy-unreadable-source",
+  "version": "1.0.0",
+  "dependencies": {
+    "possibly-used": "1.0.0"
+  }
+}"#,
+    );
+    project.write_file("src/index.js", r#"import "possibly-used";"#);
+    let source_path = project.path().join("src/index.js");
+    let mut permissions = std::fs::metadata(&source_path).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&source_path, permissions).unwrap();
+    let before = project.read_file("package.json");
+
+    let output = lpm(&project)
+        .args(["tidy", "--fix"])
+        .output()
+        .expect("failed to run lpm tidy --fix");
+
+    assert!(
+        !output.status.success(),
+        "tidy --fix must fail closed when source evidence cannot be read"
+    );
+    assert_eq!(
+        project.read_file("package.json"),
+        before,
+        "tidy --fix must not mutate the manifest after incomplete analysis"
+    );
+}
+
 #[tokio::test]
 async fn tidy_fix_removes_unused_dependency_and_reconciles_lockfile() {
     let mock = MockRegistry::start().await;
