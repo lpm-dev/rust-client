@@ -139,6 +139,7 @@ async fn mount_org_rotation_pull(
         "encryptedBlob": encrypted_blob,
         "wrappedKey": wrapped_key,
         "version": fixture.version,
+        "cryptoVersion": 1,
         "contentKeyVersion": fixture.content_key_version,
         "recipientPublicKeyVersion": 4,
         "recipientPublicKeyFingerprint": fixture.recipient_fingerprint,
@@ -3069,6 +3070,10 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     let push = pushes[0];
     let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
     assert_eq!(body["expectedVersion"], 7);
+    assert_eq!(
+        body["cryptoVersion"],
+        lpm_vault::crypto::CURRENT_CRYPTO_VERSION
+    );
     assert!(body.get("force").is_none());
 
     let wrapped_key = body["wrappedKey"].as_str().expect("wrapped key");
@@ -3078,9 +3083,12 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
         rotated_data_key, original_data_key,
         "rotation must encrypt the complete payload under a fresh data key"
     );
-    let rotated_plaintext = lpm_vault::crypto::decrypt(
+    let rotated_plaintext = lpm_vault::crypto::decrypt_vault_payload(
         &rotated_data_key,
         body["encryptedBlob"].as_str().expect("encrypted blob"),
+        lpm_vault::crypto::VaultScope::Personal,
+        "vault-rotate-123",
+        lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
     )
     .expect("decrypt rotated payload");
     let rotated_payload: serde_json::Value =
@@ -3332,6 +3340,10 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
     let body: serde_json::Value =
         serde_json::from_slice(&push.body).expect("organization push body must be JSON");
     assert_eq!(body["expectedVersion"], 8);
+    assert_eq!(
+        body["cryptoVersion"],
+        lpm_vault::crypto::CURRENT_CRYPTO_VERSION
+    );
     assert_eq!(body["wrappedKeys"][0]["publicKeyVersion"], 4);
     assert_eq!(
         body["wrappedKeys"][0]["publicKeyFingerprint"],
@@ -3344,11 +3356,14 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
         lpm_vault::crypto::unwrap_key_from_sender(wrapped_key, &prepared.private_key)
             .expect("unwrap rotated organization content key");
     assert_ne!(rotated_content_key, prepared.previous_content_key);
-    let rotated_plaintext = lpm_vault::crypto::decrypt(
+    let rotated_plaintext = lpm_vault::crypto::decrypt_vault_payload(
         &rotated_content_key,
         body["encryptedBlob"]
             .as_str()
             .expect("rotation push must contain ciphertext"),
+        lpm_vault::crypto::VaultScope::Organization(ORG_ROTATION_SLUG),
+        ORG_ROTATION_VAULT_ID,
+        lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
     )
     .expect("decrypt rotated organization payload");
     assert_eq!(

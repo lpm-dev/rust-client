@@ -1402,6 +1402,7 @@ impl MockRegistry {
             "encryptedBlob": encrypted_blob,
             "wrappedKey": wrapped_key,
             "version": version,
+            "cryptoVersion": 1,
         }))
         .expect("test pull body should serialize");
         let pull_sig = lpm_vault::signature::sign_body(pull_body.as_bytes(), bearer_token);
@@ -1457,11 +1458,11 @@ impl MockRegistry {
     ///
     /// This helper mounts the same `/api/vaults/{vault_id}/sync`
     /// endpoint but with shared `Arc<Mutex<...>>` state:
-    /// - POST: parses the body, extracts `encryptedBlob` + `wrappedKey`,
-    ///   stores them under the vault_id key, bumps the version, returns
+    /// - POST: parses the body, extracts the encrypted payload, wrapped key,
+    ///   and crypto version, stores them under the vault ID, bumps the version, returns
     ///   `{"status":"updated","version":N+1}` signed with the bearer.
     /// - GET: looks up the stored blob; if present returns
-    ///   `{"vaultId", "encryptedBlob", "wrappedKey", "version"}` signed
+    ///   `{"vaultId", "encryptedBlob", "wrappedKey", "version", "cryptoVersion"}` signed
     ///   with the bearer. If absent (no prior POST), returns 404 — the
     ///   natural "fresh machine pulls before anyone pushed" shape.
     ///
@@ -3242,6 +3243,7 @@ struct StoredSyncBlob {
     encrypted_blob: String,
     wrapped_key: String,
     version: i32,
+    crypto_version: i32,
 }
 
 struct StatefulSyncGetResponder {
@@ -3270,6 +3272,7 @@ impl Respond for StatefulSyncGetResponder {
             "encryptedBlob": blob.encrypted_blob,
             "wrappedKey": blob.wrapped_key,
             "version": blob.version,
+            "cryptoVersion": blob.crypto_version,
         }))
         .expect("stateful sync GET body must serialize");
         let sig = lpm_vault::signature::sign_body(body.as_bytes(), &self.bearer_token);
@@ -3302,11 +3305,23 @@ impl Respond for StatefulSyncPostResponder {
             .get("wrappedKey")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let crypto_version = body_value
+            .get("cryptoVersion")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|version| i32::try_from(version).ok())
+            .unwrap_or(1);
         let (Some(encrypted_blob), Some(wrapped_key)) = (encrypted_blob, wrapped_key) else {
             return ResponseTemplate::new(400).set_body_string(
                 r#"{"error":"stateful sync POST: missing encryptedBlob or wrappedKey"}"#,
             );
         };
+        if !matches!(
+            crypto_version,
+            1 | lpm_vault::crypto::CURRENT_CRYPTO_VERSION
+        ) {
+            return ResponseTemplate::new(400)
+                .set_body_string(r#"{"error":"stateful sync POST: unsupported cryptoVersion"}"#);
+        }
 
         let mut guard = self
             .state
@@ -3317,6 +3332,7 @@ impl Respond for StatefulSyncPostResponder {
             encrypted_blob,
             wrapped_key,
             version: new_version,
+            crypto_version,
         });
         drop(guard);
 

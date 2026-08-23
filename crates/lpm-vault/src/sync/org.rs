@@ -6,6 +6,10 @@ use super::personal::{
 use super::public_key::{MemberPublicKey, get_org_member_key_access, public_key_fingerprint};
 use crate::crypto;
 
+fn legacy_crypto_version() -> i32 {
+    1
+}
+
 /// Decrypted organization env payload and its remote concurrency epochs.
 #[derive(Debug)]
 pub struct PulledOrgVault {
@@ -112,6 +116,8 @@ async fn pull_org_with_content_key(
         encrypted_blob: String,
         wrapped_key: String,
         version: i32,
+        #[serde(default = "legacy_crypto_version")]
+        crypto_version: i32,
         content_key_version: i32,
         recipient_public_key_version: i32,
         recipient_public_key_fingerprint: String,
@@ -136,7 +142,13 @@ async fn pull_org_with_content_key(
 
     // Unwrap AES key with our X25519 private key, then decrypt
     let content_key = crypto::unwrap_key_from_sender(&data.wrapped_key, private_key)?;
-    let plaintext = crypto::decrypt(&content_key, &data.encrypted_blob)?;
+    let plaintext = crypto::decrypt_vault_payload(
+        &content_key,
+        &data.encrypted_blob,
+        crypto::VaultScope::Organization(org_slug),
+        vault_id,
+        data.crypto_version,
+    )?;
     let json = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
 
     Ok(DecryptedOrgVault {
@@ -180,7 +192,12 @@ pub async fn push_org(
         )
         .into());
     }
-    let encrypted_blob = crypto::encrypt(&current.content_key, request.secrets_json.as_bytes())?;
+    let encrypted_blob = crypto::encrypt_vault_payload(
+        &current.content_key,
+        request.secrets_json.as_bytes(),
+        crypto::VaultScope::Organization(request.org_slug),
+        request.vault_id,
+    )?;
     post_org_update(registry_url, auth_token, request, encrypted_blob, None).await
 }
 
@@ -222,7 +239,12 @@ async fn push_org_with_member_access(
     let members_with_keys = select_members_with_keys(members)?;
 
     let aes_key = crypto::generate_aes_key();
-    let encrypted_blob = crypto::encrypt(&aes_key, request.secrets_json.as_bytes())?;
+    let encrypted_blob = crypto::encrypt_vault_payload(
+        &aes_key,
+        request.secrets_json.as_bytes(),
+        crypto::VaultScope::Organization(request.org_slug),
+        request.vault_id,
+    )?;
 
     let wrapped_keys = wrap_keys_for_members(&aes_key, &members_with_keys)?;
 
@@ -252,7 +274,10 @@ async fn post_org_update(
         url_path_segment(request.vault_id)
     );
 
-    let mut body = serde_json::json!({ "encryptedBlob": encrypted_blob });
+    let mut body = serde_json::json!({
+        "encryptedBlob": encrypted_blob,
+        "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
+    });
     if let Some(wrapped_keys) = wrapped_keys {
         body["wrappedKeys"] = serde_json::json!(wrapped_keys);
     }
@@ -739,8 +764,19 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse update body");
         assert!(parsed.get("wrappedKeys").is_none());
         assert_eq!(parsed.get("expectedVersion"), Some(&serde_json::json!(7)));
+        assert_eq!(
+            parsed.get("cryptoVersion"),
+            Some(&serde_json::json!(crypto::CURRENT_CRYPTO_VERSION))
+        );
         let encrypted_blob = parsed["encryptedBlob"].as_str().expect("encrypted blob");
-        let decrypted = crypto::decrypt(&content_key, encrypted_blob).expect("decrypt update");
+        let decrypted = crypto::decrypt_vault_payload(
+            &content_key,
+            encrypted_blob,
+            crypto::VaultScope::Organization("acme"),
+            "vault-maintainer",
+            crypto::CURRENT_CRYPTO_VERSION,
+        )
+        .expect("decrypt update");
         assert_eq!(
             decrypted,
             br#"{"environments":{"default":{"NEW":"value"}}}"#
