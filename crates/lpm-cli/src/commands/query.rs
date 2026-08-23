@@ -23,11 +23,12 @@ use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::PackageAnalysis;
 use lpm_security::query::{
-    self, DepGraph, DepGraphEntry, PackageContext, Severity, count_all_tags, matches_with_key,
-    parse_selector,
+    self, DepGraph, DepGraphEntry, PackageContext, PseudoClass, Selector, Severity, count_all_tags,
+    matches_with_key, parse_selector,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
 
 /// Lifecycle script phases to check for `has_scripts`.
@@ -35,6 +36,93 @@ const LIFECYCLE_SCRIPTS: &[&str] = &["preinstall", "install", "postinstall", "pr
 
 /// Build state marker filename (must match build.rs).
 const BUILD_MARKER: &str = ".lpm-built";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum QueryFormat {
+    List,
+    Mermaid,
+}
+
+impl fmt::Display for QueryFormat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::List => "list",
+            Self::Mermaid => "mermaid",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct QueryDataRequirements {
+    scripts: bool,
+    built: bool,
+    vulnerabilities: bool,
+    deprecations: bool,
+}
+
+impl QueryDataRequirements {
+    fn for_request(
+        selector: Option<&Selector>,
+        count_mode: bool,
+        json_output: bool,
+        verbose: bool,
+        format: QueryFormat,
+    ) -> Self {
+        let human_list = !count_mode && !json_output && format == QueryFormat::List;
+        let verbose_json = !count_mode && json_output && verbose && format == QueryFormat::List;
+        Self {
+            scripts: count_mode
+                || human_list
+                || verbose_json
+                || selector.is_some_and(selector_needs_scripts),
+            built: human_list
+                || verbose_json
+                || selector.is_some_and(|selector| {
+                    selector_uses_pseudo_class(selector, |class| class == PseudoClass::Built)
+                }),
+            vulnerabilities: count_mode
+                || verbose_json
+                || selector.is_some_and(selector_needs_vulnerabilities),
+            deprecations: selector.is_some_and(|selector| {
+                selector_uses_pseudo_class(selector, |class| class == PseudoClass::Deprecated)
+            }),
+        }
+    }
+
+    fn needs_disk_state(self) -> bool {
+        self.scripts || self.built
+    }
+}
+
+fn selector_needs_scripts(selector: &Selector) -> bool {
+    selector_uses_pseudo_class(selector, |class| {
+        matches!(class, PseudoClass::Scripts | PseudoClass::High)
+    })
+}
+
+fn selector_needs_vulnerabilities(selector: &Selector) -> bool {
+    selector_uses_pseudo_class(selector, |class| {
+        matches!(class, PseudoClass::Vulnerable | PseudoClass::High)
+    })
+}
+
+fn selector_uses_pseudo_class(
+    selector: &Selector,
+    predicate: impl Copy + Fn(PseudoClass) -> bool,
+) -> bool {
+    match selector {
+        Selector::PseudoClass(class) => predicate(*class),
+        Selector::And(parts) | Selector::Or(parts) => parts
+            .iter()
+            .any(|part| selector_uses_pseudo_class(part, predicate)),
+        Selector::Not(inner) => selector_uses_pseudo_class(inner, predicate),
+        Selector::DirectChild { parent, child } => {
+            selector_uses_pseudo_class(parent, predicate)
+                || selector_uses_pseudo_class(child, predicate)
+        }
+        Selector::Id(_) => false,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -45,7 +133,7 @@ pub async fn run(
     json_output: bool,
     verbose: bool,
     assert_none: bool,
-    format: &str,
+    format: QueryFormat,
 ) -> Result<(), LpmError> {
     let store_version = lpm_store::StoreVersion::from_env();
     let selector = if count_mode {
@@ -61,6 +149,13 @@ pub async fn run(
                 .map_err(|e| LpmError::Registry(format!("Invalid selector: {e}")))?,
         )
     };
+    let requirements = QueryDataRequirements::for_request(
+        selector.as_ref(),
+        count_mode,
+        json_output,
+        verbose,
+        format,
+    );
     // ── Pre-discovery (cheap, no store touch) ─────────────────────────
     //
     // Determine whether this is an LPM-managed project before paying
@@ -100,19 +195,33 @@ pub async fn run(
                 store_version,
                 Some(&lpm_root_inner),
             );
-            populate_package_disk_state(
-                &inv,
-                Some(&lpm_root_inner),
-                inv.baseline_index.as_ref(),
-                &mut has_scripts,
-                &mut is_built,
-            );
+            if requirements.needs_disk_state() {
+                populate_package_disk_state(
+                    &inv,
+                    Some(&lpm_root_inner),
+                    inv.baseline_index.as_ref(),
+                    requirements.scripts,
+                    requirements.built,
+                    &mut has_scripts,
+                    &mut is_built,
+                );
+            }
             Ok(inv)
         })?
     } else {
         let inv =
             PackageInventory::from_discovery_with_lpm_root(pre_discovery, store_version, None);
-        populate_package_disk_state(&inv, None, None, &mut has_scripts, &mut is_built);
+        if requirements.needs_disk_state() {
+            populate_package_disk_state(
+                &inv,
+                None,
+                None,
+                requirements.scripts,
+                requirements.built,
+                &mut has_scripts,
+                &mut is_built,
+            );
+        }
         inv
     };
 
@@ -130,44 +239,19 @@ pub async fn run(
 
     let project_root = &inv.discovery.project_root;
 
-    // Fetch vulnerability state
-    let mut vulnerable_versions: HashMap<String, HashSet<String>> = HashMap::new();
-
-    // @lpm.dev: check registry metadata
-    let lpm_names: Vec<String> = inv
-        .discovery
-        .packages
-        .iter()
-        .filter(|p| p.name.starts_with("@lpm.dev/"))
-        .map(|p| p.name.clone())
-        .collect();
-
-    if !lpm_names.is_empty()
-        && let Ok(metadata_map) = client.batch_metadata(&lpm_names).await
-    {
-        for pkg in &inv.discovery.packages {
-            if !pkg.name.starts_with("@lpm.dev/") {
-                continue;
-            }
-            if let Some(metadata) = metadata_map.get(&pkg.name)
-                && let Some(vm) = metadata.version(&pkg.version).or_else(|| metadata.latest())
-                && vm.vulnerabilities.as_ref().is_some_and(|v| !v.is_empty())
-            {
-                vulnerable_versions
-                    .entry(pkg.name.clone())
-                    .or_default()
-                    .insert(pkg.version.clone());
-            }
-        }
-    }
-
-    // OSV for all packages
-    for (name, versions) in query_osv_vulnerable_by_nv(&inv.npm_package_pairs()).await {
-        vulnerable_versions
-            .entry(name)
-            .or_default()
-            .extend(versions);
-    }
+    let external_state = if requirements.vulnerabilities || requirements.deprecations {
+        let package_pairs = inv
+            .discovery
+            .packages
+            .iter()
+            .map(|package| (package.name.clone(), package.version.clone()))
+            .collect::<Vec<_>>();
+        load_external_package_state(client, &package_pairs, requirements).await?
+    } else {
+        ExternalPackageState::default()
+    };
+    let vulnerable_versions = external_state.vulnerable_versions;
+    let deprecated_versions = external_state.deprecated_versions;
 
     // ── Workspace detection ───────────────────────────────────────────
     //
@@ -212,7 +296,9 @@ pub async fn run(
                 is_vulnerable: vulnerable_versions
                     .get(&package.name)
                     .is_some_and(|versions| versions.contains(&package.version)),
-                is_deprecated: false,
+                is_deprecated: deprecated_versions
+                    .get(&package.name)
+                    .is_some_and(|versions| versions.contains(&package.version)),
                 is_root: false,
                 is_workspace_root_dep: false,
             })
@@ -225,7 +311,8 @@ pub async fn run(
     let selector = selector
         .as_ref()
         .expect("selector mode parses the selector before discovery");
-    let needs_dependency_graph = selector.needs_dependency_graph() || format == "mermaid";
+    let needs_dependency_graph =
+        selector.needs_dependency_graph() || format == QueryFormat::Mermaid;
 
     // ── Build PackageContexts ───────────────────────────────────────────
 
@@ -274,7 +361,9 @@ pub async fn run(
             is_vulnerable: vulnerable_versions
                 .get(&pkg.name)
                 .is_some_and(|versions| versions.contains(&pkg.version)),
-            is_deprecated: false,
+            is_deprecated: deprecated_versions
+                .get(&pkg.name)
+                .is_some_and(|versions| versions.contains(&pkg.version)),
             is_root: false,
             is_workspace_root_dep: pkg.instance_id.map_or_else(
                 || is_workspace && workspace_root_dep_names.contains(&pkg.name),
@@ -393,7 +482,7 @@ pub async fn run(
         .collect();
 
     // Output — Mermaid format
-    if format == "mermaid" {
+    if format == QueryFormat::Mermaid {
         if let Some(lf) = lockfile {
             let matched_indices = matched.iter().map(|(index, _)| *index).collect::<Vec<_>>();
             output_mermaid(&matched_indices, &lf.packages, selector_str);
@@ -661,6 +750,136 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
     tags
 }
 
+#[derive(Default)]
+struct ExternalPackageState {
+    vulnerable_versions: HashMap<String, HashSet<String>>,
+    deprecated_versions: HashMap<String, HashSet<String>>,
+}
+
+async fn load_external_package_state(
+    client: &RegistryClient,
+    packages: &[(String, String)],
+    requirements: QueryDataRequirements,
+) -> Result<ExternalPackageState, LpmError> {
+    if !requirements.vulnerabilities && !requirements.deprecations {
+        return Ok(ExternalPackageState::default());
+    }
+
+    let mut registry_seen = HashSet::with_capacity(packages.len());
+    let mut registry_pairs = Vec::with_capacity(packages.len());
+    let mut osv_seen = HashSet::with_capacity(packages.len());
+    let mut osv_pairs = Vec::with_capacity(packages.len());
+    for (name, version) in packages {
+        let is_lpm_package = name.starts_with("@lpm.dev/");
+        if (requirements.deprecations || requirements.vulnerabilities && is_lpm_package)
+            && registry_seen.insert((name.as_str(), version.as_str()))
+        {
+            registry_pairs.push((name.clone(), version.clone()));
+        }
+        if requirements.vulnerabilities
+            && !is_lpm_package
+            && osv_seen.insert((name.as_str(), version.as_str()))
+        {
+            osv_pairs.push((name.clone(), version.clone()));
+        }
+    }
+
+    let registry_future = load_registry_package_state(client, &registry_pairs, requirements);
+    let osv_future = async {
+        if osv_pairs.is_empty() {
+            Ok(HashMap::new())
+        } else {
+            crate::commands::audit::query_vulnerable_versions(&osv_pairs).await
+        }
+    };
+    let (mut state, osv_vulnerable_versions) = tokio::try_join!(registry_future, osv_future)?;
+    for (name, versions) in osv_vulnerable_versions {
+        state
+            .vulnerable_versions
+            .entry(name)
+            .or_default()
+            .extend(versions);
+    }
+    Ok(state)
+}
+
+async fn load_registry_package_state(
+    client: &RegistryClient,
+    packages: &[(String, String)],
+    requirements: QueryDataRequirements,
+) -> Result<ExternalPackageState, LpmError> {
+    if packages.is_empty() {
+        return Ok(ExternalPackageState::default());
+    }
+
+    let mut seen_names = HashSet::with_capacity(packages.len());
+    let mut names = Vec::with_capacity(packages.len());
+    for (name, _) in packages {
+        if seen_names.insert(name.as_str()) {
+            names.push(name.clone());
+        }
+    }
+    let metadata = client
+        .batch_metadata_deep_with_release_age_packages_and_package_specs(
+            &names,
+            &[],
+            false,
+            packages,
+            None,
+        )
+        .await
+        .map_err(|error| {
+            LpmError::Network(format!(
+                "registry metadata required by query could not be loaded: {error}"
+            ))
+        })?;
+
+    let mut state = ExternalPackageState::default();
+    for (name, version) in packages {
+        let package_metadata = metadata.get(name).ok_or_else(|| {
+            LpmError::Network(format!(
+                "registry metadata response omitted package {name}; query results would be incomplete"
+            ))
+        })?;
+        let version_metadata = package_metadata.version(version).ok_or_else(|| {
+            LpmError::Network(format!(
+                "registry metadata for {name} does not include installed version {version}; query results would be incomplete"
+            ))
+        })?;
+        if requirements.vulnerabilities
+            && name.starts_with("@lpm.dev/")
+            && version_metadata
+                .vulnerabilities
+                .as_ref()
+                .is_some_and(|vulnerabilities| !vulnerabilities.is_empty())
+        {
+            state
+                .vulnerable_versions
+                .entry(name.clone())
+                .or_default()
+                .insert(version.clone());
+        }
+        if requirements.deprecations
+            && registry_deprecation_is_active(version_metadata.deprecated.as_ref())
+        {
+            state
+                .deprecated_versions
+                .entry(name.clone())
+                .or_default()
+                .insert(version.clone());
+        }
+    }
+    Ok(state)
+}
+
+fn registry_deprecation_is_active(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::String(message)) => !message.trim().is_empty(),
+        Some(value) => !value.is_null(),
+        None => false,
+    }
+}
+
 /// Read direct dependencies from the root package.json.
 fn read_root_dependencies(project_dir: &Path) -> HashSet<String> {
     let pkg_json_path = project_dir.join("package.json");
@@ -696,13 +915,19 @@ fn populate_package_disk_state(
     inventory: &PackageInventory,
     lpm_root: Option<&lpm_common::LpmRoot>,
     baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
+    load_scripts: bool,
+    load_built: bool,
     has_scripts: &mut Vec<bool>,
     is_built: &mut Vec<bool>,
 ) {
     has_scripts.clear();
-    has_scripts.resize(inventory.discovery.packages.len(), false);
     is_built.clear();
-    is_built.resize(inventory.discovery.packages.len(), false);
+    if load_scripts {
+        has_scripts.resize(inventory.discovery.packages.len(), false);
+    }
+    if load_built {
+        is_built.resize(inventory.discovery.packages.len(), false);
+    }
     let project_root =
         crate::commands::audit::inventory::open_project_root(&inventory.discovery.project_root)
             .ok();
@@ -715,8 +940,12 @@ fn populate_package_disk_state(
         ) else {
             continue;
         };
-        has_scripts[index] = check_has_lifecycle_scripts(&directory);
-        is_built[index] = has_regular_build_marker(&directory);
+        if load_scripts {
+            has_scripts[index] = check_has_lifecycle_scripts(&directory);
+        }
+        if load_built {
+            is_built[index] = has_regular_build_marker(&directory);
+        }
     }
 }
 
@@ -843,86 +1072,6 @@ fn output_mermaid(
     }
 }
 
-/// Query OSV.dev for vulnerabilities given `(name, version)` pairs.
-///
-/// Works with any project type (LPM, npm, pnpm, yarn, bun).
-/// Returns the set of package names that have at least one advisory.
-/// Deduplicates queries by (name, version). Gracefully returns empty
-/// set on network/parse failure.
-async fn query_osv_vulnerable_by_nv(
-    packages: &[(String, String)],
-) -> HashMap<String, HashSet<String>> {
-    if packages.is_empty() {
-        return HashMap::new();
-    }
-
-    // Dedup by (name, version) — same artifact = one query
-    let mut seen = HashSet::new();
-    let mut deduped: Vec<&(String, String)> = Vec::new();
-    for pair in packages {
-        if seen.insert((&pair.0, &pair.1)) {
-            deduped.push(pair);
-        }
-    }
-
-    let Ok(client) = lpm_http::client_builder().build() else {
-        return HashMap::new();
-    };
-
-    let queries: Vec<serde_json::Value> = deduped
-        .iter()
-        .map(|(name, version)| {
-            serde_json::json!({
-                "package": { "name": name, "ecosystem": "npm" },
-                "version": version,
-            })
-        })
-        .collect();
-
-    let body = serde_json::json!({ "queries": queries });
-
-    let response = match client
-        .post("https://api.osv.dev/v1/querybatch")
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return HashMap::new(),
-    };
-
-    #[derive(serde::Deserialize)]
-    struct OsvBatchResponse {
-        results: Vec<OsvQueryResult>,
-    }
-    #[derive(serde::Deserialize)]
-    struct OsvQueryResult {
-        #[serde(default)]
-        vulns: Vec<serde_json::Value>,
-    }
-
-    let result: OsvBatchResponse = match response.json().await {
-        Ok(r) => r,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut vulnerable: HashMap<String, HashSet<String>> = HashMap::new();
-    for (i, query_result) in result.results.into_iter().enumerate() {
-        if i >= deduped.len() {
-            break;
-        }
-        if !query_result.vulns.is_empty() {
-            vulnerable
-                .entry(deduped[i].0.clone())
-                .or_default()
-                .insert(deduped[i].1.clone());
-        }
-    }
-
-    vulnerable
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -940,6 +1089,68 @@ mod tests {
             manifest: ManifestTags::default(),
             meta: AnalysisMeta::default(),
         }
+    }
+
+    #[test]
+    fn name_only_json_query_needs_no_external_or_disk_state() {
+        let selector = parse_selector("#plain-pkg").unwrap();
+
+        let requirements = QueryDataRequirements::for_request(
+            Some(&selector),
+            false,
+            true,
+            false,
+            QueryFormat::List,
+        );
+
+        assert_eq!(requirements, QueryDataRequirements::default());
+    }
+
+    #[test]
+    fn high_selector_requires_script_and_vulnerability_state() {
+        let selector = parse_selector(":not(:high)").unwrap();
+
+        let requirements = QueryDataRequirements::for_request(
+            Some(&selector),
+            false,
+            true,
+            false,
+            QueryFormat::List,
+        );
+
+        assert!(requirements.scripts);
+        assert!(requirements.vulnerabilities);
+        assert!(!requirements.built);
+        assert!(!requirements.deprecations);
+    }
+
+    #[test]
+    fn count_mode_requires_only_counted_dynamic_state() {
+        let requirements =
+            QueryDataRequirements::for_request(None, true, true, false, QueryFormat::List);
+
+        assert!(requirements.scripts);
+        assert!(requirements.vulnerabilities);
+        assert!(!requirements.built);
+        assert!(!requirements.deprecations);
+    }
+
+    #[test]
+    fn deprecated_selector_requires_registry_deprecation_state() {
+        let selector = parse_selector(":deprecated").unwrap();
+
+        let requirements = QueryDataRequirements::for_request(
+            Some(&selector),
+            false,
+            true,
+            false,
+            QueryFormat::List,
+        );
+
+        assert!(requirements.deprecations);
+        assert!(!requirements.scripts);
+        assert!(!requirements.built);
+        assert!(!requirements.vulnerabilities);
     }
 
     #[test]

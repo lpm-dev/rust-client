@@ -74,6 +74,9 @@ pub struct VersionMetadata {
     #[serde(default)]
     pub description: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<serde_json::Value>,
+
     #[serde(default)]
     pub dependencies: HashMap<String, String>,
 
@@ -1578,6 +1581,31 @@ pub struct BlockedSetVersionMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_metadata_reads_deprecation_without_adding_absent_null_fields() {
+        let deprecated: VersionMetadata = serde_json::from_value(serde_json::json!({
+            "name": "legacy",
+            "version": "1.0.0",
+            "deprecated": "use replacement"
+        }))
+        .unwrap();
+        assert_eq!(
+            deprecated
+                .deprecated
+                .as_ref()
+                .and_then(|value| value.as_str()),
+            Some("use replacement")
+        );
+
+        let current = VersionMetadata {
+            name: "current".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(current).unwrap();
+        assert!(serialized.get("deprecated").is_none());
+    }
 
     // ── DistInfo round-trip with + without provenance fields ──────
 

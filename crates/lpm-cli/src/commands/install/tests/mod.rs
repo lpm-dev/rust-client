@@ -128,6 +128,7 @@ fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetada
                 name: "@lpm.dev/acme.swift-logger".to_string(),
                 version: v.to_string(),
                 description: None,
+                deprecated: None,
                 engines: HashMap::new(),
                 dependencies: Default::default(),
                 dev_dependencies: Default::default(),

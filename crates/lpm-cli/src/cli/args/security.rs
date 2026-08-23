@@ -119,8 +119,8 @@ pub(crate) struct QueryArgs {
     pub(crate) assert_none: bool,
 
     /// Output format: list (default) or mermaid (dependency subgraph diagram).
-    #[arg(long, default_value = "list")]
-    pub(crate) format: String,
+    #[arg(long, value_enum, default_value = "list")]
+    pub(crate) format: commands::query::QueryFormat,
 }
 
 #[derive(Args)]

@@ -13,7 +13,10 @@
 
 mod support;
 
+use support::mock_registry::MockRegistry;
 use support::{TempProject, VALID_TEST_INTEGRITY, lpm};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, ResponseTemplate};
 
 fn integrity_for(seed: &[u8]) -> String {
     use base64::Engine as _;
@@ -1020,5 +1023,375 @@ fn query_no_match_human_output_indicates_zero_packages() {
     assert!(
         !stderr.contains('●') && !stderr.contains('│') && !stderr.contains('▲'),
         "query empty-match status output must not use legacy/cliclack glyphs, got:\n{stderr}",
+    );
+}
+
+#[test]
+fn query_rejects_unknown_output_formats_at_argument_parsing() {
+    let project = TempProject::empty(r#"{"name":"q","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["query", "#anything", "--format", "yaml"])
+        .output()
+        .expect("failed to run lpm query with an invalid output format");
+
+    assert!(!output.status.success(), "unknown formats must be rejected");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("yaml"),
+        "clap must identify the invalid format, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn query_skips_external_metadata_when_the_selector_and_output_do_not_use_it() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"@lpm.dev/clean.pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "@lpm.dev/clean.pkg", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/clean.pkg",
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {"name": "@lpm.dev/clean.pkg", "version": "1.0.0"}
+        }
+    })])
+    .await;
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "--json",
+            "query",
+            "#@lpm.dev/clean.pkg",
+        ])
+        .output()
+        .expect("failed to run a query that does not need external metadata");
+
+    assert!(output.status.success(), "name query must succeed");
+    let metadata_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/registry/batch-metadata")
+        .count();
+    assert_eq!(
+        metadata_requests, 0,
+        "unrelated selectors must not fetch registry metadata"
+    );
+}
+
+fn project_for_vulnerability_source_failure() -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"plain-pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "plain-pkg", "1.0.0", SRC_CLEAN);
+    project
+}
+
+fn run_vulnerability_assertion(project: &TempProject, osv_url: &str) -> std::process::Output {
+    lpm(project)
+        .env("LPM_OSV_URL", osv_url)
+        .args(["query", ":vulnerable", "--assert-none"])
+        .output()
+        .expect("failed to run vulnerability assertion")
+}
+
+#[tokio::test]
+async fn query_vulnerability_assertion_fails_when_osv_returns_an_error_status() {
+    let project = project_for_vulnerability_source_failure();
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(mock.server())
+        .await;
+
+    let output = run_vulnerability_assertion(&project, &format!("{}/v1/querybatch", mock.url()));
+
+    assert!(
+        !output.status.success(),
+        "a vulnerability assertion must fail closed on OSV status errors"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerability_assertion_fails_when_osv_returns_invalid_json() {
+    let project = project_for_vulnerability_source_failure();
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{"))
+        .mount(mock.server())
+        .await;
+
+    let output = run_vulnerability_assertion(&project, &format!("{}/v1/querybatch", mock.url()));
+
+    assert!(
+        !output.status.success(),
+        "a vulnerability assertion must fail closed on malformed OSV data"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerability_assertion_fails_when_osv_omits_result_slots() {
+    let project = project_for_vulnerability_source_failure();
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})))
+        .mount(mock.server())
+        .await;
+
+    let output = run_vulnerability_assertion(&project, &format!("{}/v1/querybatch", mock.url()));
+
+    assert!(
+        !output.status.success(),
+        "a vulnerability assertion must fail closed on incomplete OSV data"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerable_matches_an_osv_advisory_for_the_installed_version() {
+    let project = project_for_vulnerability_source_failure();
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![serde_json::json!({
+        "id": "GHSA-query-positive",
+        "summary": "query positive-path advisory",
+        "database_specific": {"severity": "HIGH"},
+        "affected": [{
+            "package": {"ecosystem": "npm", "name": "plain-pkg"},
+            "ranges": [{
+                "type": "SEMVER",
+                "events": [{"introduced": "0"}, {"fixed": "1.0.1"}]
+            }]
+        }]
+    })]])
+    .await;
+
+    let output = run_vulnerability_assertion(&project, &format!("{}/v1/querybatch", mock.url()));
+
+    assert!(
+        !output.status.success(),
+        "an OSV advisory affecting the installed version must match :vulnerable"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("1 package matched :vulnerable"),
+        "the failure must come from the matched vulnerability assertion"
+    );
+}
+
+#[test]
+fn query_vulnerability_assertion_fails_when_osv_cannot_be_reached() {
+    let project = project_for_vulnerability_source_failure();
+
+    let output = run_vulnerability_assertion(&project, "http://127.0.0.1:1/v1/querybatch");
+
+    assert!(
+        !output.status.success(),
+        "a vulnerability assertion must fail closed on OSV transport errors"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerability_assertion_fails_when_registry_metadata_is_unavailable() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"@lpm.dev/example.pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "@lpm.dev/example.pkg", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(mock.server())
+        .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "query",
+            ":vulnerable",
+            "--assert-none",
+        ])
+        .output()
+        .expect("failed to run registry-backed vulnerability assertion");
+
+    assert!(
+        !output.status.success(),
+        "a vulnerability assertion must fail closed on registry errors"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerable_matches_registry_advisories_for_lpm_packages() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"@lpm.dev/example.pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "@lpm.dev/example.pkg", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/example.pkg",
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": "@lpm.dev/example.pkg",
+                "version": "1.0.0",
+                "_vulnerabilities": [{"id": "LPM-QUERY-POSITIVE"}]
+            }
+        }
+    })])
+    .await;
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "query",
+            ":vulnerable",
+            "--assert-none",
+        ])
+        .output()
+        .expect("failed to run registry-backed vulnerability query");
+
+    assert!(
+        !output.status.success(),
+        "a registry advisory affecting the installed version must match :vulnerable"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("1 package matched :vulnerable"),
+        "the failure must come from the matched vulnerability assertion"
+    );
+}
+
+#[tokio::test]
+async fn query_deprecated_matches_the_installed_deprecated_version() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"legacy-pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "legacy-pkg", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "legacy-pkg",
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": "legacy-pkg",
+                "version": "1.0.0",
+                "deprecated": "use replacement-pkg"
+            }
+        }
+    })])
+    .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "query",
+            ":deprecated",
+            "--assert-none",
+        ])
+        .output()
+        .expect("failed to run deprecated-package query");
+
+    assert!(
+        !output.status.success(),
+        "the installed deprecated version must match :deprecated"
+    );
+}
+
+#[tokio::test]
+async fn query_deprecated_ignores_an_empty_registry_deprecation_message() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"current-pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "current-pkg", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "current-pkg",
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {
+            "1.0.0": {
+                "name": "current-pkg",
+                "version": "1.0.0",
+                "deprecated": ""
+            }
+        }
+    })])
+    .await;
+
+    let output = lpm(&project)
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "query",
+            ":deprecated",
+            "--assert-none",
+        ])
+        .output()
+        .expect("failed to query a package with an empty deprecation message");
+
+    assert!(
+        output.status.success(),
+        "an empty npm deprecation message clears the deprecated state"
+    );
+}
+
+#[tokio::test]
+async fn query_rejects_registry_metadata_that_omits_the_installed_version() {
+    let project = TempProject::empty(
+        r#"{"name":"q","version":"1.0.0","dependencies":{"@lpm.dev/example.pkg":"1.0.0"}}"#,
+    );
+    seed_pkg_with_source(&project, "@lpm.dev/example.pkg", "1.0.0", SRC_CLEAN);
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![serde_json::json!({
+        "name": "@lpm.dev/example.pkg",
+        "dist-tags": {"latest": "2.0.0"},
+        "versions": {
+            "2.0.0": {
+                "name": "@lpm.dev/example.pkg",
+                "version": "2.0.0",
+                "_vulnerabilities": [{"id": "LATEST-ONLY"}]
+            }
+        }
+    })])
+    .await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args([
+            "--registry",
+            &mock.url(),
+            "--insecure",
+            "query",
+            ":vulnerable",
+            "--assert-none",
+        ])
+        .output()
+        .expect("failed to run query with incomplete version metadata");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "incomplete metadata must fail closed"
+    );
+    assert!(
+        stderr.contains("does not include installed version 1.0.0"),
+        "query must identify the missing installed version instead of applying latest metadata, got:\n{stderr}"
     );
 }
