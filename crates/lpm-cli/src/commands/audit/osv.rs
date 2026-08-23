@@ -21,9 +21,12 @@ pub(super) async fn run_osv_scan(
     json_output: bool,
     level: Option<AuditLevel>,
 ) -> OsvScanOutcome {
-    // Collect non-@lpm.dev packages eligible for OSV
-    let mut osv_queries: Vec<(String, String)> = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    run_osv_queries(collect_osv_queries(packages), json_output, level).await
+}
+
+pub(super) fn collect_osv_queries(packages: &[DiscoveredPackage]) -> Vec<(String, String)> {
+    let mut osv_queries: Vec<(String, String)> = Vec::with_capacity(packages.len());
+    let mut seen = HashSet::with_capacity(packages.len());
 
     for pkg in packages {
         // Skip @lpm.dev packages — they get vuln data from registry metadata
@@ -38,12 +41,19 @@ pub(super) async fn run_osv_scan(
         // empty for unknown packages, so there's no false-positive risk for
         // querying a public name that was resolved from a proxy.
 
-        let key = (pkg.name.clone(), pkg.version.clone());
-        if seen.insert(key.clone()) {
-            osv_queries.push(key);
+        if seen.insert((pkg.name.as_str(), pkg.version.as_str())) {
+            osv_queries.push((pkg.name.clone(), pkg.version.clone()));
         }
     }
 
+    osv_queries
+}
+
+pub(super) async fn run_osv_queries(
+    osv_queries: Vec<(String, String)>,
+    json_output: bool,
+    level: Option<AuditLevel>,
+) -> OsvScanOutcome {
     if osv_queries.is_empty() {
         return OsvScanOutcome {
             vulns: Vec::new(),
@@ -317,14 +327,30 @@ async fn query_osv_batch_from_url(
     let batch_requests = stream::iter(
         requests
             .into_iter()
-            .map(|(request, query_count)| send_osv_batch_request(request, query_count)),
+            .map(|(request, query_count)| send_osv_batch_request_headers(request, query_count)),
     )
     .buffered(OSV_BATCH_REQUEST_CONCURRENCY);
     futures::pin_mut!(batch_requests);
 
     let mut query_results = Vec::with_capacity(packages.len());
+    let mut response_body = Vec::new();
     while let Some(batch_result) = batch_requests.next().await {
-        query_results.extend(batch_result?);
+        let (response, query_count) = batch_result?;
+        lpm_http::read_body_capped_into(response, OSV_BATCH_RESPONSE_MAX_BYTES, &mut response_body)
+            .await
+            .map_err(|error| LpmError::Network(format!("OSV response {error}")))?;
+        let result: OsvBatchResponse =
+            serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&response_body))
+                .map_err(|error| LpmError::Network(format!("OSV parse error: {error}")))?;
+
+        if result.results.len() != query_count {
+            return Err(LpmError::Network(format!(
+                "OSV batch response cardinality mismatch: sent {} queries, received {} result slots",
+                query_count,
+                result.results.len()
+            )));
+        }
+        query_results.extend(result.results);
     }
 
     let mut hydration_ids = HashSet::new();
@@ -401,10 +427,10 @@ fn build_osv_batch_request(
     (request, packages.len())
 }
 
-async fn send_osv_batch_request(
+async fn send_osv_batch_request_headers(
     request: reqwest::RequestBuilder,
     query_count: usize,
-) -> Result<Vec<OsvQueryResult>, LpmError> {
+) -> Result<(reqwest::Response, usize), LpmError> {
     let response = request.send().await.map_err(|error| {
         LpmError::Network(format!(
             "OSV API error: {}",
@@ -419,21 +445,7 @@ async fn send_osv_batch_request(
         )));
     }
 
-    let body = lpm_http::read_body_capped(response, OSV_BATCH_RESPONSE_MAX_BYTES)
-        .await
-        .map_err(|error| LpmError::Network(format!("OSV response {error}")))?;
-    let result: OsvBatchResponse = serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&body))
-        .map_err(|error| LpmError::Network(format!("OSV parse error: {error}")))?;
-
-    if result.results.len() != query_count {
-        return Err(LpmError::Network(format!(
-            "OSV batch response cardinality mismatch: sent {} queries, received {} result slots",
-            query_count,
-            result.results.len()
-        )));
-    }
-
-    Ok(result.results)
+    Ok((response, query_count))
 }
 
 fn osv_advisory_needs_hydration(vuln: &OsvVuln) -> bool {
@@ -689,6 +701,11 @@ fn cvss_score_to_usable_label(score_str: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn osv_batch_requests_keep_network_concurrency() {
+        assert_eq!(OSV_BATCH_REQUEST_CONCURRENCY, 4);
+    }
 
     #[test]
     fn numeric_cvss_nan_is_unusable() {

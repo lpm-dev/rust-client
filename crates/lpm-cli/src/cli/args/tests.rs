@@ -269,6 +269,46 @@ fn audit_level_accepts_documented_severity_aliases() {
 }
 
 #[test]
+fn audit_rejects_options_that_do_not_apply_to_the_selected_mode() {
+    for argv in [
+        vec!["lpm", "audit", "--level", "high", "--secrets"],
+        vec!["lpm", "audit", "--level", "high", "--fix"],
+        vec!["lpm", "audit", "--fail-on", "all", "--fix"],
+        vec!["lpm", "audit", "--level", "high", "fix"],
+        vec!["lpm", "audit", "--fail-on", "all", "signatures"],
+        vec!["lpm", "audit", "--secrets", "signatures"],
+        vec!["lpm", "audit", "--fix", "signatures"],
+    ] {
+        let error = match Cli::try_parse_from(&argv) {
+            Ok(cli) => crate::cli::format::post_parse_error(&cli)
+                .expect("an audit option that the selected mode ignores must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "unexpected parser result for {argv:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn audit_subcommands_accept_global_options_in_their_global_positions() {
+    let cli = Cli::try_parse_from(["lpm", "audit", "--json", "fix", "--dry-run"])
+        .expect("global JSON output must remain valid before an audit subcommand");
+
+    assert!(cli.json);
+    assert!(crate::cli::format::post_parse_error(&cli).is_none());
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Audit(security::AuditArgs {
+            action: Some(commands::audit::AuditCmd::Fix { dry_run: true }),
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn config_without_action_parses_to_guided_editor() {
     let cli = Cli::try_parse_from(["lpm", "config"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {

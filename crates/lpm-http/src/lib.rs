@@ -617,9 +617,21 @@ pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
 
 /// Read a response body while enforcing declared-length and streamed-byte caps.
 pub async fn read_body_capped(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     cap: usize,
 ) -> Result<Vec<u8>, ResponseBodyError> {
+    let mut body = Vec::new();
+    read_body_capped_into(response, cap, &mut body).await?;
+    Ok(body)
+}
+
+/// Read a capped response body into a caller-owned buffer, retaining its allocation for reuse.
+pub async fn read_body_capped_into(
+    mut response: reqwest::Response,
+    cap: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), ResponseBodyError> {
+    body.clear();
     if let Some(declared) = response.content_length()
         && declared > cap as u64
     {
@@ -631,14 +643,14 @@ pub async fn read_body_capped(
         .and_then(|length| usize::try_from(length).ok())
         .unwrap_or(64 * 1024)
         .min(cap);
-    let mut body = Vec::with_capacity(initial_capacity);
+    body.reserve(initial_capacity);
     while let Some(chunk) = response.chunk().await.map_err(ResponseBodyError::Read)? {
         if chunk.len() > cap.saturating_sub(body.len()) {
             return Err(ResponseBodyError::StreamedTooLarge { cap });
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(())
 }
 
 /// Build a bounded redirect policy that refuses cleartext after any HTTPS hop.
@@ -1524,6 +1536,27 @@ mod tests {
             read_body_capped(response, 32).await,
             Err(ResponseBodyError::StreamedTooLarge { cap: 32 })
         ));
+    }
+
+    #[tokio::test]
+    async fn capped_body_into_reuses_the_callers_allocation() {
+        let first = response_from_raw(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\n12345678901234567890123456789012"
+                .to_vec(),
+        )
+        .await;
+        let second = response_from_raw(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678".to_vec(),
+        )
+        .await;
+        let mut body = Vec::new();
+
+        read_body_capped_into(first, 32, &mut body).await.unwrap();
+        let allocation = body.as_ptr();
+        read_body_capped_into(second, 32, &mut body).await.unwrap();
+
+        assert_eq!(body, b"12345678");
+        assert_eq!(body.as_ptr(), allocation);
     }
 
     #[tokio::test]

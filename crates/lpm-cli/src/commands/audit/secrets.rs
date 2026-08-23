@@ -354,8 +354,15 @@ fn canonicalize_scannable_directory(
     directory: &Path,
     roots: &PackageRoots,
 ) -> Result<Option<PathBuf>, LpmError> {
-    let Ok(canonical) = directory.canonicalize() else {
-        return Ok(None);
+    let canonical = match directory.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "failed to resolve installed package path {}: {error}",
+                lpm_common::sanitize_terminal_inline(&directory.display().to_string())
+            )));
+        }
     };
     if !canonical.is_dir() {
         return Ok(None);
