@@ -38,7 +38,6 @@ use lpm_security::{
 };
 use lpm_store::PackageStore;
 use lpm_workspace::ProvenanceSnapshot;
-#[cfg(not(test))]
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -430,7 +429,11 @@ fn build_state_secret_path() -> Result<PathBuf, LpmError> {
 #[cfg(not(test))]
 fn read_build_state_secret() -> Result<Option<Vec<u8>>, LpmError> {
     let path = build_state_secret_path()?;
-    let raw = match lpm_common::read_text_file_capped_nofollow(&path, 256) {
+    read_build_state_secret_at(&path)
+}
+
+fn read_build_state_secret_at(path: &Path) -> Result<Option<Vec<u8>>, LpmError> {
+    let raw = match lpm_common::read_text_file_capped_nofollow(path, 256) {
         Ok(raw) => raw,
         Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
         Err(error) => {
@@ -457,13 +460,26 @@ fn read_build_state_secret() -> Result<Option<Vec<u8>>, LpmError> {
 
 #[cfg(not(test))]
 fn get_or_create_build_state_secret() -> Result<Vec<u8>, LpmError> {
-    if let Some(secret) = read_build_state_secret()? {
+    let path = build_state_secret_path()?;
+    get_or_create_build_state_secret_at(&path, || {})
+}
+
+fn get_or_create_build_state_secret_at(
+    path: &Path,
+    after_staging_file_create: impl FnOnce(),
+) -> Result<Vec<u8>, LpmError> {
+    if let Some(secret) = read_build_state_secret_at(path)? {
         return Ok(secret);
     }
-    let path = build_state_secret_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let lock_path = path.with_extension("lock");
+    let _lock = lpm_common::acquire_single_file_exclusive_lock(&lock_path)?;
+    if let Some(secret) = read_build_state_secret_at(path)? {
+        return Ok(secret);
+    }
+
     let mut secret = [0_u8; BUILD_STATE_SECRET_BYTES];
     rand::rngs::OsRng
         .try_fill_bytes(&mut secret)
@@ -472,29 +488,20 @@ fn get_or_create_build_state_secret() -> Result<Vec<u8>, LpmError> {
                 "failed to generate build-state signing secret: {error}"
             ))
         })?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    match options.open(&path) {
-        Ok(mut file) => {
+    lpm_common::write_file_atomic_with(
+        path,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
+        |file| -> Result<(), LpmError> {
             use std::io::Write;
+            after_staging_file_create();
             writeln!(file, "{}", hex::encode(secret))?;
-            file.sync_all()?;
-            Ok(secret.to_vec())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_build_state_secret()?.ok_or_else(|| {
-                LpmError::SecurityApprovalStore(
-                    "build-state signing secret disappeared during creation".into(),
-                )
-            })
-        }
-        Err(error) => Err(LpmError::Io(error)),
-    }
+            Ok(())
+        },
+    )?;
+    Ok(secret.to_vec())
 }
 
 /// Compute the deterministic fingerprint over a slice of blocked packages.
@@ -1445,6 +1452,41 @@ mod tests {
             authentication_tag: None,
             drift_ignore_override: None,
         }
+    }
+
+    #[test]
+    fn concurrent_secret_creation_waits_for_complete_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("build-state-secret.hex");
+        let first_path = path.clone();
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            get_or_create_build_state_secret_at(&first_path, || {
+                created_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+
+        created_rx.recv().unwrap();
+        let second_path = path;
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = get_or_create_build_state_secret_at(&second_path, || {});
+            result_tx.send(result).unwrap();
+        });
+
+        let early_result = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        let first_secret = first.join().unwrap().unwrap();
+        let second_secret = match early_result {
+            Ok(result) => result.unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => result_rx.recv().unwrap().unwrap(),
+            Err(error) => panic!("concurrent secret creator disconnected: {error}"),
+        };
+        second.join().unwrap();
+
+        assert_eq!(second_secret, first_secret);
     }
 
     /// M3: the drift_ignore_override field is omitted from on-disk
