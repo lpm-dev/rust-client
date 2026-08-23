@@ -2117,10 +2117,17 @@ fn graph_ls_alias_parses_as_graph_command() {
     let cli = Cli::try_parse_from(["lpm", "ls", "--depth", "2"]).unwrap();
     match cli.command.expect("test parse missing subcommand") {
         Commands::Graph(lifecycle::GraphArgs { depth, .. }) => {
-            assert_eq!(depth, Some(2));
+            assert_eq!(depth.map(NonZeroUsize::get), Some(2));
         }
         _ => panic!("expected Graph command"),
     }
+}
+
+#[test]
+fn graph_depth_rejects_zero() {
+    let result = Cli::try_parse_from(["lpm", "graph", "--depth", "0"]);
+
+    assert!(result.is_err(), "graph depth is 1-based");
 }
 
 #[test]

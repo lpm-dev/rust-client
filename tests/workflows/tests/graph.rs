@@ -322,6 +322,36 @@ fn graph_html_writes_to_dot_lpm_dir_and_respects_no_open() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn graph_html_rejects_a_symlinked_state_directory_without_writing_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let project = graph_fixture();
+    let outside = tempfile::tempdir().expect("create external graph directory");
+    let sentinel = outside.path().join("graph.html");
+    std::fs::write(&sentinel, "sentinel").expect("write external graph sentinel");
+    std::fs::remove_dir_all(project.path().join(".lpm"))
+        .expect("remove fixture state directory before linking it");
+    symlink(outside.path(), project.path().join(".lpm"))
+        .expect("link project state directory outside the project");
+
+    let output = lpm(&project)
+        .args(["graph", "--format", "html", "--no-open"])
+        .output()
+        .expect("run graph with a linked state directory");
+
+    assert!(
+        !output.status.success(),
+        "graph HTML must reject a linked project state directory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sentinel).expect("read external graph sentinel"),
+        "sentinel",
+        "graph HTML must not replace a file outside the project"
+    );
+}
+
 #[test]
 fn graph_html_writes_human_readable_size() {
     let project = graph_fixture();
@@ -596,6 +626,32 @@ fn dense_why_project(depth: usize) -> TempProject {
     }
     project.write_file("lpm.lock", &lockfile);
     project
+}
+
+#[test]
+fn graph_tree_expands_each_shared_subgraph_once() {
+    const DEPTH: usize = 12;
+    let project = dense_why_project(DEPTH);
+
+    let output = lpm(&project)
+        .args(["graph"])
+        .output()
+        .expect("render a tree with shared dependency subgraphs");
+
+    assert!(
+        output.status.success(),
+        "shared dependency tree must render successfully: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    assert!(
+        stdout.lines().count() <= DEPTH * 8,
+        "tree output must stay linear in the shared graph size"
+    );
+    assert!(
+        stdout.contains("(shared)"),
+        "repeated shared nodes must explain why their subtree is not expanded again"
+    );
 }
 
 /// Write a synthetic `.lpm/overrides-state.json`. Mirrors what the

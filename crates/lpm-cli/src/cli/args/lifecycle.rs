@@ -1035,7 +1035,7 @@ pub(crate) struct GraphArgs {
     /// so every output format (tree, dot, mermaid, json, stats, html)
     /// sees the same truncated set.
     #[arg(long)]
-    pub(crate) depth: Option<usize>,
+    pub(crate) depth: Option<std::num::NonZeroUsize>,
 
     /// Only show subtrees containing this package name.
     #[arg(long)]
