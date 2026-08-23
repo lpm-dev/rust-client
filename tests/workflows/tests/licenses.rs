@@ -197,6 +197,183 @@ fn licenses_json_inventories_installed_package_licenses() {
 }
 
 #[test]
+fn licenses_human_output_sanitizes_manifest_fields_without_changing_json() {
+    let project = seed_project();
+    let hostile_license = "MIT\nforged-row\u{1b}[2J";
+    project.write_file(
+        "node_modules/left-pad/package.json",
+        &serde_json::json!({
+            "name": "left-pad",
+            "version": "1.3.0",
+            "license": hostile_license,
+        })
+        .to_string(),
+    );
+
+    let human_output = lpm(&project)
+        .args(["licenses"])
+        .output()
+        .expect("run human licenses inventory");
+    assert!(
+        human_output.status.success(),
+        "human licenses must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&human_output.stdout),
+        String::from_utf8_lossy(&human_output.stderr)
+    );
+    assert!(
+        !human_output.stdout.contains(&b'\x1b'),
+        "terminal escape bytes must not reach human output: {:?}",
+        String::from_utf8_lossy(&human_output.stdout)
+    );
+    let human_stdout = String::from_utf8(human_output.stdout).expect("human output is UTF-8");
+    assert!(
+        human_stdout.lines().all(|line| line != "forged-row"),
+        "manifest fields must not create forged terminal rows: {human_stdout:?}"
+    );
+
+    let json_output = lpm(&project)
+        .args(["licenses", "--json"])
+        .output()
+        .expect("run JSON licenses inventory");
+    assert!(json_output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("licenses stdout must be valid JSON");
+    let package = package_for_version(&envelope, "left-pad", "1.3.0")
+        .expect("left-pad must be present in the inventory");
+    assert_eq!(
+        package["license_expression"],
+        serde_json::json!(hostile_license)
+    );
+    assert_eq!(package["licenses"], serde_json::json!([hostile_license]));
+}
+
+#[test]
+fn licenses_scope_follows_exact_root_and_dependency_instances() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "licenses-exact-instances",
+            "version": "1.0.0",
+            "license": "MIT",
+            "dependencies": {
+                "prod-parent": "1.0.0"
+            },
+            "devDependencies": {
+                "dev-parent": "1.0.0"
+            }
+        }"#,
+    );
+    let registry_source = "registry+https://registry.example.test";
+    let dev_source = "registry+https://dev-registry.example.test";
+    let prod_parent_id = lpm_common::PackageInstanceId::derive(
+        "prod-parent",
+        "1.0.0",
+        registry_source,
+        "licenses/prod-parent",
+    );
+    let dev_parent_id = lpm_common::PackageInstanceId::derive(
+        "dev-parent",
+        "1.0.0",
+        registry_source,
+        "licenses/dev-parent",
+    );
+    let prod_shared_id = lpm_common::PackageInstanceId::derive(
+        "shared",
+        "1.0.0",
+        registry_source,
+        "licenses/prod-shared",
+    );
+    let dev_shared_id =
+        lpm_common::PackageInstanceId::derive("shared", "1.0.0", dev_source, "licenses/dev-shared");
+
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(prod_parent_id),
+        name: "prod-parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(registry_source.to_string()),
+        dependencies: vec!["shared@1.0.0".to_string()],
+        dependency_targets: [("shared".to_string(), prod_shared_id)].into(),
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(dev_parent_id),
+        name: "dev-parent".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(registry_source.to_string()),
+        dependencies: vec!["shared@1.0.0".to_string()],
+        dependency_targets: [("shared".to_string(), dev_shared_id)].into(),
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(prod_shared_id),
+        name: "shared".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(registry_source.to_string()),
+        ..Default::default()
+    });
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(dev_shared_id),
+        name: "shared".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(dev_source.to_string()),
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        "prod-parent".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(prod_parent_id),
+            package: "prod-parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(registry_source.to_string()),
+        },
+    );
+    lockfile.root_resolutions.insert(
+        "dev-parent".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(dev_parent_id),
+            package: "dev-parent".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(registry_source.to_string()),
+        },
+    );
+    lockfile
+        .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
+        .expect("write exact-instance lockfile");
+    for name in ["prod-parent", "dev-parent", "shared"] {
+        project.write_file(
+            &format!("node_modules/{name}/package.json"),
+            &serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "license": "MIT",
+            })
+            .to_string(),
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["licenses", "--json"])
+        .output()
+        .expect("run licenses against exact-instance graph");
+    assert!(
+        output.status.success(),
+        "licenses must succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("licenses stdout must be valid JSON");
+    assert_eq!(
+        package_scope_for_source(&envelope, "shared", registry_source),
+        Some("required")
+    );
+    assert_eq!(
+        package_scope_for_source(&envelope, "shared", dev_source),
+        Some("excluded")
+    );
+}
+
+#[test]
 fn licenses_scope_marks_dev_only_alias_transitives_as_excluded() {
     let project = TempProject::empty(
         r#"{
@@ -562,6 +739,22 @@ fn package_scope_for_version<'a>(
     version: &str,
 ) -> Option<&'a str> {
     package_for_version(envelope, name, version)?
+        .get("scope")?
+        .as_str()
+}
+
+fn package_scope_for_source<'a>(
+    envelope: &'a serde_json::Value,
+    name: &str,
+    source: &str,
+) -> Option<&'a str> {
+    envelope["packages"]
+        .as_array()?
+        .iter()
+        .find(|package| {
+            package["name"] == serde_json::json!(name)
+                && package["source"] == serde_json::json!(source)
+        })?
         .get("scope")?
         .as_str()
 }
