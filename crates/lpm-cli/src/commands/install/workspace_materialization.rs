@@ -249,6 +249,7 @@ pub(super) struct WorkspaceMaterializationCoordinator {
     unshared_local_source_roots: Box<[std::path::PathBuf]>,
     fetch_semaphore: Arc<Semaphore>,
     fetch_extract_limiter: super::FetchExtractLimiter,
+    v2_streaming_lane: Arc<super::V2StreamingLane>,
     limit_v1_extraction: bool,
     v2_link_task_semaphore: Arc<Semaphore>,
     graph_key_cache: lpm_linker::v2::GraphKeyCache,
@@ -275,12 +276,12 @@ impl WorkspaceMaterializationCoordinator {
     pub(super) fn new(unshared_local_source_roots: Vec<std::path::PathBuf>) -> Self {
         let limit_v1_extraction = super::configured_fetch_extract_permits_from_env(false).is_some();
         let fetch_extract_limiter = super::configured_fetch_extract_permits_from_env(true)
-            .map(Semaphore::new)
-            .map(Arc::new);
+            .map(super::fetch_extract_limiter_with_permits);
         Self {
             unshared_local_source_roots: unshared_local_source_roots.into_boxed_slice(),
             fetch_semaphore: Arc::new(Semaphore::new(super::max_concurrent_downloads())),
             fetch_extract_limiter,
+            v2_streaming_lane: Arc::new(super::V2StreamingLane::default()),
             limit_v1_extraction,
             v2_link_task_semaphore: Arc::new(Semaphore::new(super::v2_link_task_concurrency(
                 Semaphore::MAX_PERMITS,
@@ -313,6 +314,10 @@ impl WorkspaceMaterializationCoordinator {
         } else {
             None
         }
+    }
+
+    pub(super) fn v2_streaming_lane(&self) -> Arc<super::V2StreamingLane> {
+        Arc::clone(&self.v2_streaming_lane)
     }
 
     pub(super) fn v2_link_task_semaphore(&self) -> Arc<Semaphore> {

@@ -611,6 +611,7 @@ impl ResolveState {
                 .dist
                 .get(&version)
                 .and_then(|dist| dist.integrity.clone()),
+            unpacked_size: info.dist.get(&version).and_then(|dist| dist.unpacked_size),
             platform: info.platform.get(&version).cloned(),
             node_engine: info.node_engines.get(&version).cloned(),
             optional,

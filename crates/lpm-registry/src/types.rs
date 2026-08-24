@@ -390,6 +390,14 @@ pub struct DistInfo {
     #[serde(default)]
     pub shasum: Option<String>,
 
+    #[serde(
+        default,
+        rename = "unpackedSize",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_nonzero_u64"
+    )]
+    pub unpacked_size: Option<std::num::NonZeroU64>,
+
     /// Per-key detached package signatures (npm's package-signing surface).
     /// Empty/missing when the registry does not sign packages. Registry
     /// servers that do not publish this field continue to round-trip
@@ -405,6 +413,18 @@ pub struct DistInfo {
     /// The LPM registry does not expose this field today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestations: Option<AttestationRef>,
+}
+
+fn deserialize_optional_nonzero_u64<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::num::NonZeroU64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| value.as_u64())
+        .and_then(std::num::NonZeroU64::new))
 }
 
 impl DistInfo {
@@ -1637,6 +1657,7 @@ mod tests {
         );
         assert_eq!(parsed.integrity.as_deref(), Some("sha512-abc"));
         assert_eq!(parsed.shasum.as_deref(), Some("deadbeef"));
+        assert!(parsed.unpacked_size.is_none());
         assert!(parsed.signatures.is_none());
         assert!(parsed.attestations.is_none());
 
@@ -1651,6 +1672,33 @@ mod tests {
             !reserialized.contains("attestations"),
             "legacy DistInfo must not emit an `attestations` key when None; got {reserialized}"
         );
+        assert!(!reserialized.contains("unpackedSize"));
+    }
+
+    #[test]
+    fn dist_info_accepts_only_positive_integer_unpacked_sizes() {
+        let parsed: DistInfo = serde_json::from_value(serde_json::json!({
+            "unpackedSize": 184_624_992_u64
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed.unpacked_size.map(std::num::NonZeroU64::get),
+            Some(184_624_992)
+        );
+
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("184624992"),
+        ] {
+            let parsed: DistInfo = serde_json::from_value(serde_json::json!({
+                "unpackedSize": invalid
+            }))
+            .unwrap();
+            assert!(parsed.unpacked_size.is_none());
+        }
     }
 
     #[test]
@@ -1662,6 +1710,7 @@ mod tests {
                 tarball: Some("https://example.com/legacy-1.0.0.tgz".to_string()),
                 integrity: None,
                 shasum: Some("da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string()),
+                unpacked_size: None,
                 signatures: None,
                 attestations: None,
             }),

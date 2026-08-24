@@ -21,14 +21,55 @@ pub(super) fn lockfile_fetch_schedule(packages: &[InstallPackage]) -> Vec<Instal
 }
 
 pub(in crate::commands::install) fn prioritize_fetch_schedule(packages: &mut [InstallPackage]) {
-    packages.sort_by(|a, b| {
-        b.is_direct
-            .cmp(&a.is_direct)
-            .then_with(|| b.dependencies.len().cmp(&a.dependencies.len()))
-            .then_with(|| b.peers.len().cmp(&a.peers.len()))
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.version.cmp(&b.version))
-    });
+    packages.sort_by(fetch_schedule_order);
+}
+
+fn fetch_schedule_order(a: &InstallPackage, b: &InstallPackage) -> std::cmp::Ordering {
+    b.is_direct
+        .cmp(&a.is_direct)
+        .then_with(|| b.dependencies.len().cmp(&a.dependencies.len()))
+        .then_with(|| b.peers.len().cmp(&a.peers.len()))
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.version.cmp(&b.version))
+        .then_with(|| a.source.cmp(&b.source))
+}
+
+fn streaming_candidate_order(a: &InstallPackage, b: &InstallPackage) -> std::cmp::Ordering {
+    b.unpacked_size
+        .cmp(&a.unpacked_size)
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| a.version.cmp(&b.version))
+        .then_with(|| a.source.cmp(&b.source))
+}
+
+pub(in crate::commands::install) fn v2_streaming_candidate_key(
+    packages: &[InstallPackage],
+) -> Option<String> {
+    packages
+        .iter()
+        .filter(|package| {
+            package.unpacked_size.is_some()
+                && package.integrity.is_some()
+                && matches!(
+                    package.source_kind(),
+                    Ok(lpm_lockfile::Source::Registry { .. })
+                )
+        })
+        .min_by(|a, b| streaming_candidate_order(a, b))
+        .map(install_pkg_key)
+}
+
+pub(in crate::commands::install) fn promote_fetch_candidate(
+    packages: &mut [InstallPackage],
+    candidate_key: &str,
+) {
+    let Some(index) = packages
+        .iter()
+        .position(|package| install_pkg_key(package) == candidate_key)
+    else {
+        return;
+    };
+    packages[..=index].rotate_right(1);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,6 +236,8 @@ pub(super) fn maybe_spawn_fetch(
             permit,
             &fetch_extract_limiter,
             install_accounting,
+            V2StreamingEligibility::Disabled,
+            None,
         )
         .await?;
         Ok(FetchOutcome {
@@ -213,4 +256,138 @@ fn is_local_source_package(package: &InstallPackage) -> bool {
         package.source_kind(),
         Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(name: &str, unpacked_size: Option<u64>) -> InstallPackage {
+        InstallPackage {
+            instance_id: None,
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            source: "registry+https://registry.npmjs.org".to_string(),
+            dependencies: Vec::new(),
+            dependency_targets: HashMap::new(),
+            aliases: HashMap::new(),
+            root_link_names: None,
+            is_direct: false,
+            is_lpm: false,
+            peers: Vec::new(),
+            peer_targets: HashMap::new(),
+            integrity: Some("sha512-test".to_string()),
+            unpacked_size: unpacked_size.and_then(std::num::NonZeroU64::new),
+            registry_signatures: Vec::new(),
+            registry_published_at: None,
+            platform: None,
+            node_engine: None,
+            optional: false,
+            tarball_url: Some(format!(
+                "https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz"
+            )),
+            metadata_checked_for_tarball: true,
+            manifest_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn streaming_candidate_is_largest_known_registry_package_in_any_input_order() {
+        let next = package("next", Some(184_624_992));
+        let react_dom = package("react-dom", Some(7_319_407));
+        let server_only = package("server-only", Some(611));
+        let unknown = package("unknown", None);
+        let expected = install_pkg_key(&next);
+
+        let permutations = [
+            vec![
+                next.clone(),
+                react_dom.clone(),
+                server_only.clone(),
+                unknown.clone(),
+            ],
+            vec![
+                unknown.clone(),
+                server_only.clone(),
+                next.clone(),
+                react_dom.clone(),
+            ],
+            vec![react_dom, next, unknown, server_only],
+        ];
+        for packages in permutations {
+            let selected = v2_streaming_candidate_key(&packages);
+            assert_eq!(selected.as_deref(), Some(expected.as_str()));
+            assert_eq!(
+                packages
+                    .iter()
+                    .filter(|package| selected.as_deref() == Some(install_pkg_key(package).as_str()))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_candidate_ties_are_resolved_by_stable_package_identity() {
+        let alpha = package("alpha", Some(1024));
+        let zeta = package("zeta", Some(1024));
+        assert_eq!(
+            v2_streaming_candidate_key(&[zeta, alpha.clone()]).as_deref(),
+            Some(install_pkg_key(&alpha).as_str())
+        );
+    }
+
+    #[test]
+    fn streaming_candidate_excludes_unknown_unverified_and_non_registry_artifacts() {
+        let unknown = package("unknown", None);
+        let mut unverified = package("unverified", Some(4096));
+        unverified.integrity = None;
+        let mut tarball = package("tarball", Some(8192));
+        tarball.source = "tarball+https://example.invalid/tarball.tgz".to_string();
+
+        assert!(v2_streaming_candidate_key(&[unknown, unverified, tarball]).is_none());
+    }
+
+    #[test]
+    fn background_fetch_schedule_is_independent_of_registry_size_hints() {
+        let mut direct_small = package("direct-small", Some(1024));
+        direct_small.is_direct = true;
+        let large = package("large", Some(1_000_000));
+        let unknown = package("unknown", None);
+        let mut packages = vec![unknown, direct_small, large];
+
+        prioritize_fetch_schedule(&mut packages);
+
+        assert_eq!(packages[0].name, "direct-small");
+        assert_eq!(packages[1].name, "large");
+        assert_eq!(packages[2].name, "unknown");
+    }
+
+    #[test]
+    fn streaming_candidate_moves_first_without_reordering_background_fetches() {
+        let mut direct = package("direct", Some(1024));
+        direct.is_direct = true;
+        let small = package("small", Some(2048));
+        let candidate = package("candidate", Some(1_000_000));
+        let unknown = package("unknown", None);
+        let mut packages = vec![unknown, candidate.clone(), small, direct];
+
+        prioritize_fetch_schedule(&mut packages);
+        let background_order = packages
+            .iter()
+            .filter(|package| package.name != candidate.name)
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>();
+        let candidate_key = v2_streaming_candidate_key(&packages).unwrap();
+        promote_fetch_candidate(&mut packages, &candidate_key);
+
+        assert_eq!(packages[0].name, candidate.name);
+        assert_eq!(
+            packages[1..]
+                .iter()
+                .map(|package| package.name.clone())
+                .collect::<Vec<_>>(),
+            background_order
+        );
+    }
 }

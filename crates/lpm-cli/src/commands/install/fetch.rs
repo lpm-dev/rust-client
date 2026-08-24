@@ -4,12 +4,60 @@ use tokio::sync::Mutex as AsyncMutex;
 use super::*;
 
 pub(super) type FetchLock = Arc<AsyncMutex<()>>;
-pub(super) type FetchExtractLimiter = Option<Arc<tokio::sync::Semaphore>>;
+pub(super) type FetchExtractLimiter = Option<Arc<FetchExtractCapacity>>;
+
+pub(super) struct FetchExtractCapacity {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permits: usize,
+}
+
+impl FetchExtractCapacity {
+    fn new(permits: usize) -> Self {
+        Self::with_semaphore(Arc::new(tokio::sync::Semaphore::new(permits)), permits)
+    }
+
+    fn with_semaphore(semaphore: Arc<tokio::sync::Semaphore>, permits: usize) -> Self {
+        Self { semaphore, permits }
+    }
+
+    #[cfg(test)]
+    pub(super) fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+}
+
+#[derive(Default)]
+pub(super) struct V2StreamingLane {
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+impl V2StreamingLane {
+    fn try_claim(&self) -> bool {
+        self.claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+pub(super) enum V2StreamingEligibility<'a> {
+    Disabled,
+    CriticalCandidate(&'a V2StreamingLane),
+}
 
 const ENV_FETCH_EXTRACT_PERMITS: &str = "LPM_FETCH_EXTRACT_PERMITS";
 const ENV_EXPERIMENTAL_RESOLVER: &str = "LPM_EXPERIMENTAL_INSTALLER_SPIKE";
+const ENV_V2_STREAMING_EXTRACT_WEIGHT: &str = "LPM_V2_STREAMING_EXTRACT_WEIGHT";
 // APFS store finalization contends on filesystem metadata above this width.
 pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
+const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 3;
+pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE: std::time::Duration =
+    std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ArtifactSelection {
@@ -106,8 +154,20 @@ fn default_fetch_extract_permits(v2_store_active: bool) -> Option<usize> {
 
 pub(super) fn configured_fetch_extract_limiter(v2_store_active: bool) -> FetchExtractLimiter {
     configured_fetch_extract_permits_from_env(v2_store_active)
-        .map(tokio::sync::Semaphore::new)
+        .map(FetchExtractCapacity::new)
         .map(Arc::new)
+}
+
+pub(super) fn fetch_extract_limiter_with_permits(permits: usize) -> Arc<FetchExtractCapacity> {
+    Arc::new(FetchExtractCapacity::new(permits))
+}
+
+#[cfg(test)]
+pub(super) fn fetch_extract_limiter_with_semaphore(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permits: usize,
+) -> Arc<FetchExtractCapacity> {
+    Arc::new(FetchExtractCapacity::with_semaphore(semaphore, permits))
 }
 
 pub(super) fn configured_fetch_extract_permits_from_env(v2_store_active: bool) -> Option<usize> {
@@ -123,12 +183,153 @@ pub(super) fn configured_fetch_extract_permits_from_env(v2_store_active: bool) -
 async fn acquire_fetch_extract_permit(
     limiter: &FetchExtractLimiter,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LpmError> {
+    acquire_fetch_extract_permits(limiter, 1).await
+}
+
+async fn acquire_fetch_extract_permits(
+    limiter: &FetchExtractLimiter,
+    requested: usize,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LpmError> {
     match limiter {
-        Some(limiter) => Ok(Some(limiter.clone().acquire_owned().await.map_err(
-            |_| LpmError::Registry("fetch extract limiter closed unexpectedly".into()),
-        )?)),
+        Some(limiter) => {
+            let permits = requested.min(limiter.permits).max(1);
+            let permits = u32::try_from(permits).map_err(|_| {
+                LpmError::Registry("fetch extract permit weight exceeds u32".into())
+            })?;
+            Ok(Some(
+                limiter
+                    .semaphore
+                    .clone()
+                    .acquire_many_owned(permits)
+                    .await
+                    .map_err(|_| {
+                        LpmError::Registry("fetch extract limiter closed unexpectedly".into())
+                    })?,
+            ))
+        }
         None => Ok(None),
     }
+}
+
+struct V2StreamingExtractAdmission {
+    base_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    supplemental_permit: Option<LeasedExtractPermit>,
+    requested_weight: usize,
+    acquired_weight: usize,
+    wait_ms: u128,
+}
+
+struct LeasedExtractPermit {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    acquired_at: std::time::Instant,
+}
+
+async fn acquire_v2_streaming_extract_admission(
+    limiter: &FetchExtractLimiter,
+    requested_weight: usize,
+) -> Result<V2StreamingExtractAdmission, LpmError> {
+    let wait_start = std::time::Instant::now();
+    let Some(limiter) = limiter else {
+        return Ok(V2StreamingExtractAdmission {
+            base_permit: None,
+            supplemental_permit: None,
+            requested_weight,
+            acquired_weight: 0,
+            wait_ms: 0,
+        });
+    };
+    let base_permit = limiter
+        .semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| LpmError::Registry("fetch extract limiter closed unexpectedly".into()))?;
+    let wait_ms = wait_start.elapsed().as_millis();
+    let supplemental_requested = requested_weight.min(limiter.permits).saturating_sub(1);
+    let supplemental_permit = if supplemental_requested == 0 {
+        None
+    } else {
+        let requested = u32::try_from(supplemental_requested)
+            .map_err(|_| LpmError::Registry("fetch extract permit weight exceeds u32".into()))?;
+        let permit = limiter
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(requested)
+            .ok()
+            .or_else(|| {
+                (supplemental_requested > 1)
+                    .then(|| limiter.semaphore.clone().try_acquire_owned().ok())
+                    .flatten()
+            });
+        permit.map(|permit| LeasedExtractPermit {
+            permit,
+            acquired_at: std::time::Instant::now(),
+        })
+    };
+    let acquired_weight = 1 + supplemental_permit
+        .as_ref()
+        .map_or(0, |supplemental| supplemental.permit.num_permits());
+    Ok(V2StreamingExtractAdmission {
+        base_permit: Some(base_permit),
+        supplemental_permit,
+        requested_weight,
+        acquired_weight,
+        wait_ms,
+    })
+}
+
+async fn await_v2_streaming_extract_task<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    supplemental_permit: Option<LeasedExtractPermit>,
+    lease: std::time::Duration,
+) -> (Result<T, tokio::task::JoinError>, bool, u128) {
+    let Some(supplemental_permit) = supplemental_permit else {
+        return (task.await, false, 0);
+    };
+    let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(
+        supplemental_permit.acquired_at + lease,
+    ));
+    tokio::pin!(deadline);
+    tokio::select! {
+        result = &mut task => {
+            let hold_ms = supplemental_permit.acquired_at.elapsed().as_millis();
+            drop(supplemental_permit);
+            (result, false, hold_ms)
+        }
+        () = &mut deadline => {
+            let hold_ms = supplemental_permit.acquired_at.elapsed().as_millis();
+            drop(supplemental_permit);
+            (task.await, true, hold_ms)
+        }
+    }
+}
+
+fn parse_v2_streaming_extract_weight(value: &str) -> Option<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&weight| (1..=DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS).contains(&weight))
+}
+
+fn configured_v2_streaming_extract_weight(
+    explicit_weight: Option<&str>,
+    unpacked_size: Option<std::num::NonZeroU64>,
+) -> usize {
+    if let Some(weight) = explicit_weight.and_then(parse_v2_streaming_extract_weight) {
+        return weight;
+    }
+    match unpacked_size {
+        Some(size) if size.get() >= LARGE_V2_STREAMING_OBJECT_BYTES => {
+            DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT
+        }
+        _ => 1,
+    }
+}
+
+fn v2_streaming_extract_weight(unpacked_size: Option<std::num::NonZeroU64>) -> usize {
+    let explicit_weight = std::env::var(ENV_V2_STREAMING_EXTRACT_WEIGHT).ok();
+    configured_v2_streaming_extract_weight(explicit_weight.as_deref(), unpacked_size)
 }
 
 pub(super) async fn handoff_buffered_download_to_extract<P>(
@@ -150,6 +351,56 @@ pub(super) async fn handoff_file_download_to_extract<P>(
     let wait_start = std::time::Instant::now();
     let extract_permit = acquire_fetch_extract_permit(limiter).await?;
     Ok((extract_permit, wait_start.elapsed().as_millis()))
+}
+
+struct StreamBodyPermitReader<R> {
+    inner: R,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    started: Option<std::time::Instant>,
+    elapsed_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R> StreamBodyPermitReader<R> {
+    fn new(
+        inner: R,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        elapsed_ms: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            inner,
+            permit: Some(permit),
+            started: None,
+            elapsed_ms,
+        }
+    }
+
+    fn finish_download(&mut self) {
+        if self.permit.take().is_some() {
+            self.elapsed_ms.store(
+                self.started.map_or(0, |started| {
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                }),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for StreamBodyPermitReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.started.get_or_insert_with(std::time::Instant::now);
+        let result = self.inner.read(buffer);
+        if !matches!(result, Ok(bytes) if bytes > 0) {
+            self.finish_download();
+        }
+        result
+    }
+}
+
+impl<R> Drop for StreamBodyPermitReader<R> {
+    fn drop(&mut self) {
+        self.finish_download();
+    }
 }
 
 pub(super) struct OnlineFetchPhaseInput<'a> {
@@ -352,6 +603,10 @@ pub(super) async fn run_online_fetch_phase(
     let mut fetch_stage_timings = FetchStageTimings::default();
     let v2_link_task_timings = V2LinkTaskTimings::default();
     let workspace_coordinator = workspace_materialization::current();
+    let v2_streaming_lane = workspace_coordinator.as_ref().map_or_else(
+        || Arc::new(V2StreamingLane::default()),
+        |coordinator| coordinator.v2_streaming_lane(),
+    );
     if !force
         && let (Some(coordinator), Some(store_v2)) =
             (workspace_coordinator.as_ref(), store_v2_handle.as_ref())
@@ -1670,6 +1925,14 @@ pub(super) async fn run_online_fetch_phase(
 
     let downloaded = to_download.len();
     super::resolve::prioritize_fetch_schedule(&mut to_download);
+    let v2_streaming_candidate_key = (streaming_fetch && !force)
+        .then_some(store_v2_handle.as_deref())
+        .flatten()
+        .filter(|store_v2| store_v2.supports_streamed_object_ingest())
+        .and_then(|_| super::resolve::v2_streaming_candidate_key(&to_download));
+    if let Some(candidate_key) = v2_streaming_candidate_key.as_deref() {
+        super::resolve::promote_fetch_candidate(&mut to_download, candidate_key);
+    }
     //: accumulate per-task timings across the parallel pool so we
     // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
     // breakdown on the cached-everything path; filled in below when work runs.
@@ -1693,6 +1956,9 @@ pub(super) async fn run_online_fetch_phase(
         let mut handles = Vec::new();
 
         for p in to_download {
+            let is_v2_streaming_candidate = v2_streaming_candidate_key
+                .as_deref()
+                .is_some_and(|selected| selected == install_pkg_key(&p));
             let sem = semaphore.clone();
             let client = arc_client.clone();
             let store_ref = store.clone();
@@ -1736,6 +2002,7 @@ pub(super) async fn run_online_fetch_phase(
             let source_index_for_pkg = Arc::clone(&source_index);
             let trace_slow_packages = timing_detail_mode.trace();
             let fetch_extract_limiter_c = fetch_extract_limiter.clone();
+            let v2_streaming_lane_c = Arc::clone(&v2_streaming_lane);
 
             handles.push(tokio::spawn(async move {
                 // v2-shaped link handle. Mutually exclusive with `LinkHandle`
@@ -1769,7 +2036,7 @@ pub(super) async fn run_online_fetch_phase(
                 // a permit. On wake, `has_package` is true and we skip the
                 // real fetch entirely (zero bandwidth, zero CPU).
                 let key_lock = coord.lock_for(package_key.clone()).await;
-                let _key_guard = key_lock.lock().await;
+                let mut key_guard = Some(key_lock.lock_owned().await);
 
                 // Spawn the per-pkg link task once the tarball is in the
                 // store. Used in both the sibling-skip path and the normal
@@ -1987,6 +2254,12 @@ pub(super) async fn run_online_fetch_phase(
                         permit,
                         &fetch_extract_limiter_c,
                         install_accounting,
+                        if is_v2_streaming_candidate {
+                            V2StreamingEligibility::CriticalCandidate(v2_streaming_lane_c.as_ref())
+                        } else {
+                            V2StreamingEligibility::Disabled
+                        },
+                        key_guard.take(),
                     )
                     .await?
                 } else {
@@ -2277,6 +2550,241 @@ mod tests {
     #[test]
     fn fetch_extract_permits_stay_unbounded_for_v1_installs() {
         assert_eq!(default_fetch_extract_permits(false), None);
+    }
+
+    #[test]
+    fn v2_streaming_extract_weight_is_three_only_for_large_objects_by_default() {
+        assert_eq!(configured_v2_streaming_extract_weight(None, None), 1);
+        assert_eq!(
+            configured_v2_streaming_extract_weight(
+                None,
+                std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES - 1)
+            ),
+            1
+        );
+        assert_eq!(
+            configured_v2_streaming_extract_weight(
+                None,
+                std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES)
+            ),
+            3
+        );
+        assert_eq!(
+            configured_v2_streaming_extract_weight(None, std::num::NonZeroU64::new(u64::MAX)),
+            3
+        );
+    }
+
+    #[test]
+    fn explicit_v2_streaming_extract_weight_is_bounded() {
+        let large = std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES);
+        assert_eq!(configured_v2_streaming_extract_weight(Some("1"), large), 1);
+        assert_eq!(configured_v2_streaming_extract_weight(Some("3"), large), 3);
+        assert_eq!(configured_v2_streaming_extract_weight(Some("0"), large), 3);
+        assert_eq!(configured_v2_streaming_extract_weight(Some("5"), large), 3);
+    }
+
+    #[tokio::test]
+    async fn weighted_extract_admission_reserves_requested_capacity() {
+        let limiter = Some(fetch_extract_limiter_with_permits(4));
+        let permit = acquire_fetch_extract_permits(&limiter, 2).await.unwrap();
+
+        assert_eq!(limiter.as_ref().unwrap().semaphore.available_permits(), 2);
+        drop(permit);
+        assert_eq!(limiter.as_ref().unwrap().semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn weighted_extract_admission_clamps_to_single_permit_capacity() {
+        let limiter = Some(fetch_extract_limiter_with_permits(1));
+        let permit = acquire_fetch_extract_permits(&limiter, 2).await.unwrap();
+
+        assert_eq!(limiter.as_ref().unwrap().semaphore.available_permits(), 0);
+        drop(permit);
+        assert_eq!(limiter.as_ref().unwrap().semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_admission_never_waits_for_supplemental_capacity() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let held = semaphore.clone().acquire_many_owned(2).await.unwrap();
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&semaphore),
+            4,
+        ));
+
+        let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(admission.requested_weight, 3);
+        assert_eq!(admission.acquired_weight, 2);
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(admission);
+        assert_eq!(semaphore.available_permits(), 2);
+        drop(held);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_admission_accounts_exact_capacity_at_one_two_and_four_permits() {
+        for (capacity, expected_weight) in [(1, 1), (2, 2), (4, 3)] {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(capacity));
+            let limiter = Some(fetch_extract_limiter_with_semaphore(
+                Arc::clone(&semaphore),
+                capacity,
+            ));
+
+            let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+                .await
+                .unwrap();
+
+            assert_eq!(admission.requested_weight, 3);
+            assert_eq!(admission.acquired_weight, expected_weight);
+            assert_eq!(semaphore.available_permits(), capacity - expected_weight);
+            drop(admission);
+            assert_eq!(semaphore.available_permits(), capacity);
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_supplemental_permits_release_at_lease_deadline() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&semaphore),
+            4,
+        ));
+        let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+            .await
+            .unwrap();
+        let base_permit = admission.base_permit;
+        let release_task = Arc::new(tokio::sync::Notify::new());
+        let release_task_c = Arc::clone(&release_task);
+        let task = tokio::spawn(async move { release_task_c.notified().await });
+        let leased = tokio::spawn(await_v2_streaming_extract_task(
+            task,
+            admission.supplemental_permit,
+            std::time::Duration::from_millis(20),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(semaphore.available_permits(), 3);
+        release_task.notify_one();
+        let (_, expired, hold_ms) = leased.await.unwrap();
+        assert!(expired);
+        assert!(hold_ms >= 20);
+        drop(base_permit);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn fast_streaming_task_releases_supplemental_permits_immediately() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&semaphore),
+            4,
+        ));
+        let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+            .await
+            .unwrap();
+        let base_permit = admission.base_permit;
+        let task = tokio::spawn(async { 7 });
+
+        let (result, expired, _) = await_v2_streaming_extract_task(
+            task,
+            admission.supplemental_permit,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 7);
+        assert!(!expired);
+        assert_eq!(semaphore.available_permits(), 3);
+        drop(base_permit);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn panicking_streaming_task_releases_supplemental_capacity() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&semaphore),
+            4,
+        ));
+        let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+            .await
+            .unwrap();
+        let base_permit = admission.base_permit;
+        let task = tokio::spawn(async { panic!("streaming task panic fixture") });
+
+        let (result, expired, _) = await_v2_streaming_extract_task(
+            task,
+            admission.supplemental_permit,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(result.unwrap_err().is_panic());
+        assert!(!expired);
+        assert_eq!(semaphore.available_permits(), 3);
+        drop(base_permit);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn streaming_supplemental_lease_starts_when_capacity_is_acquired() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&semaphore),
+            4,
+        ));
+        let admission = acquire_v2_streaming_extract_admission(&limiter, 3)
+            .await
+            .unwrap();
+        let release_task = Arc::new(tokio::sync::Notify::new());
+        let release_task_c = Arc::clone(&release_task);
+        let task = tokio::spawn(async move { release_task_c.notified().await });
+        let lease = std::time::Duration::from_millis(20);
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let leased = tokio::spawn(await_v2_streaming_extract_task(
+            task,
+            admission.supplemental_permit,
+            lease,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(semaphore.available_permits(), 3);
+        release_task.notify_one();
+        let (_, expired, hold_ms) = leased.await.unwrap();
+
+        assert!(expired);
+        assert!(hold_ms >= 40);
+        drop(admission.base_permit);
+        assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn stream_body_wall_includes_pauses_between_consumer_reads() {
+        use std::io::Read as _;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut reader = StreamBodyPermitReader::new(
+            std::io::Cursor::new(vec![1_u8, 2]),
+            permit,
+            Arc::clone(&elapsed_ms),
+        );
+        let mut first = [0_u8; 1];
+        reader.read_exact(&mut first).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+
+        assert_eq!(first, [1]);
+        assert_eq!(rest, [2]);
+        assert!(elapsed_ms.load(std::sync::atomic::Ordering::Relaxed) >= 20);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 
     #[test]
@@ -3189,6 +3697,130 @@ pub(super) fn artifact_unavailable_error(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn store_downloaded_registry_tarball(
+    downloaded: lpm_registry::DownloadedTarball,
+    store: &PackageStore,
+    store_v2: Option<&lpm_store::v2::Store>,
+    p: &InstallPackage,
+    queue_wait_ms: u128,
+    url_lookup_ms: u128,
+    download_headers_ms: u128,
+    download_ms: u128,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    fetch_extract_limiter: &FetchExtractLimiter,
+    final_url: String,
+) -> Result<
+    (
+        String,
+        TaskTimings,
+        String,
+        Option<lpm_store::v2::ExtractedObject>,
+    ),
+    LpmError,
+> {
+    drop(permit);
+    let extract_permit_wait_start = std::time::Instant::now();
+    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
+    let integrity = p.integrity.clone();
+    let name = p.name.clone();
+    let version = p.version.clone();
+    let store = store.clone();
+    let store_v2 = store_v2.cloned();
+    let ((stage, fresh_object, result_sri), integrity_ms) =
+        tokio::task::spawn_blocking(move || {
+            let computed_sri = downloaded.sri.clone();
+            if let Some(store_v2) = store_v2 {
+                let (object, sri, timings, integrity_ms) = store_v2
+                    .extract_object_from_file_with_fresh_integrity_timed(
+                        downloaded.file.path(),
+                        &downloaded.sha512_sri,
+                        integrity.as_deref(),
+                    )?;
+                return Ok(((timings, Some(object), sri), integrity_ms));
+            }
+
+            let integrity_start = std::time::Instant::now();
+            if let Some(ref integrity) = integrity {
+                if computed_sri != *integrity
+                    && let Err(error) =
+                        lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
+                {
+                    return Err(LpmError::Registry(format!(
+                        "integrity verification failed for {name}@{version}: {error}"
+                    )));
+                }
+            } else {
+                tracing::warn!("no integrity hash for {name}@{version} — skipping verification");
+            }
+            let integrity_ms = integrity_start.elapsed().as_millis();
+            let (_, stage) = store.store_package_from_file_timed(
+                &name,
+                &version,
+                downloaded.file.path(),
+                &computed_sri,
+            )?;
+            Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
+        })
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("file-backed extract task panicked: {error}"))
+        })??;
+
+    let mut timings = TaskTimings::from_stage(
+        queue_wait_ms,
+        url_lookup_ms,
+        download_ms,
+        integrity_ms,
+        extract_permit_wait_ms,
+        stage,
+    );
+    timings.download_headers_ms = download_headers_ms;
+    Ok((result_sri, timings, final_url, fresh_object))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spool_open_registry_response_and_store(
+    client: &RegistryClient,
+    response: reqwest::Response,
+    store: &PackageStore,
+    store_v2: Option<&lpm_store::v2::Store>,
+    p: &InstallPackage,
+    queue_wait_ms: u128,
+    url_lookup_ms: u128,
+    download_headers_ms: u128,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    fetch_extract_limiter: &FetchExtractLimiter,
+    final_url: String,
+) -> Result<
+    (
+        String,
+        TaskTimings,
+        String,
+        Option<lpm_store::v2::ExtractedObject>,
+    ),
+    LpmError,
+> {
+    let download_start = std::time::Instant::now();
+    let downloaded = client.spool_tarball_response_to_file(response).await?;
+    let download_ms = download_start.elapsed().as_millis();
+    store_downloaded_registry_tarball(
+        downloaded,
+        store,
+        store_v2,
+        p,
+        queue_wait_ms,
+        url_lookup_ms,
+        download_headers_ms,
+        download_ms,
+        permit,
+        fetch_extract_limiter,
+        final_url,
+    )
+    .await
+}
+
 /// Legacy fetch path — download to temp file, reopen, extract. Returns
 /// `(computed_sri, TaskTimings)`. Called from the per-task closure under
 /// a held download semaphore permit. Kept as the default while the
@@ -3350,73 +3982,20 @@ pub(super) async fn fetch_and_store_legacy(
     // accumulated into `url_lookup_ms` above.
     let download_ms = download_start.elapsed().as_millis();
 
-    // Drop the permit now that bytes are on disk.
-    // Integrity verification + extract that follow are CPU+I/O bound
-    // and don't need the download throttle; sibling downloads can
-    // proceed while this task finishes its post-download work.
-    drop(permit);
-
-    let extract_permit_wait_start = std::time::Instant::now();
-    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
-    let integrity = p.integrity.clone();
-    let name = p.name.clone();
-    let version = p.version.clone();
-    let store = store.clone();
-    let store_v2 = store_v2.cloned();
-    let ((stage, fresh_object, result_sri), integrity_ms) =
-        tokio::task::spawn_blocking(move || {
-            let computed_sri = downloaded.sri.clone();
-            if let Some(store_v2) = store_v2 {
-                let (object, sri, timings, integrity_ms) = store_v2
-                    .extract_object_from_file_with_fresh_integrity_timed(
-                        downloaded.file.path(),
-                        &downloaded.sha512_sri,
-                        integrity.as_deref(),
-                    )?;
-                return Ok(((timings, Some(object), sri), integrity_ms));
-            }
-
-            let integrity_start = std::time::Instant::now();
-            if let Some(ref integrity) = integrity {
-                if computed_sri != *integrity
-                    && let Err(error) =
-                        lpm_extractor::verify_integrity_file(downloaded.file.path(), integrity)
-                {
-                    return Err(LpmError::Registry(format!(
-                        "integrity verification failed for {name}@{version}: {error}"
-                    )));
-                }
-            } else {
-                tracing::warn!("no integrity hash for {name}@{version} — skipping verification");
-            }
-            let integrity_ms = integrity_start.elapsed().as_millis();
-            let (_, stage) = store.store_package_from_file_timed(
-                &name,
-                &version,
-                downloaded.file.path(),
-                &computed_sri,
-            )?;
-            Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
-        })
-        .await
-        .map_err(|error| {
-            LpmError::Registry(format!("file-backed extract task panicked: {error}"))
-        })??;
-
-    Ok((
-        result_sri,
-        TaskTimings::from_stage(
-            queue_wait_ms,
-            url_lookup_ms,
-            download_ms,
-            integrity_ms,
-            extract_permit_wait_ms,
-            stage,
-        ),
+    store_downloaded_registry_tarball(
+        downloaded,
+        store,
+        store_v2,
+        p,
+        queue_wait_ms,
+        url_lookup_ms,
+        0,
+        download_ms,
+        permit,
+        fetch_extract_limiter,
         final_url,
-        fresh_object,
-    ))
+    )
+    .await
 }
 
 /// fetch + store path for
@@ -3533,17 +4112,13 @@ pub(super) async fn fetch_and_store_tarball_url(
     Ok((result_sri, timings, url.to_string(), fresh_object))
 }
 
-/// V1 streaming fetch path — bytes flow from reqwest directly into the
-/// store's extractor via `StreamReader` + `SyncIoBridge`. V2 uses the
-/// file-backed path so completed downloads cannot retain compressed bodies
-/// while waiting for a bounded extraction slot.
+/// Streaming fetch path. V1 can consume a buffered response body; one bounded
+/// V2 critical candidate flows directly from reqwest into the object extractor
+/// through `StreamReader` + `SyncIoBridge`. Other V2 fetches use the file spool.
 ///
-/// Because download + decode + extract + hash happen in one interleaved
-/// pipeline, `download_ms` and `integrity_ms` collapse into
-/// `extract_ms` — the breakdown stays shape-compatible with the legacy
-/// path but pushes mass into one bucket. That's the whole point of:
-/// eliminate the temp-file hop that today forces sequential download →
-/// reopen → extract.
+/// Download, decode, extraction, and hashing overlap in this path. Timings
+/// expose the whole pipeline and response-body consumption wall times without
+/// adding either overlapping measurement to the per-task stage sum.
 #[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
 pub(super) async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
@@ -3560,6 +4135,8 @@ pub(super) async fn fetch_and_store_streaming(
     permit: tokio::sync::OwnedSemaphorePermit,
     fetch_extract_limiter: &FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
+    v2_streaming_eligibility: V2StreamingEligibility<'_>,
+    key_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<
     (
         String,
@@ -3569,22 +4146,30 @@ pub(super) async fn fetch_and_store_streaming(
     ),
     LpmError,
 > {
-    if store_v2.is_some() {
-        return fetch_and_store_legacy(
-            client,
-            route_table,
-            store,
-            store_v2,
-            p,
-            queue_wait_ms,
-            artifact_selection,
-            gate_stats,
-            permit,
-            fetch_extract_limiter,
-            install_accounting,
-        )
-        .await;
-    }
+    let v2_streaming_lane = match (store_v2, v2_streaming_eligibility) {
+        (Some(store_v2), V2StreamingEligibility::CriticalCandidate(lane))
+            if store_v2.supports_streamed_object_ingest() =>
+        {
+            Some(lane)
+        }
+        (Some(store_v2), _) => {
+            return fetch_and_store_legacy(
+                client,
+                route_table,
+                store,
+                Some(store_v2),
+                p,
+                queue_wait_ms,
+                artifact_selection,
+                gate_stats,
+                permit,
+                fetch_extract_limiter,
+                install_accounting,
+            )
+            .await;
+        }
+        (None, _) => None,
+    };
 
     use std::sync::atomic::Ordering;
 
@@ -3618,15 +4203,18 @@ pub(super) async fn fetch_and_store_streaming(
     let initial_url = initial_resolution.url.clone();
     let mut final_url = initial_url.clone();
 
-    let response = match client
+    let mut download_headers_ms = 0;
+    let initial_headers_start = std::time::Instant::now();
+    let initial_response = client
         .download_tarball_streaming_routed_managed(
             route_table,
             &p.name,
             &initial_url,
             install_accounting,
         )
-        .await
-    {
+        .await;
+    download_headers_ms += initial_headers_start.elapsed().as_millis();
+    let response = match initial_response {
         Ok(r) => r,
         Err(LpmError::NotFound(_)) if p.tarball_url.is_some() && p.integrity.is_some() => {
             // Stored URL stale — retry ONCE with fresh metadata.
@@ -3669,15 +4257,17 @@ pub(super) async fn fetch_and_store_streaming(
                     artifact_selection,
                 ));
             }
-            match client
+            let retry_headers_start = std::time::Instant::now();
+            let retry_response = client
                 .download_tarball_streaming_routed_managed(
                     route_table,
                     &p.name,
                     &fresh_url,
                     install_accounting,
                 )
-                .await
-            {
+                .await;
+            download_headers_ms += retry_headers_start.elapsed().as_millis();
+            match retry_response {
                 Ok(r) => {
                     gate_stats.stale_recovery.fetch_add(1, Ordering::Relaxed);
                     final_url = fresh_url;
@@ -3705,6 +4295,118 @@ pub(super) async fn fetch_and_store_streaming(
         }
         Err(e) => return Err(e),
     };
+
+    if let Some(store_v2) = store_v2 {
+        use futures::StreamExt;
+        use tokio_util::io::{StreamReader, SyncIoBridge};
+
+        let lane = v2_streaming_lane
+            .expect("V2 streamed-object ingest requires an explicit critical lane");
+        if !lane.try_claim() {
+            return spool_open_registry_response_and_store(
+                client,
+                response,
+                store,
+                Some(store_v2),
+                p,
+                queue_wait_ms,
+                url_lookup_ms,
+                download_headers_ms,
+                permit,
+                fetch_extract_limiter,
+                final_url,
+            )
+            .await;
+        }
+        let admission = acquire_v2_streaming_extract_admission(
+            fetch_extract_limiter,
+            v2_streaming_extract_weight(p.unpacked_size),
+        )
+        .await?;
+        let V2StreamingExtractAdmission {
+            base_permit,
+            mut supplemental_permit,
+            requested_weight,
+            acquired_weight,
+            wait_ms: extract_permit_wait_ms,
+        } = admission;
+
+        let pipeline_start = std::time::Instant::now();
+        let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancellation_guard = cancellation.clone().drop_guard();
+        let response_stream = Box::pin(response.bytes_stream());
+        let cancellable_stream = futures::stream::unfold(
+            (response_stream, cancellation, false),
+            |(mut stream, cancellation, finished)| async move {
+                if finished {
+                    return None;
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Some((
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "streamed tarball download cancelled",
+                        )),
+                        (stream, cancellation, true),
+                    )),
+                    chunk = stream.next() => chunk.map(|chunk| (
+                        chunk.map_err(std::io::Error::other),
+                        (stream, cancellation, false),
+                    )),
+                }
+            },
+        );
+        let async_reader = StreamReader::new(Box::pin(cancellable_stream));
+        let store_v2 = store_v2.clone();
+        let expected_integrity = p.integrity.clone();
+        let download_elapsed_for_reader = Arc::clone(&download_elapsed_ms);
+        let joined = tokio::task::spawn_blocking(move || {
+            let _key_guard = key_guard;
+            let _extract_permit = base_permit;
+            let sync_reader = SyncIoBridge::new(async_reader);
+            let reader =
+                StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
+            store_v2.extract_object_from_stream(
+                reader,
+                expected_integrity.as_deref(),
+                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+            )
+        });
+        let (joined, supplemental_lease_expired, supplemental_hold_ms) =
+            await_v2_streaming_extract_task(
+                joined,
+                supplemental_permit.take(),
+                V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE,
+            )
+            .await;
+        let joined = joined.map_err(|error| {
+            LpmError::Registry(format!("streaming object extract task panicked: {error}"))
+        });
+        let _ = cancellation_guard.disarm();
+        let (object, computed_sri, stage) = joined??;
+        let pipeline_wall_ms = pipeline_start.elapsed().as_millis();
+        let stream_body_wall_ms =
+            u128::from(download_elapsed_ms.load(std::sync::atomic::Ordering::Relaxed));
+        let timings = TaskTimings::from_stage(
+            queue_wait_ms,
+            url_lookup_ms,
+            0,
+            0,
+            extract_permit_wait_ms,
+            stage,
+        )
+        .with_streaming_pipeline(download_headers_ms, stream_body_wall_ms, pipeline_wall_ms)
+        .with_streaming_admission(
+            u64::try_from(requested_weight).unwrap_or(u64::MAX),
+            u64::try_from(acquired_weight).unwrap_or(u64::MAX),
+            p.unpacked_size,
+            supplemental_hold_ms,
+            supplemental_lease_expired,
+        );
+        return Ok((computed_sri, timings, final_url, Some(object)));
+    }
 
     // Collect the compressed body, then acquire an extraction slot before
     // handing the download slot to the next request. This keeps downloaded
@@ -3747,19 +4449,16 @@ pub(super) async fn fetch_and_store_streaming(
     // excludes join overhead.
     let _ = pipeline_ms;
 
-    Ok((
-        computed_sri,
-        TaskTimings::from_stage(
-            queue_wait_ms,
-            url_lookup_ms,
-            download_ms,
-            0,
-            extract_permit_wait_ms,
-            stage,
-        ),
-        final_url,
-        None,
-    ))
+    let mut timings = TaskTimings::from_stage(
+        queue_wait_ms,
+        url_lookup_ms,
+        download_ms,
+        0,
+        extract_permit_wait_ms,
+        stage,
+    );
+    timings.download_headers_ms = download_headers_ms;
+    Ok((computed_sri, timings, final_url, None))
 }
 
 pub(super) async fn read_buffered_tarball_body(

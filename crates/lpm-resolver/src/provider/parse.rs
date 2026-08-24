@@ -188,6 +188,7 @@ fn project_borrowed_version(
             integrity: metadata
                 .integrity_or_shasum()
                 .map(std::borrow::Cow::into_owned),
+            unpacked_size: metadata.dist.as_ref().and_then(|dist| dist.unpacked_size),
             signatures: metadata
                 .dist
                 .as_ref()
@@ -217,11 +218,16 @@ fn project_owned_version(
         dist,
         ..
     } = metadata;
-    let (tarball_url, integrity, signatures) = dist.map_or_else(
-        || (None, None, Vec::new()),
+    let (tarball_url, integrity, unpacked_size, signatures) = dist.map_or_else(
+        || (None, None, None, Vec::new()),
         |mut dist| {
             let integrity = dist.take_integrity_or_shasum();
-            (dist.tarball, integrity, dist.signatures.unwrap_or_default())
+            (
+                dist.tarball,
+                integrity,
+                dist.unpacked_size,
+                dist.signatures.unwrap_or_default(),
+            )
         },
     );
     ProjectedVersion {
@@ -238,6 +244,7 @@ fn project_owned_version(
         dist: CachedDistInfo {
             tarball_url,
             integrity,
+            unpacked_size,
             signatures,
             trust_evidence,
             ..CachedDistInfo::default()

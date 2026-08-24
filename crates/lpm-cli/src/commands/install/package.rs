@@ -78,6 +78,7 @@ fn merge_install_package(dst: &mut InstallPackage, mut src: InstallPackage) {
     if dst.integrity.is_none() {
         dst.integrity = src.integrity;
     }
+    dst.unpacked_size = dst.unpacked_size.max(src.unpacked_size);
     match (&dst.manifest_fingerprint, src.manifest_fingerprint) {
         (None, fingerprint) => dst.manifest_fingerprint = fingerprint,
         (Some(left), Some(right)) => debug_assert_eq!(left, &right),
@@ -364,6 +365,8 @@ pub(super) struct InstallPackage {
     pub(super) peer_targets: HashMap<String, lpm_common::PackageInstanceId>,
     /// SRI integrity hash for verification (e.g. "sha512-...")
     pub(super) integrity: Option<String>,
+    /// Registry-reported unpacked byte count, used only for fetch scheduling.
+    pub(super) unpacked_size: Option<std::num::NonZeroU64>,
     /// Registry package-signature payload from `dist.signatures`.
     pub(super) registry_signatures: Vec<lpm_registry::RegistrySignature>,
     /// Registry publish timestamp for the selected version, used when

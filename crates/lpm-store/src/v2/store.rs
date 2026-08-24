@@ -45,6 +45,7 @@ use super::tree_hash::{
     ObjectTreeStats, StreamedTreeBuilder, TreeContentSchema, TreeIntegrities,
     compute_object_tree_integrities, compute_tree_metadata_integrity,
 };
+use crate::extraction::{HashingReader, SizeLimitedReader, StreamingIntegrityReader};
 use crate::v2::graph_key::GraphKey;
 use crate::v2::link_meta::{
     LINK_META_FILENAME, LinkMeta, LinkMetaDep, LinkMetaPlatform, validate_name_for_path_join,
@@ -94,6 +95,32 @@ struct FileCasFinishContext<'a> {
 enum TarballInput<'a> {
     Bytes(&'a [u8]),
     File(std::io::BufReader<std::fs::File>),
+    Streaming {
+        reader: &'a mut dyn StreamingIntegrityReader,
+        expected_integrity: Option<&'a str>,
+    },
+}
+
+struct RemoveStagingOnDrop(PathBuf);
+
+impl Drop for RemoveStagingOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct StreamStagingGuard {
+    path: PathBuf,
+    lock_path: PathBuf,
+    lock: Option<lpm_common::SingleFileExclusiveLockHandle>,
+}
+
+impl Drop for StreamStagingGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+        drop(self.lock.take());
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
 }
 
 /// Subdirectory holding per-build-key advisory lock files.
@@ -101,6 +128,10 @@ const BUILD_LOCKS_DIR: &str = "build-locks";
 
 /// Subdirectory holding per-graph-entry advisory lock files.
 const BUILD_ENTRY_LOCKS_DIR: &str = "build-entry-locks";
+
+const STREAM_STAGING_PREFIX: &str = ".stream.tmp.";
+const STREAM_STAGING_LOCKS_DIR: &str = "stream-staging-locks";
+const STREAM_STAGING_CLEANUP_LOCK: &str = "cleanup.lock";
 
 /// Schema tag folded into [`compat_island_key`] so a change to the island's
 /// on-disk layout invalidates every cached island instead of silently
@@ -686,6 +717,11 @@ impl Store {
         }
     }
 
+    #[inline]
+    pub fn supports_streamed_object_ingest(&self) -> bool {
+        self.file_cas.is_none()
+    }
+
     #[cfg(test)]
     fn with_object_publish_barriers(
         mut self,
@@ -1174,86 +1210,205 @@ impl Store {
         policy: ObjectIntegrityPolicy,
     ) -> Result<(ExtractedObject, StageTimings), LpmError> {
         let object_dir = self.paths.object_dir(sri)?;
-        let mut timings = StageTimings::default();
+        if let Some(object) = self.reusable_object_for_extraction(&object_dir, sri, policy)? {
+            return Ok((object, StageTimings::default()));
+        }
 
+        let tmp_dir = self.create_object_staging_dir(&object_dir)?;
+        let _cleanup = RemoveStagingOnDrop(tmp_dir.clone());
+        let (streamed_integrities, prepared_cas, timings, _) =
+            self.extract_input_into_staging(tarball_input, &tmp_dir, Some((&object_dir, sri)))?;
+        self.publish_staged_object(
+            &tmp_dir,
+            object_dir,
+            sri,
+            policy,
+            streamed_integrities,
+            prepared_cas,
+            timings,
+        )
+    }
+
+    fn reusable_object_for_extraction(
+        &self,
+        object_dir: &Path,
+        sri: &str,
+        policy: ObjectIntegrityPolicy,
+    ) -> Result<Option<ExtractedObject>, LpmError> {
         if !object_dir.exists() {
             self.try_migrate_prior_virtual_object(sri, policy)?;
         }
-
-        // Mirrors v1's `store_at_dir` recovery: a leftover `objects/<sri>/`
-        // from a crashed extract (no `.integrity`, no `package.json`) is
-        // NOT a hit — remove it and re-extract. Without this, a partial
-        // crash leaves the install pipeline returning success on a
-        // half-populated object dir and downstream link entries inherit
-        // the corruption.
-        if object_dir.exists()
-            && let Some(mut object_integrity) =
-                object_integrity_or_remove(&object_dir, "before re-extract", sri, policy)?
-        {
-            let reusable = match self.finish_file_cas_source(
-                &object_dir,
-                sri,
-                has_local_source_sentinel(&object_dir),
-                None,
-                policy,
-            )? {
-                FileCasSourceFinish::Ready(Some(refreshed)) => {
-                    object_integrity = refreshed;
-                    true
-                }
-                FileCasSourceFinish::Ready(None) => true,
-                FileCasSourceFinish::Unusable => false,
-            };
-            if reusable {
-                self.backfill_security_cache_if_enabled(&object_dir, sri);
-                tracing::debug!(
-                    target = %object_dir.display(),
-                    "virtual store: object hit"
-                );
-                return Ok((
-                    ExtractedObject {
-                        path: object_dir,
-                        source_sri: sri.to_string(),
-                        object_integrity: FreshObjectIntegrity::new(object_integrity),
-                    },
-                    timings,
-                ));
-            }
+        if !object_dir.exists() {
+            return Ok(None);
         }
 
-        if let Some(parent) = object_dir.parent() {
-            ensure_store_tier_dir_locked(parent).map_err(|e| {
-                LpmError::Store(format!("failed to create virtual-store objects dir: {e}"))
+        let Some(mut object_integrity) =
+            object_integrity_or_remove(object_dir, "before re-extract", sri, policy)?
+        else {
+            return Ok(None);
+        };
+        let reusable = match self.finish_file_cas_source(
+            object_dir,
+            sri,
+            has_local_source_sentinel(object_dir),
+            None,
+            policy,
+        )? {
+            FileCasSourceFinish::Ready(Some(refreshed)) => {
+                object_integrity = refreshed;
+                true
+            }
+            FileCasSourceFinish::Ready(None) => true,
+            FileCasSourceFinish::Unusable => false,
+        };
+        if !reusable {
+            return Ok(None);
+        }
+
+        self.backfill_security_cache_if_enabled(object_dir, sri);
+        tracing::debug!(target = %object_dir.display(), "virtual store: object hit");
+        Ok(Some(ExtractedObject {
+            path: object_dir.to_path_buf(),
+            source_sri: sri.to_string(),
+            object_integrity: FreshObjectIntegrity::new(object_integrity),
+        }))
+    }
+
+    fn create_object_staging_dir(&self, anchor: &Path) -> Result<PathBuf, LpmError> {
+        if let Some(parent) = anchor.parent() {
+            ensure_store_tier_dir_locked(parent).map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to create virtual-store objects dir: {error}"
+                ))
             })?;
         }
-
-        let tmp_dir = tmp_sibling(&object_dir);
-        if tmp_dir.exists() {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        }
-        create_tmp_dir_locked(&tmp_dir).map_err(|e| {
+        let tmp_dir = tmp_sibling(anchor);
+        create_tmp_dir_locked(&tmp_dir).map_err(|error| {
             LpmError::Store(format!(
-                "failed to create virtual-store tmp staging dir: {e}"
+                "failed to create virtual-store tmp staging dir: {error}"
             ))
         })?;
+        Ok(tmp_dir)
+    }
 
-        // Fused extract + behavioral scan in a single pass: small source
-        // entries are buffered and fed directly into the analyzer, while
-        // oversized source entries stream to disk first and then get a
-        // bounded head/tail sample. The post-extract `finalize` only reads
-        // `package.json` for manifest-level tags.
-        //
-        // `RefCell` wraps the analyzer so the `FnMut` closure can mutate
-        // it without exclusive borrows escaping the call site.
+    fn create_stream_object_staging_dir(&self) -> Result<StreamStagingGuard, LpmError> {
+        let objects_root = self.paths.objects_root();
+        ensure_store_tier_dir_locked(&objects_root).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to create virtual-store objects dir: {error}"
+            ))
+        })?;
+        let locks_root = self.paths.root().join(STREAM_STAGING_LOCKS_DIR);
+        ensure_store_tier_dir_locked(&locks_root).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to create streamed-object staging locks dir: {error}"
+            ))
+        })?;
+        let _cleanup_lock = lpm_common::acquire_single_file_exclusive_lock(
+            locks_root.join(STREAM_STAGING_CLEANUP_LOCK),
+        )?;
+
+        for entry in std::fs::read_dir(&objects_root).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to scan streamed-object staging dirs: {error}"
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to inspect streamed-object staging dir: {error}"
+                ))
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with(STREAM_STAGING_PREFIX)
+                || !entry
+                    .file_type()
+                    .map_err(|error| {
+                        LpmError::Store(format!(
+                            "failed to inspect streamed-object staging type: {error}"
+                        ))
+                    })?
+                    .is_dir()
+            {
+                continue;
+            }
+            let lock_path = locks_root.join(format!("{name}.lock"));
+            let lock_file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to open streamed-object staging lock: {error}"
+                    ))
+                })?;
+            let Some(lock) =
+                lpm_common::try_acquire_single_file_exclusive_lock_from_file(lock_file)?
+            else {
+                continue;
+            };
+            std::fs::remove_dir_all(entry.path()).map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to remove stale streamed-object staging dir: {error}"
+                ))
+            })?;
+            drop(lock);
+            let _ = std::fs::remove_file(lock_path);
+        }
+
+        let staging_anchor = objects_root.join(".stream");
+        let path = self.create_object_staging_dir(&staging_anchor)?;
+        let name = path.file_name().ok_or_else(|| {
+            LpmError::Store("streamed-object staging path has no file name".into())
+        })?;
+        let lock_path = locks_root.join(format!("{}.lock", name.to_string_lossy()));
+        let lock = match lpm_common::acquire_single_file_exclusive_lock(&lock_path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&path);
+                return Err(error);
+            }
+        };
+        Ok(StreamStagingGuard {
+            path,
+            lock_path,
+            lock: Some(lock),
+        })
+    }
+
+    fn extract_input_into_staging(
+        &self,
+        mut tarball_input: TarballInput<'_>,
+        tmp_dir: &Path,
+        registry_identity: Option<(&Path, &str)>,
+    ) -> Result<
+        (
+            TreeIntegrities,
+            Option<PreparedSourceRecord>,
+            StageTimings,
+            Option<String>,
+        ),
+        LpmError,
+    > {
+        let mut timings = StageTimings::default();
         let extract_start = std::time::Instant::now();
         let source_analysis_enabled = self.security_analysis_policy.is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
-        let registry_cas_ingest = self
-            .file_cas
-            .as_ref()
-            .map(|cas| cas.begin_registry_ingest(&object_dir, sri))
-            .transpose()?
-            .map(std::cell::RefCell::new);
+        let registry_cas_ingest = match (self.file_cas.as_ref(), registry_identity) {
+            (Some(cas), Some((object_dir, sri))) => Some(std::cell::RefCell::new(
+                cas.begin_registry_ingest(object_dir, sri)?,
+            )),
+            (Some(_), None) => {
+                return Err(LpmError::Store(
+                    "streamed object ingest is unavailable for the v3 file CAS".into(),
+                ));
+            }
+            (None, _) => None,
+        };
         let inspection_error = std::cell::RefCell::new(None);
         let inspect_entry = |entry: lpm_extractor::EntryInfo<'_>| {
             if inspection_error.borrow().is_none()
@@ -1271,7 +1426,7 @@ impl Store {
                     .and_then(|digest| {
                         cas.ingest_registry_file(
                             &mut ingest.borrow_mut(),
-                            &tmp_dir,
+                            tmp_dir,
                             entry.relative_path,
                             entry.size,
                             digest,
@@ -1298,33 +1453,47 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let extract_result = match tarball_input {
+        let extract_result = match &mut tarball_input {
             TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
                 bytes,
-                &tmp_dir,
+                tmp_dir,
                 buffer_predicate,
                 inspect_entry,
             ),
             TarballInput::File(reader) => {
                 lpm_extractor::extract_tarball_from_reader_hybrid_with_entry_digests(
                     reader,
-                    &tmp_dir,
+                    tmp_dir,
+                    buffer_predicate,
+                    inspect_entry,
+                )
+            }
+            TarballInput::Streaming { reader, .. } => {
+                lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                    &mut **reader,
+                    tmp_dir,
                     buffer_predicate,
                     inspect_entry,
                 )
             }
         };
-        let extracted_files = match extract_result {
-            Ok(extracted_files) => extracted_files,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(error);
-            }
-        };
+        let extracted_files = extract_result?;
         if let Some(error) = inspection_error.into_inner() {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(error);
         }
+
+        let computed_sri = match &mut tarball_input {
+            TarballInput::Streaming {
+                reader,
+                expected_integrity,
+            } => {
+                std::io::copy(&mut **reader, &mut std::io::sink()).map_err(LpmError::Io)?;
+                let sha512 = reader.canonical_sha512_sri();
+                Self::verify_streamed_integrity(*expected_integrity, &**reader)?;
+                Some(sha512)
+            }
+            TarballInput::Bytes(_) | TarballInput::File(_) => None,
+        };
         timings.extract_ms = extract_start.elapsed().as_millis();
 
         let finalize_permit_wait_start = std::time::Instant::now();
@@ -1332,31 +1501,21 @@ impl Store {
         timings.finalize_permit_wait_ms = finalize_permit_wait_start.elapsed().as_millis();
         let tree_integrity_start = std::time::Instant::now();
         let streamed_integrities =
-            StreamedTreeBuilder::from_extraction(extracted_files).finish(&tmp_dir);
+            StreamedTreeBuilder::from_extraction(extracted_files).finish(tmp_dir);
         timings.finalize_tree_integrity_ms = tree_integrity_start.elapsed().as_millis();
-        let early_finalize_ms = timings.finalize_tree_integrity_ms;
         drop(finalize_permit);
-        let streamed_integrities = match streamed_integrities {
-            Ok(integrities) => integrities,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(error);
-            }
-        };
+        let streamed_integrities = streamed_integrities?;
 
-        // Manifest-level analysis + cache write. Done BEFORE the atomic
-        // rename so the cache file is part of the atomically-published
-        // state. Analysis failures are non-fatal: warn and continue
-        // (subsequent installs will retry).
         if source_analysis_enabled {
             let security_start = std::time::Instant::now();
             let analyzer = analyzer.into_inner();
             timings.source_scan_ns = analyzer.source_scan_ns();
-            let analysis = analyzer.finalize(&tmp_dir);
-            if let Err(e) = lpm_security::behavioral::write_cached_analysis(&tmp_dir, &analysis) {
+            let analysis = analyzer.finalize(tmp_dir);
+            if let Err(error) = lpm_security::behavioral::write_cached_analysis(tmp_dir, &analysis)
+            {
                 tracing::warn!(
                     target = %tmp_dir.display(),
-                    "virtual store: failed to write .lpm-security.json: {e}"
+                    "virtual store: failed to write .lpm-security.json: {error}"
                 );
             }
             timings.security_ms = security_start.elapsed().as_millis();
@@ -1367,36 +1526,63 @@ impl Store {
                 .file_cas
                 .as_ref()
                 .map(|cas| cas.finish_registry_ingest(ingest.into_inner()))
-                .transpose(),
-            None => Ok(None),
+                .transpose()?,
+            None => None,
         };
-        let prepared_cas = match prepared_cas {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(error);
-            }
-        };
+        Ok((streamed_integrities, prepared_cas, timings, computed_sri))
+    }
 
-        // Persist the SRI alongside the object bytes for
-        // post-extraction integrity verification — same `.integrity`
-        // file as v1 so `lpm store verify --deep` keeps working in
-        // mixed-v1/v2 environments. Also load-bearing for
-        // [`is_complete_object_dir`]'s incompleteness probe.
+    fn verify_streamed_integrity(
+        expected_integrity: Option<&str>,
+        reader: &dyn StreamingIntegrityReader,
+    ) -> Result<(), LpmError> {
+        let Some(expected) = expected_integrity else {
+            return Ok(());
+        };
+        let parsed = Integrity::parse(expected)?;
+        let matches = reader.integrity_matches(&parsed).ok_or_else(|| {
+            LpmError::Store(format!(
+                "streamed {} verifier was not initialized",
+                match parsed.algorithm {
+                    HashAlgorithm::Sha512 => "sha512",
+                    HashAlgorithm::Sha256 => "sha256",
+                    HashAlgorithm::Sha1 => "sha1",
+                }
+            ))
+        })?;
+        if matches {
+            Ok(())
+        } else {
+            let actual = reader.integrity_sri(parsed.algorithm).ok_or_else(|| {
+                LpmError::Store("streamed integrity verifier was not initialized".into())
+            })?;
+            Err(LpmError::IntegrityMismatch {
+                expected: parsed.to_string(),
+                actual,
+            })
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_staged_object(
+        &self,
+        tmp_dir: &Path,
+        object_dir: PathBuf,
+        sri: &str,
+        policy: ObjectIntegrityPolicy,
+        streamed_integrities: TreeIntegrities,
+        prepared_cas: Option<PreparedSourceRecord>,
+        mut timings: StageTimings,
+    ) -> Result<(ExtractedObject, StageTimings), LpmError> {
+        let early_finalize_ms = timings.finalize_tree_integrity_ms;
         let finalize_start = std::time::Instant::now();
         let object_integrity_start = std::time::Instant::now();
-        let integrities = match write_object_integrity_for_policy_with_tree(
-            &tmp_dir,
+        let integrities = write_object_integrity_for_policy_with_tree(
+            tmp_dir,
             sri,
             policy,
             streamed_integrities,
-        ) {
-            Ok(integrities) => integrities,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                return Err(e);
-            }
-        };
+        )?;
         timings.finalize_tree_integrity_ms = timings
             .finalize_tree_integrity_ms
             .saturating_add(object_integrity_start.elapsed().as_millis());
@@ -1409,14 +1595,10 @@ impl Store {
             FreshObjectIntegrity::new(VerifiedObjectIntegrity::new(integrities.content));
 
         let integrity_write_start = std::time::Instant::now();
-        let integrity_result = std::fs::write(tmp_dir.join(".integrity"), sri);
+        std::fs::write(tmp_dir.join(".integrity"), sri).map_err(|error| {
+            LpmError::Store(format!("failed to write virtual-store .integrity: {error}"))
+        })?;
         timings.finalize_integrity_write_ms = integrity_write_start.elapsed().as_millis();
-        if let Err(e) = integrity_result {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(LpmError::Store(format!(
-                "failed to write virtual-store .integrity: {e}"
-            )));
-        }
 
         #[cfg(test)]
         if let Some((arrived, resume)) = &self.object_publish_barriers {
@@ -1424,7 +1606,7 @@ impl Store {
             resume.wait();
         }
         let rename_start = std::time::Instant::now();
-        let rename_result = std::fs::rename(&tmp_dir, &object_dir);
+        let rename_result = std::fs::rename(tmp_dir, &object_dir);
         timings.finalize_rename_ms = rename_start.elapsed().as_millis();
         let result = match rename_result {
             Ok(()) => {
@@ -1449,18 +1631,17 @@ impl Store {
                     object_integrity,
                 })
             }
-            Err(e) => {
+            Err(error) => {
                 let collision_start = std::time::Instant::now();
-                let result = finish_object_rename_after_collision(
-                    &tmp_dir,
+                let object_dir = finish_object_rename_after_collision(
+                    tmp_dir,
                     &object_dir,
                     sri,
                     "virtual-store extract",
-                    e,
+                    error,
                     policy,
-                );
+                )?;
                 timings.finalize_collision_recovery_ms = collision_start.elapsed().as_millis();
-                let object_dir = result?;
                 let mut object_integrity = object_integrity_or_remove(
                     &object_dir,
                     "after virtual-store extract collision",
@@ -1495,8 +1676,56 @@ impl Store {
         };
         timings.finalize_ms =
             early_finalize_ms.saturating_add(finalize_start.elapsed().as_millis());
-
         result.map(|object| (object, timings))
+    }
+
+    pub fn extract_object_from_stream(
+        &self,
+        reader: impl std::io::Read,
+        expected_integrity: Option<&str>,
+        max_compressed_size: u64,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        if !self.supports_streamed_object_ingest() {
+            return Err(LpmError::Store(
+                "streamed object ingest is unavailable for the v3 file CAS".into(),
+            ));
+        }
+
+        let staging = self.create_stream_object_staging_dir()?;
+        let tmp_dir = &staging.path;
+        let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
+        let mut hashing_reader =
+            HashingReader::for_expected_integrity(size_limited, expected_integrity)?;
+        let (streamed_integrities, prepared_cas, timings, computed_sri) = self
+            .extract_input_into_staging(
+                TarballInput::Streaming {
+                    reader: &mut hashing_reader,
+                    expected_integrity,
+                },
+                tmp_dir,
+                None,
+            )?;
+        let computed_sri = computed_sri.ok_or_else(|| {
+            LpmError::Store("streamed object ingest did not compute a canonical SRI".into())
+        })?;
+        let object_dir = self.paths.object_dir(&computed_sri)?;
+        if let Some(object) = self.reusable_object_for_extraction(
+            &object_dir,
+            &computed_sri,
+            self.object_integrity_policy,
+        )? {
+            return Ok((object, computed_sri, timings));
+        }
+        let (object, timings) = self.publish_staged_object(
+            tmp_dir,
+            object_dir,
+            &computed_sri,
+            self.object_integrity_policy,
+            streamed_integrities,
+            prepared_cas,
+            timings,
+        )?;
+        Ok((object, computed_sri, timings))
     }
 
     /// Extract from a buffered byte slice when the SRI isn't known

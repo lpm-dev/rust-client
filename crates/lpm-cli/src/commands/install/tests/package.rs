@@ -651,6 +651,7 @@ fn wrapper_id_and_materialization_helpers_cover_every_source_kind() {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            unpacked_size: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,
@@ -704,6 +705,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         is_lpm: false,
         peers: Vec::new(),
         integrity: None,
+        unpacked_size: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
@@ -727,6 +729,7 @@ fn tarball_remote_and_local_produce_distinct_wrapper_ids() {
         is_lpm: false,
         peers: Vec::new(),
         integrity: None,
+        unpacked_size: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,
@@ -870,6 +873,24 @@ fn dedupe_install_packages_by_identity_merges_workspace_reentry_source_graph() {
             workspace.wrapper_id_for_source().unwrap()
         )],
         "edge metadata must describe the retained workspace source",
+    );
+}
+
+#[test]
+fn dedupe_install_packages_retains_largest_unpacked_size_hint() {
+    let mut first = install_package_for_tarball("ignored", None);
+    first.source = "registry+https://registry.npmjs.org".to_string();
+    first.unpacked_size = std::num::NonZeroU64::new(1024);
+    let mut second = first.clone();
+    second.unpacked_size = std::num::NonZeroU64::new(4096);
+    let mut packages = vec![first, second];
+
+    dedupe_install_packages_by_identity(&mut packages).unwrap();
+
+    assert_eq!(packages.len(), 1);
+    assert_eq!(
+        packages[0].unpacked_size.map(std::num::NonZeroU64::get),
+        Some(4096)
     );
 }
 

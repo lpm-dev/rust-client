@@ -74,12 +74,19 @@ pub(super) struct TaskTimings {
     /// path. Carved out of `download_ms` (legacy) and previously
     /// untimed in streaming.
     pub(super) url_lookup_ms: u128,
-    /// Time in `client.download_tarball_to_file` — the HTTP GET +
-    /// on-disk temp spool + SHA-512 streaming hash. ** /// note:** URL resolution is now carved out into
-    /// `url_lookup_ms` on both paths; `download_ms` covers GET +
-    /// temp-file write only (legacy path; streaming collapses
-    /// into `extract_ms`).
+    /// Time to receive the response headers for a live streaming request.
+    /// The response body is intentionally excluded because it overlaps the
+    /// extractor and is represented by `pipeline_wall_ms`.
+    pub(super) download_headers_ms: u128,
+    /// Time in `client.download_tarball_to_file`: the response-body read,
+    /// temp-file write, and SHA-512 hash. URL resolution and response headers
+    /// are recorded separately.
     pub(super) download_ms: u128,
+    /// Wall time from the first streamed response-body read until EOF is
+    /// observed by the synchronous extractor. This includes network delivery,
+    /// extractor backpressure, and time between reads. It overlaps both
+    /// `extract_ms` and `pipeline_wall_ms` and is never added to task totals.
+    pub(super) stream_body_wall_ms: u128,
     /// Time spent verifying the computed SRI against the expected hash.
     /// Near-zero in the common `sha512` matched case (string compare);
     /// non-trivial only when `integrity.algo` differs from sha512, in
@@ -109,6 +116,15 @@ pub(super) struct TaskTimings {
     pub(super) dir_count: u64,
     pub(super) symlink_count: u64,
     pub(super) unpacked_bytes: u64,
+    /// Wall time from streamed-pipeline setup through verified object
+    /// publication. Non-zero only when network and extraction overlap.
+    pub(super) pipeline_wall_ms: u128,
+    pub(super) pipeline_wall_recorded: bool,
+    pub(super) streaming_weight_requested: u64,
+    pub(super) streaming_weight_acquired: u64,
+    pub(super) declared_unpacked_bytes: Option<u64>,
+    pub(super) supplemental_permit_hold_ms: u128,
+    pub(super) supplemental_permit_lease_expired: bool,
 }
 
 impl TaskTimings {
@@ -123,7 +139,9 @@ impl TaskTimings {
         Self {
             queue_wait_ms,
             url_lookup_ms,
+            download_headers_ms: 0,
             download_ms,
+            stream_body_wall_ms: 0,
             integrity_ms,
             extract_permit_wait_ms,
             extract_ms: stage.extract_ms,
@@ -139,12 +157,56 @@ impl TaskTimings {
             dir_count: stage.dir_count,
             symlink_count: stage.symlink_count,
             unpacked_bytes: stage.unpacked_bytes,
+            pipeline_wall_ms: 0,
+            pipeline_wall_recorded: false,
+            streaming_weight_requested: 0,
+            streaming_weight_acquired: 0,
+            declared_unpacked_bytes: None,
+            supplemental_permit_hold_ms: 0,
+            supplemental_permit_lease_expired: false,
         }
     }
 
+    pub(super) fn with_streaming_pipeline(
+        mut self,
+        download_headers_ms: u128,
+        stream_body_wall_ms: u128,
+        pipeline_wall_ms: u128,
+    ) -> Self {
+        self.download_headers_ms = download_headers_ms;
+        self.stream_body_wall_ms = stream_body_wall_ms;
+        self.pipeline_wall_ms = pipeline_wall_ms;
+        self.pipeline_wall_recorded = true;
+        self
+    }
+
+    pub(super) fn with_streaming_admission(
+        mut self,
+        requested_weight: u64,
+        acquired_weight: u64,
+        declared_unpacked_bytes: Option<std::num::NonZeroU64>,
+        supplemental_hold_ms: u128,
+        supplemental_lease_expired: bool,
+    ) -> Self {
+        self.streaming_weight_requested = requested_weight;
+        self.streaming_weight_acquired = acquired_weight;
+        self.declared_unpacked_bytes = declared_unpacked_bytes.map(std::num::NonZeroU64::get);
+        self.supplemental_permit_hold_ms = supplemental_hold_ms;
+        self.supplemental_permit_lease_expired = supplemental_lease_expired;
+        self
+    }
+
     pub(super) fn total_ms(self) -> u128 {
-        self.queue_wait_ms
+        let prefix_ms = self
+            .queue_wait_ms
             .saturating_add(self.url_lookup_ms)
+            .saturating_add(self.download_headers_ms);
+        if self.pipeline_wall_recorded {
+            return prefix_ms
+                .saturating_add(self.extract_permit_wait_ms)
+                .saturating_add(self.pipeline_wall_ms);
+        }
+        prefix_ms
             .saturating_add(self.download_ms)
             .saturating_add(self.integrity_ms)
             .saturating_add(self.extract_permit_wait_ms)
@@ -181,8 +243,12 @@ pub(super) struct FetchBreakdown {
     /// on both legacy and streaming paths by construction.
     pub(super) url_lookup_sum_ms: u128,
     pub(super) url_lookup_max_ms: u128,
+    pub(super) download_headers_sum_ms: u128,
+    pub(super) download_headers_max_ms: u128,
     pub(super) download_sum_ms: u128,
     pub(super) download_max_ms: u128,
+    pub(super) stream_body_wall_sum_ms: u128,
+    pub(super) stream_body_wall_max_ms: u128,
     pub(super) integrity_sum_ms: u128,
     pub(super) integrity_max_ms: u128,
     pub(super) extract_permit_wait_sum_ms: u128,
@@ -197,6 +263,14 @@ pub(super) struct FetchBreakdown {
     pub(super) finalize_permit_wait_max_ms: u128,
     pub(super) finalize_sum_ms: u128,
     pub(super) finalize_max_ms: u128,
+    pub(super) pipeline_wall_sum_ms: u128,
+    pub(super) pipeline_wall_max_ms: u128,
+    pub(super) pipeline_wall_task_count: u64,
+    pub(super) streaming_weight_requested_max: u64,
+    pub(super) streaming_weight_acquired_max: u64,
+    pub(super) supplemental_permit_hold_sum_ms: u128,
+    pub(super) supplemental_permit_hold_max_ms: u128,
+    pub(super) supplemental_permit_lease_expired_count: u64,
 }
 
 /// speculative-fetch counters.
@@ -414,8 +488,14 @@ impl FetchBreakdown {
         self.queue_wait_max_ms = self.queue_wait_max_ms.max(t.queue_wait_ms);
         self.url_lookup_sum_ms += t.url_lookup_ms;
         self.url_lookup_max_ms = self.url_lookup_max_ms.max(t.url_lookup_ms);
+        self.download_headers_sum_ms += t.download_headers_ms;
+        self.download_headers_max_ms = self.download_headers_max_ms.max(t.download_headers_ms);
         self.download_sum_ms += t.download_ms;
         self.download_max_ms = self.download_max_ms.max(t.download_ms);
+        self.stream_body_wall_sum_ms = self
+            .stream_body_wall_sum_ms
+            .saturating_add(t.stream_body_wall_ms);
+        self.stream_body_wall_max_ms = self.stream_body_wall_max_ms.max(t.stream_body_wall_ms);
         self.integrity_sum_ms += t.integrity_ms;
         self.integrity_max_ms = self.integrity_max_ms.max(t.integrity_ms);
         self.extract_permit_wait_sum_ms += t.extract_permit_wait_ms;
@@ -434,6 +514,23 @@ impl FetchBreakdown {
             .max(t.finalize_permit_wait_ms);
         self.finalize_sum_ms += t.finalize_ms;
         self.finalize_max_ms = self.finalize_max_ms.max(t.finalize_ms);
+        self.pipeline_wall_sum_ms += t.pipeline_wall_ms;
+        self.pipeline_wall_max_ms = self.pipeline_wall_max_ms.max(t.pipeline_wall_ms);
+        self.pipeline_wall_task_count += u64::from(t.pipeline_wall_recorded);
+        self.streaming_weight_requested_max = self
+            .streaming_weight_requested_max
+            .max(t.streaming_weight_requested);
+        self.streaming_weight_acquired_max = self
+            .streaming_weight_acquired_max
+            .max(t.streaming_weight_acquired);
+        self.supplemental_permit_hold_sum_ms = self
+            .supplemental_permit_hold_sum_ms
+            .saturating_add(t.supplemental_permit_hold_ms);
+        self.supplemental_permit_hold_max_ms = self
+            .supplemental_permit_hold_max_ms
+            .max(t.supplemental_permit_hold_ms);
+        self.supplemental_permit_lease_expired_count +=
+            u64::from(t.supplemental_permit_lease_expired);
     }
 
     /// Serialize as a JSON object for `lpm install --json` output.
@@ -444,7 +541,9 @@ impl FetchBreakdown {
             "task_max_ms": self.task_max_ms,
             "queue_wait":  { "sum_ms": self.queue_wait_sum_ms,  "max_ms": self.queue_wait_max_ms  },
             "url_lookup":  { "sum_ms": self.url_lookup_sum_ms,  "max_ms": self.url_lookup_max_ms  },
+            "download_headers": { "sum_ms": self.download_headers_sum_ms, "max_ms": self.download_headers_max_ms },
             "download":    { "sum_ms": self.download_sum_ms,    "max_ms": self.download_max_ms    },
+            "stream_body_wall": { "sum_ms": self.stream_body_wall_sum_ms, "max_ms": self.stream_body_wall_max_ms },
             "integrity":   { "sum_ms": self.integrity_sum_ms,   "max_ms": self.integrity_max_ms   },
             "extract_permit_wait": { "sum_ms": self.extract_permit_wait_sum_ms, "max_ms": self.extract_permit_wait_max_ms },
             "extract":     { "sum_ms": self.extract_sum_ms,     "max_ms": self.extract_max_ms     },
@@ -452,6 +551,18 @@ impl FetchBreakdown {
             "source_scan": { "sum_ns": self.source_scan_sum_ns, "max_ns": self.source_scan_max_ns },
             "finalize_permit_wait": { "sum_ms": self.finalize_permit_wait_sum_ms, "max_ms": self.finalize_permit_wait_max_ms },
             "finalize":    { "sum_ms": self.finalize_sum_ms,    "max_ms": self.finalize_max_ms    },
+            "pipeline_wall": {
+                "task_count": self.pipeline_wall_task_count,
+                "sum_ms": self.pipeline_wall_sum_ms,
+                "max_ms": self.pipeline_wall_max_ms,
+            },
+            "streaming_admission": {
+                "requested_weight_max": self.streaming_weight_requested_max,
+                "acquired_weight_max": self.streaming_weight_acquired_max,
+                "supplemental_hold_sum_ms": self.supplemental_permit_hold_sum_ms,
+                "supplemental_hold_max_ms": self.supplemental_permit_hold_max_ms,
+                "supplemental_lease_expired_count": self.supplemental_permit_lease_expired_count,
+            },
         })
     }
 }
@@ -888,6 +999,7 @@ pub(super) struct SlowPackageTimings {
     security: Vec<PackageTiming>,
     finalize: Vec<PackageTiming>,
     fetch_tasks_by_total: Vec<FetchTaskTiming>,
+    fetch_tasks_by_pipeline: Vec<FetchTaskTiming>,
     fetch_tasks_by_extract: Vec<FetchTaskTiming>,
     fetch_tasks_by_security: Vec<FetchTaskTiming>,
     fetch_tasks_by_finalize: Vec<FetchTaskTiming>,
@@ -928,6 +1040,16 @@ impl SlowPackageTimings {
         Self::record_fetch_task(&mut self.fetch_tasks_by_total, &row, |entry| {
             entry.task_total_ms
         });
+        if timings.pipeline_wall_recorded {
+            self.fetch_tasks_by_pipeline.push(row.clone());
+            self.fetch_tasks_by_pipeline.sort_unstable_by(|a, b| {
+                b.timings
+                    .pipeline_wall_ms
+                    .cmp(&a.timings.pipeline_wall_ms)
+                    .then_with(|| a.package.cmp(&b.package))
+            });
+            self.fetch_tasks_by_pipeline.truncate(10);
+        }
         Self::record_fetch_task(&mut self.fetch_tasks_by_extract, &row, |entry| {
             entry.timings.extract_ms
         });
@@ -995,6 +1117,7 @@ impl SlowPackageTimings {
             "finalize": Self::bucket_json(&self.finalize),
             "fetch_tasks": {
                 "by_total": Self::fetch_task_bucket_json(&self.fetch_tasks_by_total),
+                "by_pipeline": Self::fetch_task_bucket_json(&self.fetch_tasks_by_pipeline),
                 "by_extract": Self::fetch_task_bucket_json(&self.fetch_tasks_by_extract),
                 "by_security": Self::fetch_task_bucket_json(&self.fetch_tasks_by_security),
                 "by_finalize": Self::fetch_task_bucket_json(&self.fetch_tasks_by_finalize),
@@ -1028,7 +1151,9 @@ impl SlowPackageTimings {
                         "task_total_ms": entry.task_total_ms,
                         "queue_wait_ms": timings.queue_wait_ms,
                         "url_lookup_ms": timings.url_lookup_ms,
+                        "download_headers_ms": timings.download_headers_ms,
                         "download_ms": timings.download_ms,
+                        "stream_body_wall_ms": timings.stream_body_wall_ms,
                         "integrity_ms": timings.integrity_ms,
                         "extract_permit_wait_ms": timings.extract_permit_wait_ms,
                         "extract_ms": timings.extract_ms,
@@ -1044,6 +1169,12 @@ impl SlowPackageTimings {
                         "dir_count": timings.dir_count,
                         "symlink_count": timings.symlink_count,
                         "unpacked_bytes": timings.unpacked_bytes,
+                        "pipeline_wall_ms": timings.pipeline_wall_ms,
+                        "streaming_weight_requested": timings.streaming_weight_requested,
+                        "streaming_weight_acquired": timings.streaming_weight_acquired,
+                        "declared_unpacked_bytes": timings.declared_unpacked_bytes,
+                        "supplemental_permit_hold_ms": timings.supplemental_permit_hold_ms,
+                        "supplemental_permit_lease_expired": timings.supplemental_permit_lease_expired,
                     })
                 })
                 .collect(),
@@ -1737,6 +1868,65 @@ mod tests {
     }
 
     #[test]
+    fn zero_millisecond_streaming_pipeline_is_counted_once() {
+        let timings = TaskTimings::default()
+            .with_streaming_pipeline(2, 0, 0)
+            .with_streaming_admission(3, 2, None, 11, true);
+        let mut breakdown = FetchBreakdown::default();
+        breakdown.record(timings);
+        let json = breakdown.to_json();
+
+        assert_eq!(timings.total_ms(), 2);
+        assert_eq!(json["task_sum_ms"], 2);
+        assert_eq!(json["pipeline_wall"]["task_count"], 1);
+        assert_eq!(json["pipeline_wall"]["sum_ms"], 0);
+        assert_eq!(json["streaming_admission"]["requested_weight_max"], 3);
+        assert_eq!(json["streaming_admission"]["acquired_weight_max"], 2);
+        assert_eq!(json["streaming_admission"]["supplemental_hold_sum_ms"], 11);
+        assert_eq!(
+            json["streaming_admission"]["supplemental_lease_expired_count"],
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_task_total_includes_each_non_overlapping_stage_once() {
+        let timings = TaskTimings {
+            queue_wait_ms: 2,
+            url_lookup_ms: 3,
+            extract_permit_wait_ms: 5,
+            ..TaskTimings::default()
+        }
+        .with_streaming_pipeline(7, 101, 11);
+        let mut breakdown = FetchBreakdown::default();
+        breakdown.record(timings);
+
+        assert_eq!(timings.total_ms(), 28);
+        assert_eq!(breakdown.task_sum_ms, 28);
+        assert_eq!(breakdown.download_sum_ms, 0);
+        assert_eq!(breakdown.stream_body_wall_sum_ms, 101);
+        assert_eq!(breakdown.pipeline_wall_sum_ms, 11);
+    }
+
+    #[test]
+    fn streaming_trace_compares_declared_and_actual_unpacked_bytes() {
+        let mut slow_packages = SlowPackageTimings::default();
+        let timings = TaskTimings {
+            unpacked_bytes: 120,
+            ..TaskTimings::default()
+        }
+        .with_streaming_pipeline(0, 0, 0)
+        .with_streaming_admission(3, 2, std::num::NonZeroU64::new(100), 0, false);
+        slow_packages.record_fetch("pkg@1.0.0", timings);
+
+        let json = slow_packages.to_json();
+        let row = &json["fetch_tasks"]["by_pipeline"][0];
+
+        assert_eq!(row["declared_unpacked_bytes"], 100);
+        assert_eq!(row["unpacked_bytes"], 120);
+    }
+
+    #[test]
     fn slow_package_trace_reports_fetch_task_attribution_rows() {
         let mut slow_packages = SlowPackageTimings::default();
 
@@ -1761,6 +1951,7 @@ mod tests {
                 dir_count: 14,
                 symlink_count: 15,
                 unpacked_bytes: 16,
+                ..TaskTimings::default()
             },
         );
 

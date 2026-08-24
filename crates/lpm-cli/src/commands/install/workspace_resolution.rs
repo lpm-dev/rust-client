@@ -1720,6 +1720,7 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: None,
+            unpacked_size: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,

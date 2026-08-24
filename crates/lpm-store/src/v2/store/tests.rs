@@ -2153,6 +2153,379 @@ fn extract_object_from_file_rejects_integrity_mismatch_without_publishing_object
     assert!(!store.paths().object_dir(&wrong_integrity).unwrap().exists());
 }
 
+#[test]
+fn streamed_object_accepts_declared_integrity_algorithms_and_uses_sha512_identity() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-object\",\"version\":\"1.0.0\"}",
+    )]);
+    let canonical_sri = Integrity::from_bytes(HashAlgorithm::Sha512, &tarball).to_string();
+
+    for algorithm in [
+        HashAlgorithm::Sha512,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Sha1,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let declared = Integrity::from_bytes(algorithm, &tarball).to_string();
+        let (object, sri, _) = store
+            .extract_object_from_stream(
+                std::io::Cursor::new(&tarball),
+                Some(&declared),
+                tarball.len() as u64,
+            )
+            .unwrap();
+
+        assert_eq!(sri, canonical_sri);
+        assert_eq!(object.source_sri, canonical_sri);
+        assert_eq!(
+            object.path,
+            store.paths().object_dir(&canonical_sri).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(object.path.join(".integrity")).unwrap(),
+            canonical_sri
+        );
+    }
+}
+
+#[test]
+fn streamed_object_trust_on_first_use_returns_canonical_sha512_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-tofu\",\"version\":\"1.0.0\"}",
+    )]);
+    let expected_sri = crate::compute_sri_hash(&tarball);
+
+    let (object, sri, _) = store
+        .extract_object_from_stream(std::io::Cursor::new(&tarball), None, tarball.len() as u64)
+        .unwrap();
+
+    assert_eq!(sri, expected_sri);
+    assert_eq!(object.source_sri, expected_sri);
+}
+
+#[test]
+fn streamed_object_integrity_mismatch_removes_private_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-mismatch\",\"version\":\"1.0.0\"}",
+    )]);
+    let wrong_integrity = crate::compute_sri_hash(b"different compressed bytes");
+
+    let error = store
+        .extract_object_from_stream(
+            std::io::Cursor::new(&tarball),
+            Some(&wrong_integrity),
+            tarball.len() as u64,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none(),
+        "an integrity failure must leave no visible object or private staging directory"
+    );
+}
+
+#[test]
+fn streamed_object_hash_includes_bytes_after_the_gzip_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let mut tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-trailing\",\"version\":\"1.0.0\"}",
+    )]);
+    tarball.extend_from_slice(b"integrity-covered-trailing-bytes");
+    let expected_sri = crate::compute_sri_hash(&tarball);
+
+    let (object, sri, _) = store
+        .extract_object_from_stream(
+            std::io::Cursor::new(&tarball),
+            Some(&expected_sri),
+            tarball.len() as u64,
+        )
+        .unwrap();
+
+    assert_eq!(sri, expected_sri);
+    assert_eq!(object.source_sri, expected_sri);
+}
+
+#[test]
+fn streamed_object_enforces_compressed_size_without_content_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-limit\",\"version\":\"1.0.0\"}",
+    )]);
+
+    let error = store
+        .extract_object_from_stream(
+            std::io::Cursor::new(&tarball),
+            None,
+            (tarball.len() - 1) as u64,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("maximum compressed size"));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+struct ChunkedReader {
+    cursor: std::io::Cursor<Vec<u8>>,
+    max_chunk: usize,
+}
+
+impl std::io::Read for ChunkedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let limit = buffer.len().min(self.max_chunk);
+        self.cursor.read(&mut buffer[..limit])
+    }
+}
+
+struct ErrorAtEofReader {
+    cursor: std::io::Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for ErrorAtEofReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cursor.position() == self.cursor.get_ref().len() as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "injected response-body failure",
+            ));
+        }
+        self.cursor.read(buffer)
+    }
+}
+
+struct EofGateReader {
+    cursor: std::io::Cursor<Vec<u8>>,
+    arrived: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+    released: bool,
+}
+
+impl std::io::Read for EofGateReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cursor.position() < self.cursor.get_ref().len() as u64 {
+            return self.cursor.read(buffer);
+        }
+        if !self.released {
+            self.arrived.wait();
+            self.resume.wait();
+            self.released = true;
+        }
+        Ok(0)
+    }
+}
+
+#[test]
+fn streamed_object_accepts_chunked_input_and_rejects_truncation_without_staging_leaks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-chunks\",\"version\":\"1.0.0\"}",
+    )]);
+    let expected_sri = crate::compute_sri_hash(&tarball);
+
+    let (_, sri, _) = store
+        .extract_object_from_stream(
+            ChunkedReader {
+                cursor: std::io::Cursor::new(tarball.clone()),
+                max_chunk: 7,
+            },
+            Some(&expected_sri),
+            tarball.len() as u64,
+        )
+        .unwrap();
+    assert_eq!(sri, expected_sri);
+
+    let truncated_dir = tempfile::tempdir().unwrap();
+    let truncated_store = Store::at(truncated_dir.path());
+    let truncated = tarball[..tarball.len() / 2].to_vec();
+    let error = truncated_store
+        .extract_object_from_stream(
+            ChunkedReader {
+                cursor: std::io::Cursor::new(truncated),
+                max_chunk: 5,
+            },
+            Some(&expected_sri),
+            tarball.len() as u64,
+        )
+        .unwrap_err();
+
+    assert!(!error.to_string().is_empty());
+    assert!(
+        std::fs::read_dir(truncated_store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn streamed_object_reader_error_removes_private_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-error\",\"version\":\"1.0.0\"}",
+    )]);
+
+    let error = store
+        .extract_object_from_stream(
+            ErrorAtEofReader {
+                cursor: std::io::Cursor::new(tarball.clone()),
+            },
+            Some(&crate::compute_sri_hash(&tarball)),
+            tarball.len() as u64,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("injected response-body failure"));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn streamed_object_is_not_published_before_eof_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-eof\",\"version\":\"1.0.0\"}",
+    )]);
+    let expected_sri = crate::compute_sri_hash(&tarball);
+    let object_dir = store.paths().object_dir(&expected_sri).unwrap();
+    let arrived = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let worker_arrived = Arc::clone(&arrived);
+    let worker_resume = Arc::clone(&resume);
+    let worker = std::thread::spawn(move || {
+        store.extract_object_from_stream(
+            EofGateReader {
+                cursor: std::io::Cursor::new(tarball),
+                arrived: worker_arrived,
+                resume: worker_resume,
+                released: false,
+            },
+            Some(&expected_sri),
+            u64::MAX,
+        )
+    });
+
+    arrived.wait();
+    assert!(!object_dir.exists());
+    resume.wait();
+    let (object, _, _) = worker.join().unwrap().unwrap();
+    assert_eq!(object.path, object_dir);
+}
+
+#[test]
+fn concurrent_streamed_object_publishers_reuse_the_same_canonical_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let arrived = Arc::new(std::sync::Barrier::new(2));
+    let resume = Arc::new(std::sync::Barrier::new(2));
+    let first_store = Store::at(dir.path())
+        .with_object_publish_barriers(Arc::clone(&arrived), Arc::clone(&resume));
+    let second_store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-collision\",\"version\":\"1.0.0\"}",
+    )]);
+    let expected_sri = crate::compute_sri_hash(&tarball);
+    let first_tarball = tarball.clone();
+    let first_integrity = expected_sri.clone();
+    let first = std::thread::spawn(move || {
+        first_store.extract_object_from_stream(
+            std::io::Cursor::new(first_tarball),
+            Some(&first_integrity),
+            u64::MAX,
+        )
+    });
+
+    arrived.wait();
+    let (winner, winner_sri, _) = second_store
+        .extract_object_from_stream(std::io::Cursor::new(tarball), Some(&expected_sri), u64::MAX)
+        .unwrap();
+    resume.wait();
+    let (reused, reused_sri, _) = first.join().unwrap().unwrap();
+
+    assert_eq!(winner_sri, expected_sri);
+    assert_eq!(reused_sri, expected_sri);
+    assert_eq!(winner.path, reused.path);
+}
+
+#[test]
+fn streamed_object_ingest_removes_unlocked_staging_from_a_crashed_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let stale = store
+        .paths()
+        .objects_root()
+        .join(".stream.tmp.0000000000000001");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("partial"), b"partial package bytes").unwrap();
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-recovery\",\"version\":\"1.0.0\"}",
+    )]);
+
+    store
+        .extract_object_from_stream(
+            std::io::Cursor::new(&tarball),
+            Some(&crate::compute_sri_hash(&tarball)),
+            tarball.len() as u64,
+        )
+        .unwrap();
+
+    assert!(!stale.exists());
+}
+
+#[test]
+fn streamed_object_cleanup_preserves_a_locked_live_staging_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let active = store.create_stream_object_staging_dir().unwrap();
+    let marker = active.path.join("active");
+    std::fs::write(&marker, b"in progress").unwrap();
+
+    let second = store.create_stream_object_staging_dir().unwrap();
+
+    assert!(marker.exists());
+    assert_ne!(active.path, second.path);
+}
+
+#[test]
+fn only_v2_store_supports_streamed_object_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+
+    assert!(Store::at(dir.path().join("v2")).supports_streamed_object_ingest());
+    assert!(!Store::at_v3(dir.path().join("v3")).supports_streamed_object_ingest());
+}
+
 fn v3_blob_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let blobs = root.join("blobs").join("blake3");

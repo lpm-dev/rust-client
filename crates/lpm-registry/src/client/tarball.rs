@@ -174,72 +174,9 @@ impl RegistryClient {
         self.check_tarball_url_scheme(url)?;
         let req = self.http.for_url(url).await?.get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
-        let mut response = self.send_with_retry(req).await?;
-
-        if let Some(content_length) = response.content_length()
-            && content_length > max_compressed_size
-        {
-            return Err(LpmError::Registry(format!(
-                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
-                content_length, max_compressed_size
-            )));
-        }
-        let spool_reservation =
-            reserve_compressed_tarball_spool(response.content_length(), max_compressed_size)
-                .await?;
-
-        use base64::Engine;
-        use sha2::{Digest, Sha512};
-
-        let mut hasher = Sha512::new();
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            LpmError::Io(std::io::Error::other(format!(
-                "failed to create temp file for tarball: {e}"
-            )))
-        })?;
-
-        // Set restrictive permissions — untrusted data until hash verified.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = temp_file
-                .as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
-
-        let mut compressed_size: u64 = 0;
-        while let Some(chunk) = response
-            .chunk()
+        let response = self.send_with_retry(req).await?;
+        self.spool_tarball_response_to_file_with_limit(response, max_compressed_size)
             .await
-            .map_err(|e| LpmError::Network(format!("failed to read tarball chunk: {e}")))?
-        {
-            compressed_size += chunk.len() as u64;
-            if compressed_size > max_compressed_size {
-                return Err(LpmError::Registry(format!(
-                    "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
-                    compressed_size, max_compressed_size
-                )));
-            }
-            spool_reservation.ensure_size(compressed_size)?;
-            hasher.update(&chunk);
-            write_tarball_chunk(&mut temp_file, &chunk)?;
-        }
-
-        flush_tarball_file(&mut temp_file)?;
-
-        let hash = hasher.finalize();
-        let sri = format!(
-            "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(hash)
-        );
-
-        DownloadedTarball::new(
-            temp_file,
-            sri.clone(),
-            sri,
-            compressed_size,
-            spool_reservation,
-        )
     }
 
     /// Streaming variant of [`Self::download_tarball_to_file_with_auth`].
@@ -268,6 +205,82 @@ impl RegistryClient {
         Ok(response)
     }
 
+    /// Drain an already-authenticated tarball response into the bounded temp-file spool.
+    pub async fn spool_tarball_response_to_file(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<DownloadedTarball, LpmError> {
+        self.spool_tarball_response_to_file_with_limit(response, MAX_COMPRESSED_TARBALL_SIZE)
+            .await
+    }
+
+    async fn spool_tarball_response_to_file_with_limit(
+        &self,
+        mut response: reqwest::Response,
+        max_compressed_size: u64,
+    ) -> Result<DownloadedTarball, LpmError> {
+        if let Some(content_length) = response.content_length()
+            && content_length > max_compressed_size
+        {
+            return Err(LpmError::Registry(format!(
+                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                content_length, max_compressed_size
+            )));
+        }
+        let spool_reservation =
+            reserve_compressed_tarball_spool(response.content_length(), max_compressed_size)
+                .await?;
+
+        use base64::Engine;
+        use sha2::{Digest, Sha512};
+
+        let mut hasher = Sha512::new();
+        let mut temp_file = tempfile::NamedTempFile::new().map_err(|error| {
+            LpmError::Io(std::io::Error::other(format!(
+                "failed to create temp file for tarball: {error}"
+            )))
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp_file
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+
+        let mut compressed_size = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| LpmError::Network(format!("failed to read tarball chunk: {error}")))?
+        {
+            compressed_size += chunk.len() as u64;
+            if compressed_size > max_compressed_size {
+                return Err(LpmError::Registry(format!(
+                    "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
+                    compressed_size, max_compressed_size
+                )));
+            }
+            spool_reservation.ensure_size(compressed_size)?;
+            hasher.update(&chunk);
+            write_tarball_chunk(&mut temp_file, &chunk)?;
+        }
+        flush_tarball_file(&mut temp_file)?;
+
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+        );
+        DownloadedTarball::new(
+            temp_file,
+            sri.clone(),
+            sri,
+            compressed_size,
+            spool_reservation,
+        )
+    }
+
     /// Download a tarball to a temp file with a custom size limit.
     ///
     /// `download_tarball_to_file()` uses the default `MAX_COMPRESSED_TARBALL_SIZE` (500 MB).
@@ -289,76 +302,9 @@ impl RegistryClient {
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let mut response = self.send_lpm_tarball_with_recovery(url, accounting).await?;
-
-        if let Some(content_length) = response.content_length()
-            && content_length > max_compressed_size
-        {
-            return Err(LpmError::Registry(format!(
-                "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
-                content_length, max_compressed_size
-            )));
-        }
-        let spool_reservation =
-            reserve_compressed_tarball_spool(response.content_length(), max_compressed_size)
-                .await?;
-
-        use base64::Engine;
-        use sha2::{Digest, Sha512};
-
-        let mut hasher = Sha512::new();
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            LpmError::Io(std::io::Error::other(format!(
-                "failed to create temp file for tarball: {e}"
-            )))
-        })?;
-
-        // Set restrictive permissions — untrusted data until hash verified
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = temp_file
-                .as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600));
-        }
-
-        let mut compressed_size: u64 = 0;
-
-        // Stream chunks to disk + hasher — bounded memory regardless of package size
-        while let Some(chunk) = response
-            .chunk()
+        let response = self.send_lpm_tarball_with_recovery(url, accounting).await?;
+        self.spool_tarball_response_to_file_with_limit(response, max_compressed_size)
             .await
-            .map_err(|e| LpmError::Network(format!("failed to read tarball chunk: {e}")))?
-        {
-            compressed_size += chunk.len() as u64;
-            if compressed_size > max_compressed_size {
-                // Clean up temp file (dropped automatically) and reject
-                return Err(LpmError::Registry(format!(
-                    "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
-                    compressed_size, max_compressed_size
-                )));
-            }
-            spool_reservation.ensure_size(compressed_size)?;
-            hasher.update(&chunk);
-            write_tarball_chunk(&mut temp_file, &chunk)?;
-        }
-
-        // Flush to ensure all data is on disk before verification
-        flush_tarball_file(&mut temp_file)?;
-
-        let hash = hasher.finalize();
-        let sri = format!(
-            "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(hash)
-        );
-
-        DownloadedTarball::new(
-            temp_file,
-            sri.clone(),
-            sri,
-            compressed_size,
-            spool_reservation,
-        )
     }
 
     /// Streaming tarball download — low-allocation fast path.

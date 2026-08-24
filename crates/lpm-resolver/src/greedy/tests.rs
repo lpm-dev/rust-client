@@ -139,6 +139,7 @@ fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageI
                     CachedDistInfo {
                         tarball_url: Some(format!("https://example.invalid/{}.tgz", v)),
                         integrity: Some(format!("sha512-fake-{}", v)),
+                        unpacked_size: None,
                         signatures: Vec::new(),
                         published_at: None,
                         published_at_unix: None,

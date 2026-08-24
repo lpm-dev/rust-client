@@ -368,6 +368,7 @@ fn workspace_package_id_for_version(package: &LockedPackage, lockfile_version: u
         version,
         source,
         integrity,
+        unpacked_size: _,
         manifest_fingerprint,
         registry_signatures,
         registry_published_at,
@@ -651,6 +652,13 @@ pub struct LockedPackage {
     /// SRI integrity hash (sha512-...). Populated when registry provides it.
     #[serde(default)]
     pub integrity: Option<String>,
+    /// Registry-reported unpacked byte count used as a fetch scheduling hint.
+    #[serde(
+        default,
+        rename = "unpacked-size",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unpacked_size: Option<std::num::NonZeroU64>,
     /// Semantic manifest digest for mutable directory/link sources.
     #[serde(
         default,

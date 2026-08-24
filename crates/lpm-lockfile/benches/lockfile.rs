@@ -12,6 +12,7 @@ fn make_lockfile(n: usize) -> Lockfile {
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-abcdef1234567890".to_string()),
+            unpacked_size: None,
             manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,

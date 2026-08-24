@@ -21,6 +21,7 @@ fn sample_lockfile() -> Lockfile {
         version: "1.1.1".to_string(),
         source: Some("registry+https://lpm.dev".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -44,6 +45,7 @@ fn sample_lockfile() -> Lockfile {
         version: "999.999.999".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -401,6 +403,7 @@ fn current_schema_accepts_exact_source_dependency_identity() {
         name: "child".to_string(),
         version: "1.0.0".to_string(),
         source: Some(child_source.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: Some(format!("sha256-{}", "a".repeat(64))),
         ..LockedPackage::default()
     });
@@ -931,6 +934,7 @@ fn patch_records_round_trip_and_skip_binary() {
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -992,6 +996,7 @@ fn write_all_skips_binary_when_importer_snapshots_present() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1165,6 +1170,7 @@ fn packages_sorted_by_name() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1188,6 +1194,7 @@ fn packages_sorted_by_name() {
         version: "2.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1227,6 +1234,7 @@ fn tarball_roundtrips_when_present() {
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1256,6 +1264,24 @@ fn tarball_roundtrips_when_present() {
         parsed.packages[0].tarball.as_deref(),
         Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz")
     );
+}
+
+#[test]
+fn unpacked_size_roundtrips_without_changing_package_identity() {
+    let mut lockfile = legacy_lockfile();
+    let mut package = sample_lockfile().packages.remove(0);
+    let identity_without_hint =
+        crate::model::workspace_package_id_for_test(&package, lockfile.metadata.lockfile_version);
+    package.unpacked_size = std::num::NonZeroU64::new(184_624_992);
+    let identity_with_hint =
+        crate::model::workspace_package_id_for_test(&package, lockfile.metadata.lockfile_version);
+    lockfile.add_package(package);
+
+    let encoded = lockfile.to_toml().unwrap();
+    assert!(encoded.contains("unpacked-size = 184624992"));
+    let decoded = Lockfile::from_toml(&encoded).unwrap();
+    assert_eq!(decoded, lockfile);
+    assert_eq!(identity_with_hint, identity_without_hint);
 }
 
 #[test]
@@ -1292,6 +1318,7 @@ fn tarball_mixed_population_roundtrips() {
         version: "4.22.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1315,6 +1342,7 @@ fn tarball_mixed_population_roundtrips() {
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1862,6 +1890,7 @@ fn fingerprints_are_rejected_before_version_eleven_and_on_non_local_sources() {
         name: "local-package".to_string(),
         version: "1.0.0".to_string(),
         source: Some("directory+./package".to_string()),
+        unpacked_size: None,
         manifest_fingerprint: fingerprint.clone(),
         ..Default::default()
     });
@@ -1875,6 +1904,7 @@ fn fingerprints_are_rejected_before_version_eleven_and_on_non_local_sources() {
         name: "registry-package".to_string(),
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
+        unpacked_size: None,
         manifest_fingerprint: fingerprint,
         ..Default::default()
     });
@@ -1953,6 +1983,7 @@ fn toml_roundtrips_npm_alias_metadata() {
         version: "6.0.1".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -1976,6 +2007,7 @@ fn toml_roundtrips_npm_alias_metadata() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2048,6 +2080,7 @@ fn write_all_skips_binary_when_root_aliases_present() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2095,6 +2128,7 @@ fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2132,6 +2166,7 @@ fn empty_deps_not_serialized() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2183,6 +2218,7 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2211,6 +2247,7 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
         version: "9.9.9".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2253,6 +2290,7 @@ fn read_fast_ignores_stale_binary() {
         version: "9.9.9".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2339,6 +2377,7 @@ fn pkg_with_source(name: &str, source: Option<&str>) -> LockedPackage {
         version: "1.0.0".to_string(),
         source: source.map(|s| s.to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2446,6 +2485,7 @@ fn pkg_with_source_and_tarball(source: Option<&str>, tarball: Option<&str>) -> L
         version: "1.0.0".to_string(),
         source: source.map(|s| s.to_string()),
         integrity,
+        unpacked_size: None,
         manifest_fingerprint,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2633,6 +2673,7 @@ fn tarball_local_source_round_trips_through_toml_with_sha256_integrity() {
         version: "1.0.0".to_string(),
         source: Some("tarball+file:./vendor/local-bundle-1.0.0.tgz".to_string()),
         integrity: Some(VALID_SHA256_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2687,6 +2728,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         version: "4.17.21".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2710,6 +2752,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         version: "1.0.0".to_string(),
         source: Some("tarball+https://e.com/remote-fork.tgz".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2733,6 +2776,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         version: "1.0.0".to_string(),
         source: Some("tarball+file:./vendor/local-tarball.tgz".to_string()),
         integrity: Some(VALID_SHA256_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2756,6 +2800,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         version: "0.1.0".to_string(),
         source: Some("directory+./packages/local-dir".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -2779,6 +2824,7 @@ fn directory_link_sources_share_lockfile_with_registry_packages() {
         version: "0.1.0".to_string(),
         source: Some("link+../shared/linked".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: Some(format!("sha256-{}", "cd".repeat(32))),
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3095,6 +3141,7 @@ fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
         version: "1.0.0".into(),
         source: Some("registry+https://registry.npmjs.org".into()),
         integrity: Some(VALID_SHA512_SRI.into()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3453,6 +3500,7 @@ fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3476,6 +3524,7 @@ fn to_toml_writer_guard_runs_per_package_and_names_first_offender() {
         version: "1.0.0".to_string(),
         source: Some("git+https://github.com/foo/bar.git".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3543,6 +3592,7 @@ fn package_key_distinguishes_cross_source_same_name_version() {
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3566,6 +3616,7 @@ fn package_key_distinguishes_cross_source_same_name_version() {
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3602,6 +3653,7 @@ fn package_key_uses_unknown_sentinel_when_source_missing() {
         version: "1.0.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3635,6 +3687,7 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3658,6 +3711,7 @@ fn add_package_sorts_cross_source_collisions_by_triple() {
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3706,6 +3760,7 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3729,6 +3784,7 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: Some(VALID_SHA512_SRI_ALT.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3857,6 +3913,7 @@ fn locked_package_peers_round_trip_through_toml() {
         version: "9.2.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -3909,6 +3966,7 @@ fn locked_package_peers_empty_skipped_in_serialization() {
         version: "4.17.21".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -4146,6 +4204,7 @@ fn binary_format_falls_back_when_ambient_peers_present() {
         version: "18.2.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -4185,6 +4244,7 @@ fn binary_format_falls_back_when_per_package_peers_present() {
         version: "9.2.0".to_string(),
         source: None,
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -4249,6 +4309,7 @@ fn registry_signature_metadata_triggers_binary_fallback() {
         version: "1.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: vec![LockedRegistrySignature {
             keyid: Some("SHA256:abc123".to_string()),
@@ -4288,6 +4349,7 @@ fn legacy_find_package_returns_some_match_under_collision() {
         version: "19.0.0".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -4311,6 +4373,7 @@ fn legacy_find_package_returns_some_match_under_collision() {
         version: "19.0.0".to_string(),
         source: Some("tarball+https://e.com/forks-of-react.tgz".to_string()),
         integrity: None,
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
@@ -4484,6 +4547,7 @@ fn failed_absorption_after_legacy_downgrade_leaves_union_unchanged() {
         name: "local-package".to_string(),
         version: "1.0.0".to_string(),
         source: Some("directory+../local-package".to_string()),
+        unpacked_size: None,
         manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
         ..LockedPackage::default()
     });
@@ -4750,6 +4814,7 @@ fn workspace_package_address_v10_has_stable_encoding() {
         version: "1.2.3".to_string(),
         source: Some("registry+https://registry.npmjs.org".to_string()),
         integrity: Some("sha512-integrity".to_string()),
+        unpacked_size: None,
         manifest_fingerprint: None,
         registry_signatures: vec![LockedRegistrySignature {
             keyid: Some("SHA256:key".to_string()),
@@ -4789,6 +4854,7 @@ fn workspace_package_address_v11_has_stable_encoding() {
         name: "local-package".to_string(),
         version: "1.2.3".to_string(),
         source: Some("directory+packages/local-package".to_string()),
+        unpacked_size: None,
         manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
         dependencies: vec!["dependency@2.0.0".to_string()],
         ..LockedPackage::default()

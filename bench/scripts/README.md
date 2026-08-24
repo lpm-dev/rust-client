@@ -138,6 +138,9 @@ LPM V2 project links point into `LPM_HOME/store`. Thus, the fifth state removes
 
 Each LPM and Bun pair is adjacent. The harness alternates the manager order and
 rotates the state order for each sample. Bun is the control for network noise.
+Scored wall-time and RSS samples do not enable LPM timing detail. After the
+scored pairs, the harness runs separate LPM-only `--json --timing` diagnostics
+with `LPM_TIMING_DETAIL=trace`. Use `--timing-samples` to set their count.
 
 Build the release CLI:
 
@@ -154,11 +157,12 @@ node bench/scripts/run-t3-install-six-states.mjs --self-test
 Run ten samples for each manager and state:
 
 ```bash
-node bench/scripts/run-t3-install-six-states.mjs --samples 10
+node bench/scripts/run-t3-install-six-states.mjs --samples 10 --timing-samples 3
 ```
 
-The result directory contains the raw rows, each install output, and JSON and
-Markdown summaries. Set `LPM_NPM_FANOUT` only for an explicit concurrency test.
+The result directory contains scored rows, separate timing rows, each install
+output, and JSON and Markdown summaries. Set `LPM_NPM_FANOUT` only for an
+explicit concurrency test.
 
 ## Production-readiness harness
 

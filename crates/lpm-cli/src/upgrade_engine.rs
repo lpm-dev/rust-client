@@ -349,6 +349,7 @@ mod tests {
                 version: version.to_string(),
                 source: None,
                 integrity: None,
+                unpacked_size: None,
                 manifest_fingerprint: None,
                 registry_signatures: Vec::new(),
                 registry_published_at: None,
