@@ -173,23 +173,12 @@ impl LinkMeta {
     /// touch only widens prune's view of cold entries by one install
     /// cycle.
     pub fn touch_on_disk(sidecar_path: &Path) -> Result<(), LpmError> {
-        let file = std::fs::File::options()
-            .write(true)
-            .open(sidecar_path)
-            .map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to open virtual-store link sidecar for touch at {}: {e}",
-                    sidecar_path.display()
-                ))
-            })?;
-        file.set_modified(std::time::SystemTime::now())
-            .map_err(|e| {
-                LpmError::Store(format!(
-                    "failed to update virtual-store link sidecar mtime at {}: {e}",
-                    sidecar_path.display()
-                ))
-            })?;
-        Ok(())
+        filetime::set_file_mtime(sidecar_path, filetime::FileTime::now()).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to update virtual-store link sidecar mtime at {}: {e}",
+                sidecar_path.display()
+            ))
+        })
     }
 
     /// The touch-time signal prune actually consults.

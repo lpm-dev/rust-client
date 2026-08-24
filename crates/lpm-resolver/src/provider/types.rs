@@ -89,7 +89,7 @@ pub struct StreamingBfsMetrics {
 ///
 /// Extracted from registry metadata so the download phase doesn't need to
 /// re-fetch metadata for tarball URL, integrity, or registry signatures.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CachedDistInfo {
     pub tarball_url: Option<String>,
     pub integrity: Option<String>,
@@ -100,7 +100,7 @@ pub struct CachedDistInfo {
 }
 
 /// Cached info about a package: available versions and their dependency maps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedPackageInfo {
     /// Package-level `modified` timestamp from npm metadata. Abbreviated
     /// packuments often omit per-version `time` but keep this upper bound.

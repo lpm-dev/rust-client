@@ -164,7 +164,7 @@ pub(super) async fn fetch_metadata_for_resolver(
 ) -> Result<FetchedMetadata, ResolveError> {
     let metadata = fetch_metadata_raw(client, route_table, canonical).await?;
     let dist_tags = metadata.dist_tags.clone();
-    let base_fact = Arc::new(parse_metadata_to_cache_info(&metadata));
+    let base_fact = Arc::new(parse_owned_metadata_to_cache_info(metadata));
     if base_fact.needs_trust_metadata(policy) {
         let mut fetched = fetch_full_metadata_for_policy(
             client,
@@ -231,7 +231,7 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
 
     let dist_tags = raw.metadata.dist_tags.clone();
     let parse_start = Instant::now();
-    let base_fact = Arc::new(parse_metadata_to_cache_info(&raw.metadata));
+    let base_fact = Arc::new(parse_owned_metadata_to_cache_info(raw.metadata));
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
     if base_fact.needs_trust_metadata(policy) {
         let policy_start = Instant::now();
@@ -345,7 +345,8 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     timings.body_bytes = raw.timings.body_bytes;
 
     let parse_start = Instant::now();
-    let mut info = parse_partial_metadata_to_cache_info(&raw.metadata);
+    let dist_tags = raw.metadata.dist_tags.clone();
+    let mut info = parse_owned_partial_metadata_to_cache_info(raw.metadata);
     info.platform_metadata_complete = true;
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
     if info.needs_supplemental_metadata(canonical, policy) {
@@ -363,8 +364,7 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
         return Ok((fetched, timings));
     }
 
-    let fetched =
-        fetched_metadata_from_info(None, raw.metadata.dist_tags, info, include_speculation);
+    let fetched = fetched_metadata_from_info(None, dist_tags, info, include_speculation);
     timings.total_ms = total_start.elapsed().as_millis();
     Ok((fetched, timings))
 }
@@ -496,16 +496,16 @@ fn parse_fetched_metadata_with_cache_completeness(
     let latest_version = include_latest_version
         .then(|| latest_version_from_metadata(&metadata))
         .flatten();
+    let dist_tags = metadata.dist_tags.clone();
     let mut info = if versions_complete {
-        parse_metadata_to_cache_info(&metadata)
+        parse_owned_metadata_to_cache_info(metadata)
     } else {
-        parse_partial_metadata_to_cache_info(&metadata)
+        parse_owned_partial_metadata_to_cache_info(metadata)
     };
     info.covered_ranges.extend(covered_ranges);
     let info = Arc::new(info);
-    let speculation = include_speculation.then(|| {
-        SpeculativePackageMetadata::from_dist_tags_and_info(metadata.dist_tags, info.clone())
-    });
+    let speculation = include_speculation
+        .then(|| SpeculativePackageMetadata::from_dist_tags_and_info(dist_tags, info.clone()));
     FetchedMetadata {
         speculation,
         shared_fact: Some(Arc::clone(&info)),
@@ -519,12 +519,14 @@ pub(super) fn parse_full_fetched_metadata(
     include_speculation: bool,
     include_latest_version: bool,
 ) -> FetchedMetadata {
+    let latest_version = include_latest_version
+        .then(|| latest_version_from_metadata(&metadata))
+        .flatten();
+    let dist_tags = metadata.dist_tags.clone();
     fetched_metadata_from_info(
-        include_latest_version
-            .then(|| latest_version_from_metadata(&metadata))
-            .flatten(),
-        metadata.dist_tags.clone(),
-        parse_full_metadata_to_cache_info(&metadata),
+        latest_version,
+        dist_tags,
+        parse_owned_full_metadata_to_cache_info(metadata),
         include_speculation,
     )
 }

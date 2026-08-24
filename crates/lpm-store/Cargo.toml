@@ -27,6 +27,7 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+filetime = { workspace = true }
 subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
@@ -43,7 +44,6 @@ flate2 = "1"
 tar = "0.4"
 serde_json = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
-filetime = { workspace = true }
 
 [[bench]]
 name = "store_paths"

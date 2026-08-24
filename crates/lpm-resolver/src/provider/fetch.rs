@@ -65,7 +65,7 @@ impl LpmDependencyProvider {
                 // Use shared parser. Prereleases included
                 // (range matcher handles npm prerelease semantics).
                 let parse_start = trace_metadata_fetches.then(Instant::now);
-                let info = parse_metadata_to_cache_info(&metadata);
+                let info = parse_owned_metadata_to_cache_info(metadata);
                 if let Some(mut record) = detail {
                     if let Some(start) = parse_start {
                         record.cache_info_parse_ms = start.elapsed().as_millis();
@@ -170,7 +170,7 @@ impl LpmDependencyProvider {
                 };
 
                 let parse_start = trace_metadata_fetches.then(Instant::now);
-                let mut info = parse_metadata_to_cache_info(&metadata);
+                let mut info = parse_owned_metadata_to_cache_info(metadata);
                 if let Some(record) = &mut detail
                     && let Some(start) = parse_start
                 {
@@ -230,7 +230,7 @@ impl LpmDependencyProvider {
                     .get_npm_metadata_routed_full(name, route.clone()),
             )
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
-        let info = parse_full_metadata_to_cache_info(&full);
+        let info = parse_owned_full_metadata_to_cache_info(full);
         if !info.needs_supplemental_metadata(key, &self.policy) {
             return Ok(info);
         }
@@ -245,7 +245,7 @@ impl LpmDependencyProvider {
             .rt
             .block_on(self.client.refetch_npm_metadata_direct_full(name))
             .map_err(|e| ProviderError::Registry(format!("npm:{name}: {e}")))?;
-        Ok(parse_full_metadata_to_cache_info(&direct_full))
+        Ok(parse_owned_full_metadata_to_cache_info(direct_full))
     }
 
     pub(super) fn fetch_release_time_policy_info(

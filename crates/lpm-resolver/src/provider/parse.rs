@@ -23,16 +23,29 @@ pub(crate) fn parse_metadata_to_cache_info(
     parse_metadata_to_cache_info_inner(metadata, false, true, false)
 }
 
-pub(crate) fn parse_partial_metadata_to_cache_info(
-    metadata: &lpm_registry::PackageMetadata,
+pub(crate) fn parse_owned_metadata_to_cache_info(
+    metadata: lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
-    parse_metadata_to_cache_info_inner(metadata, false, false, false)
+    parse_owned_metadata_to_cache_info_inner(metadata, false, true, false)
 }
 
+pub(crate) fn parse_owned_partial_metadata_to_cache_info(
+    metadata: lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    parse_owned_metadata_to_cache_info_inner(metadata, false, false, false)
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
 pub(crate) fn parse_full_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
     parse_metadata_to_cache_info_inner(metadata, true, true, true)
+}
+
+pub(crate) fn parse_owned_full_metadata_to_cache_info(
+    metadata: lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    parse_owned_metadata_to_cache_info_inner(metadata, true, true, true)
 }
 
 pub(crate) fn merge_release_times_into_cache_info(
@@ -75,12 +88,189 @@ fn parse_metadata_to_cache_info_inner(
     platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
-    let mut dependency_entry_count = 0usize;
-    for ver_meta in metadata.versions.values() {
-        if !ver_meta.dependencies.is_empty() || !ver_meta.optional_dependencies.is_empty() {
-            dependency_entry_count += 1;
+    let dependency_entry_count = metadata
+        .versions
+        .values()
+        .filter(|version| {
+            !version.dependencies.is_empty() || !version.optional_dependencies.is_empty()
+        })
+        .count();
+    let latest_version = metadata
+        .latest_version_tag()
+        .and_then(|version| NpmVersion::parse(version).ok());
+    let projected_versions = metadata
+        .versions
+        .iter()
+        .map(|(version, metadata)| project_borrowed_version(version, metadata));
+    parse_projected_metadata(
+        metadata.modified.clone(),
+        latest_version,
+        ReleaseTimes::Borrowed(&metadata.time),
+        projected_versions,
+        version_count,
+        dependency_entry_count,
+        trust_metadata_complete,
+        versions_complete,
+        platform_metadata_complete,
+    )
+}
+
+fn parse_owned_metadata_to_cache_info_inner(
+    metadata: lpm_registry::PackageMetadata,
+    trust_metadata_complete: bool,
+    versions_complete: bool,
+    platform_metadata_complete: bool,
+) -> CachedPackageInfo {
+    let latest_version = metadata
+        .latest_version_tag()
+        .and_then(|version| NpmVersion::parse(version).ok());
+    let dependency_entry_count = metadata
+        .versions
+        .values()
+        .filter(|version| {
+            !version.dependencies.is_empty() || !version.optional_dependencies.is_empty()
+        })
+        .count();
+    let lpm_registry::PackageMetadata {
+        modified,
+        versions,
+        time,
+        ..
+    } = metadata;
+    let version_count = versions.len();
+    let projected_versions = versions
+        .into_iter()
+        .map(|(version, metadata)| project_owned_version(version, metadata));
+    parse_projected_metadata(
+        modified,
+        latest_version,
+        ReleaseTimes::Owned(time),
+        projected_versions,
+        version_count,
+        dependency_entry_count,
+        trust_metadata_complete,
+        versions_complete,
+        platform_metadata_complete,
+    )
+}
+
+struct ProjectedVersion {
+    version: String,
+    dependencies: HashMap<String, String>,
+    optional_dependencies: HashMap<String, String>,
+    peer_dependencies: HashMap<String, String>,
+    peer_dependencies_meta: HashMap<String, lpm_registry::PeerDependencyMeta>,
+    bundle_dependencies: Vec<String>,
+    node_engine: Option<String>,
+    os: Vec<String>,
+    cpu: Vec<String>,
+    libc: Vec<String>,
+    dist: CachedDistInfo,
+}
+
+fn project_borrowed_version(
+    version: &str,
+    metadata: &lpm_registry::VersionMetadata,
+) -> ProjectedVersion {
+    ProjectedVersion {
+        version: version.to_owned(),
+        dependencies: metadata.dependencies.clone(),
+        optional_dependencies: metadata.optional_dependencies.clone(),
+        peer_dependencies: metadata.peer_dependencies.clone(),
+        peer_dependencies_meta: metadata.peer_dependencies_meta.clone(),
+        bundle_dependencies: metadata.bundle_dependencies.clone(),
+        node_engine: metadata.engines.get("node").cloned(),
+        os: metadata.os.clone(),
+        cpu: metadata.cpu.clone(),
+        libc: metadata.libc.clone(),
+        dist: CachedDistInfo {
+            tarball_url: metadata.tarball_url().map(str::to_owned),
+            integrity: metadata
+                .integrity_or_shasum()
+                .map(std::borrow::Cow::into_owned),
+            signatures: metadata
+                .dist
+                .as_ref()
+                .and_then(|dist| dist.signatures.clone())
+                .unwrap_or_default(),
+            trust_evidence: detect_trust_evidence(metadata),
+            ..CachedDistInfo::default()
+        },
+    }
+}
+
+fn project_owned_version(
+    version: String,
+    metadata: lpm_registry::VersionMetadata,
+) -> ProjectedVersion {
+    let trust_evidence = detect_trust_evidence(&metadata);
+    let lpm_registry::VersionMetadata {
+        dependencies,
+        peer_dependencies,
+        peer_dependencies_meta,
+        bundle_dependencies,
+        optional_dependencies,
+        mut engines,
+        os,
+        cpu,
+        libc,
+        dist,
+        ..
+    } = metadata;
+    let (tarball_url, integrity, signatures) = dist.map_or_else(
+        || (None, None, Vec::new()),
+        |mut dist| {
+            let integrity = dist.take_integrity_or_shasum();
+            (dist.tarball, integrity, dist.signatures.unwrap_or_default())
+        },
+    );
+    ProjectedVersion {
+        version,
+        dependencies,
+        optional_dependencies,
+        peer_dependencies,
+        peer_dependencies_meta,
+        bundle_dependencies,
+        node_engine: engines.remove("node"),
+        os,
+        cpu,
+        libc,
+        dist: CachedDistInfo {
+            tarball_url,
+            integrity,
+            signatures,
+            trust_evidence,
+            ..CachedDistInfo::default()
+        },
+    }
+}
+
+enum ReleaseTimes<'a> {
+    Borrowed(&'a HashMap<String, String>),
+    Owned(HashMap<String, String>),
+}
+
+impl ReleaseTimes<'_> {
+    fn published_at(&mut self, version: &str) -> Option<String> {
+        match self {
+            Self::Borrowed(times) => times.get(version).cloned(),
+            Self::Owned(times) => times.remove(version),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_projected_metadata(
+    modified: Option<String>,
+    latest_version: Option<NpmVersion>,
+    mut release_times: ReleaseTimes<'_>,
+    projected_versions: impl Iterator<Item = ProjectedVersion>,
+    version_count: usize,
+    dependency_entry_count: usize,
+    trust_metadata_complete: bool,
+    versions_complete: bool,
+    platform_metadata_complete: bool,
+) -> CachedPackageInfo {
     let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
     let mut deps: HashMap<String, HashMap<String, String>> =
         HashMap::with_capacity(dependency_entry_count);
@@ -104,26 +294,27 @@ fn parse_metadata_to_cache_info_inner(
     // the alias rewrite. Returns `(inner_range_string, target_name_if_alias)`.
     // The inner range string is always safe to hand to `NpmRange::parse`;
     // the target is recorded in the per-version aliases map when present.
-    fn split_alias(raw_range: &str) -> (String, Option<String>) {
-        match crate::ranges::parse_npm_alias(raw_range) {
+    fn split_alias(raw_range: String) -> (String, Option<String>) {
+        match crate::ranges::parse_npm_alias(&raw_range) {
             Some(alias) => (alias.range, Some(alias.target)),
-            None => (raw_range.to_string(), None),
+            None => (raw_range, None),
         }
     }
 
-    for (ver_str, ver_meta) in &metadata.versions {
-        if !is_valid_version_string(ver_str) {
+    for projected in projected_versions {
+        let ver_str = projected.version;
+        if !is_valid_version_string(&ver_str) {
             tracing::warn!("skipping invalid version string: {ver_str:?}");
             continue;
         }
-        if let Ok(v) = NpmVersion::parse(ver_str) {
+        if let Ok(v) = NpmVersion::parse(&ver_str) {
             let mut ver_deps = HashMap::with_capacity(
-                ver_meta.dependencies.len() + ver_meta.optional_dependencies.len(),
+                projected.dependencies.len() + projected.optional_dependencies.len(),
             );
             let mut ver_aliases: HashMap<String, String> = HashMap::new();
 
-            for (dep_name, dep_range) in &ver_meta.dependencies {
-                if !is_valid_dep_name(dep_name) {
+            for (dep_name, dep_range) in projected.dependencies {
+                if !is_valid_dep_name(&dep_name) {
                     tracing::debug!("skipping invalid dep name: {dep_name:?}");
                     continue;
                 }
@@ -137,12 +328,12 @@ fn parse_metadata_to_cache_info_inner(
                     }
                     ver_aliases.insert(dep_name.clone(), target);
                 }
-                ver_deps.insert(dep_name.clone(), inner_range);
+                ver_deps.insert(dep_name, inner_range);
             }
 
             let mut opt_names = HashSet::new();
-            for (dep_name, dep_range) in &ver_meta.optional_dependencies {
-                if !is_valid_dep_name(dep_name) {
+            for (dep_name, dep_range) in projected.optional_dependencies {
+                if !is_valid_dep_name(&dep_name) {
                     tracing::debug!("skipping invalid optional dep name: {dep_name:?}");
                     continue;
                 }
@@ -157,7 +348,7 @@ fn parse_metadata_to_cache_info_inner(
                     ver_aliases.insert(dep_name.clone(), target);
                 }
                 ver_deps.insert(dep_name.clone(), inner_range);
-                opt_names.insert(dep_name.clone());
+                opt_names.insert(dep_name);
             }
             if !opt_names.is_empty() {
                 optional_dep_names.insert(ver_str.clone(), opt_names);
@@ -170,11 +361,11 @@ fn parse_metadata_to_cache_info_inner(
                 deps.insert(ver_str.clone(), ver_deps);
             }
 
-            if !ver_meta.peer_dependencies.is_empty() {
-                let mut ver_peers = HashMap::with_capacity(ver_meta.peer_dependencies.len());
+            if !projected.peer_dependencies.is_empty() {
+                let mut ver_peers = HashMap::with_capacity(projected.peer_dependencies.len());
                 let mut ver_peer_aliases = HashMap::new();
-                for (dep_name, dep_range) in &ver_meta.peer_dependencies {
-                    if !is_valid_dep_name(dep_name) {
+                for (dep_name, dep_range) in projected.peer_dependencies {
+                    if !is_valid_dep_name(&dep_name) {
                         tracing::debug!("skipping invalid peer dep name: {dep_name:?}");
                         continue;
                     }
@@ -188,7 +379,7 @@ fn parse_metadata_to_cache_info_inner(
                         }
                         ver_peer_aliases.insert(dep_name.clone(), target);
                     }
-                    ver_peers.insert(dep_name.clone(), inner_range);
+                    ver_peers.insert(dep_name, inner_range);
                 }
                 if !ver_peers.is_empty() {
                     peer_deps.insert(ver_str.clone(), ver_peers);
@@ -203,14 +394,14 @@ fn parse_metadata_to_cache_info_inner(
             // resolver skip enqueuing those names as separate fetches
             // so the registry copy can't shadow the vendored one
             // depending on hoisting precedence.
-            if !ver_meta.bundle_dependencies.is_empty() {
+            if !projected.bundle_dependencies.is_empty() {
                 let mut bundled = HashSet::new();
-                for name in &ver_meta.bundle_dependencies {
-                    if !is_valid_dep_name(name) {
+                for name in projected.bundle_dependencies {
+                    if !is_valid_dep_name(&name) {
                         tracing::debug!("skipping invalid bundleDependency name: {name:?}");
                         continue;
                     }
-                    bundled.insert(name.clone());
+                    bundled.insert(name);
                 }
                 if !bundled.is_empty() {
                     bundled_dep_names.insert(ver_str.clone(), bundled);
@@ -223,56 +414,42 @@ fn parse_metadata_to_cache_info_inner(
             // the resolver consumes. Filtering by name validity matches
             // the peer-deps loop above so a malformed key in one source
             // can't poison the other.
-            if !ver_meta.peer_dependencies_meta.is_empty() {
+            if !projected.peer_dependencies_meta.is_empty() {
                 let mut opt_peers = HashSet::new();
-                for (peer_name, peer_meta) in &ver_meta.peer_dependencies_meta {
+                for (peer_name, peer_meta) in projected.peer_dependencies_meta {
                     if !peer_meta.optional {
                         continue;
                     }
-                    if !is_valid_dep_name(peer_name) {
+                    if !is_valid_dep_name(&peer_name) {
                         tracing::debug!("skipping invalid optional-peer name: {peer_name:?}");
                         continue;
                     }
-                    opt_peers.insert(peer_name.clone());
+                    opt_peers.insert(peer_name);
                 }
                 if !opt_peers.is_empty() {
                     optional_peer_names.insert(ver_str.clone(), opt_peers);
                 }
             }
 
-            if let Some(required) = ver_meta.engines.get("node") {
-                node_engines.insert(ver_str.clone(), required.clone());
+            if let Some(required) = projected.node_engine {
+                node_engines.insert(ver_str.clone(), required);
             }
 
-            if !ver_meta.os.is_empty() || !ver_meta.cpu.is_empty() || !ver_meta.libc.is_empty() {
+            if !projected.os.is_empty() || !projected.cpu.is_empty() || !projected.libc.is_empty() {
                 platform.insert(
                     ver_str.clone(),
                     PlatformMeta {
-                        os: ver_meta.os.clone(),
-                        cpu: ver_meta.cpu.clone(),
-                        libc: ver_meta.libc.clone(),
+                        os: projected.os,
+                        cpu: projected.cpu,
+                        libc: projected.libc,
                     },
                 );
             }
 
-            dist_info.insert(
-                ver_str.clone(),
-                CachedDistInfo {
-                    tarball_url: ver_meta.tarball_url().map(str::to_string),
-                    integrity: ver_meta.integrity_or_shasum().map(|s| s.into_owned()),
-                    signatures: ver_meta
-                        .dist
-                        .as_ref()
-                        .and_then(|dist| dist.signatures.clone())
-                        .unwrap_or_default(),
-                    published_at: metadata.time.get(ver_str).cloned(),
-                    published_at_unix: metadata
-                        .time
-                        .get(ver_str)
-                        .and_then(|published_at| parse_npm_time_unix(published_at)),
-                    trust_evidence: detect_trust_evidence(ver_meta),
-                },
-            );
+            let mut dist = projected.dist;
+            dist.published_at = release_times.published_at(&ver_str);
+            dist.published_at_unix = dist.published_at.as_deref().and_then(parse_npm_time_unix);
+            dist_info.insert(ver_str, dist);
 
             versions.push(v);
         }
@@ -281,17 +458,16 @@ fn parse_metadata_to_cache_info_inner(
     versions.sort();
     versions.reverse(); // Newest first
 
+    let modified_unix = modified.as_deref().and_then(parse_npm_time_unix);
     let mut info = CachedPackageInfo {
-        modified: metadata.modified.clone(),
-        modified_unix: metadata.modified.as_deref().and_then(parse_npm_time_unix),
+        modified,
+        modified_unix,
         trust_metadata_complete,
         versions_complete,
         covered_ranges: HashSet::new(),
         workspace_versions: HashSet::new(),
         platform_metadata_complete,
-        latest_version: metadata
-            .latest_version_tag()
-            .and_then(|version| NpmVersion::parse(version).ok()),
+        latest_version,
         versions,
         deps,
         peer_deps,
