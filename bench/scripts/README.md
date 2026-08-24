@@ -113,6 +113,53 @@ node bench/scripts/native-build-cache-benchmark.mjs --samples 10
 The harness writes raw rows plus JSON and Markdown summaries under
 `bench/perf-results/native-build-cache-<timestamp>/`.
 
+## T3 six-state install benchmark
+
+`run-t3-install-six-states.mjs` compares LPM with Bun. It uses the tracked
+T3-stack manifest from the install benchmark in Bun.
+
+The harness measures six states:
+
+| State | Lockfile | Dependency cache | `node_modules` |
+| --- | --- | --- | --- |
+| First install | No | Cold | No |
+| Fresh checkout | No | Warm | No |
+| CI without cache | Yes | Cold | No |
+| CI with cache | Yes | Warm | No |
+| Installed, cache removed | Yes | Cold | Yes |
+| Up to date | Yes | Warm | Yes |
+
+The harness prepares each state outside the measured interval. It makes sure
+that each prepared state has the required files before the install starts.
+
+LPM V2 project links point into `LPM_HOME/store`. Thus, the fifth state removes
+`LPM_HOME/cache` but keeps `LPM_HOME/store`. The harness also makes sure that
+`next/package.json` resolves before and after this measured install.
+
+Each LPM and Bun pair is adjacent. The harness alternates the manager order and
+rotates the state order for each sample. Bun is the control for network noise.
+
+Build the release CLI:
+
+```bash
+cargo build --release --locked -p lpm-cli --bin lpm-rs
+```
+
+Run the harness self-test:
+
+```bash
+node bench/scripts/run-t3-install-six-states.mjs --self-test
+```
+
+Run ten samples for each manager and state:
+
+```bash
+node bench/scripts/run-t3-install-six-states.mjs --samples 10
+```
+
+The result directory contains the raw rows, each install output, and JSON and
+Markdown summaries. Set `LPM_NPM_FANOUT` only for an explicit concurrency test.
+
 ## Production-readiness harness
 
 `run-install-readiness.mjs` is the current install-readiness harness. It is

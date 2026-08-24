@@ -339,6 +339,9 @@ jobs:
       - name: Install readiness bench helper tests
         run: node bench/scripts/run-install-readiness.mjs --self-test
 
+      - name: T3 six-state install bench helper tests
+        run: node bench/scripts/run-t3-install-six-states.mjs --self-test
+
       - name: Runtime readiness bench helper tests
         run: node bench/scripts/run-runtime-readiness.mjs --self-test
 
