@@ -99,6 +99,7 @@ pub fn to_lockfile(packages: Vec<MigratedPackage>) -> (Lockfile, Vec<SkippedPack
             version: pkg.version,
             source: Some(source),
             integrity: pkg.integrity,
+            unpacked_size: None,
             manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,

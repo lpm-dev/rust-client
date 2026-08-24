@@ -353,6 +353,7 @@ pub(super) fn locked_package_from_install_package(
         version: package.version.clone(),
         source: Some(package.source.clone()),
         integrity: package.integrity.clone(),
+        unpacked_size: package.unpacked_size,
         manifest_fingerprint: package.manifest_fingerprint.clone(),
         registry_signatures: lockfile_registry_signatures(&package.registry_signatures),
         registry_published_at: package.registry_published_at.clone(),
@@ -2939,6 +2940,7 @@ fn try_lockfile_fast_path_from_rows(
                 is_lpm,
                 peers,
                 integrity: lp.integrity.clone(),
+                unpacked_size: lp.unpacked_size,
                 registry_signatures: install_registry_signatures(&lp.registry_signatures),
                 registry_published_at: lp.registry_published_at.clone(),
                 platform: platform_meta_from_lockfile(lp),
@@ -3245,10 +3247,16 @@ fn resolved_to_unfinalized_install_packages(
             let name = r.package.canonical_name();
             let version = r.version.to_string();
             let canonical = CanonicalKey::from(&r.package);
-            let (registry_signatures, registry_published_at) = resolver_cache
+            let (registry_signatures, registry_published_at, unpacked_size) = resolver_cache
                 .get(&canonical)
                 .and_then(|info| info.dist.get(&version))
-                .map(|dist| (dist.signatures.clone(), dist.published_at.clone()))
+                .map(|dist| {
+                    (
+                        dist.signatures.clone(),
+                        dist.published_at.clone(),
+                        dist.unpacked_size,
+                    )
+                })
                 .unwrap_or_default();
             let is_lpm = r.package.is_lpm();
             // Derive the wire-format source string from the active
@@ -3277,6 +3285,7 @@ fn resolved_to_unfinalized_install_packages(
                 peers: r.peers.clone(),
                 peer_targets: HashMap::with_capacity(r.peer_targets.len()),
                 integrity: r.integrity.clone(),
+                unpacked_size,
                 registry_signatures,
                 registry_published_at,
                 platform: r.platform.clone(),

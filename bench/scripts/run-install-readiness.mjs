@@ -896,6 +896,9 @@ function extractLpmMetrics(json) {
     total_ms: numberAt(json, ['timing', 'total_ms']),
     fetch_task_sum_ms: numberAt(json, ['timing', 'fetch_breakdown', 'task_sum_ms']),
     fetch_task_max_ms: numberAt(json, ['timing', 'fetch_breakdown', 'task_max_ms']),
+    fetch_pipeline_wall_task_count: breakdownStat(fetchBreakdown, 'pipeline_wall', 'task_count'),
+    fetch_pipeline_wall_sum_ms: breakdownStat(fetchBreakdown, 'pipeline_wall', 'sum_ms'),
+    fetch_pipeline_wall_max_ms: breakdownStat(fetchBreakdown, 'pipeline_wall', 'max_ms'),
     fetch_queue_wait_sum_ms: breakdownStat(fetchBreakdown, 'queue_wait', 'sum_ms'),
     fetch_extract_sum_ms: breakdownStat(fetchBreakdown, 'extract', 'sum_ms'),
     fetch_source_scan_sum_ns: fetchSourceScanSumNs,
@@ -2769,6 +2772,11 @@ function runSelfTests() {
         },
       },
       fetch_breakdown: {
+        pipeline_wall: {
+          task_count: 1,
+          sum_ms: 23,
+          max_ms: 23,
+        },
         source_scan: {
           sum_ns: 12_500_000,
           max_ns: 3_750_000,
@@ -2877,6 +2885,9 @@ function runSelfTests() {
     'source scan max must include authoritative and overlap fetch tasks',
   );
   assert.equal(currentMetadataMetrics.fetch_source_scan_sum_ms, 21);
+  assert.equal(currentMetadataMetrics.fetch_pipeline_wall_task_count, 1);
+  assert.equal(currentMetadataMetrics.fetch_pipeline_wall_sum_ms, 23);
+  assert.equal(currentMetadataMetrics.fetch_pipeline_wall_max_ms, 23);
   assert.equal(currentMetadataMetrics.firewall_batch_ms, 31);
   assert.equal(currentMetadataMetrics.firewall_checked_count, 10);
   assert.equal(currentMetadataMetrics.firewall_warn_count, 1);

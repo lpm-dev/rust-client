@@ -782,6 +782,7 @@ fn install_package_from_selected_event(
         is_lpm: event.is_lpm,
         peers: Vec::new(),
         integrity: event.integrity,
+        unpacked_size: event.unpacked_size,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: event.platform,
@@ -843,6 +844,8 @@ async fn fetch_selected_package(
                 permit,
                 &fetch_extract_limiter,
                 install_accounting,
+                V2StreamingEligibility::Disabled,
+                None,
             )
             .await?
         } else {
@@ -905,6 +908,7 @@ mod tests {
             is_lpm: false,
             peers: Vec::new(),
             integrity: Some(integrity.to_string()),
+            unpacked_size: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,
             platform: None,

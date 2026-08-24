@@ -192,6 +192,7 @@ fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) 
             .integrity
             .clone()
             .or_else(|| existing.integrity.clone()),
+        unpacked_size: incoming.unpacked_size.or(existing.unpacked_size),
         signatures: if incoming.signatures.is_empty() {
             existing.signatures.clone()
         } else {

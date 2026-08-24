@@ -802,6 +802,7 @@ mod tests {
             version: "1.0.0".to_string(),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some("sha512-test".to_string()),
+            unpacked_size: None,
             manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,

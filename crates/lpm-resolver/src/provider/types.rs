@@ -93,6 +93,7 @@ pub struct StreamingBfsMetrics {
 pub struct CachedDistInfo {
     pub tarball_url: Option<String>,
     pub integrity: Option<String>,
+    pub unpacked_size: Option<std::num::NonZeroU64>,
     pub signatures: Vec<lpm_registry::RegistrySignature>,
     pub published_at: Option<String>,
     pub published_at_unix: Option<i64>,

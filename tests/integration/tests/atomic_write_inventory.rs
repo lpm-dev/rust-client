@@ -296,7 +296,7 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes or discards a complete local-source object directory after a concurrent transaction",
     ),
     (
-        "crates/lpm-store/src/v2/store.rs::extract_object_from_input_with_policy",
+        "crates/lpm-store/src/v2/store.rs::publish_staged_object",
         "writes are inside an object staging directory that is published as a directory transaction",
     ),
     (

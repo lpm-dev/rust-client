@@ -20,6 +20,7 @@ pub(super) fn fake_package(name: &str, version: &str, deps: &[(&str, &str)]) -> 
         is_lpm: false,
         peers: Vec::new(),
         integrity: Some(format!("sha512-{name}-{version}")),
+        unpacked_size: None,
         registry_signatures: Vec::new(),
         registry_published_at: None,
         platform: None,

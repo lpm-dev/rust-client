@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use lpm_common::LpmError;
+use lpm_common::integrity::{HashAlgorithm, Integrity};
 use sha1::Sha1;
 use sha2::{Digest, Sha512};
 
@@ -188,12 +189,9 @@ impl PackageStore {
     /// - Match → atomic rename into the visible store path.
     /// - Mismatch → staging dir is removed, returns `LpmError::Registry`.
     ///
-    /// Unlike `store_package_from_file_timed`, this path does NOT support
-    /// non-sha512 expected-integrity algorithms (e.g. sha256) — we've
-    /// consumed the stream by the time we'd need to re-hash. Callers
-    /// that receive non-sha512 integrity from the registry must use the
-    /// legacy `download_tarball_to_file` + `store_package_from_file_timed`
-    /// path (currently all LPM registry packages publish sha512 SRIs).
+    /// SHA-512 is always computed for canonical object identity. SHA-256 and
+    /// SHA-1 are computed in the same pass so older registry declarations can
+    /// be verified without re-reading or buffering the stream.
     ///
     /// ## Failure semantics
     /// Any error after staging-dir creation cleans up the staging dir
@@ -550,46 +548,66 @@ impl PackageStore {
     }
 }
 
-/// Transparent `Read` wrapper that feeds every byte into BOTH a
-/// SHA-512 and a SHA-256 hasher as it flows through. Computes the
-/// tarball SRI inline with streaming extraction — no second pass, no
-/// temp file.
-///
-/// SHA-512 is canonical; SHA-256 is computed in parallel because
-/// some legitimate npm lockfile entries still ship `sha256-…` SRI
-/// (older publishes / mirrors). The verifier compares against whichever computed digest
-/// matches the expected algorithm, so a sha256 expected value
-/// actually gets verified against the matching computation.
-///
-/// After the extractor finishes consuming the stream, call
-/// [`HashingReader::finalize`] to obtain `(sha512_sri, sha256_sri, sha1_sri, total_bytes)`.
-struct HashingReader<R> {
+/// Transparent `Read` wrapper that computes the canonical SHA-512 tarball
+/// identity inline with extraction. The declared-integrity constructor adds
+/// SHA-256 or SHA-1 only when the declaration requires it.
+pub(crate) struct HashingReader<R> {
     inner: R,
     sha512: Sha512,
-    sha256: sha2::Sha256,
-    sha1: Sha1,
+    sha256: Option<sha2::Sha256>,
+    sha1: Option<Sha1>,
     bytes: u64,
 }
 
+pub(crate) trait StreamingIntegrityReader: std::io::Read {
+    fn canonical_sha512_sri(&self) -> String;
+    fn integrity_matches(&self, expected: &Integrity) -> Option<bool>;
+    fn integrity_sri(&self, algorithm: HashAlgorithm) -> Option<String>;
+}
+
 impl<R: std::io::Read> HashingReader<R> {
-    fn new(inner: R) -> Self {
+    pub(crate) fn new(inner: R) -> Self {
         use sha2::Digest;
         Self {
             inner,
             sha512: Sha512::new(),
-            sha256: sha2::Sha256::new(),
-            sha1: Sha1::new(),
+            sha256: Some(sha2::Sha256::new()),
+            sha1: Some(Sha1::new()),
             bytes: 0,
         }
     }
 
+    pub(crate) fn for_expected_integrity(
+        inner: R,
+        expected_integrity: Option<&str>,
+    ) -> Result<Self, LpmError> {
+        let expected_algorithm = expected_integrity
+            .map(Integrity::parse)
+            .transpose()?
+            .map(|integrity| integrity.algorithm);
+        Ok(Self {
+            inner,
+            sha512: Sha512::new(),
+            sha256: matches!(expected_algorithm, Some(HashAlgorithm::Sha256))
+                .then(sha2::Sha256::new),
+            sha1: matches!(expected_algorithm, Some(HashAlgorithm::Sha1)).then(Sha1::new),
+            bytes: 0,
+        })
+    }
+
     /// Finalize all hashers and return `(sha512_sri, sha256_sri, sha1_sri, total_bytes)`.
     /// Consumes `self` because the hashers are one-shot.
-    fn finalize(self) -> (String, String, String, u64) {
+    pub(crate) fn finalize(self) -> (String, String, String, u64) {
         use base64::Engine;
         let sha512_digest = self.sha512.finalize();
-        let sha256_digest = self.sha256.finalize();
-        let sha1_digest = self.sha1.finalize();
+        let sha256_digest = self
+            .sha256
+            .expect("default hashing reader includes sha256")
+            .finalize();
+        let sha1_digest = self
+            .sha1
+            .expect("default hashing reader includes sha1")
+            .finalize();
         let sha512_sri = format!(
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode(sha512_digest)
@@ -606,14 +624,66 @@ impl<R: std::io::Read> HashingReader<R> {
     }
 }
 
+impl<R: std::io::Read> StreamingIntegrityReader for HashingReader<R> {
+    fn canonical_sha512_sri(&self) -> String {
+        use base64::Engine;
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(self.sha512.clone().finalize())
+        )
+    }
+
+    fn integrity_matches(&self, expected: &Integrity) -> Option<bool> {
+        use subtle::ConstantTimeEq;
+        let matches = |computed: &[u8]| {
+            expected.hash.len() == computed.len()
+                && bool::from(expected.hash.as_slice().ct_eq(computed))
+        };
+        match expected.algorithm {
+            HashAlgorithm::Sha512 => Some(matches(self.sha512.clone().finalize().as_slice())),
+            HashAlgorithm::Sha256 => self
+                .sha256
+                .as_ref()
+                .map(|hasher| matches(hasher.clone().finalize().as_slice())),
+            HashAlgorithm::Sha1 => self
+                .sha1
+                .as_ref()
+                .map(|hasher| matches(hasher.clone().finalize().as_slice())),
+        }
+    }
+
+    fn integrity_sri(&self, algorithm: HashAlgorithm) -> Option<String> {
+        use base64::Engine;
+        let encoded = match algorithm {
+            HashAlgorithm::Sha512 => {
+                base64::engine::general_purpose::STANDARD.encode(self.sha512.clone().finalize())
+            }
+            HashAlgorithm::Sha256 => base64::engine::general_purpose::STANDARD
+                .encode(self.sha256.as_ref()?.clone().finalize()),
+            HashAlgorithm::Sha1 => base64::engine::general_purpose::STANDARD
+                .encode(self.sha1.as_ref()?.clone().finalize()),
+        };
+        let algorithm = match algorithm {
+            HashAlgorithm::Sha512 => "sha512",
+            HashAlgorithm::Sha256 => "sha256",
+            HashAlgorithm::Sha1 => "sha1",
+        };
+        Some(format!("{algorithm}-{encoded}"))
+    }
+}
+
 impl<R: std::io::Read> std::io::Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use sha2::Digest;
         let n = self.inner.read(buf)?;
         if n > 0 {
             self.sha512.update(&buf[..n]);
-            self.sha256.update(&buf[..n]);
-            self.sha1.update(&buf[..n]);
+            if let Some(hasher) = &mut self.sha256 {
+                hasher.update(&buf[..n]);
+            }
+            if let Some(hasher) = &mut self.sha1 {
+                hasher.update(&buf[..n]);
+            }
             self.bytes += n as u64;
         }
         Ok(n)
@@ -625,14 +695,14 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
 /// `download_tarball_to_file` rejection, surfacing through the
 /// extractor as `LpmError::Io`. No bytes past the cap are ever
 /// written to the staging directory.
-struct SizeLimitedReader<R> {
+pub(crate) struct SizeLimitedReader<R> {
     inner: R,
     bytes_read: u64,
     limit: u64,
 }
 
 impl<R: std::io::Read> SizeLimitedReader<R> {
-    fn new(inner: R, limit: u64) -> Self {
+    pub(crate) fn new(inner: R, limit: u64) -> Self {
         Self {
             inner,
             bytes_read: 0,

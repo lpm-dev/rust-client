@@ -450,7 +450,10 @@ async fn buffered_download_keeps_its_slot_until_extraction_can_start() {
         .acquire_owned()
         .await
         .expect("extract semaphore must remain open");
-    let limiter = Some(extract_semaphore);
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        1,
+    ));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
 
     let handoff = tokio::spawn(async move {
@@ -498,7 +501,10 @@ async fn tarball_url_download_releases_network_slot_while_extraction_is_blocked(
     let download_permit = download_semaphore.clone().acquire_owned().await.unwrap();
     let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
     let held_extract_permit = extract_semaphore.clone().acquire_owned().await.unwrap();
-    let limiter = Some(extract_semaphore);
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        1,
+    ));
 
     let fetch = tokio::spawn(async move {
         fetch_and_store_tarball_url(
@@ -574,7 +580,10 @@ async fn tarball_url_v2_extraction_does_not_block_async_progress() {
     let download_permit = download_semaphore.clone().acquire_owned().await.unwrap();
     let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
     let held_extract_permit = extract_semaphore.clone().acquire_owned().await.unwrap();
-    let limiter = Some(extract_semaphore);
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        1,
+    ));
 
     let fetch = tokio::spawn(async move {
         fetch_and_store_tarball_url(
@@ -610,7 +619,7 @@ async fn tarball_url_v2_extraction_does_not_block_async_progress() {
 }
 
 #[tokio::test]
-async fn default_v2_registry_download_releases_network_slot_while_extraction_is_blocked() {
+async fn selected_v2_registry_download_waits_for_extraction_capacity_and_then_streams() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -644,7 +653,10 @@ async fn default_v2_registry_download_releases_network_slot_while_extraction_is_
     let download_permit = download_semaphore.clone().acquire_owned().await.unwrap();
     let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
     let held_extract_permit = extract_semaphore.clone().acquire_owned().await.unwrap();
-    let limiter = Some(extract_semaphore);
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        1,
+    ));
 
     let fetch = tokio::spawn(async move {
         fetch_and_store_streaming(
@@ -659,26 +671,531 @@ async fn default_v2_registry_download_releases_network_slot_while_extraction_is_
             download_permit,
             &limiter,
             ManagedInstallAccounting,
+            V2StreamingEligibility::CriticalCandidate(&V2StreamingLane::default()),
+            None,
         )
         .await
     });
 
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        download_semaphore.available_permits(),
+        0,
+        "the selected response must remain live instead of silently spooling"
+    );
+
+    drop(held_extract_permit);
+    let (_, timings, _, _) = fetch
+        .await
+        .expect("registry fetch task must not panic")
+        .expect("registry fetch must finish after extraction unblocks");
+    assert!(timings.pipeline_wall_recorded);
+    assert_eq!(download_semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn v2_streaming_lane_is_fail_closed_and_losers_release_extraction_capacity() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let url = format!(
+        "{}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz",
+        server.uri()
+    );
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(server.uri()));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+{}", server.uri());
+    package.integrity = Some(integrity);
+    package.tarball_url = Some(url);
+    let gate_stats = Arc::new(GateStats::default());
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        1,
+    ));
+    let lane = V2StreamingLane::default();
+
+    let (_, disabled_timings, _, _) = fetch_and_store_streaming(
+        &client,
+        &route_table,
+        &store,
+        Some(&store_v2),
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &gate_stats,
+        install_pkg_acquire_permit(),
+        &limiter,
+        ManagedInstallAccounting,
+        V2StreamingEligibility::Disabled,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!disabled_timings.pipeline_wall_recorded);
+
+    let (_, streamed_timings, _, _) = fetch_and_store_streaming(
+        &client,
+        &route_table,
+        &store,
+        Some(&store_v2),
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &gate_stats,
+        install_pkg_acquire_permit(),
+        &limiter,
+        ManagedInstallAccounting,
+        V2StreamingEligibility::CriticalCandidate(&lane),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(streamed_timings.pipeline_wall_recorded);
+
+    let loser = fetch_and_store_streaming(
+        &client,
+        &route_table,
+        &store,
+        Some(&store_v2),
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &gate_stats,
+        install_pkg_acquire_permit(),
+        &limiter,
+        ManagedInstallAccounting,
+        V2StreamingEligibility::CriticalCandidate(&lane),
+        None,
+    );
+    let (_, loser_timings, _, _) = tokio::time::timeout(std::time::Duration::from_secs(2), loser)
+        .await
+        .expect("a losing lane claimant must not deadlock on its own extraction permit")
+        .unwrap();
+
+    assert!(!loser_timings.pipeline_wall_recorded);
+    assert_eq!(extract_semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn v3_registry_fetch_uses_file_spool_when_offered_the_v2_streaming_lane() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!(
+        "{}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz",
+        server.uri()
+    );
+    let store_root = tempfile::tempdir().unwrap();
+    let v3_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v3 = lpm_store::v2::Store::at_v3(v3_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(server.uri()));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+{}", server.uri());
+    package.integrity = Some(integrity);
+    package.tarball_url = Some(url);
+
+    let (_, timings, _, fresh_object) = fetch_and_store_streaming(
+        &client,
+        &route_table,
+        &store,
+        Some(&store_v3),
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &Arc::new(GateStats::default()),
+        install_pkg_acquire_permit(),
+        &None,
+        ManagedInstallAccounting,
+        V2StreamingEligibility::CriticalCandidate(&V2StreamingLane::default()),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(!timings.pipeline_wall_recorded);
+    assert!(fresh_object.is_some());
+}
+
+#[tokio::test]
+async fn cancelling_weighted_stream_before_lease_expiry_releases_all_capacity_after_cleanup() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let body_started = Arc::new(tokio::sync::Notify::new());
+    let server_resume = Arc::new(tokio::sync::Notify::new());
+    let body_started_server = Arc::clone(&body_started);
+    let server_resume_server = Arc::clone(&server_resume);
+    let partial = body[..body.len() / 2].to_vec();
+    let content_length = body.len();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&partial).await.unwrap();
+        body_started_server.notify_one();
+        server_resume_server.notified().await;
+    });
+
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(format!("http://{address}")));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+http://{address}");
+    package.integrity = Some(integrity);
+    package.unpacked_size = std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES);
+    package.tarball_url = Some(format!(
+        "http://{address}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"
+    ));
+    let package_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let package_guard = Arc::clone(&package_lock).lock_owned().await;
+    let download_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let download_permit = Arc::clone(&download_semaphore)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        4,
+    ));
+    let fetch = tokio::spawn(async move {
+        let lane = V2StreamingLane::default();
+        fetch_and_store_streaming(
+            &client,
+            &route_table,
+            &store,
+            Some(&store_v2),
+            &package,
+            0,
+            ArtifactSelection::LockfileReplay,
+            &Arc::new(GateStats::default()),
+            download_permit,
+            &limiter,
+            ManagedInstallAccounting,
+            V2StreamingEligibility::CriticalCandidate(&lane),
+            Some(package_guard),
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), body_started.notified())
+        .await
+        .expect("the server must start the response body");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if download_semaphore.available_permits() == 1 {
-                break;
-            }
+        while extract_semaphore.available_permits() != 1 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("a completed V2 download must release its network slot before extraction");
+    .expect("the weighted streaming task must acquire base and supplemental capacity");
+    assert_eq!(extract_semaphore.available_permits(), 1);
+    fetch.abort();
+    assert!(fetch.await.unwrap_err().is_cancelled());
+    let guard = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        Arc::clone(&package_lock).lock_owned(),
+    )
+    .await
+    .expect("stream cancellation must finish staging cleanup before releasing the package lock");
 
-    drop(held_extract_permit);
-    fetch
+    assert_eq!(download_semaphore.available_permits(), 1);
+    assert_eq!(extract_semaphore.available_permits(), 4);
+    let objects_root = v2_root.path().join("objects");
+    assert!(!objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none());
+    drop(guard);
+    server_resume.notify_one();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn streamed_integrity_failure_releases_all_weighted_capacity_and_staging() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let body = build_test_tarball();
+    let wrong_integrity =
+        Integrity::from_bytes(HashAlgorithm::Sha512, b"different tarball").to_string();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(server.uri()));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+{}", server.uri());
+    package.integrity = Some(wrong_integrity);
+    package.unpacked_size = std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES);
+    package.tarball_url = Some(format!(
+        "{}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz",
+        server.uri()
+    ));
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        4,
+    ));
+    let lane = V2StreamingLane::default();
+
+    let error = fetch_and_store_streaming(
+        &client,
+        &route_table,
+        &store,
+        Some(&store_v2),
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &Arc::new(GateStats::default()),
+        install_pkg_acquire_permit(),
+        &limiter,
+        ManagedInstallAccounting,
+        V2StreamingEligibility::CriticalCandidate(&lane),
+        None,
+    )
+    .await
+    .expect_err("the streamed package must reject the wrong registry integrity");
+
+    assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+    assert_eq!(extract_semaphore.available_permits(), 4);
+    let objects_root = v2_root.path().join("objects");
+    assert!(!objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn cancelling_weighted_stream_after_lease_expiry_releases_base_capacity_after_cleanup() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let body_started = Arc::new(tokio::sync::Notify::new());
+    let server_resume = Arc::new(tokio::sync::Notify::new());
+    let body_started_server = Arc::clone(&body_started);
+    let server_resume_server = Arc::clone(&server_resume);
+    let split = body.len() / 2;
+    let first = body[..split].to_vec();
+    let second = body[split..].to_vec();
+    let content_length = body.len();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&first).await.unwrap();
+        body_started_server.notify_one();
+        server_resume_server.notified().await;
+        let _ = socket.write_all(&second).await;
+    });
+
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(format!("http://{address}")));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+http://{address}");
+    package.integrity = Some(integrity);
+    package.unpacked_size = std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES);
+    package.tarball_url = Some(format!(
+        "http://{address}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"
+    ));
+    let package_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let package_guard = Arc::clone(&package_lock).lock_owned().await;
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        4,
+    ));
+    let fetch = tokio::spawn(async move {
+        let lane = V2StreamingLane::default();
+        fetch_and_store_streaming(
+            &client,
+            &route_table,
+            &store,
+            Some(&store_v2),
+            &package,
+            0,
+            ArtifactSelection::LockfileReplay,
+            &Arc::new(GateStats::default()),
+            install_pkg_acquire_permit(),
+            &limiter,
+            ManagedInstallAccounting,
+            V2StreamingEligibility::CriticalCandidate(&lane),
+            Some(package_guard),
+        )
         .await
-        .expect("registry fetch task must not panic")
-        .expect("registry fetch must finish after extraction unblocks");
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), body_started.notified())
+        .await
+        .expect("the server must start the response body");
+    tokio::time::sleep(
+        V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE + std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert_eq!(extract_semaphore.available_permits(), 3);
+    fetch.abort();
+    assert!(fetch.await.unwrap_err().is_cancelled());
+    let guard = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        Arc::clone(&package_lock).lock_owned(),
+    )
+    .await
+    .expect("stream cancellation must finish staging cleanup before releasing the package lock");
+    assert_eq!(extract_semaphore.available_permits(), 4);
+    let objects_root = v2_root.path().join("objects");
+    assert!(!objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none());
+    drop(guard);
+    server_resume.notify_one();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_streaming_candidate_does_not_reserve_extraction_capacity_during_header_latency() {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let request_arrived = Arc::new(tokio::sync::Notify::new());
+    let send_response = Arc::new(tokio::sync::Notify::new());
+    let request_arrived_server = Arc::clone(&request_arrived);
+    let send_response_server = Arc::clone(&send_response);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        request_arrived_server.notify_one();
+        send_response_server.notified().await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&body).await.unwrap();
+    });
+
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(format!("http://{address}")));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+http://{address}");
+    package.integrity = Some(integrity);
+    package.tarball_url = Some(format!(
+        "http://{address}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"
+    ));
+    let extract_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&extract_semaphore),
+        1,
+    ));
+    let fetch = tokio::spawn(async move {
+        let lane = V2StreamingLane::default();
+        fetch_and_store_streaming(
+            &client,
+            &route_table,
+            &store,
+            Some(&store_v2),
+            &package,
+            0,
+            ArtifactSelection::LockfileReplay,
+            &Arc::new(GateStats::default()),
+            install_pkg_acquire_permit(),
+            &limiter,
+            ManagedInstallAccounting,
+            V2StreamingEligibility::CriticalCandidate(&lane),
+            None,
+        )
+        .await
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        request_arrived.notified(),
+    )
+    .await
+    .expect("the delayed response request must reach the server");
+    assert_eq!(extract_semaphore.available_permits(), 1);
+    send_response.notify_one();
+    let (_, timings, _, _) = fetch.await.unwrap().unwrap();
+
+    assert!(timings.pipeline_wall_recorded);
+    server.await.unwrap();
 }
 
 #[tokio::test]

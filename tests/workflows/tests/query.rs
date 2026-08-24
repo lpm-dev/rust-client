@@ -418,6 +418,7 @@ fn query_scans_v1_directory_dependencies_from_their_live_source() {
         name: "local".to_string(),
         version: "1.0.0".to_string(),
         source: Some(source.to_string()),
+        unpacked_size: None,
         manifest_fingerprint: Some(format!("sha256-{}", "ab".repeat(32))),
         ..Default::default()
     });

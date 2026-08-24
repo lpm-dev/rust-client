@@ -622,6 +622,39 @@ fn owned_metadata_projection_moves_dependency_storage_into_the_cache() {
 }
 
 #[test]
+fn metadata_projection_preserves_registry_unpacked_size() {
+    let metadata: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "large-package",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "large-package",
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.invalid/large-package-1.0.0.tgz",
+                    "integrity": "sha512-test",
+                    "unpackedSize": 184624992
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let borrowed = parse_metadata_to_cache_info(&metadata);
+    let owned = parse_owned_metadata_to_cache_info(metadata);
+    assert_eq!(
+        borrowed.dist["1.0.0"]
+            .unpacked_size
+            .map(std::num::NonZeroU64::get),
+        Some(184_624_992)
+    );
+    assert_eq!(
+        borrowed.dist["1.0.0"].unpacked_size,
+        owned.dist["1.0.0"].unpacked_size
+    );
+}
+
+#[test]
 fn owned_and_borrowed_metadata_projection_have_the_same_contract() {
     let metadata: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
         "name": "projection-contract",

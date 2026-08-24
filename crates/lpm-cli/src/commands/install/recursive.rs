@@ -2247,6 +2247,7 @@ mod tests {
             version: "4.17.21".to_string(),
             source: Some(source.to_string()),
             integrity: None,
+            unpacked_size: None,
             manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,

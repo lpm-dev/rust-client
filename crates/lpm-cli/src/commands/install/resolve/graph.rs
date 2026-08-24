@@ -386,6 +386,7 @@ pub(super) fn merge_node_into_packages(
                 is_lpm,
                 peers: Vec::new(),
                 integrity: dist.and_then(|dist| dist.integrity.clone()),
+                unpacked_size: dist.and_then(|dist| dist.unpacked_size),
                 registry_signatures: dist.map(|dist| dist.signatures.clone()).unwrap_or_default(),
                 registry_published_at: dist.and_then(|dist| dist.published_at.clone()),
                 platform: node.platform.clone(),

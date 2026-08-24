@@ -413,6 +413,7 @@ fn binary_lockfile_roundtrip_100_packages() {
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
             integrity: Some(VALID_SHA512_SRI.to_string()),
+            unpacked_size: None,
             manifest_fingerprint: None,
             registry_signatures: Vec::new(),
             registry_published_at: None,

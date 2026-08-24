@@ -117,6 +117,7 @@ pub struct SelectedPackageEvent {
     pub is_lpm: bool,
     pub tarball_url: Option<String>,
     pub integrity: Option<String>,
+    pub unpacked_size: Option<std::num::NonZeroU64>,
     pub platform: Option<PlatformMeta>,
     pub node_engine: Option<String>,
     pub optional: bool,

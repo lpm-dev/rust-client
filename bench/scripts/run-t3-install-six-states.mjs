@@ -57,6 +57,7 @@ if (argv.selfTest) {
 }
 
 const samples = positiveInteger(argv.samples ?? '10', '--samples');
+const timingSamples = positiveInteger(argv.timingSamples ?? '3', '--timing-samples');
 const lpmBin = path.resolve(argv.lpmBin ?? path.join(repoRoot, 'target/release/lpm-rs'));
 const fixtureDir = path.resolve(
   argv.fixture ?? path.join(repoRoot, 'bench/audit-fixtures/t3-install'),
@@ -83,6 +84,7 @@ fs.mkdirSync(artifactDir, { recursive: true });
 const metadata = {
   created_at: new Date().toISOString(),
   samples,
+  timing_samples: timingSamples,
   managers: MANAGERS,
   scenarios: SCENARIOS,
   fixture: {
@@ -108,7 +110,8 @@ const metadata = {
   total_memory_bytes: os.totalmem(),
   timeout_ms: timeoutMs,
   lpm_npm_fanout_override: process.env.LPM_NPM_FANOUT,
-  timing_scope: 'install command only; all state setup and cache deletion excluded',
+  timing_scope:
+    'scored wall/RSS samples omit timing instrumentation; separate LPM-only diagnostics use --timing with trace detail',
   script_policy: 'install scripts disabled for both managers',
   state_mapping: {
     lpm_cache: 'LPM_HOME/cache (ephemeral metadata)',
@@ -162,18 +165,59 @@ for (let sample = 1; sample <= samples; sample += 1) {
   writeJson(path.join(outputDir, 'rows.partial.json'), rows);
 }
 
+const timingRows = [];
+for (let sample = 1; sample <= timingSamples; sample += 1) {
+  const scenarioOrder = rotate(SCENARIOS, (sample - 1) % SCENARIOS.length);
+  for (const scenario of scenarioOrder) {
+    const root = path.join(workspaceDir, `timing-${sample}-${scenario.id}-lpm`);
+    prepareScenario({ manager: 'lpm', scenario: scenario.id, root });
+    const setup = captureState('lpm', root);
+    assertScenarioState('lpm', scenario.id, setup);
+    const output = path.join(artifactDir, 'timing', scenario.id, `sample-${sample}`);
+    const result = runInstall({
+      manager: 'lpm',
+      root,
+      output,
+      measured: false,
+      timing: true,
+    });
+    const verification = verifyInstalledProject(root);
+    const row = { sample, scenario: scenario.id, manager: 'lpm', setup, verification, ...result };
+    timingRows.push(row);
+    writeJson(path.join(output, 'metrics.json'), row);
+    console.log(
+      `[timing ${scenario.id} lpm] ${sample}/${timingSamples} ${result.ok && verification.ok ? 'ok' : 'FAIL'} ` +
+        `pipeline=${formatMs(result.pipeline_wall_max_ms)} package=${result.streamed_package ?? 'none'}`,
+    );
+    if (!keepWork) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+  writeJson(path.join(outputDir, 'timing-rows.partial.json'), timingRows);
+}
+
 const summary = summarize(rows);
+const timingSummary = summarizeTiming(timingRows);
 writeJson(path.join(outputDir, 'rows.json'), rows);
 writeJson(path.join(outputDir, 'summary.json'), summary);
-fs.writeFileSync(path.join(outputDir, 'summary.md'), renderMarkdown(metadata, summary));
+writeJson(path.join(outputDir, 'timing-rows.json'), timingRows);
+writeJson(path.join(outputDir, 'timing-summary.json'), timingSummary);
+fs.writeFileSync(
+  path.join(outputDir, 'summary.md'),
+  renderMarkdown(metadata, summary, timingSummary),
+);
 fs.rmSync(path.join(outputDir, 'rows.partial.json'), { force: true });
+fs.rmSync(path.join(outputDir, 'timing-rows.partial.json'), { force: true });
 
 if (!keepWork) {
   fs.rmSync(workspaceDir, { recursive: true, force: true });
 }
 
 console.log(`results: ${outputDir}`);
-if (rows.some((row) => !row.ok || !row.verification.ok)) {
+if (
+  rows.some((row) => !row.ok || !row.verification.ok) ||
+  timingRows.some((row) => !row.ok || !row.verification.ok)
+) {
   process.exitCode = 1;
 }
 
@@ -322,10 +366,10 @@ function lockfilePresent(manager, project) {
   return names.some((name) => fs.existsSync(path.join(project, name)));
 }
 
-function runInstall({ manager, root, output, measured }) {
+function runInstall({ manager, root, output, measured, timing = false }) {
   fs.mkdirSync(output, { recursive: true });
-  const command = installCommand(manager);
-  const env = managerEnv(manager, root);
+  const command = installCommand(manager, timing);
+  const env = managerEnv(manager, root, timing);
   const timePath = path.join(output, 'time.txt');
   const timed = measured ? timedCommand(command, timePath) : { command, enabled: false };
   const actual = timed.command;
@@ -379,12 +423,13 @@ function runInstall({ manager, root, output, measured }) {
       'v2_one',
       'touch_sum_ns',
     ]),
+    ...streamingPipelineMetrics(parsed),
   };
 }
 
-function installCommand(manager) {
+function installCommand(manager, timing) {
   if (manager === 'lpm') {
-    return [
+    const command = [
       lpmBin,
       '--json',
       'install',
@@ -392,11 +437,15 @@ function installCommand(manager) {
       '--no-skills',
       '--no-editor-setup',
     ];
+    if (timing) {
+      command.push('--timing');
+    }
+    return command;
   }
   return ['bun', 'install', '--ignore-scripts'];
 }
 
-function managerEnv(manager, root) {
+function managerEnv(manager, root, timing = false) {
   const keep = [
     'PATH',
     'SHELL',
@@ -436,7 +485,9 @@ function managerEnv(manager, root) {
   if (manager === 'lpm') {
     env.LPM_HOME = lpmHomeDir(root);
     env.LPM_STORE_VERSION = 'v2';
-    env.LPM_TIMING_DETAIL = 'trace';
+    if (timing) {
+      env.LPM_TIMING_DETAIL = 'trace';
+    }
   }
   return env;
 }
@@ -493,6 +544,49 @@ function summarize(rows) {
   });
 }
 
+function summarizeTiming(rows) {
+  return SCENARIOS.map((scenario) => {
+    const group = rows.filter(
+      (row) => row.scenario === scenario.id && row.ok && row.verification.ok,
+    );
+    const streamedPackages = {};
+    for (const row of group) {
+      const name = row.streamed_package ?? 'none';
+      streamedPackages[name] = (streamedPackages[name] ?? 0) + 1;
+    }
+    return {
+      scenario: scenario.id,
+      title: scenario.title,
+      successful_samples: group.length,
+      pipeline_wall_sum_ms: stats(group.map((row) => row.pipeline_wall_sum_ms)),
+      pipeline_wall_max_ms: stats(group.map((row) => row.pipeline_wall_max_ms)),
+      pipeline_wall_task_count: stats(group.map((row) => row.pipeline_wall_task_count)),
+      stream_body_wall_ms: stats(group.map((row) => row.stream_body_wall_ms)),
+      streaming_weight_requested: stats(
+        group.map((row) => row.streaming_weight_requested),
+      ),
+      streaming_weight_acquired: stats(
+        group.map((row) => row.streaming_weight_acquired),
+      ),
+      streaming_extract_permit_wait_ms: stats(
+        group.map((row) => row.streaming_extract_permit_wait_ms),
+      ),
+      supplemental_permit_hold_ms: stats(
+        group.map((row) => row.supplemental_permit_hold_ms),
+      ),
+      supplemental_permit_lease_expired: stats(
+        group.map((row) => row.supplemental_permit_lease_expired),
+      ),
+      declared_unpacked_bytes: stats(group.map((row) => row.declared_unpacked_bytes)),
+      actual_unpacked_bytes: stats(group.map((row) => row.actual_unpacked_bytes)),
+      actual_to_declared_unpacked_ratio: stats(
+        group.map((row) => row.actual_to_declared_unpacked_ratio),
+      ),
+      streamed_packages: streamedPackages,
+    };
+  });
+}
+
 function stats(values) {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
   if (sorted.length === 0) {
@@ -515,7 +609,7 @@ function percentile(sorted, quantile) {
   return sorted[Math.ceil(quantile * sorted.length) - 1];
 }
 
-function renderMarkdown(plan, summary) {
+function renderMarkdown(plan, summary, timingSummary) {
   const lines = [
     '# T3 six-state install benchmark',
     '',
@@ -537,6 +631,20 @@ function renderMarkdown(plan, summary) {
       `| ${row.title}<br><sub>${row.state}</sub> | ${wallCell(lpm.wall_ms)} | ${wallCell(bun.wall_ms)} | ${formatRatio(row.lpm_to_bun_wall_ratio)} | ${rssCell(lpm.max_rss_bytes)} | ${rssCell(bun.max_rss_bytes)} | ${formatRatio(row.lpm_to_bun_rss_ratio)} | ${formatMs(lpm.resolve_ms?.median)} / ${formatMs(lpm.fetch_ms?.median)} / ${formatMs(lpm.link_ms?.median)} |`,
     );
   }
+  lines.push(
+    '',
+    `## LPM timing diagnostics (${plan.timing_samples} samples, excluded from scored wall/RSS)`,
+    '',
+    '| Scenario | Pipeline / body wall median / p95 | Weight requested / acquired | Permit wait / supplemental hold | Lease expiries | Declared / actual unpacked | Streamed packages |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | --- |',
+  );
+  for (const row of timingSummary) {
+    lines.push(
+      `| ${row.title} | pipeline ${wallCell(row.pipeline_wall_max_ms)}<br>body ${wallCell(row.stream_body_wall_ms)} | ${formatNumber(row.streaming_weight_requested?.median)} / ${formatNumber(row.streaming_weight_acquired?.median)} | ${formatMs(row.streaming_extract_permit_wait_ms?.median)} / ${formatMs(row.supplemental_permit_hold_ms?.median)} | ${formatNumber(row.supplemental_permit_lease_expired?.median)} | ${formatMiB(row.declared_unpacked_bytes?.median)} / ${formatMiB(row.actual_unpacked_bytes?.median)} (${formatRatio(row.actual_to_declared_unpacked_ratio?.median)}) | ${Object.entries(row.streamed_packages)
+        .map(([name, count]) => `${name} ×${count}`)
+        .join(', ')} |`,
+    );
+  }
   return `${lines.join('\n')}\n`;
 }
 
@@ -554,6 +662,10 @@ function formatMiB(bytes) {
 
 function formatMs(value) {
   return Number.isFinite(value) ? `${value.toFixed(1)} ms` : 'n/a';
+}
+
+function formatNumber(value) {
+  return Number.isFinite(value) ? String(value) : 'n/a';
 }
 
 function ratio(numerator, denominator) {
@@ -605,6 +717,62 @@ function numberAt(value, keys) {
     current = current?.[key];
   }
   return Number.isFinite(current) ? current : undefined;
+}
+
+function streamedTask(value) {
+  const fetchTasks = value?.timing?.detail?.trace?.slow_packages?.fetch_tasks;
+  if (Array.isArray(fetchTasks?.by_pipeline) && fetchTasks.by_pipeline.length > 0) {
+    return fetchTasks.by_pipeline[0];
+  }
+  return Array.isArray(fetchTasks?.by_total)
+    ? fetchTasks.by_total.find((row) => Number(row?.pipeline_wall_ms) > 0)
+    : undefined;
+}
+
+function streamedPackage(value) {
+  return streamedTask(value)?.package;
+}
+
+function streamingPipelineMetrics(value) {
+  const task = streamedTask(value);
+  return {
+    pipeline_wall_sum_ms: numberAt(value, [
+      'timing',
+      'fetch_breakdown',
+      'pipeline_wall',
+      'sum_ms',
+    ]),
+    pipeline_wall_task_count: numberAt(value, [
+      'timing',
+      'fetch_breakdown',
+      'pipeline_wall',
+      'task_count',
+    ]),
+    pipeline_wall_max_ms: numberAt(value, [
+      'timing',
+      'fetch_breakdown',
+      'pipeline_wall',
+      'max_ms',
+    ]),
+    stream_body_wall_ms: numberAt(task, ['stream_body_wall_ms']),
+    streaming_weight_requested: numberAt(task, ['streaming_weight_requested']),
+    streaming_weight_acquired: numberAt(task, ['streaming_weight_acquired']),
+    streaming_extract_permit_wait_ms: numberAt(task, ['extract_permit_wait_ms']),
+    supplemental_permit_hold_ms: numberAt(task, ['supplemental_permit_hold_ms']),
+    supplemental_permit_lease_expired:
+      task?.supplemental_permit_lease_expired === true
+        ? 1
+        : task?.supplemental_permit_lease_expired === false
+          ? 0
+          : undefined,
+    declared_unpacked_bytes: numberAt(task, ['declared_unpacked_bytes']),
+    actual_unpacked_bytes: numberAt(task, ['unpacked_bytes']),
+    actual_to_declared_unpacked_ratio: ratio(
+      numberAt(task, ['unpacked_bytes']),
+      numberAt(task, ['declared_unpacked_bytes']),
+    ),
+    streamed_package: task?.package,
+  };
 }
 
 function rotate(values, offset) {
@@ -685,6 +853,7 @@ function parseArgs(values) {
     const key = {
       '-n': 'samples',
       '--samples': 'samples',
+      '--timing-samples': 'timingSamples',
       '--lpm-bin': 'lpmBin',
       '--fixture': 'fixture',
       '--output': 'output',
@@ -716,6 +885,80 @@ function selfTest() {
     12_641_280,
   );
   assert.equal(ratio(20, 10), 2);
+  assert.deepEqual(
+    streamingPipelineMetrics({
+      timing: {
+        fetch_breakdown: {
+          pipeline_wall: { task_count: 1, sum_ms: 17, max_ms: 17 },
+          extract_permit_wait: { max_ms: 2 },
+          streaming_admission: {
+            requested_weight_max: 3,
+            acquired_weight_max: 2,
+            supplemental_hold_max_ms: 16,
+            supplemental_lease_expired_count: 0,
+          },
+        },
+        detail: {
+          trace: {
+            slow_packages: {
+              fetch_tasks: {
+                by_pipeline: [
+                  {
+                    package: 'next@16.3.2',
+                    pipeline_wall_ms: 17,
+                    stream_body_wall_ms: 15,
+                    extract_permit_wait_ms: 2,
+                    streaming_weight_requested: 3,
+                    streaming_weight_acquired: 2,
+                    declared_unpacked_bytes: 100,
+                    unpacked_bytes: 120,
+                    supplemental_permit_hold_ms: 16,
+                    supplemental_permit_lease_expired: false,
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    }),
+    {
+      pipeline_wall_sum_ms: 17,
+      pipeline_wall_task_count: 1,
+      pipeline_wall_max_ms: 17,
+      stream_body_wall_ms: 15,
+      streaming_weight_requested: 3,
+      streaming_weight_acquired: 2,
+      streaming_extract_permit_wait_ms: 2,
+      supplemental_permit_hold_ms: 16,
+      supplemental_permit_lease_expired: 0,
+      declared_unpacked_bytes: 100,
+      actual_unpacked_bytes: 120,
+      actual_to_declared_unpacked_ratio: 1.2,
+      streamed_package: 'next@16.3.2',
+    },
+  );
+  assert.equal(
+    streamedPackage({
+      timing: {
+        detail: {
+          trace: {
+            slow_packages: {
+              fetch_tasks: {
+                by_pipeline: [{ package: 'tiny@1.0.0', pipeline_wall_ms: 0 }],
+              },
+            },
+          },
+        },
+      },
+    }),
+    'tiny@1.0.0',
+  );
+  assert.equal(managerEnv('lpm', '/tmp/lpm-bench-self-test').LPM_TIMING_DETAIL, undefined);
+  assert.equal(
+    managerEnv('lpm', '/tmp/lpm-bench-self-test', true).LPM_TIMING_DETAIL,
+    'trace',
+  );
   assert.equal(SCENARIOS.length, 6);
   const expectedStates = {
     'first-install': { lockfile: false, node_modules: false, cache: false },
@@ -765,6 +1008,7 @@ measured install must resolve next/package.json.
 
 Options:
   -n, --samples N      Samples per manager/state (default: 10)
+      --timing-samples N  Separate LPM --timing samples per state (default: 3)
       --lpm-bin PATH   LPM binary (default: target/release/lpm-rs)
       --fixture DIR    Override the directory containing package.json
       --output DIR     Result directory (default: /tmp/lpm-t3-six-*)
