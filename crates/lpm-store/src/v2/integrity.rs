@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 
 use super::fs_util::tmp_sibling;
 use super::tree_hash::{
-    TreeIntegrities, compute_object_tree_integrities, compute_tree_metadata_integrity,
+    TreeContentSchema, TreeIntegrities, compute_object_tree_integrities,
+    compute_object_tree_integrities_for_schema, compute_tree_metadata_integrity,
 };
 
 /// Store-owned metadata namespace for object attributes that must not
@@ -19,7 +20,6 @@ const LOCAL_SOURCE_OBJECT_SENTINEL: &str = "local-source";
 /// reuse.
 pub(crate) const OBJECT_INTEGRITY_FILENAME: &str = ".lpm-object-integrity";
 pub(crate) const TREE_SNAPSHOT_FILENAME: &str = ".lpm-tree-snapshot.json";
-const TREE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const TREE_SNAPSHOT_MAX_BYTES: u64 = 4096;
 pub const ENV_V2_OBJECT_INTEGRITY: &str = "LPM_V2_OBJECT_INTEGRITY";
 
@@ -72,6 +72,13 @@ pub(crate) struct TreeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) layout_content_integrity: Option<String>,
     pub(crate) metadata_integrity: String,
+}
+
+impl TreeSnapshot {
+    fn content_schema(&self) -> TreeContentSchema {
+        TreeContentSchema::from_snapshot_schema(self.schema)
+            .unwrap_or(TreeContentSchema::SequentialV1)
+    }
 }
 
 /// Object digest validated according to the active integrity policy.
@@ -214,7 +221,7 @@ pub(crate) fn try_migrate_legacy_tree_object_integrity_to_source(
     source_sri: &str,
 ) -> Result<Option<VerifiedObjectIntegrity>, LpmError> {
     let legacy_integrity = read_object_integrity(dir)?;
-    let actual = compute_object_tree_integrities(dir)?;
+    let actual = compute_tree_integrities_matching_expected(dir, &legacy_integrity)?;
     migrate_legacy_tree_object_integrity_to_source(dir, source_sri, &legacy_integrity, &actual)
 }
 
@@ -232,7 +239,7 @@ pub(crate) fn try_migrate_legacy_tree_object_integrity_to_source_with_timings(
 
     timings.full_hash_count = timings.full_hash_count.saturating_add(1);
     let full_hash_start = std::time::Instant::now();
-    let actual = compute_object_tree_integrities(dir)?;
+    let actual = compute_tree_integrities_matching_expected(dir, &legacy_integrity)?;
     timings.full_hash_ms = timings
         .full_hash_ms
         .saturating_add(full_hash_start.elapsed().as_millis());
@@ -280,7 +287,7 @@ pub(crate) fn verified_tree_object_integrity_or_migrate(
     if let Some(digest) = try_migrate_source_object_integrity_to_tree(dir, source_sri, &expected)? {
         return Ok(digest);
     }
-    let actual = compute_object_tree_integrities(dir)?;
+    let actual = compute_tree_integrities_matching_expected(dir, &expected)?;
     if expected == actual.content {
         write_tree_snapshot_best_effort(dir, &actual);
         return Ok(VerifiedObjectIntegrity::new(expected));
@@ -672,7 +679,7 @@ pub(crate) fn verified_tree_object_integrity_or_migrate_with_timings(
     }
     timings.full_hash_count = timings.full_hash_count.saturating_add(1);
     let full_hash_start = std::time::Instant::now();
-    let actual = compute_object_tree_integrities(dir)?;
+    let actual = compute_tree_integrities_matching_expected(dir, &expected)?;
     timings.full_hash_ms = timings
         .full_hash_ms
         .saturating_add(full_hash_start.elapsed().as_millis());
@@ -734,7 +741,7 @@ pub(crate) fn current_tree_content_matches_snapshot(
     dir: &Path,
     snapshot: &TreeSnapshot,
 ) -> Result<Option<TreeIntegrities>, LpmError> {
-    let actual = compute_object_tree_integrities(dir)?;
+    let actual = compute_object_tree_integrities_for_schema(dir, snapshot.content_schema())?;
     if actual.content == snapshot.content_integrity {
         Ok(Some(actual))
     } else {
@@ -749,7 +756,7 @@ pub(crate) fn current_tree_content_matches_snapshot_with_timings(
 ) -> Result<Option<TreeIntegrities>, LpmError> {
     timings.full_hash_count = timings.full_hash_count.saturating_add(1);
     let full_hash_start = std::time::Instant::now();
-    let actual = compute_object_tree_integrities(dir)?;
+    let actual = compute_object_tree_integrities_for_schema(dir, snapshot.content_schema())?;
     timings.full_hash_ms = timings
         .full_hash_ms
         .saturating_add(full_hash_start.elapsed().as_millis());
@@ -758,6 +765,30 @@ pub(crate) fn current_tree_content_matches_snapshot_with_timings(
     } else {
         timings.snapshot_miss_count = timings.snapshot_miss_count.saturating_add(1);
         Ok(None)
+    }
+}
+
+fn compute_tree_integrities_matching_expected(
+    dir: &Path,
+    expected: &str,
+) -> Result<TreeIntegrities, LpmError> {
+    let primary_schema = read_tree_snapshot(dir)
+        .map_or(TreeContentSchema::SequentialV1, |snapshot| {
+            snapshot.content_schema()
+        });
+    let primary = compute_object_tree_integrities_for_schema(dir, primary_schema)?;
+    if primary.content == expected {
+        return Ok(primary);
+    }
+    let alternate_schema = match primary_schema {
+        TreeContentSchema::SequentialV1 => TreeContentSchema::EntryDigestV2,
+        TreeContentSchema::EntryDigestV2 => TreeContentSchema::SequentialV1,
+    };
+    let alternate = compute_object_tree_integrities_for_schema(dir, alternate_schema)?;
+    if alternate.content == expected {
+        Ok(alternate)
+    } else {
+        Ok(primary)
     }
 }
 
@@ -857,9 +888,7 @@ pub(crate) fn read_tree_snapshot(dir: &Path) -> Option<TreeSnapshot> {
             return None;
         }
     };
-    if snapshot.schema != TREE_SNAPSHOT_SCHEMA_VERSION {
-        return None;
-    }
+    TreeContentSchema::from_snapshot_schema(snapshot.schema)?;
     if !valid_sha256_integrity(&snapshot.content_integrity)
         || snapshot
             .layout_content_integrity
@@ -892,7 +921,13 @@ pub(crate) fn write_tree_snapshot(
     dir: &Path,
     integrities: &TreeIntegrities,
 ) -> Result<(), LpmError> {
-    write_tree_snapshot_fields(dir, &integrities.content, None, &integrities.metadata)
+    write_tree_snapshot_fields(
+        dir,
+        integrities.content_schema,
+        &integrities.content,
+        None,
+        &integrities.metadata,
+    )
 }
 
 pub(crate) fn write_tree_snapshot_with_layout_content(
@@ -902,6 +937,7 @@ pub(crate) fn write_tree_snapshot_with_layout_content(
 ) -> Result<(), LpmError> {
     write_tree_snapshot_fields(
         dir,
+        layout_integrities.content_schema,
         source_content_integrity,
         Some(&layout_integrities.content),
         &layout_integrities.metadata,
@@ -910,12 +946,13 @@ pub(crate) fn write_tree_snapshot_with_layout_content(
 
 fn write_tree_snapshot_fields(
     dir: &Path,
+    content_schema: TreeContentSchema,
     content_integrity: &str,
     layout_content_integrity: Option<&str>,
     metadata_integrity: &str,
 ) -> Result<(), LpmError> {
     let snapshot = TreeSnapshot {
-        schema: TREE_SNAPSHOT_SCHEMA_VERSION,
+        schema: content_schema.snapshot_schema(),
         content_integrity: content_integrity.to_owned(),
         layout_content_integrity: layout_content_integrity.map(str::to_owned),
         metadata_integrity: metadata_integrity.to_owned(),
@@ -990,6 +1027,23 @@ pub(crate) fn write_object_integrity_for_policy(
     }
 }
 
+pub(crate) fn write_object_integrity_for_policy_with_tree(
+    dir: &Path,
+    source_sri: &str,
+    policy: ObjectIntegrityPolicy,
+    actual: TreeIntegrities,
+) -> Result<TreeIntegrities, LpmError> {
+    match policy {
+        ObjectIntegrityPolicy::Tree => {
+            write_tree_object_integrity_from_integrities(dir, &actual)?;
+            Ok(actual)
+        }
+        ObjectIntegrityPolicy::Source => {
+            write_source_object_integrity_with_tree(dir, source_sri, &actual)
+        }
+    }
+}
+
 pub(crate) fn write_source_object_integrity(
     dir: &Path,
     source_sri: &str,
@@ -1010,6 +1064,7 @@ pub(crate) fn write_source_object_integrity_with_tree(
         content,
         metadata: actual.metadata.clone(),
         stats: actual.stats,
+        content_schema: actual.content_schema,
     })
 }
 

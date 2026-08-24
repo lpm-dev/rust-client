@@ -1669,6 +1669,7 @@ pub(super) async fn run_online_fetch_phase(
     fetch_stage_timings.policy_gate_ms = policy_gate_start.elapsed().as_millis();
 
     let downloaded = to_download.len();
+    super::resolve::prioritize_fetch_schedule(&mut to_download);
     //: accumulate per-task timings across the parallel pool so we
     // can emit a proper fetch-stage breakdown in `lpm install --json`. Empty
     // breakdown on the cached-everything path; filled in below when work runs.

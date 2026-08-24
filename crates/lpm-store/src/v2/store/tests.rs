@@ -20,7 +20,9 @@ use crate::v2::local_source::local_source_fingerprint_path;
 use crate::v2::platform::PlatformTuple;
 #[cfg(target_os = "macos")]
 use crate::v2::tree_hash::metadata_hash_implementations_match_for_test;
-use crate::v2::tree_hash::{ObjectTreeStats, TreeIntegrities, compute_tree_metadata_integrity};
+use crate::v2::tree_hash::{
+    ObjectTreeStats, TreeContentSchema, TreeIntegrities, compute_tree_metadata_integrity,
+};
 
 const LOCK_RELEASE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -3164,12 +3166,36 @@ fn extract_object_from_bytes_source_policy_writes_source_integrity() {
         read_object_integrity(&object.path).unwrap(),
         source_object_integrity(&sri)
     );
+    assert_eq!(read_tree_snapshot(&object.path).unwrap().schema, 2);
     assert_eq!(timings.file_count, 2);
     assert_eq!(timings.dir_count, 1);
     assert_eq!(
         timings.unpacked_bytes,
         (package_json.len() + index_js.len()) as u64
     );
+}
+
+#[test]
+fn streamed_tree_policy_recreates_a_missing_versioned_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let tarball = build_test_tarball(&[
+        ("package.json", b"{\"name\":\"x\",\"version\":\"1.0.0\"}"),
+        ("index.js", b"module.exports = 1;\n"),
+    ]);
+    let (object, sri, _) = store
+        .extract_object_from_bytes_with_policy(&tarball, None, ObjectIntegrityPolicy::Tree)
+        .unwrap();
+    assert_eq!(read_tree_snapshot(&object.path).unwrap().schema, 2);
+    std::fs::remove_file(object.path.join(TREE_SNAPSHOT_FILENAME)).unwrap();
+
+    let reusable = store
+        .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Tree)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(reusable.path, object.path);
+    assert_eq!(read_tree_snapshot(&reusable.path).unwrap().schema, 2);
 }
 
 #[test]
@@ -3428,6 +3454,8 @@ fn reusable_object_tree_policy_rejects_tampered_source_object_with_matching_snap
             content: original_snapshot.content_integrity,
             metadata: current_metadata,
             stats: ObjectTreeStats::default(),
+            content_schema: TreeContentSchema::from_snapshot_schema(original_snapshot.schema)
+                .unwrap(),
         },
     )
     .unwrap();
