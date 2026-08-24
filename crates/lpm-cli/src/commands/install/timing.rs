@@ -353,7 +353,7 @@ impl SpeculativeKeyTracker {
 /// speculation doesn't ask for manifests the worker won't send.
 pub(super) const SPECULATION_MAX_DEPTH: u32 = 5;
 pub(super) const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
-pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 32;
+pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 8;
 pub(super) const MAX_NPM_FANOUT: usize = lpm_resolver::MAX_NPM_FANOUT;
 pub(super) const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
 pub(super) const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
@@ -677,16 +677,27 @@ pub(super) struct V2LinkTaskTimings {
     pub(super) freshly_populated_count: u64,
     pub(super) task_sum_ms: u128,
     pub(super) task_max_ms: u128,
+    pub(super) reuse_check_sum_ms: u128,
+    pub(super) touch_sum_ns: u128,
 }
 
 impl V2LinkTaskTimings {
-    pub(super) fn record(&mut self, ms: u128, freshly_populated: bool) {
+    pub(super) fn record(
+        &mut self,
+        ms: u128,
+        freshly_populated: bool,
+        timings: lpm_store::v2::LinkEntryTimings,
+    ) {
         self.task_count = self.task_count.saturating_add(1);
         if freshly_populated {
             self.freshly_populated_count = self.freshly_populated_count.saturating_add(1);
         }
         self.task_sum_ms = self.task_sum_ms.saturating_add(ms);
         self.task_max_ms = self.task_max_ms.max(ms);
+        self.reuse_check_sum_ms = self
+            .reuse_check_sum_ms
+            .saturating_add(timings.reuse_check_ms);
+        self.touch_sum_ns = self.touch_sum_ns.saturating_add(timings.touch_ns);
     }
 
     pub(super) fn to_json(self, await_ms: u128) -> serde_json::Value {
@@ -696,6 +707,8 @@ impl V2LinkTaskTimings {
             "reused_entry_count": self.task_count.saturating_sub(self.freshly_populated_count),
             "task_sum_ms": self.task_sum_ms,
             "task_max_ms": self.task_max_ms,
+            "reuse_check_sum_ms": self.reuse_check_sum_ms,
+            "touch_sum_ns": self.touch_sum_ns,
             "await_ms": await_ms,
         })
     }
@@ -1046,6 +1059,7 @@ impl SlowPackageTimings {
                         "package": entry.package,
                         "ms": entry.ms,
                         "reuse_check_ms": entry.timings.reuse_check_ms,
+                        "touch_ns": entry.timings.touch_ns,
                         "object_integrity_ms": entry.timings.object_integrity_ms,
                         "materialize_ms": entry.timings.materialize_ms,
                         "snapshot_ms": entry.timings.snapshot_ms,
@@ -1586,12 +1600,12 @@ mod tests {
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_when_overlap_enabled() {
-        assert_eq!(default_fusion_npm_fanout(true, 0), 32);
+        assert_eq!(default_fusion_npm_fanout(true, 0), 8);
     }
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_with_release_age() {
-        assert_eq!(default_fusion_npm_fanout(true, 86_400), 32);
+        assert_eq!(default_fusion_npm_fanout(true, 86_400), 8);
     }
 
     #[test]
@@ -1783,6 +1797,7 @@ mod tests {
             "slow@1.0.0",
             23,
             lpm_store::v2::LinkEntryTimings {
+                touch_ns: 13,
                 materialize_ms: 11,
                 snapshot_ms: 7,
                 sidecar_ms: 2,
@@ -1804,6 +1819,7 @@ mod tests {
 
         assert_eq!(json["link_v2_one"][0]["package"], "slow@1.0.0");
         assert_eq!(json["link_v2_one"][0]["ms"], 23);
+        assert_eq!(json["link_v2_one"][0]["touch_ns"], 13);
         assert_eq!(json["link_v2_one"][0]["materialize_ms"], 11);
         assert_eq!(json["link_v2_one"][0]["snapshot_ms"], 7);
         assert_eq!(json["link_v2_one"][0]["sidecar_ms"], 2);
@@ -2179,8 +2195,24 @@ mod tests {
     #[test]
     fn v2_link_task_timings_reports_reused_entries() {
         let mut timings = V2LinkTaskTimings::default();
-        timings.record(5, false);
-        timings.record(8, true);
+        timings.record(
+            5,
+            false,
+            lpm_store::v2::LinkEntryTimings {
+                reuse_check_ms: 4,
+                touch_ns: 1_500,
+                ..lpm_store::v2::LinkEntryTimings::default()
+            },
+        );
+        timings.record(
+            8,
+            true,
+            lpm_store::v2::LinkEntryTimings {
+                reuse_check_ms: 6,
+                touch_ns: 2_500,
+                ..lpm_store::v2::LinkEntryTimings::default()
+            },
+        );
 
         let json = timings.to_json(3);
 
@@ -2189,6 +2221,8 @@ mod tests {
         assert_eq!(json["reused_entry_count"], 1);
         assert_eq!(json["task_sum_ms"], 13);
         assert_eq!(json["task_max_ms"], 8);
+        assert_eq!(json["reuse_check_sum_ms"], 10);
+        assert_eq!(json["touch_sum_ns"], 4_000);
         assert_eq!(json["await_ms"], 3);
     }
 

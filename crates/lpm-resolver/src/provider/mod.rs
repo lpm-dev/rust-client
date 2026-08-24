@@ -19,9 +19,12 @@ mod tests;
 
 #[allow(unused_imports)]
 pub(crate) use parse::is_valid_dep_name;
+#[cfg(any(test, feature = "bench-internals"))]
+pub(crate) use parse::parse_full_metadata_to_cache_info;
 pub(crate) use parse::{
-    merge_release_times_into_cache_info, parse_full_metadata_to_cache_info,
-    parse_metadata_to_cache_info, parse_partial_metadata_to_cache_info,
+    merge_release_times_into_cache_info, parse_metadata_to_cache_info,
+    parse_owned_full_metadata_to_cache_info, parse_owned_metadata_to_cache_info,
+    parse_owned_partial_metadata_to_cache_info,
 };
 #[cfg(test)]
 pub(crate) use platform::Platform;
@@ -48,8 +51,8 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::parse::{
         is_valid_dep_name, is_valid_version_string, merge_release_times_into_cache_info,
-        parse_full_metadata_to_cache_info, parse_metadata_to_cache_info,
-        parse_partial_metadata_to_cache_info,
+        parse_metadata_to_cache_info, parse_owned_full_metadata_to_cache_info,
+        parse_owned_metadata_to_cache_info, parse_owned_partial_metadata_to_cache_info,
     };
     #[allow(unused_imports)]
     pub(super) use super::platform::{

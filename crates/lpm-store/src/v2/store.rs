@@ -482,6 +482,7 @@ pub struct LinkEntry {
 pub struct LinkEntryTimings {
     pub total_ms: u128,
     pub reuse_check_ms: u128,
+    pub touch_ns: u128,
     pub object_integrity_ms: u128,
     pub materialize_ms: u128,
     pub snapshot_ms: u128,
@@ -1809,9 +1810,13 @@ impl Store {
                     // refresh the existing sidecar's mtime.
                     let _ = std::fs::remove_dir_all(&tmp_dir);
                     let sidecar_path = final_dir.join(LINK_META_FILENAME);
+                    let touch_start = std::time::Instant::now();
                     if let Err(e) = LinkMeta::touch_on_disk(&sidecar_path) {
                         tracing::debug!("virtual store: race-loss touch failed: {e}");
                     }
+                    timings.touch_ns = timings
+                        .touch_ns
+                        .saturating_add(touch_start.elapsed().as_nanos());
                     timings.collision_recovery_ms = timings
                         .collision_recovery_ms
                         .saturating_add(recovery_start.elapsed().as_millis());
@@ -1877,12 +1882,16 @@ impl Store {
     fn reused_link_entry(
         final_dir: PathBuf,
         total_start: std::time::Instant,
-        timings: LinkEntryTimings,
+        mut timings: LinkEntryTimings,
     ) -> LinkEntry {
         let sidecar_path = final_dir.join(LINK_META_FILENAME);
+        let touch_start = std::time::Instant::now();
         if let Err(error) = LinkMeta::touch_on_disk(&sidecar_path) {
             tracing::debug!("virtual store: cache-hit touch failed: {error}");
         }
+        timings.touch_ns = timings
+            .touch_ns
+            .saturating_add(touch_start.elapsed().as_nanos());
         LinkEntry {
             link_dir: final_dir,
             freshly_populated: false,

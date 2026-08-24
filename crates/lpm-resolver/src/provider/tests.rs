@@ -592,6 +592,76 @@ fn metadata_with_versions(
 }
 
 #[test]
+fn owned_metadata_projection_moves_dependency_storage_into_the_cache() {
+    let metadata = metadata_with_versions(
+        "owned-projection",
+        &[("1.0.0", &[("large-dependency-name", "^123.456.789")])],
+    );
+    let original_range = metadata.versions["1.0.0"].dependencies["large-dependency-name"].as_ptr();
+    let original_integrity = metadata.versions["1.0.0"]
+        .dist
+        .as_ref()
+        .unwrap()
+        .integrity
+        .as_ref()
+        .unwrap()
+        .as_ptr();
+
+    let info = parse_owned_metadata_to_cache_info(metadata);
+
+    let projected_range = info.deps["1.0.0"]["large-dependency-name"].as_ptr();
+    let projected_integrity = info.dist["1.0.0"].integrity.as_ref().unwrap().as_ptr();
+    assert_eq!(
+        projected_range, original_range,
+        "owned parsing must reuse dependency string storage instead of cloning it"
+    );
+    assert_eq!(
+        projected_integrity, original_integrity,
+        "owned parsing must reuse integrity string storage instead of cloning it"
+    );
+}
+
+#[test]
+fn owned_and_borrowed_metadata_projection_have_the_same_contract() {
+    let metadata: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "projection-contract",
+        "modified": "2026-08-20T00:00:00.000Z",
+        "dist-tags": { "latest": "2.0.0" },
+        "time": { "2.0.0": "2026-08-19T00:00:00.000Z" },
+        "versions": {
+            "2.0.0": {
+                "name": "projection-contract",
+                "version": "2.0.0",
+                "dependencies": {
+                    "regular": "^1.0.0",
+                    "aliased": "npm:canonical@^2.0.0"
+                },
+                "optionalDependencies": { "optional": "^3.0.0" },
+                "peerDependencies": { "peer": "^4.0.0" },
+                "peerDependenciesMeta": { "peer": { "optional": true } },
+                "bundleDependencies": ["bundled"],
+                "engines": { "node": ">=22" },
+                "os": ["darwin"],
+                "cpu": ["arm64"],
+                "libc": ["glibc"],
+                "_npmUser": { "trustedPublisher": true },
+                "dist": {
+                    "tarball": "https://example.invalid/projection-contract.tgz",
+                    "integrity": "sha512-projection-contract",
+                    "signatures": [{ "keyid": "key", "sig": "signature" }]
+                }
+            }
+        }
+    }))
+    .expect("valid metadata fixture");
+    let expected = parse_metadata_to_cache_info(&metadata);
+
+    let actual = parse_owned_metadata_to_cache_info(metadata);
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn parse_metadata_keeps_dependency_cache_sparse_for_empty_versions() {
     let meta = metadata_with_versions(
         "sparse-deps",
@@ -760,7 +830,7 @@ fn merge_release_times_fills_missing_platform_axes_without_losing_abbreviated_me
         }))
         .expect("valid full metadata projected to release-time fields");
 
-    let mut info = parse_partial_metadata_to_cache_info(&abbreviated);
+    let mut info = parse_owned_partial_metadata_to_cache_info(abbreviated);
     merge_release_times_into_cache_info(&mut info, &release_times);
 
     assert!(info.platform_metadata_complete);

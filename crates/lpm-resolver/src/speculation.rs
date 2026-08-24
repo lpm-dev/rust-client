@@ -1,4 +1,6 @@
-use crate::provider::{CachedPackageInfo, parse_metadata_to_cache_info};
+use crate::provider::{
+    CachedPackageInfo, parse_metadata_to_cache_info, parse_owned_metadata_to_cache_info,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,8 +21,9 @@ impl SpeculativePackageMetadata {
 
 impl From<lpm_registry::PackageMetadata> for SpeculativePackageMetadata {
     fn from(meta: lpm_registry::PackageMetadata) -> Self {
-        let info = Arc::new(parse_metadata_to_cache_info(&meta));
-        Self::from_dist_tags_and_info(meta.dist_tags, info)
+        let dist_tags = meta.dist_tags.clone();
+        let info = Arc::new(parse_owned_metadata_to_cache_info(meta));
+        Self::from_dist_tags_and_info(dist_tags, info)
     }
 }
 

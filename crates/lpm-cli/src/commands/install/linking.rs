@@ -279,7 +279,7 @@ pub(super) async fn prepare_v2_link_tasks(
         let package_display = timing_detail_mode
             .trace()
             .then(|| format!("{}@{}", task.materialized.name, task.materialized.version));
-        v2_link_task_timings.record(task.ms, task.freshly_populated);
+        v2_link_task_timings.record(task.ms, task.freshly_populated, task.timings);
         if let Some(package_display) = package_display.as_deref() {
             slow_package_timings.record_link_v2_one(package_display, task.ms, task.timings);
         }

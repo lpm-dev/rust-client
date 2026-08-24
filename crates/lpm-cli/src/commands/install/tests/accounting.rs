@@ -24,6 +24,14 @@ fn root_names(packages: &[InstallPackage]) -> Vec<String> {
 }
 
 #[test]
+fn npm_only_graph_has_no_pool_accounting_roots() {
+    let root = accounting_package("npm-root", "1.0.0", true, false, &[("npm-child", "2.0.0")]);
+    let child = accounting_package("npm-child", "2.0.0", false, false, &[]);
+
+    assert!(select_lpm_install_roots(&[root, child]).is_empty());
+}
+
+#[test]
 fn direct_lpm_package_is_an_accounting_root() {
     let alpha = accounting_package("@lpm.dev/alice.alpha", "1.0.0", true, true, &[]);
 

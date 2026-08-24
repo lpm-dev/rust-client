@@ -407,6 +407,15 @@ pub struct DistInfo {
     pub attestations: Option<AttestationRef>,
 }
 
+impl DistInfo {
+    /// Move the strongest available integrity value out of this distribution record.
+    pub fn take_integrity_or_shasum(&mut self) -> Option<String> {
+        self.integrity
+            .take()
+            .or_else(|| self.shasum.as_deref().and_then(shasum_to_sha1_sri))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NpmUserMetadata {
     #[serde(default, rename = "trustedPublisher")]

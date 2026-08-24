@@ -2,6 +2,10 @@ use super::*;
 use lpm_registry::{ManagedInstallRoot, RegistryClient};
 
 pub(super) fn select_lpm_install_roots(packages: &[InstallPackage]) -> Vec<ManagedInstallRoot> {
+    if !packages.iter().any(|package| package.is_lpm) {
+        return Vec::new();
+    }
+
     let mut indices: Vec<usize> = (0..packages.len()).collect();
     indices.sort_unstable_by(|left, right| {
         install_pkg_key(&packages[*left]).cmp(&install_pkg_key(&packages[*right]))
