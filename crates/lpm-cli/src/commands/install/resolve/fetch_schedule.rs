@@ -16,7 +16,12 @@ pub(super) struct FetchOutcome {
 
 pub(super) fn lockfile_fetch_schedule(packages: &[InstallPackage]) -> Vec<InstallPackage> {
     let mut scheduled = packages.to_vec();
-    scheduled.sort_by(|a, b| {
+    prioritize_fetch_schedule(&mut scheduled);
+    scheduled
+}
+
+pub(in crate::commands::install) fn prioritize_fetch_schedule(packages: &mut [InstallPackage]) {
+    packages.sort_by(|a, b| {
         b.is_direct
             .cmp(&a.is_direct)
             .then_with(|| b.dependencies.len().cmp(&a.dependencies.len()))
@@ -24,7 +29,6 @@ pub(super) fn lockfile_fetch_schedule(packages: &[InstallPackage]) -> Vec<Instal
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.version.cmp(&b.version))
     });
-    scheduled
 }
 
 #[allow(clippy::too_many_arguments)]

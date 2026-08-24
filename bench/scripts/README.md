@@ -226,6 +226,21 @@ node bench/scripts/run-install-readiness.mjs \
   --modes cold,warm,up-to-date
 ```
 
+Use `ci-cold` for lockfile replay with both the LPM metadata cache and content
+store removed before the measured command. This mode is LPM-only and is useful
+for adjacent baseline/candidate comparisons:
+
+```bash
+node bench/scripts/run-install-readiness.mjs \
+  --samples 10 \
+  --fixtures /path/to/project \
+  --managers lpm \
+  --modes ci-cold \
+  --lpm-binary baseline=/path/to/baseline/lpm-rs \
+  --lpm-binary candidate=/path/to/candidate/lpm-rs \
+  --lpm-compare baseline:candidate
+```
+
 Capture a one-off firewall-enabled reference without paying that cost on every
 knob run:
 

@@ -167,6 +167,9 @@ const dryRun = Boolean(args.dryRun);
 validateManagers(managers);
 validateScriptPolicy(scriptPolicy);
 validateLpmTyposquatGuard(lpmTyposquatGuard);
+if (modes.includes('ci-cold') && managers.some((manager) => manager !== 'lpm')) {
+  throw new Error('--modes ci-cold currently supports only the lpm manager');
+}
 if (lpmComparison && !managers.includes('lpm')) {
   throw new Error('--lpm-compare requires lpm in --managers');
 }
@@ -310,6 +313,7 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
     fs.writeFileSync(path.join(runDir, 'project-dir.txt'), `${projectDir}\n`);
 
     const shouldMeasureCold = modes.includes('cold');
+    const shouldMeasureCiCold = modes.includes('ci-cold');
     const shouldMeasureWarm = modes.includes('warm');
     const shouldMeasureUpToDate = modes.includes('up-to-date');
     let installedOk = true;
@@ -327,7 +331,7 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
       });
       rowsForSpec.push(row);
       installedOk = !runFailed(row);
-    } else if (shouldMeasureWarm || shouldMeasureUpToDate) {
+    } else if (shouldMeasureCiCold || shouldMeasureWarm || shouldMeasureUpToDate) {
       const row = measureInstall({
         sample,
         fixture,
@@ -341,6 +345,37 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
       });
       rowsForSpec.push(row);
       installedOk = !runFailed(row);
+    }
+
+    if (shouldMeasureCiCold) {
+      if (installedOk) {
+        cleanProjectForWarm(projectDir);
+        cleanLpmDependencyState(lpmHome);
+        const row = measureInstall({
+          sample,
+          fixture,
+          spec,
+          mode: 'ci-cold',
+          projectDir,
+          env,
+          runDir,
+          phase: 'ci-cold',
+        });
+        rowsForSpec.push(row);
+        installedOk = !runFailed(row);
+      } else {
+        rowsForSpec.push(
+          recordSkippedInstall({
+            sample,
+            fixture,
+            spec,
+            mode: 'ci-cold',
+            runDir,
+            phase: 'ci-cold',
+            reason: 'previous install failed',
+          }),
+        );
+      }
     }
 
     if (shouldMeasureWarm) {
@@ -451,7 +486,7 @@ function runPairedLpmSpecs({ sample, fixture, pair, pairIndex, modes }) {
     const env = buildEnv({ homeDir, lpmHome, spec });
     fs.writeFileSync(path.join(runDir, 'env.json'), `${JSON.stringify(redactedEnv(env), null, 2)}\n`);
     fs.writeFileSync(path.join(runDir, 'project-dir.txt'), `${projectDir}\n`);
-    return { spec, tmpRoot, projectDir, env, runDir, installedOk: true, rows: [] };
+    return { spec, tmpRoot, projectDir, lpmHome, env, runDir, installedOk: true, rows: [] };
   });
   const pairId = [
     fixture.name,
@@ -484,6 +519,10 @@ function runPairedLpmSpecs({ sample, fixture, pair, pairIndex, modes }) {
       for (const context of ordered) {
         if (mode === 'warm' && context.installedOk) {
           cleanProjectForWarm(context.projectDir);
+        }
+        if (mode === 'ci-cold' && context.installedOk) {
+          cleanProjectForWarm(context.projectDir);
+          cleanLpmDependencyState(context.lpmHome);
         }
         const pairMeta = { pairId: `${pairId}:${mode}`, pairOrder };
         const row = context.installedOk
@@ -1143,6 +1182,11 @@ function cleanProjectForCold(projectDir) {
 
 function cleanProjectForWarm(projectDir) {
   cleanProject(projectDir, false);
+}
+
+function cleanLpmDependencyState(lpmHome) {
+  removeTree(path.join(lpmHome, 'cache'));
+  removeTree(path.join(lpmHome, 'store'));
 }
 
 function cleanProject(projectDir, removeLockfiles) {
@@ -1931,7 +1975,7 @@ function parseEnvAssignments(raw) {
 function parseModes(raw) {
   const modes = parseList(raw, '--modes');
   for (const mode of modes) {
-    if (!['cold', 'warm', 'up-to-date'].includes(mode)) {
+    if (!['cold', 'ci-cold', 'warm', 'up-to-date'].includes(mode)) {
       throw new Error(`unsupported mode: ${mode}`);
     }
   }
@@ -2305,7 +2349,12 @@ function isWarningLikeLine(line) {
 }
 
 function runSelfTests() {
-  assert.deepEqual(parseModes('cold,warm,up-to-date'), ['cold', 'warm', 'up-to-date']);
+  assert.deepEqual(parseModes('cold,ci-cold,warm,up-to-date'), [
+    'cold',
+    'ci-cold',
+    'warm',
+    'up-to-date',
+  ]);
   assert.throws(() => parseModes('repeat'), /unsupported mode/);
   assert.deepEqual(parseLpmBinaries([], '/tmp/default-lpm'), [
     { name: 'current', path: '/tmp/default-lpm' },
@@ -2551,6 +2600,26 @@ function runSelfTests() {
     );
   } finally {
     removeTree(warmCleanupFixtureRoot);
+  }
+  const ciColdHome = fs.mkdtempSync(path.join(os.tmpdir(), 'lpm-readiness-ci-cold-home-test-'));
+  try {
+    fs.mkdirSync(path.join(ciColdHome, 'cache', 'metadata'), { recursive: true });
+    fs.mkdirSync(path.join(ciColdHome, 'store', 'v2'), { recursive: true });
+    fs.mkdirSync(path.join(ciColdHome, 'config'), { recursive: true });
+    fs.writeFileSync(path.join(ciColdHome, 'cache', 'metadata', 'package.json'), '{}\n');
+    fs.writeFileSync(path.join(ciColdHome, 'store', 'v2', 'object'), 'stored\n');
+    fs.writeFileSync(path.join(ciColdHome, 'config', 'config.toml'), 'registry = "npm"\n');
+
+    cleanLpmDependencyState(ciColdHome);
+
+    assert.equal(fs.existsSync(path.join(ciColdHome, 'cache')), false);
+    assert.equal(fs.existsSync(path.join(ciColdHome, 'store')), false);
+    assert.equal(
+      fs.readFileSync(path.join(ciColdHome, 'config', 'config.toml'), 'utf8'),
+      'registry = "npm"\n',
+    );
+  } finally {
+    removeTree(ciColdHome);
   }
   assert.deepEqual(parseLpmFirewallModes('off,enabled,report'), ['off', 'enforce', 'report']);
   assert.throws(() => parseLpmFirewallModes('enabled,enforce'), /duplicate lpm firewall mode/);
@@ -3047,7 +3116,7 @@ Options:
       --top-npm-offset N       Zero-based package offset for chunked top-N sweeps
       --top-npm-limit N        Maximum packages from --top-npm-file
       --managers LIST          lpm,bun,pnpm,npm (default: lpm)
-      --modes LIST             cold,warm,up-to-date (default: cold)
+      --modes LIST             cold,ci-cold,warm,up-to-date (default: cold)
       --lpm-routes LIST        direct,proxy for lpm runs (default: direct)
       --lpm-firewall-modes LIST
                                off,report,enforce for lpm runs (default: off)

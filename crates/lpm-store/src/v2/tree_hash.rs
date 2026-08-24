@@ -1,16 +1,43 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use lpm_common::{LpmError, is_symlink_or_junction};
+use lpm_extractor::ExtractedFileDigest;
 use sha2::{Digest, Sha256};
 
 use super::integrity::{OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME};
 
+#[derive(Debug)]
 pub(crate) struct TreeIntegrities {
     pub(crate) content: String,
     pub(crate) metadata: String,
     pub(crate) stats: ObjectTreeStats,
+    pub(crate) content_schema: TreeContentSchema,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeContentSchema {
+    SequentialV1,
+    EntryDigestV2,
+}
+
+impl TreeContentSchema {
+    pub(crate) fn from_snapshot_schema(schema: u32) -> Option<Self> {
+        match schema {
+            1 => Some(Self::SequentialV1),
+            2 => Some(Self::EntryDigestV2),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn snapshot_schema(self) -> u32 {
+        match self {
+            Self::SequentialV1 => 1,
+            Self::EntryDigestV2 => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -21,10 +48,8 @@ pub(crate) struct ObjectTreeStats {
     pub(crate) unpacked_bytes: u64,
 }
 
-#[derive(Default)]
-pub(crate) struct ExtractedObjectStats {
-    stats: ObjectTreeStats,
-    dirs: std::collections::HashSet<PathBuf>,
+pub(crate) struct StreamedTreeBuilder {
+    file_digests: HashMap<PathBuf, [u8; 32]>,
 }
 
 #[derive(Clone, Copy)]
@@ -137,42 +162,76 @@ impl TreeMetadataKind {
     }
 }
 
-impl ExtractedObjectStats {
-    pub(crate) fn record_file(&mut self, relative_path: &Path, size: u64) {
-        self.stats.file_count = self.stats.file_count.saturating_add(1);
-        self.stats.unpacked_bytes = self.stats.unpacked_bytes.saturating_add(size);
-
-        let mut parent = relative_path.parent();
-        while let Some(dir) = parent {
-            if dir.as_os_str().is_empty() {
-                break;
+impl StreamedTreeBuilder {
+    pub(crate) fn from_extraction(file_digests: Vec<ExtractedFileDigest>) -> Self {
+        let mut digests_by_path = HashMap::with_capacity(file_digests.len());
+        for entry in file_digests {
+            let relative = entry.relative_path.as_path();
+            if is_object_metadata_sidecar_name(
+                Path::new(""),
+                relative.parent().unwrap_or_else(|| Path::new("")),
+                relative.file_name().unwrap_or_else(|| OsStr::new("")),
+            ) {
+                continue;
             }
-            self.dirs.insert(dir.to_path_buf());
-            parent = dir.parent();
+            digests_by_path.insert(entry.relative_path, entry.blake3_digest);
+        }
+        Self {
+            file_digests: digests_by_path,
         }
     }
 
-    pub(crate) fn finish(mut self) -> ObjectTreeStats {
-        self.stats.dir_count = self.dirs.len() as u64;
-        self.stats
+    pub(crate) fn finish(mut self, dir: &Path) -> Result<TreeIntegrities, LpmError> {
+        compute_entry_digest_tree_integrities_with_digests(dir, &mut self.file_digests)
     }
 }
 
 pub(crate) fn compute_object_tree_integrities(dir: &Path) -> Result<TreeIntegrities, LpmError> {
-    let mut content_hasher = Sha256::new();
+    compute_object_tree_integrities_for_schema(dir, TreeContentSchema::SequentialV1)
+}
+
+pub(crate) fn compute_object_tree_integrities_for_schema(
+    dir: &Path,
+    schema: TreeContentSchema,
+) -> Result<TreeIntegrities, LpmError> {
+    let mut content_hasher = match schema {
+        TreeContentSchema::SequentialV1 => TreeContentHasher::sequential(),
+        TreeContentSchema::EntryDigestV2 => TreeContentHasher::entry_digest_from_filesystem(),
+    };
+    compute_object_tree_integrities_with_hasher(dir, &mut content_hasher, schema)
+}
+
+fn compute_entry_digest_tree_integrities_with_digests(
+    dir: &Path,
+    file_digests: &mut HashMap<PathBuf, [u8; 32]>,
+) -> Result<TreeIntegrities, LpmError> {
+    let mut content_hasher = TreeContentHasher::entry_digest_from_extraction(file_digests);
+    compute_object_tree_integrities_with_hasher(
+        dir,
+        &mut content_hasher,
+        TreeContentSchema::EntryDigestV2,
+    )
+}
+
+fn compute_object_tree_integrities_with_hasher(
+    dir: &Path,
+    content_hasher: &mut TreeContentHasher<'_>,
+    content_schema: TreeContentSchema,
+) -> Result<TreeIntegrities, LpmError> {
     let mut metadata_hasher = Sha256::new();
     let mut stats = ObjectTreeStats::default();
     hash_object_tree_dir(
         dir,
         dir,
-        Some(&mut content_hasher),
+        Some(content_hasher),
         &mut metadata_hasher,
         Some(&mut stats),
     )?;
     Ok(TreeIntegrities {
-        content: format!("sha256-{}", hex::encode(content_hasher.finalize())),
+        content: content_hasher.finish()?,
         metadata: format!("sha256-{}", hex::encode(metadata_hasher.finalize())),
         stats,
+        content_schema,
     })
 }
 
@@ -205,7 +264,7 @@ pub(crate) fn metadata_hash_implementations_match_for_test(dir: &Path) -> Result
 fn hash_object_tree_dir(
     root: &Path,
     dir: &Path,
-    content_hasher: Option<&mut Sha256>,
+    content_hasher: Option<&mut TreeContentHasher<'_>>,
     metadata_hasher: &mut Sha256,
     stats: Option<&mut ObjectTreeStats>,
 ) -> Result<(), LpmError> {
@@ -224,7 +283,7 @@ fn hash_object_tree_dir_inner(
     root: &Path,
     dir: &Path,
     relative: &mut Vec<u8>,
-    mut content_hasher: Option<&mut Sha256>,
+    mut content_hasher: Option<&mut TreeContentHasher<'_>>,
     metadata_hasher: &mut Sha256,
     mut stats: Option<&mut ObjectTreeStats>,
 ) -> Result<(), LpmError> {
@@ -285,7 +344,7 @@ fn hash_object_tree_dir_inner(
             let mut target_bytes = Vec::new();
             push_os_str_bytes(&mut target_bytes, target.as_os_str());
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hash_object_tree_record(hasher, b"symlink", relative.as_slice(), &target_bytes);
+                hasher.hash_symlink(relative.as_slice(), &metadata, &target_bytes);
             }
             hash_tree_metadata_record(
                 metadata_hasher,
@@ -301,9 +360,8 @@ fn hash_object_tree_dir_inner(
             }
             path.push(&entry_name);
             path_pushed = true;
-            let mode = object_entry_mode(&metadata).to_le_bytes();
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hash_object_tree_record(hasher, b"dir", relative.as_slice(), &mode);
+                hasher.hash_directory(relative.as_slice(), &metadata);
             }
             hash_tree_metadata_record(metadata_hasher, b"dir", relative.as_slice(), &metadata, &[]);
             hash_object_tree_dir_inner(
@@ -329,7 +387,13 @@ fn hash_object_tree_dir_inner(
             if let Some(hasher) = content_hasher.as_deref_mut() {
                 path.push(&entry_name);
                 path_pushed = true;
-                hash_object_file(hasher, relative.as_slice(), &path, &metadata)?;
+                let materialized_relative = path.strip_prefix(root).map_err(|error| {
+                    LpmError::Store(format!(
+                        "failed to derive relative virtual-store object path {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                hasher.hash_file(relative.as_slice(), materialized_relative, &path, &metadata)?;
             }
             Ok(())
         } else {
@@ -693,6 +757,159 @@ struct ObjectTreeEntry {
     metadata: std::fs::Metadata,
 }
 
+enum EntryDigestSource<'a> {
+    Filesystem,
+    Extraction(&'a mut HashMap<PathBuf, [u8; 32]>),
+}
+
+enum TreeContentHasher<'a> {
+    Sequential(Sha256),
+    EntryDigest {
+        root: Sha256,
+        source: EntryDigestSource<'a>,
+    },
+}
+
+impl<'a> TreeContentHasher<'a> {
+    fn sequential() -> Self {
+        Self::Sequential(Sha256::new())
+    }
+
+    fn entry_digest_from_filesystem() -> Self {
+        Self::entry_digest(EntryDigestSource::Filesystem)
+    }
+
+    fn entry_digest_from_extraction(file_digests: &'a mut HashMap<PathBuf, [u8; 32]>) -> Self {
+        Self::entry_digest(EntryDigestSource::Extraction(file_digests))
+    }
+
+    fn entry_digest(source: EntryDigestSource<'a>) -> Self {
+        let mut root = Sha256::new();
+        root.update(b"lpm-tree-entry-digest-v2\0");
+        Self::EntryDigest { root, source }
+    }
+
+    fn hash_symlink(&mut self, relative: &[u8], metadata: &std::fs::Metadata, target: &[u8]) {
+        match self {
+            Self::Sequential(hasher) => {
+                hash_object_tree_record(hasher, b"symlink", relative, target);
+            }
+            Self::EntryDigest { root, .. } => {
+                let digest = *blake3::hash(target).as_bytes();
+                hash_entry_digest_record(
+                    root,
+                    b"symlink",
+                    relative,
+                    object_entry_mode(metadata),
+                    target.len() as u64,
+                    Some(&digest),
+                );
+            }
+        }
+    }
+
+    fn hash_directory(&mut self, relative: &[u8], metadata: &std::fs::Metadata) {
+        match self {
+            Self::Sequential(hasher) => {
+                let mode = object_entry_mode(metadata).to_le_bytes();
+                hash_object_tree_record(hasher, b"dir", relative, &mode);
+            }
+            Self::EntryDigest { root, .. } => hash_entry_digest_record(
+                root,
+                b"dir",
+                relative,
+                object_entry_mode(metadata),
+                0,
+                None,
+            ),
+        }
+    }
+
+    fn hash_file(
+        &mut self,
+        relative: &[u8],
+        materialized_relative: &Path,
+        path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(), LpmError> {
+        match self {
+            Self::Sequential(hasher) => hash_object_file(hasher, relative, path, metadata),
+            Self::EntryDigest { root, source } => {
+                let digest = match source {
+                    EntryDigestSource::Filesystem => hash_object_file_blake3(path)?,
+                    EntryDigestSource::Extraction(file_digests) => {
+                        file_digests.remove(materialized_relative).ok_or_else(|| {
+                            LpmError::Store(format!(
+                                "streamed extraction omitted a file digest for {}",
+                                path.display()
+                            ))
+                        })?
+                    }
+                };
+                hash_entry_digest_record(
+                    root,
+                    b"file",
+                    relative,
+                    object_entry_mode(metadata),
+                    metadata.len(),
+                    Some(&digest),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Result<String, LpmError> {
+        match self {
+            Self::Sequential(hasher) => Ok(format!(
+                "sha256-{}",
+                hex::encode(std::mem::take(hasher).finalize())
+            )),
+            Self::EntryDigest { root, source } => {
+                if let EntryDigestSource::Extraction(file_digests) = source {
+                    let unmatched = file_digests.len();
+                    if unmatched != 0 {
+                        return Err(LpmError::Store(format!(
+                            "streamed extraction retained {} digest(s) without materialized files",
+                            unmatched
+                        )));
+                    }
+                }
+                Ok(format!(
+                    "sha256-{}",
+                    hex::encode(std::mem::take(root).finalize())
+                ))
+            }
+        }
+    }
+}
+
+fn hash_entry_digest_record(
+    root: &mut Sha256,
+    kind: &[u8],
+    relative: &[u8],
+    mode: u32,
+    len: u64,
+    payload_digest: Option<&[u8; 32]>,
+) {
+    let mut leaf = Sha256::new();
+    leaf.update(b"lpm-tree-entry-v2\0");
+    leaf.update((kind.len() as u64).to_le_bytes());
+    leaf.update(kind);
+    leaf.update((relative.len() as u64).to_le_bytes());
+    leaf.update(relative);
+    leaf.update(mode.to_le_bytes());
+    leaf.update(len.to_le_bytes());
+    match payload_digest {
+        Some(digest) => {
+            leaf.update([1]);
+            leaf.update(digest);
+        }
+        None => leaf.update([0]),
+    }
+    root.update(leaf.finalize());
+}
+
 fn hash_tree_metadata_record(
     hasher: &mut Sha256,
     kind: &[u8],
@@ -788,6 +1005,31 @@ fn hash_object_file(
         hasher.update(&buf[..read]);
     }
     Ok(())
+}
+
+fn hash_object_file_blake3(path: &Path) -> Result<[u8; 32], LpmError> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to open virtual-store object file {} for integrity hashing: {e}",
+            path.display()
+        ))
+    })?;
+    let mut reader = file;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf).map_err(|e| {
+            LpmError::Store(format!(
+                "failed to read virtual-store object file {} for integrity hashing: {e}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 fn hash_object_tree_record(hasher: &mut Sha256, kind: &[u8], relative: &[u8], payload: &[u8]) {
     hasher.update(kind);
@@ -888,6 +1130,13 @@ pub(crate) fn is_object_metadata_sidecar_name(root: &Path, dir: &Path, name: &Os
 mod tests {
     use super::*;
 
+    fn fixture_file(path: &str, content: &[u8]) -> ExtractedFileDigest {
+        ExtractedFileDigest {
+            relative_path: path.into(),
+            blake3_digest: *blake3::hash(content).as_bytes(),
+        }
+    }
+
     #[test]
     fn relative_path_bytes_use_the_tree_hash_canonical_separator() {
         let root = Path::new("root");
@@ -898,5 +1147,125 @@ mod tests {
         push_os_str_bytes(&mut expected, OsStr::new("child"));
 
         assert_eq!(relative_path_bytes(root, &path).unwrap(), expected);
+    }
+
+    #[test]
+    fn streamed_tree_digest_is_independent_of_extraction_entry_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
+        std::fs::write(dir.path().join("lib/index.js"), b"module.exports = 1;\n").unwrap();
+
+        let forward = StreamedTreeBuilder::from_extraction(vec![
+            fixture_file("package.json", b"{\"name\":\"fixture\"}"),
+            fixture_file("lib/index.js", b"module.exports = 1;\n"),
+        ]);
+        let forward = forward.finish(dir.path()).unwrap();
+
+        let reverse = StreamedTreeBuilder::from_extraction(vec![
+            fixture_file("lib/index.js", b"module.exports = 1;\n"),
+            fixture_file("package.json", b"{\"name\":\"fixture\"}"),
+        ]);
+        let reverse = reverse.finish(dir.path()).unwrap();
+
+        assert_eq!(forward.content, reverse.content);
+        assert_eq!(forward.metadata, reverse.metadata);
+        assert_eq!(forward.content_schema, TreeContentSchema::EntryDigestV2);
+    }
+
+    #[test]
+    fn streamed_tree_digest_matches_a_full_entry_digest_recomputation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
+        std::fs::write(dir.path().join("index.js"), b"module.exports = 1;\n").unwrap();
+        let streamed = StreamedTreeBuilder::from_extraction(vec![
+            fixture_file("package.json", b"{\"name\":\"fixture\"}"),
+            fixture_file("index.js", b"module.exports = 1;\n"),
+        ]);
+
+        let streamed = streamed.finish(dir.path()).unwrap();
+        let recomputed = compute_object_tree_integrities_for_schema(
+            dir.path(),
+            TreeContentSchema::EntryDigestV2,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.content, recomputed.content);
+        assert_eq!(streamed.metadata, recomputed.metadata);
+    }
+
+    #[test]
+    fn streamed_tree_digest_uses_the_last_duplicate_file_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
+        std::fs::write(dir.path().join("index.js"), b"module.exports = 2;\n").unwrap();
+        let streamed = StreamedTreeBuilder::from_extraction(vec![
+            fixture_file("package.json", b"{\"name\":\"fixture\"}"),
+            fixture_file("index.js", b"module.exports = 1;\n"),
+            fixture_file("index.js", b"module.exports = 2;\n"),
+        ]);
+
+        let streamed = streamed.finish(dir.path()).unwrap();
+        let recomputed = compute_object_tree_integrities_for_schema(
+            dir.path(),
+            TreeContentSchema::EntryDigestV2,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.content, recomputed.content);
+    }
+
+    #[test]
+    fn streamed_tree_digest_rejects_a_missing_file_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
+        std::fs::write(dir.path().join("index.js"), b"module.exports = 1;\n").unwrap();
+        let streamed = StreamedTreeBuilder::from_extraction(vec![fixture_file(
+            "package.json",
+            b"{\"name\":\"fixture\"}",
+        )]);
+
+        let error = streamed.finish(dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("omitted a file digest"));
+    }
+
+    #[test]
+    fn streamed_tree_digest_rejects_a_digest_without_a_materialized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
+        let streamed = StreamedTreeBuilder::from_extraction(vec![
+            fixture_file("package.json", b"{\"name\":\"fixture\"}"),
+            fixture_file("ghost.js", b"not materialized\n"),
+        ]);
+
+        let error = streamed.finish(dir.path()).unwrap_err();
+
+        assert!(error.to_string().contains("without materialized files"));
+    }
+
+    #[test]
+    fn streamed_tree_digest_excludes_only_root_store_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join(".integrity"), b"package-owned root sidecar").unwrap();
+        std::fs::write(
+            dir.path().join("nested/.integrity"),
+            b"ordinary nested file",
+        )
+        .unwrap();
+        let streamed = StreamedTreeBuilder::from_extraction(vec![
+            fixture_file(".integrity", b"package-owned root sidecar"),
+            fixture_file("nested/.integrity", b"ordinary nested file"),
+        ]);
+
+        let streamed = streamed.finish(dir.path()).unwrap();
+        let recomputed = compute_object_tree_integrities_for_schema(
+            dir.path(),
+            TreeContentSchema::EntryDigestV2,
+        )
+        .unwrap();
+
+        assert_eq!(streamed.content, recomputed.content);
     }
 }

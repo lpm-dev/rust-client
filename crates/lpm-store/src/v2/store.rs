@@ -32,7 +32,8 @@ use super::integrity::{
     object_integrity_for_link, object_integrity_or_remove, object_integrity_or_remove_with_timings,
     object_integrity_policy_from_env, read_object_integrity, read_tree_snapshot,
     remove_unusable_object_dir, source_object_integrity, source_policy_uses_source_integrity,
-    tree_snapshot_matches, write_object_integrity_for_policy, write_tree_snapshot,
+    tree_snapshot_matches, write_object_integrity_for_policy,
+    write_object_integrity_for_policy_with_tree, write_tree_snapshot,
     write_tree_snapshot_best_effort, write_tree_snapshot_with_layout_content,
 };
 use super::local_source::{
@@ -41,8 +42,8 @@ use super::local_source::{
     stored_local_source_fingerprint_matches, write_local_source_fingerprint,
 };
 use super::tree_hash::{
-    ExtractedObjectStats, ObjectTreeStats, TreeIntegrities, compute_object_tree_integrities,
-    compute_tree_metadata_integrity,
+    ObjectTreeStats, StreamedTreeBuilder, TreeContentSchema, TreeIntegrities,
+    compute_object_tree_integrities, compute_tree_metadata_integrity,
 };
 use crate::v2::graph_key::GraphKey;
 use crate::v2::link_meta::{
@@ -788,17 +789,21 @@ impl Store {
             }
             SourceReuseStatus::MissingOrInvalid => {}
         }
-        let snapshot_is_valid = read_tree_snapshot(object_dir)
+        let snapshot_tree = read_tree_snapshot(object_dir)
             .map(|snapshot| current_tree_content_matches_snapshot(object_dir, &snapshot))
             .transpose()?
-            .flatten()
-            .is_some();
-        if !snapshot_is_valid {
+            .flatten();
+        let Some(snapshot_tree) = snapshot_tree else {
             remove_unusable_object_dir(object_dir, "before v3 CAS metadata reconstruction")?;
             return Ok(FileCasSourceFinish::Unusable);
-        }
+        };
         let prepared = cas.ingest_object_tree(object_dir, source_sri, local_source)?;
-        let integrities = write_object_integrity_for_policy(object_dir, source_sri, policy)?;
+        let integrities = write_object_integrity_for_policy_with_tree(
+            object_dir,
+            source_sri,
+            policy,
+            snapshot_tree,
+        )?;
         cas.publish_source_record(object_dir, &prepared)?;
         Ok(FileCasSourceFinish::Ready(Some(
             VerifiedObjectIntegrity::new(integrities.content),
@@ -843,8 +848,15 @@ impl Store {
         let valid = if matches!(policy, ObjectIntegrityPolicy::Source) {
             expected == source_object_integrity(source_sri)
         } else {
-            match compute_object_tree_integrities(&source_dir) {
-                Ok(actual) => actual.content == expected,
+            match read_tree_snapshot(&source_dir)
+                .map(|snapshot| current_tree_content_matches_snapshot(&source_dir, &snapshot))
+                .transpose()
+            {
+                Ok(Some(Some(actual))) => actual.content == expected,
+                Ok(Some(None)) => false,
+                Ok(None) => compute_object_tree_integrities(&source_dir)
+                    .map(|actual| actual.content == expected)
+                    .unwrap_or(false),
                 Err(error) => {
                     tracing::debug!(
                         target = %source_dir.display(),
@@ -1236,16 +1248,15 @@ impl Store {
         let extract_start = std::time::Instant::now();
         let source_analysis_enabled = self.security_analysis_policy.is_enabled();
         let analyzer = std::cell::RefCell::new(lpm_security::behavioral::PackageAnalyzer::new());
-        let extracted_stats = std::cell::RefCell::new(ExtractedObjectStats::default());
         let registry_cas_ingest = self
             .file_cas
             .as_ref()
             .map(|cas| cas.begin_registry_ingest(&object_dir, sri))
             .transpose()?
             .map(std::cell::RefCell::new);
-        let registry_cas_error = std::cell::RefCell::new(None);
+        let inspection_error = std::cell::RefCell::new(None);
         let inspect_entry = |entry: lpm_extractor::EntryInfo<'_>| {
-            if registry_cas_error.borrow().is_none()
+            if inspection_error.borrow().is_none()
                 && let (Some(ingest), Some(cas)) =
                     (registry_cas_ingest.as_ref(), self.file_cas.as_ref())
             {
@@ -1267,12 +1278,9 @@ impl Store {
                         )
                     });
                 if let Err(error) = result {
-                    *registry_cas_error.borrow_mut() = Some(error);
+                    *inspection_error.borrow_mut() = Some(error);
                 }
             }
-            extracted_stats
-                .borrow_mut()
-                .record_file(entry.relative_path, entry.size);
             if !source_analysis_enabled {
                 return;
             }
@@ -1290,22 +1298,14 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let extract_result = match (tarball_input, registry_cas_ingest.is_some()) {
-            (TarballInput::Bytes(bytes), true) => {
-                lpm_extractor::extract_tarball_with_entry_digests(
-                    bytes,
-                    &tmp_dir,
-                    buffer_predicate,
-                    inspect_entry,
-                )
-            }
-            (TarballInput::Bytes(bytes), false) => lpm_extractor::extract_tarball_with_inspector(
+        let extract_result = match tarball_input {
+            TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
                 bytes,
                 &tmp_dir,
                 buffer_predicate,
                 inspect_entry,
             ),
-            (TarballInput::File(reader), true) => {
+            TarballInput::File(reader) => {
                 lpm_extractor::extract_tarball_from_reader_hybrid_with_entry_digests(
                     reader,
                     &tmp_dir,
@@ -1313,24 +1313,36 @@ impl Store {
                     inspect_entry,
                 )
             }
-            (TarballInput::File(reader), false) => {
-                lpm_extractor::extract_tarball_from_reader_hybrid_with_inspector(
-                    reader,
-                    &tmp_dir,
-                    buffer_predicate,
-                    inspect_entry,
-                )
+        };
+        let extracted_files = match extract_result {
+            Ok(extracted_files) => extracted_files,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(error);
             }
         };
-        if let Err(error) = extract_result {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(error);
-        }
-        if let Some(error) = registry_cas_error.into_inner() {
+        if let Some(error) = inspection_error.into_inner() {
             let _ = std::fs::remove_dir_all(&tmp_dir);
             return Err(error);
         }
         timings.extract_ms = extract_start.elapsed().as_millis();
+
+        let finalize_permit_wait_start = std::time::Instant::now();
+        let finalize_permit = v2_finalize_limiter().map(|limiter| limiter.acquire());
+        timings.finalize_permit_wait_ms = finalize_permit_wait_start.elapsed().as_millis();
+        let tree_integrity_start = std::time::Instant::now();
+        let streamed_integrities =
+            StreamedTreeBuilder::from_extraction(extracted_files).finish(&tmp_dir);
+        timings.finalize_tree_integrity_ms = tree_integrity_start.elapsed().as_millis();
+        let early_finalize_ms = timings.finalize_tree_integrity_ms;
+        drop(finalize_permit);
+        let streamed_integrities = match streamed_integrities {
+            Ok(integrities) => integrities,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                return Err(error);
+            }
+        };
 
         // Manifest-level analysis + cache write. Done BEFORE the atomic
         // rename so the cache file is part of the atomically-published
@@ -1349,10 +1361,6 @@ impl Store {
             }
             timings.security_ms = security_start.elapsed().as_millis();
         }
-
-        let finalize_permit_wait_start = std::time::Instant::now();
-        let _finalize_permit = v2_finalize_limiter().map(|limiter| limiter.acquire());
-        timings.finalize_permit_wait_ms = finalize_permit_wait_start.elapsed().as_millis();
 
         let prepared_cas = match registry_cas_ingest {
             Some(ingest) => self
@@ -1377,19 +1385,22 @@ impl Store {
         // [`is_complete_object_dir`]'s incompleteness probe.
         let finalize_start = std::time::Instant::now();
         let object_integrity_start = std::time::Instant::now();
-        let integrities = match write_object_integrity_for_policy(&tmp_dir, sri, policy) {
+        let integrities = match write_object_integrity_for_policy_with_tree(
+            &tmp_dir,
+            sri,
+            policy,
+            streamed_integrities,
+        ) {
             Ok(integrities) => integrities,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
                 return Err(e);
             }
         };
-        timings.finalize_tree_integrity_ms = object_integrity_start.elapsed().as_millis();
-        let stats = if matches!(policy, ObjectIntegrityPolicy::Source) {
-            extracted_stats.into_inner().finish()
-        } else {
-            integrities.stats
-        };
+        timings.finalize_tree_integrity_ms = timings
+            .finalize_tree_integrity_ms
+            .saturating_add(object_integrity_start.elapsed().as_millis());
+        let stats = integrities.stats;
         timings.file_count = stats.file_count;
         timings.dir_count = stats.dir_count;
         timings.symlink_count = stats.symlink_count;
@@ -1482,7 +1493,8 @@ impl Store {
                 })
             }
         };
-        timings.finalize_ms = finalize_start.elapsed().as_millis();
+        timings.finalize_ms =
+            early_finalize_ms.saturating_add(finalize_start.elapsed().as_millis());
 
         result.map(|object| (object, timings))
     }
@@ -2121,6 +2133,7 @@ impl Store {
                     content: content.clone(),
                     metadata,
                     stats: ObjectTreeStats::default(),
+                    content_schema: TreeContentSchema::SequentialV1,
                 },
             )?;
             return Ok(content);
@@ -2877,6 +2890,7 @@ fn populate_into(
                 content: object_integrity,
                 metadata: package_metadata_integrity,
                 stats: ObjectTreeStats::default(),
+                content_schema: TreeContentSchema::SequentialV1,
             },
         )?;
     }
@@ -3107,6 +3121,7 @@ fn link_entry_is_reusable(
                 content: expected.as_ref().to_owned(),
                 metadata: actual.metadata,
                 stats: actual.stats,
+                content_schema: actual.content_schema,
             },
         );
         return Ok(true);

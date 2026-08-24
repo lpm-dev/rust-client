@@ -11,8 +11,9 @@
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, hash_map::RandomState};
 use std::ffi::OsStr;
+use std::hash::BuildHasher;
 use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
@@ -473,6 +474,7 @@ struct ExtractionLimits {
     max_extraction_size: u64,
     max_file_size: u64,
     max_file_count: usize,
+    max_path_ledger_bytes: usize,
 }
 
 impl ExtractionLimits {
@@ -490,6 +492,7 @@ const DEFAULT_EXTRACTION_LIMITS: ExtractionLimits = ExtractionLimits {
     max_extraction_size: MAX_EXTRACTION_SIZE,
     max_file_size: MAX_FILE_SIZE,
     max_file_count: MAX_FILE_COUNT,
+    max_path_ledger_bytes: MAX_PATH_LEDGER_BYTES,
 };
 
 enum BufferedGzipDecode<'a> {
@@ -726,6 +729,9 @@ const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
 /// Maximum number of files in a tarball (100,000).
 const MAX_FILE_COUNT: usize = 100_000;
 
+/// Maximum aggregate bytes retained for extracted file and directory paths (64 MiB).
+const MAX_PATH_LEDGER_BYTES: usize = 64 * 1024 * 1024;
+
 /// Extract a .tgz (gzip-compressed tar) from any `Read` source to a target directory.
 ///
 /// Strips the first path component (the `package/` prefix that npm pack adds).
@@ -737,6 +743,7 @@ const MAX_FILE_COUNT: usize = 100_000;
 /// - Max 100,000 files
 /// - Max 100,000 GNU or PAX metadata records
 /// - Max 256 path components and 32 KiB per encoded path
+/// - Max 64 MiB of retained extracted file and directory paths
 /// - Max 1 MiB per GNU or PAX metadata record
 pub fn extract_tarball_from_reader(
     reader: impl std::io::Read,
@@ -761,6 +768,66 @@ pub struct EntryInfo<'a> {
     /// BLAKE3 digest computed while the entry was written when the caller
     /// selected the digest-enabled extraction path.
     pub blake3_digest: Option<[u8; 32]>,
+}
+
+/// A successfully extracted regular file and the BLAKE3 digest computed
+/// during its write pass.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExtractedFileDigest {
+    /// Path relative to the extraction root.
+    pub relative_path: PathBuf,
+    /// BLAKE3 digest of the final bytes written for this archive entry.
+    pub blake3_digest: [u8; 32],
+}
+
+trait ExtractionRecord: Sized {
+    const RETAIN_DUPLICATE_PATHS: bool;
+
+    fn from_extracted_file(
+        relative_path: PathBuf,
+        blake3_digest: Option<[u8; 32]>,
+    ) -> Result<Self, LpmError>;
+
+    fn relative_path(&self) -> &Path;
+}
+
+impl ExtractionRecord for PathBuf {
+    const RETAIN_DUPLICATE_PATHS: bool = true;
+
+    fn from_extracted_file(
+        relative_path: PathBuf,
+        _blake3_digest: Option<[u8; 32]>,
+    ) -> Result<Self, LpmError> {
+        Ok(relative_path)
+    }
+
+    fn relative_path(&self) -> &Path {
+        self
+    }
+}
+
+impl ExtractionRecord for ExtractedFileDigest {
+    const RETAIN_DUPLICATE_PATHS: bool = false;
+
+    fn from_extracted_file(
+        relative_path: PathBuf,
+        blake3_digest: Option<[u8; 32]>,
+    ) -> Result<Self, LpmError> {
+        let blake3_digest = blake3_digest.ok_or_else(|| {
+            LpmError::Registry(format!(
+                "digest-enabled extraction omitted a digest for {}",
+                relative_path.display()
+            ))
+        })?;
+        Ok(Self {
+            relative_path,
+            blake3_digest,
+        })
+    }
+
+    fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
 }
 
 /// Extract tarball AND invoke a caller-supplied
@@ -859,7 +926,7 @@ pub fn extract_tarball_from_reader_with_entry_digests<P, I>(
     target_dir: &Path,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
 where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
@@ -880,7 +947,7 @@ pub fn extract_tarball_from_reader_streaming_with_entry_digests<P, I>(
     target_dir: &Path,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
 where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
@@ -905,7 +972,7 @@ pub fn extract_tarball_from_reader_hybrid_with_entry_digests<P, I>(
     target_dir: &Path,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
 where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
@@ -956,7 +1023,7 @@ pub fn extract_tarball_with_entry_digests<P, I>(
     target_dir: &Path,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<ExtractedFileDigest>, LpmError>
 where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
@@ -971,18 +1038,19 @@ where
     )
 }
 
-fn extract_tarball_from_reader_with_inspector_with_limits<R, P, I>(
+fn extract_tarball_from_reader_with_inspector_with_limits<R, P, I, E>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
     compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<E>, LpmError>
 where
     R: std::io::Read,
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
+    E: ExtractionRecord,
 {
     // Top-level extractor span. Visible in Tracy under `--features tracy`;
     // covers buffered read + libdeflate decompression + tar walk so the
@@ -1019,17 +1087,18 @@ where
     }
 }
 
-fn extract_tarball_from_slice_with_inspector_with_limits<P, I>(
+fn extract_tarball_from_slice_with_inspector_with_limits<P, I, E>(
     data: &[u8],
     target_dir: &Path,
     limits: ExtractionLimits,
     compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<E>, LpmError>
 where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
+    E: ExtractionRecord,
 {
     let _span = tracing::info_span!("extractor.extract").entered();
     if data.len() as u64 > limits.max_buffered_compressed_size {
@@ -1053,17 +1122,18 @@ where
     )
 }
 
-fn extract_buffered_gzip_tarball<P, I>(
+fn extract_buffered_gzip_tarball<P, I, E>(
     compressed: &[u8],
     target_dir: &Path,
     limits: ExtractionLimits,
     compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<E>, LpmError>
 where
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
+    E: ExtractionRecord,
 {
     match decompress_gzip_libdeflate_with_limits(compressed, limits)? {
         BufferedGzipDecode::Decoded(decompressed) => extract_tar_archive_with_inspector(
@@ -1123,18 +1193,19 @@ fn read_compressed_input<R: std::io::Read>(
     }
 }
 
-fn extract_streaming_gzip_tarball<R, P, I>(
+fn extract_streaming_gzip_tarball<R, P, I, E>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
     compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<E>, LpmError>
 where
     R: std::io::Read,
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
+    E: ExtractionRecord,
 {
     let decoder = GzDecoder::new(reader);
     let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
@@ -1194,7 +1265,7 @@ impl<R: std::io::Read> std::io::Read for DecompressedLimitReader<R> {
     }
 }
 
-fn extract_tar_archive_with_inspector<R, P, I, D>(
+fn extract_tar_archive_with_inspector<R, P, I, D, E>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
@@ -1202,31 +1273,22 @@ fn extract_tar_archive_with_inspector<R, P, I, D>(
     buffer_predicate: P,
     mut inspector: I,
     drain_after_entries: D,
-) -> Result<Vec<PathBuf>, LpmError>
+) -> Result<Vec<E>, LpmError>
 where
     R: std::io::Read,
     P: Fn(&Path, u64) -> bool,
     I: FnMut(EntryInfo<'_>),
     D: FnOnce(R) -> Result<(), LpmError>,
+    E: ExtractionRecord,
 {
     let mut extracted_files = Vec::new();
-    let mut created_dirs = Vec::new();
     let mut total_size: u64 = 0;
 
     std::fs::create_dir_all(target_dir)?;
     let extraction_root = target_dir.canonicalize().map_err(LpmError::Io)?;
-    // Memoize parent dirs we've already verified-or-created so the
-    // per-file `prepare_output_path` walk doesn't re-`symlink_metadata`
-    // every component on every entry. For an npm tarball with ~80
-    // entries averaging 4 path components, the walk without this cache
-    // does ~320 `symlink_metadata` syscalls; with it, ~84 (each unique
-    // dir prefix once).
-    //
-    // Capacity heuristic: most npm tarballs have ≤ 10 distinct
-    // intermediate dirs; 64 covers the long tail without over-allocating.
-    let mut verified_parents: HashSet<PathBuf> = HashSet::with_capacity(64);
-    verified_parents.insert(extraction_root.clone());
-    let mut seen_archive_paths = HashMap::with_capacity(64);
+    let mut path_ledger_budget = PathLedgerBudget::new(limits.max_path_ledger_bytes);
+    let mut directory_ledger = DirectoryLedger::new();
+    let mut seen_archive_paths = CaseFoldPathIndex::new();
 
     let visit_result = visit_tar_archive(
         reader,
@@ -1255,13 +1317,13 @@ where
                 return Ok(ControlFlow::<()>::Continue(()));
             };
 
-            let (target_path, mut entry_created_dirs) = prepare_output_path(
+            let target_path = prepare_output_path(
                 &extraction_root,
                 &relative_path,
                 &original_path,
-                &mut verified_parents,
+                &mut directory_ledger,
+                &mut path_ledger_budget,
             )?;
-            created_dirs.append(&mut entry_created_dirs);
 
             if !target_path.starts_with(&extraction_root) {
                 return Err(LpmError::Registry(format!(
@@ -1271,8 +1333,11 @@ where
             }
 
             if entry.header().entry_type().is_file() {
-                let duplicate_path =
-                    record_case_fold_archive_path(&mut seen_archive_paths, &relative_path)?;
+                let path_match = seen_archive_paths.classify(&relative_path, &extracted_files)?;
+                let duplicate_path = matches!(path_match, ArchivePathMatch::ExactDuplicate { .. });
+                if !duplicate_path || E::RETAIN_DUPLICATE_PATHS {
+                    path_ledger_budget.reserve(&relative_path)?;
+                }
                 let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
 
                 let buffer_this = buffer_predicate(&relative_path, size);
@@ -1301,14 +1366,32 @@ where
                 #[cfg(not(unix))]
                 let _ = exec_bits;
 
+                let extracted_file = E::from_extracted_file(relative_path, blake3_digest)?;
                 inspector(EntryInfo {
-                    relative_path: &relative_path,
+                    relative_path: extracted_file.relative_path(),
                     size,
                     bytes: buffered_bytes.as_deref(),
                     blake3_digest,
                 });
 
-                extracted_files.push(relative_path);
+                match path_match {
+                    ArchivePathMatch::New { folded_hash } => {
+                        let record_index = extracted_files.len();
+                        extracted_files.push(extracted_file);
+                        seen_archive_paths.record_new(folded_hash, record_index);
+                    }
+                    ArchivePathMatch::ExactDuplicate { record_index }
+                        if !E::RETAIN_DUPLICATE_PATHS =>
+                    {
+                        let previous = extracted_files.get_mut(record_index).ok_or_else(|| {
+                            LpmError::Registry("invalid duplicate archive path ledger index".into())
+                        })?;
+                        *previous = extracted_file;
+                    }
+                    ArchivePathMatch::ExactDuplicate { .. } => {
+                        extracted_files.push(extracted_file);
+                    }
+                }
             }
             Ok(ControlFlow::<()>::Continue(()))
         },
@@ -1317,11 +1400,16 @@ where
     let (inner, _) = match visit_result {
         Ok(result) => result,
         Err(error) => {
-            return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, error);
+            return rollback_extraction(
+                &extraction_root,
+                &extracted_files,
+                &directory_ledger,
+                error,
+            );
         }
     };
     if let Err(error) = drain_after_entries(inner) {
-        return rollback_extraction(&extraction_root, &extracted_files, &created_dirs, error);
+        return rollback_extraction(&extraction_root, &extracted_files, &directory_ledger, error);
     }
 
     Ok(extracted_files)
@@ -1374,28 +1462,17 @@ fn stream_entry_to_disk(
     Ok(Some(*hasher.finalize().as_bytes()))
 }
 
-fn cleanup_extracted_files(
+fn cleanup_extracted_files<E: ExtractionRecord>(
     target_dir: &Path,
-    extracted_files: &[PathBuf],
-    created_dirs: &[PathBuf],
+    extracted_files: &[E],
+    directory_ledger: &DirectoryLedger,
 ) {
-    for relative_path in extracted_files.iter().rev() {
-        let full_path = target_dir.join(relative_path);
+    for extracted_file in extracted_files.iter().rev() {
+        let full_path = target_dir.join(extracted_file.relative_path());
         let _ = std::fs::remove_file(&full_path);
-
-        let mut current = full_path.parent();
-        while let Some(directory) = current {
-            if directory == target_dir {
-                break;
-            }
-            if std::fs::remove_dir(directory).is_err() {
-                break;
-            }
-            current = directory.parent();
-        }
     }
 
-    for directory in created_dirs.iter().rev() {
+    for directory in directory_ledger.created_paths_deepest_first() {
         let _ = std::fs::remove_dir(directory);
     }
 }
@@ -1404,10 +1481,10 @@ fn prepare_output_path(
     target_dir: &Path,
     relative_path: &Path,
     original_path: &Path,
-    verified_parents: &mut std::collections::HashSet<PathBuf>,
-) -> Result<(PathBuf, Vec<PathBuf>), LpmError> {
+    directory_ledger: &mut DirectoryLedger,
+    path_ledger_budget: &mut PathLedgerBudget,
+) -> Result<PathBuf, LpmError> {
     let mut current = target_dir.to_path_buf();
-    let mut created_dirs = Vec::new();
     let mut components = relative_path.components().peekable();
 
     while let Some(component) = components.next() {
@@ -1428,7 +1505,7 @@ fn prepare_output_path(
         // Skip the `symlink_metadata` syscall when we've already
         // verified or created this exact intermediate dir on a prior
         // entry. Only applies to NON-leaf components.
-        if verified_parents.contains(&current) {
+        if directory_ledger.contains(&current) {
             continue;
         }
 
@@ -1461,18 +1538,19 @@ fn prepare_output_path(
                         original_path.display()
                     )));
                 }
-                verified_parents.insert(current.clone());
+                path_ledger_budget.reserve(&current)?;
+                directory_ledger.record(current.clone(), DirectoryState::Existing);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                path_ledger_budget.reserve(&current)?;
                 std::fs::create_dir(&current).map_err(LpmError::Io)?;
-                created_dirs.push(current.clone());
-                verified_parents.insert(current.clone());
+                directory_ledger.record(current.clone(), DirectoryState::Created);
             }
             Err(error) => return Err(LpmError::Io(error)),
         }
     }
 
-    Ok((current, created_dirs))
+    Ok(current)
 }
 
 /// Create-or-truncate the leaf file at `target_path` while atomically
@@ -1606,13 +1684,13 @@ fn is_windows_reparse_point(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-fn rollback_extraction(
+fn rollback_extraction<E: ExtractionRecord>(
     target_dir: &Path,
-    extracted_files: &[PathBuf],
-    created_dirs: &[PathBuf],
+    extracted_files: &[E],
+    directory_ledger: &DirectoryLedger,
     error: LpmError,
-) -> Result<Vec<PathBuf>, LpmError> {
-    cleanup_extracted_files(target_dir, extracted_files, created_dirs);
+) -> Result<Vec<E>, LpmError> {
+    cleanup_extracted_files(target_dir, extracted_files, directory_ledger);
     Err(error)
 }
 
@@ -1699,7 +1777,8 @@ where
     D: FnOnce(R) -> Result<(), LpmError>,
 {
     let mut files = Vec::new();
-    let mut seen_archive_paths = HashMap::with_capacity(64);
+    let mut seen_archive_paths = CaseFoldPathIndex::new();
+    let mut path_ledger_budget = PathLedgerBudget::new(limits.max_path_ledger_bytes);
 
     let (inner, _) = visit_tar_archive(
         reader,
@@ -1711,8 +1790,13 @@ where
             if entry.header().entry_type().is_file()
                 && let Some(stripped) = sanitize_entry_path(entry.path())?
             {
-                record_case_fold_archive_path(&mut seen_archive_paths, &stripped)?;
+                let path_match = seen_archive_paths.classify(&stripped, &files)?;
+                path_ledger_budget.reserve(&stripped)?;
+                let record_index = files.len();
                 files.push(stripped);
+                if let ArchivePathMatch::New { folded_hash } = path_match {
+                    seen_archive_paths.record_new(folded_hash, record_index);
+                }
             }
             Ok(ControlFlow::<()>::Continue(()))
         },
@@ -1766,25 +1850,173 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     Ok(Some(relative_path))
 }
 
-fn record_case_fold_archive_path(
-    seen_paths: &mut HashMap<String, PathBuf>,
-    relative_path: &Path,
-) -> Result<bool, LpmError> {
-    let key = case_fold_path_key(relative_path);
-    if let Some(existing_path) = seen_paths.get(&key) {
-        if existing_path == relative_path {
-            return Ok(true);
-        }
+struct PathLedgerBudget {
+    retained_bytes: usize,
+    max_bytes: usize,
+}
 
-        return Err(LpmError::Registry(format!(
-            "case-fold path collision in tarball: {} conflicts with {}",
-            relative_path.display(),
-            existing_path.display()
-        )));
+impl PathLedgerBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            retained_bytes: 0,
+            max_bytes,
+        }
     }
 
-    seen_paths.insert(key, relative_path.to_path_buf());
-    Ok(false)
+    fn reserve(&mut self, path: &Path) -> Result<(), LpmError> {
+        let next = self
+            .retained_bytes
+            .checked_add(path.as_os_str().len())
+            .ok_or_else(|| {
+                LpmError::Registry("tarball retained-path byte count overflowed".into())
+            })?;
+        if next > self.max_bytes {
+            return Err(LpmError::Registry(format!(
+                "tarball retained paths exceed the {}-byte aggregate limit",
+                self.max_bytes
+            )));
+        }
+        self.retained_bytes = next;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DirectoryState {
+    Existing,
+    Created,
+}
+
+struct DirectoryLedger {
+    entries: HashMap<PathBuf, DirectoryState>,
+}
+
+impl DirectoryLedger {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(64),
+        }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
+    }
+
+    fn record(&mut self, path: PathBuf, state: DirectoryState) {
+        let previous = self.entries.insert(path, state);
+        debug_assert!(previous.is_none());
+    }
+
+    fn created_paths_deepest_first(&self) -> Vec<&Path> {
+        let mut paths = self
+            .entries
+            .iter()
+            .filter_map(|(path, state)| {
+                (*state == DirectoryState::Created).then_some(path.as_path())
+            })
+            .collect::<Vec<_>>();
+        paths.sort_unstable_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| right.as_os_str().len().cmp(&left.as_os_str().len()))
+        });
+        paths
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ArchivePathMatch {
+    New { folded_hash: u64 },
+    ExactDuplicate { record_index: usize },
+}
+
+enum CaseFoldHashBucket {
+    One(usize),
+    Collision(Vec<usize>),
+}
+
+impl CaseFoldHashBucket {
+    fn indices(&self) -> &[usize] {
+        match self {
+            Self::One(index) => std::slice::from_ref(index),
+            Self::Collision(indices) => indices,
+        }
+    }
+
+    fn push(&mut self, index: usize) {
+        match self {
+            Self::One(first) => *self = Self::Collision(vec![*first, index]),
+            Self::Collision(indices) => indices.push(index),
+        }
+    }
+}
+
+struct CaseFoldPathIndex {
+    hash_builder: RandomState,
+    buckets: HashMap<u64, CaseFoldHashBucket>,
+}
+
+impl CaseFoldPathIndex {
+    fn new() -> Self {
+        Self {
+            hash_builder: RandomState::new(),
+            buckets: HashMap::with_capacity(64),
+        }
+    }
+
+    fn classify<E: ExtractionRecord>(
+        &self,
+        relative_path: &Path,
+        records: &[E],
+    ) -> Result<ArchivePathMatch, LpmError> {
+        let folded_path = case_fold_path_key(relative_path);
+        let folded_hash = self.hash_builder.hash_one(folded_path.as_bytes());
+        self.classify_with_hash(relative_path, records, &folded_path, folded_hash)
+    }
+
+    fn classify_with_hash<E: ExtractionRecord>(
+        &self,
+        relative_path: &Path,
+        records: &[E],
+        folded_path: &str,
+        folded_hash: u64,
+    ) -> Result<ArchivePathMatch, LpmError> {
+        let Some(bucket) = self.buckets.get(&folded_hash) else {
+            return Ok(ArchivePathMatch::New { folded_hash });
+        };
+
+        for &record_index in bucket.indices() {
+            let existing_path = records
+                .get(record_index)
+                .ok_or_else(|| LpmError::Registry("invalid archive path ledger index".into()))?
+                .relative_path();
+            if existing_path == relative_path {
+                return Ok(ArchivePathMatch::ExactDuplicate { record_index });
+            }
+            if case_fold_path_key(existing_path) == folded_path {
+                return Err(LpmError::Registry(format!(
+                    "case-fold path collision in tarball: {} conflicts with {}",
+                    relative_path.display(),
+                    existing_path.display()
+                )));
+            }
+        }
+
+        Ok(ArchivePathMatch::New { folded_hash })
+    }
+
+    fn record_new(&mut self, folded_hash: u64, record_index: usize) {
+        match self.buckets.entry(folded_hash) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(CaseFoldHashBucket::One(record_index));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().push(record_index);
+            }
+        }
+    }
 }
 
 fn case_fold_path_key(path: &Path) -> String {
@@ -1906,6 +2138,7 @@ mod tests {
             max_extraction_size: 1024 * 1024,
             max_file_size: 512 * 1024,
             max_file_count: 1000,
+            max_path_ledger_bytes: MAX_PATH_LEDGER_BYTES,
         }
     }
 
@@ -1927,7 +2160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = Vec::new();
 
-        let files = extract_tarball_from_reader_with_inspector_with_limits(
+        let files: Vec<PathBuf> = extract_tarball_from_reader_with_inspector_with_limits(
             std::io::Cursor::new(&tgz),
             dir.path(),
             streaming_test_limits(),
@@ -1958,7 +2191,7 @@ mod tests {
             ..streaming_test_limits()
         };
 
-        let error = extract_tarball_from_reader_with_inspector_with_limits(
+        let error = extract_tarball_from_reader_with_inspector_with_limits::<_, _, _, PathBuf>(
             std::io::Cursor::new(&tgz),
             dir.path(),
             limits,
@@ -2050,6 +2283,48 @@ mod tests {
     }
 
     #[test]
+    fn digest_enabled_extraction_returns_only_the_last_duplicate_record() {
+        let first = b"module.exports = 1;\n";
+        let second = b"module.exports = 2;\n";
+        let tgz = create_test_tarball_with_entries(&[
+            ("index.js", first.as_slice()),
+            ("index.js", second.as_slice()),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut inspected = Vec::new();
+
+        let extracted = extract_tarball_with_entry_digests(
+            &tgz,
+            dir.path(),
+            |_, _| false,
+            |entry| {
+                inspected.push((
+                    entry.relative_path.to_path_buf(),
+                    entry.blake3_digest.expect("digest-enabled extraction"),
+                ));
+            },
+        )
+        .unwrap();
+        let returned = extracted
+            .into_iter()
+            .map(|entry| (entry.relative_path, entry.blake3_digest))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            inspected,
+            [
+                (PathBuf::from("index.js"), *blake3::hash(first).as_bytes()),
+                (PathBuf::from("index.js"), *blake3::hash(second).as_bytes()),
+            ]
+        );
+        assert_eq!(
+            returned,
+            [(PathBuf::from("index.js"), *blake3::hash(second).as_bytes())]
+        );
+        assert_eq!(std::fs::read(dir.path().join("index.js")).unwrap(), second);
+    }
+
+    #[test]
     fn extract_tarball_streams_when_compressed_input_exceeds_buffered_cap() {
         let payload = b"small package content";
         let tgz = create_test_tarball("index.js", payload);
@@ -2060,7 +2335,7 @@ mod tests {
             ..streaming_test_limits()
         };
 
-        let files = extract_tarball_from_reader_with_inspector_with_limits(
+        let files: Vec<PathBuf> = extract_tarball_from_reader_with_inspector_with_limits(
             std::io::Cursor::new(&tgz),
             dir.path(),
             limits,
@@ -2085,7 +2360,7 @@ mod tests {
             ..streaming_test_limits()
         };
 
-        let files = extract_tarball_from_slice_with_inspector_with_limits(
+        let files: Vec<PathBuf> = extract_tarball_from_slice_with_inspector_with_limits(
             &tgz,
             dir.path(),
             limits,
@@ -2139,7 +2414,7 @@ mod tests {
             ..streaming_test_limits()
         };
 
-        let error = extract_tarball_from_reader_with_inspector_with_limits(
+        let error = extract_tarball_from_reader_with_inspector_with_limits::<_, _, _, PathBuf>(
             std::io::Cursor::new(&tgz),
             dir.path(),
             limits,
@@ -2725,6 +3000,38 @@ mod tests {
     }
 
     #[test]
+    fn case_fold_hash_collision_bucket_finds_the_exact_record() {
+        let records = vec![PathBuf::from("alpha.js"), PathBuf::from("beta.js")];
+        let mut index = CaseFoldPathIndex::new();
+        index.record_new(7, 0);
+        index.record_new(7, 1);
+
+        let path_match = index
+            .classify_with_hash(Path::new("beta.js"), &records, "beta.js", 7)
+            .unwrap();
+
+        assert!(matches!(
+            path_match,
+            ArchivePathMatch::ExactDuplicate { record_index: 1 }
+        ));
+    }
+
+    #[test]
+    fn case_fold_hash_collision_bucket_still_rejects_case_only_paths() {
+        let records = vec![PathBuf::from("alpha.js"), PathBuf::from("beta.js")];
+        let mut index = CaseFoldPathIndex::new();
+        index.record_new(7, 0);
+        index.record_new(7, 1);
+
+        let error = index
+            .classify_with_hash(Path::new("ALPHA.js"), &records, "alpha.js", 7)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("case-fold path collision"));
+    }
+
+    #[test]
     fn extract_rejects_case_fold_path_collision_and_rolls_back_written_files() {
         let tgz = create_test_tarball_with_entries(&[
             ("lib/Foo.js", b"first"),
@@ -2763,6 +3070,64 @@ mod tests {
             std::fs::read(dir.path().join("duplicate.txt")).unwrap(),
             b"second"
         );
+    }
+
+    #[test]
+    fn extract_rejects_retained_paths_over_the_aggregate_limit_and_rolls_back() {
+        let first_path = "first-entry.txt";
+        let second_path = "second-entry.txt";
+        let tgz = create_test_tarball_with_entries(&[(first_path, b""), (second_path, b"")]);
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_path_ledger_bytes: first_path.len() + second_path.len() - 1,
+            ..DEFAULT_EXTRACTION_LIMITS
+        };
+
+        let result: Result<Vec<PathBuf>, LpmError> =
+            extract_tarball_from_slice_with_inspector_with_limits(
+                &tgz,
+                dir.path(),
+                limits,
+                false,
+                |_, _| false,
+                |_| {},
+            );
+        let error = result.unwrap_err().to_string();
+
+        assert!(
+            error.contains("retained paths exceed"),
+            "expected aggregate retained-path diagnostic, got: {error}"
+        );
+        assert!(!dir.path().join(first_path).exists());
+        assert!(!dir.path().join(second_path).exists());
+    }
+
+    #[test]
+    fn extract_path_budget_includes_retained_directory_prefixes() {
+        let nested_path = "alpha/beta/gamma/index.js";
+        let tgz = create_test_tarball(nested_path, b"");
+        let dir = tempfile::tempdir().unwrap();
+        let limits = ExtractionLimits {
+            max_path_ledger_bytes: nested_path.len(),
+            ..DEFAULT_EXTRACTION_LIMITS
+        };
+
+        let result: Result<Vec<PathBuf>, LpmError> =
+            extract_tarball_from_slice_with_inspector_with_limits(
+                &tgz,
+                dir.path(),
+                limits,
+                false,
+                |_, _| false,
+                |_| {},
+            );
+        let error = result.unwrap_err().to_string();
+
+        assert!(
+            error.contains("retained paths exceed"),
+            "expected retained-directory path-budget diagnostic, got: {error}"
+        );
+        assert!(!dir.path().join("alpha").exists());
     }
 
     #[test]
@@ -2904,6 +3269,22 @@ mod tests {
             !dir.path().join("leftover").exists(),
             "directories created before extraction aborts should be cleaned up"
         );
+    }
+
+    #[test]
+    fn extraction_rollback_preserves_preexisting_empty_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("written-by-extraction.js"), b"temporary").unwrap();
+        let extracted_files = vec![PathBuf::from("existing/written-by-extraction.js")];
+        let mut directory_ledger = DirectoryLedger::new();
+        directory_ledger.record(existing.clone(), DirectoryState::Existing);
+
+        cleanup_extracted_files(dir.path(), &extracted_files, &directory_ledger);
+
+        assert!(existing.exists());
+        assert!(!existing.join("written-by-extraction.js").exists());
     }
 
     #[test]
@@ -3314,6 +3695,7 @@ mod tests {
             max_extraction_size: 64 * 1024,
             max_file_size: 64 * 1024,
             max_file_count: 16,
+            max_path_ledger_bytes: MAX_PATH_LEDGER_BYTES,
         };
 
         let BufferedGzipDecode::Decoded(decoded) =

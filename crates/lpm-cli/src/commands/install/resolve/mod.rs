@@ -9,6 +9,7 @@ mod peer;
 #[cfg(test)]
 mod tests;
 
+pub(super) use fetch_schedule::prioritize_fetch_schedule;
 pub(super) use metadata::{
     MetadataCaches, MetadataRequestContext, MetadataStats, metadata_for_package,
 };
