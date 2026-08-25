@@ -26,6 +26,7 @@ getrandom = "0.3"
 glob = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
+smallvec = "1"
 
 [target.'cfg(not(windows))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }

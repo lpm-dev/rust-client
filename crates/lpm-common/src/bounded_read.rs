@@ -15,6 +15,9 @@ pub const NPMRC_FILE_SIZE_CAP_BYTES: u64 = 1024 * 1024;
 /// Maximum size accepted for a CA bundle, client certificate, or private key.
 pub const TLS_MATERIAL_FILE_SIZE_CAP_BYTES: u64 = 1024 * 1024;
 
+/// Maximum aggregate TLS material retained by one registry client bundle.
+pub const TLS_MATERIAL_AGGREGATE_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Read at most `limit + 1` bytes from an arbitrary stream.
 ///
 /// This is intended for pipes and other readers that do not have meaningful
@@ -94,6 +97,60 @@ impl From<BoundedReadError> for crate::error::LpmError {
 /// opened target.
 pub fn read_file_capped(path: &Path, limit: u64) -> Result<Vec<u8>, BoundedReadError> {
     read_file_capped_with_metadata(path, limit).map(|(bytes, _)| bytes)
+}
+
+/// Read a bounded regular file without blocking on Unix special files.
+/// Symlinks are allowed, but the opened target must be a regular file.
+pub fn read_regular_file_capped_with_metadata(
+    path: &Path,
+    limit: u64,
+) -> Result<(Vec<u8>, Metadata), BoundedReadError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            BoundedReadError::NotFound {
+                path: path.to_path_buf(),
+            }
+        } else {
+            BoundedReadError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+    let metadata = file.metadata().map_err(|source| BoundedReadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(BoundedReadError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "not a regular file"),
+        });
+    }
+    let bytes = read_opened_file_capped(&mut file, path, limit, metadata.len())?;
+    Ok((bytes, metadata))
+}
+
+/// Read bounded UTF-8 text from a regular file without blocking on Unix special files.
+pub fn read_text_regular_file_capped_with_metadata(
+    path: &Path,
+    limit: u64,
+) -> Result<(String, Metadata), BoundedReadError> {
+    let (bytes, metadata) = read_regular_file_capped_with_metadata(path, limit)?;
+    String::from_utf8(bytes)
+        .map_err(|source| BoundedReadError::InvalidUtf8 {
+            path: path.to_path_buf(),
+            source: source.utf8_error(),
+        })
+        .map(|content| (content, metadata))
 }
 
 fn read_file_capped_with_metadata(
