@@ -355,11 +355,14 @@ pub struct StageTiming {
     /// Configured permit count for direct metadata fetches in the fused
     /// dispatcher. Zero on resolver arms that do not use this semaphore.
     pub dispatcher_configured_fanout: u64,
+    /// Configured permit count for exact npm version documents. These
+    /// responses contain one candidate and use a separate bounded pool.
+    pub dispatcher_exact_document_fanout: u64,
     /// Whether the dispatcher permits are shared by importer-local resolver
     /// states in one recursive command.
     pub dispatcher_concurrency_shared: bool,
-    /// Peak number of direct metadata fetches holding semaphore permits.
-    /// This value cannot exceed [`Self::dispatcher_configured_fanout`].
+    /// Peak number of direct metadata fetches holding either full-packument
+    /// or exact-document semaphore permits.
     pub dispatcher_inflight_high_water: u64,
     /// Peak number of canonical metadata requests pending in the resolver
     /// dispatcher, including direct jobs waiting for permits and Worker root

@@ -1324,10 +1324,34 @@ pub(super) fn metadata_fetch_detail_json_from_snapshot(
         "version_count_sum": snapshot.version_count_sum,
         "routes": {
             "npm_direct": snapshot.route_npm_direct_count,
+            "npm_direct_version_document": snapshot.route_npm_direct_version_document_count,
             "lpm_worker": snapshot.route_lpm_worker_count,
             "custom": snapshot.route_custom_count,
             "lpm": snapshot.route_lpm_count,
             "unknown": snapshot.route_unknown_count,
+        },
+        "npm_direct_version_documents": {
+            "attempt_count": snapshot.exact_documents.attempt_count,
+            "hit_count": snapshot.exact_documents.hit_count,
+            "policy_bypass_count": snapshot.exact_documents.policy_bypass_count,
+            "fallback_count": snapshot
+                .exact_documents
+                .fetch_error_fallback_count
+                .saturating_add(
+                    snapshot
+                        .exact_documents
+                        .incomplete_distribution_fallback_count,
+                ),
+            "fallback_reasons": {
+                "fetch_error": snapshot.exact_documents.fetch_error_fallback_count,
+                "incomplete_distribution": snapshot
+                    .exact_documents
+                    .incomplete_distribution_fallback_count,
+            },
+            "body_bytes_sum": snapshot.exact_documents.body_bytes_sum,
+            "version_count_sum": snapshot.exact_documents.version_count_sum,
+            "cache_hit_count": snapshot.exact_documents.cache_hit_count,
+            "not_modified_count": snapshot.exact_documents.not_modified_count,
         },
         "attribution": {
             "total_sum_ms": snapshot.attribution.total_sum_ms,
@@ -1464,6 +1488,7 @@ pub(super) fn metadata_dispatcher_json(stage: &lpm_resolver::StageTiming) -> ser
         "kind": "metadata",
         "rpc_count": stage.dispatcher_rpc_count,
         "configured_fanout": stage.dispatcher_configured_fanout,
+        "exact_document_fanout": stage.dispatcher_exact_document_fanout,
         "concurrency_scope": if stage.dispatcher_concurrency_shared {
             "workspace_command"
         } else {
@@ -2060,6 +2085,7 @@ mod tests {
             body_bytes_sum: 1024,
             version_count_sum: 42,
             route_npm_direct_count: 1,
+            route_npm_direct_version_document_count: 2,
             attribution: lpm_registry::timing::MetadataFetchAttributionSnapshot {
                 total_sum_ms: 21,
                 total_max_ms: 21,
@@ -2088,6 +2114,17 @@ mod tests {
                 policy_release_time_not_modified_count: 1,
                 policy_full_metadata_sum_ms: 9,
             },
+            exact_documents: lpm_registry::timing::ExactDocumentSnapshot {
+                attempt_count: 2,
+                hit_count: 1,
+                policy_bypass_count: 3,
+                fetch_error_fallback_count: 1,
+                incomplete_distribution_fallback_count: 1,
+                body_bytes_sum: 512,
+                version_count_sum: 2,
+                cache_hit_count: 1,
+                not_modified_count: 0,
+            },
             top_slow_packages: lpm_registry::timing::MetadataFetchSlowSnapshot {
                 by_total: vec![record.clone()],
                 by_body_bytes: vec![record.clone()],
@@ -2109,6 +2146,19 @@ mod tests {
         assert_eq!(json["scope"], "per_package_metadata_fetches");
         assert_eq!(json["batch_fetches_included"], false);
         assert_eq!(json["routes"]["npm_direct"], 1);
+        assert_eq!(json["routes"]["npm_direct_version_document"], 2);
+        assert_eq!(json["npm_direct_version_documents"]["attempt_count"], 2);
+        assert_eq!(json["npm_direct_version_documents"]["hit_count"], 1);
+        assert_eq!(
+            json["npm_direct_version_documents"]["policy_bypass_count"],
+            3
+        );
+        assert_eq!(json["npm_direct_version_documents"]["fallback_count"], 2);
+        assert_eq!(
+            json["npm_direct_version_documents"]["fallback_reasons"]["fetch_error"],
+            1
+        );
+        assert_eq!(json["npm_direct_version_documents"]["body_bytes_sum"], 512);
         assert_eq!(json["attribution"]["http_sum_ms"], 12);
         assert_eq!(
             json["attribution"]["policy_release_time_fetch"]["total_sum_ms"],

@@ -2511,6 +2511,38 @@ async fn get_npm_version_metadata_direct_rejects_wrong_network_version_document(
 }
 
 #[tokio::test]
+async fn get_npm_version_metadata_direct_rejects_oversized_version_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_server = MockServer::start().await;
+    let pkg = "exact-doc-oversized";
+    let version = "1.2.3";
+
+    Mock::given(method("GET"))
+        .and(path(format!("/{pkg}/{version}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_VERSION_METADATA_BYTES + 1]),
+        )
+        .expect(1)
+        .mount(&npm_server)
+        .await;
+
+    let client = RegistryClient::new()
+        .with_npm_registry_url(npm_server.uri())
+        .with_cache_dir(None);
+    let error = client
+        .get_npm_version_metadata_direct_with_timings(pkg, version)
+        .await
+        .expect_err("oversized version document must be rejected before parsing");
+
+    assert!(
+        error.to_string().contains("declared body length"),
+        "expected pre-stream version-document rejection, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn get_npm_version_metadata_direct_uses_scoped_package_path() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
