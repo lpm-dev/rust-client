@@ -200,6 +200,76 @@ fn token_override_replaces_attached_session_bearer() {
 }
 
 #[tokio::test]
+async fn retry_transport_refuses_cleartext_non_loopback_destination_before_network_contact() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let port = server.address().port();
+    let destination = format!("http://registry.example.test:{port}/metadata");
+    let request = reqwest::Request::new(
+        reqwest::Method::GET,
+        reqwest::Url::parse(&destination).expect("destination URL"),
+    );
+    let client_override = reqwest::Client::builder()
+        .resolve("registry.example.test", *server.address())
+        .build()
+        .expect("HTTP client with deterministic DNS override");
+
+    let error = RegistryClient::new()
+        .send_request_with_retry_and_npmrc_auth(request, Some(client_override), None)
+        .await
+        .expect_err("cleartext non-loopback destination must be refused");
+
+    assert!(
+        error.to_string().contains("insecure transport"),
+        "the refusal must identify the request destination's transport: {error}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("request log")
+            .is_empty(),
+        "destination validation must happen before network contact"
+    );
+}
+
+#[tokio::test]
+async fn retry_transport_allows_cleartext_non_loopback_destination_with_insecure() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let port = server.address().port();
+    let request = reqwest::Request::new(
+        reqwest::Method::GET,
+        reqwest::Url::parse(&format!("http://registry.example.test:{port}/metadata"))
+            .expect("destination URL"),
+    );
+    let client_override = reqwest::Client::builder()
+        .resolve("registry.example.test", *server.address())
+        .build()
+        .expect("HTTP client with deterministic DNS override");
+
+    let response = RegistryClient::new()
+        .with_insecure(true)
+        .send_request_with_retry_and_npmrc_auth(request, Some(client_override), None)
+        .await
+        .expect("explicit insecure opt-in must admit cleartext non-loopback destinations");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
 async fn execute_with_recovery_propagates_success_unchanged() {
     let client = RegistryClient::new();
     let count = std::sync::atomic::AtomicU32::new(0);

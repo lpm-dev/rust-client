@@ -2982,10 +2982,9 @@ impl RegistryClient {
     ///
     /// ## What this does NOT do
     ///
-    /// - HTTP→HTTPS upgrade or `--insecure` enforcement: the existing
-    ///   `is_https_url` / `is_localhost_url` logic governs that
-    ///   elsewhere; callers passing an `http://` URL must satisfy that
-    ///   gate themselves.
+    /// - HTTP→HTTPS upgrade: custom registry URLs retain their configured
+    ///   scheme. The retry transport enforces HTTPS, loopback HTTP, or an
+    ///   explicit `--insecure` opt-in before network contact.
     /// - Tier 2 (Worker) fallback: custom registries are by definition
     ///   not the LPM Worker; falling back would leak a private package
     ///   name to a public registry. Cache miss → direct fetch only.

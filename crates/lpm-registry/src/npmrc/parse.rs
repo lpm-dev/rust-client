@@ -279,10 +279,6 @@ fn project_layer_env_expansion_is_sensitive(key: &str) -> bool {
     )
 }
 
-fn project_registry_uses_cleartext(value: &str) -> bool {
-    reqwest::Url::parse(value).is_ok_and(|url| url.scheme() == "http")
-}
-
 fn is_unscoped_legacy_auth_key(key: &str) -> bool {
     matches!(
         key,
@@ -526,14 +522,6 @@ fn classify_and_apply(key: &str, value: &str, context: ApplyContext<'_>, cfg: &m
             });
             return;
         }
-        if is_project_layer && project_registry_uses_cleartext(value) {
-            cfg.push_security_warning(source_label, || {
-                format!(
-                    "{source_label}:{lineno}: cleartext project registry refused for '{diagnostic_key}'; configure it in user config or use an explicit command-line override"
-                )
-            });
-            return;
-        }
         cfg.scope_registries.insert(
             scope.to_ascii_lowercase(),
             RegistryTarget::from_npmrc_url(value),
@@ -546,14 +534,6 @@ fn classify_and_apply(key: &str, value: &str, context: ApplyContext<'_>, cfg: &m
         if value.is_empty() {
             cfg.push_warning(source_label, || {
                 format!("{source_label}:{lineno}: empty registry URL; skipped")
-            });
-            return;
-        }
-        if is_project_layer && project_registry_uses_cleartext(value) {
-            cfg.push_security_warning(source_label, || {
-                format!(
-                    "{source_label}:{lineno}: cleartext project registry refused; configure it in user config or use an explicit command-line override"
-                )
             });
             return;
         }

@@ -774,6 +774,19 @@ impl RegistryClient {
         Ok(())
     }
 
+    pub(super) fn validate_request_url(&self, url: &reqwest::Url) -> Result<(), LpmError> {
+        let allowed = url.scheme() == "https"
+            || super::url_gate::is_loopback_http_url(url)
+            || (self.allow_insecure && url.scheme() == "http");
+        if !allowed {
+            return Err(LpmError::Registry(format!(
+                "request destination '{}' uses insecure transport. Use HTTPS, or pass --insecure to allow HTTP non-localhost.",
+                safe_url_for_diagnostic(url.as_str())
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate a tarball URL's scheme. Allows HTTPS, localhost HTTP
     /// (loopback carve-out for development), and — only when
     /// `--insecure` is set — non-localhost HTTP. `file://`, `ftp://`,

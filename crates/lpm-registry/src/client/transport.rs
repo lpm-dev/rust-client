@@ -494,6 +494,7 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
+        self.validate_request_url(request.url())?;
 
         let mut last_error = None;
         let can_reselect_redirect_clients = request.try_clone().is_some();
