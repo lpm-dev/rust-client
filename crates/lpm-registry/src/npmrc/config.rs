@@ -1,7 +1,16 @@
 use super::types::{
-    AuthBuffer, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryTarget, TlsOverrides,
+    AuthBuffer, AuthScope, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryTarget, TaggedBool,
+    TaggedPath, TaggedRoot, TlsOverrides,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
+
+#[derive(Debug)]
+pub(super) struct UnknownConfig {
+    pub key: String,
+    pub source: String,
+    pub line: usize,
+}
 
 /// Parsed `.npmrc` config, mergeable across precedence layers.
 ///
@@ -10,7 +19,7 @@ use std::collections::HashMap;
 /// 1. **Build**: call `parse_layer` on each of the four `.npmrc` files
 ///    (system → user → project order, lowest precedence first), or use
 ///    `parse` for single-file convenience. `merge_over` composes the
-///    layers — including raw auth subkeys, so `_username` from one file
+///    layers — including raw auth subkeys, so `username` from one file
 ///    and `_password` from another will combine.
 /// 2. **Finalize**: call `finalize` once after all layers are merged.
 ///    This resolves the per-origin auth buffers into concrete
@@ -20,7 +29,7 @@ use std::collections::HashMap;
 /// `parse` does both for the common single-file case so most call sites
 /// don't have to think about it. The filesystem walker uses the layered
 /// API explicitly.
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct NpmrcConfig {
     /// Default registry, if any layer set `registry=<url>`.
     pub default_registry: Option<RegistryTarget>,
@@ -30,7 +39,8 @@ pub struct NpmrcConfig {
     /// Origin → auth. Empty until `finalize()` is called. Populated from
     /// `auth_buffers` at finalize time so cross-layer credential merging
     /// works.
-    pub origin_auth: HashMap<OriginKey, RegistryAuth>,
+    pub origin_auth: HashMap<AuthScope, Arc<RegistryAuth>>,
+    auth_by_origin: HashMap<OriginKey, HashMap<Arc<str>, Arc<RegistryAuth>>>,
     /// Non-fatal parse messages: malformed lines, deferred-feature
     /// (mTLS / per-origin TLS) notices. Caller dumps via `output::warn`.
     pub warnings: Vec<String>,
@@ -52,7 +62,14 @@ pub struct NpmrcConfig {
     /// that survive `merge_over`. Consumed and cleared by `finalize`.
     /// Private — callers should reach for `origin_auth` after finalize,
     /// or `auth_for_url` for lookup.
-    pub(super) auth_buffers: HashMap<OriginKey, AuthBuffer>,
+    pub(super) auth_buffers: HashMap<AuthScope, AuthBuffer>,
+
+    pub(super) pending_ca_roots: Option<Vec<TaggedRoot>>,
+    pub(super) pending_cafile: Option<TaggedPath>,
+    pub(super) strict_npmrc: Option<TaggedBool>,
+    pub(super) unknown_configs: Vec<UnknownConfig>,
+    pub(super) unknown_configs_suppressed: usize,
+    pub(super) expanded_data_bytes: usize,
 
     /// Whether `finalize()` has been called. Used as a debug-assert
     /// guard in `auth_for_url`; production code that forgets to
@@ -62,7 +79,52 @@ pub struct NpmrcConfig {
     pub(super) finalized: bool,
 }
 
+impl std::fmt::Debug for NpmrcConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NpmrcConfig")
+            .field("has_default_registry", &self.default_registry.is_some())
+            .field("scope_registry_count", &self.scope_registries.len())
+            .field("auth_scope_count", &self.origin_auth.len())
+            .field("pending_auth_scope_count", &self.auth_buffers.len())
+            .field("warnings", &self.warnings)
+            .field("security_warnings", &self.security_warnings)
+            .field("errors", &self.errors)
+            .field("has_tls_overrides", &!self.tls.is_empty())
+            .field("finalized", &self.finalized)
+            .finish()
+    }
+}
+
 impl NpmrcConfig {
+    pub(super) fn push_warning(&mut self, source_label: &str, make: impl FnOnce() -> String) {
+        lpm_common::push_npmrc_diagnostic(&mut self.warnings, source_label, make);
+    }
+
+    pub(super) fn push_security_warning(
+        &mut self,
+        source_label: &str,
+        make: impl FnOnce() -> String,
+    ) {
+        lpm_common::push_npmrc_diagnostic(&mut self.security_warnings, source_label, make);
+    }
+
+    pub(super) fn push_error(&mut self, source_label: &str, make: impl FnOnce() -> String) {
+        lpm_common::push_npmrc_diagnostic(&mut self.errors, source_label, make);
+    }
+
+    pub(super) fn push_unknown_config(&mut self, key: &str, source: &str, line: usize) {
+        if self.unknown_configs.len() < lpm_common::NPMRC_DIAGNOSTIC_LIMIT {
+            self.unknown_configs.push(UnknownConfig {
+                key: key.to_string(),
+                source: source.to_string(),
+                line,
+            });
+        } else {
+            self.unknown_configs_suppressed = self.unknown_configs_suppressed.saturating_add(1);
+        }
+    }
+
     /// Resolve all per-origin auth buffers into concrete `RegistryAuth`
     /// entries. Idempotent — calling twice is a no-op (the buffers are
     /// drained on first call). Emits warnings for any partial / malformed
@@ -80,11 +142,22 @@ impl NpmrcConfig {
             return;
         }
         let buffers = std::mem::take(&mut self.auth_buffers);
-        for (origin, buf) in buffers {
-            if let Some(auth) = buf.resolve(&origin, &mut self.warnings) {
-                self.origin_auth.insert(origin, auth);
+        for (scope, buf) in buffers {
+            if let Some(auth) = buf.resolve(&scope, &mut self.warnings) {
+                self.origin_auth.insert(scope, Arc::new(auth));
             }
         }
+        self.auth_by_origin = HashMap::with_capacity(self.origin_auth.len());
+        for auth in self.origin_auth.values() {
+            self.auth_by_origin
+                .entry(auth.origin().clone())
+                .or_default()
+                .insert(
+                    Arc::from(auth.scope().path_prefix.trim_end_matches('/')),
+                    Arc::clone(auth),
+                );
+        }
+        self.materialize_global_tls();
         // GLOBAL mTLS identity XOR check. Per-origin identities are validated
         // at client-build time, not here — unreached half-configs must not
         // abort unrelated installs.
@@ -93,21 +166,70 @@ impl NpmrcConfig {
             self.tls.identity_keyfile.as_ref(),
         ) {
             (Some(cert), None) => {
-                self.errors.push(format!(
-                    "{}:{}: 'certfile' (mTLS client cert) is set but 'keyfile' is missing across all merged layers; both must be set or both absent",
-                    cert.source, cert.line
-                ));
+                let source = cert.source.clone();
+                let line = cert.line;
+                self.push_error(&source, || {
+                    format!(
+                        "{source}:{line}: 'certfile' (mTLS client cert) is set but 'keyfile' is missing across all merged layers; both must be set or both absent"
+                    )
+                });
             }
             (None, Some(key)) => {
-                self.errors.push(format!(
-                    "{}:{}: 'keyfile' (mTLS private key) is set but 'certfile' is missing across all merged layers; both must be set or both absent",
-                    key.source, key.line
-                ));
+                let source = key.source.clone();
+                let line = key.line;
+                self.push_error(&source, || {
+                    format!(
+                        "{source}:{line}: 'keyfile' (mTLS private key) is set but 'certfile' is missing across all merged layers; both must be set or both absent"
+                    )
+                });
             }
             // (Some, Some) → complete pair, validated further at
             // identity-load time (concat + Identity::from_pem).
             // (None, None) → no global mTLS, nothing to check.
             _ => {}
+        }
+        if let Some(strict_ssl) = self.tls.strict_ssl.as_ref()
+            && !strict_ssl.value
+        {
+            let source = strict_ssl.source.clone();
+            let line = strict_ssl.line;
+            self.push_warning(&source, || {
+                format!(
+                    "{source}:{line}: strict-ssl=false — TLS certificate verification will be DISABLED for this install"
+                )
+            });
+        }
+        let strict_npmrc = self
+            .strict_npmrc
+            .as_ref()
+            .is_some_and(|setting| setting.value);
+        for unknown in std::mem::take(&mut self.unknown_configs) {
+            if strict_npmrc {
+                self.push_error(&unknown.source, || {
+                    format!(
+                        "{}:{}: unknown npm config '{}' — check the key spelling",
+                        unknown.source, unknown.line, unknown.key
+                    )
+                });
+            } else {
+                self.push_warning(&unknown.source, || {
+                    format!(
+                        "{}:{}: unknown npm config '{}' — check the key spelling",
+                        unknown.source, unknown.line, unknown.key
+                    )
+                });
+            }
+        }
+        if self.unknown_configs_suppressed > 0 {
+            let suppressed = std::mem::take(&mut self.unknown_configs_suppressed);
+            let destination = if strict_npmrc {
+                &mut self.errors
+            } else {
+                &mut self.warnings
+            };
+            lpm_common::push_npmrc_diagnostic(destination, "npmrc", || {
+                format!("{suppressed} additional unknown npm configuration keys suppressed")
+            });
         }
         self.finalized = true;
     }
@@ -116,17 +238,31 @@ impl NpmrcConfig {
     /// Used by the walker to compose lower-precedence layers (system,
     /// user) under higher-precedence ones (project).
     ///
-    /// Auth subkeys merge per-subkey: if `self` has `_username` for an
+    /// Auth subkeys merge per-subkey: if `self` has `username` for an
     /// origin and `other` has `_password` for the same origin, the
     /// finalized result is a Basic credential composed from both.
     ///
     /// `merge_over` panics if either side has been finalized — finalize
     /// is the irreversible last step. Tests assert this contract.
-    pub fn merge_over(&mut self, other: NpmrcConfig) {
+    pub fn merge_over(&mut self, mut other: NpmrcConfig) {
         assert!(
             !self.finalized && !other.finalized,
             "merge_over called after finalize; auth buffers have already been drained"
         );
+        let combined_expanded_bytes = self
+            .expanded_data_bytes
+            .saturating_add(other.expanded_data_bytes);
+        if combined_expanded_bytes > lpm_common::NPMRC_INTERPOLATED_VALUE_CAP_BYTES {
+            self.errors.append(&mut other.errors);
+            self.push_error("npmrc", || {
+                format!(
+                    "aggregate npm configuration expansion exceeds the {}-byte limit across merged layers",
+                    lpm_common::NPMRC_INTERPOLATED_VALUE_CAP_BYTES
+                )
+            });
+            return;
+        }
+        self.expanded_data_bytes = combined_expanded_bytes;
         if other.default_registry.is_some() {
             self.default_registry = other.default_registry;
         }
@@ -137,6 +273,25 @@ impl NpmrcConfig {
                 .or_default()
                 .merge_over(other_buf);
         }
+        if other.pending_ca_roots.is_some() {
+            self.pending_ca_roots = other.pending_ca_roots;
+        }
+        if other.pending_cafile.is_some() {
+            self.pending_cafile = other.pending_cafile;
+        }
+        if other.strict_npmrc.is_some() {
+            self.strict_npmrc = other.strict_npmrc;
+        }
+        let unknown_capacity =
+            lpm_common::NPMRC_DIAGNOSTIC_LIMIT.saturating_sub(self.unknown_configs.len());
+        let other_unknown_count = other.unknown_configs.len();
+        let retained_unknown_count = unknown_capacity.min(other_unknown_count);
+        self.unknown_configs
+            .extend(other.unknown_configs.drain(..retained_unknown_count));
+        self.unknown_configs_suppressed = self
+            .unknown_configs_suppressed
+            .saturating_add(other.unknown_configs_suppressed)
+            .saturating_add(other_unknown_count.saturating_sub(retained_unknown_count));
         // TLS overrides merge:
         // - `extra_roots`: concatenate, then deduplicate by `pem_bytes`
         //   keeping the FIRST source seen. Lower-precedence roots
@@ -151,18 +306,6 @@ impl NpmrcConfig {
         //   `~/.npmrc strict-ssl=false` persists across projects unless a
         //   project explicitly says `=true`.
         self.tls.extra_roots.extend(other.tls.extra_roots);
-        // Linear-scan dedup. The trust-store size is small (1-3 entries
-        // in practice; spec allows arbitrary bundles but real-world
-        // configs concentrate on one corporate root). O(n²) is fine.
-        let mut seen: Vec<Vec<u8>> = Vec::with_capacity(self.tls.extra_roots.len());
-        self.tls.extra_roots.retain(|r| {
-            if seen.iter().any(|prev| prev == &r.pem_bytes) {
-                false
-            } else {
-                seen.push(r.pem_bytes.clone());
-                true
-            }
-        });
         if other.tls.strict_ssl.is_some() {
             self.tls.strict_ssl = other.tls.strict_ssl;
         }
@@ -179,7 +322,7 @@ impl NpmrcConfig {
         }
         // Per-origin TLS: each origin's settings merge independently via
         // `OriginTlsOverrides::merge_over`:
-        // - `cafiles` accumulate (multiple roots stack);
+        // - higher-layer `cafile` values replace lower-layer values;
         // - `certfile` / `keyfile` higher-explicit wins.
         // The per-origin XOR-validation contract is NOT enforced here —
         // it's deferred to client-build time so a half-config for an origin
@@ -219,11 +362,8 @@ impl NpmrcConfig {
         self.default_registry.as_ref()
     }
 
-    /// Look up auth for a request URL we're about to send. Origin-matched
-    /// per npm semantics: try the exact `(host, Some(port))` first; on
-    /// miss, fall back to `(host, None)` so an npmrc entry without an
-    /// explicit port covers any port for that host (scheme-agnostic for
-    /// http vs https).
+    /// Look up auth for a request URL we're about to send using npm's
+    /// longest matching path-prefix semantics.
     ///
     /// Returns `None` if `finalize()` hasn't been called — auth_for_url
     /// reads from `origin_auth`, which is empty pre-finalize. The
@@ -231,19 +371,35 @@ impl NpmrcConfig {
     /// silently miss the lookup, which is the safer failure mode (no
     /// credential leak, just a 401 that the user can debug).
     pub fn auth_for_url(&self, url: &str) -> Option<&RegistryAuth> {
+        self.shared_auth_for_url(url).map(Arc::as_ref)
+    }
+
+    pub(crate) fn shared_auth_for_url(&self, url: &str) -> Option<&Arc<RegistryAuth>> {
         debug_assert!(
             self.finalized,
             "auth_for_url called before finalize() — credentials will silently miss"
         );
-        let exact = OriginKey::from_request_url(url)?;
-        if let Some(auth) = self.origin_auth.get(&exact) {
-            return Some(auth);
+        let parsed = reqwest::Url::parse(url).ok()?;
+        let origin = OriginKey::from_parsed_url(&parsed)?;
+        self.shared_auth_for_origin_path(&origin, parsed.path())
+    }
+
+    pub(crate) fn shared_auth_for_origin_path(
+        &self,
+        origin: &OriginKey,
+        path: &str,
+    ) -> Option<&Arc<RegistryAuth>> {
+        let credentials = self.auth_by_origin.get(origin)?;
+        let mut candidate = path.trim_end_matches('/');
+        loop {
+            if let Some(auth) = credentials.get(candidate) {
+                return Some(auth);
+            }
+            let Some(parent_end) = candidate.rfind('/') else {
+                return credentials.get("");
+            };
+            candidate = &candidate[..parent_end];
         }
-        let any_port = OriginKey {
-            host_lower: exact.host_lower,
-            port: None,
-        };
-        self.origin_auth.get(&any_port)
     }
 
     /// Look up per-origin TLS settings for a request URL. Mirrors
@@ -259,13 +415,6 @@ impl NpmrcConfig {
     /// per-origin client builder which already has the resolved origin
     /// and doesn't need a URL parse round-trip.
     pub fn tls_for_origin(&self, origin: &OriginKey) -> Option<&OriginTlsOverrides> {
-        if let Some(t) = self.tls.per_origin.get(origin) {
-            return Some(t);
-        }
-        let any_port = OriginKey {
-            host_lower: origin.host_lower.clone(),
-            port: None,
-        };
-        self.tls.per_origin.get(&any_port)
+        self.tls.per_origin.get(origin)
     }
 }

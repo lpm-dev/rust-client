@@ -153,8 +153,43 @@ pub async fn run(
     json_output: bool,
     use_oidc: bool,
 ) -> Result<(), LpmError> {
-    let token = if use_oidc {
-        oidc::exchange_oidc_token(registry_url, None, "read")
+    let registry = super::npmrc::SetupRegistry::parse(registry_url)?;
+    super::npmrc::reject_tracked_npmrc(project_dir)?;
+
+    let npmrc_path = project_dir.join(".npmrc");
+    let existing = match lpm_common::read_text_file_capped_nofollow(
+        &npmrc_path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(local_registry) = super::npmrc::local_setup_registry_url(&existing)
+        && local_registry != registry.endpoint()
+    {
+        return Err(LpmError::Script(format!(
+            "the setup-local token belongs to {local_registry}; rerun with its registry before replacing the generated block"
+        )));
+    }
+    if let Some(ci_registry) = super::npmrc::setup_ci_registry_url(&existing)
+        && ci_registry != registry.endpoint()
+    {
+        return Err(LpmError::Script(format!(
+            "the pending CI setup belongs to {ci_registry}; rerun with its registry to finish token retirement safely"
+        )));
+    }
+
+    let pending_retirement =
+        super::npmrc::setup_ci_pending_retirement(&existing, registry.auth_scope())?;
+    let token = if let Some((replacement, _)) = pending_retirement.as_ref() {
+        ResolvedSetupBearer {
+            token: replacement.clone(),
+            storage: lpm_auth::AuthStorageStatus::none(),
+            uses_env_var: false,
+        }
+    } else if use_oidc {
+        oidc::exchange_oidc_token(registry.service_base(), None, "read")
             .await
             .map(|oidc_token| ResolvedSetupBearer::oidc(oidc_token.token))
             .map_err(|error| {
@@ -163,7 +198,7 @@ pub async fn run(
                 ))
             })?
     } else {
-        resolve_lpm_bearer(session, registry_url).await?
+        resolve_lpm_bearer(session, registry.service_base()).await?
     };
 
     let storage_status = setup_storage_status(&token);
@@ -178,57 +213,78 @@ pub async fn run(
         ));
     }
 
-    let registry_host = registry_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-
-    let registry_line = format!(
-        "@lpm.dev:registry={}/api/registry/",
-        registry_url.trim_end_matches('/')
-    );
+    let registry_line = format!("@lpm.dev:registry={}/", registry.endpoint());
 
     let clean_generated = format!(
-        "{GENERATED_HEADER}\n//{}/:_authToken={}\n{}\n{GENERATED_END}",
-        registry_host, token.token, registry_line
+        "{GENERATED_HEADER}\n{}:_authToken={}\n{}\n{GENERATED_END}",
+        registry.auth_scope(),
+        token.token,
+        registry_line
     );
-    let npmrc_path = project_dir.join(".npmrc");
-    let existing =
-        match lpm_common::read_text_file_capped(&npmrc_path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES)
-        {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-    if let Some(local_registry) = super::npmrc::local_setup_registry_url(&existing) {
-        let registry_base = registry_url.trim_end_matches('/');
-        let expected_registry = if registry_base.ends_with("/api/registry") {
-            registry_base.to_string()
-        } else {
-            format!("{registry_base}/api/registry")
-        };
-        if local_registry != expected_registry {
-            return Err(LpmError::Script(format!(
-                "the setup-local token belongs to {local_registry}; rerun with its registry before replacing the generated block"
-            )));
-        }
-    }
-    if let Some(predecessor_bearer) = super::npmrc::setup_ci_predecessor_bearer(&existing)? {
+    let predecessor_bearer = pending_retirement
+        .as_ref()
+        .map(|(_, predecessor)| predecessor.clone())
+        .or(super::npmrc::setup_ci_predecessor_bearer(
+            &existing,
+            registry.auth_scope(),
+        )?);
+    let mut staged_content = None;
+    if let Some(predecessor_bearer) = predecessor_bearer.as_deref() {
         if predecessor_bearer == token.token {
             return Err(LpmError::Script(
                 "setup ci cannot replace a setup-local token with the same bearer because retiring it would make the generated credential unusable. Supply a different bearer through LPM_TOKEN, a stored session, or --oidc"
                     .into(),
             ));
         }
-        if let Err(error) =
-            super::npmrc::self_revoke_project_token(client, registry_url, &predecessor_bearer).await
+        let pending_content = if pending_retirement.is_some() {
+            existing.clone()
+        } else {
+            let pending_generated = format!(
+                "{GENERATED_HEADER}\n{}{}\n{}:_authToken={}\n{}\n{GENERATED_END}",
+                super::npmrc::CI_RETIRE_BEARER_PREFIX,
+                predecessor_bearer,
+                registry.auth_scope(),
+                token.token,
+                registry_line
+            );
+            let pending_content =
+                replace_generated_block(&existing, &pending_generated, registry.auth_scope());
+            lpm_common::write_file_atomic_with_options(
+                &npmrc_path,
+                &pending_content,
+                lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+            )?;
+            pending_content
+        };
+        if let Err(revocation) =
+            super::npmrc::self_revoke_project_token(client, &registry, predecessor_bearer).await
         {
+            if !revocation.may_have_committed {
+                let rollback = super::npmrc::restore_file_if_unchanged(
+                    &npmrc_path,
+                    &pending_content,
+                    Some(&existing),
+                    lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+                    true,
+                );
+                return match rollback {
+                    Ok(()) => Err(revocation.error),
+                    Err(rollback_error) => Err(LpmError::Script(format!(
+                        "{}; failed to restore .npmrc: {rollback_error}",
+                        revocation.error
+                    ))),
+                };
+            }
             return Err(LpmError::Registry(format!(
-                "{error}. The protected .npmrc still contains the displaced setup token; rerun `lpm setup ci npmrc` with the same registry to retry safely"
+                "{}. The protected .npmrc contains a usable replacement and retains the predecessor for a safe retry; rerun `lpm setup ci npmrc` with the same registry",
+                revocation.error
             )));
         }
+        staged_content = Some(pending_content);
     }
-    let npmrc_content = replace_generated_block(&existing, &clean_generated, registry_host);
+    let source_content = staged_content.as_deref().unwrap_or(&existing);
+    let npmrc_content =
+        replace_generated_block(source_content, &clean_generated, registry.auth_scope());
     lpm_common::write_file_atomic_with_options(
         &npmrc_path,
         &npmrc_content,
@@ -237,7 +293,8 @@ pub async fn run(
 
     if json_output {
         let safe_content = format!(
-            "{GENERATED_HEADER}\n//{registry_host}/:_authToken=<redacted>\n{registry_line}\n{GENERATED_END}\n"
+            "{GENERATED_HEADER}\n{}:_authToken=<redacted>\n{registry_line}\n{GENERATED_END}\n",
+            registry.auth_scope()
         );
         let json = serde_json::json!({
             "success": true,
@@ -268,8 +325,8 @@ pub async fn run(
     Ok(())
 }
 
-fn replace_generated_block(existing: &str, generated: &str, registry_host: &str) -> String {
-    let auth_prefix = format!("//{registry_host}/:_authToken=");
+fn replace_generated_block(existing: &str, generated: &str, auth_scope: &str) -> String {
+    let auth_prefix = format!("{auth_scope}:_authToken=");
     let lines: Vec<_> = existing.lines().collect();
     let mut kept = Vec::with_capacity(lines.len());
     let mut index = 0;
@@ -292,6 +349,7 @@ fn replace_generated_block(existing: &str, generated: &str, registry_host: &str)
                             || line.starts_with("# LPM previous project token bearer: ")
                             || line.starts_with("# LPM pending project token retirement id: ")
                             || line.starts_with("# LPM pending project token retirement hash: ")
+                            || line.starts_with(super::npmrc::CI_RETIRE_BEARER_PREFIX)
                             || line.starts_with("@lpm.dev:registry=")
                             || line.contains("/:_authToken=")
                     }) {

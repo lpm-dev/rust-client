@@ -16,7 +16,7 @@ const ATTESTATION_LIMIT = 2 * 1024 * 1024;
 const NPM_AUDIT_OUTPUT_LIMIT = 8 * 1024 * 1024;
 const TARBALL_LIMIT = 500 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
-const NPM_CLI_SPEC = "npm@11.12.1";
+const NPM_CLI_VERSION = "11.12.1";
 const IN_TOTO_PAYLOAD_TYPE = "application/vnd.in-toto+json";
 const IN_TOTO_PUBLISH_STATEMENT_TYPE = "https://in-toto.io/Statement/v0.1";
 const IN_TOTO_PROVENANCE_STATEMENT_TYPE = "https://in-toto.io/Statement/v1";
@@ -160,22 +160,31 @@ export function verifyLocalTarball({ tarballPath, record, packageName }) {
   return Object.freeze({ shasum: actualShasum, sha256: actualSha256, integrity: actualIntegrity });
 }
 
-export function verifyNpmSignatures({ packageName, version, spawnImpl = spawnSync }) {
+export function verifyNpmSignatures({
+  packageName,
+  version,
+  spawnImpl = spawnSync,
+  npmCliPath = trustedNpmCliPath(),
+}) {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-npm-signatures-"));
   const cache = path.join(workspace, "cache");
-  const npmrc = path.join(workspace, "npmrc");
+  const userNpmrc = path.join(workspace, "user.npmrc");
+  const globalNpmrc = path.join(workspace, "global.npmrc");
   fs.writeFileSync(
     path.join(workspace, "package.json"),
     `${JSON.stringify({ name: "lpm-publication-verification", version: "1.0.0", private: true })}\n`,
     { mode: 0o600 },
   );
-  fs.writeFileSync(npmrc, "", { mode: 0o600 });
+  fs.writeFileSync(userNpmrc, "", { mode: 0o600 });
+  fs.writeFileSync(globalNpmrc, "", { mode: 0o600 });
 
   try {
     runPinnedNpm(
       spawnImpl,
       workspace,
-      npmrc,
+      userNpmrc,
+      globalNpmrc,
+      npmCliPath,
       [
         "install",
         "--prefix",
@@ -197,7 +206,9 @@ export function verifyNpmSignatures({ packageName, version, spawnImpl = spawnSyn
     const stdout = runPinnedNpm(
       spawnImpl,
       workspace,
-      npmrc,
+      userNpmrc,
+      globalNpmrc,
+      npmCliPath,
       [
         "audit",
         "signatures",
@@ -237,15 +248,19 @@ export function verifyNpmSignatures({ packageName, version, spawnImpl = spawnSyn
   }
 }
 
-function runPinnedNpm(spawnImpl, workspace, npmrc, args, label) {
-  const result = spawnImpl("npx", ["--yes", NPM_CLI_SPEC, ...args], {
+function runPinnedNpm(
+  spawnImpl,
+  workspace,
+  userNpmrc,
+  globalNpmrc,
+  npmCliPath,
+  args,
+  label,
+) {
+  const result = spawnImpl(process.execPath, [npmCliPath, ...args], {
     cwd: workspace,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      NO_COLOR: "1",
-      NPM_CONFIG_USERCONFIG: npmrc,
-    },
+    env: npmVerificationEnvironment(workspace, userNpmrc, globalNpmrc),
     maxBuffer: NPM_AUDIT_OUTPUT_LIMIT,
     windowsHide: true,
   });
@@ -259,6 +274,53 @@ function runPinnedNpm(spawnImpl, workspace, npmrc, args, label) {
     throw new Error(`The npm ${label} output is not valid`);
   }
   return result.stdout;
+}
+
+function npmVerificationEnvironment(workspace, userNpmrc, globalNpmrc) {
+  const env = {
+    HOME: workspace,
+    NO_COLOR: "1",
+    PATH: path.dirname(process.execPath),
+    NPM_CONFIG_AUDIT: "false",
+    NPM_CONFIG_CACHE: path.join(workspace, "cache"),
+    NPM_CONFIG_FUND: "false",
+    NPM_CONFIG_GLOBALCONFIG: globalNpmrc,
+    NPM_CONFIG_IGNORE_SCRIPTS: "true",
+    NPM_CONFIG_REGISTRY: REGISTRY_ORIGIN,
+    NPM_CONFIG_UPDATE_NOTIFIER: "false",
+    NPM_CONFIG_USERCONFIG: userNpmrc,
+  };
+  if (process.platform === "win32") {
+    for (const key of ["COMSPEC", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "WINDIR"]) {
+      if (process.env[key]) env[key] = process.env[key];
+    }
+    env.USERPROFILE = workspace;
+  }
+  return env;
+}
+
+function trustedNpmCliPath() {
+  const nodePrefix = process.platform === "win32"
+    ? path.dirname(process.execPath)
+    : path.dirname(path.dirname(process.execPath));
+  const npmRoot = process.platform === "win32"
+    ? path.join(nodePrefix, "node_modules", "npm")
+    : path.join(nodePrefix, "lib", "node_modules", "npm");
+  const npmCli = path.join(npmRoot, "bin", "npm-cli.js");
+  const packageJson = path.join(npmRoot, "package.json");
+  const cliMetadata = fs.lstatSync(npmCli, { throwIfNoEntry: false });
+  if (!cliMetadata?.isFile() || cliMetadata.isSymbolicLink()) {
+    throw new Error(`The trusted npm ${NPM_CLI_VERSION} entrypoint is unavailable`);
+  }
+  const manifest = JSON.parse(
+    readBoundedRegularFile(packageJson, 1024 * 1024, "trusted npm package manifest").toString("utf8"),
+  );
+  if (manifest?.version !== NPM_CLI_VERSION) {
+    throw new Error(
+      `The trusted npm entrypoint has version ${format(manifest?.version)}, expected ${NPM_CLI_VERSION}`,
+    );
+  }
+  return npmCli;
 }
 
 function validateRegistryVersion({ packument, packageName, version, expectedTag, record }) {
@@ -485,19 +547,71 @@ function npmPurl(packageName, version) {
   return `pkg:npm/${encodedName}@${version}`;
 }
 
-function readManifest(file) {
-  const metadata = fs.lstatSync(file, { throwIfNoEntry: false });
-  if (!metadata?.isFile() || metadata.isSymbolicLink()) {
-    throw new Error(`The release manifest is missing or is not a regular file: ${file}`);
-  }
-  if (metadata.size > MANIFEST_LIMIT) {
-    throw new Error(`The release manifest is too large: ${file}`);
-  }
+export function readManifest(file) {
+  const bytes = readBoundedRegularFile(file, MANIFEST_LIMIT, "release manifest");
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
+    return JSON.parse(bytes.toString("utf8"));
   } catch (error) {
     throw new Error(`The release manifest is not valid JSON: ${file}`, { cause: error });
   }
+}
+
+function readBoundedRegularFile(file, limit, label) {
+  const before = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!before?.isFile() || before.isSymbolicLink()) {
+    throw new Error(`The ${label} is missing or is not a regular file: ${file}`);
+  }
+  if (before.size > limit) {
+    throw new Error(`The ${label} is too large: ${file}`);
+  }
+
+  let flags = fs.constants.O_RDONLY;
+  if (typeof fs.constants.O_CLOEXEC === "number") flags |= fs.constants.O_CLOEXEC;
+  if (typeof fs.constants.O_NOFOLLOW === "number") flags |= fs.constants.O_NOFOLLOW;
+  if (typeof fs.constants.O_NONBLOCK === "number") flags |= fs.constants.O_NONBLOCK;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(file, flags);
+  } catch (error) {
+    throw new Error(`The ${label} changed or is unsafe: ${file}`, { cause: error });
+  }
+
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || !sameFileIdentity(before, opened)) {
+      throw new Error(`The ${label} changed before it was opened: ${file}`);
+    }
+    const chunks = [];
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let total = 0;
+    for (;;) {
+      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > limit) {
+        throw new Error(`The ${label} is too large: ${file}`);
+      }
+      chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+    }
+    const after = fs.fstatSync(descriptor);
+    const pathAfter = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (
+      !pathAfter?.isFile() ||
+      pathAfter.isSymbolicLink() ||
+      !sameFileIdentity(opened, after) ||
+      !sameFileIdentity(opened, pathAfter) ||
+      after.size !== total
+    ) {
+      throw new Error(`The ${label} changed while it was read: ${file}`);
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function sameFileIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function assertPlainObject(value, label) {

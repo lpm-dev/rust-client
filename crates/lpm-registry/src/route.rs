@@ -17,11 +17,31 @@
 //! origin-scoped auth.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use crate::npmrc::{NpmrcConfig, OriginKey, RegistryAuth, RegistryKind, RegistryTarget};
+use crate::npmrc::{AuthScope, NpmrcConfig, OriginKey, RegistryAuth, RegistryKind, RegistryTarget};
 
 const JSR_NPM_REGISTRY_URL: &str = "https://npm.jsr.io";
+const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+
+static JSR_TARGET: LazyLock<RegistryTarget> = LazyLock::new(|| RegistryTarget {
+    base_url: Arc::from(JSR_NPM_REGISTRY_URL),
+    kind: RegistryKind::NpmCompatible,
+});
+static NPM_TARGET: LazyLock<RegistryTarget> = LazyLock::new(|| RegistryTarget {
+    base_url: Arc::from(NPM_REGISTRY_URL),
+    kind: RegistryKind::NpmCompatible,
+});
+static JSR_URL: LazyLock<reqwest::Url> = LazyLock::new(|| {
+    reqwest::Url::parse(JSR_NPM_REGISTRY_URL).expect("built-in JSR registry URL must be valid")
+});
+static JSR_ORIGIN: LazyLock<OriginKey> = LazyLock::new(|| {
+    OriginKey::from_parsed_url(&JSR_URL).expect("built-in JSR registry origin must be valid")
+});
+static NPM_ORIGIN: LazyLock<OriginKey> = LazyLock::new(|| {
+    OriginKey::from_request_url(NPM_REGISTRY_URL)
+        .expect("built-in npm registry origin must be valid")
+});
 
 /// How the rust-client routes npm-scoped package fetches.
 ///
@@ -46,7 +66,7 @@ pub struct WorkspaceResolutionKey {
     mode: RouteMode,
     default_registry: Option<String>,
     scope_registries: Vec<(String, String)>,
-    credentialed_origins: Vec<(OriginKey, [u8; 32])>,
+    credentialed_origins: Vec<(AuthScope, [u8; 32])>,
     package_route_overrides: Vec<(String, RouteMode)>,
 }
 
@@ -57,10 +77,8 @@ pub struct WorkspaceResolutionKey {
 /// provider's escape-hatch fetch both branch on this.
 ///
 /// **Drop of `Copy`**: the `Custom` variant carries `RegistryTarget`
-/// (`Arc<str>` base URL) and an optional `RegistryAuth` (a
-/// `SecretString`-bearing newtype), neither of which is `Copy`. The
-/// rest of the enum is still cheap to clone — `Arc::clone` for the
-/// target, `SecretString::clone` for the auth (one ref-bump on each).
+/// (`Arc<str>` base URL) and a shared optional credential. Cloning a
+/// custom route only bumps reference counts; it never copies secret bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamRoute {
     /// Fetch via the LPM Worker (auth + `batch-metadata-deep` endpoint).
@@ -77,8 +95,15 @@ pub enum UpstreamRoute {
     /// cross-origin token leaks.
     Custom {
         target: RegistryTarget,
-        auth: Option<RegistryAuth>,
+        auth: Option<Arc<RegistryAuth>>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum SelectedRoute<'a> {
+    Mode(RouteMode),
+    Custom(&'a RegistryTarget),
+    Jsr,
 }
 
 impl RouteMode {
@@ -207,36 +232,39 @@ impl RouteTable {
     /// of `@mycompany/foo`. If they have a scope mapping with no auth,
     /// the request goes anonymous — npm parity.
     pub fn route_for_package(&self, name: &str) -> UpstreamRoute {
-        if name.starts_with("@lpm.dev/") {
-            return UpstreamRoute::LpmWorker;
-        }
-        if let Some(mode) = self.package_route_overrides.get(name) {
-            return mode.route_for_package(name);
-        }
-        if let Some(target) = self.npmrc_scope_target_for_package(name) {
-            let auth = self.npmrc.auth_for_url(&target.base_url).cloned();
-            return UpstreamRoute::Custom {
+        match self.selected_route_for_package(name) {
+            SelectedRoute::Mode(mode) => self.route_for_mode(name, mode),
+            SelectedRoute::Custom(target) => UpstreamRoute::Custom {
                 target: target.clone(),
-                auth,
-            };
+                auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
+            },
+            SelectedRoute::Jsr => UpstreamRoute::Custom {
+                target: JSR_TARGET.clone(),
+                auth: self
+                    .npmrc
+                    .shared_auth_for_origin_path(&JSR_ORIGIN, "/")
+                    .cloned(),
+            },
         }
-        if name.starts_with("@jsr/") {
-            return UpstreamRoute::Custom {
-                target: RegistryTarget {
-                    base_url: Arc::from(JSR_NPM_REGISTRY_URL),
-                    kind: RegistryKind::NpmCompatible,
-                },
-                auth: self.npmrc.auth_for_url(JSR_NPM_REGISTRY_URL).cloned(),
-            };
+    }
+
+    fn route_for_mode(&self, name: &str, mode: RouteMode) -> UpstreamRoute {
+        match mode.route_for_package(name) {
+            UpstreamRoute::NpmDirect => {
+                let Some(auth) = self
+                    .npmrc
+                    .shared_auth_for_origin_path(&NPM_ORIGIN, "/")
+                    .cloned()
+                else {
+                    return UpstreamRoute::NpmDirect;
+                };
+                UpstreamRoute::Custom {
+                    target: NPM_TARGET.clone(),
+                    auth: Some(auth),
+                }
+            }
+            route => route,
         }
-        if let Some(target) = self.npmrc.default_registry.as_ref() {
-            let auth = self.npmrc.auth_for_url(&target.base_url).cloned();
-            return UpstreamRoute::Custom {
-                target: target.clone(),
-                auth,
-            };
-        }
-        self.mode.route_for_package(name)
     }
 
     /// Return the configured npm-compatible route only when `candidate`
@@ -250,26 +278,45 @@ impl RouteTable {
             return registry_url_contains(candidate, &target.base_url).then(|| {
                 UpstreamRoute::Custom {
                     target: target.clone(),
-                    auth: self.npmrc.auth_for_url(&target.base_url).cloned(),
+                    auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
                 }
             });
         }
         if name.starts_with("@jsr/") {
-            return registry_url_contains(candidate, JSR_NPM_REGISTRY_URL).then(|| {
+            return registry_url_contains_parsed(candidate, &JSR_URL).then(|| {
                 UpstreamRoute::Custom {
-                    target: RegistryTarget {
-                        base_url: Arc::from(JSR_NPM_REGISTRY_URL),
-                        kind: RegistryKind::NpmCompatible,
-                    },
-                    auth: self.npmrc.auth_for_url(JSR_NPM_REGISTRY_URL).cloned(),
+                    target: JSR_TARGET.clone(),
+                    auth: self
+                        .npmrc
+                        .shared_auth_for_origin_path(&JSR_ORIGIN, "/")
+                        .cloned(),
                 }
             });
         }
         let target = self.npmrc.default_registry.as_ref()?;
         registry_url_contains(candidate, &target.base_url).then(|| UpstreamRoute::Custom {
             target: target.clone(),
-            auth: self.npmrc.auth_for_url(&target.base_url).cloned(),
+            auth: self.npmrc.shared_auth_for_url(&target.base_url).cloned(),
         })
+    }
+
+    fn selected_route_for_package<'a>(&'a self, name: &str) -> SelectedRoute<'a> {
+        if name.starts_with("@lpm.dev/") {
+            return SelectedRoute::Mode(RouteMode::Proxy);
+        }
+        if let Some(mode) = self.package_route_overrides.get(name) {
+            return SelectedRoute::Mode(*mode);
+        }
+        if let Some(target) = self.npmrc_scope_target_for_package(name) {
+            return SelectedRoute::Custom(target);
+        }
+        if name.starts_with("@jsr/") {
+            return SelectedRoute::Jsr;
+        }
+        self.npmrc
+            .default_registry
+            .as_ref()
+            .map_or(SelectedRoute::Mode(self.mode), SelectedRoute::Custom)
     }
 
     fn npmrc_scope_target_for_package(&self, name: &str) -> Option<&RegistryTarget> {
@@ -278,7 +325,14 @@ impl RouteTable {
         if !scope.starts_with('@') {
             return None;
         }
-        self.npmrc.scope_registries.get(&scope.to_ascii_lowercase())
+        if let Some(target) = self.npmrc.scope_registries.get(scope) {
+            return Some(target);
+        }
+        scope
+            .bytes()
+            .any(|byte| byte.is_ascii_uppercase())
+            .then(|| scope.to_ascii_lowercase())
+            .and_then(|scope| self.npmrc.scope_registries.get(&scope))
     }
 
     /// Non-fatal warnings raised during npmrc parse + walker discovery.
@@ -363,9 +417,11 @@ impl RouteTable {
             .collect::<Vec<_>>();
         credentialed_origins.sort_unstable_by(|left, right| {
             left.0
+                .origin
                 .host_lower
-                .cmp(&right.0.host_lower)
-                .then_with(|| left.0.port.cmp(&right.0.port))
+                .cmp(&right.0.origin.host_lower)
+                .then_with(|| left.0.origin.port.cmp(&right.0.origin.port))
+                .then_with(|| left.0.path_prefix.cmp(&right.0.path_prefix))
         });
         let mut package_route_overrides = self
             .package_route_overrides
@@ -418,32 +474,36 @@ impl RouteTable {
         lpm_worker_url: &str,
         npm_direct_url: &str,
     ) -> Vec<crate::npmrc::OriginKey> {
-        use crate::npmrc::OriginKey;
-        // De-dup with insertion order preserved — small N (1-3
-        // typical), linear scan is fine and avoids a HashSet
-        // dependency for stability.
-        let mut origins: Vec<OriginKey> = Vec::new();
+        use std::collections::HashSet;
+
+        let worker_origin = OriginKey::from_request_url(lpm_worker_url);
+        let npm_origin = OriginKey::from_request_url(npm_direct_url);
+        let mut origins = Vec::with_capacity(top_level_specs.len().min(8));
+        let mut seen = HashSet::with_capacity(top_level_specs.len().min(8));
         let mut push_if_new = |o: OriginKey| {
-            if !origins.contains(&o) {
+            if seen.insert(o.clone()) {
                 origins.push(o);
             }
         };
         for spec in top_level_specs {
-            match self.route_for_package(spec) {
-                UpstreamRoute::LpmWorker => {
-                    if let Some(o) = OriginKey::from_request_url(lpm_worker_url) {
-                        push_if_new(o);
+            match self.selected_route_for_package(spec) {
+                SelectedRoute::Mode(RouteMode::Proxy) => {
+                    if let Some(origin) = worker_origin.as_ref() {
+                        push_if_new(origin.clone());
                     }
                 }
-                UpstreamRoute::NpmDirect => {
-                    if let Some(o) = OriginKey::from_request_url(npm_direct_url) {
-                        push_if_new(o);
+                SelectedRoute::Mode(RouteMode::Direct) => {
+                    if let Some(origin) = npm_origin.as_ref() {
+                        push_if_new(origin.clone());
                     }
                 }
-                UpstreamRoute::Custom { target, .. } => {
+                SelectedRoute::Custom(target) => {
                     if let Some(o) = OriginKey::from_request_url(&target.base_url) {
                         push_if_new(o);
                     }
+                }
+                SelectedRoute::Jsr => {
+                    push_if_new(JSR_ORIGIN.clone());
                 }
             }
         }
@@ -452,10 +512,14 @@ impl RouteTable {
 }
 
 fn registry_url_contains(candidate: &str, registry: &str) -> bool {
-    let Ok(candidate) = reqwest::Url::parse(candidate) else {
+    let Ok(registry) = reqwest::Url::parse(registry) else {
         return false;
     };
-    let Ok(registry) = reqwest::Url::parse(registry) else {
+    registry_url_contains_parsed(candidate, &registry)
+}
+
+fn registry_url_contains_parsed(candidate: &str, registry: &reqwest::Url) -> bool {
+    let Ok(candidate) = reqwest::Url::parse(candidate) else {
         return false;
     };
     if candidate.scheme() != registry.scheme()
@@ -644,11 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn tls_overridden_route_table_does_not_support_workspace_fetch_sharing() {
+    fn explicit_strict_ssl_true_preserves_workspace_fetch_sharing() {
         let npmrc = NpmrcConfig::parse("strict-ssl=true", "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("valid npmrc");
 
-        assert!(!table.supports_workspace_fetch_sharing());
+        assert!(table.supports_workspace_fetch_sharing());
     }
 
     #[test]
@@ -738,7 +802,7 @@ mod tests {
             UpstreamRoute::Custom { target, auth } => {
                 assert_eq!(target.base_url.as_ref(), "https://npm.internal");
                 let auth = auth.expect("auth should be present");
-                match auth {
+                match auth.as_ref() {
                     RegistryAuth::Bearer { token: s, .. } => {
                         use secrecy::ExposeSecret;
                         assert_eq!(s.expose_secret(), "ABC123");
@@ -748,6 +812,28 @@ mod tests {
             }
             other => panic!("expected Custom, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_route_decisions_share_the_same_credential_allocation() {
+        let table = make_table(
+            "registry=https://npm.internal/\n//npm.internal/:_authToken=ABC123\n",
+            RouteMode::Direct,
+        );
+        let first = match table.route_for_package("react") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => auth,
+            route => panic!("expected authenticated custom route, got {route:?}"),
+        };
+        let second = match table.route_for_package("lodash") {
+            UpstreamRoute::Custom {
+                auth: Some(auth), ..
+            } => auth,
+            route => panic!("expected authenticated custom route, got {route:?}"),
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
@@ -772,56 +858,33 @@ mod tests {
     }
 
     #[test]
-    fn route_table_new_fails_fast_on_fatal_npmrc_error() {
-        // A `.npmrc` with `${MISSING}` env interpolation must NOT yield
-        // a usable RouteTable. The type system enforces this — `new`
-        // returns `Err` so a caller CAN'T forget to check for errors.
+    fn route_table_accepts_literal_missing_env_references() {
         let content = "//host/:_authToken=${MISSING}\n";
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
-        let err = RouteTable::new(RouteMode::Direct, npmrc)
-            .expect_err("missing env var must block construction");
-        assert_eq!(err.errors.len(), 1);
-        assert!(err.errors[0].contains("MISSING"));
-        // Display impl renders the single error inline.
-        let rendered = format!("{err}");
-        assert!(rendered.contains("MISSING"));
+        RouteTable::new(RouteMode::Direct, npmrc)
+            .expect("npm keeps a missing non-optional environment reference literal");
     }
 
     #[test]
     fn route_table_new_collects_multiple_fatal_errors() {
-        // Two missing env vars on different lines — both surfaced in
-        // one `Err`. Caller surfaces all so the user fixes them in one
-        // edit, not iteratively.
-        let content = concat!(
-            "//host-a/:_authToken=${MISSING_A}\n",
-            "//host-b/:_authToken=${MISSING_B}\n",
-        );
-        let npmrc = NpmrcConfig::parse(content, "test", &no_env);
+        let mut npmrc = NpmrcConfig::default();
+        npmrc.errors = vec!["first failure".to_string(), "second failure".to_string()];
         let err = RouteTable::new(RouteMode::Direct, npmrc).expect_err("must Err");
         assert_eq!(err.errors.len(), 2);
         let rendered = format!("{err}");
-        assert!(rendered.contains("MISSING_A"));
-        assert!(rendered.contains("MISSING_B"));
+        assert!(rendered.contains("first failure"));
+        assert!(rendered.contains("second failure"));
         // Multi-error Display puts each on its own line.
         assert!(rendered.contains('\n'));
     }
 
     #[test]
     fn route_table_new_succeeds_with_only_warnings() {
-        // Warnings (path-prefix tokens, malformed lines, etc.) are
-        // advisory — they do NOT block construction. Only fatal
-        // errors do.
-        //
-        // Per-origin cafile/certfile/keyfile populate per-origin TLS state
-        // rather than emitting warnings. Use a path-scoped auth-token line
-        // as the deterministic warning trigger here — that warning is
-        // independent of TLS feature gating (path-scoped auth keys parse
-        // as origin-only).
-        let content = "//npm.internal/some/path/:_authToken=t\n";
+        let content = "strict-ssl=invalid\n";
         let npmrc = NpmrcConfig::parse(content, "test", &no_env);
         let table = RouteTable::new(RouteMode::Direct, npmrc).expect("warnings don't block");
         assert_eq!(table.npmrc_warnings().len(), 1);
-        assert!(table.npmrc_warnings()[0].contains("path-scoped"));
+        assert!(table.npmrc_warnings()[0].contains("strict-ssl"));
     }
 
     // ---- effective_registry_origins (request-aware) ----
@@ -888,10 +951,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_resolution_key_rejects_tls_customized_routes() {
+    fn workspace_resolution_key_accepts_explicit_strict_ssl_true() {
         let table = make_table("strict-ssl=true\n", RouteMode::Direct);
 
-        assert_eq!(table.workspace_resolution_key(), None);
+        assert!(table.workspace_resolution_key().is_some());
     }
 
     /// Empty top-level → empty effective set, no matter what's in
@@ -1116,5 +1179,23 @@ mod tests {
         let specs = vec!["react".to_string()];
         let got = table.effective_registry_origins(&specs, "not a url", "also not a url");
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn npmjs_token_without_redundant_registry_line_routes_with_auth() {
+        let table = make_table(
+            "//registry.npmjs.org/:_authToken=private-token\n",
+            RouteMode::Direct,
+        );
+        match table.route_for_package("private-package") {
+            UpstreamRoute::Custom { target, auth } => {
+                assert_eq!(target.base_url.as_ref(), "https://registry.npmjs.org");
+                assert!(
+                    auth.is_some(),
+                    "npmjs credential must reach direct metadata"
+                );
+            }
+            other => panic!("expected authenticated npm-compatible route, got {other:?}"),
+        }
     }
 }

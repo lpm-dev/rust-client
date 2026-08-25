@@ -34,7 +34,7 @@ impl RegistryClient {
             crate::UpstreamRoute::LpmWorker => self.search_packages(query, limit).await,
             crate::UpstreamRoute::NpmDirect => self.search_npm_packages(query, limit).await,
             crate::UpstreamRoute::Custom { target, auth } => {
-                self.search_npm_packages_from(&target.base_url, query, limit, auth.as_ref())
+                self.search_npm_packages_from(&target.base_url, query, limit, auth.as_deref())
                     .await
             }
         }
@@ -75,21 +75,22 @@ impl RegistryClient {
             version: String,
         }
 
-        let url = format!(
+        let destination = RequestDestination::parse(&format!(
             "{base_url}/-/v1/search?text={}&size={}",
             urlencoding::encode(query),
             limit.min(20)
-        );
+        ))?;
         let req = self
             .http
-            .for_url(&url)
+            .for_destination(&destination)
             .await?
-            .get(&url)
+            .get(destination.as_url().clone())
             .header("Accept", "application/json");
-        let req = apply_npmrc_auth(req, &url, auth)?;
-        let response = self.send_with_retry(req).await?;
+        let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
+        let response = self.send_with_retry_with_npmrc_auth(req, auth).await?;
         let envelope: NpmSearchEnvelope =
-            parse_capped_api_json(response, &format!("response from {url}")).await?;
+            parse_capped_api_json(response, &format!("response from {}", destination.as_str()))
+                .await?;
 
         Ok(SearchResponse {
             packages: envelope

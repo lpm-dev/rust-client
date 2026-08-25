@@ -9,11 +9,15 @@ pub fn is_localhost_url(url: &str) -> bool {
         return false;
     };
 
-    if parsed.scheme() != "http" {
+    is_loopback_http_url(&parsed)
+}
+
+pub(super) fn is_loopback_http_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "http" {
         return false;
     }
 
-    let Some(host) = parsed.host_str() else {
+    let Some(host) = url.host_str() else {
         return false;
     };
 

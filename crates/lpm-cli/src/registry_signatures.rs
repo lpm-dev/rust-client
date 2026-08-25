@@ -514,7 +514,7 @@ pub(crate) async fn registry_signing_keys_for_route(
     match route {
         UpstreamRoute::Custom { target, auth } => {
             match client
-                .get_registry_signing_keys(target.base_url.as_ref(), auth.as_ref())
+                .get_registry_signing_keys(target.base_url.as_ref(), auth.as_deref())
                 .await
             {
                 Ok(mut keys) => {

@@ -341,6 +341,11 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     assert_body_contains(
         &registry_config,
         "fn build_http_client_with_tls_identity_and_transport(",
+        "build_http_client_with_prepared_tls_identity_and_transport(",
+    );
+    assert_body_contains(
+        &registry_config,
+        "fn build_http_client_with_prepared_tls_identity_and_transport(",
         "lpm_http::client_builder()",
     );
     assert_body_contains(
@@ -358,7 +363,7 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     assert_body_contains(
         &registry_http,
         "fn build_per_origin_http_client(",
-        "RegistryClient::build_http_client_with_tls_and_identity(",
+        "RegistryClient::build_http_client_set_with_tls_and_identity(",
     );
 
     let registry_api = read_workspace_source("crates/lpm-registry/src/client/api.rs");

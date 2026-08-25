@@ -1407,28 +1407,32 @@ pub fn list_registry_auth_statuses() -> Vec<RegistryAuthStatus> {
     let mut result = Vec::new();
 
     // npm: check env, keychain, .npmrc — show source so user knows where token came from
-    let npm_stored_token = get_stored_builtin_token_with_backend(NPM_REGISTRY_URL);
-
-    if let Ok(token) = std::env::var("NPM_TOKEN") {
-        if !token.is_empty() {
-            result.push(RegistryAuthStatus {
-                name: "npmjs.org".into(),
-                status: "configured (env: NPM_TOKEN)".into(),
-                storage: AuthStorageStatus::none(),
-            });
-        }
-    } else if let Some(stored) = npm_stored_token {
+    if std::env::var("NPM_TOKEN").is_ok_and(|token| !token.is_empty()) {
+        result.push(RegistryAuthStatus {
+            name: "npmjs.org".into(),
+            status: "configured (env: NPM_TOKEN)".into(),
+            storage: AuthStorageStatus::none(),
+        });
+    } else if let Some(stored) = get_stored_builtin_token_with_backend(NPM_REGISTRY_URL) {
         result.push(RegistryAuthStatus {
             name: "npmjs.org".into(),
             status: stored.backend.registry_status_label().into(),
             storage: AuthStorageStatus::from_backend(stored.backend),
         });
-    } else if parse_npmrc_token().is_ok_and(|token| token.is_some()) {
-        result.push(RegistryAuthStatus {
-            name: "npmjs.org".into(),
-            status: "found in .npmrc (may be expired — run `lpm login --npm` to verify)".into(),
-            storage: AuthStorageStatus::none(),
-        });
+    } else {
+        match parse_npmrc_token() {
+            Ok(Some(_)) => result.push(RegistryAuthStatus {
+                name: "npmjs.org".into(),
+                status: "found in .npmrc (may be expired — run `lpm login --npm` to verify)".into(),
+                storage: AuthStorageStatus::none(),
+            }),
+            Ok(None) => {}
+            Err(error) => result.push(RegistryAuthStatus {
+                name: "npmjs.org".into(),
+                status: format!("npm auth unavailable: {error}"),
+                storage: AuthStorageStatus::none(),
+            }),
+        }
     }
 
     if let Some(credential) = resolve_github_credential() {
@@ -1866,44 +1870,96 @@ pub fn clear_refresh_token(registry: &str) -> Result<(), String> {
 
 /// Parse the npm auth token from `.npmrc` files.
 ///
-/// Checks project `.npmrc` first, then home `~/.npmrc`.
-/// Looks for: `//registry.npmjs.org/:_authToken=xxx`
+/// Merges npm's global, user, and project layers in precedence order.
 fn parse_npmrc_token() -> Result<Option<String>, String> {
-    // Project-level .npmrc first
+    let home = dirs::home_dir();
+    let user_path = lpm_common::npm_user_config_path(home.as_deref());
+    let user_layer = user_path
+        .as_deref()
+        .map(read_npmrc_file_layer)
+        .transpose()?
+        .flatten();
+    let user_content = user_layer.as_ref().and_then(|(bytes, metadata)| {
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(|content| (content, metadata))
+    });
+    let global_path =
+        lpm_common::npm_global_config_path_from_user_config(home.as_deref(), user_content);
+    let mut token = None;
+    if let Some(layer_value) = parse_npmrc_file_assignment(&global_path)? {
+        token = layer_value;
+    }
+    if let (Some(path), Some((bytes, metadata))) = (user_path.as_deref(), user_layer)
+        && let Some(layer_value) = parse_npmrc_opened_assignment(path, &bytes, &metadata)?
+    {
+        token = layer_value;
+    }
     if let Ok(cwd) = std::env::current_dir()
-        && let Some(token) = parse_npmrc_file(&cwd.join(".npmrc"))?
+        && let Some(project_npmrc) = npm_project_npmrc(&cwd, home.as_deref())
+        && let Some(layer_value) = parse_npmrc_file_assignment(&project_npmrc)?
     {
-        return Ok(Some(token));
+        token = layer_value;
     }
+    Ok(token)
+}
 
-    // Home-level ~/.npmrc
-    if let Some(home) = dirs::home_dir()
-        && let Some(token) = parse_npmrc_file(&home.join(".npmrc"))?
-    {
-        return Ok(Some(token));
+fn npm_project_npmrc(
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let project = lpm_workspace::find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    if home.is_some_and(|home| home == project) {
+        return None;
     }
-
-    Ok(None)
+    let selected = lpm_workspace::find_workspace_root(&project)
+        .ok()
+        .flatten()
+        .unwrap_or(project);
+    Some(selected.join(".npmrc"))
 }
 
 /// Parse a single .npmrc file for the npm registry auth token.
 ///
 /// On Unix, refuses to surface the token when group or other permission bits
 /// are set. The content and mode come from the same opened file descriptor.
+#[cfg(test)]
 fn parse_npmrc_file(path: &std::path::Path) -> Result<Option<String>, String> {
-    let (content, _file_metadata) = match lpm_common::read_text_file_capped_with_metadata(
+    Ok(parse_npmrc_file_assignment(path)?.flatten())
+}
+
+fn parse_npmrc_file_assignment(path: &std::path::Path) -> Result<Option<Option<String>>, String> {
+    let Some((bytes, file_metadata)) = read_npmrc_file_layer(path)? else {
+        return Ok(None);
+    };
+    parse_npmrc_opened_assignment(path, &bytes, &file_metadata)
+}
+
+fn read_npmrc_file_layer(
+    path: &std::path::Path,
+) -> Result<Option<(Vec<u8>, std::fs::Metadata)>, String> {
+    match lpm_common::read_regular_file_capped_with_metadata(
         path,
         lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
     ) {
-        Ok(opened_file) => opened_file,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
+        Ok(opened_file) => Ok(Some(opened_file)),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn parse_npmrc_opened_assignment(
+    path: &std::path::Path,
+    bytes: &[u8],
+    file_metadata: &std::fs::Metadata,
+) -> Result<Option<Option<String>>, String> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|error| format!("file {} is not valid UTF-8: {error}", path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let permissions = _file_metadata.permissions();
+        let permissions = file_metadata.permissions();
         if !lpm_common::permissions_are_owner_only(&permissions) {
             tracing::warn!(
                 ".npmrc at {} has mode {:04o}, which grants group or other access; \
@@ -1917,21 +1973,56 @@ fn parse_npmrc_file(path: &std::path::Path) -> Result<Option<String>, String> {
         }
     }
 
-    for line in content.lines() {
-        let line = line.trim();
-        // Match: //registry.npmjs.org/:_authToken=xxx
-        if line.starts_with("//registry.npmjs.org/:_authToken=") {
-            let token = line
-                .strip_prefix("//registry.npmjs.org/:_authToken=")
-                .unwrap_or("")
-                .trim();
-            if !token.is_empty() {
-                return Ok(Some(token.to_string()));
-            }
+    let content = lpm_common::strip_utf8_bom_str(content);
+    let mut warnings = Vec::new();
+    let settings =
+        lpm_common::parse_npmrc_ini_settings(content, &path.display().to_string(), &mut warnings);
+    for warning in warnings {
+        tracing::warn!("{warning}");
+    }
+    let mut assignment = None;
+    for setting in settings {
+        let key = lpm_common::interpolate_npmrc_env(&setting.key, &|name| std::env::var(name).ok())
+            .map_err(|error| {
+                format!(
+                    "{}: npm config key interpolation failed: {error}",
+                    path.display()
+                )
+            })?;
+        if setting.is_array || !is_npmjs_token_key(key.as_ref()) {
+            continue;
+        }
+        if let Some(raw_value) = setting.values.last() {
+            let value = lpm_common::interpolate_npmrc_env(raw_value.value.as_ref(), &|name| {
+                std::env::var(name).ok()
+            })
+            .map_err(|error| {
+                format!(
+                    "{}:{}: npm config value interpolation failed: {error}",
+                    path.display(),
+                    raw_value.line
+                )
+            })?;
+            let value = value.trim();
+            assignment = Some((!value.is_empty()).then(|| value.to_string()));
         }
     }
 
-    Ok(None)
+    Ok(assignment)
+}
+
+fn is_npmjs_token_key(key: &str) -> bool {
+    let Some(scoped) = key.strip_prefix("//") else {
+        return false;
+    };
+    let Some((scope, attribute)) = scoped.rsplit_once(':') else {
+        return false;
+    };
+    if attribute != "_authToken" {
+        return false;
+    }
+    let normalized_scope = scope.trim_end_matches('/');
+    !normalized_scope.contains('/') && normalized_scope.eq_ignore_ascii_case("registry.npmjs.org")
 }
 
 // The 24h `should_revalidate_token` / `mark_token_validated` /
@@ -4159,6 +4250,277 @@ mod tests {
     }
 
     #[test]
+    fn parse_npmrc_uses_the_last_token_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc_path = dir.path().join(".npmrc");
+        write_test_npmrc(
+            &npmrc_path,
+            "//registry.npmjs.org/:_authToken=first\n//registry.npmjs.org/:_authToken=second\n",
+        );
+
+        assert_eq!(
+            parse_npmrc_file(&npmrc_path).unwrap().as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn parse_npmrc_interpolates_the_token_with_npm_ini_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc_path = dir.path().join(".npmrc");
+        write_test_npmrc(
+            &npmrc_path,
+            "//registry.npmjs.org/:_authToken=${NPMRC_TEST_TOKEN} # comment\n",
+        );
+        let _env =
+            super::test_env::ScopedEnv::set([("NPMRC_TEST_TOKEN", "interpolated-token".into())]);
+
+        assert_eq!(
+            parse_npmrc_file(&npmrc_path).unwrap().as_deref(),
+            Some("interpolated-token")
+        );
+    }
+
+    #[test]
+    fn npmrc_token_discovery_honors_userconfig_override() {
+        let home = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let userconfig = config_dir.path().join("custom-npmrc");
+        write_test_npmrc(
+            &userconfig,
+            "//registry.npmjs.org/:_authToken=override-token\n",
+        );
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            (
+                "NPM_CONFIG_USERCONFIG",
+                Some(userconfig.as_os_str().to_owned()),
+            ),
+            ("npm_config_userconfig", None),
+        ]);
+
+        assert_eq!(
+            parse_npmrc_token().unwrap().as_deref(),
+            Some("override-token")
+        );
+    }
+
+    #[test]
+    fn npmrc_token_discovery_expands_a_tilde_userconfig_override() {
+        let home = tempfile::tempdir().unwrap();
+        write_test_npmrc(
+            &home.path().join("custom.npmrc"),
+            "//registry.npmjs.org/:_authToken=tilde-token\n",
+        );
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("NPM_CONFIG_USERCONFIG", Some("~/custom.npmrc".into())),
+            ("npm_config_userconfig", None),
+        ]);
+
+        assert_eq!(parse_npmrc_token().unwrap().as_deref(), Some("tilde-token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_user_config_cannot_redirect_global_token_discovery() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().unwrap();
+        let redirected_prefix = home.path().join("redirected-prefix");
+        std::fs::create_dir_all(redirected_prefix.join("etc")).unwrap();
+        write_test_npmrc(
+            &redirected_prefix.join("etc/npmrc"),
+            "//registry.npmjs.org/:_authToken=redirected-token\n",
+        );
+        let userconfig = home.path().join("user.npmrc");
+        write_test_npmrc(
+            &userconfig,
+            &format!("prefix={}\n", redirected_prefix.display()),
+        );
+        std::fs::set_permissions(&userconfig, std::fs::Permissions::from_mode(0o622)).unwrap();
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            (
+                "NPM_CONFIG_USERCONFIG",
+                Some(userconfig.as_os_str().to_owned()),
+            ),
+            ("npm_config_userconfig", None),
+            ("NPM_CONFIG_GLOBALCONFIG", None),
+            ("npm_config_globalconfig", None),
+            ("NPM_CONFIG_PREFIX", None),
+            ("npm_config_prefix", None),
+            ("PREFIX", None),
+        ]);
+
+        assert_eq!(parse_npmrc_token().unwrap(), None);
+    }
+
+    #[test]
+    fn npmrc_token_project_path_uses_the_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let member = workspace.path().join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"workspace-root","private":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("package.json"),
+            r#"{"name":"workspace-member","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            npm_project_npmrc(&member, None),
+            Some(workspace.path().join(".npmrc"))
+        );
+    }
+
+    #[test]
+    fn npmrc_token_project_path_falls_back_to_a_manifestless_cwd() {
+        let project = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            npm_project_npmrc(project.path(), None),
+            Some(project.path().join(".npmrc"))
+        );
+    }
+
+    #[test]
+    fn parse_npmrc_uses_the_last_key_after_environment_interpolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let npmrc_path = dir.path().join(".npmrc");
+        write_test_npmrc(
+            &npmrc_path,
+            "${NPMRC_TOKEN_KEY}=first\n//registry.npmjs.org/:_authToken=second\n",
+        );
+        let _env = super::test_env::ScopedEnv::set([(
+            "NPMRC_TOKEN_KEY",
+            "//registry.npmjs.org/:_authToken".into(),
+        )]);
+
+        assert_eq!(
+            parse_npmrc_file(&npmrc_path).unwrap().as_deref(),
+            Some("second")
+        );
+
+        write_test_npmrc(
+            &npmrc_path,
+            "//registry.npmjs.org/:_authToken=first\n${NPMRC_TOKEN_KEY}=\n",
+        );
+        assert_eq!(parse_npmrc_file(&npmrc_path).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npmrc_token_read_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(".npmrc");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let fifo_for_worker = fifo.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = parse_npmrc_file(&fifo_for_worker).map(|_| ());
+            sender.send(result).unwrap();
+        });
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result,
+            Err(error) => {
+                let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                drop(writer);
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("npm auth blocked on a FIFO .npmrc: {error}");
+            }
+        };
+        worker.join().unwrap();
+        assert!(result.is_err(), "a FIFO must not be accepted as npm config");
+    }
+
+    #[test]
+    fn npm_auth_status_reports_an_oversized_userconfig() {
+        with_temp_home(|home| {
+            let userconfig = home.join("oversized.npmrc");
+            std::fs::write(
+                &userconfig,
+                vec![b'x'; lpm_common::NPMRC_FILE_SIZE_CAP_BYTES as usize + 1],
+            )
+            .unwrap();
+            let globalconfig = home.join("missing-global.npmrc");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                ("NPM_CONFIG_USERCONFIG", Some(userconfig.into_os_string())),
+                ("npm_config_userconfig", None),
+                (
+                    "NPM_CONFIG_GLOBALCONFIG",
+                    Some(globalconfig.into_os_string()),
+                ),
+                ("npm_config_globalconfig", None),
+            ]);
+
+            let statuses = list_registry_auth_statuses();
+            assert!(
+                statuses.iter().any(|status| {
+                    status.name == "npmjs.org"
+                        && status.status.contains("unavailable")
+                        && status.status.contains("exceeds")
+                }),
+                "npm auth status must expose the read failure: {statuses:?}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_auth_status_reports_an_unreadable_userconfig() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        with_temp_home(|home| {
+            let userconfig = home.join("unreadable.npmrc");
+            write_test_npmrc(
+                &userconfig,
+                "//registry.npmjs.org/:_authToken=hidden-token\n",
+            );
+            std::fs::set_permissions(&userconfig, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let globalconfig = home.join("missing-global.npmrc");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", None),
+                (
+                    "NPM_CONFIG_USERCONFIG",
+                    Some(userconfig.clone().into_os_string()),
+                ),
+                ("npm_config_userconfig", None),
+                (
+                    "NPM_CONFIG_GLOBALCONFIG",
+                    Some(globalconfig.into_os_string()),
+                ),
+                ("npm_config_globalconfig", None),
+            ]);
+
+            let statuses = list_registry_auth_statuses();
+            std::fs::set_permissions(&userconfig, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(
+                statuses.iter().any(|status| {
+                    status.name == "npmjs.org" && status.status.contains("unavailable")
+                }),
+                "npm auth status must expose the read failure: {statuses:?}"
+            );
+        });
+    }
+
+    #[test]
     fn parse_npmrc_ignores_other_registries() {
         let dir = tempfile::tempdir().unwrap();
         let npmrc_path = dir.path().join(".npmrc");
@@ -4963,6 +5325,28 @@ mod tests {
                 registries.iter().all(|(name, _)| name != "github.com"),
                 "malformed GitHub builtin entry should not be reported as configured: {registries:?}"
             );
+        });
+    }
+
+    #[test]
+    fn empty_npm_token_env_allows_status_to_fall_back_to_npmrc() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("NPM_TOKEN", Some(String::new().into())),
+                ("GITHUB_TOKEN", None),
+                ("GITLAB_TOKEN", None),
+                ("CI_JOB_TOKEN", None),
+            ]);
+            write_test_npmrc(
+                &home.join(".npmrc"),
+                "//registry.npmjs.org/:_authToken=npmrc-fallback-token\n",
+            );
+
+            let statuses = list_registry_auth_statuses();
+            assert!(statuses.iter().any(|status| {
+                status.name == "npmjs.org" && status.status.contains("found in .npmrc")
+            }));
         });
     }
 

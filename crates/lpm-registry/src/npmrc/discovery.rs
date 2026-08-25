@@ -1,30 +1,34 @@
 use super::config::NpmrcConfig;
 use super::parse::CredentialPolicy;
 use lpm_common::{
-    BoundedReadError, NPMRC_FILE_SIZE_CAP_BYTES, read_text_file_capped_with_metadata,
+    BoundedReadError, NPMRC_FILE_SIZE_CAP_BYTES, read_text_regular_file_capped_with_metadata,
 };
 use std::path::{Path, PathBuf};
 
+type OpenedLayer = Result<(String, std::fs::Metadata), BoundedReadError>;
+
+#[derive(Debug)]
+struct PreloadedLayer {
+    index: usize,
+    path: PathBuf,
+    opened: OpenedLayer,
+}
+
 impl NpmrcConfig {
     /// Compute the four `.npmrc` paths in **lowest-to-highest precedence
-    /// order**, ready to feed `load_from_paths`, plus any warnings raised
-    /// during discovery (e.g., a project `.npmrc` that turned out to be a
-    /// directory). Pure / no IO beyond `stat`-style probing.
+    /// order**, plus any warnings raised during discovery (e.g., a project
+    /// `.npmrc` that turned out to be a directory). The user layer is opened
+    /// once so its content can select npm's prefix-derived global config and
+    /// then be reused by [`Self::load_from_discovery`].
     ///
     /// Layers:
-    /// 1. `/usr/etc/npmrc` — npm builtin, rarely present.
-    /// 2. `/etc/npmrc` — system-wide, also rare.
-    /// 3. `<home>/.npmrc` — user-level, included only if `home` is `Some`.
+    /// 1. `<effective-node-prefix>/etc/npmrc` — npm's global config.
+    /// 2. `<home>/.npmrc` — user-level, included only if `home` is `Some`.
     ///    Most teams put their auth tokens here.
-    /// 4. `<some-ancestor>/.npmrc` — found by `walk_for_project_npmrc`.
-    ///    The walker returns the nearest `.npmrc` on the walk-up path
-    ///    such that a project marker (regular-file `package.json`) has
-    ///    been seen at-or-below that level. This restores the
-    ///    monorepo-inheritance pattern (a workspace member without
-    ///    its own `.npmrc` inherits the workspace root's one) while
-    ///    keeping the security boundary against shared-ancestor
-    ///    injection — a `.npmrc` with no marker anywhere on the path
-    ///    is never trusted.
+    /// 4. `<project-or-workspace-root>/.npmrc` — selected with the same
+    ///    workspace discovery used by install. Workspace members use the
+    ///    root config; independent nested projects do not inherit an
+    ///    unrelated parent's config.
     ///
     /// Layers 1–3 are returned even if their files don't exist; the
     /// loader silently skips missing files. Layer 4 is **bounded** to
@@ -32,15 +36,48 @@ impl NpmrcConfig {
     /// no project layer is included (a planted non-regular marker would
     /// otherwise qualify any directory as a project root).
     pub fn discover_layer_paths(cwd: &Path, home: Option<&Path>) -> LayerDiscovery {
-        let mut paths = Vec::with_capacity(4);
+        let user_config_path = lpm_common::npm_user_config_path(home);
+        let opened_user = user_config_path.as_deref().map(|path| {
+            read_text_regular_file_capped_with_metadata(path, NPMRC_FILE_SIZE_CAP_BYTES)
+        });
+        let global_config = lpm_common::npm_global_config_path_from_user_config(
+            home,
+            opened_user
+                .as_ref()
+                .and_then(|opened| opened.as_ref().ok())
+                .map(|(content, metadata)| (content.as_str(), metadata)),
+        );
+        let mut discovery = Self::discover_layer_paths_with_global_config(cwd, home, global_config);
+        discovery.preloaded_user = match (discovery.user_layer_index, user_config_path, opened_user)
+        {
+            (Some(index), Some(path), Some(opened)) => Some(PreloadedLayer {
+                index,
+                path,
+                opened,
+            }),
+            _ => None,
+        };
+        discovery
+    }
+
+    fn discover_layer_paths_with_global_config(
+        cwd: &Path,
+        home: Option<&Path>,
+        global_config: PathBuf,
+    ) -> LayerDiscovery {
+        let mut paths = Vec::with_capacity(3);
         let mut warnings = Vec::new();
         let mut project_layer_index = None;
-        paths.push(PathBuf::from("/usr/etc/npmrc"));
-        paths.push(PathBuf::from("/etc/npmrc"));
-        if let Some(h) = home {
+        let mut user_layer_index = None;
+        paths.push(global_config);
+        if let Some(user_config) = lpm_common::npm_config_path_with_home("userconfig", home) {
+            user_layer_index = Some(paths.len());
+            paths.push(user_config);
+        } else if let Some(h) = home {
+            user_layer_index = Some(paths.len());
             paths.push(h.join(".npmrc"));
         }
-        match walk_for_project_npmrc(cwd, home) {
+        match npm_project_npmrc(cwd, home) {
             ProjectNpmrcOutcome::File(p) => {
                 project_layer_index = Some(paths.len());
                 paths.push(p);
@@ -61,6 +98,8 @@ impl NpmrcConfig {
             paths,
             warnings,
             project_layer_index,
+            user_layer_index,
+            preloaded_user: None,
         }
     }
 
@@ -93,9 +132,48 @@ impl NpmrcConfig {
         project_layer_index: Option<usize>,
         env_lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::load_from_paths_with_project_index_and_preloaded(
+            paths,
+            project_layer_index,
+            None,
+            env_lookup,
+        )
+    }
+
+    /// Load a discovered configuration while reusing the already-opened user
+    /// layer that selected npm's prefix-derived global configuration path.
+    pub fn load_from_discovery(
+        mut discovery: LayerDiscovery,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
+        let mut config = Self::load_from_paths_with_project_index_and_preloaded(
+            &discovery.paths,
+            discovery.project_layer_index,
+            discovery.preloaded_user.take(),
+            env_lookup,
+        );
+        discovery.warnings.append(&mut config.warnings);
+        config.warnings = discovery.warnings;
+        config
+    }
+
+    fn load_from_paths_with_project_index_and_preloaded(
+        paths: &[PathBuf],
+        project_layer_index: Option<usize>,
+        mut preloaded: Option<PreloadedLayer>,
+        env_lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let mut acc = NpmrcConfig::default();
         for (idx, path) in paths.iter().enumerate() {
-            match read_text_file_capped_with_metadata(path, NPMRC_FILE_SIZE_CAP_BYTES) {
+            let opened = if preloaded
+                .as_ref()
+                .is_some_and(|layer| layer.index == idx && layer.path == *path)
+            {
+                preloaded.take().expect("preloaded layer is present").opened
+            } else {
+                read_text_regular_file_capped_with_metadata(path, NPMRC_FILE_SIZE_CAP_BYTES)
+            };
+            match opened {
                 Ok((content, file_metadata)) => {
                     let label = path.display().to_string();
                     let source_dir = path.parent();
@@ -106,6 +184,14 @@ impl NpmrcConfig {
                         use std::os::unix::fs::PermissionsExt;
 
                         let permissions = file_metadata.permissions();
+                        let mode = permissions.mode() & 0o777;
+                        if mode & 0o022 != 0 {
+                            acc.security_warnings.push(format!(
+                                "{label}: .npmrc mode {mode:04o} is writable by group or others; refused the entire layer. Run `chmod 600 {}` before using it",
+                                path.display(),
+                            ));
+                            continue;
+                        }
                         (!lpm_common::permissions_are_owner_only(&permissions)).then(|| {
                             format!(
                                 "{label}: .npmrc mode {:04o} grants group or other access; \
@@ -168,17 +254,26 @@ impl NpmrcConfig {
     pub fn load_from_filesystem(cwd: &Path) -> Self {
         let home = dirs::home_dir();
         let discovery = Self::discover_layer_paths(cwd, home.as_deref());
-        let mut cfg = Self::load_from_paths_with_project_index(
-            &discovery.paths,
-            discovery.project_layer_index,
-            &|name| std::env::var(name).ok(),
-        );
-        // Discovery warnings happened first chronologically; prepend so
-        // they read in the order the user would expect.
-        let mut all = discovery.warnings;
-        all.append(&mut cfg.warnings);
-        cfg.warnings = all;
-        cfg
+        Self::load_from_discovery(discovery, &|name| std::env::var(name).ok())
+    }
+}
+
+fn npm_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
+    let Some(project) = lpm_workspace::find_project_root(cwd) else {
+        return ProjectNpmrcOutcome::None;
+    };
+    if home.is_some_and(|home| project == home) {
+        return ProjectNpmrcOutcome::None;
+    }
+    let selected = match lpm_workspace::find_workspace_root(&project) {
+        Ok(Some(workspace)) => workspace,
+        Ok(None) => project,
+        Err(_) => project,
+    };
+    match inspect_npmrc_at(&selected.join(".npmrc")) {
+        NpmrcEntry::File(path) => ProjectNpmrcOutcome::File(path),
+        NpmrcEntry::NotRegular { path, kind } => ProjectNpmrcOutcome::NotRegular { path, kind },
+        NpmrcEntry::Missing => ProjectNpmrcOutcome::None,
     }
 }
 
@@ -196,24 +291,8 @@ pub struct LayerDiscovery {
     /// `strict-ssl=false` are refused at parse time when sourced from
     /// this layer.
     pub project_layer_index: Option<usize>,
-}
-
-/// Markers that identify a directory as a project root for the
-/// purposes of `.npmrc` discovery. Deliberately narrow — `package.json`
-/// is the universal npm-style answer. Adding broader markers like
-/// `.git` would re-open the shared-ancestor injection class for any
-/// directory inside a git repo.
-const PROJECT_MARKERS: &[&str] = &["package.json"];
-
-/// Whether `dir` contains at least one **regular-file** project marker.
-/// `metadata().is_file()` follows symlinks (so a symlink to a real
-/// `package.json` still counts) but rejects directories and broken
-/// symlinks — `mkdir /tmp/package.json` must not qualify `/tmp` as a
-/// project root.
-fn dir_has_regular_marker(dir: &Path) -> bool {
-    PROJECT_MARKERS
-        .iter()
-        .any(|m| std::fs::metadata(dir.join(m)).is_ok_and(|meta| meta.is_file()))
+    user_layer_index: Option<usize>,
+    preloaded_user: Option<PreloadedLayer>,
 }
 
 /// Disposition of an `.npmrc` candidate path.
@@ -293,55 +372,8 @@ enum ProjectNpmrcOutcome {
     None,
 }
 
-/// Walk up from `cwd` looking for the project-layer `.npmrc`.
-///
-/// Algorithm: track `seen_marker` as we walk up. At each level:
-/// 1. If `dir == home`: stop.
-/// 2. If `dir_has_regular_marker(dir)`: set `seen_marker = true`.
-/// 3. If `seen_marker`: classify `dir/.npmrc`.
-///    - `File` → return it. Closest-wins: the deepest ancestor whose
-///      `.npmrc` we trust is the answer.
-///    - `NotRegular` → return it as a warning; do NOT fall through.
-///    - `Missing` → continue up. A higher ancestor might still have
-///      the workspace-root `.npmrc` (nested member's `package.json`
-///      flips the flag, then we walk up to the repo root's `.npmrc`).
-/// 4. If not `seen_marker`: do not even look at `dir/.npmrc`. Without
-///    a marker on the path, we can't tell a legitimate `.npmrc` from
-///    a planted one.
-///
-/// Why "marker at-or-below" rather than "marker exact-here": npm-style
-/// monorepos put `package.json` in each member but `.npmrc` only at
-/// the workspace root. A walker that required `.npmrc` and `package.json`
-/// in the same directory would miss that pattern entirely.
-fn walk_for_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
-    let mut current = Some(cwd);
-    let mut seen_marker = false;
-    while let Some(dir) = current {
-        if Some(dir) == home {
-            break;
-        }
-        if dir_has_regular_marker(dir) {
-            seen_marker = true;
-        }
-        if seen_marker {
-            match inspect_npmrc_at(&dir.join(".npmrc")) {
-                NpmrcEntry::File(p) => return ProjectNpmrcOutcome::File(p),
-                NpmrcEntry::NotRegular { path, kind } => {
-                    return ProjectNpmrcOutcome::NotRegular { path, kind };
-                }
-                NpmrcEntry::Missing => {
-                    // Keep walking — repo root might have the workspace .npmrc.
-                }
-            }
-        }
-        current = dir.parent();
-    }
-    ProjectNpmrcOutcome::None
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::npmrc::{NpmrcConfig, RegistryAuth};
     use secrecy::ExposeSecret;
     use std::path::Path;
@@ -422,6 +454,49 @@ mod tests {
     }
 
     #[test]
+    fn discovered_user_layer_is_reused_without_a_second_read() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write_npmrc(home.path(), "registry=https://opened.example/\n");
+
+        let discovery = NpmrcConfig::discover_layer_paths(project.path(), Some(home.path()));
+        write_npmrc(home.path(), "registry=https://replaced.example/\n");
+        let config = NpmrcConfig::load_from_discovery(discovery, &no_env);
+
+        assert_eq!(
+            config
+                .default_registry
+                .as_ref()
+                .map(|target| target.base_url.as_ref()),
+            Some("https://opened.example")
+        );
+    }
+
+    #[test]
+    fn mutated_discovery_path_does_not_relabel_preloaded_user_content() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write_npmrc(home.path(), "registry=https://opened.example/\n");
+        let replacement = home.path().join("replacement.npmrc");
+        fs::write(&replacement, "registry=https://replacement.example/\n").unwrap();
+        #[cfg(unix)]
+        set_npmrc_mode(&replacement, 0o600);
+
+        let mut discovery = NpmrcConfig::discover_layer_paths(project.path(), Some(home.path()));
+        let user_index = discovery.user_layer_index.expect("user layer index");
+        discovery.paths[user_index] = replacement;
+        let config = NpmrcConfig::load_from_discovery(discovery, &no_env);
+
+        assert_eq!(
+            config
+                .default_registry
+                .as_ref()
+                .map(|target| target.base_url.as_ref()),
+            Some("https://replacement.example")
+        );
+    }
+
+    #[test]
     fn walker_project_overrides_user_per_key() {
         let home = TempDir::new().unwrap();
         let proj = TempDir::new().unwrap();
@@ -463,7 +538,7 @@ mod tests {
             "registry=https://npm.internal/\n\
              //token.example/:_authToken=bearer\n\
              //auth.example/:_auth=dXNlcjpwYXNz\n\
-             //pair.example/:_username=user\n\
+             //pair.example/:username=user\n\
              //pair.example/:_password=cGFzcw==\n",
         );
         set_npmrc_mode(&path, 0o644);
@@ -575,14 +650,51 @@ mod tests {
         assert!(cfg.errors.is_empty(), "non-fatal — install must continue");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_layer_read_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("config.npmrc");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let fifo_for_worker = fifo.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let config = NpmrcConfig::load_from_paths(&[fifo_for_worker], &no_env);
+            sender.send(config).unwrap();
+        });
+        let config = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(config) => config,
+            Err(error) => {
+                let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                drop(writer);
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("registry npmrc loading blocked on a FIFO: {error}");
+            }
+        };
+        worker.join().unwrap();
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("regular file")),
+            "a special-file layer must be rejected explicitly: {:?}",
+            config.warnings
+        );
+    }
+
     #[test]
     fn walker_cross_layer_credential_merge_end_to_end() {
-        // System layer sets _username, project layer sets _password; walker
+        // System layer sets username, project layer sets _password; walker
         // composes them via merge_over before finalize — must produce one
         // Basic credential with no partial-credential warnings.
         let system_dir = TempDir::new().unwrap();
         let proj_dir = TempDir::new().unwrap();
-        write_npmrc(system_dir.path(), "//npm.internal/:_username=alice\n");
+        write_npmrc(system_dir.path(), "//npm.internal/:username=alice\n");
         write_npmrc(
             proj_dir.path(),
             &format!(
@@ -613,158 +725,10 @@ mod tests {
         }
     }
 
-    /// Test helper — write a regular-file `package.json` so the dir
-    /// counts as a project marker for `walk_for_project_npmrc`. `{}` is
-    /// enough; we never parse it.
+    /// Test helper — write a regular-file `package.json` so workspace
+    /// discovery recognizes the directory as a project.
     fn mark_as_project_root(dir: &Path) {
         fs::write(dir.join("package.json"), "{}").expect("write package.json");
-    }
-
-    /// Match a `ProjectNpmrcOutcome::File(_)` and return the path.
-    fn expect_outcome_file(outcome: ProjectNpmrcOutcome) -> PathBuf {
-        match outcome {
-            ProjectNpmrcOutcome::File(p) => p,
-            other => panic!("expected ProjectNpmrcOutcome::File, got {other:?}"),
-        }
-    }
-
-    fn assert_outcome_none(outcome: ProjectNpmrcOutcome) {
-        match outcome {
-            ProjectNpmrcOutcome::None => {}
-            other => panic!("expected ProjectNpmrcOutcome::None, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn walker_returns_npmrc_when_marker_present_at_same_level() {
-        let home = TempDir::new().unwrap();
-        let proj = home.path().join("proj");
-        fs::create_dir_all(&proj).unwrap();
-        mark_as_project_root(&proj);
-        let expected = write_npmrc(&proj, "registry=https://here/\n");
-        let outcome = walk_for_project_npmrc(&proj, Some(home.path()));
-        assert_eq!(
-            fs::canonicalize(expect_outcome_file(outcome)).unwrap(),
-            fs::canonicalize(&expected).unwrap()
-        );
-    }
-
-    #[test]
-    fn walker_finds_npmrc_at_higher_marker_when_cwd_lacks_one() {
-        // cwd is a leaf inside a marked project; the .npmrc lives at
-        // the same marker level. Walker walks up: leaf → parent → marker
-        // dir, finds .npmrc there.
-        let home = TempDir::new().unwrap();
-        let project_root = home.path().join("project");
-        let leaf = project_root.join("src/utils");
-        fs::create_dir_all(&leaf).unwrap();
-        mark_as_project_root(&project_root);
-        let expected = write_npmrc(&project_root, "registry=https://higher/\n");
-        let outcome = walk_for_project_npmrc(&leaf, Some(home.path()));
-        assert_eq!(
-            fs::canonicalize(expect_outcome_file(outcome)).unwrap(),
-            fs::canonicalize(&expected).unwrap()
-        );
-    }
-
-    #[test]
-    fn walker_inherits_repo_root_npmrc_through_workspace_member() {
-        // Monorepo layout: workspace member `packages/app` has its own package.json
-        // but no .npmrc; workspace root has both. Running from `packages/app` must
-        // inherit the workspace-root .npmrc — walker must not stop at the first marker.
-        let home = TempDir::new().unwrap();
-        let repo = home.path().join("repo");
-        let app = repo.join("packages").join("app");
-        fs::create_dir_all(&app).unwrap();
-        mark_as_project_root(&repo);
-        mark_as_project_root(&app);
-        let expected = write_npmrc(&repo, "registry=https://workspace-root/\n");
-        let outcome = walk_for_project_npmrc(&app, Some(home.path()));
-        let found = expect_outcome_file(outcome);
-        assert_eq!(
-            fs::canonicalize(&found).unwrap(),
-            fs::canonicalize(&expected).unwrap(),
-            "workspace member must inherit repo-root .npmrc"
-        );
-    }
-
-    #[test]
-    fn walker_app_npmrc_wins_over_repo_npmrc_when_both_present() {
-        // Defense for the inheritance fix: when BOTH the member and the
-        // workspace root have an .npmrc, the closer one (member) wins.
-        // Walker is bottom-up; first match returned.
-        let home = TempDir::new().unwrap();
-        let repo = home.path().join("repo");
-        let app = repo.join("packages").join("app");
-        fs::create_dir_all(&app).unwrap();
-        mark_as_project_root(&repo);
-        mark_as_project_root(&app);
-        write_npmrc(&repo, "registry=https://workspace-root/\n");
-        let app_npmrc = write_npmrc(&app, "registry=https://app-local/\n");
-        let outcome = walk_for_project_npmrc(&app, Some(home.path()));
-        assert_eq!(
-            fs::canonicalize(expect_outcome_file(outcome)).unwrap(),
-            fs::canonicalize(&app_npmrc).unwrap()
-        );
-    }
-
-    #[test]
-    fn walker_stops_at_home() {
-        // No marker between cwd and home → None. A marker exactly AT
-        // home is ignored (we stop AT home, not past it) so the user-
-        // level layer is never double-counted as project.
-        let home = TempDir::new().unwrap();
-        mark_as_project_root(home.path());
-        let child = home.path().join("project");
-        fs::create_dir_all(&child).unwrap();
-        let outcome = walk_for_project_npmrc(&child, Some(home.path()));
-        assert_outcome_none(outcome);
-    }
-
-    #[test]
-    fn walker_returns_none_when_no_marker_anywhere() {
-        // Bounded by tempdir as fake home. No marker anywhere reachable
-        // from nested cwd → None even if a planted .npmrc exists below.
-        let dir = TempDir::new().unwrap();
-        let nested = dir.path().join("a/b/c");
-        fs::create_dir_all(&nested).unwrap();
-        // Plant an .npmrc at the deeply-nested cwd. Without a marker,
-        // the walker must NOT pick it up.
-        write_npmrc(&nested, "registry=https://orphan/\n");
-        let outcome = walk_for_project_npmrc(&nested, Some(dir.path()));
-        assert_outcome_none(outcome);
-    }
-
-    #[test]
-    fn walker_rejects_directory_named_package_json_marker() {
-        // A directory named `package.json` must NOT qualify as a project-root
-        // marker — an attacker could `mkdir /tmp/package.json && touch /tmp/.npmrc`
-        // to inject auth into any install run from /tmp/build/.
-        let outer = TempDir::new().unwrap();
-        let attacker_dir = outer.path().join("planted");
-        let cwd = attacker_dir.join("build");
-        fs::create_dir_all(&cwd).unwrap();
-        // Directory (not a regular file) — must NOT count as a marker.
-        fs::create_dir(attacker_dir.join("package.json")).unwrap();
-        write_npmrc(&attacker_dir, "registry=https://attacker/\n");
-        let outcome = walk_for_project_npmrc(&cwd, Some(outer.path()));
-        assert_outcome_none(outcome);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn walker_rejects_broken_symlink_named_package_json_marker() {
-        // A broken-symlink package.json must not qualify the dir as a project root
-        // for the same reason as a directory marker: it's not a regular file.
-        use std::os::unix::fs::symlink;
-        let outer = TempDir::new().unwrap();
-        let attacker_dir = outer.path().join("planted");
-        let cwd = attacker_dir.join("build");
-        fs::create_dir_all(&cwd).unwrap();
-        symlink("/does/not/exist/path", attacker_dir.join("package.json")).unwrap();
-        write_npmrc(&attacker_dir, "registry=https://attacker/\n");
-        let outcome = walk_for_project_npmrc(&cwd, Some(outer.path()));
-        assert_outcome_none(outcome);
     }
 
     #[test]
@@ -780,8 +744,12 @@ mod tests {
         write_npmrc(&dir, "registry=https://injected/\n");
         let result = NpmrcConfig::discover_layer_paths(&dir, Some(outer.path()));
         // home boundary is the outer tempdir; dir itself has no marker.
-        // Expect only builtin + system + user (3 paths) — NO project layer.
-        assert_eq!(result.paths.len(), 3, "paths: {:?}", result.paths);
+        assert_eq!(result.paths.len(), 2, "paths: {:?}", result.paths);
+        assert_eq!(
+            result.paths[0],
+            lpm_common::npm_global_config_path(Some(outer.path()))
+        );
+        assert_eq!(result.paths[1], outer.path().join(".npmrc"));
         assert!(
             !result.paths.iter().any(|p| p == &dir.join(".npmrc")),
             "planted .npmrc must NOT be in paths: {:?}",
@@ -845,11 +813,13 @@ mod tests {
         mark_as_project_root(proj.path());
         write_npmrc(proj.path(), "registry=https://p/\n");
         let result = NpmrcConfig::discover_layer_paths(proj.path(), Some(home.path()));
-        assert_eq!(result.paths.len(), 4);
-        assert_eq!(result.paths[0], PathBuf::from("/usr/etc/npmrc"));
-        assert_eq!(result.paths[1], PathBuf::from("/etc/npmrc"));
-        assert_eq!(result.paths[2], home.path().join(".npmrc"));
-        assert_eq!(result.paths[3], proj.path().join(".npmrc"));
+        assert_eq!(result.paths.len(), 3);
+        assert_eq!(
+            result.paths[0],
+            lpm_common::npm_global_config_path(Some(home.path()))
+        );
+        assert_eq!(result.paths[1], home.path().join(".npmrc"));
+        assert_eq!(result.paths[2], proj.path().join(".npmrc"));
         assert!(result.warnings.is_empty());
     }
 
@@ -867,15 +837,13 @@ mod tests {
         // when home arg is None".
         let proj = TempDir::new().unwrap();
         let result = NpmrcConfig::discover_layer_paths(proj.path(), None);
-        // First two are always builtin and system.
-        assert!(result.paths.len() >= 2);
-        assert_eq!(result.paths[0], PathBuf::from("/usr/etc/npmrc"));
-        assert_eq!(result.paths[1], PathBuf::from("/etc/npmrc"));
-        // Anything beyond paths[1] would be a project layer that
+        assert!(!result.paths.is_empty());
+        assert_eq!(result.paths[0], lpm_common::npm_global_config_path(None));
+        // Anything beyond paths[0] would be a project layer that
         // `find_project_root` discovered above our tempdir on the
         // dev machine. None of it should reference our own tempdir
         // (we never wrote a marker there).
-        for p in &result.paths[2..] {
+        for p in &result.paths[1..] {
             assert!(
                 !p.starts_with(proj.path()),
                 "no project layer should reference our tempdir: {p:?}"
@@ -906,5 +874,203 @@ mod tests {
             RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "beta"),
             _ => panic!("expected Bearer B"),
         }
+    }
+
+    #[test]
+    fn nested_independent_project_does_not_inherit_parent_npmrc() {
+        let home = TempDir::new().unwrap();
+        let parent = home.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(parent.join("package.json"), r#"{"name":"parent"}"#).unwrap();
+        fs::write(child.join("package.json"), r#"{"name":"child"}"#).unwrap();
+        write_npmrc(&parent, "registry=https://parent.example/\n");
+
+        let discovery = NpmrcConfig::discover_layer_paths(&child, Some(home.path()));
+        assert!(
+            !discovery
+                .paths
+                .iter()
+                .any(|path| path == &parent.join(".npmrc")),
+            "an independent child project must not inherit a parent project's npmrc: {:?}",
+            discovery.paths
+        );
+        assert!(discovery.project_layer_index.is_none());
+    }
+
+    #[test]
+    fn workspace_member_uses_root_npmrc_and_ignores_member_npmrc() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("workspace");
+        let member = root.join("packages/app");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let root_npmrc = write_npmrc(&root, "registry=https://root.example/\n");
+        write_npmrc(&member, "registry=https://member.example/\n");
+
+        let discovery = NpmrcConfig::discover_layer_paths(&member, Some(home.path()));
+        let project_index = discovery
+            .project_layer_index
+            .expect("workspace project layer");
+        assert_eq!(discovery.paths[project_index], root_npmrc);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_npmrc_layer_contributes_no_routing_tls_or_credentials() {
+        let dir = TempDir::new().unwrap();
+        let path = write_npmrc(
+            dir.path(),
+            "registry=https://attacker.example/\n\
+             ca=-----BEGIN CERTIFICATE-----\\nAAAA\\n-----END CERTIFICATE-----\n\
+             //attacker.example/:_authToken=secret\n",
+        );
+        set_npmrc_mode(&path, 0o602);
+
+        let cfg = NpmrcConfig::load_from_paths(&[path], &no_env);
+        assert!(cfg.default_registry.is_none());
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert!(cfg.origin_auth.is_empty());
+        assert!(
+            cfg.security_warnings
+                .iter()
+                .any(|warning| warning.contains("writable") && warning.contains("refused")),
+            "writable-layer refusal must be visible: {:?}",
+            cfg.security_warnings
+        );
+    }
+
+    #[test]
+    fn filesystem_discovery_honors_userconfig_and_globalconfig_overrides() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..) {
+                    // SAFETY: this test holds ENV_LOCK for the mutation window.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        mark_as_project_root(&project);
+        let global = root.path().join("global.npmrc");
+        let user = root.path().join("user.npmrc");
+        fs::write(&global, "@global:registry=https://global.example/\n").unwrap();
+        fs::write(&user, "@user:registry=https://user.example/\n").unwrap();
+        #[cfg(unix)]
+        {
+            set_npmrc_mode(&global, 0o600);
+            set_npmrc_mode(&user, 0o600);
+        }
+        let restore = RestoreEnv(
+            ["NPM_CONFIG_GLOBALCONFIG", "NPM_CONFIG_USERCONFIG"]
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        // SAFETY: this test holds ENV_LOCK and restores both values on drop.
+        unsafe {
+            std::env::set_var("NPM_CONFIG_GLOBALCONFIG", &global);
+            std::env::set_var("NPM_CONFIG_USERCONFIG", &user);
+        }
+
+        let cfg = NpmrcConfig::load_from_filesystem(&project);
+        drop(restore);
+        assert_eq!(
+            cfg.scope_registries["@global"].base_url.as_ref(),
+            "https://global.example"
+        );
+        assert_eq!(
+            cfg.scope_registries["@user"].base_url.as_ref(),
+            "https://user.example"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_user_config_cannot_redirect_global_config_discovery() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, value) in self.0.drain(..) {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        mark_as_project_root(&project);
+        let redirected_prefix = root.path().join("redirected-prefix");
+        fs::create_dir_all(redirected_prefix.join("etc")).unwrap();
+        fs::write(
+            redirected_prefix.join("etc/npmrc"),
+            "@redirected:registry=https://redirected.example/\n",
+        )
+        .unwrap();
+        let user = root.path().join("user.npmrc");
+        fs::write(&user, format!("prefix={}\n", redirected_prefix.display())).unwrap();
+        set_npmrc_mode(&user, 0o622);
+        let names = [
+            "NPM_CONFIG_USERCONFIG",
+            "npm_config_userconfig",
+            "NPM_CONFIG_GLOBALCONFIG",
+            "npm_config_globalconfig",
+            "NPM_CONFIG_PREFIX",
+            "npm_config_prefix",
+            "PREFIX",
+        ];
+        let restore = RestoreEnv(
+            names
+                .into_iter()
+                .map(|name| (name, std::env::var_os(name)))
+                .collect(),
+        );
+        unsafe {
+            for name in names {
+                std::env::remove_var(name);
+            }
+            std::env::set_var("NPM_CONFIG_USERCONFIG", &user);
+        }
+
+        let config = NpmrcConfig::load_from_filesystem(&project);
+        drop(restore);
+
+        assert!(!config.scope_registries.contains_key("@redirected"));
+        assert!(
+            config
+                .security_warnings
+                .iter()
+                .any(|warning| warning.contains("writable") && warning.contains("refused")),
+            "the untrusted user layer must be refused: {:?}",
+            config.security_warnings
+        );
     }
 }

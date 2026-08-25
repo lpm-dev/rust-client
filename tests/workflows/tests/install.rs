@@ -14424,7 +14424,7 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
     member_registry
         .with_manifest_package(
             serde_json::json!({
-                "name": "peer-consumer",
+                "name": "@member/peer-consumer",
                 "version": "1.0.0",
                 "peerDependencies": { "peer-provider": "^1.0.0" }
             }),
@@ -14441,17 +14441,20 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
   "lpm": { "autoInstallPeers": false }
 }"#,
     );
-    project.write_file(".npmrc", &format!("registry={}\n", root_registry.url()));
     project.write_file(
-        "app/.npmrc",
-        &format!("registry={}\n", member_registry.url()),
+        ".npmrc",
+        &format!(
+            "registry={}\n@member:registry={}\n",
+            root_registry.url(),
+            member_registry.url()
+        ),
     );
     project.write_file(
         "app/package.json",
         r#"{
   "name": "workspace-member-peer-route",
   "private": true,
-  "dependencies": { "peer-consumer": "1.0.0" },
+  "dependencies": { "@member/peer-consumer": "1.0.0" },
   "lpm": { "autoInstallPeers": false }
 }"#,
     );
@@ -14465,10 +14468,10 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
             "--no-editor-setup",
         ])
         .output()
-        .expect("spawn recursive install with importer-specific routes");
+        .expect("spawn recursive install with package-specific routes");
     assert!(
         install.status.success(),
-        "recursive install should preserve importer registry routes\nstdout:\n{}\nstderr:\n{}",
+        "recursive install should preserve workspace registry routes\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
@@ -14482,7 +14485,7 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
     let consumer = member_lockfile
         .packages
         .iter()
-        .find(|package| package.name == "peer-consumer")
+        .find(|package| package.name == "@member/peer-consumer")
         .expect("member lockfile should contain its direct consumer");
     assert_eq!(
         provider.source.as_deref(),

@@ -4,8 +4,13 @@
 //! Publish, token, and OIDC operations are implemented in publish.rs, npmrc.rs, oidc.rs.
 //! Uses ETag conditional requests and MessagePack binary cache.
 
+#[cfg(test)]
+use crate::npmrc::TaggedPath;
 use crate::npmrc::{OriginKey, OriginTlsOverrides, TaggedRoot, TlsOverrides};
-use crate::tls_identity::{EnvThenTtyPassphrase, PassphraseProvider, load_identity};
+use crate::tls_identity::{
+    EnvThenTtyPassphrase, LoadedIdentity, PassphraseProvider, load_identity,
+    load_identity_with_material_and_reservation,
+};
 use crate::types::*;
 use lpm_auth::{RefreshPolicy, SessionManager};
 use lpm_common::{DEFAULT_REGISTRY_URL, LpmError, LpmRoot, NPM_REGISTRY_URL, PackageName};
@@ -57,7 +62,8 @@ pub use self::url_gate::{
 };
 
 use self::auth::{
-    apply_npmrc_auth, bearer_principal_fingerprint, cert_pem_fingerprint, principal_fingerprint,
+    RequestDestination, apply_npmrc_auth, apply_npmrc_auth_to_destination,
+    bearer_principal_fingerprint, cert_pem_fingerprint, principal_fingerprint,
 };
 use self::body::{
     MAX_METADATA_BYTES, MAX_VERSION_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
@@ -65,7 +71,8 @@ use self::body::{
     parse_capped_metadata_with_timing_limit, read_capped_error_text,
 };
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
-use self::state::{CacheContent, CacheValidator, CachedClient};
+use self::state::{CacheContent, CacheValidator, CachedClient, TlsMaterialBudget};
+use self::state::{LazyIdentityCert, LazyIdentityMaterial, MAX_NPMRC_TLS_CLIENT_SETS};
 use self::url_gate::validate_pem_root;
 
 #[cfg(test)]

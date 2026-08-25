@@ -14,6 +14,7 @@ pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
 pub mod lpm_json;
+pub mod npmrc;
 pub mod package_instance;
 pub mod package_name;
 pub mod paths;
@@ -35,10 +36,11 @@ pub use atomic_write::{
 pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
-    TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped, read_file_capped_from_open_file,
-    read_stream_capped, read_text_file_capped, read_text_file_capped_from_open_file,
+    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped,
+    read_file_capped_from_open_file, read_regular_file_capped_with_metadata, read_stream_capped,
+    read_text_file_capped, read_text_file_capped_from_open_file,
     read_text_file_capped_from_open_file_with_known_size, read_text_file_capped_nofollow,
-    read_text_file_capped_with_metadata,
+    read_text_file_capped_with_metadata, read_text_regular_file_capped_with_metadata,
 };
 pub use command_name::{PortableCommandNameError, validate_portable_command_name};
 pub use error::{
@@ -48,6 +50,13 @@ pub use error::{
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
 pub use lpm_json::{LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError, update_lpm_json};
+pub use npmrc::{
+    NPMRC_DIAGNOSTIC_LIMIT, NPMRC_INTERPOLATED_VALUE_CAP_BYTES, NpmrcIniSetting, NpmrcIniValue,
+    NpmrcInterpolationError, decode_npmrc_ini_fragment, interpolate_npmrc_env, npm_config_path,
+    npm_config_path_with_home, npm_global_config_path, npm_global_config_path_from_user_config,
+    npm_user_config_path, npmrc_can_influence_config_discovery, parse_npmrc_ini_settings,
+    push_npmrc_diagnostic,
+};
 pub use package_instance::{PackageInstanceId, ResolutionNodeId, artifact_binding_id};
 pub use package_name::PackageName;
 pub use paths::{

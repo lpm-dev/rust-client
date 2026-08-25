@@ -719,6 +719,7 @@ async fn run_workspace_target_install(
         &[],
         options.json_output,
         false,
+        None,
         lpm_root,
     ));
     match &capture {

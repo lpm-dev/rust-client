@@ -174,7 +174,7 @@ impl RegistryClient {
         self.check_tarball_url_scheme(url)?;
         let req = self.http.for_url(url).await?.get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
-        let response = self.send_with_retry(req).await?;
+        let response = self.send_with_retry_with_npmrc_auth(req, auth).await?;
         self.spool_tarball_response_to_file_with_limit(response, max_compressed_size)
             .await
     }
@@ -192,7 +192,7 @@ impl RegistryClient {
         self.check_tarball_url_scheme(url)?;
         let req = self.http.for_url(url).await?.get(url);
         let req = apply_npmrc_auth(req, url, auth)?;
-        let response = self.send_with_retry(req).await?;
+        let response = self.send_with_retry_with_npmrc_auth(req, auth).await?;
 
         if let Some(content_length) = response.content_length()
             && content_length > MAX_COMPRESSED_TARBALL_SIZE

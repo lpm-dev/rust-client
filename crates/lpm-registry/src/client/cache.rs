@@ -341,10 +341,13 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) {
-        let url = format!("{base_url}/{name}");
+        let Ok(destination) = RequestDestination::parse(&format!("{base_url}/{name}")) else {
+            return;
+        };
+        let url = destination.as_str();
         let cache_key = format!(
             "npm:{}:{url}",
-            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+            principal_fingerprint(auth, self.http.identity_fp_for_destination(&destination))
         );
         self.invalidate_metadata_memory_cache(&cache_key);
         self.invalidate_metadata_memory_cache(&format!("custom:{cache_key}"));

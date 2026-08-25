@@ -327,6 +327,7 @@ pub async fn run_with_options(
         compatibility_bin_names,
         true,
         false,
+        None,
         lpm_root,
     )
     .await
@@ -371,6 +372,7 @@ pub(crate) async fn run_silent_for_audit_fix(
         &[],
         false,
         false,
+        None,
         lpm_root,
     )
     .await
@@ -414,6 +416,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // Install diagnostics remain on stderr, but every stdout-only report
     // and lifecycle hint is suppressed until the child takes over.
     reserve_stdout: bool,
+    preloaded_route_table: Option<RouteTable>,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let transaction_root = lpm_workspace::find_workspace_root(project_dir)
@@ -473,6 +476,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
             compatibility_bin_names,
             emit_install_report,
             reserve_stdout,
+            preloaded_route_table,
             &lpm_root,
         )),
     );
@@ -532,6 +536,7 @@ async fn run_with_options_under_store_lock(
     emit_install_report: bool,
     // See `run_with_options_with_lpm_root` for the stdio contract.
     reserve_stdout: bool,
+    preloaded_route_table: Option<RouteTable>,
     lpm_root: &lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
@@ -757,6 +762,7 @@ async fn run_with_options_under_store_lock(
         pkg_name,
         is_add_invocation,
         json_output,
+        preloaded_route_table,
     )?;
 
     // `linker_mode` was resolved above — before `check_install_state` —

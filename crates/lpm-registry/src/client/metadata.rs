@@ -709,6 +709,15 @@ impl RegistryClient {
         &self,
         request_builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
+        self.send_package_metadata_request_with_npmrc_auth(request_builder, None)
+            .await
+    }
+
+    async fn send_package_metadata_request_with_npmrc_auth(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<reqwest::Response, LpmError> {
         let request = request_builder
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
@@ -719,7 +728,10 @@ impl RegistryClient {
         } else {
             None
         };
-        let response = match self.send_request_with_retry(request, client_override).await {
+        let response = match self
+            .send_request_with_retry_and_npmrc_auth(request, client_override, auth)
+            .await
+        {
             Ok(response) => response,
             Err(error)
                 if attempted_worker_http3
@@ -729,7 +741,8 @@ impl RegistryClient {
                     return Err(error);
                 };
                 tracing::debug!("Worker metadata HTTP/3 failed; retrying with default transport");
-                self.send_request_with_retry(fallback_request, None).await?
+                self.send_request_with_retry_and_npmrc_auth(fallback_request, None, auth)
+                    .await?
             }
             Err(error) => return Err(error),
         };
@@ -2295,7 +2308,7 @@ impl RegistryClient {
             crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata(name).await,
             crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct(name).await,
             crate::UpstreamRoute::Custom { target, auth } => {
-                self.get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                self.get_npm_metadata_from(&target.base_url, name, auth.as_deref())
                     .await
             }
         }
@@ -2312,7 +2325,7 @@ impl RegistryClient {
             crate::UpstreamRoute::LpmWorker => self.get_npm_package_metadata_full(name).await,
             crate::UpstreamRoute::NpmDirect => self.get_npm_metadata_direct_full(name).await,
             crate::UpstreamRoute::Custom { target, auth } => {
-                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_ref())
+                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_deref())
                     .await
             }
         }
@@ -2330,7 +2343,7 @@ impl RegistryClient {
                     .await
             }
             crate::UpstreamRoute::Custom { target, auth } => {
-                self.get_npm_release_times_from_full(&target.base_url, name, auth.as_ref())
+                self.get_npm_release_times_from_full(&target.base_url, name, auth.as_deref())
                     .await
             }
         }
@@ -2378,12 +2391,12 @@ impl RegistryClient {
             crate::UpstreamRoute::LpmWorker => self.get_npm_package_release_times_full(name).await,
             crate::UpstreamRoute::Custom { target, auth } => {
                 let compact = self
-                    .get_npm_release_times_from_full(&target.base_url, name, auth.as_ref())
+                    .get_npm_release_times_from_full(&target.base_url, name, auth.as_deref())
                     .await?;
                 if compact.versions.is_some() {
                     return Ok(compact);
                 }
-                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_ref())
+                self.get_npm_metadata_from_full(&target.base_url, name, auth.as_deref())
                     .await
                     .map(ReleaseTimeMetadata::from_full_package_metadata)
             }
@@ -2762,17 +2775,11 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<ReleaseTimeMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let url = format!("{base_url}/{name}");
-        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "invalid registry URL '{url}' — must be http(s) with a host"
-            ))
-        })?;
-        let _ = &dest_origin;
-        let cache_key = format!(
-            "npm-release-times:{}:{url}",
-            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
-        );
+        let destination = RequestDestination::parse(&format!("{base_url}/{name}"))?;
+        let url = destination.as_str();
+        let principal =
+            principal_fingerprint(auth, self.http.identity_fp_for_destination(&destination));
+        let cache_key = format!("npm-release-times:{principal}:{url}");
         let memory_cache_key = format!("custom:{cache_key}");
 
         if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
@@ -2789,10 +2796,7 @@ impl RegistryClient {
             self.remember_release_times_for_command(&memory_cache_key, &cached);
             return Ok(cached);
         }
-        let full_cache_key = format!(
-            "npm-full:{}:{url}",
-            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
-        );
+        let full_cache_key = format!("npm-full:{principal}:{url}");
         if let Some((cached, _etag)) = self
             .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
             .await
@@ -2830,13 +2834,16 @@ impl RegistryClient {
 
         let req = self
             .http
-            .for_url(&url)
+            .for_destination(&destination)
             .await?
-            .get(&url)
+            .get(destination.as_url().clone())
             .header("Accept", "application/json");
-        let req = apply_npmrc_auth(req, &url, auth)?;
+        let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_package_metadata_request(req).await {
+        let mut response = match self
+            .send_package_metadata_request_with_npmrc_auth(req, auth)
+            .await
+        {
             Ok(response) => response,
             Err(err) => return finish!(Err(err)),
         };
@@ -2851,12 +2858,15 @@ impl RegistryClient {
             }
             let req = self
                 .http
-                .for_url(&url)
+                .for_destination(&destination)
                 .await?
-                .get(&url)
+                .get(destination.as_url().clone())
                 .header("Accept", "application/json");
-            let req = apply_npmrc_auth(req, &url, auth)?;
-            response = match self.send_package_metadata_request(req).await {
+            let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
+            response = match self
+                .send_package_metadata_request_with_npmrc_auth(req, auth)
+                .await
+            {
                 Ok(response) => response,
                 Err(err) => return finish!(Err(err)),
             };
@@ -2972,10 +2982,9 @@ impl RegistryClient {
     ///
     /// ## What this does NOT do
     ///
-    /// - HTTP→HTTPS upgrade or `--insecure` enforcement: the existing
-    ///   `is_https_url` / `is_localhost_url` logic governs that
-    ///   elsewhere; callers passing an `http://` URL must satisfy that
-    ///   gate themselves.
+    /// - HTTP→HTTPS upgrade: custom registry URLs retain their configured
+    ///   scheme. The retry transport enforces HTTPS, loopback HTTP, or an
+    ///   explicit `--insecure` opt-in before network contact.
     /// - Tier 2 (Worker) fallback: custom registries are by definition
     ///   not the LPM Worker; falling back would leak a private package
     ///   name to a public registry. Cache miss → direct fetch only.
@@ -3010,21 +3019,9 @@ impl RegistryClient {
         cache_policy: MetadataCachePolicy,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let url = format!("{base_url}/{name}");
+        let destination = RequestDestination::parse(&format!("{base_url}/{name}"))?;
+        let url = destination.as_str();
         let mut timings = PackageMetadataFetchTimings::default();
-
-        // Parse destination origin once; used for both the cache key
-        // and the auth-origin defensive check.
-        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "invalid registry URL '{url}' — must be http(s) with a host"
-            ))
-        })?;
-
-        // Origin-mismatch defense lives in `apply_npmrc_auth` below;
-        // we still parse `dest_origin` here because we need
-        // `host_lower` for the cache key namespace.
-        let _ = &dest_origin;
 
         // Cache key namespace: `npm:<auth_fingerprint>:<url>`.
         //
@@ -3049,7 +3046,7 @@ impl RegistryClient {
         // invalidate cache cleanly even when URL + auth are unchanged.
         let cache_key = format!(
             "npm:{}:{url}",
-            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+            principal_fingerprint(auth, self.http.identity_fp_for_destination(&destination))
         );
         let memory_cache_key = format!("custom:{cache_key}");
 
@@ -3132,17 +3129,20 @@ impl RegistryClient {
         tracing::debug!("fetching {name} from custom registry {base_url}");
         let req = self
             .http
-            .for_url(&url)
+            .for_destination(&destination)
             .await?
-            .get(&url)
+            .get(destination.as_url().clone())
             .header("Accept", "application/vnd.npm.install-v1+json");
-        // `apply_npmrc_auth` does the origin-mismatch defensive check
+        // `apply_npmrc_auth_to_destination` does the origin-mismatch defensive check
         // and attaches Bearer/Basic. Anonymous = no-op.
-        let req = apply_npmrc_auth(req, &url, auth)?;
+        let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
 
         let http_start = std::time::Instant::now();
-        let mut response = match self.send_package_metadata_request(req).await {
+        let mut response = match self
+            .send_package_metadata_request_with_npmrc_auth(req, auth)
+            .await
+        {
             Ok(r) => {
                 timings.http_ms = http_start.elapsed().as_millis();
                 r
@@ -3162,13 +3162,16 @@ impl RegistryClient {
             timings.not_modified = false;
             let req = self
                 .http
-                .for_url(&url)
+                .for_destination(&destination)
                 .await?
-                .get(&url)
+                .get(destination.as_url().clone())
                 .header("Accept", "application/vnd.npm.install-v1+json");
-            let req = apply_npmrc_auth(req, &url, auth)?;
+            let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
             let retry_http_start = std::time::Instant::now();
-            response = match self.send_package_metadata_request(req).await {
+            response = match self
+                .send_package_metadata_request_with_npmrc_auth(req, auth)
+                .await
+            {
                 Ok(r) => {
                     timings.http_ms = timings
                         .http_ms
@@ -3206,16 +3209,11 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<PackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let url = format!("{base_url}/{name}");
-        let dest_origin = crate::npmrc::OriginKey::from_request_url(&url).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "invalid registry URL '{url}' — must be http(s) with a host"
-            ))
-        })?;
-        let _ = &dest_origin;
+        let destination = RequestDestination::parse(&format!("{base_url}/{name}"))?;
+        let url = destination.as_str();
         let cache_key = format!(
             "npm-full:{}:{url}",
-            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+            principal_fingerprint(auth, self.http.identity_fp_for_destination(&destination))
         );
 
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
@@ -3237,13 +3235,16 @@ impl RegistryClient {
 
         let req = self
             .http
-            .for_url(&url)
+            .for_destination(&destination)
             .await?
-            .get(&url)
+            .get(destination.as_url().clone())
             .header("Accept", "application/json");
-        let req = apply_npmrc_auth(req, &url, auth)?;
+        let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let mut response = match self.send_package_metadata_request(req).await {
+        let mut response = match self
+            .send_package_metadata_request_with_npmrc_auth(req, auth)
+            .await
+        {
             Ok(r) => r,
             Err(e) => return finish!(Err(e)),
         };
@@ -3254,12 +3255,15 @@ impl RegistryClient {
             }
             let req = self
                 .http
-                .for_url(&url)
+                .for_destination(&destination)
                 .await?
-                .get(&url)
+                .get(destination.as_url().clone())
                 .header("Accept", "application/json");
-            let req = apply_npmrc_auth(req, &url, auth)?;
-            response = match self.send_package_metadata_request(req).await {
+            let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
+            response = match self
+                .send_package_metadata_request_with_npmrc_auth(req, auth)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => return finish!(Err(e)),
             };
@@ -3289,10 +3293,14 @@ impl RegistryClient {
             keys: Vec<RegistrySigningKey>,
         }
 
-        let url = format!("{}/-/npm/v1/keys", base_url.trim_end_matches('/'));
+        let destination = RequestDestination::parse(&format!(
+            "{}/-/npm/v1/keys",
+            base_url.trim_end_matches('/')
+        ))?;
+        let url = destination.as_str();
         let cache_key = format!(
             "registry-signing-keys:{}:{url}",
-            principal_fingerprint(auth, self.http.identity_fp_for_url(&url))
+            principal_fingerprint(auth, self.http.identity_fp_for_destination(&destination))
         );
         let mut cache = self.registry_signing_keys_cache.lock().await;
         if let Some(keys) = cache.get(&cache_key) {
@@ -3301,12 +3309,12 @@ impl RegistryClient {
 
         let req = self
             .http
-            .for_url(&url)
+            .for_destination(&destination)
             .await?
-            .get(&url)
+            .get(destination.as_url().clone())
             .header("Accept", "application/json");
-        let req = apply_npmrc_auth(req, &url, auth)?;
-        let response = match self.send_with_retry(req).await {
+        let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
+        let response = match self.send_with_retry_with_npmrc_auth(req, auth).await {
             Ok(response) => response,
             Err(LpmError::NotFound(_)) => {
                 cache.insert(cache_key, Vec::new());

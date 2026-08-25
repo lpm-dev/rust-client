@@ -5,6 +5,209 @@ pub(super) type ReleaseTimeMemoryCache =
     Arc<std::sync::Mutex<HashMap<String, Arc<ReleaseTimeMetadata>>>>;
 pub(super) type MetadataRouteOverrides =
     Arc<std::sync::Mutex<HashMap<String, crate::route::RouteMode>>>;
+pub(super) const MAX_NPMRC_TLS_CLIENT_SETS: usize = 64;
+const HTTP_CLIENTS_PER_TLS_SET: u64 = 3;
+
+#[derive(Debug)]
+pub(super) struct TlsMaterialBudget {
+    used: std::sync::atomic::AtomicU64,
+    global_root_bytes: u64,
+    global_identity_bytes: std::sync::atomic::AtomicU64,
+    read_lock: std::sync::Mutex<()>,
+}
+
+impl TlsMaterialBudget {
+    pub(super) fn new(initial_bytes: u64) -> Result<Self, LpmError> {
+        Self::new_with_retained_source(initial_bytes, 0)
+    }
+
+    pub(super) fn new_with_retained_source(
+        initial_bytes: u64,
+        retained_source_bytes: u64,
+    ) -> Result<Self, LpmError> {
+        let retained_bytes = initial_bytes
+            .checked_mul(HTTP_CLIENTS_PER_TLS_SET)
+            .and_then(|bytes| bytes.checked_add(retained_source_bytes))
+            .ok_or_else(|| LpmError::Cert("global npmrc TLS material size overflow".into()))?;
+        if retained_bytes > lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES {
+            return Err(LpmError::Cert(format!(
+                "effective npmrc TLS material requires approximately {retained_bytes} retained bytes, exceeding the {}-byte aggregate limit",
+                lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES
+            )));
+        }
+        Ok(Self {
+            used: std::sync::atomic::AtomicU64::new(retained_bytes),
+            global_root_bytes: initial_bytes,
+            global_identity_bytes: std::sync::atomic::AtomicU64::new(0),
+            read_lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    pub(super) fn reserve(&self, additional_bytes: u64, context: &str) -> Result<(), LpmError> {
+        let _read_guard = self
+            .read_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.reserve_locked(additional_bytes, context)
+    }
+
+    fn reserve_locked(&self, additional_bytes: u64, context: &str) -> Result<(), LpmError> {
+        use std::sync::atomic::Ordering;
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let total = used
+                .checked_add(additional_bytes)
+                .ok_or_else(|| LpmError::Cert(format!("{context}: TLS material size overflow")))?;
+            if total > lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES {
+                return Err(LpmError::Cert(format!(
+                    "{context}: effective npmrc TLS material would require {total} bytes, exceeding the {}-byte aggregate limit",
+                    lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES
+                )));
+            }
+            match self
+                .used
+                .compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => used = actual,
+            }
+        }
+    }
+
+    pub(super) fn read_material<'a>(
+        &'a self,
+        path: &std::path::Path,
+        context: &str,
+    ) -> Result<(Vec<u8>, std::fs::Metadata, TlsMaterialReservation<'a>), LpmError> {
+        use std::sync::atomic::Ordering;
+
+        let _read_guard = self
+            .read_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let used = self.used.load(Ordering::Acquire);
+        let available = lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES.saturating_sub(used);
+        let read_limit = available.min(lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES);
+        let (bytes, metadata) = lpm_common::read_regular_file_capped_with_metadata(
+            path, read_limit,
+        )
+        .map_err(|error| {
+            if matches!(error, lpm_common::BoundedReadError::TooLarge { .. })
+                && read_limit < lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES
+            {
+                LpmError::Cert(format!(
+                    "{context}: TLS material would exceed the {}-byte aggregate limit",
+                    lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES
+                ))
+            } else {
+                LpmError::Cert(format!("{context}: {error}"))
+            }
+        })?;
+        let reserved_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.reserve_locked(reserved_bytes, context)?;
+        Ok((
+            bytes,
+            metadata,
+            TlsMaterialReservation {
+                budget: self,
+                bytes: reserved_bytes,
+                committed: false,
+            },
+        ))
+    }
+
+    pub(super) fn reserve_client_set(
+        &self,
+        origin_root_bytes: u64,
+        per_origin_identity_bytes: Option<u64>,
+        context: &str,
+    ) -> Result<u64, LpmError> {
+        use std::sync::atomic::Ordering;
+
+        let identity_bytes = per_origin_identity_bytes
+            .unwrap_or_else(|| self.global_identity_bytes.load(Ordering::Acquire));
+        let retained_bytes = self
+            .global_root_bytes
+            .checked_add(origin_root_bytes)
+            .and_then(|bytes| bytes.checked_add(identity_bytes))
+            .and_then(|bytes| bytes.checked_mul(HTTP_CLIENTS_PER_TLS_SET))
+            .ok_or_else(|| LpmError::Cert(format!("{context}: TLS material size overflow")))?;
+        self.reserve(retained_bytes, context)?;
+        Ok(retained_bytes)
+    }
+
+    pub(super) fn set_global_identity_bytes(&self, bytes: u64) -> Result<(), LpmError> {
+        use std::sync::atomic::Ordering;
+
+        self.global_identity_bytes
+            .compare_exchange(0, bytes, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| LpmError::Cert("global npmrc TLS identity was initialized twice".into()))
+    }
+
+    pub(super) fn reserve_temporary(
+        &self,
+        bytes: u64,
+        context: &str,
+    ) -> Result<TlsMaterialReservation<'_>, LpmError> {
+        self.reserve(bytes, context)?;
+        Ok(TlsMaterialReservation {
+            budget: self,
+            bytes,
+            committed: false,
+        })
+    }
+
+    pub(super) fn release(&self, bytes: u64) {
+        use std::sync::atomic::Ordering;
+
+        self.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+}
+
+pub(super) struct TlsMaterialReservation<'a> {
+    budget: &'a TlsMaterialBudget,
+    bytes: u64,
+    committed: bool,
+}
+
+impl TlsMaterialReservation<'_> {
+    pub(super) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TlsMaterialReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.budget.release(self.bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tls_material_budget_tests {
+    use super::*;
+
+    #[test]
+    fn replacing_per_origin_identity_is_not_charged_for_the_global_identity() {
+        let global_identity_bytes = 4 * 1024 * 1024;
+        let budget = TlsMaterialBudget::new_with_retained_source(
+            0,
+            global_identity_bytes * HTTP_CLIENTS_PER_TLS_SET,
+        )
+        .unwrap();
+        budget
+            .set_global_identity_bytes(global_identity_bytes)
+            .unwrap();
+
+        let reserved = budget
+            .reserve_client_set(0, Some(1024 * 1024), "replacing identity")
+            .expect("the replacement identity must fit within the remaining budget");
+
+        assert_eq!(reserved, 3 * 1024 * 1024);
+    }
+}
 
 /// Aggregate capacity retained by one file-backed compressed archive.
 #[derive(Debug)]
@@ -218,6 +421,16 @@ pub(super) struct CachedClient {
     pub(super) identity_fp: Option<Arc<str>>,
 }
 
+pub(super) struct LazyIdentityMaterial {
+    pub(super) cert_pem: Arc<Vec<u8>>,
+    pub(super) fingerprint: Arc<str>,
+}
+
+pub(super) struct LazyIdentityCert {
+    pub(super) certfile: crate::npmrc::TaggedPath,
+    pub(super) material: std::sync::OnceLock<Result<LazyIdentityMaterial, Arc<str>>>,
+}
+
 /// Bundle of HTTP clients keyed by origin. One [`RegistryClient`] holds
 /// one of these via `Arc<>` so the per-origin clients survive
 /// `clone_with_config` and ride along every request the
@@ -234,18 +447,16 @@ pub(super) struct CachedClient {
 ///    after `with_tls_overrides_for` returns; lookups don't lock.
 /// 3. `lazy` — clients built on first request to a previously-unseen
 ///    origin (tarball CDN that differs from the metadata host, etc.).
-///    Single-flight per origin via the tokio mutex: concurrent callers
-///    for the same new origin queue on the lock, second sees the
-///    entry inserted by the first.
+///    A per-origin async cell provides single-flight without serializing
+///    independent origins.
 ///
-/// **Fallback rule** for both eager and lazy: try `(host, Some(port))`
-/// first, fall back to `(host, None)` so an `.npmrc` entry without an
-/// explicit port covers any port for that host. Mirrors
-/// [`OriginKey`]'s scheme-agnostic auth lookup.
+/// Explicit non-default ports are separate origins. A portless npmrc
+/// key never widens TLS state to an explicitly different port.
 pub struct HttpClients {
     pub(super) default: CachedClient,
     pub(super) eager: HashMap<OriginKey, CachedClient>,
-    pub(super) lazy: tokio::sync::Mutex<HashMap<OriginKey, CachedClient>>,
+    pub(super) lazy: HashMap<OriginKey, tokio::sync::OnceCell<Result<CachedClient, Arc<str>>>>,
+    pub(super) built_client_sets: std::sync::atomic::AtomicUsize,
     /// Snapshot of the TLS overrides used to build `default` and
     /// `eager`. Held here so lazy builds can construct matching
     /// per-origin clients on demand.
@@ -254,24 +465,8 @@ pub struct HttpClients {
     /// builds (eager + lazy). The inner `PassphraseCache` memoizes
     /// across calls; a fresh provider per build would defeat it.
     pub(super) passphrase: Arc<dyn PassphraseProvider>,
-    /// Pre-computed identity fingerprints for every origin that has
-    /// per-origin TLS configured. Populated at `with_tls_overrides_for`
-    /// time by reading + hashing each origin's certfile (or inheriting
-    /// the global identity_fp when the origin has per-origin cafile but
-    /// no own identity).
-    ///
-    /// Cache-key composition is sync and runs BEFORE any actual dispatch.
-    /// For lazy-target origins (those configured in `tls.per_origin` but
-    /// not in the eager set), the lazy client hasn't been built yet — so
-    /// consulting the lazy map at cache-key-compose time misses, and the
-    /// key would fall back to the default client's identity_fp. That means
-    /// a rotated per-origin cert wouldn't change the cache namespace,
-    /// leaking entries across principals on lazy origins. Pre-computation
-    /// keeps `identity_fp_for_url` sync while honoring the actual identity
-    /// each origin will use at request time.
-    ///
-    /// Cert read failures here are non-fatal — the entry stays absent and
-    /// the lazy build will surface a cited error if/when the origin is
-    /// actually reached.
-    pub(super) per_origin_identity_fps: HashMap<OriginKey, Arc<str>>,
+    /// Reusable global identity for per-origin clients that inherit it.
+    pub(super) global_identity: Option<Arc<LoadedIdentity>>,
+    pub(super) tls_material_budget: Arc<TlsMaterialBudget>,
+    pub(super) per_origin_identity_certs: HashMap<OriginKey, LazyIdentityCert>,
 }

@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     fn tls_customized_route_table() -> lpm_registry::RouteTable {
-        let npmrc = lpm_registry::NpmrcConfig::parse("strict-ssl=true\n", "test", &|_| None);
+        let npmrc = lpm_registry::NpmrcConfig::parse("strict-ssl=false\n", "test", &|_| None);
         lpm_registry::RouteTable::new(lpm_registry::RouteMode::Direct, npmrc)
             .expect("valid route table")
     }

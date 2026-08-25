@@ -3635,7 +3635,7 @@ pub(super) fn invalidate_metadata_routed(
 ) {
     match route_table.route_for_package(name) {
         UpstreamRoute::Custom { target, auth } => {
-            client.invalidate_custom_metadata_cache(&target.base_url, name, auth.as_ref());
+            client.invalidate_custom_metadata_cache(&target.base_url, name, auth.as_deref());
         }
         _ => {
             client.invalidate_metadata_cache(name);

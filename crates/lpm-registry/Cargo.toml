@@ -15,6 +15,7 @@ lpm-common = { workspace = true }
 lpm-auth = { workspace = true }
 lpm-http = { workspace = true }
 lpm-semver = { workspace = true }
+lpm-workspace = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -30,6 +31,7 @@ rand = { workspace = true }
 rmp-serde = { workspace = true }
 filetime = { workspace = true }
 secrecy = { workspace = true }
+zeroize = "1"
 dirs = { workspace = true }
 futures = { workspace = true }
 tempfile = "3"
@@ -39,6 +41,9 @@ time = { version = "0.3", features = ["parsing"] }
 # See `tls_identity.rs` for the loader.
 pkcs8 = { workspace = true }
 rpassword = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

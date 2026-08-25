@@ -11,6 +11,7 @@ description = "Authentication, secure token storage, and lazy session management
 # Shared error type
 lpm-common = { workspace = true }
 lpm-http = { workspace = true }
+lpm-workspace = { workspace = true }
 
 # Secure storage primitives
 keyring = { workspace = true }
@@ -60,6 +61,9 @@ keyring = { workspace = true, features = ["windows-native"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 acceptance-test-hooks = []

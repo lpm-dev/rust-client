@@ -246,7 +246,7 @@ fn bearer_for(server_uri: &str, token: &str) -> crate::npmrc::RegistryAuth {
     let origin = crate::npmrc::OriginKey::from_request_url(&format!("{server_uri}/_"))
         .expect("mock server URI must parse");
     crate::npmrc::RegistryAuth::Bearer {
-        origin,
+        scope: crate::npmrc::AuthScope::from_origin(origin),
         token: SecretString::from(token.to_string()),
     }
 }
@@ -255,7 +255,7 @@ fn basic_for(server_uri: &str, b64: &str) -> crate::npmrc::RegistryAuth {
     let origin = crate::npmrc::OriginKey::from_request_url(&format!("{server_uri}/_"))
         .expect("mock server URI must parse");
     crate::npmrc::RegistryAuth::Basic {
-        origin,
+        scope: crate::npmrc::AuthScope::from_origin(origin),
         credential: SecretString::from(b64.to_string()),
     }
 }

@@ -44,7 +44,7 @@ fn trusted_client(ca: &TestCa) -> reqwest::Client {
 fn registry_client(url: String, ca: &TestCa, allow_insecure: bool) -> RegistryClient {
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: ca.cert_pem.as_bytes().to_vec(),
+            pem_bytes: ca.cert_pem.as_bytes().to_vec().into(),
             source: "redirect test CA".into(),
             line: 1,
         }],

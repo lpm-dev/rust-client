@@ -28,19 +28,17 @@
 //! - Validate per-origin XOR pairs. The caller checks
 //!   `cert.is_some() == key.is_some()` for the specific origin
 //!   being built; this module assumes both are present.
-//! - Cache identities. Identities are reusable but the loader is
-//!   called rarely (once per per-origin client, eager or lazy);
-//!   the [`PassphraseCache`] memoizes the *passphrase*, not the
-//!   parsed identity, since cert/key files can change between
-//!   eager and lazy builds in the same process.
+//! - Decide identity cache lifetime. The HTTP client bundle owns that
+//!   command-scoped policy and can reuse a loaded identity safely.
 
 use lpm_common::error::LpmError;
-use lpm_common::{TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped};
+use lpm_common::{TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_regular_file_capped_with_metadata};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
 use crate::npmrc::TaggedPath;
 
@@ -253,10 +251,11 @@ impl PassphraseCache {
 /// fingerprinting hashes the cert, not the key, since that's the
 /// public-facing identity and a key in a hash chain is one
 /// compromise away from a leak.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LoadedIdentity {
     pub identity: reqwest::Identity,
-    pub cert_pem: Vec<u8>,
+    pub cert_pem: Arc<Vec<u8>>,
+    pub material_bytes: u64,
 }
 
 /// Load a [`reqwest::Identity`] from a `(certfile, keyfile)` pair.
@@ -282,24 +281,95 @@ pub fn load_identity(
     // `${PWD}`. `TaggedPath::resolve` returns the original path unchanged for
     // absolute inputs and for tests whose source is a non-file label.
     let cert_path = cert.resolve();
+    let (cert_bytes, _) =
+        read_regular_file_capped_with_metadata(&cert_path, TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!(
+                    "{}:{}: failed to read certfile {}: {e}",
+                    cert.source,
+                    cert.line,
+                    cert_path.display()
+                ))
+            })?;
+    load_identity_with_cert_bytes(cert, Arc::new(cert_bytes), key, passphrase)
+}
+
+pub(crate) fn load_identity_with_cert_bytes(
+    cert: &TaggedPath,
+    cert_bytes: Arc<Vec<u8>>,
+    key: &TaggedPath,
+    passphrase: &dyn PassphraseProvider,
+) -> Result<LoadedIdentity, LpmError> {
     let key_path = key.resolve();
-    let cert_bytes =
-        read_file_capped(&cert_path, TLS_MATERIAL_FILE_SIZE_CAP_BYTES).map_err(|e| {
-            LpmError::Cert(format!(
-                "{}:{}: failed to read certfile {}: {e}",
-                cert.source,
-                cert.line,
-                cert_path.display()
-            ))
-        })?;
-    let key_bytes = read_file_capped(&key_path, TLS_MATERIAL_FILE_SIZE_CAP_BYTES).map_err(|e| {
-        LpmError::Cert(format!(
-            "{}:{}: failed to read keyfile {}: {e}",
-            key.source,
-            key.line,
-            key_path.display()
-        ))
-    })?;
+    let (key_bytes, key_metadata) =
+        read_regular_file_capped_with_metadata(&key_path, TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+                LpmError::Cert(format!(
+                    "{}:{}: failed to read keyfile {}: {e}",
+                    key.source,
+                    key.line,
+                    key_path.display()
+                ))
+            })?;
+    load_identity_with_material(cert, cert_bytes, key, key_bytes, key_metadata, passphrase)
+}
+
+pub(crate) fn load_identity_with_material(
+    cert: &TaggedPath,
+    cert_bytes: Arc<Vec<u8>>,
+    key: &TaggedPath,
+    key_bytes: Vec<u8>,
+    key_metadata: std::fs::Metadata,
+    passphrase: &dyn PassphraseProvider,
+) -> Result<LoadedIdentity, LpmError> {
+    load_identity_with_material_and_reservation(
+        cert,
+        cert_bytes,
+        key,
+        key_bytes,
+        key_metadata,
+        passphrase,
+        |_| Ok(()),
+    )
+    .map(|(identity, ())| identity)
+}
+
+pub(crate) fn load_identity_with_material_and_reservation<R>(
+    cert: &TaggedPath,
+    cert_bytes: Arc<Vec<u8>>,
+    key: &TaggedPath,
+    key_bytes: Vec<u8>,
+    key_metadata: std::fs::Metadata,
+    passphrase: &dyn PassphraseProvider,
+    reserve_bundle: impl FnOnce(u64) -> Result<R, LpmError>,
+) -> Result<(LoadedIdentity, R), LpmError> {
+    let cert_path = cert.resolve();
+    let key_path = key.resolve();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let mode = key_metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(LpmError::Cert(format!(
+                "{}:{}: private key permissions {mode:04o} grant group or other access; run `chmod 600 {}`",
+                key.source,
+                key.line,
+                key_path.display()
+            )));
+        }
+        // SAFETY: geteuid has no preconditions and only reads process identity.
+        let effective_uid = unsafe { libc::geteuid() };
+        if key_metadata.uid() != effective_uid {
+            return Err(LpmError::Cert(format!(
+                "{}:{}: private key is owned by uid {}, not the current uid {effective_uid}",
+                key.source,
+                key.line,
+                key_metadata.uid()
+            )));
+        }
+    }
+    let key_bytes = Zeroizing::new(key_bytes);
 
     // PKCS#12 detection — informative cited error, not a generic
     // "rustls failed to parse." Catches both .p12 and .pfx file
@@ -378,7 +448,7 @@ pub fn load_identity(
         )));
     }
 
-    let unencrypted_key_pem: String = if key_text.contains(ENCRYPTED_PKCS8_HEADER) {
+    let unencrypted_key_pem = Zeroizing::new(if key_text.contains(ENCRYPTED_PKCS8_HEADER) {
         decrypt_pkcs8(key_text, key, passphrase)?
     } else if PEM_KEY_HEADERS.iter().any(|m| key_text.contains(m)) {
         // Already unencrypted — feed verbatim.
@@ -392,12 +462,24 @@ pub fn load_identity(
             key.line,
             key_path.display()
         )));
-    };
+    });
 
     // Concat: key first, then cert chain. `Identity::from_pem` accepts
     // both orderings, but key-first is the more common convention.
-    let mut bundle = unencrypted_key_pem.into_bytes();
-    if !bundle.ends_with(b"\n") {
+    let needs_newline = !unencrypted_key_pem.as_bytes().ends_with(b"\n");
+    let bundle_len = unencrypted_key_pem
+        .len()
+        .checked_add(usize::from(needs_newline))
+        .and_then(|len| len.checked_add(cert_bytes.len()))
+        .ok_or_else(|| LpmError::Cert("TLS identity material size overflow".into()))?;
+    let transient_bytes = u64::try_from(bundle_len)
+        .unwrap_or(u64::MAX)
+        .checked_mul(2)
+        .ok_or_else(|| LpmError::Cert("TLS identity material size overflow".into()))?;
+    let reservation = reserve_bundle(transient_bytes)?;
+    let mut bundle = Zeroizing::new(Vec::with_capacity(bundle_len));
+    bundle.extend_from_slice(unencrypted_key_pem.as_bytes());
+    if needs_newline {
         bundle.push(b'\n');
     }
     bundle.extend_from_slice(&cert_bytes);
@@ -408,10 +490,14 @@ pub fn load_identity(
             cert.source, cert.line, key.source, key.line
         ))
     })?;
-    Ok(LoadedIdentity {
-        identity,
-        cert_pem: cert_bytes,
-    })
+    Ok((
+        LoadedIdentity {
+            identity,
+            cert_pem: cert_bytes,
+            material_bytes: u64::try_from(bundle.len()).unwrap_or(u64::MAX),
+        },
+        reservation,
+    ))
 }
 
 /// Decrypt an encrypted PKCS#8 PEM block using the supplied passphrase
@@ -534,6 +620,12 @@ mod tests {
     fn write(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, contents).expect("write fixture");
+        #[cfg(unix)]
+        if name.contains("key") {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict private key fixture");
+        }
         p
     }
 
@@ -554,6 +646,45 @@ mod tests {
         let key = tagged(write(dir.path(), "key.pem", &key_pem));
         let pp = NoPassphrase;
         load_identity(&cert, &key, &pp).expect("identity ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_private_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (cert_pem, key_pem) = gen_rsa_pair();
+        let dir = TempDir::new().unwrap();
+        let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));
+        let key_path = write(dir.path(), "key.pem", &key_pem);
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let error = load_identity(&cert, &tagged(key_path), &NoPassphrase).unwrap_err();
+        assert!(error.to_string().contains("private key permissions"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_private_key_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::time::Duration;
+
+        let (cert_pem, _) = gen_rsa_pair();
+        let dir = TempDir::new().unwrap();
+        let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));
+        let fifo = dir.path().join("key.fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path and mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let key = tagged(fifo);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(load_identity(&cert, &key, &NoPassphrase)).ok();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("FIFO validation must not block");
+        assert!(result.unwrap_err().to_string().contains("regular file"));
     }
 
     #[test]
@@ -606,7 +737,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Files live alongside the (fictional) .npmrc in `dir/`.
         std::fs::write(dir.path().join("corp-cert.pem"), &cert_pem).unwrap();
-        std::fs::write(dir.path().join("corp-key.pem"), &key_pem).unwrap();
+        write(dir.path(), "corp-key.pem", &key_pem);
         // Tagged paths carry RELATIVE values + source_dir.
         let cert = TaggedPath {
             path: PathBuf::from("corp-cert.pem"),
@@ -736,6 +867,11 @@ mod tests {
         let key_path = dir.path().join("key.pfx");
         // Real-ish PKCS#12 prefix: SEQUENCE tag + length + non-ASCII body.
         std::fs::write(&key_path, [0x30u8, 0x82, 0x04, 0x00, 0xff, 0xfe, 0xfd]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let cert = tagged(cert_path);
         let key = tagged(key_path);
         let pp = NoPassphrase;

@@ -571,6 +571,7 @@ pub(super) async fn refresh_dependency_install(
                 &[],
                 false, // the enclosing add command owns stdout reporting
                 json_output,
+                None,
                 lpm_root,
             )
             .await

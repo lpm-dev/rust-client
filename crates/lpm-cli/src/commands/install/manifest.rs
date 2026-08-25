@@ -784,7 +784,7 @@ pub(super) async fn resolve_catalog_policy_candidate_version(
 
 pub(super) async fn preflight_catalog_policy_rejection(
     client: &RegistryClient,
-    route_cwd: &Path,
+    route_table: &RouteTable,
     staged: &StagedManifest,
     catalog_policy: &CatalogSavePolicy,
 ) -> Result<(), LpmError> {
@@ -802,9 +802,6 @@ pub(super) async fn preflight_catalog_policy_rejection(
     } else {
         "dependencies"
     };
-    let route_table = RouteTable::from_env_and_filesystem(route_cwd)
-        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
-
     for entry in &staged.entries {
         let manifest_spec = doc
             .get(dep_key)
@@ -824,7 +821,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
             let catalog_range = catalog_policy.catalog_entry(catalog_name, &entry.name)?;
             let resolved = resolve_catalog_policy_candidate_version(
                 client,
-                &route_table,
+                route_table,
                 &entry.name,
                 &effective_spec,
             )
@@ -851,7 +848,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
 
         let resolved = resolve_catalog_policy_candidate_version(
             client,
-            &route_table,
+            route_table,
             &entry.name,
             &effective_spec,
         )
@@ -886,7 +883,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
 /// just the staged manifest entries to their concrete versions.
 pub(super) async fn pin_staged_dist_tags_for_resolution(
     client: &RegistryClient,
-    route_cwd: &Path,
+    route_table: &RouteTable,
     staged: &StagedManifest,
 ) -> Result<(), LpmError> {
     let dist_tag_entries: Vec<(&str, &str)> = staged
@@ -903,9 +900,6 @@ pub(super) async fn pin_staged_dist_tags_for_resolution(
     if dist_tag_entries.is_empty() {
         return Ok(());
     }
-
-    let route_table = lpm_registry::RouteTable::from_env_and_filesystem(route_cwd)
-        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
 
     let content = read_manifest_text(&staged.pkg_json_path)?;
     let mut doc: serde_json::Value =
@@ -1138,8 +1132,9 @@ pub async fn run_add_packages(
         let catalog_policy = catalog_save_policy_for_project(project_dir, catalog_name_override)?;
         let staged =
             stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
-        pin_staged_dist_tags_for_resolution(client, project_dir, &staged).await?;
-        preflight_catalog_policy_rejection(client, project_dir, &staged, &catalog_policy).await?;
+        let route_table = load_install_route_table(project_dir, client)?;
+        pin_staged_dist_tags_for_resolution(client, &route_table, &staged).await?;
+        preflight_catalog_policy_rejection(client, &route_table, &staged, &catalog_policy).await?;
         maybe_test_panic("after-stage");
 
         // 3. Run the full install pipeline, capturing the direct-dep version
@@ -1152,7 +1147,7 @@ pub async fn run_add_packages(
         // entries no longer satisfy the staged manifest, so keeping the file
         // does not suppress a needed re-resolve.
         let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-        run_with_options(
+        run_with_options_with_lpm_root(
             client,
             project_dir,
             json_output,
@@ -1184,6 +1179,10 @@ pub async fn run_add_packages(
             audit_after_install,
             timing,
             &[],
+            true,
+            false,
+            Some(route_table),
+            lpm_common::LpmRoot::from_env()?,
         )
         .await?;
         maybe_test_panic("after-install");
@@ -1551,6 +1550,8 @@ pub async fn run_install_filtered_add(
             crate::save_config::SaveConfigLoader::load_for_project(&workspace_root_for_config)?;
         let catalog_policy =
             catalog_save_policy_for_project(&workspace_root_for_config, catalog_name_override)?;
+        let route_table = load_install_route_table(&workspace_root_for_config, client)?;
+        let lpm_root = lpm_common::LpmRoot::from_env()?;
 
         // Wrap the workspace-install snapshot, target loop, and commit in an
         // exclusive per-workspace lock. Two concurrent
@@ -1571,7 +1572,7 @@ pub async fn run_install_filtered_add(
             let mut staged_manifests: Vec<StagedManifest> =
                 Vec::with_capacity(targets.member_manifests.len());
             let mut last_err: Option<LpmError> = None;
-            for (idx, manifest_path) in targets.member_manifests.iter().enumerate() {
+            for manifest_path in &targets.member_manifests {
                 // (a) Stage the target manifest. Explicit specs land verbatim;
                 // bare/dist-tag entries get a `*` placeholder.
                 let staged = match stage_packages_to_manifest(
@@ -1587,13 +1588,8 @@ pub async fn run_install_filtered_add(
                     }
                 };
 
-                // Use the precomputed install root so the transaction
-                // snapshot above and the loop below agree on the exact
-                // member path (no double-compute, no path drift).
-                let install_root = &member_install_roots[idx];
-
                 if let Err(e) =
-                    pin_staged_dist_tags_for_resolution(client, install_root, &staged).await
+                    pin_staged_dist_tags_for_resolution(client, &route_table, &staged).await
                 {
                     last_err = Some(e);
                     break;
@@ -1601,7 +1597,7 @@ pub async fn run_install_filtered_add(
 
                 if let Err(e) = preflight_catalog_policy_rejection(
                     client,
-                    install_root,
+                    &route_table,
                     &staged,
                     &catalog_policy,
                 )
@@ -1628,7 +1624,7 @@ pub async fn run_install_filtered_add(
                 // warm fast-path validator rejects projections that no longer
                 // satisfy the staged manifest.
                 let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-                let result = run_with_options(
+                let result = run_with_options_with_lpm_root(
                     client,
                     install_root,
                     json_output,
@@ -1673,6 +1669,10 @@ pub async fn run_install_filtered_add(
                     audit_after_install,
                     timing,
                     &[],
+                    true,
+                    false,
+                    Some(route_table.clone()),
+                    lpm_root.clone(),
                 )
                 .await;
 
