@@ -123,11 +123,8 @@ fn find_version_satisfying_all(
         // Platform filter — same gate the regular dep path uses, so
         // an ambient install never lands a tarball the current OS/CPU
         // can't use.
-        let platform_ok = info.platform.is_empty()
-            || info
-                .platform
-                .get(&v.to_string())
-                .is_none_or(crate::provider::is_platform_compatible);
+        let platform_ok = !info.has_platform_metadata()
+            || info.platform_is_compatible(&v.to_string()).unwrap_or(true);
         if !platform_ok {
             continue;
         }
@@ -174,11 +171,8 @@ fn find_version_satisfying_most<'a>(
 
     let mut best: Option<(NpmVersion, usize, Vec<usize>)> = None;
     for v in peer_versions_by_npm_preference(info, reqs) {
-        let platform_ok = info.platform.is_empty()
-            || info
-                .platform
-                .get(&v.to_string())
-                .is_none_or(crate::provider::is_platform_compatible);
+        let platform_ok = !info.has_platform_metadata()
+            || info.platform_is_compatible(&v.to_string()).unwrap_or(true);
         if !platform_ok || !version_allowed_by_policy(canonical, info, v, policy) {
             continue;
         }

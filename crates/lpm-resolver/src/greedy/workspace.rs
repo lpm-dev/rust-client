@@ -13,8 +13,7 @@ use crate::overrides::{OverrideHit, OverrideSet};
 use crate::package::CanonicalKey;
 use crate::policy::ResolverPolicy;
 use crate::provider::{
-    CachedPackageInfo, SharedCache, is_platform_compatible, select_override_target,
-    version_allowed_by_policy,
+    CachedPackageInfo, SharedCache, select_override_target, version_allowed_by_policy,
 };
 use crate::ranges::NpmRange;
 use crate::resolve::{
@@ -439,10 +438,7 @@ fn projection_satisfies_release_age_policy(
             return false;
         };
         let status = if let Some(info) = result.cache.get(&canonical) {
-            let published_at = info
-                .dist
-                .get(&resolution.version)
-                .and_then(|dist| dist.published_at.as_deref());
+            let published_at = info.published_at(&resolution.version);
             policy.release_time_status_for_package_version(&canonical, &version, published_at)
         } else {
             policy.release_time_status_for_package_version(&canonical, &version, None)
@@ -659,21 +655,13 @@ fn project_peer_context(
             let Some(info) = union.cache.get(&canonical) else {
                 continue;
             };
-            let Some(peer_deps) = info.peer_deps.get(&version) else {
+            let Some(peer_dependencies) = info.peer_dependencies(&version) else {
                 continue;
             };
-            let regular = info.deps.get(&version);
-            let optional = info.optional_peer_names.get(&version);
-            let aliases = info.peer_aliases.get(&version);
-            let mut entries = peer_deps.iter().collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(right.0));
-            for (peer_name, raw_range) in entries {
-                if regular.is_some_and(|deps| deps.contains_key(peer_name)) {
-                    continue;
-                }
-                let target = aliases
-                    .and_then(|values| values.get(peer_name))
-                    .unwrap_or(peer_name);
+            for peer in peer_dependencies {
+                let peer_name = peer.name;
+                let raw_range = peer.range;
+                let target = peer.alias.unwrap_or(peer_name);
                 let range = NpmRange::parse(raw_range).map_err(|error| {
                     ResolveError::Internal(format!(
                         "failed to parse peer range {raw_range:?} for {target}: {error}"
@@ -707,11 +695,11 @@ fn project_peer_context(
                         target_id,
                     ));
                 } else {
-                    missing.entry(target.clone()).or_default().push((
+                    missing.entry(target.to_owned()).or_default().push((
                         index,
-                        peer_name.clone(),
+                        peer_name.to_owned(),
                         range,
-                        optional.is_some_and(|names| names.contains(peer_name)),
+                        peer.optional,
                     ));
                 }
             }
@@ -934,9 +922,8 @@ fn select_union_peer_candidate<'a>(
             .filter(|candidate| preferred_latest != Some(*candidate)),
     ) {
         if info
-            .platform
-            .get(&candidate.to_string())
-            .is_some_and(|platform| !is_platform_compatible(platform))
+            .platform_is_compatible(&candidate.to_string())
+            .is_some_and(|compatible| !compatible)
         {
             continue;
         }
@@ -997,65 +984,58 @@ mod tests {
     );
 
     fn cached_package(versions: &[PackageFixture<'_>]) -> Arc<CachedPackageInfo> {
-        let parsed_versions = versions
+        let manifests = versions
             .iter()
-            .map(|(version, _, _)| crate::NpmVersion::parse(version).unwrap())
+            .map(
+                |(version, dependencies, peers)| crate::provider::ManifestVersion {
+                    version: crate::NpmVersion::parse(version).unwrap(),
+                    dependencies: dependencies
+                        .iter()
+                        .map(|(name, range)| crate::provider::ManifestDependency {
+                            name: (*name).to_owned(),
+                            range: (*range).to_owned(),
+                            alias: None,
+                            optional: false,
+                            bundled: false,
+                        })
+                        .collect(),
+                    peer_dependencies: peers
+                        .iter()
+                        .map(|(name, range)| crate::provider::ManifestPeerDependency {
+                            name: (*name).to_owned(),
+                            range: (*range).to_owned(),
+                            alias: None,
+                            optional: false,
+                        })
+                        .collect(),
+                    node_engine: None,
+                    platform: None,
+                    dist: CachedDistInfo::default(),
+                },
+            )
             .collect::<Vec<_>>();
-        Arc::new(CachedPackageInfo {
-            modified: None,
-            modified_unix: None,
-            trust_metadata_complete: true,
-            versions_complete: true,
-            covered_ranges: HashSet::new(),
-            workspace_versions: HashSet::new(),
-            platform_metadata_complete: true,
-            latest_version: parsed_versions.first().cloned(),
-            versions: parsed_versions,
-            deps: versions
-                .iter()
-                .map(|(version, dependencies, _)| {
-                    (
-                        (*version).to_string(),
-                        dependencies
-                            .iter()
-                            .map(|(name, range)| ((*name).to_string(), (*range).to_string()))
-                            .collect(),
-                    )
-                })
-                .collect(),
-            peer_deps: versions
-                .iter()
-                .map(|(version, _, peers)| {
-                    (
-                        (*version).to_string(),
-                        peers
-                            .iter()
-                            .map(|(name, range)| ((*name).to_string(), (*range).to_string()))
-                            .collect(),
-                    )
-                })
-                .collect(),
-            peer_aliases: HashMap::new(),
-            optional_dep_names: HashMap::new(),
-            optional_peer_names: HashMap::new(),
-            node_engines: HashMap::new(),
-            bundled_dep_names: HashMap::new(),
-            platform: HashMap::new(),
-            dist: versions
-                .iter()
-                .map(|(version, _, _)| ((*version).to_string(), CachedDistInfo::default()))
-                .collect(),
-            aliases: HashMap::new(),
-        })
+        let latest_version = manifests.first().map(|manifest| manifest.version.clone());
+        Arc::new(CachedPackageInfo::from_manifest_versions(
+            None,
+            true,
+            true,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            latest_version,
+            manifests,
+        ))
     }
 
     fn cached_package_with_publish_time(name: &str, published_at: &str) -> Arc<CachedPackageInfo> {
         let mut info = cached_package(&[("1.0.0", &[], &[])]);
-        Arc::make_mut(&mut info)
-            .dist
-            .get_mut("1.0.0")
-            .unwrap_or_else(|| panic!("{name} fixture should contain 1.0.0"))
-            .published_at = Some(published_at.to_string());
+        assert!(
+            Arc::make_mut(&mut info).update_manifest_version("1.0.0", |manifest| {
+                manifest.dist.published_at = Some(published_at.to_string());
+                manifest.dist.published_at_unix = crate::policy::parse_npm_time_unix(published_at);
+            }),
+            "{name} fixture should contain 1.0.0"
+        );
         info
     }
 

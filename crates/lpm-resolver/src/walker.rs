@@ -994,20 +994,12 @@ fn expand_deps_from_info(
     let Some(newest) = info.versions.first() else {
         return;
     };
-    // `info.versions` round-trips through `NpmVersion::parse` →
-    // `Display`; the same string was used as the `info.deps` /
-    // `info.aliases` key in `parse_metadata_to_cache_info`.
     let ver_str = newest.to_string();
-    let Some(deps) = info.deps.get(&ver_str) else {
+    let Some(dependencies) = info.dependencies(&ver_str) else {
         return;
     };
-    let ver_aliases = info.aliases.get(&ver_str);
-    for dep_name in deps.keys() {
-        // Alias rewrite: if this version declares `dep_name` as a
-        // `npm:<target>@<range>` alias, enqueue the target.
-        let target_name: &str = ver_aliases
-            .and_then(|m| m.get(dep_name))
-            .map_or(dep_name.as_str(), String::as_str);
+    for dependency in dependencies {
+        let target_name = dependency.alias.unwrap_or(dependency.name);
         let dep_key = CanonicalKey::from_dep_name(target_name);
         if seen.insert(dep_key) {
             next_level.push(target_name.to_string());

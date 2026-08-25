@@ -175,6 +175,7 @@ pub(super) async fn fetch_metadata_for_resolver(
             false,
         )
         .await?;
+        share_manifest_core_with_base(&mut fetched, &base_fact);
         fetched.shared_fact = Some(base_fact);
         return Ok(fetched);
     }
@@ -244,6 +245,7 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
             true,
         )
         .await?;
+        share_manifest_core_with_base(&mut fetched, &base_fact);
         fetched.shared_fact = Some(base_fact);
         timings.policy_full_metadata_ms = policy_start.elapsed().as_millis();
         timings.total_ms = total_start.elapsed().as_millis();
@@ -414,11 +416,8 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
     {
         Ok((fetched, timings)) => {
             let exact_candidate_is_installable = fetched.info.versions_complete
-                || fetched
-                    .info
-                    .dist
-                    .get(version)
-                    .is_some_and(|dist| dist.tarball_url.is_some() && dist.integrity.is_some());
+                || (fetched.info.tarball_url(version).is_some()
+                    && fetched.info.integrity(version).is_some());
             if trace_metadata_fetches {
                 lpm_registry::timing::record_metadata_fetch_detail(metadata_fetch_detail_record(
                     timings,
@@ -635,6 +634,18 @@ fn fetched_metadata_from_arc(
     }
 }
 
+fn share_manifest_core_with_base(fetched: &mut FetchedMetadata, base: &Arc<CachedPackageInfo>) {
+    let mut info = (*fetched.info).clone();
+    if !info.share_manifest_core_from_if_equivalent(base) {
+        return;
+    }
+    let info = Arc::new(info);
+    fetched.info = Arc::clone(&info);
+    if let Some(speculation) = &mut fetched.speculation {
+        speculation.info = info;
+    }
+}
+
 fn latest_version_from_metadata(metadata: &lpm_registry::PackageMetadata) -> Option<NpmVersion> {
     metadata
         .latest_version_tag()
@@ -706,9 +717,10 @@ pub(super) async fn ensure_policy_metadata_for_cached_manifest(
         return Ok(merged);
     }
     let policy_start = trace_metadata_fetches.then(Instant::now);
-    let fetched =
+    let mut fetched =
         fetch_full_metadata_for_policy(client, route_table, canonical, policy, false, false)
             .await?;
+    share_manifest_core_with_base(&mut fetched, &info);
     let full_info = fetched.info;
     if let Some(start) = policy_start {
         let elapsed = start.elapsed().as_millis();

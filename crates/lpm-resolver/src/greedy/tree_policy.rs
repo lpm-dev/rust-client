@@ -160,30 +160,25 @@ where
         }
 
         let version_str = version.to_string();
-        let Some(deps) = info.deps.get(&version_str) else {
+        let Some(dependencies) = info.dependencies(&version_str) else {
             visited.remove(&visit_key);
             cache.insert(visit_key, TreeStatus::Compatible);
             return TreeStatus::Compatible;
         };
-        let aliases = info.aliases.get(&version_str);
-        let optional_names = info.optional_dep_names.get(&version_str);
-        let bundled_names = info.bundled_dep_names.get(&version_str);
-        let mut entries: Vec<(&String, &String)> = deps.iter().collect();
-        entries.sort_by_key(|(name, _)| *name);
+        let entries = dependencies.collect::<Vec<_>>();
         let prefetch_canonicals: Vec<CanonicalKey> = entries
             .iter()
-            .filter_map(|(local_name, range_str)| {
-                if bundled_names.is_some_and(|names| names.contains(*local_name))
-                    || optional_names.is_some_and(|names| names.contains(*local_name))
-                    || super::version::is_workspace_specifier(range_str)
-                    || NpmRange::parse(range_str).is_err()
+            .filter_map(|dependency| {
+                if dependency.bundled
+                    || dependency.optional
+                    || super::version::is_workspace_specifier(dependency.range)
+                    || NpmRange::parse(dependency.range).is_err()
                 {
                     return None;
                 }
-                Some(match aliases.and_then(|alias| alias.get(*local_name)) {
-                    Some(target) => CanonicalKey::from_dep_name(target),
-                    None => CanonicalKey::from_dep_name(local_name),
-                })
+                Some(CanonicalKey::from_dep_name(
+                    dependency.alias.unwrap_or(dependency.name),
+                ))
             })
             .collect();
         let release_age_tree_policy = policy.release_age_checks_all_packages();
@@ -191,23 +186,20 @@ where
             provider.prefetch_manifests(&prefetch_canonicals).await;
         }
 
-        for (local_name, range_str) in entries {
-            if bundled_names.is_some_and(|names| names.contains(local_name)) {
+        for dependency in entries {
+            if dependency.bundled || dependency.optional {
                 continue;
             }
-            if optional_names.is_some_and(|names| names.contains(local_name)) {
-                continue;
-            }
+            let local_name = dependency.name;
+            let range_str = dependency.range;
             if super::version::is_workspace_specifier(range_str) {
                 continue;
             }
             let Ok(range) = NpmRange::parse(range_str) else {
                 continue;
             };
-            let child_canonical = match aliases.and_then(|alias| alias.get(local_name)) {
-                Some(target) => CanonicalKey::from_dep_name(target),
-                None => CanonicalKey::from_dep_name(local_name),
-            };
+            let child_canonical =
+                CanonicalKey::from_dep_name(dependency.alias.unwrap_or(local_name));
             let child_info = if policy.requires_trust_history() {
                 match provider.ensure_manifest(&child_canonical).await {
                     Ok(info) => info,

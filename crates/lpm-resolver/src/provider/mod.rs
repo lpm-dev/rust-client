@@ -8,6 +8,7 @@ mod cache;
 mod config;
 mod error;
 mod fetch;
+mod manifest_core;
 mod parse;
 mod platform;
 mod policy;
@@ -17,6 +18,11 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use manifest_core::{
+    CachedDistInfo, CachedPackageInfo, ManifestDependency, ManifestDependencyIter,
+    ManifestDependencyRef, ManifestPeerDependency, ManifestPeerDependencyIter,
+    ManifestPeerDependencyRef, ManifestVersion, PlatformMeta,
+};
 #[allow(unused_imports)]
 pub(crate) use parse::is_valid_dep_name;
 #[cfg(any(test, feature = "bench-internals"))]
@@ -38,10 +44,7 @@ pub(crate) use types::LpmDependencyProvider;
 pub(crate) use types::SkippedDependency;
 #[cfg(test)]
 pub(crate) use types::SkippedDependencyReason;
-pub use types::{
-    CachedDistInfo, CachedPackageInfo, NotifyMap, PlatformMeta, SharedCache, StreamingBfsMetrics,
-    WalkerDone,
-};
+pub use types::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 
 mod prelude {
     #[allow(unused_imports)]
@@ -49,14 +52,18 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::error::{ProviderError, classify_registry_error};
     #[allow(unused_imports)]
+    pub(super) use super::manifest_core::{CachedDistInfo, CachedPackageInfo, PlatformMeta};
+    #[allow(unused_imports)]
     pub(super) use super::parse::{
         is_valid_dep_name, is_valid_version_string, merge_release_times_into_cache_info,
         parse_metadata_to_cache_info, parse_owned_full_metadata_to_cache_info,
         parse_owned_metadata_to_cache_info, parse_owned_partial_metadata_to_cache_info,
     };
+    #[cfg(test)]
+    pub(super) use super::platform::check_platform_filter;
     #[allow(unused_imports)]
     pub(super) use super::platform::{
-        Platform, check_platform_filter, is_platform_compatible, is_platform_compatible_for,
+        Platform, is_platform_compatible, is_platform_compatible_for,
     };
     #[allow(unused_imports)]
     pub(super) use super::policy::{
@@ -68,8 +75,8 @@ mod prelude {
     pub(super) use super::pubgrub_impl::deep_followup_enabled;
     #[allow(unused_imports)]
     pub(super) use super::types::{
-        CachedDistInfo, CachedPackageInfo, LpmDependencyProvider, NotifyMap, PlatformMeta,
-        SharedCache, SkippedDependency, SkippedDependencyReason, StreamingBfsMetrics, WalkerDone,
+        LpmDependencyProvider, NotifyMap, SharedCache, SkippedDependency, SkippedDependencyReason,
+        StreamingBfsMetrics, WalkerDone,
     };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;
@@ -109,4 +116,6 @@ mod prelude {
     pub(super) use version_ranges::Ranges;
 }
 
+#[cfg(feature = "bench-internals")]
+pub(crate) use cache::merge_cached_package_info;
 pub(crate) use cache::{activate_workspace_fallback, insert_or_merge_cached_package_info};

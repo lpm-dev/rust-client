@@ -391,50 +391,50 @@ fn make_cached_info(
     // `Arc<CachedPackageInfo>` values, so the test helper wraps once at
     // construction time. Tests insert the returned Arc directly with no
     // further changes.
-    std::sync::Arc::new(CachedPackageInfo {
-        modified: None,
-        modified_unix: None,
-        trust_metadata_complete: false,
-        versions_complete: true,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::new(),
-        platform_metadata_complete: true,
-        latest_version: None,
-        versions: versions
-            .iter()
-            .map(|v| NpmVersion::parse(v).unwrap())
-            .collect(),
-        deps: deps
-            .into_iter()
-            .map(|(v, d)| {
-                (
-                    v.to_string(),
-                    d.into_iter()
-                        .map(|(k, r)| (k.to_string(), r.to_string()))
-                        .collect(),
-                )
-            })
-            .collect(),
-        peer_deps: peer_deps
-            .into_iter()
-            .map(|(v, d)| {
-                (
-                    v.to_string(),
-                    d.into_iter()
-                        .map(|(k, r)| (k.to_string(), r.to_string()))
-                        .collect(),
-                )
-            })
-            .collect(),
-        peer_aliases: HashMap::new(),
-        optional_dep_names: HashMap::new(),
-        optional_peer_names: HashMap::new(),
-        node_engines: HashMap::new(),
-        bundled_dep_names: HashMap::new(),
-        platform: HashMap::new(),
-        dist: HashMap::new(),
-        aliases: HashMap::new(),
-    })
+    let mut deps = deps.into_iter().collect::<HashMap<_, _>>();
+    let mut peer_deps = peer_deps.into_iter().collect::<HashMap<_, _>>();
+    let manifests = versions
+        .iter()
+        .map(|version| crate::provider::ManifestVersion {
+            version: NpmVersion::parse(version).unwrap(),
+            dependencies: deps
+                .remove(version)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, range)| crate::provider::ManifestDependency {
+                    name: name.to_owned(),
+                    range: range.to_owned(),
+                    alias: None,
+                    optional: false,
+                    bundled: false,
+                })
+                .collect(),
+            peer_dependencies: peer_deps
+                .remove(version)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, range)| crate::provider::ManifestPeerDependency {
+                    name: name.to_owned(),
+                    range: range.to_owned(),
+                    alias: None,
+                    optional: false,
+                })
+                .collect(),
+            node_engine: None,
+            platform: None,
+            dist: crate::provider::CachedDistInfo::default(),
+        })
+        .collect();
+    std::sync::Arc::new(CachedPackageInfo::from_manifest_versions(
+        None,
+        false,
+        true,
+        HashSet::new(),
+        HashSet::new(),
+        true,
+        None,
+        manifests,
+    ))
 }
 
 fn make_version_metadata(
@@ -1528,9 +1528,14 @@ fn peer_check_aliased_missing_warning_preserves_local_and_canonical_names() {
         vec![],
         vec![("1.0.0", vec![("react-compat", "^18.0.0")])],
     );
-    Arc::get_mut(&mut info).unwrap().peer_aliases.insert(
-        "1.0.0".to_string(),
-        HashMap::from([("react-compat".to_string(), "react".to_string())]),
+    assert!(
+        Arc::make_mut(&mut info).update_manifest_version("1.0.0", |manifest| {
+            manifest
+                .peer_dependencies
+                .first_mut()
+                .expect("aliased peer fixture")
+                .alias = Some("react".to_string());
+        })
     );
     let mut cache = HashMap::new();
     cache.insert(CanonicalKey::from(&consumer), info);
@@ -1654,10 +1659,13 @@ fn peer_check_optional_peer_missing_no_warning() {
     .clone();
     // Mark `react` as optional via peerDependenciesMeta — the
     // missing-peer warning must be suppressed.
-    let mut opt_peers = HashSet::new();
-    opt_peers.insert("react".to_string());
-    info.optional_peer_names
-        .insert("9.0.0".to_string(), opt_peers);
+    assert!(info.update_manifest_version("9.0.0", |manifest| {
+        manifest
+            .peer_dependencies
+            .first_mut()
+            .expect("optional peer fixture")
+            .optional = true;
+    }));
     cache.insert(CanonicalKey::from(&pkg), std::sync::Arc::new(info));
 
     let warnings = check_unmet_peers(&resolved, &cache, &CompiledPeerRules::default());
@@ -1718,10 +1726,13 @@ fn peer_check_optional_peer_wrong_version_still_warns() {
         vec![("9.0.0", vec![("react", "^18 || ^19")])],
     ))
     .clone();
-    let mut opt_peers = HashSet::new();
-    opt_peers.insert("react".to_string());
-    info.optional_peer_names
-        .insert("9.0.0".to_string(), opt_peers);
+    assert!(info.update_manifest_version("9.0.0", |manifest| {
+        manifest
+            .peer_dependencies
+            .first_mut()
+            .expect("optional peer fixture")
+            .optional = true;
+    }));
     cache.insert(CanonicalKey::from(&pkg), std::sync::Arc::new(info));
     cache.insert(
         CanonicalKey::from(&react_pkg),

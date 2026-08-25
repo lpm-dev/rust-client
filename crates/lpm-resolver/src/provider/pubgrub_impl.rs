@@ -36,7 +36,7 @@ impl LpmDependencyProvider {
         }
 
         // Versions are sorted newest-first; first match wins.
-        for version in &info.versions {
+        for version in info.versions.iter() {
             if info.latest_version.as_ref() == Some(version) {
                 continue;
             }
@@ -370,7 +370,7 @@ impl DependencyProvider for LpmDependencyProvider {
 
         let ver_str = version.to_string();
         let key = CanonicalKey::from(package);
-        let (ver_deps, optional_names, ver_aliases, bundled_names) = {
+        let ver_deps = {
             let info = match self.cache.get(&key) {
                 Some(info) => info,
                 None => {
@@ -379,50 +379,36 @@ impl DependencyProvider for LpmDependencyProvider {
                     )));
                 }
             };
-            let mut deps = match info.deps.get(&ver_str) {
-                Some(deps) => deps.clone(),
+            let dependencies = match info.dependencies(&ver_str) {
+                Some(dependencies) => dependencies,
                 None => return Ok(Dependencies::Available(pubgrub::Map::default())),
             };
-            let mut opt = info
-                .optional_dep_names
-                .get(&ver_str)
-                .cloned()
-                .unwrap_or_default();
-            // local_name → target_name alias map. Empty for most packages (bare-identity deps).
-            let aliases = info.aliases.get(&ver_str).cloned().unwrap_or_default();
-            // Collect bundled dep names for this version. Used
-            // below to drop them from `deps` BEFORE the prefetch +
-            // pubgrub-constraint loop runs — pubgrub never sees the
-            // bundled names so it doesn't try to resolve them as
-            // separate registry packages.
-            let bundled = info
-                .bundled_dep_names
-                .get(&ver_str)
-                .cloned()
-                .unwrap_or_default();
-            // Strip bundled deps from the constraint set up front.
-            // Done here rather than per-loop-iteration so the prefetch
-            // batch below also skips them (they're not in the registry
-            // under their bundled identity, so prefetching is wasted
-            // work + a likely 404).
-            if !bundled.is_empty() {
-                let before = deps.len();
-                deps.retain(|name, _| !bundled.contains(name));
-                let dropped = before - deps.len();
-                if dropped > 0 {
-                    tracing::debug!(
-                        "skipping {dropped} bundled dep(s) of {package}@{ver_str} \
-                         — provided by parent's tarball"
-                    );
+            let mut deps = Vec::with_capacity(dependencies.len());
+            let mut bundled_count = 0usize;
+            for dependency in dependencies {
+                if dependency.bundled {
+                    bundled_count += 1;
+                    continue;
                 }
+                if dependency.optional && !self.include_optional_dependencies {
+                    continue;
+                }
+                deps.push(super::manifest_core::ManifestDependency {
+                    name: dependency.name.to_owned(),
+                    range: dependency.range.to_owned(),
+                    alias: dependency.alias.map(str::to_owned),
+                    optional: dependency.optional,
+                    bundled: false,
+                });
             }
-            if !self.include_optional_dependencies && !opt.is_empty() {
-                deps.retain(|name, _| !opt.contains(name));
-                opt.clear();
+            if bundled_count > 0 {
+                tracing::debug!(
+                    "skipping {bundled_count} bundled dep(s) of {package}@{ver_str} \
+                         — provided by parent's tarball"
+                );
             }
-            (deps, opt, aliases, bundled)
+            deps
         };
-        let _ = bundled_names; // currently consumed up front; kept for future use
 
         // Scope key for a child of a split parent must include the parent's
         // OWN split context, not just its canonical name. Otherwise,
@@ -460,10 +446,11 @@ impl DependencyProvider for LpmDependencyProvider {
         let deep_followup = deep_followup_enabled();
         if self.fetch_wait_timeout.is_zero() {
             let uncached: Vec<String> = ver_deps
-                .keys()
-                .filter(|name| {
-                    let k = CanonicalKey::from_dep_name(name);
-                    !self.cache.contains_key(&k) && !self.client.is_metadata_fresh(name)
+                .iter()
+                .map(|dependency| dependency.alias.as_ref().unwrap_or(&dependency.name))
+                .filter(|target_name| {
+                    let k = CanonicalKey::from_dep_name(target_name);
+                    !self.cache.contains_key(&k) && !self.client.is_metadata_fresh(target_name)
                 })
                 .cloned()
                 .collect();
@@ -496,7 +483,9 @@ impl DependencyProvider for LpmDependencyProvider {
             }
         }
 
-        for (dep_name, dep_range_str) in &ver_deps {
+        for dependency in &ver_deps {
+            let dep_name = &dependency.name;
+            let dep_range_str = &dependency.range;
             // **Defense-in-depth.** Detect a leaked
             // `workspace:` specifier BEFORE the alias rewrite +
             // ensure_cached path runs — otherwise we'd try to fetch
@@ -530,9 +519,7 @@ impl DependencyProvider for LpmDependencyProvider {
             // refer to this dep" (split set, is_optional flag), and in
             // `format_solution` it becomes the edge key on
             // `ResolvedPackage.dependencies`.
-            let target_name: &str = ver_aliases
-                .get(dep_name)
-                .map_or(dep_name.as_str(), String::as_str);
+            let target_name = dependency.alias.as_deref().unwrap_or(dep_name);
             let base_pkg = ResolverPackage::from_dep_name(target_name);
 
             // If this dep is in the split set, create a scoped identity
@@ -546,7 +533,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 base_pkg
             };
 
-            let edge_is_optional = optional_names.contains(dep_name);
+            let edge_is_optional = dependency.optional;
 
             // Dependency fetch failures are recorded against this exact
             // parent version and provisionally omitted. PubGrub can query

@@ -91,8 +91,7 @@ pub(super) fn format_solution(
             // package for the linker.
             let cached_aliases: HashMap<String, String> = cache
                 .get(&key)
-                .and_then(|info| info.aliases.get(&ver_str))
-                .cloned()
+                .map(|info| info.dependency_aliases(&ver_str))
                 .unwrap_or_default();
 
             // Look up this package's declared deps from the provider
@@ -102,14 +101,12 @@ pub(super) fn format_solution(
             // the provider constructed for this parent.
             let resolved_dependencies = cache
                 .get(&key)
-                .and_then(|info| info.deps.get(&ver_str))
-                .map(|ver_deps| {
-                    ver_deps
-                        .keys()
-                        .filter_map(|local_name| {
-                            let target_name = cached_aliases
-                                .get(local_name)
-                                .map_or(local_name.as_str(), String::as_str);
+                .and_then(|info| info.dependencies(&ver_str))
+                .map(|dependencies| {
+                    dependencies
+                        .filter_map(|dependency| {
+                            let local_name = dependency.name;
+                            let target_name = dependency.alias.unwrap_or(local_name);
                             let target = ResolverPackage::from_dep_name(target_name);
                             let split_target = target.with_context(&parent_identity);
                             resolved_versions
@@ -123,7 +120,7 @@ pub(super) fn format_solution(
                                             target
                                         };
                                     (
-                                        local_name.clone(),
+                                        local_name.to_owned(),
                                         resolved_ver.clone(),
                                         resolution_ids[&exact_target],
                                     )
@@ -142,8 +139,7 @@ pub(super) fn format_solution(
                 .collect::<HashMap<_, _>>();
             let optional_dependencies = cache
                 .get(&key)
-                .and_then(|info| info.optional_dep_names.get(&ver_str))
-                .cloned()
+                .map(|info| info.optional_dependency_names(&ver_str))
                 .unwrap_or_default();
 
             // Only surface aliases that actually survived resolution —
@@ -158,19 +154,19 @@ pub(super) fn format_solution(
                 .collect();
 
             // Extract tarball URL and integrity from cached dist info
-            let (tarball_url, integrity) = cache
-                .get(&key)
-                .and_then(|info| info.dist.get(&ver_str))
-                .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
-                .unwrap_or_default();
-            let platform = cache
-                .get(&key)
-                .and_then(|info| info.platform.get(&ver_str))
-                .cloned();
+            let (tarball_url, integrity) = cache.get(&key).map_or_else(
+                || (None, None),
+                |info| {
+                    (
+                        info.tarball_url(&ver_str).map(str::to_owned),
+                        info.integrity(&ver_str).map(str::to_owned),
+                    )
+                },
+            );
+            let platform = cache.get(&key).and_then(|info| info.platform(&ver_str));
             let node_engine = cache
                 .get(&key)
-                .and_then(|info| info.node_engines.get(&ver_str))
-                .cloned();
+                .and_then(|info| info.node_engine(&ver_str).map(str::to_owned));
 
             // Surface resolved peers per package. The resolver already
             // proved each peer's range was satisfied (or surfaced a

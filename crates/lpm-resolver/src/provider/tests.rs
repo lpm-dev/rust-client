@@ -68,10 +68,7 @@ fn registry_attestation_pointer_is_not_trust_evidence_before_verification() {
 
     let info = parse_full_metadata_to_cache_info(&metadata);
     assert_eq!(
-        info.dist
-            .get("1.0.0")
-            .expect("parsed version")
-            .trust_evidence,
+        info.trust_evidence("1.0.0"),
         None,
         "a registry-controlled URL and predicate marker are only a claim; install must verify the bundle before recording provenance"
     );
@@ -83,53 +80,41 @@ fn registry_attestation_pointer_is_not_trust_evidence_before_verification() {
 fn peer_deps_stored_per_version() {
     // Verify that peer deps are stored separately per version in CachedPackageInfo,
     // so post-resolution check_unmet_peers() can look up the exact version's peers.
-    let mut peer_deps = HashMap::new();
-
-    let mut v1_peers = HashMap::new();
-    v1_peers.insert("react".to_string(), "^16".to_string());
-    peer_deps.insert("1.0.0".to_string(), v1_peers);
-
-    let mut v2_peers = HashMap::new();
-    v2_peers.insert("react".to_string(), "^18".to_string());
-    peer_deps.insert("2.0.0".to_string(), v2_peers);
-
-    let info = CachedPackageInfo {
-        modified: None,
-        modified_unix: None,
-        trust_metadata_complete: false,
-        versions_complete: true,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::new(),
-        platform_metadata_complete: true,
-        latest_version: None,
-        versions: vec![
-            NpmVersion::parse("2.0.0").unwrap(),
-            NpmVersion::parse("1.0.0").unwrap(),
-        ],
-        deps: HashMap::new(),
-        peer_deps,
-        peer_aliases: HashMap::new(),
-        optional_dep_names: HashMap::new(),
-        optional_peer_names: HashMap::new(),
-        node_engines: HashMap::new(),
-        bundled_dep_names: HashMap::new(),
-        platform: HashMap::new(),
-        dist: HashMap::new(),
-        aliases: HashMap::new(),
+    let manifest = |version: &str, range: &str| super::ManifestVersion {
+        version: NpmVersion::parse(version).unwrap(),
+        dependencies: Vec::new(),
+        peer_dependencies: vec![super::ManifestPeerDependency {
+            name: "react".to_string(),
+            range: range.to_string(),
+            alias: None,
+            optional: false,
+        }],
+        node_engine: None,
+        platform: None,
+        dist: CachedDistInfo::default(),
     };
+    let info = CachedPackageInfo::from_manifest_versions(
+        None,
+        false,
+        true,
+        HashSet::new(),
+        HashSet::new(),
+        true,
+        None,
+        vec![manifest("2.0.0", "^18"), manifest("1.0.0", "^16")],
+    );
 
     // Version 1.0.0 peers on react@^16
-    let v1_peers = info.peer_deps.get("1.0.0").unwrap();
-    assert_eq!(v1_peers.get("react").unwrap(), "^16");
+    let v1_peer = info.peer_dependency("1.0.0", "react").unwrap();
+    assert_eq!(v1_peer.range, "^16");
 
     // Version 2.0.0 peers on react@^18
-    let v2_peers = info.peer_deps.get("2.0.0").unwrap();
-    assert_eq!(v2_peers.get("react").unwrap(), "^18");
+    let v2_peer = info.peer_dependency("2.0.0", "react").unwrap();
+    assert_eq!(v2_peer.range, "^18");
 
     // They are independent — no union, no aggregation
     assert_ne!(
-        v1_peers.get("react").unwrap(),
-        v2_peers.get("react").unwrap(),
+        v1_peer.range, v2_peer.range,
         "per-version peers must not be merged"
     );
 }
@@ -500,60 +485,64 @@ fn make_info(
     optional_names: Vec<(&str, Vec<&str>)>,
     platform: Vec<(&str, Vec<&str>, Vec<&str>)>,
 ) -> CachedPackageInfo {
-    CachedPackageInfo {
-        modified: None,
-        modified_unix: None,
-        trust_metadata_complete: false,
-        versions_complete: true,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::new(),
-        platform_metadata_complete: true,
-        latest_version: None,
-        versions: versions
-            .iter()
-            .filter_map(|v| NpmVersion::parse(v).ok())
-            .collect(),
-        deps: deps
-            .into_iter()
-            .map(|(v, d)| {
-                (
-                    v.to_string(),
-                    d.into_iter()
-                        .map(|(k, r)| (k.to_string(), r.to_string()))
-                        .collect(),
-                )
+    let mut deps = deps.into_iter().collect::<HashMap<_, _>>();
+    let optional_names = optional_names
+        .into_iter()
+        .map(|(version, names)| (version, names.into_iter().collect::<HashSet<_>>()))
+        .collect::<HashMap<_, _>>();
+    let mut platform = platform
+        .into_iter()
+        .map(|(version, os, cpu)| (version, (os, cpu)))
+        .collect::<HashMap<_, _>>();
+    let manifests = versions
+        .iter()
+        .filter_map(|version| {
+            let parsed = NpmVersion::parse(version).ok()?;
+            let optional = optional_names.get(version).cloned().unwrap_or_default();
+            let dependencies = deps
+                .remove(version)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, range)| super::ManifestDependency {
+                    optional: optional.contains(name),
+                    name: name.to_owned(),
+                    range: range.to_owned(),
+                    alias: None,
+                    bundled: false,
+                })
+                .collect();
+            let platform = platform.remove(version).map(|(os, cpu)| PlatformMeta {
+                os: os.into_iter().map(str::to_owned).collect(),
+                cpu: cpu.into_iter().map(str::to_owned).collect(),
+                libc: Vec::new(),
+            });
+            Some(super::ManifestVersion {
+                version: parsed,
+                dependencies,
+                peer_dependencies: Vec::new(),
+                node_engine: None,
+                platform,
+                dist: CachedDistInfo::default(),
             })
-            .collect(),
-        peer_deps: HashMap::new(),
-        peer_aliases: HashMap::new(),
-        optional_peer_names: HashMap::new(),
-        node_engines: HashMap::new(),
-        bundled_dep_names: HashMap::new(),
-        optional_dep_names: optional_names
-            .into_iter()
-            .map(|(v, names)| {
-                (
-                    v.to_string(),
-                    names.into_iter().map(|n| n.to_string()).collect(),
-                )
-            })
-            .collect(),
-        platform: platform
-            .into_iter()
-            .map(|(v, os, cpu)| {
-                (
-                    v.to_string(),
-                    PlatformMeta {
-                        os: os.into_iter().map(|s| s.to_string()).collect(),
-                        cpu: cpu.into_iter().map(|s| s.to_string()).collect(),
-                        libc: Vec::new(),
-                    },
-                )
-            })
-            .collect(),
-        dist: HashMap::new(),
-        aliases: HashMap::new(),
-    }
+        })
+        .collect();
+    CachedPackageInfo::from_manifest_versions(
+        None,
+        false,
+        true,
+        HashSet::new(),
+        HashSet::new(),
+        true,
+        None,
+        manifests,
+    )
+}
+
+fn set_published_at(info: &mut CachedPackageInfo, version: &str, published_at: &str) {
+    assert!(info.update_manifest_version(version, |manifest| {
+        manifest.dist.published_at = Some(published_at.to_string());
+        manifest.dist.published_at_unix = parse_npm_time_unix(published_at);
+    }));
 }
 
 /// Build a minimal PackageMetadata fixture with the given versions
@@ -592,12 +581,12 @@ fn metadata_with_versions(
 }
 
 #[test]
-fn owned_metadata_projection_moves_dependency_storage_into_the_cache() {
+fn owned_metadata_projection_preserves_dependency_and_dist_values() {
     let metadata = metadata_with_versions(
         "owned-projection",
         &[("1.0.0", &[("large-dependency-name", "^123.456.789")])],
     );
-    let original_range = metadata.versions["1.0.0"].dependencies["large-dependency-name"].as_ptr();
+    let original_range = metadata.versions["1.0.0"].dependencies["large-dependency-name"].clone();
     let original_integrity = metadata.versions["1.0.0"]
         .dist
         .as_ref()
@@ -605,19 +594,22 @@ fn owned_metadata_projection_moves_dependency_storage_into_the_cache() {
         .integrity
         .as_ref()
         .unwrap()
-        .as_ptr();
+        .clone();
 
     let info = parse_owned_metadata_to_cache_info(metadata);
 
-    let projected_range = info.deps["1.0.0"]["large-dependency-name"].as_ptr();
-    let projected_integrity = info.dist["1.0.0"].integrity.as_ref().unwrap().as_ptr();
+    let projected_range = info
+        .dependency("1.0.0", "large-dependency-name")
+        .expect("projected dependency")
+        .range;
+    let projected_integrity = info.integrity("1.0.0").expect("projected integrity");
     assert_eq!(
         projected_range, original_range,
-        "owned parsing must reuse dependency string storage instead of cloning it"
+        "owned parsing must preserve dependency ranges"
     );
     assert_eq!(
         projected_integrity, original_integrity,
-        "owned parsing must reuse integrity string storage instead of cloning it"
+        "owned parsing must preserve integrity metadata"
     );
 }
 
@@ -643,14 +635,14 @@ fn metadata_projection_preserves_registry_unpacked_size() {
     let borrowed = parse_metadata_to_cache_info(&metadata);
     let owned = parse_owned_metadata_to_cache_info(metadata);
     assert_eq!(
-        borrowed.dist["1.0.0"]
-            .unpacked_size
+        borrowed
+            .unpacked_size("1.0.0")
             .map(std::num::NonZeroU64::get),
         Some(184_624_992)
     );
     assert_eq!(
-        borrowed.dist["1.0.0"].unpacked_size,
-        owned.dist["1.0.0"].unpacked_size
+        borrowed.unpacked_size("1.0.0"),
+        owned.unpacked_size("1.0.0")
     );
 }
 
@@ -702,12 +694,10 @@ fn parse_metadata_keeps_dependency_cache_sparse_for_empty_versions() {
     );
     let info = parse_metadata_to_cache_info(&meta);
 
-    assert!(!info.deps.contains_key("1.0.1"));
+    assert_eq!(info.dependencies("1.0.1").unwrap().len(), 0);
     assert_eq!(
-        info.deps
-            .get("1.0.0")
-            .and_then(|deps| deps.get("left-pad"))
-            .map(String::as_str),
+        info.dependency("1.0.0", "left-pad")
+            .map(|dependency| dependency.range),
         Some("^1.0.0")
     );
 }
@@ -735,12 +725,10 @@ fn parse_metadata_keeps_peer_dependencies_when_regular_dependency_cache_is_spars
         serde_json::from_value(value).expect("valid PackageMetadata");
     let info = parse_metadata_to_cache_info(&meta);
 
-    assert!(!info.deps.contains_key("1.0.0"));
+    assert_eq!(info.dependencies("1.0.0").unwrap().len(), 0);
     assert_eq!(
-        info.peer_deps
-            .get("1.0.0")
-            .and_then(|deps| deps.get("react"))
-            .map(String::as_str),
+        info.peer_dependency("1.0.0", "react")
+            .map(|peer| peer.range),
         Some("^18.0.0")
     );
 }
@@ -770,18 +758,14 @@ fn parse_metadata_normalizes_npm_aliased_peer_to_canonical_target() {
     let info = parse_metadata_to_cache_info(&metadata);
 
     assert_eq!(
-        info.peer_deps
-            .get("1.0.0")
-            .and_then(|deps| deps.get("react-compat"))
-            .map(String::as_str),
+        info.peer_dependency("1.0.0", "react-compat")
+            .map(|peer| peer.range),
         Some("^18.0.0"),
         "peer ranges must be normalized before semver parsing"
     );
     assert_eq!(
-        info.peer_aliases
-            .get("1.0.0")
-            .and_then(|aliases| aliases.get("react-compat"))
-            .map(String::as_str),
+        info.peer_dependency("1.0.0", "react-compat")
+            .and_then(|peer| peer.alias),
         Some("react"),
         "the local peer slot must retain its canonical provider name"
     );
@@ -814,17 +798,12 @@ fn parse_metadata_regular_dependency_shadows_same_named_peer_requirement() {
     let info = parse_metadata_to_cache_info(&meta);
 
     assert_eq!(
-        info.deps
-            .get("1.0.0")
-            .and_then(|deps| deps.get("zod"))
-            .map(String::as_str),
+        info.dependency("1.0.0", "zod")
+            .map(|dependency| dependency.range),
         Some("^4.3.6")
     );
     assert!(
-        !info
-            .peer_deps
-            .get("1.0.0")
-            .is_some_and(|peers| peers.contains_key("zod")),
+        info.peer_dependency("1.0.0", "zod").is_none(),
         "a regular dependency must not also become peer context"
     );
 }
@@ -870,20 +849,14 @@ fn merge_release_times_fills_missing_platform_axes_without_losing_abbreviated_me
 
     assert_eq!(
         (
-            info.platform.get("1.0.0"),
-            info.deps
-                .get("1.0.0")
-                .and_then(|dependencies| dependencies.get("runtime-helper"))
-                .map(String::as_str),
-            info.dist
-                .get("1.0.0")
-                .and_then(|dist| dist.tarball_url.as_deref()),
-            info.dist
-                .get("1.0.0")
-                .and_then(|dist| dist.published_at.as_deref()),
+            info.platform("1.0.0"),
+            info.dependency("1.0.0", "runtime-helper")
+                .map(|dependency| dependency.range),
+            info.tarball_url("1.0.0"),
+            info.published_at("1.0.0"),
         ),
         (
-            Some(&PlatformMeta {
+            Some(PlatformMeta {
                 os: vec!["linux".to_string()],
                 cpu: vec!["arm64".to_string()],
                 libc: vec!["glibc".to_string()],
@@ -1725,10 +1698,7 @@ fn direct_fetch_uses_direct_full_when_worker_full_omits_release_time() {
     assert_eq!(worker_requests.load(Ordering::SeqCst), 2);
     let cached = provider.cache.get(&key).expect("cache entry should exist");
     assert_eq!(
-        cached
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        cached.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
 }
@@ -1798,9 +1768,6 @@ fn ensure_policy_metadata_trace_records_cached_release_time_hydration() {
     let mut cached = make_info(&["1.0.0"], vec![], vec![], vec![]);
     cached.modified = Some("2025-01-03T00:00:00.000Z".to_string());
     cached.modified_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
-    cached
-        .dist
-        .insert("1.0.0".to_string(), CachedDistInfo::default());
     provider.cache.insert(key.clone(), Arc::new(cached));
 
     provider
@@ -1826,10 +1793,7 @@ fn ensure_policy_metadata_trace_records_cached_release_time_hydration() {
     );
     let hydrated = provider.cache.get(&key).expect("hydrated cache entry");
     assert_eq!(
-        hydrated
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        hydrated.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
 }
@@ -1838,11 +1802,9 @@ fn ensure_policy_metadata_trace_records_cached_release_time_hydration() {
 fn release_age_package_scope_skips_unlisted_transitive_metadata_hydration() {
     let transitive = CanonicalKey::npm("transitive");
     let direct = CanonicalKey::npm("direct");
-    let info = CachedPackageInfo {
-        modified: Some("2025-01-03T00:00:00.000Z".to_string()),
-        modified_unix: parse_npm_time_unix("2025-01-03T00:00:00.000Z"),
-        ..make_info(&["1.0.0"], vec![], vec![], vec![])
-    };
+    let mut info = make_info(&["1.0.0"], vec![], vec![], vec![]);
+    info.modified = Some("2025-01-03T00:00:00.000Z".to_string());
+    info.modified_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
     let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
         86_400,
         parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
@@ -1859,11 +1821,7 @@ fn release_age_package_scope_allows_unlisted_transitive_version() {
     let transitive = CanonicalKey::npm("transitive");
     let direct = CanonicalKey::npm("direct");
     let mut info = make_info(&["1.0.0"], vec![], vec![], vec![]);
-    info.dist
-        .insert("1.0.0".to_string(), CachedDistInfo::default());
-    let dist = info.dist.get_mut("1.0.0").unwrap();
-    dist.published_at = Some("2025-01-03T00:00:00.000Z".to_string());
-    dist.published_at_unix = parse_npm_time_unix("2025-01-03T00:00:00.000Z");
+    set_published_at(&mut info, "1.0.0", "2025-01-03T00:00:00.000Z");
     let policy = ResolverPolicy::with_cutoff_unix_and_release_age_packages(
         86_400,
         parse_npm_time_unix("2025-01-02T00:00:00.000Z").unwrap(),
@@ -1907,14 +1865,7 @@ fn latest_range_fallback_never_exceeds_dist_tag_target() {
         ("3.1.0", "2025-01-03T00:00:00.000Z"),
         ("3.0.0", "2025-01-01T00:00:00.000Z"),
     ] {
-        info.dist.insert(
-            version.to_string(),
-            CachedDistInfo {
-                published_at: Some(published_at.to_string()),
-                published_at_unix: parse_npm_time_unix(published_at),
-                ..CachedDistInfo::default()
-            },
-        );
+        set_published_at(&mut info, version, published_at);
     }
 
     let client = Arc::new(RegistryClient::new());
@@ -2012,6 +1963,7 @@ fn available_versions_cached_hits_on_repeated_query() {
 
     let second = provider.available_versions(&pkg);
     assert_eq!(first, second);
+    assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(provider.available_versions_cache.lock().len(), 1);
 }
 
@@ -2019,22 +1971,8 @@ fn available_versions_cached_hits_on_repeated_query() {
 fn available_versions_cache_invalidates_when_metadata_is_upgraded() {
     let pkg = ResolverPackage::npm("age-gated");
     let mut upgraded = make_info(&["2.0.0", "1.0.0"], vec![], vec![], vec![]);
-    upgraded.dist.insert(
-        "2.0.0".to_string(),
-        CachedDistInfo {
-            published_at: Some("2025-01-03T00:00:00.000Z".to_string()),
-            published_at_unix: parse_npm_time_unix("2025-01-03T00:00:00.000Z"),
-            ..CachedDistInfo::default()
-        },
-    );
-    upgraded.dist.insert(
-        "1.0.0".to_string(),
-        CachedDistInfo {
-            published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
-            published_at_unix: parse_npm_time_unix("2025-01-01T00:00:00.000Z"),
-            ..CachedDistInfo::default()
-        },
-    );
+    set_published_at(&mut upgraded, "2.0.0", "2025-01-03T00:00:00.000Z");
+    set_published_at(&mut upgraded, "1.0.0", "2025-01-01T00:00:00.000Z");
 
     let client = Arc::new(RegistryClient::new());
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2054,13 +1992,16 @@ fn available_versions_cache_invalidates_when_metadata_is_upgraded() {
     let after_upgrade = provider.available_versions(&pkg);
 
     assert_eq!(
-        before_upgrade,
-        vec![
+        before_upgrade.as_ref(),
+        &[
             NpmVersion::parse("2.0.0").unwrap(),
             NpmVersion::parse("1.0.0").unwrap()
         ]
     );
-    assert_eq!(after_upgrade, vec![NpmVersion::parse("1.0.0").unwrap()]);
+    assert_eq!(
+        after_upgrade.as_ref(),
+        &[NpmVersion::parse("1.0.0").unwrap()]
+    );
 }
 
 #[test]

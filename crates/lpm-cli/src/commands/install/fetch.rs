@@ -2825,10 +2825,13 @@ pub(super) fn pick_speculative_version(
 ) -> Option<(String, String, Option<String>)> {
     // dist-tag path (e.g. "latest", "next", "beta")
     if let Some(pinned) = meta.dist_tags.get(range_str)
-        && let Some(dist) = meta.info.dist.get(pinned)
-        && let Some(url) = dist.tarball_url.as_deref()
+        && let Some(url) = meta.info.tarball_url(pinned)
     {
-        return Some((pinned.clone(), url.to_string(), dist.integrity.clone()));
+        return Some((
+            pinned.clone(),
+            url.to_owned(),
+            meta.info.integrity(pinned).map(str::to_owned),
+        ));
     }
 
     let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
@@ -2838,9 +2841,8 @@ pub(super) fn pick_speculative_version(
         .iter()
         .find(|version| range.satisfies(version))?;
     let v_str = version.to_string();
-    let dist = meta.info.dist.get(&v_str)?;
-    let url = dist.tarball_url.clone()?;
-    let integrity = dist.integrity.clone();
+    let url = meta.info.tarball_url(&v_str)?.to_owned();
+    let integrity = meta.info.integrity(&v_str).map(str::to_owned);
     Some((v_str, url, integrity))
 }
 
@@ -2850,21 +2852,17 @@ pub(super) fn push_regular_speculative_dependencies(
     next_depth: u32,
     work_queue: &mut Vec<(String, String, u32, bool)>,
 ) {
-    let Some(deps) = meta.info.deps.get(version) else {
+    let Some(dependencies) = meta.info.dependencies(version) else {
         return;
     };
-    let optional = meta.info.optional_dep_names.get(version);
-    let aliases = meta.info.aliases.get(version);
-    for (dep_name, dep_range) in deps {
-        if optional.is_some_and(|names| names.contains(dep_name)) {
+    for dependency in dependencies {
+        if dependency.optional {
             continue;
         }
-        let target_name = aliases
-            .and_then(|map| map.get(dep_name))
-            .map_or(dep_name.as_str(), String::as_str);
+        let target_name = dependency.alias.unwrap_or(dependency.name);
         work_queue.push((
-            target_name.to_string(),
-            dep_range.clone(),
+            target_name.to_owned(),
+            dependency.range.to_owned(),
             next_depth,
             false,
         ));

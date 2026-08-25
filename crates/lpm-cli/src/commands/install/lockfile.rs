@@ -3249,12 +3249,11 @@ fn resolved_to_unfinalized_install_packages(
             let canonical = CanonicalKey::from(&r.package);
             let (registry_signatures, registry_published_at, unpacked_size) = resolver_cache
                 .get(&canonical)
-                .and_then(|info| info.dist.get(&version))
-                .map(|dist| {
+                .map(|info| {
                     (
-                        dist.signatures.clone(),
-                        dist.published_at.clone(),
-                        dist.unpacked_size,
+                        info.signatures(&version).to_vec(),
+                        info.published_at(&version).map(str::to_owned),
+                        info.unpacked_size(&version),
                     )
                 })
                 .unwrap_or_default();

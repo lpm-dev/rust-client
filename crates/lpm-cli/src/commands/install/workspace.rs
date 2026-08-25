@@ -525,8 +525,6 @@ pub(super) fn workspace_member_cache_info(
     let Ok(pkg) = lpm_workspace::read_package_json(&pkg_json_path) else {
         return Ok(None);
     };
-    let version_string = version.to_string();
-
     let mut dependencies =
         HashMap::with_capacity(pkg.dependencies.len() + pkg.optional_dependencies.len());
     let mut aliases = HashMap::new();
@@ -563,9 +561,6 @@ pub(super) fn workspace_member_cache_info(
         }
     }
 
-    let mut dependencies_by_version = HashMap::with_capacity(1);
-    dependencies_by_version.insert(version_string.clone(), dependencies);
-
     let mut peer_deps_for_version = HashMap::with_capacity(pkg.peer_dependencies.len());
     let mut peer_aliases = HashMap::new();
     for (local_name, raw_specifier) in pkg.peer_dependencies {
@@ -585,64 +580,51 @@ pub(super) fn workspace_member_cache_info(
             peer_deps_for_version.insert(local_name, effective_specifier);
         }
     }
-    let mut peer_dependencies = HashMap::new();
-    if !peer_deps_for_version.is_empty() {
-        peer_dependencies.insert(version_string.clone(), peer_deps_for_version);
-    }
-    let mut peer_aliases_by_version = HashMap::new();
-    if !peer_aliases.is_empty() {
-        peer_aliases_by_version.insert(version_string.clone(), peer_aliases);
-    }
-
-    let mut optional_dependency_names = HashMap::new();
-    if !optional_names.is_empty() {
-        optional_dependency_names.insert(version_string.clone(), optional_names);
-    }
-
     let optional_peers: HashSet<String> = pkg
         .peer_dependencies_meta
         .into_iter()
         .filter_map(|(name, metadata)| metadata.optional.then_some(name))
         .collect();
-    let mut optional_peer_names = HashMap::new();
-    if !optional_peers.is_empty() {
-        optional_peer_names.insert(version_string.clone(), optional_peers);
-    }
+    let manifest_dependencies = dependencies
+        .into_iter()
+        .map(|(name, range)| lpm_resolver::ManifestDependency {
+            alias: aliases.remove(&name),
+            optional: optional_names.contains(&name),
+            name,
+            range,
+            bundled: false,
+        })
+        .collect();
+    let manifest_peers = peer_deps_for_version
+        .into_iter()
+        .map(|(name, range)| lpm_resolver::ManifestPeerDependency {
+            alias: peer_aliases.remove(&name),
+            optional: optional_peers.contains(&name),
+            name,
+            range,
+        })
+        .collect();
+    let manifest = lpm_resolver::ManifestVersion {
+        version: version.clone(),
+        dependencies: manifest_dependencies,
+        peer_dependencies: manifest_peers,
+        node_engine: pkg.engines.get("node").cloned(),
+        platform: None,
+        dist: lpm_resolver::CachedDistInfo::default(),
+    };
 
-    let mut aliases_by_version = HashMap::new();
-    if !aliases.is_empty() {
-        aliases_by_version.insert(version_string.clone(), aliases);
-    }
-
-    let mut node_engines = HashMap::new();
-    if let Some(required) = pkg.engines.get("node") {
-        node_engines.insert(version_string.clone(), required.clone());
-    }
-
-    let mut dist = HashMap::with_capacity(1);
-    dist.insert(version_string, lpm_resolver::CachedDistInfo::default());
-
-    Ok(Some(lpm_resolver::CachedPackageInfo {
-        modified: Some("1970-01-01T00:00:00.000Z".to_string()),
-        modified_unix: Some(0),
-        trust_metadata_complete: true,
-        versions_complete: false,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::from([version.clone()]),
-        platform_metadata_complete: true,
-        latest_version: None,
-        versions: vec![version],
-        deps: dependencies_by_version,
-        peer_deps: peer_dependencies,
-        peer_aliases: peer_aliases_by_version,
-        optional_dep_names: optional_dependency_names,
-        optional_peer_names,
-        node_engines,
-        bundled_dep_names: HashMap::new(),
-        platform: HashMap::new(),
-        dist,
-        aliases: aliases_by_version,
-    }))
+    Ok(Some(
+        lpm_resolver::CachedPackageInfo::from_manifest_versions(
+            Some("1970-01-01T00:00:00.000Z".to_string()),
+            true,
+            false,
+            HashSet::new(),
+            HashSet::from([version]),
+            true,
+            None,
+            vec![manifest],
+        ),
+    ))
 }
 
 pub(super) fn seed_workspace_resolver_cache(

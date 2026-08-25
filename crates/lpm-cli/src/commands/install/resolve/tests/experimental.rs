@@ -6,7 +6,7 @@ use super::super::experimental::{
     unsupported_admission_reasons,
 };
 use super::super::peer::{attach_peer_edges_to_drafts, collect_peer_requirements};
-use super::common::{empty_info_value, fake_draft};
+use super::common::{fake_draft, info_with_peers};
 
 fn contextual_v2_target(
     package: &InstallPackage,
@@ -125,11 +125,7 @@ fn computed_sri_updates_every_contextual_instance_of_matching_artifact() {
 
 #[test]
 fn experimental_resolver_rejects_malformed_required_peer_range() {
-    let mut info = empty_info_value();
-    info.peer_deps.insert(
-        "1.0.0".to_string(),
-        HashMap::from([("runtime".to_string(), "~X0^.00".to_string())]),
-    );
+    let info = info_with_peers("1.0.0", &[("runtime", "~X0^.00")]);
     let mut consumer = fake_draft("consumer", "1.0.0", &[]);
     consumer.info = Arc::new(info);
     let mut packages = HashMap::from([
