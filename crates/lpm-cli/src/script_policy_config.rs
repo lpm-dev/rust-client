@@ -180,6 +180,10 @@ impl ScriptPolicyConfig {
             return Ok(Self::default());
         };
 
+        Ok(Self::from_package_json_value(&parsed))
+    }
+
+    pub(crate) fn from_package_json_value(parsed: &serde_json::Value) -> Self {
         let lpm = parsed.get("lpm");
         let scripts = lpm.and_then(|l| l.get("scripts"));
 
@@ -227,14 +231,14 @@ impl ScriptPolicyConfig {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        Ok(Self {
+        Self {
             policy,
             auto_build,
             deny_all,
             trusted_scopes,
             policy_parse_error,
             triage_advisor,
-        })
+        }
     }
 }
 
@@ -437,6 +441,14 @@ pub fn resolve_script_policy_raw(
     project_config: &ScriptPolicyConfig,
 ) -> crate::precedence::Resolution<ScriptPolicy> {
     let global = GlobalConfig::load();
+    resolve_script_policy_raw_with_global(cli_override, project_config, &global)
+}
+
+pub(crate) fn resolve_script_policy_raw_with_global(
+    cli_override: Option<ScriptPolicy>,
+    project_config: &ScriptPolicyConfig,
+    global: &GlobalConfig,
+) -> crate::precedence::Resolution<ScriptPolicy> {
     let user = global
         .get_str("script-policy")
         .and_then(|s| ScriptPolicy::parse(s).ok());

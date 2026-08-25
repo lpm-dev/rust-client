@@ -119,6 +119,19 @@ pub(crate) fn resolve_effective_linker_with_source(
     cfg: &GlobalConfig,
     project_dir: &Path,
 ) -> Result<(LinkerMode, LinkerModeSource), String> {
+    let workspace_detected = matches!(
+        crate::workspace_discovery_cache::discover_workspace(project_dir),
+        Ok(Some(_))
+    );
+    resolve_effective_linker_with_source_and_workspace(cli_override, pkg, cfg, workspace_detected)
+}
+
+pub(crate) fn resolve_effective_linker_with_source_and_workspace(
+    cli_override: Option<LinkerMode>,
+    pkg: &PackageJson,
+    cfg: &GlobalConfig,
+    workspace_detected: bool,
+) -> Result<(LinkerMode, LinkerModeSource), String> {
     if let Some(mode) = cli_override {
         return Ok((mode, LinkerModeSource::CliFlag));
     }
@@ -149,10 +162,7 @@ pub(crate) fn resolve_effective_linker_with_source(
     // chain) we fall through silently to the default rather than fail
     // the install — the install pipeline still works under Hoisted, so
     // the cost of a recoverable I/O blip should not be a hard error.
-    if matches!(
-        crate::workspace_discovery_cache::discover_workspace(project_dir),
-        Ok(Some(_))
-    ) {
+    if workspace_detected {
         return Ok((
             LinkerMode::Isolated,
             LinkerModeSource::WorkspaceAutoDetected,

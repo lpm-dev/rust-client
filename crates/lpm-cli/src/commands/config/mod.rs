@@ -22,11 +22,11 @@ pub(crate) use wizards::{
 };
 
 use effective::EffectiveConfig;
-use global_config::global_config_view_from_value;
 pub(crate) use io::update_config;
 use io::{
-    config_value_for_display, config_value_to_json, guard_generic_delete_against_force_floor,
-    guard_generic_set_against_force_floor, read_config,
+    config_value_at_path, config_value_for_display, config_value_to_json,
+    guard_generic_delete_against_force_floor, guard_generic_set_against_force_floor, read_config,
+    redact_config_json_value, remove_config_value_at_path,
 };
 use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY, RELEASE_AGE_KEY,
@@ -37,11 +37,7 @@ use wizards::{
     format_current_firewall_mode, format_current_integrity_policy, format_current_lpm_skills,
     format_current_release_age, format_current_typosquat_guard, parse_config_bool,
     parse_firewall_mode_selection, parse_integrity_policy_selection, parse_sigstore_assignment,
-    parse_typosquat_guard_selection, read_auto_install_lpm_skills, read_bool_value,
-    read_fetch_lpm_security_insights, read_firewall_mode, read_install_time_source_analysis,
-    read_integrity_policy, read_release_age_override, read_release_age_policy_override,
-    read_sandbox_mode, read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
-    read_string_value, read_typosquat_guard_override, reject_looser_typosquat_guard_write,
+    parse_typosquat_guard_selection, read_string_value, reject_looser_typosquat_guard_write,
     run_firewall_wizard, run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard,
     run_lpm_skills_wizard, run_release_age_policy_wizard, run_release_age_wizard,
     run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard, run_sigstore_wizard,
@@ -124,6 +120,7 @@ pub async fn run(
     set: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    validate_action_arguments(action, key, value, set)?;
     let config_path = LpmRoot::from_env()?.root().join("config.toml");
 
     let Some(action) = action else {
@@ -190,7 +187,9 @@ pub async fn run(
         "get" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let config = read_config(&config_path)?;
-            let value = config.get(key);
+            let value = config
+                .as_table()
+                .and_then(|table| config_value_at_path(table, key));
             if json_output {
                 let envelope = serde_json::json!({
                     "success": true,
@@ -204,7 +203,10 @@ pub async fn run(
                 if let Some(raw) = value.as_str() {
                     println!("{}", lpm_common::sanitize_terminal_inline(raw));
                 } else {
-                    println!("{}", config_value_for_display(value));
+                    println!(
+                        "{}",
+                        lpm_common::sanitize_terminal_inline(&config_value_for_display(value))
+                    );
                 }
             } else {
                 install_ui::warn_untrusted(&format!("{key} is not set"));
@@ -308,9 +310,8 @@ pub async fn run(
                     RELEASE_AGE_POLICY_KEY => {
                         let requested =
                             crate::release_age_config::ReleaseAgePolicy::parse(key, value)?;
-                        let global = global_config_view_from_value(config);
                         crate::security_floor::reject_looser_release_age_policy_write(
-                            &global, requested,
+                            config, requested,
                         )?;
                         crate::security_approval::authorize_persistent_release_age_policy(
                             requested,
@@ -339,8 +340,7 @@ pub async fn run(
                     }
                     TYPOSQUAT_GUARD_KEY => {
                         let requested = parse_typosquat_guard_selection(value)?;
-                        let global = global_config_view_from_value(config);
-                        reject_looser_typosquat_guard_write(&global, requested)?;
+                        reject_looser_typosquat_guard_write(config, requested)?;
                         crate::security_approval::authorize_persistent_typosquat_guard(
                             requested,
                             json_output,
@@ -349,7 +349,8 @@ pub async fn run(
                     }
                     _ => {}
                 }
-                if let Some(table) = config.as_table_mut() {
+                {
+                    let table = config.table_mut();
                     if key == AUTO_INSTALL_LPM_SKILLS_KEY {
                         table.remove(LEGACY_NO_SKILLS_KEY);
                     }
@@ -429,6 +430,9 @@ pub async fn run(
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
             let existed = update_config(&config_path, |config| {
+                if config_value_at_path(config.table(), key).is_none() {
+                    return Ok((false, false));
+                }
                 guard_generic_delete_against_force_floor(config, key)?;
                 match key {
                     SCRIPT_POLICY_KEY => {
@@ -445,7 +449,7 @@ pub async fn run(
                     )?,
                     RELEASE_AGE_POLICY_KEY => {
                         crate::security_floor::reject_looser_release_age_policy_write(
-                            &global_config_view_from_value(config),
+                            config,
                             crate::release_age_config::ReleaseAgePolicy::Direct,
                         )?;
                         crate::security_approval::authorize_persistent_release_age_policy(
@@ -454,11 +458,20 @@ pub async fn run(
                             &format!("lpm config delete {key}"),
                         )?;
                     }
-                    "sandbox" => crate::security_approval::authorize_persistent_sandbox_mode(
-                        ResolvedSandboxMode::Default,
-                        json_output,
-                        "lpm config delete sandbox",
-                    )?,
+                    "sandbox" | "sandbox.mode" => {
+                        crate::security_approval::authorize_persistent_sandbox_mode(
+                            ResolvedSandboxMode::Default,
+                            json_output,
+                            &format!("lpm config delete {key}"),
+                        )?
+                    }
+                    "sigstore" | "sigstore.verify" => {
+                        crate::security_approval::authorize_persistent_sigstore(
+                            crate::provenance_fetch::EnforceMode::Deny,
+                            json_output,
+                            &format!("lpm config delete {key}"),
+                        )?;
+                    }
                     TYPOSQUAT_GUARD_KEY => {
                         crate::security_approval::authorize_persistent_typosquat_guard(
                             TyposquatGuardSelection::Default,
@@ -466,9 +479,9 @@ pub async fn run(
                             &format!("lpm config delete {key}"),
                         )?;
                     }
-                    FIREWALL_CONFIG_SECTION => {
+                    FIREWALL_CONFIG_SECTION | "firewall.mode" => {
                         crate::security_floor::reject_looser_firewall_mode_write(
-                            &global_config_view_from_value(config),
+                            config,
                             NpmFirewallMode::Off,
                         )?;
                         crate::security_approval::authorize_persistent_npm_firewall_mode(
@@ -486,8 +499,8 @@ pub async fn run(
                     }
                     _ => {}
                 }
-                let existed = config.as_table_mut().and_then(|t| t.remove(key)).is_some();
-                Ok((existed, true))
+                let existed = remove_config_value_at_path(config.table_mut(), key);
+                Ok((existed, existed))
             })
             .await?;
             if json_output {
@@ -501,17 +514,21 @@ pub async fn run(
                     })
                 );
             } else {
-                install_ui::done_line(crate::install_ui::terminal_line!(
-                    "Deleted {}",
-                    install_ui::bold(key)
-                ));
+                if existed {
+                    install_ui::done_line(crate::install_ui::terminal_line!(
+                        "Deleted {}",
+                        install_ui::bold(key)
+                    ));
+                } else {
+                    install_ui::warn_untrusted(&format!("{key} was not set"));
+                }
             }
         }
         "list" | "ls" => {
             let current_dir = std::env::current_dir()?;
             let config = EffectiveConfig::load(&current_dir)?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&config.to_json())?);
+                config.print_json()?;
             } else {
                 config.print_human();
             }
@@ -534,6 +551,11 @@ fn announce_generic_set(
     json_value: serde_json::Value,
     json_output: bool,
 ) {
+    let json_value = redact_config_json_value(key, json_value);
+    let display_value = match &json_value {
+        serde_json::Value::String(value) => value.as_str(),
+        _ => display_value,
+    };
     if json_output {
         let envelope = serde_json::json!({
             "success": true,
@@ -543,12 +565,42 @@ fn announce_generic_set(
         });
         println!("{envelope}");
     } else {
+        let key = lpm_common::sanitize_terminal_inline(key);
+        let display_value = lpm_common::sanitize_terminal_inline(display_value);
         install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · {} = {}",
             key,
             install_ui::section(&format!("\"{display_value}\""))
         ));
     }
+}
+
+fn validate_action_arguments(
+    action: Option<&str>,
+    key: Option<&str>,
+    value: Option<&str>,
+    set: Option<&str>,
+) -> Result<(), LpmError> {
+    let invalid = match action {
+        None => key.is_some() || value.is_some() || set.is_some(),
+        Some("get" | "delete" | "unset") => key.is_none() || value.is_some() || set.is_some(),
+        Some("set") => key.is_none() || value.is_none() || set.is_some(),
+        Some("list" | "ls") => key.is_some() || value.is_some() || set.is_some(),
+        Some("release-age-exclude") => false,
+        Some(
+            "scripts" | "triage" | "sandbox" | "sigstore" | "signatures" | "trust-policy"
+            | "typosquat" | "firewall" | "integrity" | "release-age" | "release-age-policy"
+            | "source-analysis" | "lpm-dev" | "lpm-skills" | "lpm-insights",
+        ) => key.is_some() || value.is_some(),
+        Some(_) => false,
+    };
+    if invalid {
+        let action = action.unwrap_or("guided editor");
+        return Err(LpmError::Registry(format!(
+            "invalid arguments for `lpm config {action}`; run `lpm config --help` for the supported command shape"
+        )));
+    }
+    Ok(())
 }
 
 async fn run_guided_config_menu(
@@ -714,43 +766,65 @@ struct GuidedConfigSummary {
 fn read_guided_config_summary(
     config_path: &std::path::Path,
 ) -> Result<GuidedConfigSummary, LpmError> {
+    let global = GlobalConfig::from_value(read_config(config_path)?)?;
+    let sandbox_mode = global
+        .get_table("sandbox")
+        .and_then(|table| table.get("mode"))
+        .and_then(toml::Value::as_str);
+    let sigstore_value = |key: &str| {
+        global
+            .get_table("sigstore")
+            .and_then(|table| table.get(key))
+            .and_then(toml::Value::as_str)
+    };
+    let release_age_policy = global
+        .get_str(RELEASE_AGE_POLICY_KEY)
+        .map(|raw| crate::release_age_config::ReleaseAgePolicy::parse(RELEASE_AGE_POLICY_KEY, raw))
+        .transpose()?;
     Ok(GuidedConfigSummary {
-        script_policy: read_string_value(config_path, SCRIPT_POLICY_KEY)?
+        script_policy: global
+            .get_str(SCRIPT_POLICY_KEY)
+            .map(str::to_string)
             .filter(|value| SCRIPT_POLICY_VALUES.contains(&value.as_str()))
             .unwrap_or_else(|| "deny".to_string()),
-        triage_advisor: read_string_value(config_path, TRIAGE_ADVISOR_KEY)?
+        triage_advisor: global
+            .get_str(TRIAGE_ADVISOR_KEY)
+            .map(str::to_string)
             .filter(|value| TRIAGE_ADVISOR_VALUES.contains(&value.as_str()))
             .unwrap_or_else(|| "none".to_string()),
-        sandbox_mode: read_sandbox_mode(config_path)?
-            .filter(|value| SANDBOX_MODE_VALUES.contains(&value.as_str()))
-            .unwrap_or_else(|| "default".to_string()),
-        sigstore_verify: read_sigstore_verify(config_path)?
-            .filter(|value| SIGSTORE_VERIFY_VALUES.contains(&value.as_str()))
-            .unwrap_or_else(|| "deny".to_string()),
-        sigstore_scope: read_sigstore_scope(config_path)?
-            .filter(|value| SIGSTORE_SCOPE_VALUES.contains(&value.as_str()))
-            .unwrap_or_else(|| "approved".to_string()),
-        sigstore_availability: read_sigstore_availability(config_path)?
-            .filter(|value| SIGSTORE_AVAILABILITY_VALUES.contains(&value.as_str()))
-            .unwrap_or_else(|| "best-effort".to_string()),
-        signatures: format_bool_enabled(
-            read_bool_value(config_path, SIGNATURES_KEY)?.unwrap_or(false),
-        ),
-        trust_policy: read_string_value(config_path, TRUST_POLICY_KEY)?
+        sandbox_mode: sandbox_mode
+            .filter(|value| SANDBOX_MODE_VALUES.contains(value))
+            .map_or_else(|| "default".to_string(), str::to_string),
+        sigstore_verify: sigstore_value("verify")
+            .filter(|value| SIGSTORE_VERIFY_VALUES.contains(value))
+            .map_or_else(|| "deny".to_string(), str::to_string),
+        sigstore_scope: sigstore_value("scope")
+            .filter(|value| SIGSTORE_SCOPE_VALUES.contains(value))
+            .map_or_else(|| "approved".to_string(), str::to_string),
+        sigstore_availability: sigstore_value("availability")
+            .filter(|value| SIGSTORE_AVAILABILITY_VALUES.contains(value))
+            .map_or_else(|| "best-effort".to_string(), str::to_string),
+        signatures: format_bool_enabled(global.get_bool(SIGNATURES_KEY).unwrap_or(false)),
+        trust_policy: global
+            .get_str(TRUST_POLICY_KEY)
+            .map(str::to_string)
             .filter(|value| TRUST_POLICY_VALUES.contains(&value.as_str()))
             .unwrap_or_else(|| "off".to_string()),
-        typosquat_guard: format_current_typosquat_guard(read_typosquat_guard_override(
-            config_path,
+        typosquat_guard: format_current_typosquat_guard(global.get_typosquat_guard_mode()),
+        firewall_mode: format_current_firewall_mode(crate::npm_firewall_config::config_mode(
+            &global,
         )?),
-        firewall_mode: format_current_firewall_mode(read_firewall_mode(config_path)?),
-        integrity_mode: format_current_integrity_policy(read_integrity_policy(config_path)?),
-        release_age: format_current_release_age(read_release_age_override(config_path)?),
-        release_age_policy: read_release_age_policy_override(config_path)?
-            .unwrap_or_default()
-            .as_str()
-            .to_string(),
-        source_analysis: format_bool_enabled(read_install_time_source_analysis(config_path)?),
-        lpm_skills: format_current_lpm_skills(read_auto_install_lpm_skills(config_path)?),
-        lpm_insights: format_bool_enabled(read_fetch_lpm_security_insights(config_path)?),
+        integrity_mode: format_current_integrity_policy(global.get_integrity_policy()?),
+        release_age: format_current_release_age(global.get_u64(RELEASE_AGE_KEY)),
+        release_age_policy: release_age_policy.unwrap_or_default().as_str().to_string(),
+        source_analysis: format_bool_enabled(
+            crate::source_analysis_config::read_install_time_source_analysis(&global)?,
+        ),
+        lpm_skills: format_current_lpm_skills(
+            crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?,
+        ),
+        lpm_insights: format_bool_enabled(
+            crate::lpm_insights_config::read_fetch_lpm_security_insights(&global)?,
+        ),
     })
 }

@@ -51,7 +51,7 @@ pub(in crate::commands::config) fn read_auto_install_lpm_skills(
     config_path: &std::path::Path,
 ) -> Result<bool, LpmError> {
     let config = read_config(config_path)?;
-    LpmSkillsPreference::Config.resolve(&global_config_view_from_value(&config))
+    LpmSkillsPreference::Config.resolve(&GlobalConfig::from_value(config)?)
 }
 
 pub(in crate::commands::config) fn format_current_lpm_skills(enabled: bool) -> &'static str {
@@ -67,9 +67,7 @@ async fn persist_auto_install_lpm_skills(
     enabled: bool,
 ) -> Result<(), LpmError> {
     update_config(config_path, |config| {
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.remove(LEGACY_NO_SKILLS_KEY);
         table.insert(
             AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),

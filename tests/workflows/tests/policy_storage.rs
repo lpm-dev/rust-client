@@ -6,7 +6,7 @@ use lpm_common::atomic_write::is_atomic_temp_name;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
-    wait_for_lock_contention, write_signed_unlock_for,
+    wait_for_lock_contention, write_signed_release_age_exclusion_posture, write_signed_unlock_for,
 };
 
 const VERSION: &str = "1.0.0";
@@ -121,6 +121,7 @@ async fn release_age_layers_merge_for_install_without_cross_persistence() {
     );
     project.write_file("lpm.lock", "lockfile-before-policy-commands\n");
     seed_global_lifecycle_trust(&project);
+    write_signed_release_age_exclusion_posture(&project, &["@company/*"]);
     let global_trust_before = std::fs::read(global_trust_path(&project)).unwrap();
 
     let user_add = lpm(&project)

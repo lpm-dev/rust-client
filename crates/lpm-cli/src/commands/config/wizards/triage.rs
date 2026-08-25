@@ -29,8 +29,9 @@ pub(in crate::commands::config) async fn run_triage_wizard(
     }
 
     // Cross-prompt: triage-advisor is inert unless script-policy = triage.
-    let current_policy =
-        read_string_value(config_path, SCRIPT_POLICY_KEY)?.unwrap_or_else(|| "deny".to_string());
+    let current_policy = read_string_value(config_path, SCRIPT_POLICY_KEY)?
+        .filter(|value| SCRIPT_POLICY_VALUES.contains(&value.as_str()))
+        .unwrap_or_else(|| "deny".to_string());
     if current_policy != "triage" {
         println!();
         println!(

@@ -40,6 +40,29 @@ pub(crate) fn resolve_workspace_concurrency(
     Ok(default_workspace_concurrency())
 }
 
+pub(crate) fn resolve_workspace_concurrency_from_tables(
+    project: &toml::map::Map<String, toml::Value>,
+    global: &crate::commands::config::GlobalConfig,
+    project_source: &Path,
+    global_source: &Path,
+) -> Result<NonZeroUsize, LpmError> {
+    if let Some(workspace) = project.get("workspace") {
+        let workspace = workspace.as_table().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "{}: `workspace` must be a TOML table when present",
+                project_source.display()
+            ))
+        })?;
+        if let Some(value) = workspace.get("concurrency") {
+            return parse_config_value(project_source, "workspace.concurrency", value);
+        }
+    }
+    if let Some(value) = global.get_value("workspace-concurrency") {
+        return parse_config_value(global_source, "workspace-concurrency", value);
+    }
+    Ok(default_workspace_concurrency())
+}
+
 fn read_project_workspace_concurrency_from_file(
     path: &Path,
 ) -> Result<Option<NonZeroUsize>, LpmError> {

@@ -39,21 +39,38 @@ use std::path::{Path, PathBuf};
 /// for a malformed user config (the install pipeline has its own
 /// stricter loader if we ever add one).
 pub fn resolve_relay_url() -> String {
-    if let Ok(val) = std::env::var("LPM_TUNNEL_RELAY")
-        && !val.trim().is_empty()
-    {
-        let trimmed = val.trim().to_string();
-        return accept_relay_override(&trimmed, "LPM_TUNNEL_RELAY");
+    if let Some(value) = relay_url_from_env() {
+        return accept_relay_override(&value, "LPM_TUNNEL_RELAY");
     }
+    let config_value = lpm_common::LpmRoot::from_env()
+        .ok()
+        .and_then(|root| read_relay_url_from_config(&root.root().join("config.toml")));
+    resolve_config_relay_url(config_value.as_deref())
+}
 
-    if let Ok(root) = lpm_common::LpmRoot::from_env() {
-        let path = root.root().join("config.toml");
-        if let Some(val) = read_relay_url_from_config(&path) {
-            return accept_relay_override(&val, "LPM config.toml tunnel.relay-url");
-        }
+pub fn resolve_relay_url_from_config_value(config_value: Option<&str>) -> String {
+    if let Some(value) = relay_url_from_env() {
+        return accept_relay_override(&value, "LPM_TUNNEL_RELAY");
+    }
+    resolve_config_relay_url(config_value)
+}
+
+fn resolve_config_relay_url(config_value: Option<&str>) -> String {
+    if let Some(value) = config_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return accept_relay_override(value, "LPM config.toml tunnel.relay-url");
     }
 
     crate::DEFAULT_RELAY_URL.to_string()
+}
+
+fn relay_url_from_env() -> Option<String> {
+    std::env::var("LPM_TUNNEL_RELAY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Gate a relay-URL override and log its use.

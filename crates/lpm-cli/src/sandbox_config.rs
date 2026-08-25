@@ -82,11 +82,8 @@ pub fn load_sandbox_options_with_mode(
     let project_path = project_dir.join("lpm.toml");
     let project = read_sandbox_keys_from_file(&project_path)?;
 
-    let global_path = dirs::home_dir().map(|h| h.join(".lpm").join("config.toml"));
-    let global = match global_path {
-        Some(ref p) => read_sandbox_keys_from_file(p)?,
-        None => RawSandboxKeys::default(),
-    };
+    let global_path = lpm_common::LpmRoot::from_env()?.root().join("config.toml");
+    let global = read_sandbox_keys_from_file(&global_path)?;
 
     Ok(merge(project, global))
 }
@@ -117,11 +114,8 @@ pub fn resolve_sandbox_mode_from_chain(
     let project_path = project_dir.join("lpm.toml");
     let mut project = read_sandbox_keys_from_file(&project_path)?;
 
-    let global_path = dirs::home_dir().map(|h| h.join(".lpm").join("config.toml"));
-    let global = match global_path {
-        Some(ref p) => read_sandbox_keys_from_file(p)?,
-        None => RawSandboxKeys::default(),
-    };
+    let global_path = lpm_common::LpmRoot::from_env()?.root().join("config.toml");
+    let global = read_sandbox_keys_from_file(&global_path)?;
     let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
     let authorized_mode = authorized.sandbox_mode();
     let authorized_mode_key = match authorized_mode {
@@ -396,6 +390,25 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
         }
     };
 
+    read_sandbox_keys_from_table(&table, &path.display().to_string())
+}
+
+pub(crate) fn load_sandbox_options_from_tables(
+    project: &toml::map::Map<String, toml::Value>,
+    global: &crate::commands::config::GlobalConfig,
+    project_source: &str,
+    global_source: &str,
+) -> Result<(SandboxOptions, ResolvedSandboxMode), LpmError> {
+    Ok(merge(
+        read_sandbox_keys_from_table(project, project_source)?,
+        read_sandbox_keys_from_table(global.table(), global_source)?,
+    ))
+}
+
+fn read_sandbox_keys_from_table(
+    table: &toml::map::Map<String, toml::Value>,
+    source: &str,
+) -> Result<RawSandboxKeys, LpmError> {
     let mut keys = RawSandboxKeys::default();
 
     // The surface lives under `[sandbox]`. A bare
@@ -406,7 +419,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
         let sb_table = sandbox_section.as_table().ok_or_else(|| {
             LpmError::Registry(format!(
                 "{}: `[sandbox]` must be a TOML table, got {sandbox_section}",
-                path.display(),
+                source,
             ))
         })?;
 
@@ -416,7 +429,7 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
                     "{}: `[sandbox] allow-degraded` must be a boolean (`true`, `false`) or one \
                      of the string aliases (\"true\", \"false\", \"1\", \"0\", \"yes\", \"no\"), \
                      got {value}",
-                    path.display(),
+                    source,
                 ))
             })?);
         }
@@ -429,14 +442,14 @@ fn read_sandbox_keys_from_file(path: &Path) -> Result<RawSandboxKeys, LpmError> 
             let raw = value.as_str().ok_or_else(|| {
                 LpmError::Registry(format!(
                     "{}: `[sandbox] mode` must be a string, got {value}",
-                    path.display(),
+                    source,
                 ))
             })?;
             let parsed = SandboxModeKey::parse(raw).ok_or_else(|| {
                 LpmError::Registry(format!(
                     "{}: `[sandbox] mode` must be one of \"default\", \"strict\", \"none\", \
                      got {raw:?}",
-                    path.display(),
+                    source,
                 ))
             })?;
             keys.mode = Some(parsed);

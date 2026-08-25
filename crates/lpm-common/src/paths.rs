@@ -656,12 +656,15 @@ fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    options.open(lock_path)
 }
 
 fn open_capability_lock_file(
@@ -1160,18 +1163,27 @@ pub fn try_acquire_exclusive_lock(
     let queue_file = open_lock_file(&queue_path)?;
     let mut queue_rw = fd_lock::RwLock::new(queue_file);
     if !try_acquire(&mut queue_rw, LockMode::Shared)? {
+        if let Some(callback) = test_lock_contention_callback(data_path) {
+            callback();
+        }
         return Ok(None);
     }
 
     let intent_file = open_lock_file(&intent_path)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
     if !try_acquire(&mut intent_rw, LockMode::Exclusive)? {
+        if let Some(callback) = test_lock_contention_callback(data_path) {
+            callback();
+        }
         return Ok(None);
     }
 
     let data_file = open_lock_file(data_path)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
     if !try_acquire(&mut data_rw, LockMode::Exclusive)? {
+        if let Some(callback) = test_lock_contention_callback(data_path) {
+            callback();
+        }
         return Ok(None);
     }
 

@@ -26,7 +26,9 @@ pub(in crate::commands::config) async fn run_sandbox_wizard(
         ));
     }
 
-    let current = read_sandbox_mode(config_path)?.unwrap_or_else(|| "default".to_string());
+    let current = read_sandbox_mode(config_path)?
+        .filter(|value| SANDBOX_MODE_VALUES.contains(&value.as_str()))
+        .unwrap_or_else(|| "default".to_string());
     println!();
     println!("  current: {}", current.cyan());
     let new_value: &str = cliclack::select("How strict should the install-time sandbox be?")
@@ -100,16 +102,14 @@ pub(in crate::commands::config) async fn apply_sandbox_mode(
     let requested = ResolvedSandboxMode::parse_for_security_floor(value)
         .ok_or_else(|| LpmError::Registry(format!("invalid sandbox mode '{value}'")))?;
     update_config(config_path, |config| {
-        let global = global_config_view_from_value(config);
-        crate::security_floor::reject_looser_sandbox_mode_write(&global, requested)?;
+        validate_sandbox_table(config, config_path)?;
+        crate::security_floor::reject_looser_sandbox_mode_write(config, requested)?;
         crate::security_approval::authorize_persistent_sandbox_mode(
             requested,
             json_output,
             proposed_command,
         )?;
-        let top = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let top = config.table_mut();
         let sandbox_section = top
             .entry("sandbox".to_string())
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
@@ -123,6 +123,22 @@ pub(in crate::commands::config) async fn apply_sandbox_mode(
         Ok(((), true))
     })
     .await
+}
+
+fn validate_sandbox_table(
+    config: &GlobalConfig,
+    config_path: &std::path::Path,
+) -> Result<(), LpmError> {
+    if config
+        .get_value("sandbox")
+        .is_some_and(|section| !section.is_table())
+    {
+        return Err(LpmError::Registry(format!(
+            "{}: `[sandbox]` is not a TOML table — refusing to clobber",
+            config_path.display(),
+        )));
+    }
+    Ok(())
 }
 
 pub(in crate::commands::config) fn read_sandbox_mode(

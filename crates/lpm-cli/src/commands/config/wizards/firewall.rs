@@ -144,8 +144,8 @@ async fn apply_firewall_selection(
 ) -> Result<(), LpmError> {
     let mode = selection.mode();
     update_config(config_path, |config| {
-        let global = global_config_view_from_value(config);
-        crate::security_floor::reject_looser_firewall_mode_write(&global, mode)?;
+        validate_firewall_selection_target(config, selection)?;
+        crate::security_floor::reject_looser_firewall_mode_write(config, mode)?;
         crate::security_approval::authorize_persistent_npm_firewall_mode(
             mode,
             json_output,
@@ -158,6 +158,38 @@ async fn apply_firewall_selection(
         Ok(((), true))
     })
     .await
+}
+
+fn validate_firewall_selection_target(
+    config: &GlobalConfig,
+    selection: FirewallWizardSelection,
+) -> Result<(), LpmError> {
+    let Some(firewall) = config.get_value(FIREWALL_CONFIG_SECTION) else {
+        return Ok(());
+    };
+    let firewall = firewall.as_table().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "`{FIREWALL_CONFIG_SECTION}` is not a TOML table — refusing to clobber"
+        ))
+    })?;
+    if selection.policy_profile().is_none() {
+        return Ok(());
+    }
+    let Some(npm) = firewall.get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION) else {
+        return Ok(());
+    };
+    let npm = npm
+        .as_table()
+        .ok_or_else(|| LpmError::Registry("`firewall.npm` is not a TOML table".to_string()))?;
+    if npm
+        .get(crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION)
+        .is_some_and(|policies| !policies.is_table())
+    {
+        return Err(LpmError::Registry(
+            "`firewall.npm.policies` is not a TOML table".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(in crate::commands::config) fn parse_firewall_mode_selection(
@@ -182,12 +214,10 @@ pub(in crate::commands::config) fn read_firewall_mode(
 }
 
 pub(in crate::commands::config) fn persist_firewall_mode_in_config_value(
-    cfg: &mut toml::Value,
+    cfg: &mut GlobalConfig,
     mode: NpmFirewallMode,
 ) -> Result<(), LpmError> {
-    let top = cfg.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
+    let top = cfg.table_mut();
     let firewall_section = top
         .entry(FIREWALL_CONFIG_SECTION.to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
@@ -204,12 +234,10 @@ pub(in crate::commands::config) fn persist_firewall_mode_in_config_value(
 }
 
 pub(in crate::commands::config) fn persist_firewall_policy_profile_in_config_value(
-    cfg: &mut toml::Value,
+    cfg: &mut GlobalConfig,
     profile: NpmFirewallPolicyProfile,
 ) -> Result<(), LpmError> {
-    let top = cfg.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("config.toml must be a TOML table at the top level".into())
-    })?;
+    let top = cfg.table_mut();
     let firewall_table = top
         .entry(FIREWALL_CONFIG_SECTION.to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -471,7 +499,7 @@ fn read_firewall_policy_profile(
     config_path: &std::path::Path,
 ) -> Result<NpmFirewallPolicyProfile, LpmError> {
     let cfg = read_config(config_path)?;
-    crate::npm_firewall_config::config_policy_profile(&global_config_view_from_value(&cfg))
+    crate::npm_firewall_config::config_policy_profile(&GlobalConfig::from_value(cfg)?)
 }
 
 fn should_persist_firewall_policy_profile(

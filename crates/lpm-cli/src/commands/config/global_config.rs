@@ -6,14 +6,6 @@ use super::wizards::{
     TyposquatGuardSelection, parse_integrity_policy_selection,
 };
 
-pub(super) fn global_config_view_from_value(config: &toml::Value) -> GlobalConfig {
-    let table = match config {
-        toml::Value::Table(t) => t.clone(),
-        _ => toml::map::Map::new(),
-    };
-    GlobalConfig { table }
-}
-
 /// Read the global config file (~/.lpm/config.toml) once and provide
 /// typed accessors. Cheap to construct (one file read, cached in struct).
 pub struct GlobalConfig {
@@ -21,6 +13,31 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
+    pub(in crate::commands::config) fn from_value(value: toml::Value) -> Result<Self, LpmError> {
+        match value {
+            toml::Value::Table(table) => Ok(Self { table }),
+            _ => Err(LpmError::Registry(
+                "config.toml must be a TOML table at the top level".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn table(&self) -> &toml::map::Map<String, toml::Value> {
+        &self.table
+    }
+
+    pub(crate) fn table_mut(&mut self) -> &mut toml::map::Map<String, toml::Value> {
+        &mut self.table
+    }
+
+    pub(in crate::commands::config) fn into_value(self) -> toml::Value {
+        toml::Value::Table(self.table)
+    }
+
+    pub(in crate::commands::config) fn into_table(self) -> toml::map::Map<String, toml::Value> {
+        self.table
+    }
+
     /// Load from the configured LPM root's config.toml. Returns empty
     /// config if missing or unreadable.
     pub fn load() -> Self {

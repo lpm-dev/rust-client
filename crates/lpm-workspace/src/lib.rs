@@ -37,8 +37,8 @@ pub use discovery::{
 pub use error::WorkspaceError;
 pub use package_json::{
     BinConfig, CatalogMode, LpmConfig, PackageJson, PatchedDependencyEntry, PeerDependencyMeta,
-    PeerDependencyRules, PeerDepsResult, PnpmRaw, WorkspacesConfig, parse_bin_field,
-    parse_peer_dependencies, read_package_json, read_peer_dependencies,
+    PeerDependencyRules, PeerDepsResult, PnpmRaw, WorkspacesConfig, package_json_from_value,
+    parse_bin_field, parse_peer_dependencies, read_package_json, read_peer_dependencies,
 };
 pub use protocols::{
     CatalogProtocolError, CatalogProtocolResolution, resolve_catalog_protocol,

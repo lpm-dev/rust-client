@@ -40,11 +40,7 @@ pub(in crate::commands::config) async fn run_source_analysis_wizard(
     };
 
     update_config(config_path, |config| {
-        if !enabled
-            && crate::security_floor::force_security_floor_enabled(&global_config_view_from_value(
-                config,
-            ))
-        {
+        if !enabled && crate::security_floor::force_security_floor_enabled(config) {
             return Err(crate::security_floor::security_floor_write_error(
                 INSTALL_TIME_SOURCE_ANALYSIS_KEY,
                 "false",
@@ -56,9 +52,7 @@ pub(in crate::commands::config) async fn run_source_analysis_wizard(
             json_output,
             &format!("lpm config source-analysis --set {enabled}"),
         )?;
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.insert(
             INSTALL_TIME_SOURCE_ANALYSIS_KEY.to_string(),
             toml::Value::Boolean(enabled),
@@ -74,7 +68,7 @@ pub(in crate::commands::config) fn read_install_time_source_analysis(
     config_path: &std::path::Path,
 ) -> Result<bool, LpmError> {
     let config = read_config(config_path)?;
-    crate::source_analysis_config::read_install_time_source_analysis(
-        &global_config_view_from_value(&config),
-    )
+    crate::source_analysis_config::read_install_time_source_analysis(&GlobalConfig::from_value(
+        config,
+    )?)
 }

@@ -836,10 +836,7 @@ pub fn load_sandbox_read_allow(
     project_dir: &Path,
     user_extra_paths: &[String],
 ) -> Result<Vec<PathBuf>, SandboxError> {
-    let project_dir_canon = logical_normalize(project_dir);
-
-    // Per-project list from package.json.
-    let mut entries: Vec<(String, usize, &'static str)> = Vec::new();
+    let mut project_entries = Vec::new();
     let project_raw = match lpm_common::read_text_file_capped(
         package_json,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
@@ -879,14 +876,28 @@ pub fn load_sandbox_read_allow(
                         item
                     ),
                 })?;
-                entries.push((s.to_string(), i, "package.json"));
+                project_entries.push(s.to_string());
             }
         }
     }
 
-    // Per-user list from ~/.lpm/config.toml.
+    resolve_sandbox_read_allow(project_dir, &project_entries, user_extra_paths)
+}
+
+/// Validate and resolve already-parsed project and user read-allow entries.
+pub fn resolve_sandbox_read_allow(
+    project_dir: &Path,
+    project_entries: &[String],
+    user_extra_paths: &[String],
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let project_dir_canon = logical_normalize(project_dir);
+    let mut entries = Vec::with_capacity(project_entries.len() + user_extra_paths.len());
+    for (index, path) in project_entries.iter().enumerate() {
+        entries.push((path.as_str(), index, "package.json"));
+    }
+
     for (i, s) in user_extra_paths.iter().enumerate() {
-        entries.push((s.clone(), i, "~/.lpm/config.toml > script-read-allow"));
+        entries.push((s.as_str(), i, "~/.lpm/config.toml > script-read-allow"));
     }
 
     // Validate + resolve each entry.
@@ -901,7 +912,7 @@ pub fn load_sandbox_read_allow(
                 ),
             });
         }
-        let authored_path = PathBuf::from(&authored);
+        let authored_path = PathBuf::from(authored);
         let joined = if authored_path.is_absolute() {
             authored_path.clone()
         } else {
