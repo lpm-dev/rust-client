@@ -19,6 +19,19 @@ use support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
+fn git(project: &TempProject, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project.path())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ─── default scoped config ────────────────────────────────────────────
 
 #[test]
@@ -46,6 +59,146 @@ fn setup_ci_without_bearer_fails_before_writing_dot_npmrc() {
     assert!(
         stderr.contains("LPM_TOKEN") && stderr.contains("lpm login"),
         "failure must explain how to supply a bearer, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn setup_ci_refuses_to_write_a_tracked_npmrc() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci npmrc with tracked npmrc");
+
+    assert!(!output.status.success(), "tracked npmrc must be refused");
+    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tracked"),
+        "error must explain the git-index risk: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn setup_ci_fails_closed_when_git_tracking_cannot_be_inspected() {
+    let project = TempProject::empty(r#"{"name":"git-unavailable","version":"1.0.0"}"#);
+    let empty_path = tempfile::tempdir().expect("create empty PATH");
+
+    let output = lpm(&project)
+        .env("PATH", empty_path.path())
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci without git on PATH");
+
+    assert!(
+        !output.status.success(),
+        "setup ci must not write a bearer when Git tracking cannot be inspected"
+    );
+    assert!(!project.file_exists(".npmrc"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Git tracking"),
+        "failure must identify the unavailable tracking check: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn setup_ci_fails_closed_when_git_dir_poisoning_breaks_repository_inspection() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+
+    let output = lpm(&project)
+        .env("GIT_DIR", project.path().join("missing-git-dir"))
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci with a poisoned GIT_DIR");
+
+    assert!(
+        !output.status.success(),
+        "failed repository inspection must not be treated as a non-repository"
+    );
+    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tracked"),
+        "failure must identify the tracked npmrc: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn setup_ci_ignores_a_poisoned_git_index_when_checking_tracked_npmrc() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+
+    let output = lpm(&project)
+        .env(
+            "GIT_INDEX_FILE",
+            project.path().join("missing-alternate-index"),
+        )
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci with a poisoned GIT_INDEX_FILE");
+
+    assert!(
+        !output.status.success(),
+        "tracked npmrc must still be refused"
+    );
+    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tracked"),
+        "the real repository index must remain authoritative: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_ci_refuses_a_linked_npmrc_without_reading_or_replacing_its_target() {
+    let project = TempProject::empty(r#"{"name":"linked","version":"1.0.0"}"#);
+    let external = tempfile::NamedTempFile::new().expect("create external npmrc target");
+    std::fs::write(
+        external.path(),
+        "//registry.npmjs.org/:_authToken=external-secret\n",
+    )
+    .expect("seed external npmrc target");
+    std::os::unix::fs::symlink(external.path(), project.path().join(".npmrc"))
+        .expect("link project npmrc");
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci with linked npmrc");
+
+    assert!(!output.status.success(), "linked npmrc must be refused");
+    assert!(
+        std::fs::symlink_metadata(project.path().join(".npmrc"))
+            .expect("linked npmrc must remain")
+            .file_type()
+            .is_symlink(),
+        "setup ci must not replace the linked path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(external.path()).expect("read external target"),
+        "//registry.npmjs.org/:_authToken=external-secret\n"
     );
 }
 
@@ -104,6 +257,78 @@ fn setup_ci_writes_literal_env_bearer_and_preserves_unrelated_config() {
             .auth_for_url("https://lpm.example.test/api/registry/@lpm.dev/pkg")
             .is_some(),
         "generated literal bearer must resolve for the scoped registry origin"
+    );
+    assert!(
+        parsed
+            .auth_for_url("https://lpm.example.test/unrelated")
+            .is_none(),
+        "the generated bearer must not be sent to unrelated same-origin paths"
+    );
+}
+
+#[test]
+fn setup_ci_rejects_unsafe_registry_urls_before_writing_credentials() {
+    for registry in [
+        "https://user:password@lpm.example.test",
+        "https://lpm.example.test?registry=other",
+        "https://lpm.example.test#fragment",
+        "ftp://lpm.example.test",
+        "http://lpm.example.test",
+        "https://lpm.example.test/\n//attacker.example/:_authToken=stolen",
+    ] {
+        let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+        let output = lpm(&project)
+            .env("LPM_TOKEN", "ci-runtime-token")
+            .args(["--registry", registry, "setup", "ci", "npmrc"])
+            .output()
+            .expect("run setup ci with an unsafe registry URL");
+
+        assert!(
+            !output.status.success(),
+            "unsafe registry URL was accepted: {registry:?}"
+        );
+        assert!(
+            !project.file_exists(".npmrc"),
+            "unsafe registry URL wrote credentials: {registry:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("registry URL"),
+            "failure must identify the rejected registry URL {registry:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn setup_ci_does_not_duplicate_an_existing_registry_endpoint_suffix() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "ci-runtime-token")
+        .args([
+            "--registry",
+            "https://lpm.example.test/api/registry/",
+            "setup",
+            "ci",
+            "npmrc",
+        ])
+        .output()
+        .expect("run setup ci with a registry endpoint URL");
+
+    assert!(
+        output.status.success(),
+        "setup ci failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let npmrc = project.read_file(".npmrc");
+    assert!(
+        npmrc.contains("@lpm.dev:registry=https://lpm.example.test/api/registry/"),
+        "the normalized endpoint must be written once:\n{npmrc}"
+    );
+    assert!(
+        !npmrc.contains("/api/registry/api/registry"),
+        "the endpoint suffix must not be duplicated:\n{npmrc}"
     );
 }
 
@@ -271,6 +496,86 @@ async fn setup_ci_self_revokes_the_displaced_setup_token_before_writing_the_new_
     let npmrc = project.read_file(".npmrc");
     assert!(npmrc.contains("oidc-or-read-replacement-token"));
     assert!(!npmrc.contains(previous_token));
+}
+
+#[tokio::test]
+async fn setup_ci_refuses_a_generated_predecessor_bearer_for_another_registry_scope() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let original = format!(
+        "# LPM Registry (generated by lpm setup local — do not commit)\n\
+         @lpm.dev:registry={}/api/registry\n\
+         //attacker.invalid/api/registry/:_authToken=foreign-predecessor\n\
+         # End LPM Registry\n",
+        mock.url(),
+    );
+    project.write_file(".npmrc", &original);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "replacement-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci with a foreign generated bearer scope");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file(".npmrc"), original);
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "a predecessor bearer must never be sent to a different registry origin"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("scope"),
+        "failure must identify the generated scope mismatch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_ci_write_failure_happens_before_displaced_token_revocation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TempProject::empty(r#"{"name":"unwritable","version":"1.0.0"}"#);
+    let previous_token = "lpm_active_setup_token";
+    let mock = MockRegistry::start().await;
+    let original = format!(
+        "# LPM Registry (generated by lpm setup local — do not commit)\n\
+         @lpm.dev:registry={}/api/registry\n\
+         {}/api/registry/:_authToken={previous_token}\n\
+         # End LPM Registry\n",
+        mock.url(),
+        mock.url().replace("http:", "")
+    );
+    project.write_file(".npmrc", &original);
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/revoke-project"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(mock.server())
+        .await;
+
+    let original_mode = std::fs::metadata(project.path())
+        .expect("project metadata")
+        .permissions()
+        .mode();
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("make project unwritable");
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "replacement-token")
+        .args(["setup", "ci", "npmrc"])
+        .output()
+        .expect("run setup ci in unwritable project");
+    std::fs::set_permissions(
+        project.path(),
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .expect("restore project permissions");
+
+    assert!(!output.status.success(), "the npmrc write must fail");
+    assert_eq!(project.read_file(".npmrc"), original);
+    assert!(
+        mock.server().received_requests().await.unwrap().is_empty(),
+        "a recoverable local write failure must happen before remote token revocation"
+    );
 }
 
 #[tokio::test]
@@ -516,11 +821,17 @@ async fn setup_ci_ambiguous_self_revocation_leaves_the_old_bearer_for_a_safe_ret
         .expect("run setup ci with an ambiguous retirement response");
     assert!(!first.status.success());
     let pending = project.read_file(".npmrc");
-    assert_eq!(pending, original);
-    assert!(!pending.contains("ci-runtime-token"));
+    assert!(
+        pending.contains("ci-runtime-token"),
+        "a usable replacement must be staged before ambiguous revocation"
+    );
+    assert!(
+        pending.contains(previous_token),
+        "the protected recovery state must retain the predecessor for retry"
+    );
 
     let second = lpm_with_registry(&project, &mock.url())
-        .env("LPM_TOKEN", "ci-runtime-token")
+        .env("LPM_TOKEN", "different-runtime-token")
         .args(["setup", "ci", "npmrc"])
         .output()
         .expect("retry setup ci retirement");
@@ -532,6 +843,7 @@ async fn setup_ci_ambiguous_self_revocation_leaves_the_old_bearer_for_a_safe_ret
     );
     let final_npmrc = project.read_file(".npmrc");
     assert!(final_npmrc.contains("ci-runtime-token"));
+    assert!(!final_npmrc.contains("different-runtime-token"));
     assert!(!final_npmrc.contains(previous_token));
 
     let requests = mock.server().received_requests().await.unwrap();

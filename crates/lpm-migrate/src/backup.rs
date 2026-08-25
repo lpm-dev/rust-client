@@ -168,8 +168,15 @@ impl MigrationBackup {
             "created": created_entries,
         });
         let manifest_path = project_dir.join(MANIFEST_FILENAME);
-        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
-            .map_err(|e| LpmError::Script(format!("failed to write backup manifest: {e}")))?;
+        let contents = serde_json::to_string_pretty(&manifest)?;
+        lpm_common::write_file_atomic_with_options(
+            &manifest_path,
+            contents,
+            lpm_common::AtomicWriteOptions::new()
+                .sync_file()
+                .sync_parent(),
+        )
+        .map_err(|e| LpmError::Script(format!("failed to write backup manifest: {e}")))?;
         Ok(())
     }
 
@@ -811,6 +818,26 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), "old lock");
         assert_eq!(fs::read_to_string(&npmrc_path).unwrap(), "old npmrc");
+    }
+
+    #[test]
+    fn write_manifest_replaces_existing_file_without_mutating_other_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_created = dir.path().join("first-created");
+        let second_created = dir.path().join("second-created");
+        let manifest_path = dir.path().join(MANIFEST_FILENAME);
+        let prior_manifest_link = dir.path().join("prior-manifest.json");
+
+        let mut backup = MigrationBackup::new();
+        backup.backup_file(&first_created).unwrap();
+        backup.write_manifest(dir.path()).unwrap();
+        fs::hard_link(&manifest_path, &prior_manifest_link).unwrap();
+        let prior_manifest = fs::read(&prior_manifest_link).unwrap();
+
+        backup.backup_file(&second_created).unwrap();
+        backup.write_manifest(dir.path()).unwrap();
+
+        assert_eq!(fs::read(&prior_manifest_link).unwrap(), prior_manifest);
     }
 
     #[test]

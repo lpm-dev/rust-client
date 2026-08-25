@@ -525,17 +525,75 @@ fn render_migrate_detail<T: install_ui::TerminalValue>(label: &'static str, valu
 fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Result<(), LpmError> {
     let npmrc_path = cwd.join(".npmrc");
 
-    let existing =
-        match lpm_common::read_text_file_capped(&npmrc_path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES)
-        {
-            Ok(content) => Some(content),
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
-            Err(error) => {
-                return Err(LpmError::Script(format!("failed to read .npmrc: {error}")));
-            }
-        };
+    let existing = match lpm_common::read_text_file_capped_nofollow(
+        &npmrc_path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => Some(content),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => {
+            return Err(LpmError::Script(format!("failed to read .npmrc: {error}")));
+        }
+    };
     if let Some(content) = existing {
-        if content.contains("@lpm.dev:registry") {
+        let mut warnings = Vec::new();
+        let settings = lpm_common::parse_npmrc_ini_settings(
+            lpm_common::strip_utf8_bom_str(&content),
+            &npmrc_path.display().to_string(),
+            &mut warnings,
+        );
+        for warning in warnings {
+            tracing::warn!("{warning}");
+        }
+        let mut has_lpm_registry = false;
+        for setting in settings {
+            let key =
+                lpm_common::interpolate_npmrc_env(&setting.key, &|name| std::env::var(name).ok())
+                    .map_err(|error| {
+                    LpmError::Script(format!(
+                        "failed to expand npm config key in {}: {error}",
+                        npmrc_path.display()
+                    ))
+                })?;
+            if key != "@lpm.dev:registry" {
+                continue;
+            }
+            if setting.is_array {
+                return Err(LpmError::Script(format!(
+                    "{} configures @lpm.dev:registry as an array; replace it with one scalar registry URL before migrating",
+                    npmrc_path.display()
+                )));
+            }
+            let Some(raw_value) = setting.values.last() else {
+                continue;
+            };
+            let value = lpm_common::interpolate_npmrc_env(raw_value.value.as_ref(), &|name| {
+                std::env::var(name).ok()
+            })
+            .map_err(|error| {
+                LpmError::Script(format!(
+                    "failed to expand @lpm.dev:registry in {}: {error}",
+                    npmrc_path.display()
+                ))
+            })?;
+            if value.trim().is_empty() {
+                continue;
+            }
+            let parsed = reqwest::Url::parse(value.trim()).map_err(|error| {
+                LpmError::Script(format!(
+                    "{} has an invalid @lpm.dev:registry URL: {error}",
+                    npmrc_path.display()
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(LpmError::Script(format!(
+                    "{} has an invalid @lpm.dev:registry URL; use an http:// or https:// URL with a host",
+                    npmrc_path.display()
+                )));
+            }
+            has_lpm_registry = true;
+        }
+        if has_lpm_registry {
             if !json {
                 install_ui::skipped(".npmrc already has @lpm.dev:registry scope");
             }
@@ -555,7 +613,11 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
         }
         new_content.push_str("@lpm.dev:registry=https://lpm.dev/api/registry/\n");
 
-        if let Err(e) = std::fs::write(&npmrc_path, &new_content) {
+        if let Err(e) = lpm_common::write_file_atomic_with_options(
+            &npmrc_path,
+            &new_content,
+            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+        ) {
             install_ui::failed_untrusted(&format!("Failed to update .npmrc: {e}"));
             if let Err(re) = backup.rollback() {
                 install_ui::failed_untrusted(&format!("Rollback also failed: {re}"));
@@ -572,9 +634,14 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
         }
 
         backup.backup_file(&npmrc_path)?;
+        backup.write_manifest(cwd)?;
 
         let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
-        if let Err(e) = std::fs::write(&npmrc_path, npmrc_content) {
+        if let Err(e) = lpm_common::write_file_atomic_with_options(
+            &npmrc_path,
+            npmrc_content,
+            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+        ) {
             install_ui::failed_untrusted(&format!("Failed to write .npmrc: {e}"));
             if let Err(re) = backup.rollback() {
                 install_ui::failed_untrusted(&format!("Rollback also failed: {re}"));

@@ -6,7 +6,7 @@
 mod support;
 
 use support::assertions;
-use support::{TempProject, lpm};
+use support::{TempProject, configure_fake_node, lpm};
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -921,5 +921,139 @@ fn migrate_default_creates_npmrc_unless_no_npmrc_passed() {
     assert!(
         project.file_exists(".npmrc"),
         "migrate without --no-npmrc must write .npmrc by default"
+    );
+}
+
+#[test]
+fn migrate_does_not_treat_a_commented_scope_as_active_npm_config() {
+    let project = TempProject::from_fixture("migrate-npm");
+    project.write_file(
+        ".npmrc",
+        "# @lpm.dev:registry=https://disabled.example.test/\nfund=false\n",
+    );
+
+    lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .assert()
+        .success();
+
+    let npmrc = project.read_file(".npmrc");
+    assert!(
+        npmrc
+            .lines()
+            .any(|line| line == "@lpm.dev:registry=https://lpm.dev/api/registry/"),
+        "migrate must add an active scoped registry when only a comment mentions it:\n{npmrc}"
+    );
+}
+
+#[test]
+fn migrate_repairs_an_empty_scoped_registry_setting() {
+    let project = TempProject::from_fixture("migrate-npm");
+    project.write_file(".npmrc", "@lpm.dev:registry=\nfund=false\n");
+
+    lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .assert()
+        .success();
+
+    let npmrc = project.read_file(".npmrc");
+    assert!(
+        npmrc
+            .lines()
+            .any(|line| line == "@lpm.dev:registry=https://lpm.dev/api/registry/"),
+        "migrate must repair an empty registry setting:\n{npmrc}"
+    );
+}
+
+#[test]
+fn migrate_rejects_an_array_scoped_registry_setting_without_rewriting_it() {
+    let project = TempProject::from_fixture("migrate-npm");
+    let original = "@lpm.dev:registry[]=https://one.example.test/\n";
+    project.write_file(".npmrc", original);
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("run migration with an array registry setting");
+
+    assert!(
+        !output.status.success(),
+        "an array registry must be rejected"
+    );
+    assert_eq!(project.read_file(".npmrc"), original);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("array"),
+        "the failure must explain how to repair the setting: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn migrate_refuses_a_linked_npmrc_without_copying_or_modifying_its_target() {
+    let project = TempProject::from_fixture("migrate-npm");
+    let external = tempfile::NamedTempFile::new().expect("create external npmrc target");
+    std::fs::write(
+        external.path(),
+        "//registry.npmjs.org/:_authToken=external-secret\n",
+    )
+    .expect("seed external npmrc target");
+    std::os::unix::fs::symlink(external.path(), project.path().join(".npmrc"))
+        .expect("link project npmrc");
+
+    let output = lpm(&project)
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("run migrate with linked npmrc");
+
+    assert!(!output.status.success(), "linked npmrc must be refused");
+    assert!(
+        std::fs::symlink_metadata(project.path().join(".npmrc"))
+            .expect("linked npmrc must remain")
+            .file_type()
+            .is_symlink(),
+        "migrate must not replace the linked path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(external.path()).expect("read external target"),
+        "//registry.npmjs.org/:_authToken=external-secret\n"
+    );
+    assert!(
+        !project.file_exists(".npmrc.backup"),
+        "migrate must not copy a linked target into the project"
+    );
+}
+
+#[test]
+fn migrate_rollback_removes_npmrc_created_before_verification_failure() {
+    let project = TempProject::from_fixture("migrate-npm");
+    let mut package: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).expect("parse package.json");
+    package["scripts"] = serde_json::json!({ "test": "false" });
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&package).expect("encode package.json"),
+    );
+    assert!(!project.file_exists(".npmrc"));
+
+    let mut migrate = lpm(&project);
+    configure_fake_node(&mut migrate, &project, "22.0.0");
+    let output = migrate
+        .args(["migrate", "--no-install", "--force"])
+        .output()
+        .expect("run migration with failing verification");
+    assert!(!output.status.success(), "verification must fail");
+    assert!(
+        project.file_exists(".npmrc"),
+        "the pre-verification migration step must have created .npmrc"
+    );
+
+    lpm(&project)
+        .args(["migrate", "--rollback"])
+        .assert()
+        .success();
+    assert!(
+        !project.file_exists(".npmrc"),
+        "rollback must remove an npmrc that did not exist before migration"
     );
 }

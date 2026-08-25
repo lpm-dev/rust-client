@@ -15,7 +15,93 @@ const PREVIOUS_TOKEN_HASH_PREFIX: &str = "# LPM previous project token hash: ";
 const PREVIOUS_TOKEN_BEARER_PREFIX: &str = "# LPM previous project token bearer: ";
 const RETIRE_TOKEN_ID_PREFIX: &str = "# LPM pending project token retirement id: ";
 const RETIRE_TOKEN_HASH_PREFIX: &str = "# LPM pending project token retirement hash: ";
+pub(super) const CI_RETIRE_BEARER_PREFIX: &str =
+    "# LPM pending setup-local token retirement bearer: ";
 const GENERATED_END: &str = "# End LPM Registry";
+
+pub(super) struct SetupRegistry {
+    service_base: String,
+    endpoint: String,
+    auth_scope: String,
+}
+
+impl SetupRegistry {
+    pub(super) fn parse(raw: &str) -> Result<Self, LpmError> {
+        if raw.is_empty() || raw.trim() != raw || raw.chars().any(char::is_control) {
+            return Err(LpmError::Script(
+                "the registry URL contains whitespace or control characters".into(),
+            ));
+        }
+        let parsed = reqwest::Url::parse(raw)
+            .map_err(|error| LpmError::Script(format!("invalid registry URL: {error}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(LpmError::Script(
+                "the registry URL must use https://, or http:// for a loopback host".into(),
+            ));
+        }
+        if parsed.scheme() == "http" && !lpm_registry::is_localhost_url(parsed.as_str()) {
+            return Err(LpmError::Script(
+                "the registry URL must use https:// unless its host is loopback".into(),
+            ));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(LpmError::Script(
+                "the registry URL must not contain credentials".into(),
+            ));
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(LpmError::Script(
+                "the registry URL must not contain a query or fragment".into(),
+            ));
+        }
+
+        let input_path = parsed.path().trim_end_matches('/');
+        let base_path = input_path
+            .strip_suffix("/api/registry")
+            .unwrap_or(input_path);
+        let endpoint_path = if input_path.ends_with("/api/registry") {
+            input_path.to_string()
+        } else if input_path.is_empty() {
+            "/api/registry".to_string()
+        } else {
+            format!("{input_path}/api/registry")
+        };
+
+        let mut service_url = parsed.clone();
+        service_url.set_path(base_path);
+        let service_base = service_url.as_str().trim_end_matches('/').to_string();
+        let mut endpoint_url = parsed;
+        endpoint_url.set_path(&endpoint_path);
+        let endpoint = endpoint_url.as_str().trim_end_matches('/').to_string();
+        let without_scheme = endpoint
+            .strip_prefix("https://")
+            .or_else(|| endpoint.strip_prefix("http://"))
+            .expect("accepted registry schemes have a serialized prefix");
+        let auth_scope = format!("//{without_scheme}/");
+
+        Ok(Self {
+            service_base,
+            endpoint,
+            auth_scope,
+        })
+    }
+
+    pub(super) fn service_base(&self) -> &str {
+        &self.service_base
+    }
+
+    pub(super) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub(super) fn auth_scope(&self) -> &str {
+        &self.auth_scope
+    }
+
+    pub(super) fn token_url(&self, operation: &str) -> String {
+        format!("{}/-/token/{operation}", self.endpoint)
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,7 +122,7 @@ struct SetupRollback<'a> {
     gitignore_path: &'a Path,
     expected_gitignore: &'a str,
     original_gitignore: Option<&'a str>,
-    npmrc: Option<(&'a Path, &'a str, &'a str)>,
+    npmrc: Option<(&'a Path, &'a str, Option<&'a str>)>,
 }
 
 impl<'a> SetupRollback<'a> {
@@ -57,7 +143,7 @@ impl<'a> SetupRollback<'a> {
         mut self,
         npmrc_path: &'a Path,
         expected_npmrc: &'a str,
-        original_npmrc: &'a str,
+        original_npmrc: Option<&'a str>,
     ) -> Self {
         self.npmrc = Some((npmrc_path, expected_npmrc, original_npmrc));
         self
@@ -69,7 +155,7 @@ impl<'a> SetupRollback<'a> {
             && let Err(error) = restore_file_if_unchanged(
                 npmrc_path,
                 expected_npmrc,
-                Some(original_npmrc),
+                original_npmrc,
                 lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
                 true,
             )
@@ -107,6 +193,9 @@ pub async fn run(
             "--days must be between 1 and 90".to_string(),
         ));
     }
+    let registry = SetupRegistry::parse(registry_url)?;
+
+    reject_tracked_npmrc(project_dir)?;
 
     let pkg_json_path = project_dir.join("package.json");
     let npmrc_path = project_dir.join(".npmrc");
@@ -120,13 +209,15 @@ pub async fn run(
         Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
         Err(error) => return Err(error.into()),
     };
-    let existing_npmrc =
-        match lpm_common::read_text_file_capped(&npmrc_path, lpm_common::NPMRC_FILE_SIZE_CAP_BYTES)
-        {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
-            Err(error) => return Err(error.into()),
-        };
+    let existing_npmrc_state = match lpm_common::read_text_file_capped_nofollow(
+        &npmrc_path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => Some(content),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let existing_npmrc = existing_npmrc_state.as_deref().unwrap_or_default();
     let existing_gitignore = match lpm_common::read_text_file_capped(
         &gitignore_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
@@ -170,30 +261,21 @@ pub async fn run(
     let today = format!("{days_since_epoch}");
     let token_name = format!("npmrc-{project_name}-{today}");
 
-    let full_registry_url = if registry_url
-        .trim_end_matches('/')
-        .ends_with("/api/registry")
-    {
-        registry_url.trim_end_matches('/').to_string()
-    } else {
-        format!("{}/api/registry", registry_url.trim_end_matches('/'))
-    };
-    let registry_host = full_registry_url.replace("https:", "").replace("http:", "");
-    let registry_line = format!("@lpm.dev:registry={full_registry_url}");
-    if let Some(existing_registry) = local_setup_registry_url(&existing_npmrc)
-        && existing_registry != full_registry_url
+    let registry_line = format!("@lpm.dev:registry={}", registry.endpoint());
+    if let Some(existing_registry) = local_setup_registry_url(existing_npmrc)
+        && existing_registry != registry.endpoint()
     {
         return Err(LpmError::Script(format!(
             "the setup-local token belongs to {existing_registry}; rerun with its registry to finish replacement safely"
         )));
     }
-    reject_legacy_ci_retirement_state(&existing_npmrc)?;
-    let pending = match pending_setup_token(&existing_npmrc)? {
+    reject_legacy_ci_retirement_state(existing_npmrc)?;
+    let pending = match pending_setup_token(existing_npmrc, registry.auth_scope())? {
         Some(pending) => pending,
         None => PendingSetupToken {
             token: generate_project_token()?,
             token_id: generate_uuid_v4()?,
-            previous_bearer: local_project_token_bearer(&existing_npmrc)?,
+            previous_bearer: local_project_token_bearer(existing_npmrc, registry.auth_scope())?,
         },
     };
 
@@ -232,10 +314,12 @@ pub async fn run(
             format!("{PREVIOUS_TOKEN_BEARER_PREFIX}{bearer}\n")
         });
     let pending_config = format!(
-        "{GENERATED_HEADER}\n{PENDING_TOKEN_ID_PREFIX}{}\n{previous_marker}{registry_line}\n{registry_host}/:_authToken={}\n{GENERATED_END}",
-        pending.token_id, pending.token
+        "{GENERATED_HEADER}\n{PENDING_TOKEN_ID_PREFIX}{}\n{previous_marker}{registry_line}\n{}:_authToken={}\n{GENERATED_END}",
+        pending.token_id,
+        registry.auth_scope(),
+        pending.token
     );
-    let pending_content = replace_generated_block(&existing_npmrc, &pending_config);
+    let pending_content = replace_generated_block(existing_npmrc, &pending_config);
     if let Err(error) = lpm_common::write_file_atomic_with_options(
         &npmrc_path,
         &pending_content,
@@ -243,7 +327,11 @@ pub async fn run(
     ) {
         return Err(rollback_files(LpmError::Io(error), rollback));
     }
-    let rollback = rollback.with_npmrc(&npmrc_path, &pending_content, &existing_npmrc);
+    let rollback = rollback.with_npmrc(
+        &npmrc_path,
+        &pending_content,
+        existing_npmrc_state.as_deref(),
+    );
 
     if !json_output {
         install_ui::phase("Creating read-only token...");
@@ -260,10 +348,7 @@ pub async fn run(
         body["previousTokenHash"] =
             serde_json::Value::String(hex::encode(Sha256::digest(previous_bearer.as_bytes())));
     }
-    let url = format!(
-        "{}/api/registry/-/token/replace-project",
-        registry_url.trim_end_matches('/')
-    );
+    let url = registry.token_url("replace-project");
     let response = match client.post_json_raw_status_with_recovery(&url, &body).await {
         Ok(response) => response,
         Err(error @ (LpmError::AuthRequired | LpmError::SessionExpired)) => {
@@ -345,8 +430,10 @@ pub async fn run(
     let expires_at = replaced.expires_at;
 
     let lpm_config = format!(
-        "{GENERATED_HEADER}\n{TOKEN_ID_PREFIX}{}\n{registry_line}\n{registry_host}/:_authToken={}\n{GENERATED_END}",
-        pending.token_id, pending.token
+        "{GENERATED_HEADER}\n{TOKEN_ID_PREFIX}{}\n{registry_line}\n{}:_authToken={}\n{GENERATED_END}",
+        pending.token_id,
+        registry.auth_scope(),
+        pending.token
     );
     let final_content = replace_generated_block(&pending_content, &lpm_config);
     if let Err(error) = lpm_common::write_file_atomic_with_options(
@@ -398,6 +485,77 @@ pub async fn run(
     Ok(())
 }
 
+pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
+    let inside = hardened_git_command(project_dir, &["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|error| {
+            LpmError::Script(format!(
+                "failed to inspect Git tracking for .npmrc: {error}"
+            ))
+        })?;
+    if !inside.status.success() {
+        let stderr = String::from_utf8_lossy(&inside.stderr);
+        if inside.status.code() == Some(128) && stderr.contains("not a git repository") {
+            return Ok(());
+        }
+        return Err(LpmError::Script(format!(
+            "failed to inspect Git tracking for .npmrc: {}",
+            stderr.trim()
+        )));
+    }
+    if inside.stdout == b"false\n" {
+        return Ok(());
+    }
+    if inside.stdout != b"true\n" {
+        return Err(LpmError::Script(
+            "failed to inspect Git tracking for .npmrc: git returned an unexpected repository state"
+                .into(),
+        ));
+    }
+
+    let tracked = hardened_git_command(
+        project_dir,
+        &["ls-files", "--error-unmatch", "--", ".npmrc"],
+    )
+    .output()
+    .map_err(|error| {
+        LpmError::Script(format!(
+            "failed to inspect Git tracking for .npmrc: {error}"
+        ))
+    })?;
+    if tracked.status.success() {
+        return Err(LpmError::Script(
+            "refused to write a Git-tracked .npmrc because it will contain a bearer token; remove .npmrc from the index first"
+                .into(),
+        ));
+    }
+    if tracked.status.code() == Some(1) {
+        return Ok(());
+    }
+    Err(LpmError::Script(format!(
+        "failed to verify whether .npmrc is Git-tracked: {}",
+        String::from_utf8_lossy(&tracked.stderr).trim()
+    )))
+}
+
+fn hardened_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(args)
+        .current_dir(project_dir)
+        .env("LC_ALL", "C");
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
 fn rollback_files(primary: LpmError, rollback: SetupRollback<'_>) -> LpmError {
     combine_rollback_error(primary, rollback.restore())
 }
@@ -412,24 +570,32 @@ fn sanitize_registry_message(message: &str, secret: &str) -> String {
     lpm_common::sanitize_terminal_inline(message).replace(secret, "<redacted>")
 }
 
+pub(super) struct SelfRevokeError {
+    pub(super) error: LpmError,
+    pub(super) may_have_committed: bool,
+}
+
 pub(super) async fn self_revoke_project_token(
     client: &RegistryClient,
-    registry_url: &str,
+    registry: &SetupRegistry,
     bearer: &str,
-) -> Result<(), LpmError> {
-    let url = format!(
-        "{}/api/registry/-/token/revoke-project",
-        registry_url.trim_end_matches('/')
-    );
+) -> Result<(), SelfRevokeError> {
+    let url = registry.token_url("revoke-project");
     let isolated_client = client.clone_with_static_token(bearer);
-    let response = isolated_client
+    let response = match isolated_client
         .post_json_raw_status(&url, &serde_json::json!({ "self": true }))
         .await
-        .map_err(|error| {
-            LpmError::Registry(format!(
-                "project token self-revocation response was not received: {error}"
-            ))
-        })?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(SelfRevokeError {
+                error: LpmError::Registry(format!(
+                    "project token self-revocation response was not received: {error}"
+                )),
+                may_have_committed: true,
+            });
+        }
+    };
     let status = response.status();
     if matches!(
         status,
@@ -439,16 +605,23 @@ pub(super) async fn self_revoke_project_token(
     }
     let body: serde_json::Value =
         lpm_registry::parse_capped_api_json(response, "project token self-revocation response")
-            .await?;
+            .await
+            .map_err(|error| SelfRevokeError {
+                error,
+                may_have_committed: status.is_success() || status.is_server_error(),
+            })?;
     if !status.is_success() {
         let message = body
             .get("error")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("project token self-revocation failed");
-        return Err(LpmError::Registry(format!(
-            "{} ({status})",
-            sanitize_registry_message(message, bearer)
-        )));
+        return Err(SelfRevokeError {
+            error: LpmError::Registry(format!(
+                "{} ({status})",
+                sanitize_registry_message(message, bearer)
+            )),
+            may_have_committed: status.is_server_error(),
+        });
     }
     let returned_token_id = body
         .get("tokenId")
@@ -457,21 +630,22 @@ pub(super) async fn self_revoke_project_token(
     if body.get("revoked").and_then(serde_json::Value::as_bool) != Some(true)
         || returned_token_id.is_none()
     {
-        return Err(LpmError::Registry(
-            "invalid project token self-revocation response".into(),
-        ));
+        return Err(SelfRevokeError {
+            error: LpmError::Registry("invalid project token self-revocation response".into()),
+            may_have_committed: true,
+        });
     }
     Ok(())
 }
 
-fn restore_file_if_unchanged(
+pub(super) fn restore_file_if_unchanged(
     path: &Path,
     expected_current: &str,
     original: Option<&str>,
     cap: u64,
     sensitive: bool,
 ) -> Result<(), String> {
-    let current = match lpm_common::read_text_file_capped(path, cap) {
+    let current = match lpm_common::read_text_file_capped_nofollow(path, cap) {
         Ok(current) => Some(current),
         Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
         Err(error) => return Err(error.to_string()),
@@ -511,13 +685,16 @@ fn combine_rollback_error(primary: LpmError, rollback_errors: Vec<String>) -> Lp
     }
 }
 
-fn pending_setup_token(existing: &str) -> Result<Option<PendingSetupToken>, LpmError> {
+fn pending_setup_token(
+    existing: &str,
+    expected_auth_scope: &str,
+) -> Result<Option<PendingSetupToken>, LpmError> {
     let lines = local_generated_lines(existing);
     let Some(token_id) = parse_single_marker(&lines, PENDING_TOKEN_ID_PREFIX, valid_token_id)?
     else {
         return Ok(None);
     };
-    let token = auth_token_from_lines(&lines)?.ok_or_else(|| {
+    let token = auth_token_from_lines(&lines, expected_auth_scope)?.ok_or_else(|| {
         LpmError::Script(
             "the pending setup-token block is missing its protected bearer; restore the file or remove the generated block before retrying".into(),
         )
@@ -548,12 +725,15 @@ fn pending_setup_token(existing: &str) -> Result<Option<PendingSetupToken>, LpmE
     }))
 }
 
-fn local_project_token_bearer(existing: &str) -> Result<Option<String>, LpmError> {
+fn local_project_token_bearer(
+    existing: &str,
+    expected_auth_scope: &str,
+) -> Result<Option<String>, LpmError> {
     let lines = local_generated_lines(existing);
     if lines.is_empty() {
         return Ok(None);
     }
-    let bearer = auth_token_from_lines(&lines)?;
+    let bearer = auth_token_from_lines(&lines, expected_auth_scope)?;
     if bearer.is_some_and(|value| !valid_stored_bearer(value)) {
         return Err(LpmError::Script(
             "the generated setup-local block contains an invalid bearer".into(),
@@ -566,7 +746,10 @@ pub(super) fn local_setup_registry_url(existing: &str) -> Option<String> {
     registry_url_from_lines(&local_generated_lines(existing)).map(normalize_registry_url)
 }
 
-pub(super) fn setup_ci_predecessor_bearer(existing: &str) -> Result<Option<String>, LpmError> {
+pub(super) fn setup_ci_predecessor_bearer(
+    existing: &str,
+    expected_auth_scope: &str,
+) -> Result<Option<String>, LpmError> {
     reject_legacy_ci_retirement_state(existing)?;
     let local_lines = local_generated_lines(existing);
     if local_lines
@@ -577,7 +760,33 @@ pub(super) fn setup_ci_predecessor_bearer(existing: &str) -> Result<Option<Strin
             "setup local has a pending token replacement. Run `lpm setup local` with the same registry to finish it before switching to `lpm setup ci npmrc`".into(),
         ));
     }
-    local_project_token_bearer(existing)
+    local_project_token_bearer(existing, expected_auth_scope)
+}
+
+pub(super) fn setup_ci_pending_retirement(
+    existing: &str,
+    expected_auth_scope: &str,
+) -> Result<Option<(String, String)>, LpmError> {
+    let lines = ci_generated_lines(existing);
+    let predecessor = parse_single_marker(&lines, CI_RETIRE_BEARER_PREFIX, valid_stored_bearer)?;
+    let Some(predecessor) = predecessor else {
+        return Ok(None);
+    };
+    let replacement = auth_token_from_lines(&lines, expected_auth_scope)?.ok_or_else(|| {
+        LpmError::Script(
+            "the pending CI token-retirement block is missing its replacement bearer".into(),
+        )
+    })?;
+    if !valid_stored_bearer(replacement) || replacement == predecessor {
+        return Err(LpmError::Script(
+            "the pending CI token-retirement block contains invalid recovery credentials".into(),
+        ));
+    }
+    Ok(Some((replacement.to_string(), predecessor)))
+}
+
+pub(super) fn setup_ci_registry_url(existing: &str) -> Option<String> {
+    registry_url_from_lines(&ci_generated_lines(existing)).map(normalize_registry_url)
 }
 
 fn reject_legacy_ci_retirement_state(existing: &str) -> Result<(), LpmError> {
@@ -642,12 +851,18 @@ fn parse_single_marker(
     Ok(found)
 }
 
-fn auth_token_from_lines<'a>(lines: &'a [&str]) -> Result<Option<&'a str>, LpmError> {
+fn auth_token_from_lines<'a>(
+    lines: &'a [&str],
+    expected_auth_scope: &str,
+) -> Result<Option<&'a str>, LpmError> {
+    let expected_prefix = format!("{expected_auth_scope}:_authToken=");
     let mut found = None;
-    for token in lines
-        .iter()
-        .filter_map(|line| line.split_once("/:_authToken=").map(|(_, token)| token))
-    {
+    for line in lines.iter().filter(|line| line.contains("/:_authToken=")) {
+        let Some(token) = line.strip_prefix(&expected_prefix) else {
+            return Err(LpmError::Script(
+                "the generated setup block contains a bearer for a different registry scope".into(),
+            ));
+        };
         if token.is_empty() {
             return Err(LpmError::Script(
                 "the generated setup block contains an empty bearer".into(),
@@ -761,6 +976,7 @@ fn replace_generated_block(existing: &str, generated: &str) -> String {
                             || line.starts_with(PREVIOUS_TOKEN_BEARER_PREFIX)
                             || line.starts_with(RETIRE_TOKEN_ID_PREFIX)
                             || line.starts_with(RETIRE_TOKEN_HASH_PREFIX)
+                            || line.starts_with(CI_RETIRE_BEARER_PREFIX)
                             || line.starts_with("@lpm.dev:registry=")
                             || line.contains("/:_authToken=")
                     }) {

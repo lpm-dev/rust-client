@@ -9,6 +9,19 @@ use wiremock::{Mock, ResponseTemplate};
 
 const FIRST_TOKEN_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+fn git(project: &TempProject, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project.path())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
 async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
     let project = TempProject::empty(r#"{"name":"web app","version":"1.0.0"}"#);
@@ -120,6 +133,74 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
             .starts_with("npmrc-web-app-"),
         "token name must derive from the package name, got body:\n{}",
         serde_json::to_string_pretty(&body).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn setup_local_refuses_to_write_a_tracked_npmrc_before_minting_a_token() {
+    let project = TempProject::empty(r#"{"name":"tracked","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "--", ".npmrc"]);
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace(14, "2030-01-02T03:04:05Z", 0)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local", "--days", "14"])
+        .output()
+        .expect("run setup local with tracked npmrc");
+
+    assert!(!output.status.success(), "tracked npmrc must be refused");
+    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
+    assert!(!project.file_exists(".gitignore"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tracked"),
+        "error must explain the git-index risk: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("request log")
+            .is_empty(),
+        "tracked-file refusal must happen before token mutation"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn setup_local_refuses_a_linked_npmrc_before_minting_a_token() {
+    let project = TempProject::empty(r#"{"name":"linked","version":"1.0.0"}"#);
+    let external = tempfile::NamedTempFile::new().expect("create external npmrc target");
+    std::fs::write(
+        external.path(),
+        "//registry.npmjs.org/:_authToken=external-secret\n",
+    )
+    .expect("seed external npmrc target");
+    std::os::unix::fs::symlink(external.path(), project.path().join(".npmrc"))
+        .expect("link project npmrc");
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace(14, "2030-01-02T03:04:05Z", 0)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local", "--days", "14"])
+        .output()
+        .expect("run setup local with linked npmrc");
+
+    assert!(!output.status.success(), "linked npmrc must be refused");
+    assert!(
+        std::fs::symlink_metadata(project.path().join(".npmrc"))
+            .expect("linked npmrc must remain")
+            .file_type()
+            .is_symlink(),
+        "setup local must not replace the linked path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(external.path()).expect("read external target"),
+        "//registry.npmjs.org/:_authToken=external-secret\n"
     );
 }
 
@@ -558,6 +639,41 @@ async fn setup_local_bounded_registry_rejection_restores_pre_request_files() {
         1,
         "bounded client errors must not be retried"
     );
+}
+
+#[tokio::test]
+async fn setup_local_rejection_removes_an_npmrc_that_did_not_exist_before_setup() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace_error(400).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with an absent npmrc");
+
+    assert!(!output.status.success());
+    assert!(
+        !project.file_exists(".npmrc"),
+        "rollback must restore absence instead of leaving an empty npmrc"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_rejection_preserves_an_existing_empty_npmrc() {
+    let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "");
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace_error(400).await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .expect("run setup local with an empty npmrc");
+
+    assert!(!output.status.success());
+    assert!(project.file_exists(".npmrc"));
+    assert_eq!(project.read_file(".npmrc"), "");
 }
 
 #[tokio::test]
