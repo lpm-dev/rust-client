@@ -67,7 +67,7 @@ fn build_client(cfg: ClientConfig, ca_pem: &str) -> RegistryClient {
             // already pin the file-vs-inline parsing difference.
             let tls = TlsOverrides {
                 extra_roots: vec![TaggedRoot {
-                    pem_bytes: ca_pem.as_bytes().to_vec(),
+                    pem_bytes: ca_pem.as_bytes().to_vec().into(),
                     source: "test:.npmrc".into(),
                     line: 1,
                 }],

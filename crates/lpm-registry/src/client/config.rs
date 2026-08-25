@@ -12,6 +12,11 @@ enum HttpRedirectMode {
     Manual,
 }
 
+struct PreparedTlsRoots {
+    replace_builtin_roots: bool,
+    certificates: Vec<reqwest::Certificate>,
+}
+
 impl RegistryClient {
     pub(super) fn worker_metadata_http3_enabled_from_env() -> bool {
         Self::worker_metadata_http3_enabled_for_lpm_http(std::env::var("LPM_HTTP").ok().as_deref())
@@ -73,11 +78,8 @@ impl RegistryClient {
     /// Build the underlying `reqwest::Client` with optional `.npmrc`-derived
     /// TLS overrides applied:
     ///
-    /// - `extra_roots` from `cafile=` / `ca=` are attached via
-    ///   [`reqwest::ClientBuilder::add_root_certificate`]. They are
-    ///   **additive** to the system trust store, never a replacement —
-    ///   so a corporate-CA-trusted client still validates public
-    ///   registries normally.
+    /// - `extra_roots` from `cafile=` / `ca=` replace the built-in root
+    ///   set, matching npm's configured-CA trust contract.
     /// - `strict_ssl == Some(false)` flips
     ///   [`reqwest::ClientBuilder::danger_accept_invalid_certs(true)`].
     ///   This is process-wide on the resulting client; install.rs gates
@@ -156,10 +158,87 @@ impl RegistryClient {
         )
     }
 
+    pub(super) fn build_http_client_set_with_tls_and_identity(
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+    ) -> Result<(reqwest::Client, reqwest::Client, reqwest::Client), LpmError> {
+        let roots = Self::prepare_tls_roots(tls)?;
+        let client = Self::build_http_client_with_prepared_tls_identity_and_transport(
+            connect_timeout,
+            read_timeout,
+            tls,
+            &roots,
+            identity.clone(),
+            HttpTransportMode::Default,
+            HttpRedirectMode::Automatic,
+        )?;
+        let policy_metadata = Self::build_http_client_with_prepared_tls_identity_and_transport(
+            connect_timeout,
+            read_timeout,
+            tls,
+            &roots,
+            identity.clone(),
+            HttpTransportMode::Default,
+            HttpRedirectMode::Automatic,
+        )?;
+        let manual_redirect = Self::build_http_client_with_prepared_tls_identity_and_transport(
+            connect_timeout,
+            read_timeout,
+            tls,
+            &roots,
+            identity,
+            HttpTransportMode::Default,
+            HttpRedirectMode::Manual,
+        )?;
+        Ok((client, policy_metadata, manual_redirect))
+    }
+
+    fn prepare_tls_roots(tls: &TlsOverrides) -> Result<PreparedTlsRoots, LpmError> {
+        let mut certificates = Vec::with_capacity(tls.extra_roots.len());
+        for root in &tls.extra_roots {
+            validate_pem_root(root.pem_bytes.as_ref(), &root.source, root.line)?;
+            let certificate =
+                reqwest::Certificate::from_pem(root.pem_bytes.as_ref()).map_err(|error| {
+                    LpmError::Cert(format!(
+                        "npmrc cafile/ca at {}:{}: failed to parse PEM: {error}",
+                        root.source, root.line
+                    ))
+                })?;
+            certificates.push(certificate);
+        }
+        Ok(PreparedTlsRoots {
+            replace_builtin_roots: !certificates.is_empty(),
+            certificates,
+        })
+    }
+
     fn build_http_client_with_tls_identity_and_transport(
         connect_timeout: Duration,
         read_timeout: Duration,
         tls: &TlsOverrides,
+        identity: Option<reqwest::Identity>,
+        transport: HttpTransportMode,
+        redirect: HttpRedirectMode,
+    ) -> Result<reqwest::Client, LpmError> {
+        let roots = Self::prepare_tls_roots(tls)?;
+        Self::build_http_client_with_prepared_tls_identity_and_transport(
+            connect_timeout,
+            read_timeout,
+            tls,
+            &roots,
+            identity,
+            transport,
+            redirect,
+        )
+    }
+
+    fn build_http_client_with_prepared_tls_identity_and_transport(
+        connect_timeout: Duration,
+        read_timeout: Duration,
+        tls: &TlsOverrides,
+        roots: &PreparedTlsRoots,
         identity: Option<reqwest::Identity>,
         transport: HttpTransportMode,
         redirect: HttpRedirectMode,
@@ -181,21 +260,11 @@ impl RegistryClient {
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
         }
-        for root in &tls.extra_roots {
-            // Pre-validate before `from_pem`: reqwest's rustls-tls
-            // `from_pem` is permissive (stores raw bytes; validation
-            // happens at `.build()` time) and the build-time error
-            // can't tell us WHICH root caused it. Validating per-root
-            // up front lets us cite source/line on the common failure
-            // modes (truncated body, non-base64, empty cert).
-            validate_pem_root(&root.pem_bytes, &root.source, root.line)?;
-            let cert = reqwest::Certificate::from_pem(&root.pem_bytes).map_err(|e| {
-                LpmError::Cert(format!(
-                    "npmrc cafile/ca at {}:{}: failed to parse PEM: {e}",
-                    root.source, root.line
-                ))
-            })?;
-            b = b.add_root_certificate(cert);
+        if roots.replace_builtin_roots {
+            b = b.tls_built_in_root_certs(false);
+        }
+        for certificate in &roots.certificates {
+            b = b.add_root_certificate(certificate.clone());
         }
         if let Some(tagged) = tls.strict_ssl.as_ref()
             && !tagged.value
@@ -271,7 +340,7 @@ impl RegistryClient {
             {
                 tracing::warn!(
                     env_var = var,
-                    proxy = %val,
+                    proxy = %safe_url_for_diagnostic(&val),
                     "registry HTTP client will route through proxy from env; \
                      confirm this is expected (the LPM bearer goes via this proxy)",
                 );
@@ -504,7 +573,7 @@ impl RegistryClient {
             || tls.identity_certfile.is_some()
             || tls.identity_keyfile.is_some()
             || !tls.per_origin.is_empty();
-        if !needs_rebuild && eager_origins.is_empty() {
+        if !needs_rebuild {
             return Ok(self);
         }
         // Reuse the existing passphrase provider so its inner cache
@@ -512,105 +581,141 @@ impl RegistryClient {
         // HttpClients. First-build path falls back to a fresh provider.
         let passphrase = Arc::clone(&self.http.passphrase);
 
-        // Resolve the GLOBAL identity (if any) once here so we can
-        // both attach it to the default client AND fingerprint the
-        // cert PEM for cache-key composition. A default-routed URL
-        // carries the global identity in its cache namespace, so
-        // re-issued global certs invalidate cleanly. Global XOR was
-        // enforced at finalize.
+        let global_root_bytes = tls.extra_roots.iter().try_fold(0_u64, |total, root| {
+            total.checked_add(u64::try_from(root.pem_bytes.len()).unwrap_or(u64::MAX))
+        });
+        let global_root_bytes = global_root_bytes
+            .ok_or_else(|| LpmError::Cert("global npmrc TLS material size overflow".to_string()))?;
+        let tls_material_budget = Arc::new(TlsMaterialBudget::new_with_retained_source(
+            global_root_bytes,
+            global_root_bytes,
+        )?);
+
         let global_loaded = match (
             tls.identity_certfile.as_ref(),
             tls.identity_keyfile.as_ref(),
         ) {
-            (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase.as_ref())?),
+            (Some(cert), Some(key)) => {
+                let cert_path = cert.resolve();
+                let cert_context = format!(
+                    "{}:{}: failed to read certfile {}",
+                    cert.source,
+                    cert.line,
+                    cert_path.display()
+                );
+                let (cert_bytes, _, cert_reservation) =
+                    tls_material_budget.read_material(&cert_path, &cert_context)?;
+                let key_path = key.resolve();
+                let key_context = format!(
+                    "{}:{}: failed to read keyfile {}",
+                    key.source,
+                    key.line,
+                    key_path.display()
+                );
+                let (key_bytes, key_metadata, key_reservation) =
+                    tls_material_budget.read_material(&key_path, &key_context)?;
+                let identity_context = "global npmrc TLS identity";
+                let (loaded, bundle_reservation) = load_identity_with_material_and_reservation(
+                    cert,
+                    Arc::new(cert_bytes),
+                    key,
+                    key_bytes,
+                    key_metadata,
+                    passphrase.as_ref(),
+                    |bytes| tls_material_budget.reserve_temporary(bytes, identity_context),
+                )?;
+                drop(key_reservation);
+                let additional_identity_bytes =
+                    loaded.material_bytes.checked_mul(2).ok_or_else(|| {
+                        LpmError::Cert("global npmrc TLS identity size overflow".to_string())
+                    })?;
+                tls_material_budget.reserve(additional_identity_bytes, identity_context)?;
+                tls_material_budget.set_global_identity_bytes(loaded.material_bytes)?;
+                bundle_reservation.commit();
+                cert_reservation.commit();
+                Some(Arc::new(loaded))
+            }
             _ => None,
         };
         let default_identity_fp = global_loaded
             .as_ref()
             .map(|l| cert_pem_fingerprint(&l.cert_pem));
         let default_identity = global_loaded.as_ref().map(|l| l.identity.clone());
-        let default_reqwest_client = Self::build_http_client_with_tls_and_identity(
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-            tls,
-            default_identity.clone(),
-        )?;
-        let policy_metadata_client = Self::build_http_client_with_tls_and_identity(
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-            tls,
-            default_identity.clone(),
-        )?;
-        let manual_redirect_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-            tls,
-            default_identity,
-        )?;
+        let (default_reqwest_client, policy_metadata_client, manual_redirect_client) =
+            Self::build_http_client_set_with_tls_and_identity(
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+                tls,
+                default_identity,
+            )?;
         let default_cached = CachedClient {
             client: default_reqwest_client,
             policy_metadata_client,
             manual_redirect_client,
             identity_fp: default_identity_fp,
         };
+        let eager_tls_origin_count = eager_origins
+            .iter()
+            .filter(|origin| {
+                tls.per_origin
+                    .get(*origin)
+                    .is_some_and(|overrides| !overrides.is_empty())
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if eager_tls_origin_count > MAX_NPMRC_TLS_CLIENT_SETS {
+            return Err(LpmError::Cert(format!(
+                "npmrc requests {eager_tls_origin_count} eager per-origin TLS client sets; the limit is {MAX_NPMRC_TLS_CLIENT_SETS}"
+            )));
+        }
         // Eager per-origin builds — only for origins in the supplied set
         // that ALSO have per-origin TLS configured.
         let mut eager_map = HashMap::new();
         for origin in eager_origins {
-            // Look up per-origin TLS using the same (host, Some(port))
-            // → (host, None) fallback as the auth path.
-            let any_port = OriginKey {
-                host_lower: origin.host_lower.clone(),
-                port: None,
-            };
-            let per_origin_tls = tls
-                .per_origin
-                .get(origin)
-                .or_else(|| tls.per_origin.get(&any_port));
+            let per_origin_tls = tls.per_origin.get(origin);
             let Some(per_origin_tls) = per_origin_tls else {
                 continue;
             };
-            let cached =
-                build_per_origin_http_client(tls, per_origin_tls, origin, passphrase.as_ref())?;
+            let cached = build_per_origin_http_client(
+                tls,
+                per_origin_tls,
+                origin,
+                passphrase.as_ref(),
+                global_loaded.as_deref(),
+                None,
+                tls_material_budget.as_ref(),
+            )?;
             eager_map.insert(origin.clone(), cached);
         }
-        // Pre-compute identity fingerprints for every configured per-origin
-        // TLS entry so cache-key composition (sync, runs BEFORE lazy
-        // dispatch) can answer correctly for lazy-target origins. Origins
-        // with their own certfile: hash that cert. Origins with per-origin
-        // cafile but no own identity: inherit the global identity_fp.
-        // Cert read failures here are non-fatal — the entry stays absent
-        // and the lazy build will surface a cited error if and when the
-        // origin is actually reached.
-        let mut per_origin_identity_fps: HashMap<OriginKey, Arc<str>> = HashMap::new();
+        let mut per_origin_identity_certs = HashMap::with_capacity(tls.per_origin.len());
         for (origin, per_origin) in &tls.per_origin {
-            let fp = if let Some(cert) = &per_origin.certfile {
-                match lpm_common::read_file_capped(
-                    &cert.resolve(),
-                    lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
-                ) {
-                    Ok(bytes) => Some(cert_pem_fingerprint(&bytes)),
-                    Err(_) => None,
-                }
-            } else {
-                // No own identity → inherits global. Carry the global
-                // fp into the per-origin map so the lookup tier-2 hit
-                // returns it (else tier-3 default would catch it,
-                // but only when no other entry exists — having it in
-                // tier-2 keeps the resolution rule uniform).
-                default_cached.identity_fp.clone()
-            };
-            if let Some(fp) = fp {
-                per_origin_identity_fps.insert(origin.clone(), fp);
+            if let Some(certfile) = per_origin.certfile.as_ref() {
+                per_origin_identity_certs.insert(
+                    origin.clone(),
+                    LazyIdentityCert {
+                        certfile: certfile.clone(),
+                        material: std::sync::OnceLock::new(),
+                    },
+                );
             }
         }
+        let lazy = tls
+            .per_origin
+            .keys()
+            .filter(|origin| !eager_map.contains_key(*origin))
+            .map(|origin| (origin.clone(), tokio::sync::OnceCell::new()))
+            .collect();
+        let built_client_sets = std::sync::atomic::AtomicUsize::new(eager_map.len());
         let http = Arc::new(HttpClients {
             default: default_cached,
             eager: eager_map,
-            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            lazy,
+            built_client_sets,
             tls_overrides: Arc::new(tls.clone()),
             passphrase,
-            per_origin_identity_fps,
+            global_identity: global_loaded,
+            tls_material_budget,
+            per_origin_identity_certs,
         });
         self.http = http;
         self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
@@ -645,7 +750,7 @@ impl RegistryClient {
         if !allowed {
             return Err(LpmError::Registry(format!(
                 "registry URL '{}' uses insecure transport. Use HTTPS, or pass --insecure to allow HTTP non-localhost.",
-                self.base_url
+                safe_url_for_diagnostic(&self.base_url)
             )));
         }
         // When `--insecure` is the path that admitted an HTTP
@@ -662,7 +767,7 @@ impl RegistryClient {
         if self.allow_insecure && is_http_url(url) && !is_localhost_url(url) {
             tracing::warn!(
                 target: "lpm_registry::client",
-                base_url = %url,
+                base_url = %safe_url_for_diagnostic(url),
                 "--insecure HTTP non-loopback registry: there is a DNS-rebinding window between this URL validation and the eventual TCP connect. Use HTTPS to anchor the trust to a TLS cert rather than DNS"
             );
         }
@@ -685,7 +790,7 @@ impl RegistryClient {
         if !allowed {
             return Err(LpmError::Registry(format!(
                 "tarball URL must use HTTPS (got: {}). Pass --insecure to allow HTTP non-localhost.",
-                if url.len() > 80 { &url[..80] } else { url }
+                safe_url_for_diagnostic(url)
             )));
         }
         Ok(())
@@ -835,8 +940,97 @@ impl RegistryClient {
     }
 }
 
+fn safe_url_for_diagnostic(value: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return "<invalid-url>".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return format!("{}:<redacted>", url.scheme());
+    };
+    let mut rendered = String::with_capacity(url.scheme().len() + host.len() + 10);
+    rendered.push_str(url.scheme());
+    rendered.push_str("://");
+    rendered.push_str(host);
+    if let Some(port) = url.port() {
+        rendered.push(':');
+        rendered.push_str(&port.to_string());
+    }
+    rendered
+}
+
 impl Default for RegistryClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn configured_ca_replaces_the_builtin_root_store() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate certificate");
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: Arc::new(certificate.cert.pem().into_bytes()),
+                source: "test".to_string(),
+                line: 1,
+            }],
+            ..TlsOverrides::default()
+        };
+
+        let roots = RegistryClient::prepare_tls_roots(&tls).expect("prepare TLS roots");
+
+        assert!(roots.replace_builtin_roots);
+        assert_eq!(roots.certificates.len(), 1);
+    }
+
+    #[test]
+    fn global_identity_reads_respect_remaining_aggregate_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate certificate");
+        let cert_path = directory.path().join("client.pem");
+        let key_path = directory.path().join("client.key");
+        std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
+        std::fs::write(&key_path, certificate.key_pair.serialize_pem()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let root_bytes = usize::try_from(lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES / 4).unwrap();
+        let mut root = vec![b' '; root_bytes];
+        let marker = b"-----BEGIN CERTIFICATE-----";
+        root[..marker.len()].copy_from_slice(marker);
+        let tls = TlsOverrides {
+            extra_roots: vec![TaggedRoot {
+                pem_bytes: Arc::new(root),
+                source: "test".to_string(),
+                line: 1,
+            }],
+            identity_certfile: Some(TaggedPath {
+                path: cert_path,
+                source: "test".to_string(),
+                line: 2,
+                source_dir: None,
+            }),
+            identity_keyfile: Some(TaggedPath {
+                path: key_path,
+                source: "test".to_string(),
+                line: 3,
+                source_dir: None,
+            }),
+            ..TlsOverrides::default()
+        };
+
+        let error = match RegistryClient::new().with_tls_overrides(&tls) {
+            Ok(_) => panic!("the global identity read must honor the exhausted aggregate budget"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("aggregate limit"), "{error}");
     }
 }

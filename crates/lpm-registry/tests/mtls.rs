@@ -72,6 +72,13 @@ fn write_client_identity(
     let key_path = dir.join("client-key.pem");
     std::fs::write(&cert_path, &leaf.cert_pem).expect("write cert");
     std::fs::write(&key_path, &leaf.key_pem).expect("write key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict client key permissions");
+    }
     (cert_path, key_path)
 }
 
@@ -113,7 +120,7 @@ fn build_client_with_per_origin_identity(
         // Global trust root: the server's CA. Per-origin clients
         // inherit this through the TLS overrides composition rule.
         extra_roots: vec![TaggedRoot {
-            pem_bytes: server_ca_pem.as_bytes().to_vec(),
+            pem_bytes: server_ca_pem.as_bytes().to_vec().into(),
             source: "test:.npmrc".into(),
             line: 3,
         }],
@@ -131,7 +138,7 @@ fn build_client_with_per_origin_identity(
 fn build_client_with_ca_only(server_ca_pem: &str) -> RegistryClient {
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: server_ca_pem.as_bytes().to_vec(),
+            pem_bytes: server_ca_pem.as_bytes().to_vec().into(),
             source: "test:.npmrc".into(),
             line: 1,
         }],
@@ -281,7 +288,7 @@ async fn mtls_per_origin_isolation() {
     );
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: server_ca.cert_pem.as_bytes().to_vec(),
+            pem_bytes: server_ca.cert_pem.as_bytes().to_vec().into(),
             source: "test:.npmrc".into(),
             line: 3,
         }],
@@ -421,6 +428,13 @@ async fn mtls_encrypted_pkcs8_with_correct_passphrase_succeeds() {
     let key_path = dir.path().join("client-key.pem");
     std::fs::write(&cert_path, &client_leaf.cert_pem).expect("write cert");
     std::fs::write(&key_path, &encrypted_pem).expect("write encrypted key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict encrypted client key permissions");
+    }
 
     let leaf = make_leaf(&server_ca, LeafShape::Valid);
     let (port, _handle) = spawn_tls_server_mutual(leaf, &server_ca, &server_ca).await;

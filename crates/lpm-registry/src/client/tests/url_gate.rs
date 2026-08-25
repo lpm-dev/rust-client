@@ -360,3 +360,44 @@ fn gate_rejects_malformed_url() {
         GateDecision::RejectedScheme,
     );
 }
+
+#[test]
+fn rejected_registry_and_tarball_urls_redact_credentials_paths_and_queries() {
+    let registry_secret = "registry-password";
+    let registry = RegistryClient::new().with_base_url(format!(
+        "http://user:{registry_secret}@registry.example/private?token=query-secret"
+    ));
+    let registry_error = registry.validate_base_url().unwrap_err().to_string();
+    for secret in [registry_secret, "private", "query-secret"] {
+        assert!(
+            !registry_error.contains(secret),
+            "registry error leaked {secret}: {registry_error}"
+        );
+    }
+
+    let tarball_secret = "tarball-password";
+    let tarball_url = format!(
+        "ftp://user:{tarball_secret}@registry.example/private/package.tgz?token=tarball-query"
+    );
+    let tarball_error = RegistryClient::new()
+        .check_tarball_url_scheme(&tarball_url)
+        .unwrap_err()
+        .to_string();
+    for secret in [tarball_secret, "private", "tarball-query"] {
+        assert!(
+            !tarball_error.contains(secret),
+            "tarball error leaked {secret}: {tarball_error}"
+        );
+    }
+}
+
+#[test]
+fn rejected_long_unicode_tarball_url_returns_an_error_without_panicking() {
+    let url = format!("ftp://registry.example/{}é/package.tgz", "a".repeat(56));
+    let result = std::panic::catch_unwind(|| RegistryClient::new().check_tarball_url_scheme(&url));
+    assert!(
+        result.is_ok(),
+        "malformed Unicode URL must not panic error formatting"
+    );
+    assert!(result.unwrap().is_err());
+}

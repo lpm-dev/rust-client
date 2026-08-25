@@ -296,6 +296,7 @@ impl ReplayableHttpClientProvider for reqwest::Client {
 pub enum ReplayableRequestError<E> {
     Client(E),
     Request(reqwest::Error),
+    NonReplayableBody,
     TooManyRedirects,
     Timeout,
     HttpsDowngrade,
@@ -315,6 +316,7 @@ impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
         match self {
             Self::Client(error) => error.fmt(formatter),
             Self::Request(error) => display_error(error).fmt(formatter),
+            Self::NonReplayableBody => formatter.write_str("request body cannot be replayed"),
             Self::TooManyRedirects => formatter.write_str("too many redirects"),
             Self::Timeout => formatter.write_str("request timed out"),
             Self::HttpsDowngrade => formatter.write_str(HTTPS_DOWNGRADE_REFUSAL),
@@ -336,7 +338,8 @@ where
         match self {
             Self::Client(error) => Some(error),
             Self::Request(error) => Some(error),
-            Self::TooManyRedirects
+            Self::NonReplayableBody
+            | Self::TooManyRedirects
             | Self::Timeout
             | Self::HttpsDowngrade
             | Self::CleartextNonLoopback
@@ -348,8 +351,22 @@ where
 /// Execute a request with replay-safe, credential-aware redirect handling.
 pub async fn send_with_replayable_redirects<P>(
     provider: &P,
-    mut request: reqwest::Request,
+    request: reqwest::Request,
     replayable_body: Option<&ReplayableRequestBody>,
+) -> Result<reqwest::Response, ReplayableRequestError<P::Error>>
+where
+    P: ReplayableHttpClientProvider + ?Sized,
+{
+    send_with_replayable_redirects_and_authorization_scope(provider, request, replayable_body, None)
+        .await
+}
+
+/// Execute a replay-safe request and re-check Authorization scope at every redirect hop.
+pub async fn send_with_replayable_redirects_and_authorization_scope<P>(
+    provider: &P,
+    request: reqwest::Request,
+    replayable_body: Option<&ReplayableRequestBody>,
+    authorization_allowed: Option<&(dyn Fn(&reqwest::Url) -> bool + Send + Sync)>,
 ) -> Result<reqwest::Response, ReplayableRequestError<P::Error>>
 where
     P: ReplayableHttpClientProvider + ?Sized,
@@ -360,25 +377,36 @@ where
     let mut method = request.method().clone();
     let mut url = request.url().clone();
     let mut headers = request.headers().clone();
-    let mut send_body = replayable_body.is_some();
+    let mut send_body = request.body().is_some() || replayable_body.is_some();
+    let request_template = request.try_clone();
+    if replayable_body.is_none() && request.body().is_some() && request_template.is_none() {
+        return Err(ReplayableRequestError::NonReplayableBody);
+    }
     let mut chain_used_https = url.scheme() == "https";
     let mut redirects_followed = 0usize;
 
     loop {
-        *request.method_mut() = method.clone();
-        *request.url_mut() = url.clone();
-        *request.headers_mut() = headers.clone();
-        *request.version_mut() = version;
-        *request.body_mut() = if send_body {
-            replayable_body.map(ReplayableRequestBody::body)
-        } else {
-            None
-        };
-        if send_body {
-            request.headers_mut().insert(
-                CONTENT_LENGTH,
-                replayable_body.map_or(0, ReplayableRequestBody::len).into(),
-            );
+        let mut hop_request = request_template
+            .as_ref()
+            .and_then(reqwest::Request::try_clone)
+            .unwrap_or_else(|| reqwest::Request::new(method.clone(), url.clone()));
+        *hop_request.method_mut() = method.clone();
+        *hop_request.url_mut() = url.clone();
+        *hop_request.headers_mut() = headers.clone();
+        *hop_request.version_mut() = version;
+        if replayable_body.is_some() {
+            *hop_request.body_mut() = if send_body {
+                replayable_body.map(ReplayableRequestBody::body)
+            } else {
+                None
+            };
+        } else if !send_body {
+            *hop_request.body_mut() = None;
+        }
+        if send_body && let Some(replayable_body) = replayable_body {
+            hop_request
+                .headers_mut()
+                .insert(CONTENT_LENGTH, replayable_body.len().into());
         }
 
         let client_future = provider.client_for_url(&url);
@@ -391,7 +419,7 @@ where
                 .await
                 .map_err(ReplayableRequestError::Client)?,
         };
-        *request.timeout_mut() = match deadline {
+        *hop_request.timeout_mut() = match deadline {
             Some(deadline) => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
@@ -401,7 +429,7 @@ where
             }
             None => None,
         };
-        let response_future = client.execute(request);
+        let response_future = client.execute(hop_request);
         let response = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, response_future)
                 .await
@@ -439,7 +467,9 @@ where
                 }
             });
         }
-        if !same_origin(&url, &next_url) {
+        if !same_origin(&url, &next_url)
+            || authorization_allowed.is_some_and(|allowed| !allowed(&next_url))
+        {
             remove_cross_origin_credentials(&mut headers);
         }
         if !next_has_body {
@@ -452,7 +482,6 @@ where
         method = next_method;
         url = next_url;
         send_body = next_has_body;
-        request = reqwest::Request::new(method.clone(), url.clone());
     }
 }
 
@@ -1111,6 +1140,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_origin_redirects_keep_authorization_only_inside_its_allowed_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (target_path, expects_authorization) in
+            [("/registry/packages/next", true), ("/sibling/next", false)]
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/registry/packages/start"))
+                .respond_with(ResponseTemplate::new(302).insert_header("location", target_path))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(target_path))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .unwrap();
+            let request = client
+                .get(format!("{}/registry/packages/start", server.uri()))
+                .header(AUTHORIZATION, "Bearer path-scoped")
+                .build()
+                .unwrap();
+            let authorization_allowed = |url: &reqwest::Url| {
+                url.path() == "/registry" || url.path().starts_with("/registry/")
+            };
+
+            let response = send_with_replayable_redirects_and_authorization_scope(
+                &client,
+                request,
+                None,
+                Some(&authorization_allowed),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let requests = server.received_requests().await.unwrap();
+            let redirected = requests
+                .iter()
+                .find(|request| request.url.path() == target_path)
+                .unwrap();
+            assert_eq!(
+                redirected
+                    .headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                expects_authorization.then_some("Bearer path-scoped")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cross_origin_307_replays_body_without_forwarding_credentials() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1157,6 +1245,45 @@ mod tests {
         assert!(redirected.headers.get(AUTHORIZATION).is_none());
         assert!(redirected.headers.get("x-otp").is_none());
         assert!(redirected.headers.get("npm-otp").is_none());
+    }
+
+    #[tokio::test]
+    async fn cloneable_buffered_request_body_replays_without_a_second_body_buffer() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/initial"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/redirected"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/redirected"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .unwrap();
+        let request = client
+            .put(format!("{}/initial", server.uri()))
+            .body(bytes::Bytes::from_static(b"shared-buffer"))
+            .build()
+            .unwrap();
+
+        let response = send_with_replayable_redirects(&client, request, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, b"shared-buffer");
+        assert_eq!(requests[1].body, b"shared-buffer");
     }
 
     #[tokio::test]

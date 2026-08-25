@@ -1136,6 +1136,58 @@ async fn download_tarball_with_auth_strips_authorization_on_cross_origin_redirec
 }
 
 #[tokio::test]
+async fn path_scoped_auth_is_stripped_from_a_same_origin_redirect_outside_its_prefix() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let saw_authorization = Arc::new(AtomicBool::new(false));
+    let body = b"redirected-tarball-body".to_vec();
+
+    Mock::given(method("GET"))
+        .and(path("/outside/target.tgz"))
+        .respond_with(AuthorizationRecorder {
+            saw_authorization: Arc::clone(&saw_authorization),
+            body: body.clone(),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/foo.tgz"))
+        .and(header("Authorization", "Bearer PATH-TOKEN"))
+        .respond_with(ResponseTemplate::new(302).append_header("Location", "/outside/target.tgz"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let origin = crate::npmrc::OriginKey::from_request_url(&format!("{}/_", server.uri()))
+        .expect("mock server origin");
+    let auth = crate::npmrc::RegistryAuth::Bearer {
+        scope: crate::npmrc::AuthScope {
+            origin,
+            path_prefix: std::sync::Arc::from("/api/"),
+        },
+        token: secrecy::SecretString::from("PATH-TOKEN".to_string()),
+    };
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let downloaded = client
+        .download_tarball_to_file_with_auth(&format!("{}/api/foo.tgz", server.uri()), Some(&auth))
+        .await
+        .expect("same-origin redirect should complete without leaking scoped auth");
+
+    assert_eq!(downloaded.compressed_size, body.len() as u64);
+    assert!(
+        !saw_authorization.load(Ordering::SeqCst),
+        "path-scoped Authorization escaped its configured prefix"
+    );
+}
+
+#[tokio::test]
 async fn download_tarball_with_auth_anon_when_none() {
     // No npmrc auth for this URL → request goes anonymous (no
     // Authorization header). Importantly, the LPM session bearer
@@ -1552,8 +1604,8 @@ async fn download_tarball_with_auth_origin_mismatch_returns_error() {
     match result {
         Err(LpmError::Registry(msg)) => {
             assert!(
-                msg.contains("origin mismatch"),
-                "error must mention origin mismatch: {msg}"
+                msg.contains("scope mismatch"),
+                "error must mention scope mismatch: {msg}"
             );
         }
         other => panic!("expected origin-mismatch Registry error, got {other:?}"),

@@ -138,7 +138,7 @@ impl LpmDependencyProvider {
                             .block_on(self.client.get_npm_metadata_from(
                                 &target.base_url,
                                 name,
-                                auth.as_ref(),
+                                auth.as_deref(),
                             ))
                             .inspect(|metadata| {
                                 if let Some(start) = raw_start {

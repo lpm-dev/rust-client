@@ -274,6 +274,7 @@ pub async fn run(
         &[],
         true,  // emit the install report before the deploy-specific summary
         false, // reserve_stdout: deploy owns no stdio protocol channel
+        None,
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
     )
     .await?;

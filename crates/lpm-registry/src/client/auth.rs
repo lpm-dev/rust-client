@@ -1,5 +1,59 @@
 use super::*;
 
+pub(super) struct RequestDestination {
+    url: reqwest::Url,
+    origin: crate::npmrc::OriginKey,
+}
+
+impl RequestDestination {
+    pub(super) fn parse(url: &str) -> Result<Self, LpmError> {
+        let parsed = reqwest::Url::parse(url).map_err(|_| {
+            LpmError::Registry(format!(
+                "invalid registry URL '{}'",
+                lpm_common::safe_url_origin(url)
+            ))
+        })?;
+        let origin = crate::npmrc::OriginKey::from_parsed_url(&parsed).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid URL '{}' — must be http(s) with a host",
+                lpm_common::safe_url_origin(url)
+            ))
+        })?;
+        Ok(Self {
+            url: parsed,
+            origin,
+        })
+    }
+
+    pub(super) fn as_url(&self) -> &reqwest::Url {
+        &self.url
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        self.url.as_str()
+    }
+
+    pub(super) fn origin(&self) -> &crate::npmrc::OriginKey {
+        &self.origin
+    }
+
+    fn is_cleartext_non_loopback(&self) -> bool {
+        if self.url.scheme() != "http" {
+            return false;
+        }
+        let Some(host) = self.url.host_str() else {
+            return true;
+        };
+        if host.eq_ignore_ascii_case("localhost") {
+            return false;
+        }
+        let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
+        !normalized_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(super::url_gate::is_loopback_ip)
+    }
+}
+
 /// Per-request auth posture.
 ///
 /// Every public request method on `RegistryClient` is annotated with
@@ -64,32 +118,30 @@ pub(super) fn apply_npmrc_auth(
     url: &str,
     auth: Option<&crate::npmrc::RegistryAuth>,
 ) -> Result<reqwest::RequestBuilder, LpmError> {
+    let destination = RequestDestination::parse(url)?;
+    apply_npmrc_auth_to_destination(req, &destination, auth)
+}
+
+pub(super) fn apply_npmrc_auth_to_destination(
+    req: reqwest::RequestBuilder,
+    destination: &RequestDestination,
+    auth: Option<&crate::npmrc::RegistryAuth>,
+) -> Result<reqwest::RequestBuilder, LpmError> {
     use secrecy::ExposeSecret;
     let Some(a) = auth else {
         return Ok(req);
     };
-    let parsed = reqwest::Url::parse(url).map_err(|_| {
-        LpmError::Registry(format!(
-            "invalid registry URL '{}'",
-            lpm_common::safe_url_origin(url)
-        ))
-    })?;
-    if parsed.scheme() == "http" && !super::url_gate::is_localhost_url(url) {
+    if destination.is_cleartext_non_loopback() {
         return Err(LpmError::Registry(format!(
             "refusing to send registry credentials over cleartext HTTP to {}",
-            lpm_common::safe_url_origin(url)
+            lpm_common::safe_url_origin(destination.as_str())
         )));
     }
-    let dest = crate::npmrc::OriginKey::from_request_url(url).ok_or_else(|| {
-        LpmError::Registry(format!(
-            "invalid URL '{}' — must be http(s) with a host",
-            lpm_common::safe_url_origin(url)
-        ))
-    })?;
-    if !a.matches_destination(&dest) {
+    if !a.matches_origin_path(destination.origin(), destination.as_url().path()) {
         return Err(LpmError::Registry(format!(
-            "auth/destination origin mismatch: credential scoped to {} but request targets {dest} (this is an lpm bug — please report)",
-            a.origin()
+            "auth/destination scope mismatch: credential scoped to {} but request targets {} (this is an lpm bug — please report)",
+            a.scope(),
+            lpm_common::safe_url_origin(destination.as_str())
         )));
     }
     let req = match a {

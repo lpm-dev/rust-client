@@ -108,10 +108,13 @@ impl HttpClients {
                 identity_fp: None,
             },
             eager: HashMap::new(),
-            lazy: tokio::sync::Mutex::new(HashMap::new()),
+            lazy: HashMap::new(),
+            built_client_sets: std::sync::atomic::AtomicUsize::new(0),
             tls_overrides: Arc::new(TlsOverrides::default()),
             passphrase: Arc::new(EnvThenTtyPassphrase::new()),
-            per_origin_identity_fps: HashMap::new(),
+            global_identity: None,
+            tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+            per_origin_identity_certs: HashMap::new(),
         })
     }
 
@@ -122,14 +125,11 @@ impl HttpClients {
         let Some(origin) = OriginKey::from_request_url(url) else {
             return &self.default;
         };
-        if let Some(c) = self.eager.get(&origin) {
-            return c;
-        }
-        let any_port = OriginKey {
-            host_lower: origin.host_lower,
-            port: None,
-        };
-        if let Some(c) = self.eager.get(&any_port) {
+        self.cached_for_origin_no_build(&origin)
+    }
+
+    fn cached_for_origin_no_build(&self, origin: &OriginKey) -> &CachedClient {
+        if let Some(c) = self.eager.get(origin) {
             return c;
         }
         &self.default
@@ -168,26 +168,56 @@ impl HttpClients {
         let Some(origin) = OriginKey::from_request_url(url) else {
             return self.default.identity_fp.as_deref();
         };
-        // Tier 1: eager hit.
-        if let Some(c) = self.eager.get(&origin) {
+        self.identity_fp_for_origin(&origin)
+    }
+
+    pub(super) fn identity_fp_for_destination(
+        &self,
+        destination: &RequestDestination,
+    ) -> Option<&str> {
+        self.identity_fp_for_origin(destination.origin())
+    }
+
+    fn identity_fp_for_origin(&self, origin: &OriginKey) -> Option<&str> {
+        if let Some(c) = self.eager.get(origin) {
             return c.identity_fp.as_deref();
         }
-        let any_port = OriginKey {
-            host_lower: origin.host_lower.clone(),
-            port: None,
-        };
-        if let Some(c) = self.eager.get(&any_port) {
-            return c.identity_fp.as_deref();
+        if let Some(material) = self.lazy_identity_material(origin) {
+            return Some(match material {
+                Ok(material) => material.fingerprint.as_ref(),
+                Err(_) => "identity-unavailable",
+            });
         }
-        // Tier 2: pre-computed lazy-target fp.
-        if let Some(fp) = self.per_origin_identity_fps.get(&origin) {
-            return Some(fp.as_ref());
-        }
-        if let Some(fp) = self.per_origin_identity_fps.get(&any_port) {
-            return Some(fp.as_ref());
-        }
-        // Tier 3: default client's fp (global identity, if any).
         self.default.identity_fp.as_deref()
+    }
+
+    fn lazy_identity_material(
+        &self,
+        origin: &OriginKey,
+    ) -> Option<Result<&LazyIdentityMaterial, &Arc<str>>> {
+        let lazy = self.per_origin_identity_certs.get(origin)?;
+        Some(
+            lazy.material
+                .get_or_init(|| {
+                    let resolved = lazy.certfile.resolve();
+                    let context = format!(
+                        "{}:{}: failed to read per-origin certfile for {origin}",
+                        lazy.certfile.source, lazy.certfile.line
+                    );
+                    let (bytes, _, reservation) = self
+                        .tls_material_budget
+                        .read_material(&resolved, &context)
+                        .map_err(|error| Arc::from(error.to_string()))?;
+                    let cert_pem = Arc::new(bytes);
+                    let material = LazyIdentityMaterial {
+                        fingerprint: cert_pem_fingerprint(cert_pem.as_ref()),
+                        cert_pem,
+                    };
+                    reservation.commit();
+                    Ok(material)
+                })
+                .as_ref(),
+        )
     }
 
     /// Look up (or lazily build) a client for `url`. Returns the eager
@@ -200,11 +230,18 @@ impl HttpClients {
     /// provider). For origins guaranteed to be eager-built, prefer
     /// [`Self::for_url_no_build`] — it's sync and infallible.
     ///
-    /// Single-flight: while the build is in flight, concurrent callers
-    /// queue on `lazy.lock()`. The second caller observes the
-    /// just-inserted entry and skips the build.
+    /// Single-flight is keyed by origin, so matching callers share one build
+    /// while unrelated origins can build independently.
     pub async fn for_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
         self.for_url_pool(url, ClientPool::General).await
+    }
+
+    pub(super) async fn for_destination(
+        &self,
+        destination: &RequestDestination,
+    ) -> Result<reqwest::Client, LpmError> {
+        self.for_origin_pool(destination.origin(), ClientPool::General)
+            .await
     }
 
     /// Resolve the configuration-equivalent client from the dedicated
@@ -219,60 +256,92 @@ impl HttpClients {
     }
 
     async fn for_url_pool(&self, url: &str, pool: ClientPool) -> Result<reqwest::Client, LpmError> {
+        let Some(origin) = OriginKey::from_request_url(url) else {
+            return Ok(self.select_pool_client(&self.default, pool));
+        };
+        self.for_origin_pool(&origin, pool).await
+    }
+
+    fn select_pool_client(&self, cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
+        match pool {
+            ClientPool::General => cached.client.clone(),
+            ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
+            ClientPool::ManualRedirect => cached.manual_redirect_client.clone(),
+        }
+    }
+
+    async fn for_origin_pool(
+        &self,
+        origin: &OriginKey,
+        pool: ClientPool,
+    ) -> Result<reqwest::Client, LpmError> {
         let select = |cached: &CachedClient| match pool {
             ClientPool::General => cached.client.clone(),
             ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
             ClientPool::ManualRedirect => cached.manual_redirect_client.clone(),
         };
-        let Some(origin) = OriginKey::from_request_url(url) else {
+        if let Some(c) = self.eager.get(origin) {
+            return Ok(select(c));
+        }
+        let Some(per_origin_tls) = self.tls_overrides.per_origin.get(origin) else {
             return Ok(select(&self.default));
         };
-        if let Some(c) = self.eager.get(&origin) {
-            return Ok(select(c));
-        }
-        let any_port = OriginKey {
-            host_lower: origin.host_lower.clone(),
-            port: None,
+        let preloaded_cert_pem = match self.lazy_identity_material(origin) {
+            Some(Ok(material)) => Some(Arc::clone(&material.cert_pem)),
+            Some(Err(error)) => return Err(LpmError::Cert(error.to_string())),
+            None => None,
         };
-        if let Some(c) = self.eager.get(&any_port) {
-            return Ok(select(c));
+        let cell = self
+            .lazy
+            .get(origin)
+            .expect("every non-eager TLS origin has a lazy cell");
+        let cached = cell
+            .get_or_init(|| {
+                let global = Arc::clone(&self.tls_overrides);
+                let per_origin_tls = per_origin_tls.clone();
+                let origin = origin.clone();
+                let passphrase = Arc::clone(&self.passphrase);
+                let global_identity = self.global_identity.clone();
+                let material_budget = Arc::clone(&self.tls_material_budget);
+                async move {
+                    use std::sync::atomic::Ordering;
+
+                    if self
+                        .built_client_sets
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                            (used < MAX_NPMRC_TLS_CLIENT_SETS).then_some(used + 1)
+                        })
+                        .is_err()
+                    {
+                        return Err(Arc::from(format!(
+                            "npmrc per-origin TLS client-set limit of {MAX_NPMRC_TLS_CLIENT_SETS} reached while building {origin}"
+                        )));
+                    }
+                    let result = tokio::task::spawn_blocking(move || {
+                        build_per_origin_http_client(
+                            global.as_ref(),
+                            &per_origin_tls,
+                            &origin,
+                            passphrase.as_ref(),
+                            global_identity.as_deref(),
+                            preloaded_cert_pem.as_ref(),
+                            material_budget.as_ref(),
+                        )
+                    })
+                    .await
+                    .map_err(|error| LpmError::Cert(format!("per-origin TLS client build task failed: {error}")))
+                    .and_then(|result| result);
+                    if result.is_err() {
+                        self.built_client_sets.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    result.map_err(|error| Arc::from(error.to_string()))
+                }
+            })
+            .await;
+        match cached {
+            Ok(cached) => Ok(select(cached)),
+            Err(error) => Err(LpmError::Cert(error.to_string())),
         }
-        // Fast path: no per-origin TLS configured at all → the lazy map is
-        // guaranteed empty and the build below would no-op to default. Skip
-        // the tokio mutex entirely. This is the common case for installs
-        // with no .npmrc per-origin TLS (default public-registry traffic),
-        // where many concurrent metadata fetches would otherwise serialize
-        // briefly on `lazy.lock().await`.
-        if self.tls_overrides.per_origin.is_empty() {
-            return Ok(select(&self.default));
-        }
-        let mut guard = self.lazy.lock().await;
-        if let Some(c) = guard.get(&origin) {
-            return Ok(select(c));
-        }
-        if let Some(c) = guard.get(&any_port) {
-            return Ok(select(c));
-        }
-        // No client cached. Look up per-origin TLS for this origin.
-        let per_origin_tls = self
-            .tls_overrides
-            .per_origin
-            .get(&origin)
-            .or_else(|| self.tls_overrides.per_origin.get(&any_port));
-        let Some(per_origin_tls) = per_origin_tls else {
-            // No per-origin TLS → use default client.
-            return Ok(select(&self.default));
-        };
-        // Build under lock — single-flight per origin.
-        let cached = build_per_origin_http_client(
-            &self.tls_overrides,
-            per_origin_tls,
-            &origin,
-            self.passphrase.as_ref(),
-        )?;
-        let out = select(&cached);
-        guard.insert(origin, cached);
-        Ok(out)
     }
 }
 
@@ -299,26 +368,26 @@ pub(super) fn build_per_origin_http_client(
     per_origin: &OriginTlsOverrides,
     origin: &OriginKey,
     passphrase: &dyn PassphraseProvider,
+    global_identity: Option<&LoadedIdentity>,
+    preloaded_cert_pem: Option<&Arc<Vec<u8>>>,
+    material_budget: &TlsMaterialBudget,
 ) -> Result<CachedClient, LpmError> {
     // Compose extra roots: global + per-origin (additive).
     // Per-origin cafiles are deferred-read; do the IO here.
     let mut all_roots: Vec<TaggedRoot> = global.extra_roots.clone();
+    let mut origin_root_bytes = 0_u64;
+    let mut source_material_reservations = Vec::new();
     for cafile in &per_origin.cafiles {
         let resolved = cafile.resolve();
-        let bytes =
-            lpm_common::read_file_capped(&resolved, lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES)
-                .map_err(|e| {
-                tracing::debug!(
-                    resolved_path = %resolved.display(),
-                    source = %cafile.source,
-                    line = cafile.line,
-                    error = %e,
-                    "per-origin cafile read failed",
-                );
-                LpmError::Cert(format!(
-                    "{}:{}: failed to read per-origin cafile for {origin}: {e}",
-                    cafile.source, cafile.line,
-                ))
+        let context = format!(
+            "{}:{}: failed to read per-origin cafile for {origin}",
+            cafile.source, cafile.line
+        );
+        let (bytes, _, reservation) = material_budget.read_material(&resolved, &context)?;
+        origin_root_bytes = origin_root_bytes
+            .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                LpmError::Cert(format!("per-origin TLS material overflow for {origin}"))
             })?;
         if !contains_pem_certificate_block_inline(&bytes) {
             return Err(LpmError::Cert(format!(
@@ -327,10 +396,11 @@ pub(super) fn build_per_origin_http_client(
             )));
         }
         all_roots.push(TaggedRoot {
-            pem_bytes: bytes,
+            pem_bytes: Arc::new(bytes),
             source: cafile.source.clone(),
             line: cafile.line,
         });
+        source_material_reservations.push(reservation);
     }
 
     // Resolve identity. Per-origin replaces global; per-origin
@@ -341,7 +411,47 @@ pub(super) fn build_per_origin_http_client(
         per_origin.certfile.as_ref(),
         per_origin.keyfile.as_ref(),
     ) {
-        (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
+        (Some(cert), Some(key)) => {
+            let key_path = key.resolve();
+            let key_context = format!(
+                "{}:{}: failed to read keyfile {}",
+                key.source,
+                key.line,
+                key_path.display()
+            );
+            let (key_bytes, key_metadata, key_reservation) =
+                material_budget.read_material(&key_path, &key_context)?;
+            source_material_reservations.push(key_reservation);
+
+            let cert_pem = match preloaded_cert_pem {
+                Some(cert_pem) => Arc::clone(cert_pem),
+                None => {
+                    let cert_path = cert.resolve();
+                    let cert_context = format!(
+                        "{}:{}: failed to read certfile {}",
+                        cert.source,
+                        cert.line,
+                        cert_path.display()
+                    );
+                    let (cert_bytes, _, cert_reservation) =
+                        material_budget.read_material(&cert_path, &cert_context)?;
+                    source_material_reservations.push(cert_reservation);
+                    Arc::new(cert_bytes)
+                }
+            };
+            let identity_context = format!("per-origin TLS identity for {origin}");
+            let (loaded, bundle_reservation) = load_identity_with_material_and_reservation(
+                cert,
+                cert_pem,
+                key,
+                key_bytes,
+                key_metadata,
+                passphrase,
+                |bytes| material_budget.reserve_temporary(bytes, &identity_context),
+            )?;
+            source_material_reservations.push(bundle_reservation);
+            Some(loaded)
+        }
         (Some(cert), None) => {
             return Err(LpmError::Cert(format!(
                 "{}:{}: per-origin certfile is set for {origin} but matching keyfile is missing across all merged layers — both must be set or both absent",
@@ -355,17 +465,12 @@ pub(super) fn build_per_origin_http_client(
             )));
         }
         // No per-origin identity → inherit global (if any).
-        (None, None) => match (
-            global.identity_certfile.as_ref(),
-            global.identity_keyfile.as_ref(),
-        ) {
-            (Some(cert), Some(key)) => Some(load_identity(cert, key, passphrase)?),
-            // Global XOR is finalize-time fatal; if we got here
-            // with half-set, finalize would have aborted upstream.
-            // Treat as "no identity" defensively.
-            _ => None,
-        },
+        (None, None) => global_identity.cloned(),
     };
+    let per_origin_identity_bytes = per_origin
+        .certfile
+        .as_ref()
+        .and_then(|_| loaded.as_ref().map(|identity| identity.material_bytes));
 
     // Hash the cert PEM once so cache-key composition doesn't re-read
     // or re-hash on every request.
@@ -382,25 +487,26 @@ pub(super) fn build_per_origin_http_client(
         identity_keyfile: None,
         per_origin: HashMap::new(),
     };
-    let client = RegistryClient::build_http_client_with_tls_and_identity(
+    let context = format!("per-origin TLS for {origin}");
+    let reserved_bytes = material_budget.reserve_client_set(
+        origin_root_bytes,
+        per_origin_identity_bytes,
+        &context,
+    )?;
+    let clients = RegistryClient::build_http_client_set_with_tls_and_identity(
         CONNECT_TIMEOUT,
         READ_TIMEOUT,
         &synthetic,
-        identity.clone(),
-    )?;
-    let policy_metadata_client = RegistryClient::build_http_client_with_tls_and_identity(
-        CONNECT_TIMEOUT,
-        READ_TIMEOUT,
-        &synthetic,
-        identity.clone(),
-    )?;
-    let manual_redirect_client =
-        RegistryClient::build_manual_redirect_http_client_with_tls_and_identity(
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-            &synthetic,
-            identity,
-        )?;
+        identity,
+    );
+    let (client, policy_metadata_client, manual_redirect_client) = match clients {
+        Ok(clients) => clients,
+        Err(error) => {
+            material_budget.release(reserved_bytes);
+            return Err(error);
+        }
+    };
+    drop(source_material_reservations);
     Ok(CachedClient {
         client,
         policy_metadata_client,

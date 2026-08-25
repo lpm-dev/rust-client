@@ -541,6 +541,7 @@ pub async fn run(
                     &[],
                     !json_output,
                     false,
+                    None,
                     lpm_root,
                 )
                 .await;

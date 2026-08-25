@@ -1,5 +1,31 @@
 use super::*;
 
+fn lazy_cells(
+    tls: &TlsOverrides,
+) -> HashMap<OriginKey, tokio::sync::OnceCell<Result<CachedClient, Arc<str>>>> {
+    tls.per_origin
+        .keys()
+        .map(|origin| (origin.clone(), tokio::sync::OnceCell::new()))
+        .collect()
+}
+
+fn lazy_identity_certs(tls: &TlsOverrides) -> HashMap<OriginKey, LazyIdentityCert> {
+    tls.per_origin
+        .iter()
+        .filter_map(|(origin, overrides)| {
+            overrides.certfile.as_ref().map(|certfile| {
+                (
+                    origin.clone(),
+                    LazyIdentityCert {
+                        certfile: certfile.clone(),
+                        material: std::sync::OnceLock::new(),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 #[test]
 fn with_tls_overrides_default_is_noop() {
     // No extra roots, no strict_ssl set → no rebuild, no error.
@@ -32,7 +58,7 @@ fn with_tls_overrides_with_valid_pem_builds_ok() {
     let pem = rcgen_pem();
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: pem,
+            pem_bytes: pem.into(),
             source: "test:.npmrc".into(),
             line: 1,
         }],
@@ -41,6 +67,80 @@ fn with_tls_overrides_with_valid_pem_builds_ok() {
     };
     let client = RegistryClient::new();
     assert!(client.with_tls_overrides(&tls).is_ok());
+}
+
+#[test]
+fn unreached_per_origin_identity_certificates_are_not_read_eagerly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cert_path = dir.path().join("large-cert.pem");
+    let mut bytes = vec![b'A'; lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES as usize];
+    let marker = b"-----BEGIN CERTIFICATE-----";
+    bytes[..marker.len()].copy_from_slice(marker);
+    std::fs::write(&cert_path, bytes).expect("write certificate fixture");
+
+    let mut per_origin = HashMap::new();
+    for index in 0..17 {
+        per_origin.insert(
+            OriginKey {
+                host_lower: format!("registry-{index}.example.test"),
+                port: None,
+            },
+            crate::npmrc::OriginTlsOverrides {
+                cafiles: Vec::new(),
+                certfile: Some(crate::npmrc::TaggedPath {
+                    path: cert_path.clone(),
+                    source: "test".to_string(),
+                    line: index + 1,
+                    source_dir: None,
+                }),
+                keyfile: None,
+            },
+        );
+    }
+    let tls = TlsOverrides {
+        per_origin,
+        ..TlsOverrides::default()
+    };
+
+    RegistryClient::new()
+        .with_tls_overrides_for(&tls, &[])
+        .expect("unreached identity certificates must stay lazy");
+}
+
+#[test]
+fn eager_per_origin_tls_client_sets_are_bounded_before_file_reads() {
+    let mut per_origin = HashMap::new();
+    let mut eager_origins = Vec::new();
+    for index in 0..65 {
+        let origin = OriginKey {
+            host_lower: format!("registry-{index}.example.test"),
+            port: None,
+        };
+        eager_origins.push(origin.clone());
+        per_origin.insert(
+            origin,
+            OriginTlsOverrides {
+                cafiles: vec![TaggedPath {
+                    path: format!("missing-{index}.pem").into(),
+                    source: "test".into(),
+                    line: index + 1,
+                    source_dir: None,
+                }],
+                ..OriginTlsOverrides::default()
+            },
+        );
+    }
+    let tls = TlsOverrides {
+        per_origin,
+        ..TlsOverrides::default()
+    };
+
+    let error = match RegistryClient::new().with_tls_overrides_for(&tls, &eager_origins) {
+        Ok(_) => panic!("per-origin HTTP client sets must be bounded"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("64"), "{error}");
 }
 
 #[test]
@@ -61,7 +161,7 @@ fn with_tls_overrides_with_malformed_pem_returns_err_with_source() {
     let no_marker = b"this is plainly not a PEM file".to_vec();
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: no_marker,
+            pem_bytes: no_marker.into(),
             source: "/Users/me/.npmrc".into(),
             line: 7,
         }],
@@ -107,7 +207,7 @@ fn with_tls_overrides_combined_pem_and_strict_ssl_builds_ok() {
     let pem = rcgen_pem();
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: pem,
+            pem_bytes: pem.into(),
             source: "test".into(),
             line: 1,
         }],
@@ -160,10 +260,13 @@ fn http_clients_eager_hit_overrides_default() {
     let http = Arc::new(HttpClients {
         default: cached(default),
         eager,
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: HashMap::new(),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(1),
         tls_overrides: Arc::new(TlsOverrides::default()),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -317,10 +420,13 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
     let clients = HttpClients {
         default: cached(reqwest::Client::new()),
         eager,
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: HashMap::new(),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(2),
         tls_overrides: Arc::new(TlsOverrides::default()),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
     };
     let body = lpm_http::ReplayableRequestBody::from_bytes(b"body".to_vec());
     let mut request = reqwest::Request::new(
@@ -339,8 +445,89 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
 }
 
+#[tokio::test]
+async fn retry_transport_reselects_origin_specific_clients_across_redirects() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn cached_for_origin(origin: &'static str) -> CachedClient {
+        let headers = reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-selected-origin"),
+            reqwest::header::HeaderValue::from_static(origin),
+        )]);
+        let automatic = reqwest::Client::builder()
+            .default_headers(headers.clone())
+            .build()
+            .expect("automatic client");
+        let manual = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(headers)
+            .build()
+            .expect("manual client");
+        CachedClient {
+            client: automatic.clone(),
+            policy_metadata_client: automatic,
+            manual_redirect_client: manual,
+            identity_fp: None,
+        }
+    }
+
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/landing"))
+        .and(header("x-selected-origin", "target"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hop"))
+        .and(header("x-selected-origin", "source"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/landing", target.uri())),
+        )
+        .expect(1)
+        .mount(&source)
+        .await;
+
+    let mut eager = HashMap::new();
+    eager.insert(
+        OriginKey::from_request_url(&source.uri()).unwrap(),
+        cached_for_origin("source"),
+    );
+    eager.insert(
+        OriginKey::from_request_url(&target.uri()).unwrap(),
+        cached_for_origin("target"),
+    );
+    let http = Arc::new(HttpClients {
+        default: cached(reqwest::Client::new()),
+        eager,
+        lazy: HashMap::new(),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(2),
+        tls_overrides: Arc::new(TlsOverrides::default()),
+        passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
+    });
+    let mut client = RegistryClient::new();
+    client.http = http;
+    let request = reqwest::Request::new(
+        reqwest::Method::GET,
+        reqwest::Url::parse(&format!("{}/hop", source.uri())).unwrap(),
+    );
+
+    let response = client
+        .send_request_with_retry_and_npmrc_auth(request, None, None)
+        .await
+        .expect("redirect must reselect the target origin client");
+    assert_eq!(response.text().await.unwrap(), "ok");
+}
+
 #[test]
-fn http_clients_eager_port_none_matches_any_port() {
+fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let pem = rcgen_pem();
     let per_origin_client = reqwest::Client::builder()
@@ -357,21 +544,23 @@ fn http_clients_eager_port_none_matches_any_port() {
     let http = Arc::new(HttpClients {
         default: cached(default),
         eager,
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: HashMap::new(),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(1),
         tls_overrides: Arc::new(TlsOverrides::default()),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
     });
     let mut client = RegistryClient::new();
     client.http = http;
-    // Both 443 (default https) and 8443 must hit the no-port entry.
     let picked_443 = client.http.for_url_no_build("https://host.internal/foo");
     let picked_8443 = client
         .http
         .for_url_no_build("https://host.internal:8443/bar");
     let stored = &client.http.eager.get(&key_no_port).unwrap().client;
     assert!(std::ptr::eq(picked_443, stored));
-    assert!(std::ptr::eq(picked_8443, stored));
+    assert!(std::ptr::eq(picked_8443, &client.http.default.client));
 }
 
 #[tokio::test]
@@ -408,10 +597,13 @@ async fn http_clients_lazy_builds_and_memoizes() {
     let http = Arc::new(HttpClients {
         default: cached(default),
         eager: HashMap::new(),
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: lazy_cells(&tls),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(0),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
     });
     // First call must build + insert.
     let c1 = http.for_url("https://lazy.internal/pkg").await.expect("ok");
@@ -420,30 +612,72 @@ async fn http_clients_lazy_builds_and_memoizes() {
         .for_url("https://lazy.internal/other")
         .await
         .expect("ok");
-    // Same origin → same cached entry. The dispatcher inserts
-    // under the URL's concrete-port origin (`Some(443)` for
-    // HTTPS), not the configured port-None entry — both calls
-    // produce the same key, so the second call's `guard.get`
-    // hits without rebuild. Verify the lazy map has exactly one
-    // entry, keyed by the concrete-port origin.
-    let concrete_port_key = OriginKey {
-        host_lower: "lazy.internal".into(),
-        port: Some(443),
-    };
-    let map = http.lazy.lock().await;
+    let map = &http.lazy;
     assert_eq!(map.len(), 1, "lazy map must contain exactly one entry");
     assert!(
-        map.contains_key(&concrete_port_key),
-        "lazy entry must be keyed by the URL's concrete-port origin (got keys: {:?})",
+        map.contains_key(&origin),
+        "lazy entry must be keyed by the portless request origin (got keys: {:?})",
         map.keys().map(|k| k.to_string()).collect::<Vec<_>>()
     );
-    // The originally-configured port-None origin is the per_origin
-    // TLS lookup key, not the lazy cache key — the dispatcher's
-    // (host, Some(port)) → (host, None) fallback bridges the two.
-    // Reference but unused: prevents the unused-binding warning.
-    let _ = origin;
+    assert!(map[&origin].get().is_some(), "lazy client was not cached");
     // Sanity: both returned clients are usable Client values.
     let _ = (c1, c2);
+}
+
+#[tokio::test]
+async fn unrelated_origins_bypass_a_busy_lazy_tls_builder() {
+    let configured_origin = OriginKey {
+        host_lower: "configured.internal".into(),
+        port: None,
+    };
+    let mut per_origin = HashMap::new();
+    per_origin.insert(
+        configured_origin.clone(),
+        OriginTlsOverrides {
+            cafiles: vec![TaggedPath {
+                path: "unused.pem".into(),
+                source: "test".into(),
+                line: 1,
+                source_dir: None,
+            }],
+            ..OriginTlsOverrides::default()
+        },
+    );
+    let tls = TlsOverrides {
+        per_origin,
+        ..TlsOverrides::default()
+    };
+    let clients = Arc::new(HttpClients {
+        default: cached(reqwest::Client::new()),
+        eager: HashMap::new(),
+        lazy: lazy_cells(&tls),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(0),
+        tls_overrides: Arc::new(tls),
+        passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
+    });
+    let blocked_clients = Arc::clone(&clients);
+    let blocked_origin = configured_origin.clone();
+    let blocked = tokio::spawn(async move {
+        let _ = blocked_clients.lazy[&blocked_origin]
+            .get_or_init(std::future::pending)
+            .await;
+    });
+    tokio::task::yield_now().await;
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(50),
+        clients.for_url("https://unrelated.internal/pkg"),
+    )
+    .await;
+
+    blocked.abort();
+    assert!(
+        result.is_ok(),
+        "an unrelated origin waited on the TLS build mutex"
+    );
 }
 
 #[tokio::test]
@@ -452,18 +686,20 @@ async fn http_clients_no_per_origin_tls_falls_through_to_default() {
     let http = Arc::new(HttpClients {
         default: cached(default.clone()),
         eager: HashMap::new(),
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: HashMap::new(),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(0),
         tls_overrides: Arc::new(TlsOverrides::default()),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
+        per_origin_identity_certs: HashMap::new(),
     });
     let _ = http
         .for_url("https://anywhere.example/foo")
         .await
         .expect("ok");
     // Lazy map must remain empty (no per-origin TLS to build).
-    let map = http.lazy.lock().await;
-    assert!(map.is_empty());
+    assert!(http.lazy.is_empty());
 }
 
 #[tokio::test]
@@ -501,10 +737,13 @@ async fn http_clients_per_origin_certfile_xor_is_fatal_at_build() {
     let http = Arc::new(HttpClients {
         default: cached(default),
         eager: HashMap::new(),
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: lazy_cells(&tls),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(0),
+        per_origin_identity_certs: lazy_identity_certs(&tls),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
     });
     let result = http.for_url("https://halfconf.internal/foo").await;
     match result {
@@ -553,10 +792,13 @@ async fn http_clients_unreached_half_config_does_not_break_unrelated_lookup() {
     let http = Arc::new(HttpClients {
         default: cached(default),
         eager: HashMap::new(),
-        lazy: tokio::sync::Mutex::new(HashMap::new()),
+        lazy: lazy_cells(&tls),
+        built_client_sets: std::sync::atomic::AtomicUsize::new(0),
+        per_origin_identity_certs: lazy_identity_certs(&tls),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
-        per_origin_identity_fps: HashMap::new(),
+        global_identity: None,
+        tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
     });
     // Request to a DIFFERENT origin must succeed (lookup → default).
     let _ = http
@@ -614,14 +856,8 @@ async fn production_tarball_path_triggers_lazy_build_for_per_origin_tls() {
     // lazy map gets populated.
     let url = "https://lazy-target.invalid/foo/-/foo-1.0.0.tgz";
     let _ = client.download_tarball_to_file_with_auth(url, None).await;
-    // Verify: lazy map now contains an entry for the URL's
-    // concrete-port origin (per-origin lookup with port=None
-    // fallback hit; insertion key is the URL's resolved origin).
-    let lazy = client.http.lazy.lock().await;
-    let concrete_port_key = OriginKey {
-        host_lower: "lazy-target.invalid".into(),
-        port: Some(443),
-    };
+    // Verify: lazy map now contains the portless request origin.
+    let lazy = &client.http.lazy;
     assert_eq!(
         lazy.len(),
         1,
@@ -629,8 +865,12 @@ async fn production_tarball_path_triggers_lazy_build_for_per_origin_tls() {
         lazy.keys().map(|k| k.to_string()).collect::<Vec<_>>()
     );
     assert!(
-        lazy.contains_key(&concrete_port_key),
-        "lazy entry must be keyed by URL's concrete-port origin"
+        lazy.contains_key(&origin),
+        "lazy entry must be keyed by URL's portless origin"
+    );
+    assert!(
+        lazy[&origin].get().is_some_and(Result::is_ok),
+        "lazy client build was not cached"
     );
 }
 
@@ -674,19 +914,19 @@ fn principal_fingerprint_changes_with_identity_alone() {
 
 #[test]
 fn principal_fingerprint_changes_with_auth_alone() {
-    use crate::npmrc::{OriginKey, RegistryAuth};
+    use crate::npmrc::{AuthScope, OriginKey, RegistryAuth};
     let bearer_a = RegistryAuth::Bearer {
-        origin: OriginKey {
+        scope: AuthScope::from_origin(OriginKey {
             host_lower: "x".into(),
             port: None,
-        },
+        }),
         token: SecretString::from("token-a".to_string()),
     };
     let bearer_b = RegistryAuth::Bearer {
-        origin: OriginKey {
+        scope: AuthScope::from_origin(OriginKey {
             host_lower: "x".into(),
             port: None,
-        },
+        }),
         token: SecretString::from("token-b".to_string()),
     };
     let fp_a = principal_fingerprint(Some(&bearer_a), None);
@@ -700,12 +940,12 @@ fn principal_fingerprint_auth_plus_identity_differs_from_auth_alone() {
     // with vs. without an identity hash MUST produce distinct
     // fingerprints, otherwise a client that re-issues a cert
     // would still hit the old cache entry under the same auth.
-    use crate::npmrc::{OriginKey, RegistryAuth};
+    use crate::npmrc::{AuthScope, OriginKey, RegistryAuth};
     let bearer = RegistryAuth::Bearer {
-        origin: OriginKey {
+        scope: AuthScope::from_origin(OriginKey {
             host_lower: "x".into(),
             port: None,
-        },
+        }),
         token: SecretString::from("tok".to_string()),
     };
     let fp_no_id = principal_fingerprint(Some(&bearer), None);
@@ -724,6 +964,25 @@ fn cert_pem_fingerprint_is_deterministic_and_truncated() {
     let other = b"-----BEGIN CERTIFICATE-----\nEFGH\n-----END CERTIFICATE-----\n";
     let fp_other = cert_pem_fingerprint(other);
     assert_ne!(&*fp1, &*fp_other);
+}
+
+#[test]
+fn tls_material_reads_respect_remaining_aggregate_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("root.pem");
+    std::fs::write(&path, b"12345").unwrap();
+    let budget = TlsMaterialBudget::new_with_retained_source(
+        0,
+        lpm_common::TLS_MATERIAL_AGGREGATE_CAP_BYTES - 4,
+    )
+    .unwrap();
+
+    let error = match budget.read_material(&path, "test TLS material") {
+        Ok(_) => panic!("a file larger than the remaining budget must be refused"),
+        Err(error) => error.to_string(),
+    };
+
+    assert!(error.contains("aggregate limit"), "{error}");
 }
 
 #[test]
@@ -800,6 +1059,56 @@ fn lazy_target_origin_identity_fp_namespaces_cache_pre_dispatch() {
     );
 }
 
+#[tokio::test]
+async fn unreadable_lazy_identity_cannot_use_the_default_cache_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let origin = OriginKey {
+        host_lower: "lazy.internal".into(),
+        port: None,
+    };
+    let mut per_origin = HashMap::new();
+    per_origin.insert(
+        origin,
+        crate::npmrc::OriginTlsOverrides {
+            cafiles: Vec::new(),
+            certfile: Some(crate::npmrc::TaggedPath {
+                path: dir.path().join("missing-cert.pem"),
+                source: "user:.npmrc".into(),
+                line: 7,
+                source_dir: None,
+            }),
+            keyfile: Some(crate::npmrc::TaggedPath {
+                path: dir.path().join("missing-key.pem"),
+                source: "user:.npmrc".into(),
+                line: 8,
+                source_dir: None,
+            }),
+        },
+    );
+    let client = RegistryClient::new()
+        .with_tls_overrides_for(
+            &TlsOverrides {
+                per_origin,
+                ..TlsOverrides::default()
+            },
+            &[],
+        )
+        .expect("unreached lazy identity failures stay deferred");
+
+    assert_eq!(
+        client
+            .http
+            .identity_fp_for_url("https://lazy.internal/package"),
+        Some("identity-unavailable")
+    );
+    let error = client
+        .http
+        .for_url("https://lazy.internal/package")
+        .await
+        .expect_err("targeting an unreadable identity must fail before dispatch");
+    assert!(error.to_string().contains("user:.npmrc:7"));
+}
+
 #[test]
 fn http_clients_identity_fp_for_url_reflects_per_origin_cert() {
     // Generate a matching cert+key pair (same signing_key). Using
@@ -814,6 +1123,11 @@ fn http_clients_identity_fp_for_url_reflects_per_origin_cert() {
     std::fs::write(&cert_path, &cert_pem_str).unwrap();
     let key_path = dir.path().join("client.key");
     std::fs::write(&key_path, &key_pem_str).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let origin = OriginKey {
         host_lower: "corp.internal".into(),
         port: None,
@@ -868,7 +1182,7 @@ fn render_effective_tls_summary_reports_global_extra_roots() {
     let pem = rcgen_pem();
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: pem,
+            pem_bytes: pem.into(),
             source: "test".into(),
             line: 1,
         }],
@@ -896,12 +1210,12 @@ fn render_effective_tls_summary_pluralizes_extra_roots() {
     let tls = TlsOverrides {
         extra_roots: vec![
             TaggedRoot {
-                pem_bytes: rcgen_pem(),
+                pem_bytes: rcgen_pem().into(),
                 source: "a".into(),
                 line: 1,
             },
             TaggedRoot {
-                pem_bytes: rcgen_pem(),
+                pem_bytes: rcgen_pem().into(),
                 source: "b".into(),
                 line: 2,
             },

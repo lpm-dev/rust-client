@@ -464,6 +464,15 @@ impl RegistryClient {
         &self,
         request_builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
+        self.send_with_retry_with_npmrc_auth(request_builder, None)
+            .await
+    }
+
+    pub(super) async fn send_with_retry_with_npmrc_auth(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+    ) -> Result<reqwest::Response, LpmError> {
         // Reject insecure non-localhost HTTP before making any request
         self.validate_base_url()?;
 
@@ -474,28 +483,62 @@ impl RegistryClient {
             .build()
             .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
 
-        self.send_request_with_retry(request, None).await
+        self.send_request_with_retry_and_npmrc_auth(request, None, auth)
+            .await
     }
 
-    pub(super) async fn send_request_with_retry(
+    pub(super) async fn send_request_with_retry_and_npmrc_auth(
         &self,
         request: reqwest::Request,
         client_override: Option<reqwest::Client>,
+        auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
 
         let mut last_error = None;
+        let can_reselect_redirect_clients = request.try_clone().is_some();
 
         for attempt in 0..=MAX_RETRIES {
             let req = request.try_clone().ok_or_else(|| {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
 
-            let client_for_req = match client_override.as_ref() {
-                Some(client) => client.clone(),
-                None => self.http.for_url(req.url().as_str()).await?,
+            let response = if let Some(client) = client_override.as_ref() {
+                client
+                    .execute(req)
+                    .await
+                    .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+            } else if can_reselect_redirect_clients {
+                let authorization_allowed = |url: &reqwest::Url| {
+                    auth.is_none_or(|credential| credential.matches_destination(url))
+                };
+                let authorization_scope = auth.map(|_| {
+                    &authorization_allowed as &(dyn Fn(&reqwest::Url) -> bool + Send + Sync)
+                });
+                match lpm_http::send_with_replayable_redirects_and_authorization_scope(
+                    self.http.as_ref(),
+                    req,
+                    None,
+                    authorization_scope,
+                )
+                .await
+                {
+                    Ok(response) => Ok(response),
+                    Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
+                    Err(lpm_http::ReplayableRequestError::Request(error)) => {
+                        Err(LpmError::Network(lpm_http::error_chain(&error)))
+                    }
+                    Err(error) => return Err(LpmError::Network(error.to_string())),
+                }
+            } else {
+                self.http
+                    .for_url(req.url().as_str())
+                    .await?
+                    .execute(req)
+                    .await
+                    .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
             };
-            match client_for_req.execute(req).await {
+            match response {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
@@ -553,12 +596,9 @@ impl RegistryClient {
                         }
                     }
                 }
-                Err(e) => {
-                    if lpm_http::is_https_downgrade(&e) {
-                        return Err(LpmError::Network(lpm_http::error_chain(&e)));
-                    }
+                Err(error) => {
                     // Network-level errors (DNS, connection refused, timeout) are retryable
-                    last_error = Some(LpmError::Network(lpm_http::error_chain(&e)));
+                    last_error = Some(error);
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;

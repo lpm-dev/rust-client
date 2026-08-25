@@ -138,7 +138,7 @@ async fn fetch_walker_metadata_with_trace(
         }
         UpstreamRoute::Custom { target, auth } => {
             let result = client
-                .get_npm_metadata_from(&target.base_url, &name, auth.as_ref())
+                .get_npm_metadata_from(&target.base_url, &name, auth.as_deref())
                 .await;
             result.inspect(|metadata| {
                 let total_ms = total_start.elapsed().as_millis();
@@ -178,7 +178,7 @@ async fn fetch_walker_metadata(
         }
         UpstreamRoute::Custom { target, auth } => {
             client
-                .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                .get_npm_metadata_from(&target.base_url, name, auth.as_deref())
                 .await
         }
     }
@@ -472,7 +472,8 @@ impl BfsWalker {
             // the fetch task can call `get_npm_metadata_from` directly.
             // Custom registries have no batch endpoint, so they're fetched
             // per-package via a `FuturesUnordered` fan-out.
-            let mut custom_jobs: Vec<(String, RegistryTarget, Option<RegistryAuth>)> = Vec::new();
+            let mut custom_jobs: Vec<(String, RegistryTarget, Option<Arc<RegistryAuth>>)> =
+                Vec::new();
             for name in current_level.drain(..) {
                 let key = CanonicalKey::from_dep_name(&name);
                 // Clone the cached info out of the DashMap guard and let

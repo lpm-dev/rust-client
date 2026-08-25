@@ -8,7 +8,7 @@
 //!   `.npmrc` files in the wild sometimes have mixed case).
 //! - `//host[:port]/:_authToken=<token>` — bearer auth, origin-scoped.
 //! - `//host[:port]/:_auth=<base64>` — basic auth (already-encoded).
-//! - `//host[:port]/:_username=<user>` + `:_password=<base64>` — basic auth
+//! - `//host[:port]/:username=<user>` + `:_password=<base64>` — basic auth
 //!   that we join + re-encode at materialization time.
 //! - `${VAR}` env-var interpolation. Missing var → fatal (`errors` field
 //!   populated; caller surfaces and exits before any network).
@@ -85,6 +85,6 @@ mod types;
 pub use config::NpmrcConfig;
 pub use discovery::LayerDiscovery;
 pub use types::{
-    OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget, TaggedBool,
-    TaggedPath, TaggedRoot, TlsOverrides,
+    AuthScope, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,
+    TaggedBool, TaggedPath, TaggedRoot, TlsOverrides,
 };

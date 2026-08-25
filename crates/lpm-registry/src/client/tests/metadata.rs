@@ -2108,8 +2108,13 @@ async fn batch_metadata_deep_fails_under_old_wallclock_timeout() {
         slow_streaming_ndjson_server(packages.clone(), std::time::Duration::from_millis(200)).await;
 
     let mut client = RegistryClient::new().with_base_url(&base_url);
-    // Wrap the wall-clock-timeout client in HttpClients.
-    client.http = HttpClients::from_default_client(old_style_http);
+    // Put the wall-clock-timeout client in every pool so the manual
+    // redirect transport preserves the legacy timeout under test.
+    client.http = HttpClients::from_default_clients(
+        old_style_http.clone(),
+        old_style_http.clone(),
+        old_style_http,
+    );
     client.cache_dir = Some(tmp.path().to_path_buf());
 
     let result = client.batch_metadata_deep(&packages).await;
@@ -3092,8 +3097,8 @@ async fn get_npm_metadata_from_origin_mismatch_returns_error() {
     match result {
         Err(LpmError::Registry(msg)) => {
             assert!(
-                msg.contains("origin mismatch"),
-                "error must mention origin mismatch: {msg}"
+                msg.contains("scope mismatch"),
+                "error must mention scope mismatch: {msg}"
             );
         }
         other => panic!("expected origin-mismatch Registry error, got {other:?}"),
@@ -3214,7 +3219,7 @@ fn validate_pem_root_catches_malformed_second_block_in_multi_cert_bundle() {
     );
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: bundle,
+            pem_bytes: bundle.into(),
             source: "/Users/me/.npmrc".into(),
             line: 12,
         }],
@@ -3248,7 +3253,7 @@ fn validate_pem_root_accepts_valid_multi_cert_bundle() {
     bundle.extend_from_slice(&rcgen_pem());
     let tls = TlsOverrides {
         extra_roots: vec![TaggedRoot {
-            pem_bytes: bundle,
+            pem_bytes: bundle.into(),
             source: "test".into(),
             line: 1,
         }],

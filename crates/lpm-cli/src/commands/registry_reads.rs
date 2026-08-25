@@ -158,7 +158,11 @@ pub async fn revalidate_routed_package_metadata(
         UpstreamRoute::Custom { target, auth } => {
             context
                 .client
-                .revalidate_npm_metadata_from_with_timings(&target.base_url, package, auth.as_ref())
+                .revalidate_npm_metadata_from_with_timings(
+                    &target.base_url,
+                    package,
+                    auth.as_deref(),
+                )
                 .await
         }
         UpstreamRoute::LpmWorker => {

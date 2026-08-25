@@ -723,6 +723,7 @@ async fn install_dlx_target(
         &[],                                                     // compatibility_bin_names
         !options.reserve_stdout,                                 // emit_install_report
         options.reserve_stdout,
+        None,
         lpm_common::LpmRoot::from_env()?,
     )
     .await

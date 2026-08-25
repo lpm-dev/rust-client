@@ -1,7 +1,13 @@
 use super::config::NpmrcConfig;
-use super::types::{OriginKey, RegistryTarget, TaggedBool, TaggedPath, TaggedRoot, TaggedValue};
-use lpm_common::{TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped};
+use super::types::{AuthScope, RegistryTarget, TaggedBool, TaggedPath, TaggedRoot, TaggedValue};
+use lpm_common::{
+    TLS_MATERIAL_FILE_SIZE_CAP_BYTES, interpolate_npmrc_env, parse_npmrc_ini_settings,
+    read_regular_file_capped_with_metadata,
+};
+#[cfg(test)]
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub(super) enum CredentialPolicy<'a> {
@@ -85,69 +91,79 @@ impl NpmrcConfig {
         // .npmrc with one and npm tolerates it.
         let content = content.strip_prefix('\u{feff}').unwrap_or(content);
 
-        for (lineno, raw_line) in content.lines().enumerate() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
-                continue;
-            }
-            let Some(eq_idx) = line.find('=') else {
-                cfg.warnings.push(format!(
-                    "{}:{}: line has no '=' separator; skipped",
-                    source_label,
-                    lineno + 1
-                ));
-                continue;
+        for setting in parse_npmrc_ini_settings(content, source_label, &mut cfg.warnings) {
+            let diagnostic_key = Arc::clone(&setting.key);
+            let key = match interpolate_npmrc_env(&setting.key, env_lookup) {
+                Ok(key) => key,
+                Err(error) => {
+                    cfg.push_error(source_label, || {
+                        format!("{source_label}: npm config key interpolation failed: {error}")
+                    });
+                    continue;
+                }
             };
-            let key = line[..eq_idx].trim();
+            if !reserve_expanded_npmrc_data(&mut cfg, key.len(), source_label) {
+                break;
+            }
 
-            if npmrc_key_is_credential(key)
+            if npmrc_key_is_credential(key.as_ref())
                 && let CredentialPolicy::Refuse { warning } = credential_policy
             {
                 if !emitted_credential_refusal {
-                    cfg.security_warnings.push(warning.to_string());
+                    cfg.push_security_warning(source_label, || warning.to_string());
                     emitted_credential_refusal = true;
                 }
                 continue;
             }
 
-            let raw_value = line[eq_idx + 1..].trim();
-            let value = strip_surrounding_quotes(raw_value);
-
-            if is_project_layer
-                && contains_env_interpolation(value)
-                && project_layer_env_expansion_is_sensitive(key)
-            {
-                cfg.security_warnings.push(format!(
-                    "{source_label}:{}: env expansion in project-local .npmrc for '{key}' refused: \
-                     move this registry/auth/TLS setting to user config or use registry-scoped auth",
-                    lineno + 1,
-                ));
-                continue;
+            if key == "ca" && !is_project_layer {
+                cfg.pending_ca_roots = Some(Vec::with_capacity(setting.values.len()));
             }
 
-            // Env-var interpolation. Missing var is fatal per npm.
-            let interpolated = match interpolate_env(value, env_lookup) {
-                Ok(s) => s,
-                Err(missing) => {
-                    cfg.errors.push(format!(
-                        "{}:{}: environment variable '${{{}}}' is not set; refusing to use this config",
-                        source_label,
-                        lineno + 1,
-                        missing
-                    ));
+            for raw_value in setting.values {
+                if is_project_layer
+                    && project_layer_env_expansion_is_sensitive(key.as_ref())
+                    && (contains_active_env_interpolation(&setting.key)
+                        || contains_active_env_interpolation(raw_value.value.as_ref()))
+                {
+                    cfg.push_security_warning(source_label, || {
+                        format!(
+                            "{source_label}:{}: env expansion in project-local .npmrc for '{diagnostic_key}' refused: \
+                             move this registry/auth/TLS setting to user config or use registry-scoped auth",
+                            raw_value.line,
+                        )
+                    });
                     continue;
                 }
-            };
 
-            classify_and_apply(
-                key,
-                &interpolated,
-                source_label,
-                source_dir,
-                is_project_layer,
-                lineno + 1,
-                &mut cfg,
-            );
+                let value = match interpolate_npmrc_env(raw_value.value.as_ref(), env_lookup) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        cfg.push_error(source_label, || {
+                            format!(
+                                "{source_label}:{}: npm config value interpolation failed: {error}",
+                                raw_value.line
+                            )
+                        });
+                        continue;
+                    }
+                };
+                if !reserve_expanded_npmrc_data(&mut cfg, value.len(), source_label) {
+                    return cfg;
+                }
+                classify_and_apply(
+                    key.as_ref(),
+                    value.as_ref(),
+                    ApplyContext {
+                        diagnostic_key: diagnostic_key.as_ref(),
+                        source_label,
+                        source_dir,
+                        is_project_layer,
+                        lineno: raw_value.line,
+                    },
+                    &mut cfg,
+                );
+            }
         }
 
         cfg
@@ -167,39 +183,70 @@ impl NpmrcConfig {
     }
 }
 
+fn reserve_expanded_npmrc_data(
+    config: &mut NpmrcConfig,
+    additional_bytes: usize,
+    source_label: &str,
+) -> bool {
+    let next = config.expanded_data_bytes.saturating_add(additional_bytes);
+    if next > lpm_common::NPMRC_INTERPOLATED_VALUE_CAP_BYTES {
+        config.push_error(source_label, || {
+            format!(
+                "{source_label}: aggregate npm configuration expansion exceeds the {}-byte limit",
+                lpm_common::NPMRC_INTERPOLATED_VALUE_CAP_BYTES
+            )
+        });
+        return false;
+    }
+    config.expanded_data_bytes = next;
+    true
+}
+
 fn npmrc_key_is_credential(key: &str) -> bool {
-    if matches!(key, "_authToken" | "_auth" | "_username" | "_password") {
+    if matches!(key, "_authToken" | "_auth" | "username" | "_password") {
         return true;
     }
 
-    let Some(rest) = key.strip_prefix("//") else {
+    let Some((_, attr)) = split_scoped_key(key) else {
         return false;
     };
-    let Some(split_idx) = rest.rfind("/:") else {
-        return false;
-    };
-    matches!(
-        &rest[split_idx + 2..],
-        "_authToken" | "_auth" | "_username" | "_password"
-    )
+    matches!(attr, "_authToken" | "_auth" | "username" | "_password")
 }
 
-/// Strip surrounding single or double quotes from a value, if any.
-/// `"foo"` → `foo`, `'foo'` → `foo`. Mismatched quotes left alone.
-fn strip_surrounding_quotes(s: &str) -> &str {
-    if s.len() >= 2 {
-        let bytes = s.as_bytes();
-        let first = bytes[0];
-        let last = bytes[s.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return &s[1..s.len() - 1];
+fn split_scoped_key(key: &str) -> Option<(&str, &str)> {
+    let rest = key.strip_prefix("//")?;
+    let (scope, attr) = rest.rsplit_once(':')?;
+    (!scope.is_empty() && !attr.is_empty()).then_some((scope, attr))
+}
+
+fn contains_active_env_interpolation(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'\\' {
+            let start = index;
+            while index < bytes.len() && bytes[index] == b'\\' {
+                index += 1;
+            }
+            if index + 1 < bytes.len()
+                && bytes[index] == b'$'
+                && bytes[index + 1] == b'{'
+                && (index - start) % 2 == 0
+            {
+                return true;
+            }
+            continue;
         }
+        if bytes[index] == b'$' && bytes[index + 1] == b'{' {
+            return true;
+        }
+        index += value[index..]
+            .chars()
+            .next()
+            .expect("index is within value")
+            .len_utf8();
     }
-    s
-}
-
-fn contains_env_interpolation(value: &str) -> bool {
-    value.contains("${")
+    false
 }
 
 fn project_layer_env_expansion_is_sensitive(key: &str) -> bool {
@@ -223,55 +270,222 @@ fn project_layer_env_expansion_is_sensitive(key: &str) -> bool {
         return true;
     }
 
-    let Some(rest) = key.strip_prefix("//") else {
+    let Some((_, attr)) = split_scoped_key(key) else {
         return false;
     };
-    let Some(split_idx) = rest.rfind("/:") else {
-        return false;
-    };
-    let attr = &rest[split_idx + 2..];
     matches!(
         attr,
-        "_authToken" | "_auth" | "_password" | "_username" | "cafile" | "certfile" | "keyfile"
+        "_authToken" | "_auth" | "_password" | "username" | "cafile" | "certfile" | "keyfile"
     )
 }
 
-/// Expand `${VAR}` references in `value`. On the first missing var, return
-/// `Err(var_name)` so the caller can surface a fatal parse error matching
-/// npm's behavior.
-///
-/// We only expand `${NAME}` — bare `$NAME` is left as-is, matching npm.
-fn interpolate_env(
-    value: &str,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
-) -> Result<String, String> {
-    if !value.contains("${") {
-        return Ok(value.to_string());
-    }
-    let mut out = String::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$'
-            && i + 1 < bytes.len()
-            && bytes[i + 1] == b'{'
-            && let Some(rel) = value[i + 2..].find('}')
-        {
-            let var_name = &value[i + 2..i + 2 + rel];
-            match env_lookup(var_name) {
-                Some(v) => out.push_str(&v),
-                None => return Err(var_name.to_string()),
-            }
-            i += 2 + rel + 1;
-            continue;
-        }
-        // Advance one Unicode scalar — `value` is &str so `i` is on a
-        // valid char boundary on entry to each iteration.
-        let ch = value[i..].chars().next().expect("non-empty by loop guard");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    Ok(out)
+fn project_registry_uses_cleartext(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| url.scheme() == "http")
+}
+
+fn is_unscoped_legacy_auth_key(key: &str) -> bool {
+    matches!(
+        key,
+        "_auth" | "_authToken" | "username" | "_password" | "email" | "certfile" | "keyfile"
+    )
+}
+
+fn is_known_npm_config_key(key: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "_auth",
+        "access",
+        "all",
+        "allow-directory",
+        "allow-file",
+        "allow-git",
+        "allow-remote",
+        "allow-same-version",
+        "allow-scripts",
+        "allow-scripts-pending",
+        "allow-scripts-pin",
+        "allow-unused-patches",
+        "also",
+        "audit",
+        "audit-level",
+        "auth-type",
+        "before",
+        "bin-links",
+        "browser",
+        "bypass-2fa",
+        "ca",
+        "cache",
+        "cache-max",
+        "cache-min",
+        "cafile",
+        "call",
+        "cert",
+        "cidr",
+        "color",
+        "commit-hooks",
+        "cpu",
+        "dangerously-allow-all-scripts",
+        "depth",
+        "description",
+        "dev",
+        "diff",
+        "diff-dst-prefix",
+        "diff-ignore-all-space",
+        "diff-name-only",
+        "diff-no-prefix",
+        "diff-src-prefix",
+        "diff-text",
+        "diff-unified",
+        "dry-run",
+        "edit-dir",
+        "editor",
+        "engine-strict",
+        "expect-result-count",
+        "expect-results",
+        "expires",
+        "extension-file",
+        "fetch-retries",
+        "fetch-retry-factor",
+        "fetch-retry-maxtimeout",
+        "fetch-retry-mintimeout",
+        "fetch-timeout",
+        "force",
+        "foreground-scripts",
+        "format-package-lock",
+        "fund",
+        "git",
+        "git-tag-version",
+        "global",
+        "global-ignore-file",
+        "global-style",
+        "globalconfig",
+        "heading",
+        "https-proxy",
+        "if-present",
+        "ignore-existing",
+        "ignore-extension",
+        "ignore-patch-failures",
+        "ignore-scripts",
+        "include",
+        "include-attestations",
+        "include-staged",
+        "include-workspace-root",
+        "init-author-email",
+        "init-author-name",
+        "init-author-url",
+        "init-license",
+        "init-module",
+        "init-private",
+        "init-type",
+        "init-version",
+        "init.author.email",
+        "init.author.name",
+        "init.author.url",
+        "init.license",
+        "init.module",
+        "init.version",
+        "install-links",
+        "install-strategy",
+        "json",
+        "keep-edit-dir",
+        "key",
+        "legacy-bundling",
+        "legacy-peer-deps",
+        "libc",
+        "link",
+        "local-address",
+        "location",
+        "lockfile-version",
+        "loglevel",
+        "logs-dir",
+        "logs-max",
+        "long",
+        "maxsockets",
+        "message",
+        "min-release-age",
+        "min-release-age-exclude",
+        "name",
+        "node-gyp",
+        "node-options",
+        "noproxy",
+        "offline",
+        "omit",
+        "omit-lockfile-registry-resolved",
+        "only",
+        "optional",
+        "orgs",
+        "orgs-permission",
+        "os",
+        "otp",
+        "pack-destination",
+        "package",
+        "package-lock",
+        "package-lock-only",
+        "packages",
+        "packages-all",
+        "packages-and-scopes-permission",
+        "parseable",
+        "password",
+        "patches-dir",
+        "prefer-dedupe",
+        "prefer-offline",
+        "prefer-online",
+        "prefix",
+        "preid",
+        "production",
+        "progress",
+        "provenance",
+        "provenance-file",
+        "proxy",
+        "read-only",
+        "rebuild-bundle",
+        "registry",
+        "replace-registry-host",
+        "save",
+        "save-bundle",
+        "save-dev",
+        "save-exact",
+        "save-optional",
+        "save-peer",
+        "save-prefix",
+        "save-prod",
+        "sbom-format",
+        "sbom-type",
+        "scope",
+        "scopes",
+        "script-shell",
+        "searchexclude",
+        "searchlimit",
+        "searchopts",
+        "searchstaleness",
+        "shell",
+        "sign-git-commit",
+        "sign-git-tag",
+        "strict-allow-scripts",
+        "strict-npmrc",
+        "strict-peer-deps",
+        "strict-ssl",
+        "tag",
+        "tag-version-prefix",
+        "timing",
+        "to",
+        "token-description",
+        "umask",
+        "unicode",
+        "update-notifier",
+        "usage",
+        "user-agent",
+        "userconfig",
+        "version",
+        "versions",
+        "viewer",
+        "which",
+        "workspace",
+        "workspaces",
+        "workspaces-update",
+        "yes",
+    ];
+
+    KNOWN.binary_search(&key).is_ok()
 }
 
 /// Classify a key/value pair and apply it to the config-being-built.
@@ -283,23 +497,41 @@ fn interpolate_env(
 /// when populated, every emitted [`TaggedPath`] carries it so
 /// [`TaggedPath::resolve`] can turn relative paths into absolute ones
 /// at load time. Test stubs pass `None`.
-fn classify_and_apply(
-    key: &str,
-    value: &str,
-    source_label: &str,
-    source_dir: Option<&Path>,
+#[derive(Clone, Copy)]
+struct ApplyContext<'a> {
+    diagnostic_key: &'a str,
+    source_label: &'a str,
+    source_dir: Option<&'a Path>,
     is_project_layer: bool,
     lineno: usize,
-    cfg: &mut NpmrcConfig,
-) {
+}
+
+fn classify_and_apply(key: &str, value: &str, context: ApplyContext<'_>, cfg: &mut NpmrcConfig) {
+    let ApplyContext {
+        diagnostic_key,
+        source_label,
+        source_dir,
+        is_project_layer,
+        lineno,
+    } = context;
     // Scope registry: `@foo:registry`.
     if key.starts_with('@')
         && let Some(scope) = key.strip_suffix(":registry")
     {
         if value.is_empty() {
-            cfg.warnings.push(format!(
-                "{source_label}:{lineno}: empty registry URL for scope '{scope}'; skipped"
-            ));
+            cfg.push_warning(source_label, || {
+                format!(
+                    "{source_label}:{lineno}: empty registry URL for '{diagnostic_key}'; skipped"
+                )
+            });
+            return;
+        }
+        if is_project_layer && project_registry_uses_cleartext(value) {
+            cfg.push_security_warning(source_label, || {
+                format!(
+                    "{source_label}:{lineno}: cleartext project registry refused for '{diagnostic_key}'; configure it in user config or use an explicit command-line override"
+                )
+            });
             return;
         }
         cfg.scope_registries.insert(
@@ -312,77 +544,92 @@ fn classify_and_apply(
     // Default registry.
     if key == "registry" {
         if value.is_empty() {
-            cfg.warnings.push(format!(
-                "{source_label}:{lineno}: empty registry URL; skipped"
-            ));
+            cfg.push_warning(source_label, || {
+                format!("{source_label}:{lineno}: empty registry URL; skipped")
+            });
+            return;
+        }
+        if is_project_layer && project_registry_uses_cleartext(value) {
+            cfg.push_security_warning(source_label, || {
+                format!(
+                    "{source_label}:{lineno}: cleartext project registry refused; configure it in user config or use an explicit command-line override"
+                )
+            });
             return;
         }
         cfg.default_registry = Some(RegistryTarget::from_npmrc_url(value));
         return;
     }
 
+    if is_unscoped_legacy_auth_key(key) {
+        if value.is_empty() {
+            return;
+        }
+        if is_project_layer && matches!(key, "certfile" | "keyfile") {
+            cfg.push_security_warning(source_label, || {
+                format!(
+                    "{source_label}:{lineno}: project-local '{diagnostic_key}' refused; TLS client identities must come from user or system config"
+                )
+            });
+            return;
+        }
+        cfg.push_error(source_label, || {
+            format!(
+                "{source_label}:{lineno}: unscoped legacy auth key '{diagnostic_key}' is invalid; use '//host/:{diagnostic_key}=...' registry-scoped auth syntax"
+            )
+        });
+        return;
+    }
+
     // Origin-scoped auth: `//host[:port][/path]/:_<attr>`.
-    if let Some(rest) = key.strip_prefix("//") {
-        // The auth attribute is the substring after the LAST occurrence
-        // of `/:` in the key. Everything before that slash is the
-        // (path-aware) URL prefix; we use its origin only in v1.
-        if let Some(split_idx) = rest.rfind("/:") {
-            let origin_part = &rest[..split_idx]; // host[:port][/path] without trailing slash
-            let attr = &rest[split_idx + 2..]; // attribute name after `:`
-            let Some(origin) = OriginKey::from_npmrc_origin(origin_part) else {
-                cfg.warnings.push(format!(
-                    "{source_label}:{lineno}: cannot parse origin from auth key '{key}'; skipped"
-                ));
+    if key.starts_with("//") {
+        if let Some((origin_part, attr)) = split_scoped_key(key) {
+            let Some(scope) = AuthScope::from_npmrc_scope(origin_part) else {
+                cfg.push_warning(source_label, || {
+                    format!(
+                        "{source_label}:{lineno}: cannot parse origin from auth key '{diagnostic_key}'; skipped"
+                    )
+                });
                 return;
             };
-            // Path-scoped credentials cannot be represented safely by the
-            // origin-only matcher. For shared-host registries such as GitLab
-            // or Artifactory, widening a project-scoped token to the whole
-            // origin would over-disclose it to sibling projects. Refuse those
-            // credential attrs with a warning; TLS attrs are still materialized
-            // because they are not credentials and per-path TLS overrides are
-            // uncommon enough that origin-wide application is the better UX.
-            let is_credential_attr =
-                matches!(attr, "_authToken" | "_auth" | "_password" | "_username");
-            if origin_part.contains('/') {
-                if is_credential_attr {
-                    cfg.warnings.push(format!(
-                        "{source_label}:{lineno}: path-scoped npmrc credential key ('{key}') would \
-                         be widened to ALL paths on {origin} (v1 matches by origin only); \
-                         refusing to materialize — narrow the host config OR rewrite the key as \
-                         `//{origin}/:{attr}` to opt into origin-wide reach."
-                    ));
-                    return;
-                }
-                cfg.warnings.push(format!(
-                    "{source_label}:{lineno}: path-scoped npmrc key ('{key}') is parsed as origin-only in v1; \
-                     setting will apply to ALL paths on {origin}"
-                ));
+            let is_tls_attr = matches!(attr, "cafile" | "certfile" | "keyfile");
+            if is_project_layer && is_tls_attr {
+                cfg.push_security_warning(source_label, || {
+                    format!(
+                        "{source_label}:{lineno}: project-local TLS key '{diagnostic_key}' refused; TLS trust and client identities must come from user or system config"
+                    )
+                });
+                return;
             }
-            let tagged = TaggedValue::new(value.to_string(), source_label, lineno);
+            if scope.path_prefix.as_ref() != "/" && is_tls_attr {
+                cfg.push_security_warning(source_label, || {
+                    format!(
+                        "{source_label}:{lineno}: path-scoped TLS key '{diagnostic_key}' refused because the HTTP client cache cannot safely confine TLS state by path"
+                    )
+                });
+                return;
+            }
             // Auth subkeys go into the per-origin auth buffer; TLS subkeys
             // go into the per-origin TLS buffer. Two distinct entry maps share
             // the same `OriginKey` so a matching-origin lookup fetches both.
             match attr {
                 "_authToken" => {
-                    cfg.auth_buffers.entry(origin).or_default().auth_token = Some(tagged);
+                    cfg.auth_buffers.entry(scope).or_default().auth_token =
+                        Some(TaggedValue::new(value.to_string(), source_label, lineno));
                 }
                 "_auth" => {
-                    cfg.auth_buffers.entry(origin).or_default().auth_b64 = Some(tagged);
+                    cfg.auth_buffers.entry(scope).or_default().auth_b64 =
+                        Some(TaggedValue::new(value.to_string(), source_label, lineno));
                 }
-                "_username" => {
-                    cfg.auth_buffers.entry(origin).or_default().username = Some(tagged);
+                "username" => {
+                    cfg.auth_buffers.entry(scope).or_default().username =
+                        Some(TaggedValue::new(value.to_string(), source_label, lineno));
                 }
                 "_password" => {
-                    cfg.auth_buffers.entry(origin).or_default().password_b64 = Some(tagged);
+                    cfg.auth_buffers.entry(scope).or_default().password_b64 =
+                        Some(TaggedValue::new(value.to_string(), source_label, lineno));
                 }
-                "always-auth" | "email" => {
-                    // Silently accepted at origin scope. `always-auth` is
-                    // vestigial — modern npm 7+ removed
-                    // the per-registry distinction; lpm always sends
-                    // matching-origin tokens. `email` is publish-flow
-                    // metadata, irrelevant to install routing.
-                }
+                "email" => {}
                 "cafile" => {
                     // Per-origin extra root. DEFERRED-READ by design: the PEM
                     // is read at client-build time for the matching origin,
@@ -390,14 +637,16 @@ fn classify_and_apply(
                     // stale path on a shared `~/.npmrc`) cannot break installs
                     // that never reach the configured origin.
                     if value.is_empty() {
-                        cfg.warnings.push(format!(
-                            "{source_label}:{lineno}: empty per-origin cafile path; skipped"
-                        ));
+                        cfg.push_warning(source_label, || {
+                            format!(
+                                "{source_label}:{lineno}: empty per-origin cafile path; skipped"
+                            )
+                        });
                         return;
                     }
                     cfg.tls
                         .per_origin
-                        .entry(origin)
+                        .entry(scope.origin)
                         .or_default()
                         .cafiles
                         .push(TaggedPath {
@@ -413,93 +662,89 @@ fn classify_and_apply(
                     // client-build time. Configured-but-unreached half-configs
                     // do not abort the install.
                     if value.is_empty() {
-                        cfg.warnings.push(format!(
-                            "{source_label}:{lineno}: empty per-origin certfile path; skipped"
-                        ));
+                        cfg.push_warning(source_label, || {
+                            format!(
+                                "{source_label}:{lineno}: empty per-origin certfile path; skipped"
+                            )
+                        });
                         return;
                     }
-                    cfg.tls.per_origin.entry(origin).or_default().certfile = Some(TaggedPath {
-                        path: PathBuf::from(value),
-                        source: source_label.to_string(),
-                        line: lineno,
-                        source_dir: source_dir.map(|p| p.to_path_buf()),
-                    });
+                    cfg.tls.per_origin.entry(scope.origin).or_default().certfile =
+                        Some(TaggedPath {
+                            path: PathBuf::from(value),
+                            source: source_label.to_string(),
+                            line: lineno,
+                            source_dir: source_dir.map(|p| p.to_path_buf()),
+                        });
                 }
                 "keyfile" => {
                     // Per-origin mTLS private key path.
                     // Same deferred-read contract as `certfile`.
                     if value.is_empty() {
-                        cfg.warnings.push(format!(
-                            "{source_label}:{lineno}: empty per-origin keyfile path; skipped"
-                        ));
+                        cfg.push_warning(source_label, || {
+                            format!(
+                                "{source_label}:{lineno}: empty per-origin keyfile path; skipped"
+                            )
+                        });
                         return;
                     }
-                    cfg.tls.per_origin.entry(origin).or_default().keyfile = Some(TaggedPath {
-                        path: PathBuf::from(value),
-                        source: source_label.to_string(),
-                        line: lineno,
-                        source_dir: source_dir.map(|p| p.to_path_buf()),
-                    });
+                    cfg.tls.per_origin.entry(scope.origin).or_default().keyfile =
+                        Some(TaggedPath {
+                            path: PathBuf::from(value),
+                            source: source_label.to_string(),
+                            line: lineno,
+                            source_dir: source_dir.map(|p| p.to_path_buf()),
+                        });
                 }
-                _ => {
-                    // Unknown attribute on a `//host` key. Silent ignore
-                    // matches npm: unknown keys aren't an error.
+                _ if !is_known_npm_config_key(attr) => {
+                    cfg.push_unknown_config(diagnostic_key, source_label, lineno);
                 }
+                _ => {}
             }
             return;
         }
-        // Malformed: starts with `//` but no `/:` separator.
-        cfg.warnings.push(format!(
-            "{source_label}:{lineno}: auth key '{key}' has no '/:<attr>' suffix; skipped"
-        ));
+        // Malformed: starts with `//` but has no scoped attribute suffix.
+        cfg.push_warning(source_label, || {
+            format!(
+                "{source_label}:{lineno}: auth key '{diagnostic_key}' has no ':<attr>' suffix; skipped"
+            )
+        });
         return;
     }
 
     // Globally-scoped TLS settings.
+    if is_project_layer && matches!(key, "ca" | "cafile") {
+        cfg.push_security_warning(source_label, || {
+            format!(
+                "{source_label}:{lineno}: project-local '{diagnostic_key}' refused; TLS trust and client identities must come from user or system config"
+            )
+        });
+        return;
+    }
     if key == "cafile" {
         if value.is_empty() {
-            cfg.warnings.push(format!(
-                "{source_label}:{lineno}: empty cafile path; skipped"
-            ));
+            cfg.push_warning(source_label, || {
+                format!("{source_label}:{lineno}: empty cafile path; skipped")
+            });
             return;
         }
-        match read_file_capped(Path::new(value), TLS_MATERIAL_FILE_SIZE_CAP_BYTES) {
-            Ok(bytes) => {
-                // No `decode_npmrc_pem_escapes` here — `cafile=<path>` reads
-                // the PEM from disk where newlines are real (`\n` bytes),
-                // not the escape-encoded `\\n` sequences npm uses for
-                // inline `ca=` values on a single `.npmrc` line. The
-                // asymmetry is intentional and matches npm.
-                if !contains_pem_certificate_block(&bytes) {
-                    cfg.warnings.push(format!(
-                        "{source_label}:{lineno}: cafile='{value}' contains no \
-                         '-----BEGIN CERTIFICATE-----' block; skipped"
-                    ));
-                    return;
-                }
-                cfg.tls.extra_roots.push(TaggedRoot {
-                    pem_bytes: bytes,
-                    source: source_label.to_string(),
-                    line: lineno,
-                });
-            }
-            Err(e) => {
-                // Fail-fast: a typo'd cafile path silently falls back to
-                // system roots, which means the user hits a confusing
-                // handshake error mid-install. Surface it at config-load
-                // instead so the install aborts before any network.
-                cfg.errors.push(format!(
-                    "{source_label}:{lineno}: cafile='{value}': failed to read: {e}"
-                ));
-            }
-        }
+        cfg.pending_cafile = Some(TaggedPath {
+            path: PathBuf::from(value),
+            source: source_label.to_string(),
+            line: lineno,
+            source_dir: source_dir.map(Path::to_path_buf),
+        });
         return;
     }
     if key == "ca" {
+        if value == "null" {
+            cfg.pending_ca_roots = Some(Vec::new());
+            return;
+        }
         if value.is_empty() {
-            cfg.warnings.push(format!(
-                "{source_label}:{lineno}: empty ca PEM value; skipped"
-            ));
+            cfg.push_warning(source_label, || {
+                format!("{source_label}:{lineno}: empty ca PEM value; skipped")
+            });
             return;
         }
         // `.npmrc` is line-based; npm encodes multi-line PEMs as a single
@@ -508,19 +753,22 @@ fn classify_and_apply(
         // Decode those to real newlines so the marker check and downstream
         // `reqwest::Certificate::from_pem` see structurally-valid PEM.
         let decoded = decode_npmrc_pem_escapes(value);
-        let bytes = decoded.as_bytes();
-        if !contains_pem_certificate_block(bytes) {
-            cfg.warnings.push(format!(
-                "{source_label}:{lineno}: ca PEM contains no \
-                 '-----BEGIN CERTIFICATE-----' block; skipped"
-            ));
+        if !contains_pem_certificate_block(decoded.as_bytes()) {
+            cfg.push_warning(source_label, || {
+                format!(
+                    "{source_label}:{lineno}: ca PEM contains no \
+                     '-----BEGIN CERTIFICATE-----' block; skipped"
+                )
+            });
             return;
         }
-        cfg.tls.extra_roots.push(TaggedRoot {
-            pem_bytes: bytes.to_vec(),
-            source: source_label.to_string(),
-            line: lineno,
-        });
+        cfg.pending_ca_roots
+            .get_or_insert_with(Vec::new)
+            .push(TaggedRoot {
+                pem_bytes: Arc::new(decoded.into_owned().into_bytes()),
+                source: source_label.to_string(),
+                line: lineno,
+            });
         return;
     }
     if key == "strict-ssl" {
@@ -538,11 +786,13 @@ fn classify_and_apply(
                     // the refusal is surfaced under `--json` too —
                     // CI / agents need to know a malicious config was
                     // refused, not just silently no-op'd.
-                    cfg.security_warnings.push(format!(
-                        "{source_label}:{lineno}: strict-ssl=false refused — \
-                         project-local .npmrc cannot disable TLS verification; \
-                         move the setting to ~/.npmrc if you really want it"
-                    ));
+                    cfg.push_security_warning(source_label, || {
+                        format!(
+                            "{source_label}:{lineno}: strict-ssl=false refused — \
+                             project-local .npmrc cannot disable TLS verification; \
+                             move the setting to ~/.npmrc if you really want it"
+                        )
+                    });
                     return;
                 }
                 cfg.tls.strict_ssl = Some(TaggedBool {
@@ -550,10 +800,6 @@ fn classify_and_apply(
                     source: source_label.to_string(),
                     line: lineno,
                 });
-                cfg.warnings.push(format!(
-                    "{source_label}:{lineno}: strict-ssl=false — TLS certificate \
-                     verification will be DISABLED for this install"
-                ));
             }
             "true" => {
                 // Explicit =true: silent no-op (the default). Still
@@ -566,49 +812,75 @@ fn classify_and_apply(
                 });
             }
             _ => {
-                cfg.warnings.push(format!(
-                    "{source_label}:{lineno}: strict-ssl='{value}' is not a \
-                     boolean; ignored"
-                ));
+                cfg.push_warning(source_label, || {
+                    format!("{source_label}:{lineno}: strict-ssl is not a boolean; ignored")
+                });
             }
         }
         return;
     }
-    if key == "certfile" || key == "keyfile" {
-        // Global mTLS identity (cert chain + private key). Path-only at parse
-        // time; the actual cert/key file is read at client-build time. The
-        // XOR-pair contract (both set or both absent) is enforced at
-        // finalize() across all merged layers, so `certfile=` in `~/.npmrc`
-        // plus `keyfile=` in a project `.npmrc` legitimately compose.
-        if value.is_empty() {
-            cfg.warnings.push(format!(
-                "{source_label}:{lineno}: empty {key} path; skipped"
-            ));
-            return;
-        }
-        let tagged_path = TaggedPath {
-            path: PathBuf::from(value),
-            source: source_label.to_string(),
-            line: lineno,
-            source_dir: source_dir.map(|p| p.to_path_buf()),
-        };
-        if key == "certfile" {
-            cfg.tls.identity_certfile = Some(tagged_path);
-        } else {
-            cfg.tls.identity_keyfile = Some(tagged_path);
+    if key == "strict-npmrc" {
+        match value {
+            "true" | "false" => {
+                cfg.strict_npmrc = Some(TaggedBool {
+                    value: value == "true",
+                    source: source_label.to_string(),
+                    line: lineno,
+                });
+            }
+            _ => cfg.push_warning(source_label, || {
+                format!("{source_label}:{lineno}: strict-npmrc expects true or false; skipped")
+            }),
         }
         return;
     }
-    if key == "always-auth" {
-        // Silently accepted. lpm always sends a matching-origin token, which
-        // is what `always-auth=true` users want; `=false` is a no-op.
-        // Modern npm 7+ removed the per-registry distinction.
-    }
 
-    // Anything else — silent ignore. Matches npm: unknown keys aren't
-    // an error. Things like `engine-strict`, `save-prefix`, `lockfile`
-    // are lpm's own concerns and the npmrc value (if any) is just
-    // noise from this module's perspective.
+    if !is_known_npm_config_key(key) {
+        cfg.push_unknown_config(diagnostic_key, source_label, lineno);
+    }
+}
+
+impl NpmrcConfig {
+    pub(super) fn materialize_global_tls(&mut self) {
+        if let Some(cafile) = self.pending_cafile.take() {
+            let resolved = cafile.resolve();
+            match read_regular_file_capped_with_metadata(
+                &resolved,
+                TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+            ) {
+                Ok((bytes, _)) if contains_pem_certificate_block(&bytes) => {
+                    self.tls.extra_roots = vec![TaggedRoot {
+                        pem_bytes: Arc::new(bytes),
+                        source: cafile.source,
+                        line: cafile.line,
+                    }];
+                }
+                Ok(_) => {
+                    self.tls.extra_roots.clear();
+                    self.push_warning(&cafile.source, || {
+                        format!(
+                            "{}:{}: cafile contains no '-----BEGIN CERTIFICATE-----' block; skipped",
+                            cafile.source, cafile.line
+                        )
+                    });
+                }
+                Err(error) => {
+                    self.tls.extra_roots.clear();
+                    self.push_error(&cafile.source, || {
+                        format!(
+                            "{}:{}: cafile='{}': failed to read: {error}",
+                            cafile.source,
+                            cafile.line,
+                            resolved.display()
+                        )
+                    });
+                }
+            }
+            self.pending_ca_roots = None;
+        } else if let Some(roots) = self.pending_ca_roots.take() {
+            self.tls.extra_roots = roots;
+        }
+    }
 }
 
 /// Cheap parse-time validation: does this byte slice contain at least one
@@ -647,14 +919,42 @@ fn contains_pem_certificate_block(bytes: &[u8]) -> bool {
 /// characters in the unencoded form. Documenting the limitation here
 /// so a future "let's also support `\\` escaping" change is a deliberate
 /// decision, not an accidental rewrite of the contract.
-fn decode_npmrc_pem_escapes(s: &str) -> String {
-    s.replace("\\n", "\n").replace("\\r", "\r")
+fn decode_npmrc_pem_escapes(s: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = s.as_bytes();
+    let Some(first_escape) = bytes
+        .windows(2)
+        .position(|pair| pair == b"\\n" || pair == b"\\r")
+    else {
+        return std::borrow::Cow::Borrowed(s);
+    };
+
+    let mut decoded = String::with_capacity(s.len());
+    decoded.push_str(&s[..first_escape]);
+    let mut copied_until = first_escape;
+    let mut index = first_escape;
+    while index + 1 < bytes.len() {
+        let replacement = match &bytes[index..index + 2] {
+            b"\\n" => Some('\n'),
+            b"\\r" => Some('\r'),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            decoded.push_str(&s[copied_until..index]);
+            decoded.push(replacement);
+            index += 2;
+            copied_until = index;
+        } else {
+            index += 1;
+        }
+    }
+    decoded.push_str(&s[copied_until..]);
+    std::borrow::Cow::Owned(decoded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::npmrc::{RegistryAuth, RegistryKind};
+    use crate::npmrc::{OriginKey, RegistryAuth, RegistryKind};
     use secrecy::{ExposeSecret, SecretString};
 
     fn no_env(_name: &str) -> Option<String> {
@@ -673,6 +973,26 @@ mod tests {
     fn encoded_npmrc_password(password: &str) -> String {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(password.as_bytes())
+    }
+
+    #[test]
+    fn plain_ini_values_and_uninterpolated_env_values_remain_borrowed() {
+        assert!(matches!(
+            lpm_common::decode_npmrc_ini_fragment("plain-value"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            interpolate_npmrc_env("plain-value", &no_env).unwrap(),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            lpm_common::decode_npmrc_ini_fragment("value # comment"),
+            Cow::Owned(_)
+        ));
+        assert!(matches!(
+            interpolate_npmrc_env("${TOKEN}", &no_env).unwrap(),
+            Cow::Borrowed(_)
+        ));
     }
 
     fn encoded_basic_credential(username: &str, password: &str) -> String {
@@ -760,17 +1080,16 @@ mod tests {
     }
 
     #[test]
-    fn env_var_interpolation_missing_is_fatal() {
+    fn missing_env_var_remains_literal() {
         let content = "//npm.internal/:_authToken=${NPM_TOKEN}\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
-        assert_eq!(cfg.errors.len(), 1);
-        assert!(
-            cfg.errors[0].contains("NPM_TOKEN"),
-            "error mentions var name: {:?}",
-            cfg.errors[0]
-        );
-        // No partial credential should be stored.
-        assert!(cfg.origin_auth.is_empty());
+        assert!(cfg.errors.is_empty());
+        match cfg.auth_for_url("https://npm.internal/").unwrap() {
+            RegistryAuth::Bearer { token, .. } => {
+                assert_eq!(token.expose_secret(), "${NPM_TOKEN}")
+            }
+            other => panic!("expected Bearer, got {other:?}"),
+        }
     }
 
     #[test]
@@ -840,7 +1159,7 @@ mod tests {
     fn basic_auth_via_split_username_password() {
         let password = encoded_npmrc_password("pass");
         let content = format!(
-            "//npm.internal/:_username=user\n\
+            "//npm.internal/:username=user\n\
              //npm.internal/:_password={password}\n"
         );
         let cfg = NpmrcConfig::parse(&content, "test", &no_env);
@@ -886,8 +1205,7 @@ mod tests {
 
     #[test]
     fn malformed_line_warns_and_continues() {
-        // No `=` separator: should warn, not abort.
-        let content = "registry=https://good.example.com/\nthis-line-is-bad\nstill-parsing=true\n";
+        let content = "registry=https://good.example.com/\nfund\nfund=true\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         assert!(cfg.default_registry.is_some());
         assert_eq!(cfg.warnings.len(), 1);
@@ -895,18 +1213,115 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_silently_ignored() {
-        // `engine-strict`, `save-prefix` etc. are lpm's own concerns.
+    fn unknown_file_keys_warn_by_default() {
         let content = concat!(
             "engine-strict=true\n",
             "save-prefix=^\n",
-            "lockfile=true\n",
+            "registri=https://typo.example/\n",
             "registry=https://good.example.com/\n",
         );
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         assert!(cfg.default_registry.is_some());
-        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.warnings.len(), 1, "warnings: {:?}", cfg.warnings);
+        assert!(cfg.warnings[0].contains("registri"));
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+    }
+
+    #[test]
+    fn unknown_npmrc_diagnostics_are_bounded_before_formatting() {
+        let content = (0..1_000)
+            .map(|index| format!("unknown-{index}=value\n"))
+            .collect::<String>();
+
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+
+        assert!(cfg.warnings.len() <= lpm_common::NPMRC_DIAGNOSTIC_LIMIT + 1);
+        assert!(
+            cfg.warnings
+                .last()
+                .is_some_and(|warning| warning.contains("suppressed")),
+            "suppression must be visible: {:?}",
+            cfg.warnings
+        );
+    }
+
+    #[test]
+    fn strict_npmrc_makes_unknown_file_keys_fatal() {
+        let cfg = NpmrcConfig::parse(
+            "strict-npmrc=true\nregistri=https://typo.example/\n",
+            "test",
+            &no_env,
+        );
+        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
+        assert!(cfg.errors[0].contains("registri"));
+    }
+
+    #[test]
+    fn interpolated_npmrc_secrets_are_not_echoed_in_diagnostics() {
+        let secret = "npm_secret_diagnostic_canary";
+        let config = NpmrcConfig::parse(
+            "${UNKNOWN_KEY}=value\nstrict-ssl=${SECRET}\nstrict-npmrc=${SECRET}\n",
+            "test",
+            &|name| match name {
+                "UNKNOWN_KEY" | "SECRET" => Some(secret.to_string()),
+                _ => None,
+            },
+        );
+
+        for diagnostic in config
+            .warnings
+            .iter()
+            .chain(config.errors.iter())
+            .chain(config.security_warnings.iter())
+        {
+            assert!(
+                !diagnostic.contains(secret),
+                "interpolated secret leaked through npmrc diagnostics: {diagnostic}"
+            );
+        }
+        assert!(
+            !format!("{config:?}").contains(secret),
+            "interpolated secrets must not appear in configuration Debug output"
+        );
+    }
+
+    #[test]
+    fn aggregate_npmrc_interpolation_is_bounded_per_configuration() {
+        let mut content = String::new();
+        for index in 0..700 {
+            use std::fmt::Write as _;
+            writeln!(
+                content,
+                "//registry-{index}.example/${{LONG_PATH}}/:_authToken=token-{index}"
+            )
+            .unwrap();
+        }
+        let config = NpmrcConfig::parse(&content, "test", &|name| {
+            (name == "LONG_PATH").then(|| "x".repeat(8 * 1024))
+        });
+
+        assert!(
+            config
+                .errors
+                .iter()
+                .any(|error| error.contains("aggregate") && error.contains("limit")),
+            "expanded settings must have one cumulative memory bound: {:?}",
+            config.errors
+        );
+    }
+
+    #[test]
+    fn effective_strict_npmrc_applies_after_layer_merging() {
+        let mut config = NpmrcConfig::parse_layer("strict-npmrc=true\n", "user", &no_env);
+        config.merge_over(NpmrcConfig::parse_layer(
+            "registri=value\n",
+            "project",
+            &no_env,
+        ));
+        config.finalize();
+        assert_eq!(config.errors.len(), 1);
+        assert!(config.errors[0].contains("project:1"));
     }
 
     // ---- TLS overrides: cafile / ca / strict-ssl / always-auth ----
@@ -932,7 +1347,7 @@ mod tests {
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
         assert_eq!(cfg.tls.extra_roots.len(), 1);
         let root = &cfg.tls.extra_roots[0];
-        assert_eq!(root.pem_bytes, pem.as_bytes());
+        assert_eq!(root.pem_bytes.as_ref(), pem.as_bytes());
         assert_eq!(root.source, "test");
         assert_eq!(root.line, 1);
     }
@@ -1002,7 +1417,7 @@ mod tests {
         let root = &cfg.tls.extra_roots[0];
         assert_eq!(root.source, "test");
         assert_eq!(
-            root.pem_bytes,
+            root.pem_bytes.as_ref(),
             pem.as_bytes(),
             "decoded PEM bytes should match the original"
         );
@@ -1017,7 +1432,7 @@ mod tests {
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
         assert_eq!(cfg.tls.extra_roots.len(), 1);
-        let stored = &cfg.tls.extra_roots[0].pem_bytes;
+        let stored = cfg.tls.extra_roots[0].pem_bytes.as_ref();
         assert_eq!(
             stored,
             b"-----BEGIN CERTIFICATE-----\nABCDEF\n-----END CERTIFICATE-----"
@@ -1044,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_cafile_and_ca_mixed_all_present_in_extra_roots() {
+    fn cafile_takes_precedence_over_ca_in_the_same_layer() {
         let pem_a = generate_test_cert_pem();
         let pem_b = generate_test_cert_pem();
         let dir = tempfile::tempdir().unwrap();
@@ -1054,41 +1469,67 @@ mod tests {
         let content = format!("cafile={}\nca={escaped_b}\n", cafile_path.display());
         let cfg = NpmrcConfig::parse(&content, "test", &no_env);
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
-        assert_eq!(cfg.tls.extra_roots.len(), 2);
-        // Order is insertion order (cafile= line 1, ca= line 2).
+        assert_eq!(cfg.tls.extra_roots.len(), 1);
+        assert_eq!(cfg.tls.extra_roots[0].pem_bytes.as_ref(), pem_a.as_bytes());
         assert_eq!(cfg.tls.extra_roots[0].line, 1);
-        assert_eq!(cfg.tls.extra_roots[1].line, 2);
     }
 
     #[test]
-    fn merge_over_concatenates_extra_roots_lower_first() {
+    fn lower_cafile_remains_effective_when_higher_layer_sets_ca() {
+        let lower_pem = generate_test_cert_pem();
+        let higher_pem = generate_test_cert_pem().replace('\n', "\\n");
+        let dir = tempfile::tempdir().unwrap();
+        let cafile_path = dir.path().join("lower.pem");
+        std::fs::write(&cafile_path, &lower_pem).unwrap();
+        let mut config = NpmrcConfig::parse_layer(
+            &format!("cafile={}\n", cafile_path.display()),
+            "lower",
+            &no_env,
+        );
+        config.merge_over(NpmrcConfig::parse_layer(
+            &format!("ca={higher_pem}\n"),
+            "higher",
+            &no_env,
+        ));
+        config.finalize();
+
+        assert!(config.errors.is_empty(), "errors: {:?}", config.errors);
+        assert_eq!(config.tls.extra_roots.len(), 1);
+        assert_eq!(
+            config.tls.extra_roots[0].pem_bytes.as_ref(),
+            lower_pem.as_bytes()
+        );
+        assert_eq!(config.tls.extra_roots[0].source, "lower");
+    }
+
+    #[test]
+    fn higher_ca_replaces_lower_ca() {
         let pem_lower = generate_test_cert_pem().replace('\n', "\\n");
         let pem_higher = generate_test_cert_pem().replace('\n', "\\n");
         let mut acc = NpmrcConfig::parse_layer(&format!("ca={pem_lower}\n"), "lower", &no_env);
         let higher = NpmrcConfig::parse_layer(&format!("ca={pem_higher}\n"), "higher", &no_env);
         acc.merge_over(higher);
         acc.finalize();
-        assert_eq!(acc.tls.extra_roots.len(), 2);
-        assert_eq!(acc.tls.extra_roots[0].source, "lower");
-        assert_eq!(acc.tls.extra_roots[1].source, "higher");
+        assert_eq!(acc.tls.extra_roots.len(), 1);
+        assert_eq!(acc.tls.extra_roots[0].source, "higher");
     }
 
     #[test]
-    fn merge_over_dedupes_identical_extra_roots_preserving_first_source() {
-        // Regression — if two layers contribute the same PEM bytes
-        // (common in shops where `~/.npmrc` and a project `.npmrc`
-        // both set `cafile=/etc/ssl/corp-ca.pem`), the merged
-        // `extra_roots` should NOT duplicate the cert. Rustls handles
-        // duplicate roots without erroring, but we'd still pay an
-        // extra `validate_pem_root` + `Certificate::from_pem` round
-        // for nothing, AND the source attribution would silently
-        // shift from "the file you set first" to "the file you set
-        // later" depending on which one wins downstream.
-        //
-        // Dedup by `pem_bytes`, keeping the FIRST source seen (the
-        // lower-precedence / earliest layer). That preserves
-        // chronological attribution and matches the lower-first
-        // ordering used everywhere else in this merge.
+    fn higher_ca_null_clears_lower_custom_roots() {
+        let pem = generate_test_cert_pem().replace('\n', "\\n");
+        let mut config = NpmrcConfig::parse_layer(&format!("ca={pem}\n"), "lower", &no_env);
+        config.merge_over(NpmrcConfig::parse_layer("ca=null\n", "higher", &no_env));
+        config.finalize();
+        assert!(config.tls.extra_roots.is_empty());
+        assert!(
+            config.warnings.is_empty(),
+            "warnings: {:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn identical_higher_ca_replaces_lower_source_attribution() {
         let pem = generate_test_cert_pem().replace('\n', "\\n");
         let mut acc = NpmrcConfig::parse_layer(&format!("ca={pem}\n"), "lower", &no_env);
         let higher = NpmrcConfig::parse_layer(&format!("ca={pem}\n"), "higher", &no_env);
@@ -1097,11 +1538,11 @@ mod tests {
         assert_eq!(
             acc.tls.extra_roots.len(),
             1,
-            "duplicate PEM bytes across layers must be deduplicated"
+            "the effective scalar CA has one value"
         );
         assert_eq!(
-            acc.tls.extra_roots[0].source, "lower",
-            "first source must persist on dedup so attribution doesn't shift"
+            acc.tls.extra_roots[0].source, "higher",
+            "the winning layer owns error attribution"
         );
     }
 
@@ -1126,6 +1567,44 @@ mod tests {
         let tagged = cfg.tls.strict_ssl.expect("strict_ssl should be Some(true)");
         assert!(tagged.value);
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_cafile_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("ca.fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let content = format!("cafile={}\n", fifo.display());
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(NpmrcConfig::parse(&content, "test", &no_env))
+                .unwrap();
+        });
+        let config = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(config) => config,
+            Err(error) => {
+                let writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+                drop(writer);
+                let _ = receiver.recv_timeout(std::time::Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("global cafile loading blocked on a FIFO: {error}");
+            }
+        };
+        worker.join().unwrap();
+        assert!(
+            config
+                .errors
+                .iter()
+                .any(|error| error.contains("regular file")),
+            "a special-file cafile must be rejected explicitly: {:?}",
+            config.errors
+        );
     }
 
     #[test]
@@ -1233,15 +1712,17 @@ mod tests {
     }
 
     #[test]
-    fn always_auth_global_silently_accepted_no_warning() {
+    fn removed_always_auth_key_warns_as_unknown() {
         for v in ["true", "false", "always"] {
             let content = format!("always-auth={v}\n");
             let cfg = NpmrcConfig::parse(&content, "test", &no_env);
-            assert!(
-                cfg.warnings.is_empty(),
+            assert_eq!(
+                cfg.warnings.len(),
+                1,
                 "warnings for value {v}: {:?}",
                 cfg.warnings
             );
+            assert!(cfg.warnings[0].contains("always-auth"));
             assert!(
                 cfg.errors.is_empty(),
                 "errors for value {v}: {:?}",
@@ -1251,71 +1732,77 @@ mod tests {
     }
 
     #[test]
-    fn always_auth_per_origin_silently_accepted_no_warning() {
+    fn removed_scoped_always_auth_key_warns_as_unknown() {
         let content = "//npm.internal/:always-auth=true\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
-        assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
+        assert_eq!(cfg.warnings.len(), 1, "warnings: {:?}", cfg.warnings);
+        assert!(cfg.warnings[0].contains("always-auth"));
     }
 
     // ---- per-origin TLS / mTLS parsing ----
 
     #[test]
-    fn global_certfile_xor_keyfile_is_fatal_with_cited_line() {
-        // Half-configured global identity at finalize time → fatal, citing
-        // the line of the present key and naming the missing one. This is
-        // GLOBAL state — wrong here breaks every fetch, so install must
-        // abort before any network.
+    fn unscoped_certfile_and_keyfile_are_invalid_auth() {
         let cfg = NpmrcConfig::parse("certfile=/path/cert.pem\n", "test", &no_env);
         assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
         assert!(cfg.errors[0].contains("test:1"));
         assert!(cfg.errors[0].contains("certfile"));
-        assert!(cfg.errors[0].contains("keyfile"));
+        assert!(cfg.errors[0].contains("unscoped"));
 
         let cfg = NpmrcConfig::parse("keyfile=/path/key.pem\n", "test", &no_env);
         assert_eq!(cfg.errors.len(), 1, "errors: {:?}", cfg.errors);
         assert!(cfg.errors[0].contains("test:1"));
         assert!(cfg.errors[0].contains("keyfile"));
-        assert!(cfg.errors[0].contains("certfile"));
+        assert!(cfg.errors[0].contains("unscoped"));
     }
 
     #[test]
-    fn global_certfile_and_keyfile_complete_pair_is_clean() {
+    fn unscoped_auth_values_report_registry_scoping_repairs() {
+        let password = encoded_npmrc_password("pass");
+        let cfg = NpmrcConfig::parse(
+            &format!(
+                "_authToken=token\n_auth=dXNlcjpwYXNz\nusername=alice\n_password={password}\nemail=alice@example.test\n"
+            ),
+            "user/.npmrc",
+            &no_env,
+        );
+        assert_eq!(cfg.errors.len(), 5, "errors: {:?}", cfg.errors);
+        assert!(
+            cfg.errors
+                .iter()
+                .all(|error| error.contains("unscoped") && error.contains("//host/:"))
+        );
+        assert!(cfg.origin_auth.is_empty());
+    }
+
+    #[test]
+    fn unscoped_certfile_and_keyfile_pair_is_not_materialized() {
         let content = "certfile=/path/cert.pem\nkeyfile=/path/key.pem\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
-        assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
+        assert_eq!(cfg.errors.len(), 2, "errors: {:?}", cfg.errors);
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
-        assert_eq!(
-            cfg.tls.identity_certfile.as_ref().unwrap().path,
-            PathBuf::from("/path/cert.pem")
-        );
-        assert_eq!(
-            cfg.tls.identity_keyfile.as_ref().unwrap().path,
-            PathBuf::from("/path/key.pem")
-        );
+        assert!(cfg.tls.identity_certfile.is_none());
+        assert!(cfg.tls.identity_keyfile.is_none());
     }
 
     #[test]
-    fn global_certfile_keyfile_compose_across_layers() {
-        // certfile in lower-precedence + keyfile in higher-precedence
-        // should compose into a complete pair, NOT trigger the XOR
-        // fatal — the contract is across all merged layers.
+    fn unscoped_identity_errors_survive_layer_merging() {
         let mut acc = NpmrcConfig::parse_layer("certfile=/etc/cert.pem\n", "system", &no_env);
         let higher = NpmrcConfig::parse_layer("keyfile=/home/u/key.pem\n", "user", &no_env);
         acc.merge_over(higher);
         acc.finalize();
-        assert!(acc.errors.is_empty(), "errors: {:?}", acc.errors);
-        assert_eq!(acc.tls.identity_certfile.as_ref().unwrap().source, "system");
-        assert_eq!(acc.tls.identity_keyfile.as_ref().unwrap().source, "user");
+        assert_eq!(acc.errors.len(), 2, "errors: {:?}", acc.errors);
+        assert!(acc.tls.identity_certfile.is_none());
+        assert!(acc.tls.identity_keyfile.is_none());
     }
 
     #[test]
-    fn global_certfile_empty_value_warns_skipped() {
+    fn empty_unscoped_certfile_is_ignored() {
         let cfg = NpmrcConfig::parse("certfile=\n", "test", &no_env);
         // Empty value warned + skipped means no certfile is set,
         // which means no XOR fatal either.
         assert!(cfg.errors.is_empty(), "errors: {:?}", cfg.errors);
-        assert_eq!(cfg.warnings.len(), 1);
-        assert!(cfg.warnings[0].contains("empty certfile"));
+        assert!(cfg.warnings.is_empty());
         assert!(cfg.tls.identity_certfile.is_none());
     }
 
@@ -1381,15 +1868,14 @@ mod tests {
     }
 
     #[test]
-    fn tls_for_origin_falls_back_to_any_port() {
+    fn portless_tls_does_not_match_an_explicit_nondefault_port() {
         let cfg = NpmrcConfig::parse("//npm.internal/:cafile=/path/ca.pem\n", "test", &no_env);
-        // Lookup with a concrete port should fall back to the
-        // port-less entry, mirroring auth_for_url's semantics.
+        assert!(cfg.tls_for_url("https://npm.internal/pkg").is_some());
         let with_port = OriginKey {
             host_lower: "npm.internal".into(),
-            port: Some(443),
+            port: Some(8443),
         };
-        assert!(cfg.tls_for_origin(&with_port).is_some());
+        assert!(cfg.tls_for_origin(&with_port).is_none());
         let other_host = OriginKey {
             host_lower: "other.internal".into(),
             port: Some(443),
@@ -1398,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_over_per_origin_cafiles_concatenate() {
+    fn higher_per_origin_cafile_replaces_the_lower_scalar() {
         let mut acc =
             NpmrcConfig::parse_layer("//npm.internal/:cafile=/system/ca.pem\n", "system", &no_env);
         let higher =
@@ -1410,39 +1896,18 @@ mod tests {
             port: None,
         };
         let per_origin = acc.tls.per_origin.get(&origin).expect("entry");
-        assert_eq!(per_origin.cafiles.len(), 2);
-        assert_eq!(per_origin.cafiles[0].source, "system");
-        assert_eq!(per_origin.cafiles[1].source, "user");
+        assert_eq!(per_origin.cafiles.len(), 1);
+        assert_eq!(per_origin.cafiles[0].source, "user");
     }
 
     #[test]
-    fn parse_layer_with_source_dir_tags_certfile_for_resolve() {
-        // When parse_layer_with_source_dir is given a directory, every
-        // TaggedPath in this layer (global + per-origin) must carry it so
-        // `TaggedPath::resolve()` can compose absolute paths from relative
-        // `.npmrc` values.
+    fn parse_layer_with_source_dir_tags_scoped_tls_paths_for_resolve() {
         let dir = std::path::Path::new("/etc/npm");
-        let content = "certfile=corp-cert.pem\n\
-                       keyfile=corp-key.pem\n\
-                       //npm.internal/:cafile=ca.pem\n\
+        let content = "//npm.internal/:cafile=ca.pem\n\
                        //npm.internal/:certfile=client.pem\n\
                        //npm.internal/:keyfile=client.key\n";
         let cfg =
             NpmrcConfig::parse_layer_with_source_dir(content, "/etc/npmrc", Some(dir), &no_env);
-
-        // Global identity tags both paths with source_dir.
-        let global_cert = cfg.tls.identity_certfile.as_ref().unwrap();
-        assert_eq!(global_cert.path, PathBuf::from("corp-cert.pem"));
-        assert_eq!(global_cert.source_dir.as_deref(), Some(dir));
-        assert_eq!(
-            global_cert.resolve(),
-            PathBuf::from("/etc/npm/corp-cert.pem")
-        );
-
-        let global_key = cfg.tls.identity_keyfile.as_ref().unwrap();
-        assert_eq!(global_key.resolve(), PathBuf::from("/etc/npm/corp-key.pem"));
-
-        // Per-origin entries: same scoping.
         let origin = OriginKey {
             host_lower: "npm.internal".into(),
             port: None,
@@ -1464,24 +1929,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_layer_without_source_dir_leaves_path_unchanged_on_resolve() {
-        // Tests / single-file convenience callers pass None — the
-        // resolve() helper returns the verbatim path so loaders
-        // fall back to ${PWD}-relative resolution (matching the
-        // pre-58.3 behavior).
+    fn parse_layer_without_source_dir_leaves_scoped_paths_unchanged() {
         let cfg = NpmrcConfig::parse(
-            "certfile=/abs/cert.pem\nkeyfile=relative.pem\n",
+            "//npm.internal/:certfile=/abs/cert.pem\n\
+             //npm.internal/:keyfile=relative.pem\n",
             "test",
             &no_env,
         );
-        let cert = cfg.tls.identity_certfile.as_ref().unwrap();
+        let tls = cfg.tls_for_url("https://npm.internal/pkg").unwrap();
+        let cert = tls.certfile.as_ref().unwrap();
         assert!(cert.source_dir.is_none());
-        // Absolute path: unchanged regardless.
         assert_eq!(cert.resolve(), PathBuf::from("/abs/cert.pem"));
 
-        let key = cfg.tls.identity_keyfile.as_ref().unwrap();
+        let key = tls.keyfile.as_ref().unwrap();
         assert!(key.source_dir.is_none());
-        // Relative + no source_dir → returned as-is (loader resolves vs cwd).
         assert_eq!(key.resolve(), PathBuf::from("relative.pem"));
     }
 
@@ -1517,7 +1978,7 @@ mod tests {
     #[test]
     fn password_containing_colon_round_trips() {
         // Defensive regression test against a hypothetical future "split on
-        // every `:`" refactor of the _username/_password join.
+        // every `:`" refactor of the username/_password join.
         //
         // Per RFC 7617, the userid:password wire format reserves only
         // the FIRST `:` as the separator; the password may contain
@@ -1535,7 +1996,7 @@ mod tests {
         let raw_pw = "p@ss:word";
         let encoded_pw = base64::engine::general_purpose::STANDARD.encode(raw_pw.as_bytes());
         let content = format!(
-            "//npm.internal/:_username=user\n\
+            "//npm.internal/:username=user\n\
              //npm.internal/:_password={encoded_pw}\n"
         );
         let cfg = NpmrcConfig::parse(&content, "test", &no_env);
@@ -1543,7 +2004,7 @@ mod tests {
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
         assert_eq!(cfg.origin_auth.len(), 1);
         let auth = cfg.origin_auth.values().next().unwrap();
-        match auth {
+        match auth.as_ref() {
             RegistryAuth::Basic { credential, .. } => {
                 let combined = base64::engine::general_purpose::STANDARD
                     .decode(credential.expose_secret())
@@ -1602,7 +2063,7 @@ mod tests {
         // password. Finalize must combine them into Basic auth, not emit two
         // partial-credential warnings.
         let system =
-            NpmrcConfig::parse_layer("//npm.internal/:_username=alice\n", "/etc/npmrc", &no_env);
+            NpmrcConfig::parse_layer("//npm.internal/:username=alice\n", "/etc/npmrc", &no_env);
         let password = encoded_npmrc_password("pass");
         let user = NpmrcConfig::parse_layer(
             &format!("//npm.internal/:_password={password}\n"),
@@ -1631,11 +2092,11 @@ mod tests {
     #[test]
     fn higher_layer_password_overrides_lower_layer_password() {
         // Per-subkey last-wins: lower layer's _password is replaced by
-        // higher layer's, but lower layer's _username survives because
+        // higher layer's, but lower layer's username survives because
         // higher doesn't set one.
         let old_password = encoded_npmrc_password("old-pw");
         let lower = NpmrcConfig::parse_layer(
-            &format!("//npm.internal/:_username=alice\n//npm.internal/:_password={old_password}\n"),
+            &format!("//npm.internal/:username=alice\n//npm.internal/:_password={old_password}\n"),
             "/etc/npmrc",
             &no_env,
         );
@@ -1685,17 +2146,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_port_443_does_not_leak_to_http() {
-        // An explicit `:443` in the npmrc key means "this auth is for port 443 specifically",
-        // so an http request (default port 80) must NOT pick it up.
-        // This test exists to catch regressions where someone "fixes"
-        // the implicit-port case by widening matching too aggressively.
+    fn explicit_default_port_key_does_not_match_a_normalized_url() {
         let content = "//npm.internal:443/:_authToken=HTTPS_ONLY\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
-        assert!(cfg.auth_for_url("https://npm.internal/").is_some());
+        assert!(cfg.auth_for_url("https://npm.internal/").is_none());
         assert!(
             cfg.auth_for_url("http://npm.internal/").is_none(),
-            "explicit :443 must not leak to http (port 80)"
+            "explicit :443 must not leak to normalized portless URLs"
         );
     }
 
@@ -1703,11 +2160,11 @@ mod tests {
 
     #[test]
     fn partial_credential_warning_cites_source() {
-        // Single-file partial: only _username, no _password.
+        // Single-file partial: only username, no _password.
         // Warning must mention `~/.npmrc:7` (the source + line) and
         // the origin, so a user with multiple .npmrc files can find
         // and fix the offender.
-        let content = "\n\n\n\n\n\n//npm.internal/:_username=alice\n";
+        let content = "\n\n\n\n\n\n//npm.internal/:username=alice\n";
         let cfg = NpmrcConfig::parse(content, "~/.npmrc", &no_env);
         assert!(cfg.origin_auth.is_empty());
         assert_eq!(cfg.warnings.len(), 1, "warnings: {:?}", cfg.warnings);
@@ -1729,7 +2186,7 @@ mod tests {
         // half-credential. The other layer didn't write anything for
         // that origin, so there's nothing else to cite.
         let lower =
-            NpmrcConfig::parse_layer("//npm.internal/:_username=alice\n", "/etc/npmrc", &no_env);
+            NpmrcConfig::parse_layer("//npm.internal/:username=alice\n", "/etc/npmrc", &no_env);
         // Higher layer adds nothing to this origin — different host.
         let higher = NpmrcConfig::parse_layer("//other.host/:_authToken=X\n", "~/.npmrc", &no_env);
         let mut acc = lower;
@@ -1760,17 +2217,16 @@ mod tests {
     #[test]
     fn debug_impl_redacts_secret() {
         let auth = RegistryAuth::Bearer {
-            origin: OriginKey {
+            scope: AuthScope::from_origin(OriginKey {
                 host_lower: "example.com".to_string(),
                 port: None,
-            },
+            }),
             token: SecretString::from("very-secret"),
         };
         let formatted = format!("{auth:?}");
         assert!(!formatted.contains("very-secret"));
         assert!(formatted.contains("REDACTED"));
-        // Origin must still be visible — it's not a secret.
-        assert!(formatted.contains("example.com"));
+        assert!(!formatted.contains("example.com"));
     }
 
     #[test]
@@ -1808,14 +2264,14 @@ mod tests {
         let key =
             OriginKey::from_request_url("https://attacker.com@registry.npmjs.org/foo").unwrap();
         assert_eq!(key.host_lower, "registry.npmjs.org");
-        assert_eq!(key.port, Some(443));
+        assert_eq!(key.port, None);
     }
 
     #[test]
     fn from_request_url_strips_user_and_password_userinfo() {
         let key = OriginKey::from_request_url("https://user:pass@registry.npmjs.org/foo").unwrap();
         assert_eq!(key.host_lower, "registry.npmjs.org");
-        assert_eq!(key.port, Some(443));
+        assert_eq!(key.port, None);
     }
 
     #[test]
@@ -1848,7 +2304,7 @@ mod tests {
         // bracket-stripped form, matching what the previous parser
         // emitted via [`from_host_port_str`].
         let key = OriginKey::from_request_url("https://[::1]:8443/foo").unwrap();
-        assert_eq!(key.host_lower, "[::1]");
+        assert_eq!(key.host_lower, "::1");
         assert_eq!(key.port, Some(8443));
     }
 
@@ -1868,26 +2324,19 @@ mod tests {
         );
     }
 
-    /// A path-scoped `_authToken` key is refused instead of being widened
-    /// to the entire origin. The warning explains how to opt in to
-    /// origin-wide reach without silently over-disclosing a narrow
-    /// GitLab-style project token to sibling projects on the same host.
     #[test]
-    fn path_prefixed_auth_key_is_refused_with_explanatory_warning() {
+    fn path_prefixed_auth_key_is_confined_to_its_registry_path() {
         let content = "//gitlab.com/api/v4/projects/123/packages/npm/:_authToken=glpat-x\n";
         let cfg = NpmrcConfig::parse(content, "test", &no_env);
         assert!(
             cfg.auth_for_url("https://gitlab.com/api/v4/projects/123/packages/npm/foo")
-                .is_none(),
-            "path-scoped credential must NOT be materialized",
+                .is_some(),
+            "path-scoped credential must match its declared path",
         );
         assert!(
-            cfg.warnings
-                .iter()
-                .any(|w| w.contains("refusing to materialize")
-                    && w.contains("path-scoped npmrc credential")),
-            "explanatory warning required; got {:?}",
-            cfg.warnings
+            cfg.auth_for_url("https://gitlab.com/api/v4/projects/other/packages/npm/foo")
+                .is_none(),
+            "path-scoped credential must not reach a sibling path",
         );
     }
 
@@ -1908,7 +2357,7 @@ mod tests {
 
     #[test]
     fn _authtoken_beats_auth_within_same_origin() {
-        // Precedence: _authToken > _auth > _username/_password.
+        // Precedence: _authToken > _auth > username/_password.
         let credential = encoded_basic_credential("user", "pass");
         let content = format!(
             "//npm.internal/:_authToken=BEARER\n\
@@ -1920,5 +2369,370 @@ mod tests {
             RegistryAuth::Bearer { token: s, .. } => assert_eq!(s.expose_secret(), "BEARER"),
             other => panic!("expected Bearer (precedence rule), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn standard_username_and_password_materialize_basic_auth() {
+        let password = encoded_npmrc_password("pass");
+        let content =
+            format!("//npm.internal/:username=alice\n//npm.internal/:_password={password}\n");
+        let cfg = NpmrcConfig::parse(&content, "test", &no_env);
+        let auth = cfg
+            .auth_for_url("https://npm.internal/package")
+            .expect("standard npm username key must combine with _password");
+        match auth {
+            RegistryAuth::Basic { credential, .. } => assert_eq!(
+                credential.expose_secret(),
+                encoded_basic_credential("alice", "pass")
+            ),
+            other => panic!("expected Basic auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_scoped_auth_uses_the_longest_matching_prefix() {
+        let cfg = NpmrcConfig::parse(
+            "//registry.example/:_authToken=root\n\
+             //registry.example/api/:_authToken=api\n\
+             //registry.example/api/projects/one/:_authToken=project\n",
+            "test",
+            &no_env,
+        );
+
+        let project = cfg
+            .auth_for_url("https://registry.example/api/projects/one/pkg")
+            .expect("project prefix must match");
+        let api = cfg
+            .auth_for_url("https://registry.example/api/projects/two/pkg")
+            .expect("api prefix must match");
+        let root = cfg
+            .auth_for_url("https://registry.example/other/pkg")
+            .expect("root prefix must match");
+        fn bearer_token(auth: &RegistryAuth) -> &str {
+            match auth {
+                RegistryAuth::Bearer { token, .. } => token.expose_secret(),
+                other => panic!("expected Bearer auth, got {other:?}"),
+            }
+        }
+        assert_eq!(bearer_token(project), "project");
+        assert_eq!(bearer_token(api), "api");
+        assert_eq!(bearer_token(root), "root");
+        assert!(
+            cfg.auth_for_url("https://registry.example/apiv2/pkg")
+                .is_some_and(|auth| bearer_token(auth) == "root"),
+            "path matching must respect segment boundaries"
+        );
+    }
+
+    #[test]
+    fn path_scoped_auth_without_a_slash_before_the_attribute_matches_segment_boundaries() {
+        let cfg = NpmrcConfig::parse("//registry.example/api:_authToken=api\n", "test", &no_env);
+        assert!(cfg.auth_for_url("https://registry.example/api").is_some());
+        assert!(
+            cfg.auth_for_url("https://registry.example/api/pkg")
+                .is_some()
+        );
+        assert!(cfg.auth_for_url("https://registry.example/apiv2").is_none());
+    }
+
+    #[test]
+    fn portless_auth_does_not_match_an_explicit_nondefault_port() {
+        let cfg = NpmrcConfig::parse(
+            "//npm.internal/:_authToken=default\n//npm.internal:8443/:_authToken=alternate\n",
+            "test",
+            &no_env,
+        );
+        let ordinary = cfg
+            .auth_for_url("https://npm.internal/pkg")
+            .expect("portless URL must match portless auth");
+        let alternate = cfg
+            .auth_for_url("https://npm.internal:8443/pkg")
+            .expect("explicit port must match exact auth");
+        match (ordinary, alternate) {
+            (
+                RegistryAuth::Bearer {
+                    token: ordinary, ..
+                },
+                RegistryAuth::Bearer {
+                    token: alternate, ..
+                },
+            ) => {
+                assert_eq!(ordinary.expose_secret(), "default");
+                assert_eq!(alternate.expose_secret(), "alternate");
+            }
+            other => panic!("expected bearer credentials, got {other:?}"),
+        }
+
+        let portless_only =
+            NpmrcConfig::parse("//npm.internal/:_authToken=default\n", "test", &no_env);
+        assert!(
+            portless_only
+                .auth_for_url("https://npm.internal:8443/pkg")
+                .is_none(),
+            "portless auth must not widen to an explicitly different port"
+        );
+    }
+
+    #[test]
+    fn ipv6_auth_and_tls_origins_match_request_urls() {
+        let cfg = NpmrcConfig::parse(
+            "//[::1]:8443/:_authToken=ipv6\n//[::1]:8443/:cafile=/unused/ca.pem\n",
+            "test",
+            &no_env,
+        );
+        assert!(
+            cfg.auth_for_url("https://[::1]:8443/pkg").is_some(),
+            "IPv6 auth key must use the request URL's canonical host form"
+        );
+        assert!(
+            cfg.tls_for_url("https://[::1]:8443/pkg").is_some(),
+            "IPv6 TLS key must use the request URL's canonical host form"
+        );
+    }
+
+    #[test]
+    fn npm_env_interpolation_keeps_missing_values_and_supports_optional_and_escaped_forms() {
+        let cfg = NpmrcConfig::parse(
+            "ignored=${MISSING}\n\
+             @${SCOPE}:registry=https://registry.example/${MISSING}\n\
+             //registry.example/:_authToken=${TOKEN?}\n\
+             literal=\\${ESCAPED}\n",
+            "test",
+            &fixed_env(&[("SCOPE", "private")]),
+        );
+
+        assert!(cfg.errors.is_empty(), "npm leaves missing values literal");
+        assert_eq!(
+            cfg.scope_registries["@private"].base_url.as_ref(),
+            "https://registry.example/${MISSING}"
+        );
+        assert!(
+            cfg.auth_for_url("https://registry.example/pkg").is_none(),
+            "an unset optional token must not materialize an empty credential"
+        );
+    }
+
+    #[test]
+    fn ini_comments_escapes_and_quoted_json_values_match_npm() {
+        let cfg = NpmrcConfig::parse(
+            "registry=https://registry.example/ ; comment\n\
+             //registry.example/:_authToken=abc\\;def ; comment\n\
+             @quoted:registry=\"https://registry.example/\\u0061\"\n",
+            "test",
+            &no_env,
+        );
+        assert_eq!(
+            cfg.default_registry.as_ref().unwrap().base_url.as_ref(),
+            "https://registry.example"
+        );
+        assert_eq!(
+            cfg.scope_registries["@quoted"].base_url.as_ref(),
+            "https://registry.example/a"
+        );
+        match cfg
+            .auth_for_url("https://registry.example/pkg")
+            .expect("escaped token must parse")
+        {
+            RegistryAuth::Bearer { token, .. } => assert_eq!(token.expose_secret(), "abc;def"),
+            other => panic!("expected Bearer auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ca_arrays_preserve_order_and_scalar_ca_uses_last_value() {
+        let first = generate_test_cert_pem();
+        let second = generate_test_cert_pem();
+        let third = generate_test_cert_pem();
+        let array_cfg = NpmrcConfig::parse(
+            &format!(
+                "ca[]={first}\nca[]={second}\n",
+                first = first.replace('\n', "\\n"),
+                second = second.replace('\n', "\\n")
+            ),
+            "test",
+            &no_env,
+        );
+        assert_eq!(array_cfg.tls.extra_roots.len(), 2);
+        assert_eq!(
+            array_cfg.tls.extra_roots[0].pem_bytes.as_ref(),
+            first.as_bytes()
+        );
+        assert_eq!(
+            array_cfg.tls.extra_roots[1].pem_bytes.as_ref(),
+            second.as_bytes()
+        );
+
+        let scalar_cfg = NpmrcConfig::parse(
+            &format!(
+                "ca={first}\nca={third}\n",
+                first = first.replace('\n', "\\n"),
+                third = third.replace('\n', "\\n")
+            ),
+            "test",
+            &no_env,
+        );
+        assert_eq!(scalar_cfg.tls.extra_roots.len(), 1);
+        assert_eq!(
+            scalar_cfg.tls.extra_roots[0].pem_bytes.as_ref(),
+            third.as_bytes()
+        );
+    }
+
+    #[test]
+    fn higher_cafile_replaces_a_missing_lower_cafile_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = generate_test_cert_pem();
+        let valid = dir.path().join("valid.pem");
+        std::fs::write(&valid, &pem).unwrap();
+        let lower = NpmrcConfig::parse_layer_with_source_dir(
+            "cafile=missing.pem\n",
+            "lower/.npmrc",
+            Some(dir.path()),
+            &no_env,
+        );
+        let higher = NpmrcConfig::parse_layer_with_source_dir(
+            "cafile=valid.pem\n",
+            "higher/.npmrc",
+            Some(dir.path()),
+            &no_env,
+        );
+        let mut merged = lower;
+        merged.merge_over(higher);
+        merged.finalize();
+
+        assert!(
+            merged.errors.is_empty(),
+            "a missing lower cafile must not remain an effective configuration error"
+        );
+        assert_eq!(merged.tls.extra_roots.len(), 1);
+        assert_eq!(merged.tls.extra_roots[0].pem_bytes.as_ref(), pem.as_bytes());
+    }
+
+    #[test]
+    fn relative_scoped_identity_paths_resolve_beside_their_npmrc() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cfg = NpmrcConfig::parse_layer_with_source_dir(
+            "//registry.example/:certfile=client.pem\n\
+             //registry.example/:keyfile=client.key\n",
+            "user/.npmrc",
+            Some(config_dir.path()),
+            &no_env,
+        );
+        let tls = cfg
+            .tls_for_url("https://registry.example/pkg")
+            .expect("scoped identity");
+        assert_eq!(
+            tls.certfile.as_ref().map(TaggedPath::resolve),
+            Some(config_dir.path().join("client.pem"))
+        );
+        assert_eq!(
+            tls.keyfile.as_ref().map(TaggedPath::resolve),
+            Some(config_dir.path().join("client.key"))
+        );
+    }
+
+    #[test]
+    fn higher_strict_ssl_true_suppresses_a_shadowed_false_warning() {
+        let mut merged = NpmrcConfig::parse_layer("strict-ssl=false\n", "lower", &no_env);
+        merged.merge_over(NpmrcConfig::parse_layer(
+            "strict-ssl=true\n",
+            "higher",
+            &no_env,
+        ));
+        merged.finalize();
+        assert_eq!(
+            merged.tls.strict_ssl.as_ref().map(|value| value.value),
+            Some(true)
+        );
+        assert!(
+            merged
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("DISABLED")),
+            "shadowed warning is false: {:?}",
+            merged.warnings
+        );
+    }
+
+    #[test]
+    fn empty_credentials_shadow_lower_values_without_materializing_auth() {
+        for key in ["_authToken", "_auth"] {
+            let mut merged = NpmrcConfig::parse_layer(
+                &format!("//registry.example/:{key}=secret\n"),
+                "lower",
+                &no_env,
+            );
+            merged.merge_over(NpmrcConfig::parse_layer(
+                &format!("//registry.example/:{key}=\n"),
+                "higher",
+                &no_env,
+            ));
+            merged.finalize();
+            assert!(
+                merged
+                    .auth_for_url("https://registry.example/pkg")
+                    .is_none(),
+                "empty {key} must clear lower auth"
+            );
+        }
+    }
+
+    #[test]
+    fn project_layer_refuses_literal_tls_trust_and_identity_settings() {
+        let pem = generate_test_cert_pem().replace('\n', "\\n");
+        let cfg = NpmrcConfig::parse_layer_with_options(
+            &format!(
+                "ca={pem}\ncafile=ca.pem\ncertfile=client.pem\nkeyfile=client.key\n\
+                 //registry.example/:cafile=ca.pem\n\
+                 //registry.example/:certfile=client.pem\n\
+                 //registry.example/:keyfile=client.key\n"
+            ),
+            "project/.npmrc",
+            None,
+            true,
+            &no_env,
+        );
+        assert!(cfg.tls.extra_roots.is_empty());
+        assert!(cfg.tls.identity_certfile.is_none());
+        assert!(cfg.tls.identity_keyfile.is_none());
+        assert!(cfg.tls.per_origin.is_empty());
+        assert_eq!(cfg.security_warnings.len(), 7);
+    }
+
+    #[test]
+    fn debug_redacts_credentials_before_finalize() {
+        let cfg = NpmrcConfig::parse_layer(
+            "//registry.example/:_authToken=raw-token\n\
+             //other.example/:_auth=dXNlcjpwYXNz\n\
+             //third.example/:_password=c2VjcmV0\n",
+            "test",
+            &no_env,
+        );
+        let debug = format!("{cfg:?}");
+        for secret in ["raw-token", "dXNlcjpwYXNz", "c2VjcmV0"] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+    }
+
+    #[test]
+    fn merged_layers_share_one_aggregate_interpolation_budget() {
+        let expansion = "x".repeat(lpm_common::NPMRC_INTERPOLATED_VALUE_CAP_BYTES / 2);
+        let env = |name: &str| (name == "LARGE_SCOPE").then(|| expansion.clone());
+        let content = "//registry.example/${LARGE_SCOPE}/:_authToken=secret\n";
+        let mut merged = NpmrcConfig::parse_layer(content, "lower", &env);
+        let higher = NpmrcConfig::parse_layer(content, "higher", &env);
+
+        assert!(merged.errors.is_empty());
+        assert!(higher.errors.is_empty());
+        merged.merge_over(higher);
+
+        assert!(
+            merged
+                .errors
+                .iter()
+                .any(|error| error.contains("across merged layers")),
+            "merged expansion budget must fail closed: {:?}",
+            merged.errors
+        );
     }
 }

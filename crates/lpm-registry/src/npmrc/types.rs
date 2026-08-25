@@ -48,7 +48,7 @@ pub struct TaggedRoot {
     /// Raw PEM bytes — one or more `-----BEGIN CERTIFICATE-----` blocks.
     /// Cryptographic validation deferred to `reqwest::Certificate::from_pem`
     /// at builder time; parse time only verifies the marker is present.
-    pub pem_bytes: Vec<u8>,
+    pub pem_bytes: Arc<Vec<u8>>,
     /// Source label (file path or test stub).
     pub source: String,
     /// 1-indexed line number of the contributing `cafile=` / `ca=` line.
@@ -153,8 +153,9 @@ impl OriginTlsOverrides {
     /// precedence `.npmrc` layer adds keys for the same origin a
     /// lower-precedence layer already covered.
     pub(super) fn merge_over(&mut self, other: OriginTlsOverrides) {
-        // cafiles concatenate (multiple roots may stack).
-        self.cafiles.extend(other.cafiles);
+        if !other.cafiles.is_empty() {
+            self.cafiles = other.cafiles;
+        }
         if other.certfile.is_some() {
             self.certfile = other.certfile;
         }
@@ -222,7 +223,7 @@ pub struct TlsOverrides {
 impl TlsOverrides {
     pub(crate) fn is_empty(&self) -> bool {
         self.extra_roots.is_empty()
-            && self.strict_ssl.is_none()
+            && !matches!(self.strict_ssl.as_ref(), Some(setting) if !setting.value)
             && self.identity_certfile.is_none()
             && self.identity_keyfile.is_none()
             && self.per_origin.is_empty()
@@ -233,14 +234,9 @@ impl TlsOverrides {
 ///
 /// `port` is `Option<u16>`:
 /// - `None` — port was unspecified in the npmrc key (`//host/`). The
-///   stored entry matches a request to this host on **any** port,
-///   making auth scheme-agnostic for http vs https.
+///   stored entry matches request URLs without an explicit non-default port.
 /// - `Some(p)` — port was explicit (`//host:p/`). The stored entry
 ///   matches only that exact port.
-///
-/// `OriginKey::from_request_url` always returns `Some(port)` (concrete),
-/// so the lookup falls back to `(host, None)` when an exact-port match
-/// misses. See `NpmrcConfig::auth_for_url`.
 ///
 /// Scheme is intentionally absent — npm's nerf-dart auth keys
 /// (`//host[:port]/`) are scheme-agnostic. The `--insecure` flag
@@ -249,6 +245,61 @@ impl TlsOverrides {
 pub struct OriginKey {
     pub host_lower: String,
     pub port: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AuthScope {
+    pub origin: OriginKey,
+    pub path_prefix: Arc<str>,
+}
+
+impl AuthScope {
+    pub fn from_origin(origin: OriginKey) -> Self {
+        Self {
+            origin,
+            path_prefix: Arc::from("/"),
+        }
+    }
+
+    pub(super) fn from_npmrc_scope(scope: &str) -> Option<Self> {
+        let (host_port, path) = scope.split_once('/').unwrap_or((scope, ""));
+        let origin = OriginKey::from_host_port_str(host_port, None)?;
+        let path_prefix = if path.is_empty() {
+            Arc::from("/")
+        } else {
+            let mut normalized = String::with_capacity(path.len() + 2);
+            normalized.push('/');
+            normalized.push_str(path.trim_matches('/'));
+            normalized.push('/');
+            Arc::from(normalized)
+        };
+        Some(Self {
+            origin,
+            path_prefix,
+        })
+    }
+
+    pub(super) fn matches(&self, origin: &OriginKey, path: &str) -> bool {
+        if self.origin != *origin {
+            return false;
+        }
+        if self.path_prefix.as_ref() == "/" {
+            return true;
+        }
+        let without_trailing_slash = self.path_prefix.trim_end_matches('/');
+        path == without_trailing_slash || path.starts_with(self.path_prefix.as_ref())
+    }
+}
+
+impl std::fmt::Display for AuthScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            self.origin,
+            self.path_prefix.trim_start_matches('/')
+        )
+    }
 }
 
 impl std::fmt::Display for OriginKey {
@@ -264,24 +315,6 @@ impl std::fmt::Display for OriginKey {
 }
 
 impl OriginKey {
-    /// Parse from a `//host[:port]/...` `.npmrc` auth-key fragment.
-    ///
-    /// Caller has already verified the leading `//`. We strip it,
-    /// lop everything from the first `/` onward (path is ignored in v1),
-    /// then split host:port. An omitted port
-    /// yields `port: None` (matches any port for that host).
-    pub(super) fn from_npmrc_origin(after_double_slash: &str) -> Option<Self> {
-        // Drop the path component, if any.
-        let host_port = match after_double_slash.find('/') {
-            Some(idx) => &after_double_slash[..idx],
-            None => after_double_slash,
-        };
-        if host_port.is_empty() {
-            return None;
-        }
-        Self::from_host_port_str(host_port, None)
-    }
-
     /// Parse a `host` or `host:port` literal. `default_port` is used iff
     /// the literal omits a port AND the caller has a concrete fallback
     /// in mind (request URL parsing). For npmrc parsing the caller
@@ -318,10 +351,9 @@ impl OriginKey {
     }
 
     /// Build from a fully-formed request URL the way the dispatcher will
-    /// see it. Always returns `port: Some(_)` — the scheme implies a
-    /// concrete default (80 for http, 443 for https) when no port is in
-    /// the URL itself. Lookup callers fall back to `(host, None)` when
-    /// the exact-port match misses; see `NpmrcConfig::auth_for_url`.
+    /// see it. A missing/default port remains `None`; a non-default explicit
+    /// port remains `Some(port)`, matching WHATWG `URL.host` and npm 12's
+    /// registry-auth scoping.
     ///
     /// Delegates to `reqwest::Url::parse` (the RFC 3986 parser reqwest
     /// itself uses to dispatch) so the host extracted here matches the
@@ -335,28 +367,29 @@ impl OriginKey {
     /// registry-metadata field.
     pub fn from_request_url(url: &str) -> Option<Self> {
         let parsed = reqwest::Url::parse(url).ok()?;
-        let default_port = match parsed.scheme() {
-            "https" => 443,
-            "http" => 80,
-            _ => return None,
-        };
+        Self::from_parsed_url(&parsed)
+    }
+
+    pub(crate) fn from_parsed_url(parsed: &reqwest::Url) -> Option<Self> {
+        if !matches!(parsed.scheme(), "https" | "http") {
+            return None;
+        }
         let host = parsed.host_str()?;
-        // `Url::port_or_known_default` returns the scheme's default
-        // when the URL omits an explicit port. For http/https this is
-        // 80/443; we keep the explicit fallback so non-default schemes
-        // (rejected above) never sneak through with an unexpected port.
-        let port = parsed.port().unwrap_or(default_port);
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
         Some(Self {
             host_lower: host.to_ascii_lowercase(),
-            port: Some(port),
+            port: parsed.port(),
         })
     }
 }
 
 /// Auth credential to attach to a request.
 ///
-/// Each variant carries the [`OriginKey`] the credential is scoped to.
-/// `RegistryClient::get_npm_metadata_from` re-verifies that this origin
+/// Each variant carries the [`AuthScope`] the credential is scoped to.
+/// `RegistryClient::get_npm_metadata_from` re-verifies that this scope
 /// is compatible with the destination URL via [`Self::matches_destination`]
 /// before sending the `Authorization` header, so a routing bug elsewhere
 /// can't leak a token cross-origin.
@@ -367,13 +400,13 @@ impl OriginKey {
 pub enum RegistryAuth {
     /// Sent as `Authorization: Bearer <token>`. From `_authToken=...`.
     Bearer {
-        origin: OriginKey,
+        scope: AuthScope,
         token: SecretString,
     },
     /// Sent as `Authorization: Basic <b64>`. From `_auth=...` directly,
-    /// or computed by joining `_username` + base64-decoded `_password`.
+    /// or computed by joining `username` + base64-decoded `_password`.
     Basic {
-        origin: OriginKey,
+        scope: AuthScope,
         credential: SecretString,
     },
 }
@@ -384,25 +417,28 @@ impl RegistryAuth {
     /// never trust a separately-supplied auth/URL pair.
     pub fn origin(&self) -> &OriginKey {
         match self {
-            Self::Bearer { origin, .. } | Self::Basic { origin, .. } => origin,
+            Self::Bearer { scope, .. } | Self::Basic { scope, .. } => &scope.origin,
+        }
+    }
+
+    pub fn scope(&self) -> &AuthScope {
+        match self {
+            Self::Bearer { scope, .. } | Self::Basic { scope, .. } => scope,
         }
     }
 
     /// Whether this credential is acceptable to attach to a request to
     /// `dest`. Mirrors the [`NpmrcConfig::auth_for_url`] match rule:
-    /// same host, AND (auth port is `None` OR equal to dest port).
-    /// Asymmetric on purpose — an auth registered without a port covers
-    /// any port for that host, but an explicit-port auth never leaks
-    /// to a different port.
-    pub fn matches_destination(&self, dest: &OriginKey) -> bool {
-        let auth_origin = self.origin();
-        if auth_origin.host_lower != dest.host_lower {
+    /// same canonical host and the same explicit-port posture.
+    pub fn matches_destination(&self, dest: &reqwest::Url) -> bool {
+        let Some(origin) = OriginKey::from_parsed_url(dest) else {
             return false;
-        }
-        match auth_origin.port {
-            Some(p) => Some(p) == dest.port,
-            None => true,
-        }
+        };
+        self.matches_origin_path(&origin, dest.path())
+    }
+
+    pub(crate) fn matches_origin_path(&self, origin: &OriginKey, path: &str) -> bool {
+        self.scope().matches(origin, path)
     }
 
     /// Stable auth identity for security-preserving workspace grouping.
@@ -428,14 +464,12 @@ impl RegistryAuth {
 impl std::fmt::Debug for RegistryAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bearer { origin, .. } => write!(
-                f,
-                "RegistryAuth::Bearer {{ origin: {origin}, token: [REDACTED] }}"
-            ),
-            Self::Basic { origin, .. } => write!(
-                f,
-                "RegistryAuth::Basic {{ origin: {origin}, credential: [REDACTED] }}"
-            ),
+            Self::Bearer { .. } => {
+                f.write_str("RegistryAuth::Bearer { scope: [REDACTED], token: [REDACTED] }")
+            }
+            Self::Basic { .. } => {
+                f.write_str("RegistryAuth::Basic { scope: [REDACTED], credential: [REDACTED] }")
+            }
         }
     }
 }
@@ -448,24 +482,24 @@ impl PartialEq for RegistryAuth {
         match (self, other) {
             (
                 Self::Bearer {
-                    origin: a_o,
+                    scope: a_s,
                     token: a_t,
                 },
                 Self::Bearer {
-                    origin: b_o,
+                    scope: b_s,
                     token: b_t,
                 },
-            ) => a_o == b_o && a_t.expose_secret() == b_t.expose_secret(),
+            ) => a_s == b_s && a_t.expose_secret() == b_t.expose_secret(),
             (
                 Self::Basic {
-                    origin: a_o,
+                    scope: a_s,
                     credential: a_c,
                 },
                 Self::Basic {
-                    origin: b_o,
+                    scope: b_s,
                     credential: b_c,
                 },
-            ) => a_o == b_o && a_c.expose_secret() == b_c.expose_secret(),
+            ) => a_s == b_s && a_c.expose_secret() == b_c.expose_secret(),
             _ => false,
         }
     }
@@ -477,11 +511,21 @@ impl Eq for RegistryAuth {}
 /// merges so finalize warnings can cite the contributing source file
 /// (and line, when relevant) — not just the host/port the credential
 /// was for.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct TaggedValue {
     value: String,
     source: String,
     line: usize,
+}
+
+impl std::fmt::Debug for TaggedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaggedValue")
+            .field("value", &"[REDACTED]")
+            .field("source", &self.source)
+            .field("line", &self.line)
+            .finish()
+    }
 }
 
 impl TaggedValue {
@@ -497,7 +541,7 @@ impl TaggedValue {
 /// Per-origin auth buffer. Holds raw tagged subkeys until
 /// `NpmrcConfig::finalize` resolves them into a concrete
 /// `RegistryAuth`. Buffers persist across `merge_over` so subkeys set
-/// by different layers (e.g., system-wide `_username` + per-user
+/// by different layers (e.g., system-wide `username` + per-user
 /// `_password`) compose correctly.
 #[derive(Default, Clone, Debug)]
 pub(super) struct AuthBuffer {
@@ -509,66 +553,81 @@ pub(super) struct AuthBuffer {
 
 impl AuthBuffer {
     /// Resolve to a final `RegistryAuth`, or `None` if nothing usable.
-    /// Precedence matches npm: `_authToken` > `_auth` > `_username`+`_password`.
+    /// Precedence matches npm: `_authToken` > `_auth` > `username`+`_password`.
     /// Warnings about partial/malformed credentials cite the source
     /// label of whichever subkey contributed the partial state.
     pub(super) fn resolve(
         self,
-        origin: &OriginKey,
+        scope: &AuthScope,
         warnings: &mut Vec<String>,
     ) -> Option<RegistryAuth> {
-        if let Some(t) = self.auth_token {
+        if let Some(t) = self.auth_token
+            && !t.value.is_empty()
+        {
             return Some(RegistryAuth::Bearer {
-                origin: origin.clone(),
+                scope: scope.clone(),
                 token: SecretString::from(t.value),
             });
         }
-        if let Some(b) = self.auth_b64 {
+        if let Some(b) = self.auth_b64
+            && !b.value.is_empty()
+        {
             return Some(RegistryAuth::Basic {
-                origin: origin.clone(),
+                scope: scope.clone(),
                 credential: SecretString::from(b.value),
             });
         }
         match (self.username, self.password_b64) {
             (Some(user), Some(pw_tagged)) => {
+                if user.value.is_empty() || pw_tagged.value.is_empty() {
+                    return None;
+                }
                 let pw = match base64::engine::general_purpose::STANDARD.decode(&pw_tagged.value) {
                     Ok(bytes) => match String::from_utf8(bytes) {
                         Ok(s) => s,
                         Err(_) => {
-                            warnings.push(format!(
-                                "{}:{}: {} _password is not valid UTF-8 after base64 decode; ignoring credential",
-                                pw_tagged.source, pw_tagged.line, origin
-                            ));
+                            lpm_common::push_npmrc_diagnostic(warnings, &pw_tagged.source, || {
+                                format!(
+                                    "{}:{}: {} _password is not valid UTF-8 after base64 decode; ignoring credential",
+                                    pw_tagged.source, pw_tagged.line, scope
+                                )
+                            });
                             return None;
                         }
                     },
                     Err(_) => {
-                        warnings.push(format!(
-                            "{}:{}: {} _password is not valid base64; ignoring credential",
-                            pw_tagged.source, pw_tagged.line, origin
-                        ));
+                        lpm_common::push_npmrc_diagnostic(warnings, &pw_tagged.source, || {
+                            format!(
+                                "{}:{}: {} _password is not valid base64; ignoring credential",
+                                pw_tagged.source, pw_tagged.line, scope
+                            )
+                        });
                         return None;
                     }
                 };
                 let combined = format!("{}:{}", user.value, pw);
                 let encoded = base64::engine::general_purpose::STANDARD.encode(combined.as_bytes());
                 Some(RegistryAuth::Basic {
-                    origin: origin.clone(),
+                    scope: scope.clone(),
                     credential: SecretString::from(encoded),
                 })
             }
             (Some(user), None) => {
-                warnings.push(format!(
-                    "{}:{}: {} has _username but no _password (across all merged layers); ignoring partial credential",
-                    user.source, user.line, origin
-                ));
+                lpm_common::push_npmrc_diagnostic(warnings, &user.source, || {
+                    format!(
+                        "{}:{}: {} has username but no _password (across all merged layers); ignoring partial credential",
+                        user.source, user.line, scope
+                    )
+                });
                 None
             }
             (None, Some(pw_tagged)) => {
-                warnings.push(format!(
-                    "{}:{}: {} has _password but no _username (across all merged layers); ignoring partial credential",
-                    pw_tagged.source, pw_tagged.line, origin
-                ));
+                lpm_common::push_npmrc_diagnostic(warnings, &pw_tagged.source, || {
+                    format!(
+                        "{}:{}: {} has _password but no username (across all merged layers); ignoring partial credential",
+                        pw_tagged.source, pw_tagged.line, scope
+                    )
+                });
                 None
             }
             (None, None) => None,
@@ -578,7 +637,7 @@ impl AuthBuffer {
     /// Merge `other` ON TOP OF `self` per subkey. `other`'s `Some` slots
     /// overwrite `self`'s; `other`'s `None` slots leave `self` unchanged.
     /// This is what makes cross-layer credential composition work
-    /// (e.g., `_username` from system-wide, `_password` from project).
+    /// (e.g., `username` from system-wide, `_password` from project).
     pub(super) fn merge_over(&mut self, other: AuthBuffer) {
         if other.auth_token.is_some() {
             self.auth_token = other.auth_token;

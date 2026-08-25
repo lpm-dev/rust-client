@@ -1156,7 +1156,7 @@ async fn fetch_metadata_raw(
                     // `get_npm_metadata_from` before the Authorization
                     // header is attached.
                     client
-                        .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                        .get_npm_metadata_from(&target.base_url, name, auth.as_deref())
                         .await
                 }
             }
@@ -1228,7 +1228,7 @@ async fn fetch_metadata_raw_with_timings(
                     })
                 }
                 UpstreamRoute::Custom { target, auth } => client
-                    .get_npm_metadata_from(&target.base_url, name, auth.as_ref())
+                    .get_npm_metadata_from(&target.base_url, name, auth.as_deref())
                     .await
                     .map(|metadata| RawMetadataWithTimings {
                         metadata,

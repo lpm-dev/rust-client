@@ -314,6 +314,18 @@ pub(super) struct InstallRoutingContext {
     pub(super) setup_route_table_ms: u128,
 }
 
+pub(super) fn load_install_route_table(
+    project_dir: &Path,
+    client: &RegistryClient,
+) -> Result<RouteTable, LpmError> {
+    let mut route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
+    if let Some(overrides) = client.metadata_route_overrides() {
+        route_table = route_table.with_package_route_overrides(overrides);
+    }
+    Ok(route_table)
+}
+
 pub(super) fn prepare_install_routing_context(
     project_dir: &Path,
     deps: &HashMap<String, String>,
@@ -321,13 +333,13 @@ pub(super) fn prepare_install_routing_context(
     pkg_name: &str,
     is_add_invocation: bool,
     json_output: bool,
+    preloaded_route_table: Option<RouteTable>,
 ) -> Result<InstallRoutingContext, LpmError> {
     let setup_route_t = Instant::now();
-    let mut route_table = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
-        .map_err(|e| LpmError::Registry(format!("npmrc: {e}")))?;
-    if let Some(overrides) = client.metadata_route_overrides() {
-        route_table = route_table.with_package_route_overrides(overrides);
-    }
+    let route_table = match preloaded_route_table {
+        Some(route_table) => route_table,
+        None => load_install_route_table(project_dir, client)?,
+    };
     let setup_route_table_ms = setup_route_t.elapsed().as_millis();
 
     if !json_output {
@@ -3384,6 +3396,47 @@ fn merge_optional_registry_roots(
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    #[test]
+    fn preloaded_install_route_table_is_reused_after_the_npmrc_changes() {
+        let project = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"route-reuse","version":"1.0.0"}"#,
+        )
+        .expect("write package manifest");
+        std::fs::write(
+            project.path().join(".npmrc"),
+            "registry=https://original.example/\n",
+        )
+        .expect("write npmrc");
+        let client = RegistryClient::new();
+        let route_table =
+            load_install_route_table(project.path(), &client).expect("load route table once");
+        std::fs::write(
+            project.path().join(".npmrc"),
+            "strict-npmrc=true\nunknown-setting=true\n",
+        )
+        .expect("replace npmrc after preflight");
+
+        let context = prepare_install_routing_context(
+            project.path(),
+            &HashMap::from([("package-a".to_string(), "^1.0.0".to_string())]),
+            &client,
+            "route-reuse",
+            true,
+            true,
+            Some(route_table),
+        )
+        .expect("pipeline must reuse the command-scoped route table");
+
+        match context.route_table.route_for_package("package-a") {
+            UpstreamRoute::Custom { target, .. } => {
+                assert_eq!(target.base_url.as_ref(), "https://original.example");
+            }
+            route => panic!("expected the preloaded custom route, got {route:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn recursive_metadata_sharing_remains_enabled_for_unused_npm_auth() {
