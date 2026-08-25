@@ -1,9 +1,11 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
-    FetchResult, FetchedMetadata, MetadataFetchCompletion, cached_manifest_from_importer_or_facts,
-    complete_metadata_fetch, ensure_policy_metadata_for_cached_manifest,
+    ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
+    cached_manifest_from_importer_or_facts, complete_metadata_fetch,
+    ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
     fetch_metadata_for_resolver_with_trace_detail, parse_cached_metadata_for_resolver,
     parse_fetched_metadata, parse_partial_fetched_metadata, publish_direct_base_fact,
+    try_fetch_exact_metadata_for_resolver,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -14,37 +16,60 @@ use crate::resolve::SelectedPackageEvent;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+const EXACT_DOCUMENT_CONCURRENCY_MULTIPLIER: usize = 4;
+
 /// Command-scoped permit pool shared by importer-local resolver passes.
 #[derive(Clone)]
 pub struct SharedMetadataConcurrency {
     semaphore: Arc<tokio::sync::Semaphore>,
+    exact_document_semaphore: Arc<tokio::sync::Semaphore>,
     limit: usize,
+    exact_document_limit: usize,
 }
 
 impl SharedMetadataConcurrency {
     /// Creates a metadata permit pool with at least one permit.
     pub fn new(limit: usize) -> Self {
         let limit = limit.clamp(1, crate::MAX_NPM_FANOUT);
+        let exact_document_limit = limit
+            .saturating_mul(EXACT_DOCUMENT_CONCURRENCY_MULTIPLIER)
+            .min(crate::MAX_NPM_FANOUT);
         Self {
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            exact_document_semaphore: Arc::new(tokio::sync::Semaphore::new(exact_document_limit)),
             limit,
+            exact_document_limit,
         }
     }
 
-    /// Returns the maximum number of concurrent metadata requests.
+    /// Returns the maximum number of concurrent packument requests.
     #[inline]
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Returns the maximum number of concurrent exact-version documents.
+    #[inline]
+    pub fn exact_document_limit(&self) -> usize {
+        self.exact_document_limit
     }
 
     /// Returns whether two handles control the same permit pool.
     #[inline]
     pub fn shares_pool_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.semaphore, &other.semaphore)
+            && Arc::ptr_eq(
+                &self.exact_document_semaphore,
+                &other.exact_document_semaphore,
+            )
     }
 
     fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
         Arc::clone(&self.semaphore)
+    }
+
+    fn exact_document_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.exact_document_semaphore)
     }
 }
 
@@ -57,6 +82,15 @@ mod shared_metadata_concurrency_tests {
         let concurrency = SharedMetadataConcurrency::new(usize::MAX);
 
         assert_eq!(concurrency.limit(), crate::MAX_NPM_FANOUT);
+        assert_eq!(concurrency.exact_document_limit(), crate::MAX_NPM_FANOUT);
+    }
+
+    #[test]
+    fn exact_documents_use_a_wider_bounded_permit_pool() {
+        let concurrency = SharedMetadataConcurrency::new(8);
+
+        assert_eq!(concurrency.limit(), 8);
+        assert_eq!(concurrency.exact_document_limit(), 32);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -121,9 +155,16 @@ mod shared_metadata_concurrency_tests {
             policy: &policy,
             trace_metadata_fetches: false,
         };
-        let mut jobs = MetadataFetchScheduler::new(Arc::clone(&metadata_sem));
+        let mut jobs =
+            MetadataFetchScheduler::new(Arc::clone(&metadata_sem), Arc::clone(&metadata_sem));
 
-        spawn_metadata_fetch_job(&mut jobs, &dispatch, CanonicalKey::npm(package), false);
+        spawn_metadata_fetch_job(
+            &mut jobs,
+            &dispatch,
+            CanonicalKey::npm(package),
+            None,
+            false,
+        );
         let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             jobs.join_next()
                 .await
@@ -175,9 +216,16 @@ mod shared_metadata_concurrency_tests {
             policy: &policy,
             trace_metadata_fetches: false,
         };
-        let mut jobs = MetadataFetchScheduler::new(Arc::clone(&metadata_sem));
+        let mut jobs =
+            MetadataFetchScheduler::new(Arc::clone(&metadata_sem), Arc::clone(&metadata_sem));
 
-        spawn_metadata_fetch_job(&mut jobs, &dispatch, CanonicalKey::npm(package), false);
+        spawn_metadata_fetch_job(
+            &mut jobs,
+            &dispatch,
+            CanonicalKey::npm(package),
+            None,
+            false,
+        );
         let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             jobs.join_next()
                 .await
@@ -579,6 +627,7 @@ struct PendingMetadataFetch {
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     policy: ResolverPolicy,
+    exact_version: Option<String>,
     include_speculation: bool,
     trace_metadata_fetches: bool,
     telemetry: Arc<MetadataFetchTelemetry>,
@@ -587,17 +636,24 @@ struct PendingMetadataFetch {
 
 struct MetadataFetchScheduler {
     semaphore: Arc<tokio::sync::Semaphore>,
+    exact_document_semaphore: Arc<tokio::sync::Semaphore>,
     jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
     pending: VecDeque<PendingMetadataFetch>,
+    pending_exact_documents: VecDeque<PendingMetadataFetch>,
     ready: VecDeque<(CanonicalKey, FetchResult)>,
 }
 
 impl MetadataFetchScheduler {
-    fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+    fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        exact_document_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
             semaphore,
+            exact_document_semaphore,
             jobs: tokio::task::JoinSet::new(),
             pending: VecDeque::new(),
+            pending_exact_documents: VecDeque::new(),
             ready: VecDeque::new(),
         }
     }
@@ -606,6 +662,7 @@ impl MetadataFetchScheduler {
         &mut self,
         dispatch: &MetadataFetchDispatch<'_>,
         canonical: CanonicalKey,
+        exact_version: Option<String>,
         include_speculation: bool,
     ) {
         let client = dispatch.client.clone();
@@ -631,19 +688,35 @@ impl MetadataFetchScheduler {
             client,
             route_table,
             policy,
+            exact_version,
             include_speculation,
             trace_metadata_fetches: dispatch.trace_metadata_fetches,
             telemetry: Arc::clone(dispatch.telemetry),
             queued_at: Instant::now(),
         };
-        match Arc::clone(&self.semaphore).try_acquire_owned() {
+        let exact_document_lane = pending.exact_version.is_some()
+            && exact_metadata_fast_path_eligible(
+                &pending.route_table,
+                &pending.canonical,
+                &pending.policy,
+            );
+        let semaphore = if exact_document_lane {
+            &self.exact_document_semaphore
+        } else {
+            &self.semaphore
+        };
+        match Arc::clone(semaphore).try_acquire_owned() {
             Ok(permit) => self.spawn(pending, permit),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 pending
                     .telemetry
                     .semaphore_wait_count
                     .fetch_add(1, Ordering::Relaxed);
-                self.pending.push_back(pending);
+                if exact_document_lane {
+                    self.pending_exact_documents.push_back(pending);
+                } else {
+                    self.pending.push_back(pending);
+                }
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 panic!("metadata semaphore must outlive the resolver")
@@ -657,18 +730,97 @@ impl MetadataFetchScheduler {
                 .telemetry
                 .record_wait_duration(pending.queued_at.elapsed());
         }
-        self.jobs.spawn(async move {
-            let _permit = permit;
-            let _active_fetch = pending.telemetry.enter();
-            let result = fetch_metadata_for_resolver_with_trace_detail(
-                &pending.client,
+        let exact_document_lane = pending.exact_version.is_some()
+            && exact_metadata_fast_path_eligible(
                 &pending.route_table,
                 &pending.canonical,
                 &pending.policy,
-                pending.include_speculation,
-                pending.trace_metadata_fetches,
-            )
-            .await;
+            );
+        let metadata_semaphore = Arc::clone(&self.semaphore);
+        self.jobs.spawn(async move {
+            let _active_fetch = pending.telemetry.enter();
+            let result = if exact_document_lane {
+                let version = pending
+                    .exact_version
+                    .as_deref()
+                    .expect("exact-document lane requires an exact version");
+                match try_fetch_exact_metadata_for_resolver(
+                    &pending.client,
+                    &pending.route_table,
+                    &pending.canonical,
+                    version,
+                    &pending.policy,
+                    pending.include_speculation,
+                    pending.trace_metadata_fetches,
+                )
+                .await
+                {
+                    ExactMetadataFetchOutcome::Hit(fetched) => {
+                        drop(permit);
+                        Ok(fetched)
+                    }
+                    ExactMetadataFetchOutcome::Fallback => {
+                        let fallback_permit =
+                            match Arc::clone(&metadata_semaphore).try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                                    pending
+                                        .telemetry
+                                        .semaphore_wait_count
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    let wait_start = Instant::now();
+                                    let permit = Arc::clone(&metadata_semaphore)
+                                        .acquire_owned()
+                                        .await
+                                        .expect("metadata semaphore must outlive the resolver");
+                                    pending.telemetry.record_wait_duration(wait_start.elapsed());
+                                    permit
+                                }
+                                Err(tokio::sync::TryAcquireError::Closed) => {
+                                    panic!("metadata semaphore must outlive the resolver")
+                                }
+                            };
+                        drop(permit);
+                        let _fallback_permit = fallback_permit;
+                        fetch_metadata_for_resolver_with_trace_detail(
+                            &pending.client,
+                            &pending.route_table,
+                            &pending.canonical,
+                            &pending.policy,
+                            pending.include_speculation,
+                            pending.trace_metadata_fetches,
+                        )
+                        .await
+                    }
+                }
+            } else {
+                let _permit = permit;
+                if pending.exact_version.is_some()
+                    && matches!(
+                        &pending.canonical,
+                        CanonicalKey::Npm { name }
+                            if matches!(
+                                pending.route_table.route_for_package(name),
+                                UpstreamRoute::NpmDirect
+                            )
+                    )
+                    && (pending.policy.requires_trust_history()
+                        || pending
+                            .policy
+                            .release_age_applies_to_package(&pending.canonical))
+                {
+                    lpm_registry::timing::record_exact_document_policy_bypass();
+                }
+                fetch_metadata_for_resolver_with_trace_detail(
+                    &pending.client,
+                    &pending.route_table,
+                    &pending.canonical,
+                    &pending.policy,
+                    pending.include_speculation,
+                    pending.trace_metadata_fetches,
+                )
+                .await
+            };
             (pending.canonical, result)
         });
     }
@@ -685,6 +837,20 @@ impl MetadataFetchScheduler {
             let pending = self.pending.pop_front().expect("checked non-empty");
             self.spawn(pending, permit);
         }
+        while !self.pending_exact_documents.is_empty() {
+            let permit = match Arc::clone(&self.exact_document_semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(tokio::sync::TryAcquireError::NoPermits) => break,
+                Err(tokio::sync::TryAcquireError::Closed) => {
+                    panic!("exact document semaphore must outlive the resolver")
+                }
+            };
+            let pending = self
+                .pending_exact_documents
+                .pop_front()
+                .expect("checked non-empty");
+            self.spawn(pending, permit);
+        }
     }
 
     async fn join_next(
@@ -694,12 +860,49 @@ impl MetadataFetchScheduler {
             return Some(Ok(ready));
         }
         self.fill_available();
-        if self.jobs.is_empty() && !self.pending.is_empty() {
-            let permit = Arc::clone(&self.semaphore)
-                .acquire_owned()
-                .await
-                .expect("metadata semaphore must outlive the resolver");
-            let pending = self.pending.pop_front().expect("checked non-empty");
+        if self.jobs.is_empty()
+            && (!self.pending.is_empty() || !self.pending_exact_documents.is_empty())
+        {
+            let (pending, permit) = match (
+                self.pending.is_empty(),
+                self.pending_exact_documents.is_empty(),
+            ) {
+                (false, true) => {
+                    let permit = Arc::clone(&self.semaphore)
+                        .acquire_owned()
+                        .await
+                        .expect("metadata semaphore must outlive the resolver");
+                    (self.pending.pop_front().expect("checked non-empty"), permit)
+                }
+                (true, false) => {
+                    let permit = Arc::clone(&self.exact_document_semaphore)
+                        .acquire_owned()
+                        .await
+                        .expect("exact document semaphore must outlive the resolver");
+                    (
+                        self.pending_exact_documents
+                            .pop_front()
+                            .expect("checked non-empty"),
+                        permit,
+                    )
+                }
+                (false, false) => {
+                    let metadata_permit = Arc::clone(&self.semaphore).acquire_owned();
+                    let exact_document_permit =
+                        Arc::clone(&self.exact_document_semaphore).acquire_owned();
+                    tokio::select! {
+                        permit = metadata_permit => (
+                            self.pending.pop_front().expect("checked non-empty"),
+                            permit.expect("metadata semaphore must outlive the resolver"),
+                        ),
+                        permit = exact_document_permit => (
+                            self.pending_exact_documents.pop_front().expect("checked non-empty"),
+                            permit.expect("exact document semaphore must outlive the resolver"),
+                        ),
+                    }
+                }
+                (true, true) => unreachable!("pending work was checked above"),
+            };
             self.spawn(pending, permit);
         }
         let joined = self.jobs.join_next().await;
@@ -709,7 +912,7 @@ impl MetadataFetchScheduler {
 
     #[cfg(test)]
     fn queued_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.pending_exact_documents.len()
     }
 
     #[cfg(test)]
@@ -718,7 +921,10 @@ impl MetadataFetchScheduler {
     }
 
     fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.pending.is_empty() && self.ready.is_empty()
+        self.jobs.is_empty()
+            && self.pending.is_empty()
+            && self.pending_exact_documents.is_empty()
+            && self.ready.is_empty()
     }
 }
 
@@ -744,14 +950,136 @@ mod metadata_fetch_scheduler_tests {
             policy: &policy,
             trace_metadata_fetches: false,
         };
-        let mut scheduler = MetadataFetchScheduler::new(Arc::clone(&semaphore));
+        let mut scheduler =
+            MetadataFetchScheduler::new(Arc::clone(&semaphore), Arc::clone(&semaphore));
         for index in 0..10_000 {
             let package = format!("stress-package-{index}");
-            scheduler.enqueue(&dispatch, CanonicalKey::npm(&package), false);
+            scheduler.enqueue(&dispatch, CanonicalKey::npm(&package), None, false);
         }
         assert_eq!(scheduler.spawned_len(), 4);
         assert_eq!(scheduler.queued_len(), 9_996);
         scheduler.jobs.abort_all();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_documents_do_not_consume_large_packument_permits() {
+        let metadata_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let exact_document_semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let client = Arc::new(RegistryClient::new().with_cache_dir(None));
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut scheduler = MetadataFetchScheduler::new(
+            Arc::clone(&metadata_semaphore),
+            Arc::clone(&exact_document_semaphore),
+        );
+
+        for index in 0..10 {
+            let packument = format!("packument-{index}");
+            scheduler.enqueue(&dispatch, CanonicalKey::npm(&packument), None, false);
+            let exact = format!("exact-{index}");
+            scheduler.enqueue(
+                &dispatch,
+                CanonicalKey::npm(&exact),
+                Some("1.0.0".to_string()),
+                false,
+            );
+        }
+
+        assert_eq!(scheduler.spawned_len(), 10);
+        assert_eq!(scheduler.queued_len(), 10);
+        scheduler.jobs.abort_all();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_document_fallback_waits_for_a_packument_permit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fallback/1.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "fallback",
+                "version": "1.0.0",
+                "dependencies": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "fallback",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "fallback",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://example.invalid/fallback-1.0.0.tgz",
+                            "integrity": "sha512-fallback"
+                        },
+                        "dependencies": {}
+                    }
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let metadata_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let exact_document_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let held_packument_permit = Arc::clone(&metadata_semaphore)
+            .acquire_owned()
+            .await
+            .expect("metadata semaphore must be open");
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut scheduler =
+            MetadataFetchScheduler::new(Arc::clone(&metadata_semaphore), exact_document_semaphore);
+        scheduler.enqueue(
+            &dispatch,
+            CanonicalKey::npm("fallback"),
+            Some("1.0.0".to_string()),
+            false,
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), scheduler.join_next())
+                .await
+                .is_err(),
+            "fallback must remain blocked while the packument lane is full"
+        );
+        drop(held_packument_permit);
+        let (_, result) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), scheduler.join_next())
+                .await
+                .expect("fallback should finish after a packument permit is released")
+                .expect("scheduler should return the fallback job")
+                .expect("fallback task should join");
+        result.expect("packument fallback should resolve");
+        server.verify().await;
     }
 }
 
@@ -759,9 +1087,10 @@ fn spawn_metadata_fetch_job(
     metadata_jobs: &mut MetadataFetchScheduler,
     dispatch: &MetadataFetchDispatch<'_>,
     canonical: CanonicalKey,
+    exact_version: Option<String>,
     include_speculation: bool,
 ) {
-    metadata_jobs.enqueue(dispatch, canonical, include_speculation);
+    metadata_jobs.enqueue(dispatch, canonical, exact_version, include_speculation);
 }
 
 fn release_age_names_from_root_deps(
@@ -999,10 +1328,11 @@ fn cached_info_satisfies_peer_requirements(
 ///   and resume parked edges in stable `(parent_id, local_name)` order
 ///   so multi-version dedupe stays deterministic across runs.
 ///
-/// **Concurrency caps.** A single `npm_fanout` semaphore gates
-/// outstanding metadata fetches. Callers tune the fanout for their
-/// registry/network regime; tarball downloads run later in install.rs
-/// unless a caller explicitly supplies a speculation channel.
+/// **Concurrency caps.** `npm_fanout` gates full packuments. Exact npm
+/// version documents use a separate command-scoped pool widened by a bounded
+/// factor because they decode one candidate rather than a package history.
+/// Tarball downloads run later in install.rs unless a caller explicitly
+/// supplies a speculation channel.
 ///
 /// **Counters.** `dispatcher_rpc_count`, `inflight_high_water`,
 /// `parked_max_depth`, `tarball_dispatched_count`, and
@@ -1255,6 +1585,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let metadata_concurrency =
         shared_metadata_concurrency.unwrap_or_else(|| SharedMetadataConcurrency::new(npm_fanout));
     let metadata_sem = metadata_concurrency.semaphore();
+    let exact_document_sem = metadata_concurrency.exact_document_semaphore();
     let metadata_fetch_telemetry = Arc::new(MetadataFetchTelemetry::default());
     let metadata_dispatch = MetadataFetchDispatch {
         telemetry: &metadata_fetch_telemetry,
@@ -1291,7 +1622,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     let mut counted_metadata_edge_misses =
         trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
-    let mut metadata_jobs = MetadataFetchScheduler::new(Arc::clone(&metadata_sem));
+    let mut metadata_jobs =
+        MetadataFetchScheduler::new(Arc::clone(&metadata_sem), exact_document_sem);
     let mut worker_batch_stream = None;
     let mut worker_batch_stream_package_specs: Vec<(String, String)> = Vec::new();
     let mut worker_stream_can_batch_waiting = false;
@@ -1496,6 +1828,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             ) {
                 if info_arc.needs_metadata_for_range(&edge.range) {
                     let canonical = edge.canonical.clone();
+                    let exact_version = edge
+                        .range
+                        .exact_version()
+                        .map(|version| version.to_string());
                     let new_fetch = ordered_metadata.start(&canonical)?;
                     if new_fetch && trace_metadata_fetches {
                         state.work_stats.record_metadata_edge_miss(
@@ -1534,6 +1870,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             &mut metadata_jobs,
                             &metadata_dispatch,
                             canonical,
+                            exact_version,
                             spec_tx.is_some(),
                         );
                         dispatcher_rpc_count += 1;
@@ -1624,6 +1961,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             // drain are grouped into one batch below; direct/custom
             // routes keep the existing per-package fetch path.
             let canonical = edge.canonical.clone();
+            let exact_version = edge
+                .range
+                .exact_version()
+                .map(|version| version.to_string());
             let new_fetch = ordered_metadata.start(&canonical)?;
             if new_fetch && trace_metadata_fetches {
                 state
@@ -1659,6 +2000,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         &mut metadata_jobs,
                         &metadata_dispatch,
                         canonical,
+                        exact_version,
                         include_speculation,
                     );
                     dispatcher_rpc_count += 1;
@@ -1716,6 +2058,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                 &mut metadata_jobs,
                                 &metadata_dispatch,
                                 canonical,
+                                None,
                                 spec_tx.is_some(),
                             );
                             dispatcher_rpc_count += 1;
@@ -1806,6 +2149,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                 &mut metadata_jobs,
                                 &metadata_dispatch,
                                 canonical,
+                                None,
                                 spec_tx.is_some(),
                             );
                             dispatcher_rpc_count += 1;
@@ -1837,6 +2181,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                 &mut metadata_jobs,
                                 &metadata_dispatch,
                                 canonical,
+                                None,
                                 spec_tx.is_some(),
                             );
                             dispatcher_rpc_count += 1;
@@ -1885,6 +2230,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     &mut metadata_jobs,
                     &metadata_dispatch,
                     canonical,
+                    None,
                     include_speculation,
                 );
                 dispatcher_rpc_count += 1;
@@ -2041,6 +2387,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             &mut metadata_jobs,
                             &metadata_dispatch,
                             canonical,
+                            None,
                             spec_tx.is_some(),
                         );
                         dispatcher_rpc_count += 1;
@@ -2264,6 +2611,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             dispatcher_rpc_count: dispatcher_rpc_count
                 + tree_provider.dispatcher_rpc_count.load(Ordering::Relaxed),
             dispatcher_configured_fanout: u64::try_from(npm_fanout).unwrap_or(u64::MAX),
+            dispatcher_exact_document_fanout: u64::try_from(
+                metadata_concurrency.exact_document_limit(),
+            )
+            .unwrap_or(u64::MAX),
             dispatcher_concurrency_shared,
             dispatcher_inflight_high_water: metadata_fetch_telemetry
                 .active_high_water

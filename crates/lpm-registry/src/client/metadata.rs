@@ -1885,8 +1885,9 @@ impl RegistryClient {
         }
         let etag = Self::response_etag(&response);
         let (version_metadata, body_timings) =
-            match parse_capped_metadata_with_timing::<VersionMetadata>(
+            match parse_capped_metadata_with_timing_limit::<VersionMetadata>(
                 response,
+                MAX_VERSION_METADATA_BYTES,
                 &format!("get_npm_version_metadata_direct {name}@{version}"),
             )
             .await

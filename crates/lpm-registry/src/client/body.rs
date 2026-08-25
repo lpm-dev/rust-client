@@ -8,6 +8,9 @@ use super::*;
 /// legitimate metadata response and orders of magnitude below a
 /// memory-exhaustion attack from a compromised mirror or MITM.
 pub(super) const MAX_METADATA_BYTES: usize = 100 * 1024 * 1024;
+/// Exact npm version documents contain one manifest rather than package
+/// history. Keep their widened concurrency lane under a tighter memory cap.
+pub(super) const MAX_VERSION_METADATA_BYTES: usize = 4 * 1024 * 1024;
 // Keep small responses inline; large packuments can monopolize an async worker.
 const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 
@@ -80,8 +83,18 @@ pub(super) async fn parse_capped_metadata_with_timing<
     response: reqwest::Response,
     context: &str,
 ) -> Result<(T, MetadataBodyTimings), LpmError> {
+    parse_capped_metadata_with_timing_limit(response, MAX_METADATA_BYTES, context).await
+}
+
+pub(super) async fn parse_capped_metadata_with_timing_limit<
+    T: serde::de::DeserializeOwned + Send + 'static,
+>(
+    response: reqwest::Response,
+    cap: usize,
+    context: &str,
+) -> Result<(T, MetadataBodyTimings), LpmError> {
     let body_start = std::time::Instant::now();
-    let buf = read_capped_body(response, MAX_METADATA_BYTES, context).await?;
+    let buf = read_capped_body(response, cap, context).await?;
     let mut timings = MetadataBodyTimings {
         body_read_ms: body_start.elapsed().as_millis(),
         body_bytes: buf.len() as u64,

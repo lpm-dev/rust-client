@@ -97,6 +97,27 @@ fn metadata_json_version(name: &str, version: &str, deps: &[(&str, &str)]) -> se
     })
 }
 
+fn version_document_json(name: &str, version: &str, deps: &[(&str, &str)]) -> serde_json::Value {
+    let dependencies: serde_json::Map<String, serde_json::Value> = deps
+        .iter()
+        .map(|(name, range)| {
+            (
+                name.to_string(),
+                serde_json::Value::String(range.to_string()),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "dist": {
+            "tarball": format!("https://example.invalid/{name}-{version}.tgz"),
+            "integrity": format!("sha512-{name}-{version}")
+        },
+        "dependencies": dependencies
+    })
+}
+
 /// Build a minimal CachedPackageInfo for a synthesized npm package.
 /// `versions` are passed already in descending order to mirror
 /// `parse_metadata_to_cache_info`'s contract.
@@ -4362,6 +4383,498 @@ async fn fusion_terminates_on_empty_deps() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fusion_exact_npm_range_fetches_only_the_version_document() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/exact-root/1.2.3"))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "exact-root",
+            "version": "1.2.3",
+            "dist": {
+                "tarball": "https://example.invalid/exact-root-1.2.3.tgz",
+                "integrity": "sha512-exact-root"
+            },
+            "dependencies": {}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let result = resolve_greedy_fused(
+        client,
+        HashMap::from([("exact-root".to_string(), "1.2.3".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("an exact npm range should resolve from its version document");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_broad_npm_range_keeps_using_the_packument() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/broad-root"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json_version(
+                "broad-root",
+                "1.2.3",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let result = resolve_greedy_fused(
+        client,
+        HashMap::from([("broad-root".to_string(), "^1.0.0".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("a broad npm range should continue to resolve from a packument");
+
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_invalid_exact_version_document_falls_back_to_the_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fallback-root/1.2.3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "wrong-package",
+            "version": "1.2.3",
+            "dist": {
+                "tarball": "https://example.invalid/wrong-package-1.2.3.tgz",
+                "integrity": "sha512-wrong-package"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/fallback-root"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json_version(
+                "fallback-root",
+                "1.2.3",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let result = resolve_greedy_fused(
+        client,
+        HashMap::from([("fallback-root".to_string(), "1.2.3".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("an invalid exact version document should fall back to the packument");
+
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_exact_prerelease_fetches_the_prerelease_version_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/prerelease-root/2.0.0-beta.3"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(version_document_json(
+                "prerelease-root",
+                "2.0.0-beta.3",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("prerelease-root".to_string(), "2.0.0-beta.3".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("an exact prerelease should resolve from its version document");
+
+    assert_eq!(result.packages[0].version.to_string(), "2.0.0-beta.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_exact_npm_alias_fetches_the_target_version_document() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/alias-target/1.2.3"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(version_document_json(
+                "alias-target",
+                "1.2.3",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([(
+            "local-alias".to_string(),
+            "npm:alias-target@1.2.3".to_string(),
+        )]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("an exact npm alias should resolve from the target version document");
+
+    assert_eq!(
+        result.root_aliases.get("local-alias").map(String::as_str),
+        Some("alias-target")
+    );
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_exact_document_without_distribution_falls_back_to_the_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/missing-dist/1.2.3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "missing-dist",
+            "version": "1.2.3",
+            "dependencies": {}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/missing-dist"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json_version(
+                "missing-dist",
+                "1.2.3",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("missing-dist".to_string(), "1.2.3".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("an incomplete version document should fall back to the packument");
+
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_release_age_policy_skips_the_exact_document_and_uses_complete_metadata() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/policy-root/1.2.3"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/policy-root"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "policy-root",
+            "dist-tags": { "latest": "1.2.3" },
+            "versions": {
+                "1.2.3": version_document_json("policy-root", "1.2.3", &[])
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/policy-root"))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "policy-root",
+            "time": { "1.2.3": "2025-01-01T00:00:00.000Z" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused_with_cache_options_and_policy(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("policy-root".to_string(), "1.2.3".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        true,
+        true,
+        ResolverPolicy::with_cutoff_unix(86_400, 1_750_000_000, TrustPolicyMode::Off),
+    )
+    .await
+    .expect("release-age policy should resolve from complete metadata");
+
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_broad_range_after_an_exact_document_refetches_the_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/shared-range/1.0.0"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(version_document_json(
+                "shared-range",
+                "1.0.0",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/shared-range"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "shared-range",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": version_document_json("shared-range", "1.0.0", &[]),
+                "2.0.0": version_document_json("shared-range", "2.0.0", &[])
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("a-exact".to_string(), "npm:shared-range@1.0.0".to_string()),
+            ("z-broad".to_string(), "npm:shared-range@^2.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("an uncovered broad range should refetch complete metadata");
+
+    let versions: HashSet<_> = result
+        .packages
+        .iter()
+        .map(|package| package.version.to_string())
+        .collect();
+    assert_eq!(
+        versions,
+        HashSet::from(["1.0.0".to_string(), "2.0.0".to_string()])
+    );
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_multiple_exact_versions_merge_without_fetching_a_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for version in ["1.0.0", "2.0.0"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/shared-exact/{version}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(version_document_json(
+                    "shared-exact",
+                    version,
+                    &[],
+                )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("a-one".to_string(), "npm:shared-exact@1.0.0".to_string()),
+            ("z-two".to_string(), "npm:shared-exact@2.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("multiple exact versions should merge as partial metadata");
+
+    let versions: HashSet<_> = result
+        .packages
+        .iter()
+        .map(|package| package.version.to_string())
+        .collect();
+    assert_eq!(
+        versions,
+        HashSet::from(["1.0.0".to_string(), "2.0.0".to_string()])
+    );
+    assert!(!result.cache[&CanonicalKey::npm("shared-exact")].versions_complete);
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_custom_registry_exact_range_keeps_using_the_packument() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/custom-exact/1.2.3"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/custom-exact"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json_version(
+                "custom-exact",
+                "1.2.3",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let npmrc =
+        lpm_registry::NpmrcConfig::parse(&format!("registry={}\n", server.uri()), "test", &|_| {
+            None
+        });
+
+    let result = resolve_greedy_fused(
+        Arc::new(RegistryClient::new().with_cache_dir(None)),
+        HashMap::from([("custom-exact".to_string(), "1.2.3".to_string())]),
+        OverrideSet::empty(),
+        RouteTable::new(RouteMode::Direct, npmrc).expect("valid custom registry"),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("custom registry exact ranges should keep the existing path");
+
+    assert_eq!(result.packages[0].version.to_string(), "1.2.3");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4412,6 +4925,7 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
         result.stage_timing.dispatcher_configured_fanout,
         FANOUT as u64
     );
+    assert_eq!(result.stage_timing.dispatcher_exact_document_fanout, 8);
     assert_eq!(result.stage_timing.dispatcher_inflight_high_water, 2);
     assert_eq!(
         result.stage_timing.dispatcher_pending_high_water,
@@ -4422,6 +4936,57 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
         (PACKAGE_COUNT - FANOUT) as u64
     );
     assert!(result.stage_timing.dispatcher_semaphore_wait_ns > 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_exact_documents_use_the_wider_bounded_fanout() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PACKAGE_COUNT: usize = 6;
+    const PACKUMENT_FANOUT: usize = 2;
+
+    let server = MockServer::start().await;
+    let mut deps = HashMap::with_capacity(PACKAGE_COUNT);
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("exact-fanout-{index}");
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}/1.0.0")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(50))
+                    .set_body_json(version_document_json(&name, "1.0.0", &[])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        deps.insert(name, "1.0.0".to_string());
+    }
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        deps,
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        PACKUMENT_FANOUT,
+        None,
+        true,
+    )
+    .await
+    .expect("exact version documents should resolve through the wider lane");
+
+    assert_eq!(result.stage_timing.dispatcher_configured_fanout, 2);
+    assert_eq!(result.stage_timing.dispatcher_exact_document_fanout, 8);
+    assert_eq!(
+        result.stage_timing.dispatcher_inflight_high_water,
+        PACKAGE_COUNT as u64
+    );
+    assert_eq!(result.stage_timing.dispatcher_semaphore_wait_count, 0);
+    server.verify().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

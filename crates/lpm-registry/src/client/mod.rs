@@ -60,9 +60,9 @@ use self::auth::{
     apply_npmrc_auth, bearer_principal_fingerprint, cert_pem_fingerprint, principal_fingerprint,
 };
 use self::body::{
-    MAX_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
+    MAX_METADATA_BYTES, MAX_VERSION_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
     parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,
-    read_capped_error_text,
+    parse_capped_metadata_with_timing_limit, read_capped_error_text,
 };
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
 use self::state::{CacheContent, CacheValidator, CachedClient};

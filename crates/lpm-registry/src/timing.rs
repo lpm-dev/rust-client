@@ -340,6 +340,42 @@ pub fn record_metadata_fetch_detail(record: MetadataFetchDetailRecord) {
     metadata_fetch_detail().record(record);
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ExactDocumentFallbackReason {
+    FetchError,
+    IncompleteDistribution,
+}
+
+pub fn record_exact_document_attempt() {
+    metadata_fetch_detail()
+        .exact_document_attempt_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_exact_document_hit() {
+    metadata_fetch_detail()
+        .exact_document_hit_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_exact_document_policy_bypass() {
+    metadata_fetch_detail()
+        .exact_document_policy_bypass_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_exact_document_fallback(reason: ExactDocumentFallbackReason) {
+    let counter = match reason {
+        ExactDocumentFallbackReason::FetchError => {
+            &metadata_fetch_detail().exact_document_fetch_error_count
+        }
+        ExactDocumentFallbackReason::IncompleteDistribution => {
+            &metadata_fetch_detail().exact_document_incomplete_distribution_count
+        }
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_metadata_cache_info_parse_detail(
     package: impl Into<String>,
     route: &'static str,
@@ -531,6 +567,7 @@ struct MetadataFetchDetailCounters {
     body_bytes_sum: AtomicU64,
     version_count_sum: AtomicU64,
     route_npm_direct_count: AtomicU64,
+    route_npm_direct_version_document_count: AtomicU64,
     route_lpm_worker_count: AtomicU64,
     route_custom_count: AtomicU64,
     route_lpm_count: AtomicU64,
@@ -561,6 +598,15 @@ struct MetadataFetchDetailCounters {
     policy_release_time_cache_hit_count: AtomicU64,
     policy_release_time_not_modified_count: AtomicU64,
     policy_full_metadata_sum_ms: AtomicU64,
+    exact_document_attempt_count: AtomicU64,
+    exact_document_hit_count: AtomicU64,
+    exact_document_policy_bypass_count: AtomicU64,
+    exact_document_fetch_error_count: AtomicU64,
+    exact_document_incomplete_distribution_count: AtomicU64,
+    exact_document_body_bytes_sum: AtomicU64,
+    exact_document_version_count_sum: AtomicU64,
+    exact_document_cache_hit_count: AtomicU64,
+    exact_document_not_modified_count: AtomicU64,
     slow_by_total: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_raw_fetch: Mutex<Vec<MetadataFetchDetailRecord>>,
     slow_by_http: Mutex<Vec<MetadataFetchDetailRecord>>,
@@ -585,6 +631,8 @@ impl MetadataFetchDetailCounters {
         self.body_bytes_sum.store(0, Ordering::Relaxed);
         self.version_count_sum.store(0, Ordering::Relaxed);
         self.route_npm_direct_count.store(0, Ordering::Relaxed);
+        self.route_npm_direct_version_document_count
+            .store(0, Ordering::Relaxed);
         self.route_lpm_worker_count.store(0, Ordering::Relaxed);
         self.route_custom_count.store(0, Ordering::Relaxed);
         self.route_lpm_count.store(0, Ordering::Relaxed);
@@ -627,6 +675,23 @@ impl MetadataFetchDetailCounters {
         self.policy_release_time_not_modified_count
             .store(0, Ordering::Relaxed);
         self.policy_full_metadata_sum_ms.store(0, Ordering::Relaxed);
+        self.exact_document_attempt_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_hit_count.store(0, Ordering::Relaxed);
+        self.exact_document_policy_bypass_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_fetch_error_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_incomplete_distribution_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_body_bytes_sum
+            .store(0, Ordering::Relaxed);
+        self.exact_document_version_count_sum
+            .store(0, Ordering::Relaxed);
+        self.exact_document_cache_hit_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_not_modified_count
+            .store(0, Ordering::Relaxed);
         Self::clear_bucket(&self.slow_by_total);
         Self::clear_bucket(&self.slow_by_raw_fetch);
         Self::clear_bucket(&self.slow_by_http);
@@ -663,12 +728,27 @@ impl MetadataFetchDetailCounters {
             .fetch_add(record.version_count, Ordering::Relaxed);
         match record.route {
             "npm_direct" => &self.route_npm_direct_count,
+            "npm_direct_version_doc" => &self.route_npm_direct_version_document_count,
             "lpm_worker" => &self.route_lpm_worker_count,
             "custom" => &self.route_custom_count,
             "lpm" => &self.route_lpm_count,
             _ => &self.route_unknown_count,
         }
         .fetch_add(1, Ordering::Relaxed);
+        if record.route == "npm_direct_version_doc" {
+            self.exact_document_body_bytes_sum
+                .fetch_add(record.body_bytes, Ordering::Relaxed);
+            self.exact_document_version_count_sum
+                .fetch_add(record.version_count, Ordering::Relaxed);
+            if record.cache_hit {
+                self.exact_document_cache_hit_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if record.not_modified {
+                self.exact_document_not_modified_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         Self::record_sum_max(&self.total_sum_ms, &self.total_max_ms, record.total_ms);
         Self::record_sum_max(
@@ -846,6 +926,9 @@ impl MetadataFetchDetailCounters {
             body_bytes_sum: self.body_bytes_sum.load(Ordering::Relaxed),
             version_count_sum: self.version_count_sum.load(Ordering::Relaxed),
             route_npm_direct_count: self.route_npm_direct_count.load(Ordering::Relaxed),
+            route_npm_direct_version_document_count: self
+                .route_npm_direct_version_document_count
+                .load(Ordering::Relaxed),
             route_lpm_worker_count: self.route_lpm_worker_count.load(Ordering::Relaxed),
             route_custom_count: self.route_custom_count.load(Ordering::Relaxed),
             route_lpm_count: self.route_lpm_count.load(Ordering::Relaxed),
@@ -906,6 +989,27 @@ impl MetadataFetchDetailCounters {
                     .policy_full_metadata_sum_ms
                     .load(Ordering::Relaxed),
             },
+            exact_documents: ExactDocumentSnapshot {
+                attempt_count: self.exact_document_attempt_count.load(Ordering::Relaxed),
+                hit_count: self.exact_document_hit_count.load(Ordering::Relaxed),
+                policy_bypass_count: self
+                    .exact_document_policy_bypass_count
+                    .load(Ordering::Relaxed),
+                fetch_error_fallback_count: self
+                    .exact_document_fetch_error_count
+                    .load(Ordering::Relaxed),
+                incomplete_distribution_fallback_count: self
+                    .exact_document_incomplete_distribution_count
+                    .load(Ordering::Relaxed),
+                body_bytes_sum: self.exact_document_body_bytes_sum.load(Ordering::Relaxed),
+                version_count_sum: self
+                    .exact_document_version_count_sum
+                    .load(Ordering::Relaxed),
+                cache_hit_count: self.exact_document_cache_hit_count.load(Ordering::Relaxed),
+                not_modified_count: self
+                    .exact_document_not_modified_count
+                    .load(Ordering::Relaxed),
+            },
             top_slow_packages: MetadataFetchSlowSnapshot {
                 by_total: Self::snapshot_bucket(&self.slow_by_total),
                 by_raw_fetch: Self::snapshot_bucket(&self.slow_by_raw_fetch),
@@ -954,13 +1058,28 @@ pub struct MetadataFetchDetailSnapshot {
     pub body_bytes_sum: u64,
     pub version_count_sum: u64,
     pub route_npm_direct_count: u64,
+    pub route_npm_direct_version_document_count: u64,
     pub route_lpm_worker_count: u64,
     pub route_custom_count: u64,
     pub route_lpm_count: u64,
     pub route_unknown_count: u64,
     pub attribution: MetadataFetchAttributionSnapshot,
+    pub exact_documents: ExactDocumentSnapshot,
     pub top_slow_packages: MetadataFetchSlowSnapshot,
     pub top_direct_packuments: MetadataFetchDirectPackumentSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExactDocumentSnapshot {
+    pub attempt_count: u64,
+    pub hit_count: u64,
+    pub policy_bypass_count: u64,
+    pub fetch_error_fallback_count: u64,
+    pub incomplete_distribution_fallback_count: u64,
+    pub body_bytes_sum: u64,
+    pub version_count_sum: u64,
+    pub cache_hit_count: u64,
+    pub not_modified_count: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1104,6 +1223,7 @@ mod tests {
             total_ms: 50,
             http_ms: 40,
             body_bytes: 2_000,
+            version_count: 1,
             policy_release_time_fetch_ms: 30,
             policy_release_time_body_bytes: 1_500,
             ..MetadataFetchDetailRecord::default()
@@ -1114,9 +1234,12 @@ mod tests {
         assert_eq!(snapshot.calls, 3);
         assert_eq!(snapshot.cache_hit_count, 1);
         assert_eq!(snapshot.route_npm_direct_count, 2);
-        assert_eq!(snapshot.route_unknown_count, 1);
+        assert_eq!(snapshot.route_npm_direct_version_document_count, 1);
+        assert_eq!(snapshot.route_unknown_count, 0);
         assert_eq!(snapshot.body_bytes_sum, 3000);
-        assert_eq!(snapshot.version_count_sum, 10);
+        assert_eq!(snapshot.version_count_sum, 11);
+        assert_eq!(snapshot.exact_documents.body_bytes_sum, 2_000);
+        assert_eq!(snapshot.exact_documents.version_count_sum, 1);
         assert_eq!(snapshot.attribution.total_sum_ms, 67);
         assert_eq!(snapshot.attribution.total_max_ms, 50);
         assert_eq!(snapshot.attribution.http_sum_ms, 51);
@@ -1151,6 +1274,53 @@ mod tests {
         assert_eq!(snapshot.calls, 0);
         assert!(snapshot.top_slow_packages.by_total.is_empty());
         assert!(snapshot.top_direct_packuments.by_http.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_document_outcomes_are_counted_and_reset() {
+        let _guard = metadata_fetch_detail_test_lock().lock().await;
+        let _env = ScopedEnv::set("LPM_TIMING_DETAIL", "trace");
+        reset_metadata_detail();
+
+        record_exact_document_attempt();
+        record_exact_document_attempt();
+        record_exact_document_hit();
+        record_exact_document_policy_bypass();
+        record_exact_document_fallback(ExactDocumentFallbackReason::FetchError);
+        record_exact_document_fallback(ExactDocumentFallbackReason::IncompleteDistribution);
+        record_metadata_fetch_detail(MetadataFetchDetailRecord {
+            package: "exact".to_string(),
+            route: "npm_direct_version_doc",
+            body_bytes: 512,
+            version_count: 1,
+            cache_hit: true,
+            not_modified: true,
+            ..MetadataFetchDetailRecord::default()
+        });
+
+        let snapshot = snapshot_metadata_fetch_detail();
+        assert_eq!(snapshot.exact_documents.attempt_count, 2);
+        assert_eq!(snapshot.exact_documents.hit_count, 1);
+        assert_eq!(snapshot.exact_documents.policy_bypass_count, 1);
+        assert_eq!(snapshot.exact_documents.fetch_error_fallback_count, 1);
+        assert_eq!(
+            snapshot
+                .exact_documents
+                .incomplete_distribution_fallback_count,
+            1
+        );
+        assert_eq!(snapshot.exact_documents.body_bytes_sum, 512);
+        assert_eq!(snapshot.exact_documents.version_count_sum, 1);
+        assert_eq!(snapshot.exact_documents.cache_hit_count, 1);
+        assert_eq!(snapshot.exact_documents.not_modified_count, 1);
+
+        reset_metadata_detail();
+        assert_eq!(
+            snapshot_metadata_fetch_detail()
+                .exact_documents
+                .attempt_count,
+            0
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

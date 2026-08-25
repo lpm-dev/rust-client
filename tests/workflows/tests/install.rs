@@ -2994,6 +2994,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         for field in [
             "rpc_count",
             "configured_fanout",
+            "exact_document_fanout",
             "inflight_high_water",
             "active_fetch_high_water",
             "pending_high_water",
@@ -3021,6 +3022,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
     insta::assert_json_snapshot!("install_json_timing_dispatcher_concurrency", dispatcher_contract, {
         ".summary.rpc_count" => "[COUNT]",
         ".summary.configured_fanout" => "[COUNT]",
+        ".summary.exact_document_fanout" => "[COUNT]",
         ".summary.inflight_high_water" => "[COUNT]",
         ".summary.active_fetch_high_water" => "[COUNT]",
         ".summary.pending_high_water" => "[COUNT]",
@@ -3032,6 +3034,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
         ".summary.peer_prefetch_count" => "[COUNT]",
         ".detail.rpc_count" => "[COUNT]",
         ".detail.configured_fanout" => "[COUNT]",
+        ".detail.exact_document_fanout" => "[COUNT]",
         ".detail.inflight_high_water" => "[COUNT]",
         ".detail.active_fetch_high_water" => "[COUNT]",
         ".detail.pending_high_water" => "[COUNT]",

@@ -44,6 +44,7 @@ const SCENARIOS = [
 ];
 
 const MANAGERS = ['lpm', 'bun'];
+const SCENARIO_POSITIONS = new Map(SCENARIOS.map(({ id }, index) => [id, index]));
 const argv = parseArgs(process.argv.slice(2));
 
 if (argv.help) {
@@ -124,8 +125,8 @@ writeJson(path.join(outputDir, 'plan.json'), metadata);
 const rows = [];
 for (let sample = 1; sample <= samples; sample += 1) {
   const scenarioOrder = rotate(SCENARIOS, (sample - 1) % SCENARIOS.length);
-  for (const [scenarioPosition, scenario] of scenarioOrder.entries()) {
-    const managerOrder = (sample + scenarioPosition) % 2 === 0 ? MANAGERS : [...MANAGERS].reverse();
+  for (const scenario of scenarioOrder) {
+    const managerOrder = managerOrderFor(sample, scenario.id);
     const pairId = `${scenario.id}:sample-${sample}`;
     const prepared = new Map();
     for (const manager of MANAGERS) {
@@ -779,6 +780,14 @@ function rotate(values, offset) {
   return [...values.slice(offset), ...values.slice(0, offset)];
 }
 
+function managerOrderFor(sample, scenarioId) {
+  const scenarioPosition = SCENARIO_POSITIONS.get(scenarioId);
+  if (scenarioPosition === undefined) {
+    throw new Error(`unknown scenario: ${scenarioId}`);
+  }
+  return (sample + scenarioPosition) % 2 === 0 ? MANAGERS : [...MANAGERS].reverse();
+}
+
 function projectDir(root) {
   return path.join(root, 'project');
 }
@@ -960,6 +969,26 @@ function selfTest() {
     'trace',
   );
   assert.equal(SCENARIOS.length, 6);
+  for (const scenario of SCENARIOS) {
+    const orders = Array.from({ length: 10 }, (_, sampleIndex) => {
+      const sample = sampleIndex + 1;
+      return managerOrderFor(sample, scenario.id).join('-');
+    });
+    assert.equal(new Set(orders).size, 2, `${scenario.id} must use both manager orders`);
+    assert.equal(
+      orders.filter((order) => order === 'lpm-bun').length,
+      5,
+      `${scenario.id} manager order must be balanced`,
+    );
+    for (let index = 1; index < orders.length; index += 1) {
+      assert.notEqual(
+        orders[index],
+        orders[index - 1],
+        `${scenario.id} manager order must alternate across samples`,
+      );
+    }
+  }
+  assert.throws(() => managerOrderFor(1, 'missing'), /unknown scenario/);
   const expectedStates = {
     'first-install': { lockfile: false, node_modules: false, cache: false },
     'fresh-checkout-warm-cache': { lockfile: false, node_modules: false, cache: true },

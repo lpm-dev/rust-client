@@ -348,6 +348,8 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     let dist_tags = raw.metadata.dist_tags.clone();
     let mut info = parse_owned_partial_metadata_to_cache_info(raw.metadata);
     info.platform_metadata_complete = true;
+    info.covered_ranges.insert(version.to_string());
+    info.covered_ranges.insert(format!("={version}"));
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
     if info.needs_supplemental_metadata(canonical, policy) {
         let policy_start = Instant::now();
@@ -364,9 +366,85 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
         return Ok((fetched, timings));
     }
 
-    let fetched = fetched_metadata_from_info(None, dist_tags, info, include_speculation);
+    let mut fetched = fetched_metadata_from_info(None, dist_tags, info, include_speculation);
+    fetched.shared_fact = Some(Arc::clone(&fetched.info));
     timings.total_ms = total_start.elapsed().as_millis();
     Ok((fetched, timings))
+}
+
+pub(super) fn exact_metadata_fast_path_eligible(
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+) -> bool {
+    let CanonicalKey::Npm { name } = canonical else {
+        return false;
+    };
+    matches!(
+        route_table.route_for_package(name),
+        UpstreamRoute::NpmDirect
+    ) && !policy.requires_trust_history()
+        && !policy.release_age_applies_to_package(canonical)
+}
+
+pub(super) enum ExactMetadataFetchOutcome {
+    Hit(FetchedMetadata),
+    Fallback,
+}
+
+pub(super) async fn try_fetch_exact_metadata_for_resolver(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    version: &str,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+    trace_metadata_fetches: bool,
+) -> ExactMetadataFetchOutcome {
+    lpm_registry::timing::record_exact_document_attempt();
+    match fetch_exact_metadata_for_resolver_with_timings(
+        client,
+        route_table,
+        canonical,
+        version,
+        policy,
+        include_speculation,
+    )
+    .await
+    {
+        Ok((fetched, timings)) => {
+            let exact_candidate_is_installable = fetched.info.versions_complete
+                || fetched
+                    .info
+                    .dist
+                    .get(version)
+                    .is_some_and(|dist| dist.tarball_url.is_some() && dist.integrity.is_some());
+            if trace_metadata_fetches {
+                lpm_registry::timing::record_metadata_fetch_detail(metadata_fetch_detail_record(
+                    timings,
+                ));
+            }
+            if exact_candidate_is_installable {
+                lpm_registry::timing::record_exact_document_hit();
+                return ExactMetadataFetchOutcome::Hit(fetched);
+            }
+            lpm_registry::timing::record_exact_document_fallback(
+                lpm_registry::timing::ExactDocumentFallbackReason::IncompleteDistribution,
+            );
+            tracing::debug!(
+                "npm version document for {canonical}@{version} omitted install distribution fields; falling back to the packument"
+            );
+        }
+        Err(error) => {
+            lpm_registry::timing::record_exact_document_fallback(
+                lpm_registry::timing::ExactDocumentFallbackReason::FetchError,
+            );
+            tracing::debug!(
+                "npm version document fetch for {canonical}@{version} failed: {error}; falling back to the packument"
+            );
+        }
+    }
+    ExactMetadataFetchOutcome::Fallback
 }
 
 pub(super) async fn fetch_metadata_for_resolver_with_trace_detail(
