@@ -2,7 +2,9 @@ use super::wizards::{
     CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, FIREWALL_ENFORCE_HINT,
     FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT, FIREWALL_WIZARD_PROMPT, INTEGRITY_SOURCE_HINT,
     INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT, persist_firewall_policy_profile_in_config_value,
-    persist_script_policy, release_age_initial_choice,
+    persist_script_policy, read_firewall_mode, read_integrity_policy, read_release_age_override,
+    read_sandbox_mode, read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
+    read_typosquat_guard_override, release_age_initial_choice,
 };
 use super::*;
 use crate::npm_firewall_config::{FIREWALL_CONFIG_MODE_KEY, FIREWALL_CONFIG_PATH};
@@ -38,6 +40,10 @@ fn tmp_config() -> (TempDir, std::path::PathBuf, crate::test_env::ScopedEnv) {
     crate::security_approval::persist_authorized_posture(&posture).unwrap();
     let path = dir.path().join("config.toml");
     (dir, path, env)
+}
+
+fn global_config(contents: &str) -> GlobalConfig {
+    GlobalConfig::from_value(toml::from_str(contents).unwrap()).unwrap()
 }
 
 #[test]
@@ -599,7 +605,7 @@ async fn firewall_wizard_preserves_sibling_keys() {
 
 #[test]
 fn firewall_policy_profile_persistence_writes_nested_policy_table() {
-    let mut cfg = toml::Value::Table(toml::map::Map::new());
+    let mut cfg = GlobalConfig::empty();
 
     persist_firewall_policy_profile_in_config_value(
         &mut cfg,
@@ -612,7 +618,7 @@ fn firewall_policy_profile_persistence_writes_nested_policy_table() {
     .unwrap();
 
     let policies = cfg
-        .get(FIREWALL_CONFIG_SECTION)
+        .get_value(FIREWALL_CONFIG_SECTION)
         .and_then(|value| value.as_table())
         .and_then(|table| table.get(crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION))
         .and_then(|value| value.as_table())
@@ -973,11 +979,17 @@ async fn sandbox_wizard_refuses_to_clobber_non_table_sandbox_key() {
     // table. Honest error > silent migration on a typed config knob.
     let (_dir, path, _env) = tmp_config();
     std::fs::write(&path, "sandbox = \"not-a-table\"\n").unwrap();
+    let posture_before = crate::security_approval::load_authorized_posture().unwrap();
     let err = run_sandbox_wizard(&path, Some("strict"), true)
         .await
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("not a TOML table"), "got: {msg}");
+    assert_eq!(
+        crate::security_approval::load_authorized_posture().unwrap(),
+        posture_before,
+        "a failed config mutation must not change approved posture"
+    );
 }
 
 #[tokio::test]
@@ -1163,7 +1175,7 @@ async fn sigstore_wizard_set_rejects_looser_value_when_force_floor_enabled() {
 
 #[test]
 fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
-    let config: toml::Value = toml::from_str("force-security-floor = true\n").unwrap();
+    let config = global_config("force-security-floor = true\n");
     let err = guard_generic_set_against_force_floor(&config, "force-security-floor", "false")
         .unwrap_err();
     assert_eq!(err.error_code(), "security_floor");
@@ -1171,7 +1183,7 @@ fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_force_floor() {
-    let config: toml::Value = toml::from_str("force-security-floor = true\n").unwrap();
+    let config = global_config("force-security-floor = true\n");
     let err =
         guard_generic_set_against_force_floor(&config, INSTALL_TIME_SOURCE_ANALYSIS_KEY, " FALSE ")
             .unwrap_err();
@@ -1182,16 +1194,15 @@ fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_forc
 
 #[test]
 fn guard_generic_delete_rejects_lowering_release_age_to_default() {
-    let config: toml::Value =
-        toml::from_str("force-security-floor = true\nminimum-release-age-secs = \"259200\"\n")
-            .unwrap();
+    let config =
+        global_config("force-security-floor = true\nminimum-release-age-secs = \"259200\"\n");
     let err = guard_generic_delete_against_force_floor(&config, RELEASE_AGE_KEY).unwrap_err();
     assert_eq!(err.error_code(), "security_floor");
 }
 
 #[test]
 fn guard_generic_delete_rejects_unsetting_force_floor_when_enabled() {
-    let config: toml::Value = toml::from_str("force-security-floor = true\n").unwrap();
+    let config = global_config("force-security-floor = true\n");
     let err =
         guard_generic_delete_against_force_floor(&config, "force-security-floor").unwrap_err();
     assert_eq!(err.error_code(), "security_floor");
@@ -1199,8 +1210,7 @@ fn guard_generic_delete_rejects_unsetting_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_floor() {
-    let config: toml::Value =
-        toml::from_str("force-security-floor = true\ntyposquat-guard = \"on\"\n").unwrap();
+    let config = global_config("force-security-floor = true\ntyposquat-guard = \"on\"\n");
 
     let err = guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap_err();
 
@@ -1210,8 +1220,7 @@ fn guard_generic_delete_rejects_unsetting_enabled_typosquat_guard_under_force_fl
 
 #[test]
 fn guard_generic_delete_allows_removing_disabled_typosquat_guard_under_force_floor() {
-    let config: toml::Value =
-        toml::from_str("force-security-floor = true\ntyposquat-guard = \"off\"\n").unwrap();
+    let config = global_config("force-security-floor = true\ntyposquat-guard = \"off\"\n");
 
     guard_generic_delete_against_force_floor(&config, TYPOSQUAT_GUARD_KEY).unwrap();
 }
@@ -1294,11 +1303,62 @@ async fn sigstore_wizard_preserves_other_keys() {
 async fn sigstore_wizard_refuses_to_clobber_non_table_sigstore_key() {
     let (_dir, path, _env) = tmp_config();
     std::fs::write(&path, "sigstore = \"not-a-table\"\n").unwrap();
+    let posture_before = crate::security_approval::load_authorized_posture().unwrap();
     let err = run_sigstore_wizard(&path, Some("warn"), true)
         .await
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("not a TOML table"), "got: {msg}");
+    assert_eq!(
+        crate::security_approval::load_authorized_posture().unwrap(),
+        posture_before,
+        "a failed config mutation must not change approved posture"
+    );
+}
+
+#[tokio::test]
+async fn firewall_setter_refuses_non_table_without_changing_approved_posture() {
+    let (_dir, path, _env) = tmp_config();
+    std::fs::write(&path, "firewall = \"not-a-table\"\n").unwrap();
+    let posture_before = crate::security_approval::load_authorized_posture().unwrap();
+
+    let err = apply_firewall_mode(
+        &path,
+        NpmFirewallMode::Enforce,
+        true,
+        "lpm config firewall --set enforce",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("not a TOML table"));
+    assert_eq!(
+        crate::security_approval::load_authorized_posture().unwrap(),
+        posture_before,
+        "a failed config mutation must not change approved posture"
+    );
+}
+
+#[tokio::test]
+async fn failed_oversized_config_write_does_not_change_approved_posture() {
+    let (_dir, path, _env) = tmp_config();
+    let suffix = "\"\n[sandbox]\nmode = \"none\"\n";
+    let prefix = "payload = \"";
+    let payload_len = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize - prefix.len() - suffix.len();
+    let content = format!("{prefix}{}{suffix}", "x".repeat(payload_len));
+    assert_eq!(content.len() as u64, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES);
+    std::fs::write(&path, &content).unwrap();
+    let posture_before = crate::security_approval::load_authorized_posture().unwrap();
+
+    let err = apply_sandbox_mode(&path, "strict", true, "lpm config sandbox --set strict")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exceed"), "got: {err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    assert_eq!(
+        crate::security_approval::load_authorized_posture().unwrap(),
+        posture_before,
+        "a rejected config write must roll back approved posture"
+    );
 }
 
 /// Overwrite path: setting twice must end on the second value.

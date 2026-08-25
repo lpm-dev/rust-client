@@ -90,14 +90,12 @@ pub(in crate::commands::config) fn read_fetch_lpm_security_insights(
     config_path: &std::path::Path,
 ) -> Result<bool, LpmError> {
     let config = read_config(config_path)?;
-    crate::lpm_insights_config::read_fetch_lpm_security_insights(&global_config_view_from_value(
-        &config,
-    ))
+    crate::lpm_insights_config::read_fetch_lpm_security_insights(&GlobalConfig::from_value(config)?)
 }
 
 fn read_lpm_dev_settings(config_path: &std::path::Path) -> Result<LpmDevSettings, LpmError> {
     let config = read_config(config_path)?;
-    let global = global_config_view_from_value(&config);
+    let global = GlobalConfig::from_value(config)?;
     Ok(LpmDevSettings {
         package_skills: LpmSkillsPreference::Config.resolve(&global)?,
         security_insights: crate::lpm_insights_config::read_fetch_lpm_security_insights(&global)?,
@@ -109,9 +107,7 @@ async fn persist_lpm_dev_settings(
     settings: LpmDevSettings,
 ) -> Result<(), LpmError> {
     update_config(config_path, |config| {
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.remove(LEGACY_NO_SKILLS_KEY);
         table.insert(
             AUTO_INSTALL_LPM_SKILLS_KEY.to_string(),

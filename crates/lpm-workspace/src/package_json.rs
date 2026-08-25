@@ -134,7 +134,7 @@ impl<'de> Deserialize<'de> for PackageJson {
     }
 }
 
-fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, String> {
+pub fn package_json_from_value(value: &serde_json::Value) -> Result<PackageJson, String> {
     let Some(obj) = value.as_object() else {
         return Err("expected package.json object".to_string());
     };

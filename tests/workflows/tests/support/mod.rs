@@ -622,6 +622,14 @@ pub fn write_lpm_proxy_npmrc(project: &TempProject, registry_url: &str) {
 /// guard floor for workflow scenarios that intentionally exercise an
 /// approved machine-wide typosquat setting.
 pub fn write_signed_typosquat_guard_posture(project: &TempProject, typosquat_guard: &str) {
+    write_signed_posture(project, typosquat_guard, &[]);
+}
+
+pub fn write_signed_release_age_exclusion_posture(project: &TempProject, exclusions: &[&str]) {
+    write_signed_posture(project, "default", exclusions);
+}
+
+fn write_signed_posture(project: &TempProject, typosquat_guard: &str, exclusions: &[&str]) {
     use hmac::Mac;
 
     let security_dir = project.home().join(".lpm/security");
@@ -635,6 +643,7 @@ pub fn write_signed_typosquat_guard_posture(project: &TempProject, typosquat_gua
         "updated_at": chrono::Utc::now().to_rfc3339(),
         "script_policy": "deny",
         "minimum_release_age_secs": 86400,
+        "minimum_release_age_exclude": exclusions,
         "release_age_policy": "direct",
         "sandbox_mode": "default",
         "sandbox_allow_degraded": false,

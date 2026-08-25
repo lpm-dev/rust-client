@@ -24,7 +24,7 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub use relay::resolve_relay_url;
+pub use relay::{resolve_relay_url, resolve_relay_url_from_config_value};
 
 pub(crate) fn validate_forward_target(
     target: &lpm_common::LocalTarget,

@@ -107,15 +107,13 @@ pub(in crate::commands::config) async fn run_typosquat_wizard(
     }
 
     update_config(config_path, |config| {
-        reject_looser_typosquat_guard_write(&global_config_view_from_value(config), selection)?;
+        reject_looser_typosquat_guard_write(config, selection)?;
         crate::security_approval::authorize_persistent_typosquat_guard(
             selection,
             json_output,
             &format!("lpm config typosquat --set {}", selection.as_str()),
         )?;
-        let top = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let top = config.table_mut();
         if selection == TyposquatGuardSelection::Default {
             top.remove(TYPOSQUAT_GUARD_KEY);
         } else {

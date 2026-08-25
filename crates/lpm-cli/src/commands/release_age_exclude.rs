@@ -142,22 +142,40 @@ pub(crate) async fn run_user(
 ) -> Result<(), LpmError> {
     let result = if operation.mutates() {
         crate::commands::config::update_config(config_path, |config| {
-            let existing = user_exclusions(config_path, config)?;
+            let existing = user_exclusions(config_path, config.table())?;
             let result = edit_exclusions(
                 "~/.lpm/config.toml > minimum-release-age-exclude",
                 existing,
                 operation,
             )?;
             let storage_changed = result.storage_changed();
+            if result.changed {
+                let selector = result
+                    .selector
+                    .as_deref()
+                    .expect("a changed exclusion edit has a selector");
+                crate::security_approval::authorize_persistent_release_age_exclusion(
+                    selector,
+                    matches!(operation, ReleaseAgeExcludeOperation::Add(_)),
+                    json_output,
+                    &format!(
+                        "lpm config release-age-exclude {} {selector}",
+                        operation.action()
+                    ),
+                )?;
+            }
             if storage_changed {
-                set_user_exclusions(config, &result.exclusions)?;
+                set_user_exclusions(config, &result.exclusions);
             }
             Ok((result, storage_changed))
         })
         .await?
     } else {
         let config = read_user_config(config_path)?;
-        let existing = user_exclusions(config_path, &config)?;
+        let table = config.as_table().ok_or_else(|| {
+            LpmError::Registry("~/.lpm/config.toml must be a TOML table at the top level".into())
+        })?;
+        let existing = user_exclusions(config_path, table)?;
         edit_exclusions(
             "~/.lpm/config.toml > minimum-release-age-exclude",
             existing,
@@ -293,7 +311,10 @@ fn read_user_config(path: &Path) -> Result<toml::Value, LpmError> {
     Ok(config)
 }
 
-fn user_exclusions(path: &Path, config: &toml::Value) -> Result<Vec<String>, LpmError> {
+fn user_exclusions(
+    path: &Path,
+    config: &toml::map::Map<String, toml::Value>,
+) -> Result<Vec<String>, LpmError> {
     let Some(value) = config.get(USER_KEY) else {
         return Ok(Vec::new());
     };
@@ -337,10 +358,8 @@ impl StringArrayValue for toml::Value {
     }
 }
 
-fn set_user_exclusions(config: &mut toml::Value, exclusions: &[String]) -> Result<(), LpmError> {
-    let table = config.as_table_mut().ok_or_else(|| {
-        LpmError::Registry("~/.lpm/config.toml must be a TOML table at the top level".into())
-    })?;
+fn set_user_exclusions(config: &mut crate::commands::config::GlobalConfig, exclusions: &[String]) {
+    let table = config.table_mut();
     if exclusions.is_empty() {
         table.remove(USER_KEY);
     } else {
@@ -354,7 +373,6 @@ fn set_user_exclusions(config: &mut toml::Value, exclusions: &[String]) -> Resul
             ),
         );
     }
-    Ok(())
 }
 
 fn print_result(

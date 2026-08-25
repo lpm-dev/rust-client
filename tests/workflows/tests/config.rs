@@ -2,7 +2,8 @@ mod support;
 
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, assertions, lpm, lpm_spawnable,
-    wait_for_lock_contention, write_signed_typosquat_guard_posture,
+    wait_for_lock_contention, write_signed_release_age_exclusion_posture,
+    write_signed_typosquat_guard_posture,
 };
 
 fn config_path(project: &TempProject) -> std::path::PathBuf {
@@ -948,6 +949,7 @@ fn config_delete_removes_existing_key_and_preserves_other_entries() {
 fn config_mutations_wait_for_one_shared_transaction_lock_and_preserve_prior_updates() {
     let project = TempProject::empty(r#"{"name":"config-lock","version":"1.0.0"}"#);
     seed_config(&project, "color = \"always\"\n");
+    write_signed_release_age_exclusion_posture(&project, &["react"]);
     let lock_path = project.home().join(".lpm/.config.lock");
 
     for (index, args) in [
@@ -1473,6 +1475,7 @@ fn config_release_age_exclude_add_accepts_supported_selectors_and_writes_a_toml_
     let project = TempProject::empty(r#"{"name":"config-excludes","version":"1.0.0"}"#);
     seed_config(&project, "registry = \"https://registry.example.test\"\n");
     let selectors = ["react", "@company/*", "react@1.0.0"];
+    write_signed_release_age_exclusion_posture(&project, &selectors);
 
     for selector in selectors {
         let output = lpm(&project)
@@ -1710,4 +1713,268 @@ fn config_release_age_exclude_list_without_config_reports_an_empty_user_list() {
     assert_eq!(envelope["count"], serde_json::json!(0));
     assert_eq!(envelope["normalized"], serde_json::json!(false));
     assert!(!config_path(&project).exists());
+}
+
+#[test]
+fn config_rejects_arguments_that_do_not_belong_to_the_selected_action() {
+    let cases: &[&[&str]] = &[
+        &["config", "list", "ignored"],
+        &["config", "get", "registry", "ignored"],
+        &["config", "delete", "registry", "ignored"],
+        &["config", "scripts", "ignored", "--set", "deny"],
+        &["config", "list", "--set", "anything"],
+        &["config", "set", "registry", "value", "--set", "ignored"],
+    ];
+
+    for args in cases {
+        let project = TempProject::empty(r#"{"name":"config-shape","version":"1.0.0"}"#);
+        let output = lpm(&project)
+            .args(*args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {args:?}: {error}"));
+        assert!(
+            !output.status.success(),
+            "invalid config shape {args:?} must fail:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            !config_path(&project).exists(),
+            "invalid config shape {args:?} must not create config.toml"
+        );
+    }
+}
+
+#[test]
+fn config_mutation_preserves_unrelated_toml_comments_and_formatting() {
+    let project = TempProject::empty(r#"{"name":"config-comments","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "# registry routing\nregistry = \"https://registry.example.test\" # keep inline\n\n[sandbox] # containment\nmode = \"default\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["config", "set", "color", "always"])
+        .output()
+        .expect("failed to mutate commented config");
+    assert!(output.status.success());
+
+    let content = std::fs::read_to_string(config_path(&project)).unwrap();
+    assert!(content.contains("# registry routing"), "{content}");
+    assert!(
+        content.contains("registry = \"https://registry.example.test\" # keep inline"),
+        "{content}"
+    );
+    assert!(content.contains("[sandbox] # containment"), "{content}");
+}
+
+#[test]
+fn config_get_and_delete_round_trip_nested_list_keys() {
+    let project = TempProject::empty(r#"{"name":"config-nested","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[sandbox]\nmode = \"strict\"\nallow-degraded = false\n",
+    );
+
+    let get = lpm(&project)
+        .args(["--json", "config", "get", "sandbox.mode"])
+        .output()
+        .expect("failed to get nested config key");
+    assert!(get.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(envelope["found"], serde_json::json!(true));
+    assert_eq!(envelope["value"], serde_json::json!("strict"));
+
+    let delete = lpm(&project)
+        .args(["--json", "config", "delete", "sandbox.mode"])
+        .output()
+        .expect("failed to delete nested config key");
+    assert!(delete.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&delete.stdout).unwrap();
+    assert_eq!(envelope["existed"], serde_json::json!(true));
+
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(config_path(&project)).unwrap()).unwrap();
+    assert!(config["sandbox"].get("mode").is_none());
+    assert_eq!(config["sandbox"]["allow-degraded"].as_bool(), Some(false));
+}
+
+#[test]
+fn deleting_an_absent_config_key_is_a_true_no_op() {
+    let project = TempProject::empty(r#"{"name":"config-delete-noop","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "delete", "missing"])
+        .output()
+        .expect("failed to delete absent config key");
+    assert!(output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["existed"], serde_json::json!(false));
+    assert!(!config_path(&project).exists());
+}
+
+#[test]
+fn config_list_rejects_every_malformed_known_scalar() {
+    let cases = [
+        ("signatures = \"sometimes\"\n", "signatures"),
+        ("trust-policy = \"warn\"\n", "trust-policy"),
+        ("typosquat-guard = \"maybe\"\n", "typosquat-guard"),
+        ("engine-strict = \"maybe\"\n", "engine-strict"),
+        (
+            "strict-peer-dependencies = \"maybe\"\n",
+            "strict-peer-dependencies",
+        ),
+        ("auto-install-peers = \"maybe\"\n", "auto-install-peers"),
+        ("audit-after-install = \"maybe\"\n", "audit-after-install"),
+        ("triage-advisor = 42\n", "triage-advisor"),
+    ];
+
+    for (content, key) in cases {
+        let project = TempProject::empty(r#"{"name":"config-invalid","version":"1.0.0"}"#);
+        seed_config(&project, content);
+        let output = lpm(&project)
+            .args(["--json", "config", "list"])
+            .output()
+            .unwrap_or_else(|error| panic!("failed to list malformed {key}: {error}"));
+        assert!(
+            !output.status.success(),
+            "malformed known key {key} must fail:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            diagnostic.contains(key),
+            "diagnostic must name {key}: {diagnostic}",
+        );
+    }
+}
+
+#[test]
+fn sandbox_config_and_list_use_lpm_home_when_home_differs() {
+    let project = TempProject::empty(r#"{"name":"config-lpm-home","version":"1.0.0"}"#);
+    let other_home = project.path().join("other-home");
+    std::fs::create_dir_all(&other_home).unwrap();
+
+    let set = lpm(&project)
+        .env("HOME", &other_home)
+        .args(["config", "sandbox", "--set", "strict"])
+        .output()
+        .expect("failed to set sandbox under custom LPM_HOME");
+    assert!(set.status.success());
+
+    let list = lpm(&project)
+        .env("HOME", &other_home)
+        .args(["--json", "config", "list"])
+        .output()
+        .expect("failed to list sandbox under custom LPM_HOME");
+    assert!(list.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let sandbox = envelope["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == "sandbox.mode")
+        .expect("sandbox.mode entry");
+    assert_eq!(sandbox["value"], serde_json::json!("strict"));
+    assert_eq!(
+        sandbox["source"],
+        serde_json::json!("$LPM_HOME/config.toml")
+    );
+}
+
+#[test]
+fn managed_release_age_policy_rejects_a_new_user_wide_exclusion() {
+    let project = TempProject::empty(r#"{"name":"config-managed-exclude","version":"1.0.0"}"#);
+    let policy_path = project.home().join(".lpm/security-policy.toml");
+    std::fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+    std::fs::write(&policy_path, "minimum-release-age-secs = 259200\n").unwrap();
+
+    let output = lpm(&project)
+        .args(["--json", "config", "release-age-exclude", "add", "react"])
+        .output()
+        .expect("failed to attempt managed release-age exclusion");
+    assert!(!output.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostic.contains("managed security policy"),
+        "managed-policy diagnostic missing: {diagnostic}",
+    );
+    assert!(!config_path(&project).exists());
+}
+
+#[test]
+fn unapproved_user_wide_release_age_exclusion_requires_explicit_approval() {
+    let project = TempProject::empty(r#"{"name":"config-unapproved-exclude","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "config", "release-age-exclude", "add", "react"])
+        .output()
+        .expect("failed to attempt unapproved release-age exclusion");
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "security_approval_required");
+    assert_eq!(
+        envelope["error"]["requested_scopes"],
+        serde_json::json!(["cooldown-bypass"])
+    );
+    assert!(!config_path(&project).exists());
+}
+
+#[test]
+fn config_output_redacts_secret_values_except_for_explicit_get() {
+    let project = TempProject::empty(r#"{"name":"config-redaction","version":"1.0.0"}"#);
+
+    let set = lpm(&project)
+        .args(["--json", "config", "set", "api-token", "super-secret"])
+        .output()
+        .expect("failed to set secret-like config key");
+    assert!(set.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&set.stdout).unwrap();
+    assert_eq!(envelope["value"], serde_json::json!("[REDACTED]"));
+    assert!(!String::from_utf8_lossy(&set.stdout).contains("super-secret"));
+
+    let list = lpm(&project)
+        .args(["--json", "config", "list"])
+        .output()
+        .expect("failed to list secret-like config key");
+    assert!(list.status.success());
+    assert!(!String::from_utf8_lossy(&list.stdout).contains("super-secret"));
+
+    let get = lpm(&project)
+        .args(["--json", "config", "get", "api-token"])
+        .output()
+        .expect("failed to explicitly get secret-like config key");
+    assert!(get.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(envelope["value"], serde_json::json!("super-secret"));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_mutation_creates_an_owner_only_config_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TempProject::empty(r#"{"name":"config-mode","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["config", "set", "color", "always"])
+        .output()
+        .expect("failed to create config file");
+    assert!(output.status.success());
+
+    let mode = std::fs::metadata(config_path(&project))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }

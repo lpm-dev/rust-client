@@ -63,10 +63,15 @@ pub(in crate::commands::config) async fn run_sigstore_wizard(
         ));
     }
 
-    let current_verify = read_sigstore_verify(config_path)?.unwrap_or_else(|| "deny".to_string());
-    let current_scope = read_sigstore_scope(config_path)?.unwrap_or_else(|| "approved".to_string());
-    let current_availability =
-        read_sigstore_availability(config_path)?.unwrap_or_else(|| "best-effort".to_string());
+    let current_verify = read_sigstore_verify(config_path)?
+        .filter(|value| SIGSTORE_VERIFY_VALUES.contains(&value.as_str()))
+        .unwrap_or_else(|| "deny".to_string());
+    let current_scope = read_sigstore_scope(config_path)?
+        .filter(|value| SIGSTORE_SCOPE_VALUES.contains(&value.as_str()))
+        .unwrap_or_else(|| "approved".to_string());
+    let current_availability = read_sigstore_availability(config_path)?
+        .filter(|value| SIGSTORE_AVAILABILITY_VALUES.contains(&value.as_str()))
+        .unwrap_or_else(|| "best-effort".to_string());
     println!();
     println!(
         "  current: verify={}, scope={}, availability={}",
@@ -224,18 +229,24 @@ pub(in crate::commands::config) async fn apply_sigstore_assignment(
         .then(|| parse_sigstore_enforce_mode(assignment.value))
         .transpose()?;
     update_config(config_path, |config| {
+        if config
+            .get_value("sigstore")
+            .is_some_and(|section| !section.is_table())
+        {
+            return Err(LpmError::Registry(format!(
+                "{}: `[sigstore]` is not a TOML table — refusing to clobber",
+                config_path.display(),
+            )));
+        }
         if let Some(requested) = requested {
-            let global = global_config_view_from_value(config);
-            crate::security_floor::reject_looser_sigstore_write(&global, requested)?;
+            crate::security_floor::reject_looser_sigstore_write(config, requested)?;
             crate::security_approval::authorize_persistent_sigstore(
                 requested,
                 json_output,
                 proposed_command,
             )?;
         }
-        let top = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let top = config.table_mut();
         let sigstore_section = top
             .entry("sigstore".to_string())
             .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));

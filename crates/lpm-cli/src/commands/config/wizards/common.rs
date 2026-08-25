@@ -38,9 +38,7 @@ pub(in crate::commands::config) async fn persist_bool(
     value: bool,
 ) -> Result<(), LpmError> {
     update_config(config_path, |config| {
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.insert(key.to_string(), toml::Value::Boolean(value));
         Ok(((), true))
     })
@@ -84,9 +82,7 @@ pub(in crate::commands::config) async fn persist_string(
     value: &str,
 ) -> Result<(), LpmError> {
     update_config(config_path, |config| {
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.insert(key.to_string(), toml::Value::String(value.to_string()));
         Ok(((), true))
     })

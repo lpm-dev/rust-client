@@ -46,6 +46,15 @@ pub const DEFAULT_ENGINE_STRICT: EngineStrict = true;
 /// there is no `--engine-strict` to force-on at the CLI layer (the
 /// default already enforces).
 pub fn resolve_for_root(cli_no_engine_strict: bool, root_pkg: &PackageJson) -> EngineStrict {
+    let global = GlobalConfig::load();
+    resolve_for_root_with_global(cli_no_engine_strict, root_pkg, &global)
+}
+
+pub(crate) fn resolve_for_root_with_global(
+    cli_no_engine_strict: bool,
+    root_pkg: &PackageJson,
+    global: &GlobalConfig,
+) -> EngineStrict {
     if cli_no_engine_strict {
         return false;
     }
@@ -54,7 +63,6 @@ pub fn resolve_for_root(cli_no_engine_strict: bool, root_pkg: &PackageJson) -> E
     {
         return value;
     }
-    let global = GlobalConfig::load();
     global
         .get_bool("engine-strict")
         .unwrap_or(DEFAULT_ENGINE_STRICT)

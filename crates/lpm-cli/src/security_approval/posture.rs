@@ -1,6 +1,86 @@
 use super::prelude::*;
 
+struct AuthorizedPostureTransactionState {
+    original: Option<AuthorizedPosture>,
+    pending: Option<AuthorizedPosture>,
+}
+
+thread_local! {
+    static AUTHORIZED_POSTURE_TRANSACTION: std::cell::RefCell<Option<AuthorizedPostureTransactionState>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct AuthorizedPostureTransaction {
+    active: bool,
+}
+
+impl AuthorizedPostureTransaction {
+    pub(crate) fn commit(mut self) -> Result<(), LpmError> {
+        let state =
+            AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| transaction.borrow_mut().take());
+        self.active = false;
+        let Some(state) = state else {
+            return Err(LpmError::SecurityApprovalStore(
+                "authorized posture transaction was not active".to_string(),
+            ));
+        };
+        let Some(pending) = state.pending else {
+            return Ok(());
+        };
+        if state.original.as_ref() == Some(&pending) {
+            return Ok(());
+        }
+        persist_authorized_posture_immediately(&pending)
+    }
+}
+
+impl Drop for AuthorizedPostureTransaction {
+    fn drop(&mut self) {
+        if self.active {
+            AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| {
+                transaction.borrow_mut().take();
+            });
+        }
+    }
+}
+
+pub(crate) fn begin_authorized_posture_transaction()
+-> Result<AuthorizedPostureTransaction, LpmError> {
+    AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| {
+        let mut transaction = transaction.borrow_mut();
+        if transaction.is_some() {
+            return Err(LpmError::SecurityApprovalStore(
+                "nested authorized posture transactions are not supported".to_string(),
+            ));
+        }
+        *transaction = Some(AuthorizedPostureTransactionState {
+            original: None,
+            pending: None,
+        });
+        Ok(AuthorizedPostureTransaction { active: true })
+    })
+}
+
 pub fn load_authorized_posture() -> Result<AuthorizedPosture, LpmError> {
+    if let Some(posture) = AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| {
+        transaction
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.pending.clone())
+    }) {
+        return Ok(posture);
+    }
+    let posture = load_authorized_posture_immediately()?;
+    AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| {
+        if let Some(state) = transaction.borrow_mut().as_mut()
+            && state.original.is_none()
+        {
+            state.original = Some(posture.clone());
+        }
+    });
+    Ok(posture)
+}
+
+fn load_authorized_posture_immediately() -> Result<AuthorizedPosture, LpmError> {
     Ok(read_signed_json(&approved_posture_path()?)?.unwrap_or_default())
 }
 
@@ -68,7 +148,35 @@ pub fn persist_authorized_posture(posture: &AuthorizedPosture) -> Result<(), Lpm
     let mut normalized = posture.clone();
     normalized.schema_version = APPROVED_POSTURE_SCHEMA_VERSION;
     normalized.updated_at = Utc::now();
-    write_signed_json(&approved_posture_path()?, &normalized)
+    let transaction_active =
+        AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| transaction.borrow().is_some());
+    if !transaction_active {
+        return persist_authorized_posture_immediately(&normalized);
+    }
+    let needs_original = AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| {
+        transaction
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.original.is_none())
+    });
+    let original = needs_original
+        .then(load_authorized_posture_immediately)
+        .transpose()?;
+    AUTHORIZED_POSTURE_TRANSACTION.with(|transaction| {
+        let mut transaction = transaction.borrow_mut();
+        let state = transaction
+            .as_mut()
+            .expect("active posture transaction disappeared before staging");
+        if state.original.is_none() {
+            state.original = original;
+        }
+        state.pending = Some(normalized.clone());
+    });
+    Ok(())
+}
+
+fn persist_authorized_posture_immediately(posture: &AuthorizedPosture) -> Result<(), LpmError> {
+    write_signed_json(&approved_posture_path()?, posture)
 }
 
 fn active_runtime_overrides(

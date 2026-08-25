@@ -585,6 +585,50 @@ pub fn authorize_persistent_release_age(
     persist_authorized_posture(&posture)
 }
 
+pub fn authorize_persistent_release_age_exclusion(
+    selector: &str,
+    adding: bool,
+    json_output: bool,
+    command_hint: &str,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if adding
+        && let Some(err) = managed_policy_blocks_scope(&effective, ApprovalScope::CooldownBypass)
+    {
+        record_persistent_guarded_attempt(ApprovalScope::CooldownBypass, false, &err.to_string());
+        return Err(err);
+    }
+
+    let mut posture = load_authorized_posture()?;
+    if adding {
+        if posture
+            .minimum_release_age_exclude
+            .iter()
+            .any(|approved| approved == selector)
+        {
+            return Ok(());
+        }
+        confirm_persistent_weakening(
+            ApprovalScope::CooldownBypass,
+            json_output,
+            command_hint,
+            &format!(
+                "Persisting minimum release-age exclusion `{selector}` bypasses the approved cooldown for matching packages."
+            ),
+        )?;
+        posture
+            .minimum_release_age_exclude
+            .push(selector.to_string());
+        posture.minimum_release_age_exclude.sort();
+        posture.minimum_release_age_exclude.dedup();
+    } else {
+        posture
+            .minimum_release_age_exclude
+            .retain(|approved| approved != selector);
+    }
+    persist_authorized_posture(&posture)
+}
+
 pub fn authorize_persistent_release_age_policy(
     requested: ReleaseAgePolicy,
     json_output: bool,

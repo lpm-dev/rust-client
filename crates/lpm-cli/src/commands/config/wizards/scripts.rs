@@ -26,8 +26,9 @@ pub(in crate::commands::config) async fn run_scripts_wizard(
         ));
     }
 
-    let current =
-        read_string_value(config_path, SCRIPT_POLICY_KEY)?.unwrap_or_else(|| "deny".to_string());
+    let current = read_string_value(config_path, SCRIPT_POLICY_KEY)?
+        .filter(|value| SCRIPT_POLICY_VALUES.contains(&value.as_str()))
+        .unwrap_or_else(|| "deny".to_string());
     println!();
     install_ui::detail_line(crate::install_ui::terminal_line!(
         "  current: {}",
@@ -69,16 +70,13 @@ pub(in crate::commands::config) async fn persist_script_policy(
     let requested = crate::script_policy_config::ScriptPolicy::parse(value)
         .map_err(|e| LpmError::Registry(e.to_string()))?;
     update_config(config_path, |config| {
-        let global = global_config_view_from_value(config);
-        crate::security_floor::reject_looser_script_policy_write(&global, requested)?;
+        crate::security_floor::reject_looser_script_policy_write(config, requested)?;
         crate::security_approval::authorize_persistent_script_policy(
             requested,
             json_output,
             &format!("lpm config scripts --set {value}"),
         )?;
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.insert(
             SCRIPT_POLICY_KEY.to_string(),
             toml::Value::String(value.to_string()),

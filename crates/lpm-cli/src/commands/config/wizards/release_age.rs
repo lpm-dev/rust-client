@@ -162,15 +162,14 @@ async fn persist_release_age_selection(
     command_hint: &str,
 ) -> Result<Option<u64>, LpmError> {
     update_config(config_path, |config| {
-        let global = global_config_view_from_value(config);
-        crate::security_floor::reject_looser_release_age_write(&global, requested_secs)?;
+        crate::security_floor::reject_looser_release_age_write(config, requested_secs)?;
         crate::security_approval::authorize_persistent_release_age(
             requested_secs,
             json_output,
             command_hint,
         )?;
         if let Some(policy) = requested_policy {
-            crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
+            crate::security_floor::reject_looser_release_age_policy_write(config, policy)?;
             crate::security_approval::authorize_persistent_release_age_policy(
                 policy,
                 json_output,
@@ -178,9 +177,7 @@ async fn persist_release_age_selection(
             )?;
         }
 
-        let top = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let top = config.table_mut();
         let persisted = match selection {
             ReleaseAgeSelection::Default => {
                 top.remove(RELEASE_AGE_KEY);
@@ -223,16 +220,13 @@ pub(in crate::commands::config) async fn run_release_age_policy_wizard(
     };
 
     update_config(config_path, |config| {
-        let global = global_config_view_from_value(config);
-        crate::security_floor::reject_looser_release_age_policy_write(&global, policy)?;
+        crate::security_floor::reject_looser_release_age_policy_write(config, policy)?;
         crate::security_approval::authorize_persistent_release_age_policy(
             policy,
             json_output,
             &format!("lpm config release-age-policy --set {}", policy.as_str()),
         )?;
-        let table = config.as_table_mut().ok_or_else(|| {
-            LpmError::Registry("config.toml must be a TOML table at the top level".into())
-        })?;
+        let table = config.table_mut();
         table.insert(
             RELEASE_AGE_POLICY_KEY.to_string(),
             toml::Value::String(policy.as_str().to_string()),

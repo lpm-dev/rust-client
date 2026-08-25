@@ -9,7 +9,7 @@ use crate::precedence::{PolicyTier, PurePolicyKnob};
 use crate::security_approval::{EffectiveAuthorizedPosture, PostureSourceKind};
 
 const DEFAULT_SOURCE: &str = "built-in default";
-const USER_SOURCE: &str = "~/.lpm/config.toml";
+const DEFAULT_USER_SOURCE: &str = "~/.lpm/config.toml";
 const PROJECT_TOML_SOURCE: &str = "lpm.toml";
 const PACKAGE_JSON_SOURCE: &str = "package.json > lpm";
 
@@ -30,7 +30,7 @@ pub(super) struct EffectiveConfig {
     entries: Vec<EffectiveConfigEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 struct EffectiveConfigEntry {
     key: String,
     value: serde_json::Value,
@@ -45,93 +45,136 @@ impl EffectiveConfigEntry {
         source: impl Into<String>,
         group: &'static str,
     ) -> Self {
+        let key = key.into();
         Self {
-            key: key.into(),
-            value: value.into(),
+            value: super::redact_config_json_value(&key, value.into()),
+            key,
             source: source.into(),
             group,
         }
     }
+}
 
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "key": self.key,
-            "value": self.value,
-            "source": self.source,
-            "group": self.group,
-        })
-    }
+#[derive(serde::Serialize)]
+struct EffectiveConfigJson<'a> {
+    success: bool,
+    action: &'static str,
+    count: usize,
+    entries: &'a [EffectiveConfigEntry],
 }
 
 impl EffectiveConfig {
     pub(super) fn load(current_dir: &Path) -> Result<Self, LpmError> {
         let project_dir = lpm_workspace::find_project_root(current_dir)
             .unwrap_or_else(|| current_dir.to_path_buf());
-        let global = GlobalConfig::load_checked()?;
-        let project_toml = read_optional_toml_table(&project_dir.join("lpm.toml"))?;
+        let global_path = lpm_common::LpmRoot::from_env()?.root().join("config.toml");
+        let user_source = global_source_label();
+        let global = GlobalConfig::from_value(super::read_config(&global_path)?)?;
+        let project_toml_path = project_dir.join("lpm.toml");
+        let project_toml = read_optional_toml_table(&project_toml_path)?;
         let (package_json, package_json_value) = read_package_json(&project_dir)?;
         let script_config =
-            crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&project_dir)?;
+            crate::script_policy_config::ScriptPolicyConfig::from_package_json_value(
+                &package_json_value,
+            );
         if let Some(invalid) = script_config.policy_parse_error.as_deref() {
             return Err(LpmError::Registry(format!(
                 "invalid package.json > lpm > scriptPolicy value `{invalid}`"
             )));
         }
         let posture = crate::security_approval::load_effective_authorized_posture()?;
-        let workspace = lpm_workspace::discover_workspace(&project_dir)
+        let workspace_root = lpm_workspace::find_workspace_root(&project_dir)
             .map_err(|error| LpmError::Workspace(error.to_string()))?;
-        let workspace_root = workspace
-            .as_ref()
-            .map_or(project_dir.as_path(), |workspace| workspace.root.as_path());
-        let root_package = workspace
-            .as_ref()
-            .map_or(&package_json, |workspace| &workspace.root_package);
+        let workspace_detected = workspace_root.is_some();
+        let workspace_root = workspace_root.as_deref().unwrap_or(project_dir.as_path());
+        let root_package_storage;
+        let root_package = if workspace_root == project_dir {
+            &package_json
+        } else {
+            root_package_storage = lpm_workspace::read_workspace_root_package(workspace_root)
+                .map_err(|error| LpmError::Workspace(error.to_string()))?;
+            &root_package_storage
+        };
+        let workspace_toml_path = workspace_root.join("lpm.toml");
+        let workspace_toml_storage;
+        let workspace_toml = if workspace_root == project_dir {
+            &project_toml
+        } else {
+            workspace_toml_storage = read_optional_toml_table(&workspace_toml_path)?;
+            &workspace_toml_storage
+        };
 
         let mut entries = Vec::with_capacity(STATIC_CONFIG_ENTRY_COUNT + 8);
-        add_save_entries(&mut entries, &project_dir, &project_toml, &global)?;
+        add_save_entries(
+            &mut entries,
+            &project_toml,
+            &project_toml_path,
+            &global,
+            &global_path,
+            &user_source,
+        )?;
         add_script_entries(
             &mut entries,
-            &project_dir,
-            &project_toml,
-            &package_json_value,
-            &script_config,
-            &global,
-            &posture,
+            ScriptEntryContext {
+                project_dir: &project_dir,
+                project: &project_toml,
+                package_json: &package_json_value,
+                script_config: &script_config,
+                global: &global,
+                global_path: &global_path,
+                user_source: &user_source,
+                posture: &posture,
+            },
         )?;
         add_security_entries(
             &mut entries,
             &package_json,
             &package_json_value,
             &global,
+            &global_path,
+            &user_source,
             &posture,
         )?;
         add_install_entries(
             &mut entries,
-            &project_dir,
             &package_json,
             root_package,
             &global,
+            &global_path,
+            &user_source,
+            workspace_detected,
         )?;
-        add_workspace_entry(&mut entries, workspace_root, &global)?;
-        add_network_entry(&mut entries, &global);
-        add_policy_extension_entries(&mut entries, &global)?;
-        add_unknown_saved_entries(&mut entries, &global);
+        add_workspace_entry(
+            &mut entries,
+            workspace_toml,
+            &workspace_toml_path,
+            &global,
+            &global_path,
+            &user_source,
+        )?;
+        add_network_entry(&mut entries, &global, &global_path, &user_source)?;
+        add_policy_extension_entries(&mut entries, &global, &user_source)?;
+        add_unknown_saved_entries(&mut entries, global.into_table(), &user_source);
 
         Ok(Self { entries })
     }
 
-    pub(super) fn to_json(&self) -> serde_json::Value {
-        let entries: Vec<_> = self
-            .entries
-            .iter()
-            .map(EffectiveConfigEntry::to_json)
-            .collect();
-        serde_json::json!({
-            "success": true,
-            "action": "list",
-            "count": entries.len(),
-            "entries": entries,
-        })
+    pub(super) fn print_json(&self) -> Result<(), LpmError> {
+        use std::io::Write as _;
+
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        serde_json::to_writer_pretty(
+            &mut output,
+            &EffectiveConfigJson {
+                success: true,
+                action: "list",
+                count: self.entries.len(),
+                entries: &self.entries,
+            },
+        )?;
+        writeln!(output)?;
+        Ok(())
     }
 
     pub(super) fn print_human(&self) {
@@ -156,54 +199,85 @@ impl EffectiveConfig {
 
 fn add_save_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
-    project_dir: &Path,
     project: &toml::map::Map<String, toml::Value>,
+    project_path: &Path,
     global: &GlobalConfig,
+    global_path: &Path,
+    user_source: &str,
 ) -> Result<(), LpmError> {
-    let config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
-    let prefix = config
-        .save_prefix
+    let project_prefix = read_save_prefix(project, project_path)?;
+    let global_prefix = read_save_prefix(global.table(), global_path)?;
+    let prefix = project_prefix
+        .or(global_prefix)
         .unwrap_or(crate::save_spec::SavePrefix::Caret)
         .as_str();
+    let project_exact = read_optional_bool_from_table(project, "save-exact", project_path)?;
+    let global_exact = read_optional_bool(global, "save-exact", global_path)?;
+    let save_exact = project_exact.or(global_exact).unwrap_or(false);
     entries.push(EffectiveConfigEntry::new(
         "save-prefix",
         prefix,
         first_source(
             project.contains_key("save-prefix"),
             global.get_value("save-prefix").is_some(),
+            user_source,
         ),
         GROUP_SAVE,
     ));
     entries.push(EffectiveConfigEntry::new(
         "save-exact",
-        config.save_exact,
+        save_exact,
         first_source(
             project.contains_key("save-exact"),
             global.get_value("save-exact").is_some(),
+            user_source,
         ),
         GROUP_SAVE,
     ));
     Ok(())
 }
 
+struct ScriptEntryContext<'a> {
+    project_dir: &'a Path,
+    project: &'a toml::map::Map<String, toml::Value>,
+    package_json: &'a serde_json::Value,
+    script_config: &'a crate::script_policy_config::ScriptPolicyConfig,
+    global: &'a GlobalConfig,
+    global_path: &'a Path,
+    user_source: &'a str,
+    posture: &'a EffectiveAuthorizedPosture,
+}
+
 fn add_script_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
-    project_dir: &Path,
-    project: &toml::map::Map<String, toml::Value>,
-    package_json: &serde_json::Value,
-    script_config: &crate::script_policy_config::ScriptPolicyConfig,
-    global: &GlobalConfig,
-    posture: &EffectiveAuthorizedPosture,
+    context: ScriptEntryContext<'_>,
 ) -> Result<(), LpmError> {
+    let ScriptEntryContext {
+        project_dir,
+        project,
+        package_json,
+        script_config,
+        global,
+        global_path,
+        user_source,
+        posture,
+    } = context;
     if let Some(value) = global.get_value("script-policy") {
         let raw = value.as_str().ok_or_else(|| {
-            LpmError::Registry("`script-policy` in ~/.lpm/config.toml must be a string".to_string())
+            LpmError::Registry(format!(
+                "`script-policy` in {} must be a string",
+                global_path.display()
+            ))
         })?;
         crate::script_policy_config::ScriptPolicy::parse(raw)
             .map_err(|error| LpmError::Registry(error.to_string()))?;
     }
-    let resolution = crate::script_policy_config::resolve_script_policy_raw(None, script_config);
-    let candidate_source = policy_source(resolution.effective_source);
+    let resolution = crate::script_policy_config::resolve_script_policy_raw_with_global(
+        None,
+        script_config,
+        global,
+    );
+    let candidate_source = policy_source(resolution.effective_source, user_source);
     let (script_policy, script_source) = select_security_value(
         resolution.effective,
         candidate_source,
@@ -218,10 +292,23 @@ fn add_script_entries(
         GROUP_SCRIPTS,
     ));
 
+    let global_advisor = read_optional_string_choice(
+        global,
+        "triage-advisor",
+        global_path,
+        &["none", "claude-cli", "codex", "ollama"],
+    )?;
+    if let Some(value) = script_config.triage_advisor.as_deref()
+        && !["none", "claude-cli", "codex", "ollama"].contains(&value)
+    {
+        return Err(LpmError::Registry(format!(
+            "invalid package.json > lpm > triageAdvisor value `{value}`; must be none | claude-cli | codex | ollama"
+        )));
+    }
     let (advisor, advisor_source) = if let Some(value) = script_config.triage_advisor.as_deref() {
         (value, PACKAGE_JSON_SOURCE)
-    } else if let Some(value) = global.get_str("triage-advisor") {
-        (value, USER_SOURCE)
+    } else if let Some(value) = global_advisor {
+        (value, user_source)
     } else {
         ("none", DEFAULT_SOURCE)
     };
@@ -232,8 +319,12 @@ fn add_script_entries(
         GROUP_SCRIPTS,
     ));
 
-    let (sandbox_options, sandbox_mode) =
-        crate::sandbox_config::load_sandbox_options_with_mode(project_dir)?;
+    let (sandbox_options, sandbox_mode) = crate::sandbox_config::load_sandbox_options_from_tables(
+        project,
+        global,
+        &project_dir.join("lpm.toml").display().to_string(),
+        &global_path.display().to_string(),
+    )?;
     let env_strict = env_bool("LPM_STRICT_SANDBOX") == Some(true);
     let candidate_mode = if env_strict {
         crate::sandbox_config::ResolvedSandboxMode::Strict
@@ -243,7 +334,7 @@ fn add_script_entries(
     let candidate_mode_source = if env_strict {
         "LPM_STRICT_SANDBOX"
     } else {
-        nested_source(project, &global.table, &["sandbox", "mode"])
+        nested_source(project, global.table(), &["sandbox", "mode"], user_source)
     };
     let (sandbox_mode, sandbox_mode_source) = select_security_value(
         candidate_mode,
@@ -259,8 +350,12 @@ fn add_script_entries(
         GROUP_SCRIPTS,
     ));
 
-    let allow_degraded_source =
-        nested_source(project, &global.table, &["sandbox", "allow-degraded"]);
+    let allow_degraded_source = nested_source(
+        project,
+        global.table(),
+        &["sandbox", "allow-degraded"],
+        user_source,
+    );
     let (allow_degraded, allow_degraded_source) = select_security_value(
         sandbox_options.allow_degraded,
         allow_degraded_source,
@@ -275,18 +370,14 @@ fn add_script_entries(
         GROUP_SCRIPTS,
     ));
 
-    let user_read_allow = read_string_array(global, "script-read-allow")?;
+    let user_read_allow = read_string_array(global, "script-read-allow", global_path)?;
     let project_read_allow = package_json
         .pointer("/lpm/scripts/sandboxReadAllow")
         .map(|value| json_string_array(value, "package.json > lpm > scripts > sandboxReadAllow"))
         .transpose()?
         .unwrap_or_default();
-    lpm_sandbox::load_sandbox_read_allow(
-        &project_dir.join("package.json"),
-        project_dir,
-        &user_read_allow,
-    )
-    .map_err(|error| LpmError::Registry(error.to_string()))?;
+    lpm_sandbox::resolve_sandbox_read_allow(project_dir, &project_read_allow, &user_read_allow)
+        .map_err(|error| LpmError::Registry(error.to_string()))?;
     let read_allow = merge_unique(project_read_allow, user_read_allow);
     let read_allow_source = merged_source([
         package_json
@@ -296,7 +387,7 @@ fn add_script_entries(
         global
             .get_value("script-read-allow")
             .is_some()
-            .then_some(USER_SOURCE),
+            .then_some(user_source),
     ]);
     entries.push(EffectiveConfigEntry::new(
         "script-read-allow",
@@ -305,12 +396,12 @@ fn add_script_entries(
         GROUP_SCRIPTS,
     ));
 
-    let max_write_roots = effective_max_write_roots(global)?;
+    let max_write_roots = effective_max_write_roots(global, global_path)?;
     entries.push(EffectiveConfigEntry::new(
         "max-sandbox-write-roots",
         serde_json::json!(max_write_roots),
         if global.get_value("max-sandbox-write-roots").is_some() {
-            USER_SOURCE
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -324,15 +415,17 @@ fn add_security_entries(
     package: &lpm_workspace::PackageJson,
     package_json: &serde_json::Value,
     global: &GlobalConfig,
+    global_path: &Path,
+    user_source: &str,
     posture: &EffectiveAuthorizedPosture,
 ) -> Result<(), LpmError> {
     let lpm = package.lpm.as_ref();
-    let global_release_age = read_optional_u64(global, "minimum-release-age-secs")?;
+    let global_release_age = read_optional_u64(global, "minimum-release-age-secs", global_path)?;
     let (candidate_age, candidate_age_source) =
         if let Some(value) = lpm.and_then(|lpm| lpm.minimum_release_age) {
             (value, PACKAGE_JSON_SOURCE)
         } else if let Some(value) = global_release_age {
-            (value, USER_SOURCE)
+            (value, user_source)
         } else {
             (
                 crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS,
@@ -366,15 +459,16 @@ fn add_security_entries(
         .get_value(crate::release_age_config::GLOBAL_POLICY_KEY)
         .map(|value| {
             value.as_str().ok_or_else(|| {
-                LpmError::Registry(
-                    "`release-age-policy` in ~/.lpm/config.toml must be a string".to_string(),
-                )
+                LpmError::Registry(format!(
+                    "`release-age-policy` in {} must be a string",
+                    global_path.display()
+                ))
             })
         })
         .transpose()?
         .map(|raw| {
             crate::release_age_config::ReleaseAgePolicy::parse(
-                "~/.lpm/config.toml > release-age-policy",
+                &format!("{} > release-age-policy", global_path.display()),
                 raw,
             )
         })
@@ -382,7 +476,7 @@ fn add_security_entries(
     let (candidate_policy, candidate_policy_source) = if let Some(value) = project_policy {
         (value, PACKAGE_JSON_SOURCE)
     } else if let Some(value) = global_policy {
-        (value, USER_SOURCE)
+        (value, user_source)
     } else {
         (
             crate::release_age_config::ReleaseAgePolicy::Direct,
@@ -406,13 +500,13 @@ fn add_security_entries(
     let project_excludes = lpm
         .map(|lpm| lpm.minimum_release_age_exclude.clone())
         .unwrap_or_default();
-    let global_excludes = read_string_array(global, "minimum-release-age-exclude")?;
+    let global_excludes = read_string_array(global, "minimum-release-age-exclude", global_path)?;
     let project_excludes = crate::release_age_config::validate_release_age_excludes(
         "package.json > lpm > minimumReleaseAgeExclude",
         &project_excludes,
     )?;
     let global_excludes = crate::release_age_config::validate_release_age_excludes(
-        "~/.lpm/config.toml > minimum-release-age-exclude",
+        &format!("{} > minimum-release-age-exclude", global_path.display()),
         &global_excludes,
     )?;
     let excludes = merge_unique(project_excludes, global_excludes);
@@ -424,7 +518,7 @@ fn add_security_entries(
         global
             .get_value("minimum-release-age-exclude")
             .is_some()
-            .then_some(USER_SOURCE),
+            .then_some(user_source),
     ]);
     entries.push(EffectiveConfigEntry::new(
         "minimum-release-age-exclude",
@@ -434,14 +528,19 @@ fn add_security_entries(
     ));
 
     let env_sigstore = std::env::var("LPM_PROVENANCE_ENFORCE").ok();
-    validate_sigstore_verify(global)?;
+    let sigstore_verify_raw = read_nested_optional_string_choice(
+        global,
+        &["sigstore", "verify"],
+        global_path,
+        &["deny", "warn", "off"],
+    )?;
     let (candidate_sigstore, sigstore_source_kind) =
         crate::provenance_fetch::EnforceMode::resolve_from_chain(env_sigstore.as_deref(), || {
-            global.get_sigstore_verify()
+            sigstore_verify_raw.map(str::to_string)
         });
     let candidate_sigstore_source = match sigstore_source_kind {
         crate::provenance_fetch::EnforceModeSource::Env => "LPM_PROVENANCE_ENFORCE",
-        crate::provenance_fetch::EnforceModeSource::Config => USER_SOURCE,
+        crate::provenance_fetch::EnforceModeSource::Config => user_source,
         crate::provenance_fetch::EnforceModeSource::Default => DEFAULT_SOURCE,
     };
     let (sigstore, sigstore_source) = select_security_value(
@@ -458,9 +557,14 @@ fn add_security_entries(
         GROUP_SECURITY,
     ));
 
-    let sigstore_scope = crate::provenance_fetch::VerificationScope::from_config(
-        global.get_sigstore_scope().as_deref(),
+    let sigstore_scope_raw = read_nested_optional_string_choice(
+        global,
+        &["sigstore", "scope"],
+        global_path,
+        &["approved", "all"],
     )?;
+    let sigstore_scope =
+        crate::provenance_fetch::VerificationScope::from_config(sigstore_scope_raw)?;
     entries.push(EffectiveConfigEntry::new(
         "sigstore.scope",
         if sigstore_scope.verifies_all() {
@@ -470,14 +574,20 @@ fn add_security_entries(
         },
         nested_source(
             &toml::map::Map::new(),
-            &global.table,
+            global.table(),
             &["sigstore", "scope"],
+            user_source,
         ),
         GROUP_SECURITY,
     ));
-    let sigstore_availability = crate::provenance_fetch::AvailabilityMode::from_config(
-        global.get_sigstore_availability().as_deref(),
+    let sigstore_availability_raw = read_nested_optional_string_choice(
+        global,
+        &["sigstore", "availability"],
+        global_path,
+        &["best-effort", "strict"],
     )?;
+    let sigstore_availability =
+        crate::provenance_fetch::AvailabilityMode::from_config(sigstore_availability_raw)?;
     entries.push(EffectiveConfigEntry::new(
         "sigstore.availability",
         if sigstore_availability.is_strict() {
@@ -487,21 +597,23 @@ fn add_security_entries(
         },
         nested_source(
             &toml::map::Map::new(),
-            &global.table,
+            global.table(),
             &["sigstore", "availability"],
+            user_source,
         ),
         GROUP_SECURITY,
     ));
 
     let signatures_env = std::env::var("LPM_VERIFY_REGISTRY_SIGNATURES").ok();
+    let configured_signatures = read_optional_bool(global, "signatures", global_path)?;
     let signatures = signatures_env.as_deref().map_or_else(
-        || global.get_bool("signatures").unwrap_or(false),
+        || configured_signatures.unwrap_or(false),
         |value| parse_bool_text(value).unwrap_or(false),
     );
     let signatures_source = if signatures_env.is_some() {
         "LPM_VERIFY_REGISTRY_SIGNATURES"
-    } else if global.get_bool("signatures").is_some() {
-        USER_SOURCE
+    } else if configured_signatures.is_some() {
+        user_source
     } else {
         DEFAULT_SOURCE
     };
@@ -512,13 +624,18 @@ fn add_security_entries(
         GROUP_SECURITY,
     ));
 
-    let configured_trust_policy = global.get_trust_policy();
+    let configured_trust_policy = read_optional_string_choice(
+        global,
+        "trust-policy",
+        global_path,
+        &["off", "no-downgrade"],
+    )?;
     let trust_policy_source = if configured_trust_policy.is_some() {
-        USER_SOURCE
+        user_source
     } else {
         DEFAULT_SOURCE
     };
-    let trust_policy = configured_trust_policy.unwrap_or_else(|| "off".to_string());
+    let trust_policy = configured_trust_policy.unwrap_or("off");
     entries.push(EffectiveConfigEntry::new(
         "trust-policy",
         trust_policy,
@@ -526,12 +643,24 @@ fn add_security_entries(
         GROUP_SECURITY,
     ));
 
-    let config_typosquat = global.get_typosquat_guard_mode();
+    let config_typosquat = match global.get_value("typosquat-guard") {
+        Some(value) => {
+            let raw = value.as_str().ok_or_else(|| {
+                invalid_global_value(global_path, "typosquat-guard", "default | on | off")
+            })?;
+            Some(
+                crate::commands::config::TyposquatGuardSelection::parse(raw).ok_or_else(|| {
+                    invalid_global_value(global_path, "typosquat-guard", "default | on | off")
+                })?,
+            )
+        }
+        None => None,
+    };
     let env_typosquat_off = env_bool("LPM_TYPOSQUAT_GUARD") == Some(false);
     let (typosquat, typosquat_source) = if let Some(candidate) = config_typosquat {
         select_security_value(
             candidate,
-            USER_SOURCE,
+            user_source,
             posture.posture.typosquat_guard(),
             posture.sources.typosquat_guard,
             |candidate, floor| candidate.loosens(floor),
@@ -575,10 +704,10 @@ fn add_security_entries(
     } else {
         "LPM_EXPERIMENT_NPM_FIREWALL"
     };
-    let combined_firewall_source = format!("{USER_SOURCE} + {firewall_env_source}");
+    let combined_firewall_source = format!("{user_source} + {firewall_env_source}");
     let (candidate_firewall, candidate_firewall_source) = match (config_firewall, env_firewall) {
         (Some(config), Some(env)) => (config.stricter(env), combined_firewall_source.as_str()),
-        (Some(config), None) => (config, USER_SOURCE),
+        (Some(config), None) => (config, user_source),
         (None, Some(env)) => (env, firewall_env_source),
         (None, None) => (
             posture.posture.firewall_mode(),
@@ -598,7 +727,7 @@ fn add_security_entries(
         firewall_source,
         GROUP_SECURITY,
     ));
-    add_firewall_policy_entries(entries, global)?;
+    add_firewall_policy_entries(entries, global, user_source)?;
 
     let integrity = crate::commands::config::resolve_object_integrity_policy(global)?;
     entries.push(EffectiveConfigEntry::new(
@@ -607,7 +736,7 @@ fn add_security_entries(
         if std::env::var_os(lpm_store::v2::ENV_V2_OBJECT_INTEGRITY).is_some() {
             lpm_store::v2::ENV_V2_OBJECT_INTEGRITY
         } else if global.get_value("integrity").is_some() {
-            USER_SOURCE
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -621,7 +750,7 @@ fn add_security_entries(
             .get_value(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
             .is_some()
         {
-            USER_SOURCE
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -643,7 +772,7 @@ fn add_security_entries(
             .get_value(crate::lpm_insights_config::FETCH_LPM_SECURITY_INSIGHTS_KEY)
             .is_some()
         {
-            USER_SOURCE
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -655,6 +784,7 @@ fn add_security_entries(
 fn add_firewall_policy_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
     global: &GlobalConfig,
+    user_source: &str,
 ) -> Result<(), LpmError> {
     let profile = crate::npm_firewall_config::config_policy_profile(global)?;
     let policies = global
@@ -665,7 +795,7 @@ fn add_firewall_policy_entries(
         .and_then(toml::Value::as_table);
     let policy_source = |key: &str| {
         if policies.is_some_and(|policies| policies.contains_key(key)) {
-            USER_SOURCE
+            user_source
         } else {
             DEFAULT_SOURCE
         }
@@ -690,7 +820,7 @@ fn add_firewall_policy_entries(
                     crate::npm_firewall_config::LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY,
                 )
             }) {
-            USER_SOURCE
+            user_source
         } else {
             policy_source(key)
         };
@@ -706,20 +836,24 @@ fn add_firewall_policy_entries(
 
 fn add_install_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
-    project_dir: &Path,
     package: &lpm_workspace::PackageJson,
     root_package: &lpm_workspace::PackageJson,
     global: &GlobalConfig,
+    global_path: &Path,
+    user_source: &str,
+    workspace_detected: bool,
 ) -> Result<(), LpmError> {
     let root_lpm = root_package.lpm.as_ref();
-    let engine_strict = crate::engine_strict_config::resolve_for_root(false, root_package);
+    let global_engine_strict = read_optional_bool(global, "engine-strict", global_path)?;
+    let engine_strict =
+        crate::engine_strict_config::resolve_for_root_with_global(false, root_package, global);
     entries.push(EffectiveConfigEntry::new(
         "engine-strict",
         engine_strict,
         if root_lpm.and_then(|lpm| lpm.engine_strict).is_some() {
             PACKAGE_JSON_SOURCE
-        } else if global.get_bool("engine-strict").is_some() {
-            USER_SOURCE
+        } else if global_engine_strict.is_some() {
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -727,33 +861,35 @@ fn add_install_entries(
     ));
 
     let lpm = package.lpm.as_ref();
+    let global_strict_peers = read_optional_bool(global, "strict-peer-dependencies", global_path)?;
     let strict_peers = lpm
         .and_then(|lpm| lpm.strict_peer_dependencies)
-        .or_else(|| global.get_bool("strict-peer-dependencies"))
+        .or(global_strict_peers)
         .unwrap_or(false);
     entries.push(EffectiveConfigEntry::new(
         "strict-peer-dependencies",
         strict_peers,
         if lpm.and_then(|lpm| lpm.strict_peer_dependencies).is_some() {
             PACKAGE_JSON_SOURCE
-        } else if global.get_bool("strict-peer-dependencies").is_some() {
-            USER_SOURCE
+        } else if global_strict_peers.is_some() {
+            user_source
         } else {
             DEFAULT_SOURCE
         },
         GROUP_INSTALL,
     ));
+    let global_auto_peers = read_optional_bool(global, "auto-install-peers", global_path)?;
     let auto_peers = lpm
         .and_then(|lpm| lpm.auto_install_peers)
-        .or_else(|| global.get_bool("auto-install-peers"))
+        .or(global_auto_peers)
         .unwrap_or(true);
     entries.push(EffectiveConfigEntry::new(
         "auto-install-peers",
         auto_peers,
         if lpm.and_then(|lpm| lpm.auto_install_peers).is_some() {
             PACKAGE_JSON_SOURCE
-        } else if global.get_bool("auto-install-peers").is_some() {
-            USER_SOURCE
+        } else if global_auto_peers.is_some() {
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -765,14 +901,17 @@ fn add_install_entries(
         .get_value(crate::lpm_skills_config::AUTO_INSTALL_LPM_SKILLS_KEY)
         .is_some()
     {
-        USER_SOURCE
-    } else if global
-        .get_bool(crate::lpm_skills_config::LEGACY_NO_SKILLS_KEY)
-        .is_some()
+        user_source.to_string()
+    } else if read_optional_bool(
+        global,
+        crate::lpm_skills_config::LEGACY_NO_SKILLS_KEY,
+        global_path,
+    )?
+    .is_some()
     {
-        "~/.lpm/config.toml (legacy noSkills)"
+        format!("{user_source} (legacy noSkills)")
     } else {
-        DEFAULT_SOURCE
+        DEFAULT_SOURCE.to_string()
     };
     entries.push(EffectiveConfigEntry::new(
         crate::lpm_skills_config::AUTO_INSTALL_LPM_SKILLS_KEY,
@@ -783,35 +922,42 @@ fn add_install_entries(
 
     let audit_env = std::env::var("LPM_AUDIT_AFTER_INSTALL").ok();
     let audit_env_value = audit_env.as_deref().and_then(parse_bool_text);
-    let audit = audit_env_value
-        .or_else(|| global.get_bool("audit-after-install"))
-        .unwrap_or(false);
+    let configured_audit = read_optional_bool(global, "audit-after-install", global_path)?;
+    let audit = audit_env_value.or(configured_audit).unwrap_or(false);
     entries.push(EffectiveConfigEntry::new(
         "audit-after-install",
         audit,
         if audit_env_value.is_some() {
             "LPM_AUDIT_AFTER_INSTALL"
-        } else if global.get_bool("audit-after-install").is_some() {
-            USER_SOURCE
+        } else if configured_audit.is_some() {
+            user_source
         } else {
             DEFAULT_SOURCE
         },
         GROUP_INSTALL,
     ));
 
-    let (linker, linker_source) = crate::linker_config::resolve_effective_linker_with_source(
-        None,
-        package,
-        global,
-        project_dir,
-    )
-    .map_err(LpmError::Script)?;
+    if global.get_value("linker").is_some() && global.get_str("linker").is_none() {
+        return Err(invalid_global_value(
+            global_path,
+            "linker",
+            "isolated | hoisted",
+        ));
+    }
+    let (linker, linker_source) =
+        crate::linker_config::resolve_effective_linker_with_source_and_workspace(
+            None,
+            package,
+            global,
+            workspace_detected,
+        )
+        .map_err(LpmError::Script)?;
     entries.push(EffectiveConfigEntry::new(
         "linker",
         linker.as_str(),
         match linker_source {
             crate::linker_config::LinkerModeSource::CliFlag => "--linker",
-            crate::linker_config::LinkerModeSource::GlobalConfig => USER_SOURCE,
+            crate::linker_config::LinkerModeSource::GlobalConfig => user_source,
             crate::linker_config::LinkerModeSource::EnvVar => "LPM_LINKER",
             crate::linker_config::LinkerModeSource::PackageJson => PACKAGE_JSON_SOURCE,
             crate::linker_config::LinkerModeSource::WorkspaceAutoDetected => {
@@ -826,19 +972,26 @@ fn add_install_entries(
 
 fn add_workspace_entry(
     entries: &mut Vec<EffectiveConfigEntry>,
-    workspace_root: &Path,
+    workspace_config: &toml::map::Map<String, toml::Value>,
+    workspace_config_path: &Path,
     global: &GlobalConfig,
+    global_path: &Path,
+    user_source: &str,
 ) -> Result<(), LpmError> {
     let concurrency =
-        crate::workspace_concurrency_config::resolve_workspace_concurrency(workspace_root, None)?;
-    let workspace_config = read_optional_toml_table(&workspace_root.join("lpm.toml"))?;
+        crate::workspace_concurrency_config::resolve_workspace_concurrency_from_tables(
+            workspace_config,
+            global,
+            workspace_config_path,
+            global_path,
+        )?;
     entries.push(EffectiveConfigEntry::new(
         "workspace-concurrency",
         concurrency.get(),
-        if nested_value(&workspace_config, &["workspace", "concurrency"]).is_some() {
+        if nested_value(workspace_config, &["workspace", "concurrency"]).is_some() {
             PROJECT_TOML_SOURCE
         } else if global.get_value("workspace-concurrency").is_some() {
-            USER_SOURCE
+            user_source
         } else {
             DEFAULT_SOURCE
         },
@@ -847,22 +1000,24 @@ fn add_workspace_entry(
     Ok(())
 }
 
-fn add_network_entry(entries: &mut Vec<EffectiveConfigEntry>, global: &GlobalConfig) {
-    let relay = lpm_tunnel::resolve_relay_url();
+fn add_network_entry(
+    entries: &mut Vec<EffectiveConfigEntry>,
+    global: &GlobalConfig,
+    global_path: &Path,
+    user_source: &str,
+) -> Result<(), LpmError> {
+    let config_relay = read_nested_optional_string(global, &["tunnel", "relay-url"], global_path)?
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let relay = lpm_tunnel::resolve_relay_url_from_config_value(config_relay);
     let env_relay = std::env::var("LPM_TUNNEL_RELAY")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let config_relay = global
-        .get_table("tunnel")
-        .and_then(|table| table.get("relay-url"))
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
     let source = if env_relay.as_deref() == Some(relay.as_str()) {
         "LPM_TUNNEL_RELAY"
     } else if config_relay == Some(relay.as_str()) {
-        USER_SOURCE
+        user_source
     } else {
         DEFAULT_SOURCE
     };
@@ -872,11 +1027,13 @@ fn add_network_entry(entries: &mut Vec<EffectiveConfigEntry>, global: &GlobalCon
         source,
         GROUP_NETWORK,
     ));
+    Ok(())
 }
 
 fn add_policy_extension_entries(
     entries: &mut Vec<EffectiveConfigEntry>,
     global: &GlobalConfig,
+    user_source: &str,
 ) -> Result<(), LpmError> {
     let mut active: BTreeMap<_, _> = load_policy_extension_configs(global)?
         .into_iter()
@@ -900,7 +1057,7 @@ fn add_policy_extension_entries(
             entries.push(EffectiveConfigEntry::new(
                 format!("{base}.enabled"),
                 false,
-                USER_SOURCE,
+                user_source,
                 GROUP_EXTENSIONS,
             ));
             continue;
@@ -912,7 +1069,7 @@ fn add_policy_extension_entries(
         })?;
         let field_source = |field: &str| {
             if table.contains_key(field) {
-                USER_SOURCE
+                user_source
             } else {
                 DEFAULT_SOURCE
             }
@@ -957,21 +1114,25 @@ fn add_policy_extension_entries(
     Ok(())
 }
 
-fn add_unknown_saved_entries(entries: &mut Vec<EffectiveConfigEntry>, global: &GlobalConfig) {
+fn add_unknown_saved_entries(
+    entries: &mut Vec<EffectiveConfigEntry>,
+    global: toml::map::Map<String, toml::Value>,
+    user_source: &str,
+) {
     let known: HashSet<&str> = entries
         .iter()
         .map(|entry| entry.key.as_str())
         .chain(LEGACY_CONFIG_PATHS.iter().copied())
         .collect();
     let mut unknown = Vec::new();
-    flatten_unknown_values("", &global.table, &known, &mut unknown);
+    flatten_unknown_values("", global, &known, &mut unknown);
     drop(known);
     unknown.sort_by(|left, right| left.0.cmp(&right.0));
     entries.extend(unknown.into_iter().map(|(key, value)| {
         EffectiveConfigEntry::new(
             key,
             super::config_value_to_json(&value),
-            USER_SOURCE,
+            user_source,
             GROUP_ADDITIONAL,
         )
     }));
@@ -979,23 +1140,24 @@ fn add_unknown_saved_entries(entries: &mut Vec<EffectiveConfigEntry>, global: &G
 
 fn flatten_unknown_values(
     prefix: &str,
-    table: &toml::map::Map<String, toml::Value>,
+    table: toml::map::Map<String, toml::Value>,
     known: &HashSet<&str>,
     output: &mut Vec<(String, toml::Value)>,
 ) {
     for (key, value) in table {
         let path = if prefix.is_empty() {
-            key.clone()
+            key
         } else {
             format!("{prefix}.{key}")
         };
         if known.contains(path.as_str()) || path.starts_with("policy.extensions.") {
             continue;
         }
-        if let Some(nested) = value.as_table() {
-            flatten_unknown_values(&path, nested, known, output);
-        } else {
-            output.push((path, value.clone()));
+        match value {
+            toml::Value::Table(nested) => {
+                flatten_unknown_values(&path, nested, known, output);
+            }
+            value => output.push((path, value)),
         }
     }
 }
@@ -1012,10 +1174,11 @@ fn read_package_json(
             }
             Err(error) => return Err(LpmError::Registry(error.to_string())),
         };
-    let package = serde_json::from_str(&content).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|error| {
         LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
     })?;
-    let value = serde_json::from_str(&content).map_err(|error| {
+    let package = lpm_workspace::package_json_from_value(&value).map_err(|error| {
         LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
     })?;
     Ok((package, value))
@@ -1037,43 +1200,165 @@ fn read_optional_toml_table(path: &Path) -> Result<toml::map::Map<String, toml::
         .ok_or_else(|| LpmError::Registry(format!("{} must contain a TOML table", path.display())))
 }
 
-fn validate_sigstore_verify(global: &GlobalConfig) -> Result<(), LpmError> {
-    let Some(value) = global
-        .get_table("sigstore")
-        .and_then(|table| table.get("verify"))
-    else {
-        return Ok(());
+fn global_source_label() -> String {
+    let Some(configured) = std::env::var_os("LPM_HOME").filter(|value| !value.is_empty()) else {
+        return DEFAULT_USER_SOURCE.to_string();
     };
-    let raw = value
-        .as_str()
-        .ok_or_else(|| LpmError::Registry("`[sigstore].verify` must be a string".to_string()))?;
-    if matches!(raw, "deny" | "warn" | "off") {
-        Ok(())
+    if dirs::home_dir()
+        .as_ref()
+        .is_some_and(|home| std::path::Path::new(&configured) == home.join(".lpm"))
+    {
+        DEFAULT_USER_SOURCE.to_string()
     } else {
-        Err(LpmError::Registry(format!(
-            "invalid `[sigstore].verify` value `{raw}`; must be deny | warn | off"
-        )))
+        "$LPM_HOME/config.toml".to_string()
     }
 }
 
-fn read_optional_u64(global: &GlobalConfig, key: &str) -> Result<Option<u64>, LpmError> {
+fn invalid_global_value(path: &Path, key: &str, expected: &str) -> LpmError {
+    LpmError::Registry(format!(
+        "invalid `{key}` in {}; must be {expected}",
+        path.display()
+    ))
+}
+
+fn read_optional_bool(
+    global: &GlobalConfig,
+    key: &str,
+    path: &Path,
+) -> Result<Option<bool>, LpmError> {
+    let Some(_) = global.get_value(key) else {
+        return Ok(None);
+    };
+    global
+        .get_bool(key)
+        .map(Some)
+        .ok_or_else(|| invalid_global_value(path, key, "true or false"))
+}
+
+fn read_optional_bool_from_table(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    path: &Path,
+) -> Result<Option<bool>, LpmError> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        toml::Value::Boolean(value) => Ok(Some(*value)),
+        toml::Value::String(value) => parse_bool_text(value)
+            .map(Some)
+            .ok_or_else(|| invalid_global_value(path, key, "true or false")),
+        _ => Err(invalid_global_value(path, key, "true or false")),
+    }
+}
+
+fn read_save_prefix(
+    table: &toml::map::Map<String, toml::Value>,
+    path: &Path,
+) -> Result<Option<crate::save_spec::SavePrefix>, LpmError> {
+    let Some(value) = table.get("save-prefix") else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| invalid_global_value(path, "save-prefix", "\"^\", \"~\", or \"\""))?;
+    crate::save_spec::SavePrefix::parse(raw)
+        .map(Some)
+        .map_err(|error| LpmError::Registry(format!("{}: {error}", path.display())))
+}
+
+fn read_optional_string_choice<'a>(
+    global: &'a GlobalConfig,
+    key: &str,
+    path: &Path,
+    choices: &[&str],
+) -> Result<Option<&'a str>, LpmError> {
+    let Some(value) = global.get_value(key) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(|| {
+        invalid_global_value(path, key, &format!("one of: {}", choices.join(" | ")))
+    })?;
+    if choices.contains(&raw) {
+        Ok(Some(raw))
+    } else {
+        Err(invalid_global_value(
+            path,
+            key,
+            &format!("one of: {}", choices.join(" | ")),
+        ))
+    }
+}
+
+fn read_nested_optional_string<'a>(
+    global: &'a GlobalConfig,
+    path: &[&str],
+    global_path: &Path,
+) -> Result<Option<&'a str>, LpmError> {
+    let Some(value) = nested_value(global.table(), path) else {
+        if path
+            .first()
+            .and_then(|section| global.get_value(section))
+            .is_some_and(|section| !section.is_table())
+        {
+            return Err(invalid_global_value(global_path, path[0], "a TOML table"));
+        }
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(Some)
+        .ok_or_else(|| invalid_global_value(global_path, &path.join("."), "a string"))
+}
+
+fn read_nested_optional_string_choice<'a>(
+    global: &'a GlobalConfig,
+    path: &[&str],
+    global_path: &Path,
+    choices: &[&str],
+) -> Result<Option<&'a str>, LpmError> {
+    let Some(raw) = read_nested_optional_string(global, path, global_path)? else {
+        return Ok(None);
+    };
+    if choices.contains(&raw) {
+        Ok(Some(raw))
+    } else {
+        Err(invalid_global_value(
+            global_path,
+            &path.join("."),
+            &format!("one of: {}", choices.join(" | ")),
+        ))
+    }
+}
+
+fn read_optional_u64(
+    global: &GlobalConfig,
+    key: &str,
+    global_path: &Path,
+) -> Result<Option<u64>, LpmError> {
     let Some(_) = global.get_value(key) else {
         return Ok(None);
     };
     global.get_u64(key).map(Some).ok_or_else(|| {
         LpmError::Registry(format!(
-            "invalid `{key}` in ~/.lpm/config.toml; must be a non-negative integer"
+            "invalid `{key}` in {}; must be a non-negative integer",
+            global_path.display()
         ))
     })
 }
 
-fn read_string_array(global: &GlobalConfig, key: &str) -> Result<Vec<String>, LpmError> {
+fn read_string_array(
+    global: &GlobalConfig,
+    key: &str,
+    global_path: &Path,
+) -> Result<Vec<String>, LpmError> {
     let Some(value) = global.get_value(key) else {
         return Ok(Vec::new());
     };
     let array = value.as_array().ok_or_else(|| {
         LpmError::Registry(format!(
-            "invalid `{key}` in ~/.lpm/config.toml; must be an array of strings"
+            "invalid `{key}` in {}; must be an array of strings",
+            global_path.display()
         ))
     })?;
     array
@@ -1082,29 +1367,35 @@ fn read_string_array(global: &GlobalConfig, key: &str) -> Result<Vec<String>, Lp
         .map(|(index, value)| {
             value.as_str().map(str::to_string).ok_or_else(|| {
                 LpmError::Registry(format!(
-                    "invalid `{key}[{index}]` in ~/.lpm/config.toml; must be a string"
+                    "invalid `{key}[{index}]` in {}; must be a string",
+                    global_path.display()
                 ))
             })
         })
         .collect()
 }
 
-fn effective_max_write_roots(global: &GlobalConfig) -> Result<Vec<String>, LpmError> {
+fn effective_max_write_roots(
+    global: &GlobalConfig,
+    global_path: &Path,
+) -> Result<Vec<String>, LpmError> {
     let home = dirs::home_dir();
-    Ok(read_string_array(global, "max-sandbox-write-roots")?
-        .into_iter()
-        .filter_map(|value| {
-            if let Some(rest) = value.strip_prefix("~/") {
-                home.as_ref()
-                    .map(|home| home.join(rest).display().to_string())
-            } else if value == "~" {
-                home.as_ref().map(|home| home.display().to_string())
-            } else {
-                let path = std::path::PathBuf::from(&value);
-                path.is_absolute().then_some(value)
-            }
-        })
-        .collect())
+    Ok(
+        read_string_array(global, "max-sandbox-write-roots", global_path)?
+            .into_iter()
+            .filter_map(|value| {
+                if let Some(rest) = value.strip_prefix("~/") {
+                    home.as_ref()
+                        .map(|home| home.join(rest).display().to_string())
+                } else if value == "~" {
+                    home.as_ref().map(|home| home.display().to_string())
+                } else {
+                    let path = std::path::PathBuf::from(&value);
+                    path.is_absolute().then_some(value)
+                }
+            })
+            .collect(),
+    )
 }
 
 fn json_string_array(value: &serde_json::Value, source: &str) -> Result<Vec<String>, LpmError> {
@@ -1123,25 +1414,26 @@ fn json_string_array(value: &serde_json::Value, source: &str) -> Result<Vec<Stri
         .collect()
 }
 
-fn first_source(project: bool, user: bool) -> &'static str {
+fn first_source(project: bool, user: bool, user_source: &str) -> &str {
     if project {
         PROJECT_TOML_SOURCE
     } else if user {
-        USER_SOURCE
+        user_source
     } else {
         DEFAULT_SOURCE
     }
 }
 
-fn nested_source(
+fn nested_source<'a>(
     project: &toml::map::Map<String, toml::Value>,
     global: &toml::map::Map<String, toml::Value>,
     path: &[&str],
-) -> &'static str {
+    user_source: &'a str,
+) -> &'a str {
     if nested_value(project, path).is_some() {
         PROJECT_TOML_SOURCE
     } else if nested_value(global, path).is_some() {
-        USER_SOURCE
+        user_source
     } else {
         DEFAULT_SOURCE
     }
@@ -1159,11 +1451,11 @@ fn nested_value<'a>(
     Some(value)
 }
 
-fn policy_source(source: PolicyTier) -> &'static str {
+fn policy_source(source: PolicyTier, user_source: &str) -> &str {
     match source {
         PolicyTier::Cli => "CLI flag",
         PolicyTier::Project => PACKAGE_JSON_SOURCE,
-        PolicyTier::User => USER_SOURCE,
+        PolicyTier::User => user_source,
         PolicyTier::Default => DEFAULT_SOURCE,
     }
 }

@@ -120,6 +120,8 @@ pub struct AuthorizedPosture {
     pub updated_at: DateTime<Utc>,
     pub script_policy: String,
     pub minimum_release_age_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub minimum_release_age_exclude: Vec<String>,
     #[serde(default = "default_release_age_policy_string")]
     pub release_age_policy: String,
     pub sandbox_mode: String,
@@ -173,6 +175,7 @@ impl Default for AuthorizedPosture {
             updated_at: Utc::now(),
             script_policy: ScriptPolicy::default().as_str().to_string(),
             minimum_release_age_secs: DEFAULT_MIN_RELEASE_AGE_SECS,
+            minimum_release_age_exclude: Vec::new(),
             release_age_policy: default_release_age_policy_string(),
             sandbox_mode: ResolvedSandboxMode::Default.as_str().to_string(),
             sandbox_allow_degraded: false,

@@ -280,9 +280,9 @@ impl ReleaseAgeResolver {
         json_output: bool,
     ) -> Result<ReleaseAgeConfig, LpmError> {
         let global = crate::commands::config::GlobalConfig::load();
-        let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
-        let authorized_floor = authorized.minimum_release_age_secs();
-        let authorized_policy = authorized.release_age_policy();
+        let effective_authorized = crate::security_approval::load_effective_authorized_posture()?;
+        let authorized_floor = effective_authorized.posture.minimum_release_age_secs();
+        let authorized_policy = effective_authorized.posture.release_age_policy();
         let force_security_floor = crate::security_floor::force_security_floor_enabled(&global);
         let floor = crate::security_floor::current_release_age_floor_secs(&global);
         let policy_floor = crate::security_floor::current_release_age_policy_floor(&global);
@@ -299,6 +299,12 @@ impl ReleaseAgeResolver {
         let global_release_age_config = match global_config_path() {
             Some(path) => match read_global_release_age_config_from_file(&path) {
                 Ok(mut config) => {
+                    ensure_global_release_age_excludes_authorized(
+                        &effective_authorized,
+                        project_dir,
+                        json_output,
+                        &config.minimum_release_age_exclude,
+                    )?;
                     extend_unique_excludes(
                         &mut minimum_release_age_exclude,
                         std::mem::take(&mut config.minimum_release_age_exclude),
@@ -439,6 +445,47 @@ impl ReleaseAgeResolver {
             minimum_release_age_policy: effective_policy,
         })
     }
+}
+
+fn ensure_global_release_age_excludes_authorized(
+    effective: &crate::security_approval::EffectiveAuthorizedPosture,
+    project_dir: &Path,
+    json_output: bool,
+    exclusions: &[String],
+) -> Result<(), LpmError> {
+    if exclusions.is_empty() {
+        return Ok(());
+    }
+    let managed_cooldown = matches!(
+        effective.sources.minimum_release_age_secs,
+        crate::security_approval::PostureSourceKind::ManagedPolicy
+    ) || matches!(
+        effective.sources.release_age_policy,
+        crate::security_approval::PostureSourceKind::ManagedPolicy
+    );
+    let unauthorized: Vec<_> = exclusions
+        .iter()
+        .filter(|selector| {
+            managed_cooldown
+                || !effective
+                    .posture
+                    .minimum_release_age_exclude
+                    .contains(selector)
+        })
+        .cloned()
+        .collect();
+    if unauthorized.is_empty() {
+        return Ok(());
+    }
+    crate::security_approval::ensure_project_unlock(
+        crate::security_approval::ApprovalScope::CooldownBypass,
+        project_dir,
+        json_output,
+        crate::security_approval::ApprovalSource::GlobalConfig,
+        "The persisted global release-age exclusion list bypasses the approved cooldown for matching packages.",
+        None,
+        &unauthorized,
+    )
 }
 
 fn enforce_release_age_policy_posture(
@@ -1205,8 +1252,16 @@ mod tests {
     }
 
     fn write_authorized_min_age(secs: u64) {
+        write_authorized_min_age_with_excludes(secs, &[]);
+    }
+
+    fn write_authorized_min_age_with_excludes(secs: u64, excludes: &[&str]) {
         let posture = crate::security_approval::AuthorizedPosture {
             minimum_release_age_secs: secs,
+            minimum_release_age_exclude: excludes
+                .iter()
+                .map(|exclude| (*exclude).to_string())
+                .collect(),
             ..crate::security_approval::AuthorizedPosture::default()
         };
         crate::security_approval::persist_authorized_posture(&posture).unwrap();
@@ -1434,7 +1489,7 @@ mod tests {
     fn resolve_config_merges_cli_project_and_global_excludes_when_global_sets_age() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
-        write_authorized_min_age(0);
+        write_authorized_min_age_with_excludes(0, &["global-pkg", "shared-pkg"]);
         write_package_json_with_excludes(project.path(), &["project-pkg", "shared-pkg"]);
         write_global_config(
             home.path(),
@@ -1463,7 +1518,7 @@ minimum-release-age-exclude = ["global-pkg", "shared-pkg"]
     fn resolve_config_merges_global_excludes_when_cli_override_sets_age() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
-        write_authorized_min_age(0);
+        write_authorized_min_age_with_excludes(0, &["global-pkg"]);
         write_package_json_with_excludes(project.path(), &["project-pkg"]);
         write_global_config(
             home.path(),
@@ -1492,7 +1547,7 @@ minimum-release-age-exclude = ["global-pkg"]
     fn resolve_config_merges_global_excludes_when_package_json_sets_age() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
-        write_authorized_min_age(0);
+        write_authorized_min_age_with_excludes(0, &["global-pkg"]);
         write_package_json_with_min_age_and_excludes(project.path(), Some(1000), &["project-pkg"]);
         write_global_config(
             home.path(),
@@ -1507,6 +1562,29 @@ minimum-release-age-exclude = ["global-pkg"]
         assert_eq!(
             result.minimum_release_age_exclude,
             vec!["project-pkg".to_string(), "global-pkg".to_string()]
+        );
+    }
+
+    #[test]
+    fn hand_edited_global_exclusion_requires_a_project_unlock() {
+        let project = tempfile::tempdir().unwrap();
+        let home = scoped_home_dir();
+        write_authorized_min_age(0);
+        write_package_json_with_min_age(project.path(), None);
+        write_global_config(
+            home.path(),
+            r#"minimum-release-age-secs = 2000
+minimum-release-age-exclude = ["global-pkg"]
+"#,
+        );
+
+        let error =
+            ReleaseAgeResolver::resolve_config(project.path(), None, &[], true).unwrap_err();
+
+        assert_eq!(error.error_code(), "security_approval_required");
+        assert!(
+            error.to_string().contains("cooldown-bypass"),
+            "got: {error}"
         );
     }
 
