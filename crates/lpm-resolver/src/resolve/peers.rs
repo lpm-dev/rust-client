@@ -31,32 +31,26 @@ pub(super) fn compute_resolved_peers(
     resolved_versions: &HashMap<String, Vec<(ResolverPackage, String)>>,
 ) -> Result<Vec<(lpm_common::PeerEdge, ResolverPackage)>, ResolveError> {
     let key = CanonicalKey::from(consumer);
-    let Some(peer_deps) = cache
-        .get(&key)
-        .and_then(|info| info.peer_deps.get(consumer_version))
-    else {
+    let Some(info) = cache.get(&key) else {
         return Ok(Vec::new());
     };
-    let peer_aliases = cache
-        .get(&key)
-        .and_then(|info| info.peer_aliases.get(consumer_version));
-    let optional_peers = cache
-        .get(&key)
-        .and_then(|info| info.optional_peer_names.get(consumer_version));
-    let mut peers = Vec::with_capacity(peer_deps.len());
-    for (peer_name, peer_range) in peer_deps {
-        let target_name = peer_aliases
-            .and_then(|aliases| aliases.get(peer_name))
-            .unwrap_or(peer_name);
+    let Some(peer_dependencies) = info.peer_dependencies(consumer_version) else {
+        return Ok(Vec::new());
+    };
+    let mut peers = Vec::with_capacity(peer_dependencies.len());
+    for peer in peer_dependencies {
+        let peer_name = peer.name;
+        let peer_range = peer.range;
+        let target_name = peer.alias.unwrap_or(peer_name);
         let parsed_range = match NpmRange::parse(peer_range) {
             Ok(range) => range,
-            Err(_) if optional_peers.is_some_and(|peers| peers.contains(peer_name)) => continue,
+            Err(_) if peer.optional => continue,
             Err(detail) => {
                 return Err(ResolveError::InvalidPeerRange {
                     package: consumer.canonical_name(),
                     version: consumer_version.to_string(),
-                    peer: peer_name.clone(),
-                    range: peer_range.clone(),
+                    peer: peer_name.to_owned(),
+                    range: peer_range.to_owned(),
                     detail,
                 });
             }
@@ -801,26 +795,17 @@ pub fn check_unmet_peers(
         // version. Canonicalize — split-retry variants share a single
         // cache entry under the canonical key.
         let key = CanonicalKey::from(&resolved_pkg.package);
-        let info = cache.get(&key);
-        let peer_deps = info.and_then(|i| i.peer_deps.get(&ver_str));
-
-        let Some(peer_deps) = peer_deps else {
+        let Some(info) = cache.get(&key) else {
+            continue;
+        };
+        let Some(peer_dependencies) = info.peer_dependencies(&ver_str) else {
             continue;
         };
 
-        // Set of peer names this version marked optional via
-        // `peerDependenciesMeta.optional`. Empty for the common case.
-        // Used below to suppress the missing-peer warning ONLY — an
-        // optional peer that's present but at the wrong version still
-        // warrants a warning (the user opted into having a peer, just
-        // at an incompatible version).
-        let optional_peers = info.and_then(|i| i.optional_peer_names.get(&ver_str));
-        let peer_aliases = info.and_then(|i| i.peer_aliases.get(&ver_str));
-
-        for (peer_name, peer_range_str) in peer_deps {
-            let target_name = peer_aliases
-                .and_then(|aliases| aliases.get(peer_name))
-                .unwrap_or(peer_name);
+        for peer in peer_dependencies {
+            let peer_name = peer.name;
+            let peer_range_str = peer.range;
+            let target_name = peer.alias.unwrap_or(peer_name);
             let parsed_range = NpmRange::parse(peer_range_str).ok();
             let resolved_peer_ver = resolve_peer_binding_version(
                 &resolved_pkg.package,
@@ -861,9 +846,9 @@ pub fn check_unmet_peers(
                         warnings.push(PeerWarning {
                             package: canonical.clone(),
                             version: ver_str.clone(),
-                            peer: peer_name.clone(),
-                            target: target_name.clone(),
-                            required_range: peer_range_str.clone(),
+                            peer: peer_name.to_owned(),
+                            target: target_name.to_owned(),
+                            required_range: peer_range_str.to_owned(),
                             resolved_version: Some(resolved_ver.clone()),
                         });
                     }
@@ -881,15 +866,15 @@ pub fn check_unmet_peers(
                     // yarn, and npm v7+ all honor this. Gates ONLY
                     // the missing-peer branch — version-mismatch
                     // above still warrants a warning.
-                    if optional_peers.is_some_and(|set| set.contains(peer_name)) {
+                    if peer.optional {
                         continue;
                     }
                     warnings.push(PeerWarning {
                         package: canonical.clone(),
                         version: ver_str.clone(),
-                        peer: peer_name.clone(),
-                        target: target_name.clone(),
-                        required_range: peer_range_str.clone(),
+                        peer: peer_name.to_owned(),
+                        target: target_name.to_owned(),
+                        required_range: peer_range_str.to_owned(),
                         resolved_version: None,
                     });
                 }

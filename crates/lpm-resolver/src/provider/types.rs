@@ -1,3 +1,4 @@
+use super::manifest_core::CachedPackageInfo;
 use super::prelude::*;
 
 /// Shared metadata cache for the streaming BFS resolver.
@@ -85,103 +86,6 @@ pub struct StreamingBfsMetrics {
     pub(super) cache_wait_walker_done_shortcuts: Arc<AtomicU64>,
 }
 
-/// Distribution info for a specific version.
-///
-/// Extracted from registry metadata so the download phase doesn't need to
-/// re-fetch metadata for tarball URL, integrity, or registry signatures.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CachedDistInfo {
-    pub tarball_url: Option<String>,
-    pub integrity: Option<String>,
-    pub unpacked_size: Option<std::num::NonZeroU64>,
-    pub signatures: Vec<lpm_registry::RegistrySignature>,
-    pub published_at: Option<String>,
-    pub published_at_unix: Option<i64>,
-    pub trust_evidence: Option<TrustEvidence>,
-}
-
-/// Cached info about a package: available versions and their dependency maps.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachedPackageInfo {
-    /// Package-level `modified` timestamp from npm metadata. Abbreviated
-    /// packuments often omit per-version `time` but keep this upper bound.
-    pub modified: Option<String>,
-    pub modified_unix: Option<i64>,
-    /// True when this cache entry came from a full packument fetch, so
-    /// missing trust evidence can be treated as genuinely absent rather
-    /// than "not present in abbreviated metadata."
-    pub trust_metadata_complete: bool,
-    /// True when `versions` represents the complete available version set.
-    /// Range-aware Worker responses intentionally carry only selected
-    /// versions, so broad ranges must refetch before choosing a version.
-    pub versions_complete: bool,
-    /// Range strings for which an incomplete `versions` set is known to be
-    /// Worker-selected. Empty for normal complete packuments.
-    pub covered_ranges: HashSet<String>,
-    /// Versions sourced from local workspace manifests rather than registry
-    /// packuments. A satisfying local version is preferred, while a range
-    /// that matches none of these versions must be allowed to fetch registry
-    /// metadata for the same package name.
-    pub workspace_versions: HashSet<NpmVersion>,
-    /// True when the registry response included full per-version platform
-    /// fields. npm abbreviated packuments retain `os` and `cpu` but omit
-    /// `libc`, so a non-empty platform map is not necessarily complete.
-    pub platform_metadata_complete: bool,
-    /// Parsed target of the registry's authoritative `latest` dist-tag.
-    pub latest_version: Option<NpmVersion>,
-    /// Available versions, sorted descending (newest first).
-    pub versions: Vec<NpmVersion>,
-    /// Regular dependencies for each version: version_string → { dep_name → range_string }.
-    pub deps: HashMap<String, HashMap<String, String>>,
-    /// Peer dependencies for each version: version_string → { dep_name → range_string }.
-    /// A same-named regular or optional dependency takes precedence and is omitted here.
-    /// Checked post-resolution against the actual resolved tree (not during resolution).
-    pub peer_deps: HashMap<String, HashMap<String, String>>,
-    /// npm-alias peer edges per version: local peer name → canonical provider name.
-    /// Kept separate from [`Self::aliases`] because peers are not dependency edges.
-    pub peer_aliases: HashMap<String, HashMap<String, String>>,
-    /// Optional dependency names (per version). Included in deps but resolution failure
-    /// for these is non-fatal.
-    pub optional_dep_names: HashMap<String, HashSet<String>>,
-    /// `peerDependenciesMeta.optional`
-    /// flags per version: `version_string → { peer_name }` for peers
-    /// the manifest marked optional. Consumed by [`crate::check_unmet_peers`]
-    /// to suppress the missing-peer warning (an opt-out the manifest
-    /// author requested). Optional peers that ARE present but at the
-    /// wrong version still produce a warning — the user opted into
-    /// having a peer, just at an incompatible version.
-    pub optional_peer_names: HashMap<String, HashSet<String>>,
-    /// `engines.node` constraints keyed by version string. Versions without
-    /// a Node.js constraint are absent from the map.
-    pub node_engines: HashMap<String, String>,
-    /// `bundleDependencies` /
-    /// `bundledDependencies` names per version. Per-version because
-    /// the same package's bundling intent can change across releases
-    /// (e.g., a maintainer drops bundling between major versions).
-    /// The resolver skips enqueueing these names as separate installs
-    /// — they're already provided by the parent's tarball. The
-    /// extractor preserves the in-tarball `node_modules/<bundled>/`
-    /// subtree implicitly; without bundled-dependency filtering the resolver also fetches a
-    /// registry copy of the bundled name, which the linker may then
-    /// shadow over the bundled copy depending on hoisting precedence.
-    pub bundled_dep_names: HashMap<String, HashSet<String>>,
-    /// Platform restrictions per version: version_string → PlatformMeta.
-    /// Only populated for versions that declare os/cpu/libc restrictions.
-    pub platform: HashMap<String, PlatformMeta>,
-    /// Distribution info per version: tarball URL and integrity hash.
-    /// Carried through to the download phase to avoid re-fetching metadata.
-    pub dist: HashMap<String, CachedDistInfo>,
-    /// npm-alias dep edges per version. Shape:
-    /// `version_string → { local_name → target_canonical_name }`.
-    /// Only populated for versions whose declared deps include the
-    /// `npm:<target>@<range>` alias syntax. Used by the resolver to
-    /// (a) resolve each aliased dep under its target identity in
-    /// PubGrub, and (b) populate `ResolvedPackage.aliases` so the
-    /// linker can build `node_modules/<local>/` → store entry for
-    /// `<target>@<version>`.
-    pub aliases: HashMap<String, HashMap<String, String>>,
-}
-
 #[derive(Debug)]
 pub(crate) enum SkippedDependencyReason {
     Fetch { detail: String, warn_auth: bool },
@@ -244,123 +148,6 @@ impl SkippedDependency {
             reason,
         }
     }
-}
-
-impl CachedPackageInfo {
-    pub(super) fn remove_shadowed_peer_requirements(&mut self) {
-        let deps = &self.deps;
-        self.peer_deps.retain(|version, peers| {
-            if let Some(regular) = deps.get(version) {
-                peers.retain(|name, _| !regular.contains_key(name));
-            }
-            !peers.is_empty()
-        });
-        self.peer_aliases.retain(|version, aliases| {
-            if let Some(regular) = deps.get(version) {
-                aliases.retain(|name, _| !regular.contains_key(name));
-            }
-            !aliases.is_empty()
-        });
-        self.optional_peer_names.retain(|version, peers| {
-            if let Some(regular) = deps.get(version) {
-                peers.retain(|name| !regular.contains_key(name));
-            }
-            !peers.is_empty()
-        });
-    }
-
-    pub fn needs_metadata_for_range(&self, range: &NpmRange) -> bool {
-        if self.versions_complete {
-            return false;
-        }
-        if !self.workspace_versions.is_empty() {
-            return true;
-        }
-        if let Some(exact) = range.exact_version() {
-            return !self.versions.contains(&exact);
-        }
-        !self.covered_ranges.contains(range.raw())
-            || !self.versions.iter().any(|version| {
-                range.satisfies_with_latest_bound(version, self.latest_version.as_ref())
-            })
-    }
-
-    pub fn workspace_version_satisfies(&self, range: &NpmRange) -> bool {
-        self.workspace_versions
-            .iter()
-            .any(|version| range.satisfies_with_latest_bound(version, self.latest_version.as_ref()))
-    }
-
-    pub fn needs_trust_metadata(&self, policy: &ResolverPolicy) -> bool {
-        policy.requires_trust_history() && !self.trust_metadata_complete
-    }
-
-    pub fn needs_release_time_metadata(
-        &self,
-        package: &CanonicalKey,
-        policy: &ResolverPolicy,
-    ) -> bool {
-        if !policy.release_age_active() || policy.release_age_excluded(package) {
-            return false;
-        }
-        let missing_version_time = self.versions.iter().any(|version| {
-            self.dist
-                .get(&version.to_string())
-                .and_then(|dist| dist.published_at.as_deref())
-                .is_none()
-        });
-        missing_version_time
-            && policy.metadata_modified_after_cutoff_for_package(
-                package,
-                self.modified.as_deref(),
-                self.modified_unix,
-            )
-    }
-
-    pub fn needs_policy_metadata(&self, package: &CanonicalKey, policy: &ResolverPolicy) -> bool {
-        self.needs_trust_metadata(policy) || self.needs_release_time_metadata(package, policy)
-    }
-
-    pub fn needs_platform_metadata(&self) -> bool {
-        !self.platform_metadata_complete
-            && self.platform.values().any(|platform| {
-                platform.libc.is_empty()
-                    && (!platform.os.is_empty() || !platform.cpu.is_empty())
-                    && platform_may_target_linux(&platform.os)
-            })
-    }
-
-    pub fn needs_supplemental_metadata(
-        &self,
-        package: &CanonicalKey,
-        policy: &ResolverPolicy,
-    ) -> bool {
-        self.needs_policy_metadata(package, policy) || self.needs_platform_metadata()
-    }
-}
-
-fn platform_may_target_linux(os: &[String]) -> bool {
-    if os.is_empty() {
-        return true;
-    }
-    if os.iter().any(|entry| entry.starts_with('!')) {
-        return !os.iter().any(|entry| entry == "!linux");
-    }
-    os.iter().any(|entry| entry == "linux")
-}
-
-/// Platform restriction metadata for a specific package version.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PlatformMeta {
-    /// OS restrictions: e.g., ["darwin", "linux"] or ["!win32"].
-    pub os: Vec<String>,
-    /// CPU restrictions: e.g., ["x64", "arm64"] or ["!ia32"].
-    pub cpu: Vec<String>,
-    /// Linux libc restrictions: e.g., ["musl"], ["glibc"], or ["!glibc"].
-    /// Same inclusion / exclusion semantics as `os` / `cpu`, per the npm
-    /// spec at <https://docs.npmjs.com/cli/v9/configuring-npm/package-json#libc>.
-    /// Empty when the manifest declares no libc restriction.
-    pub libc: Vec<String>,
 }
 
 /// The DependencyProvider that bridges PubGrub with LPM's registry.
@@ -442,6 +229,6 @@ pub struct LpmDependencyProvider {
     /// (e.g. a future per-split platform override) can't accidentally
     /// read stale memoized Ranges from a prior pass.
     pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
-    pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, Vec<NpmVersion>>>,
+    pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, Arc<[NpmVersion]>>>,
     pub(super) include_optional_dependencies: bool,
 }

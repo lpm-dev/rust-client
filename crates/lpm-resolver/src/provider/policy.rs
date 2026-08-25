@@ -58,10 +58,7 @@ pub(crate) fn release_age_status_for_version_unprofiled(
     version: &NpmVersion,
     policy: &ResolverPolicy,
 ) -> ReleaseTimeStatus {
-    let published_unix = info
-        .dist
-        .get(&version.to_string())
-        .and_then(|dist| dist.published_at_unix);
+    let published_unix = info.published_at_unix(&version.to_string());
     if published_unix.is_none()
         && policy.metadata_modified_before_or_at_cutoff_for_package(
             package,
@@ -89,13 +86,12 @@ pub(crate) fn trust_downgrade_violation_unprofiled(
     version: &NpmVersion,
 ) -> Option<String> {
     let version_str = version.to_string();
-    let current = info.dist.get(&version_str)?;
-    let published_unix = current.published_at_unix?;
-    let current_evidence = current.trust_evidence;
+    let published_unix = info.published_at_unix(&version_str)?;
+    let current_evidence = info.trust_evidence(&version_str);
     let exclude_prerelease = !version.is_prerelease();
 
     let mut strongest_prior: Option<TrustEvidence> = None;
-    for candidate in &info.versions {
+    for candidate in info.versions.iter() {
         if exclude_prerelease && candidate.is_prerelease() {
             continue;
         }
@@ -103,16 +99,13 @@ pub(crate) fn trust_downgrade_violation_unprofiled(
         if candidate_str == version_str {
             continue;
         }
-        let Some(dist) = info.dist.get(&candidate_str) else {
-            continue;
-        };
-        let Some(candidate_published) = dist.published_at_unix else {
+        let Some(candidate_published) = info.published_at_unix(&candidate_str) else {
             continue;
         };
         if candidate_published >= published_unix {
             continue;
         }
-        let Some(evidence) = dist.trust_evidence else {
+        let Some(evidence) = info.trust_evidence(&candidate_str) else {
             continue;
         };
         if strongest_prior.is_none_or(|prior| evidence > prior) {
@@ -171,11 +164,10 @@ pub(crate) fn select_override_target(
         {
             return Some(OverrideTargetRejection::TrustPolicy(reason));
         }
-        if !info.platform.is_empty()
+        if info.has_platform_metadata()
             && info
-                .platform
-                .get(&version.to_string())
-                .is_some_and(|metadata| !super::platform::is_platform_compatible(metadata))
+                .platform_is_compatible(&version.to_string())
+                .is_some_and(|compatible| !compatible)
         {
             return Some(OverrideTargetRejection::PlatformIncompatible);
         }
@@ -197,7 +189,7 @@ pub(crate) fn select_override_target(
             ..
         } => {
             let mut first_rejection = None;
-            for version in &info.versions {
+            for version in info.versions.iter() {
                 if !target_range.satisfies(version) {
                     continue;
                 }

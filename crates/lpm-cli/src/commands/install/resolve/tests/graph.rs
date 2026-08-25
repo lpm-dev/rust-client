@@ -4,10 +4,10 @@ use super::super::graph::{
     select_or_reuse_node,
 };
 use super::common::{
-    empty_info_value, fake_draft, fake_package, info_with_versions, override_set,
+    fake_draft, fake_package, info_with_dependencies, info_with_versions, override_set,
     resolve_request_for_test,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[test]
@@ -79,10 +79,7 @@ fn optional_reachability_marks_reused_optional_descendants_required() {
 
     let mut optional_parent = fake_draft("optional-parent", "1.0.0", &[("shared", "1.0.0")]);
     optional_parent.package.root_link_names = Some(vec!["optional-parent".to_string()]);
-    let mut optional_parent_info = empty_info_value();
-    optional_parent_info
-        .optional_dep_names
-        .insert("1.0.0".to_string(), HashSet::from(["shared".to_string()]));
+    let optional_parent_info = info_with_dependencies("1.0.0", &[("shared", "1.0.0", true)]);
     optional_parent.info = Arc::new(optional_parent_info);
 
     let mut shared = fake_draft("shared", "1.0.0", &[("leaf", "1.0.0")]);
@@ -124,10 +121,7 @@ fn optional_reachability_keeps_optional_only_subtree_optional() {
     let mut packages = HashMap::new();
     let mut parent = fake_draft("parent", "1.0.0", &[("child", "1.0.0")]);
     parent.package.root_link_names = Some(vec!["parent".to_string()]);
-    let mut parent_info = empty_info_value();
-    parent_info
-        .optional_dep_names
-        .insert("1.0.0".to_string(), HashSet::from(["child".to_string()]));
+    let parent_info = info_with_dependencies("1.0.0", &[("child", "1.0.0", true)]);
     parent.info = Arc::new(parent_info);
 
     let mut child = fake_draft("child", "1.0.0", &[("leaf", "1.0.0")]);

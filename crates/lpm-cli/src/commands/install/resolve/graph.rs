@@ -170,7 +170,7 @@ pub(super) fn select_or_reuse_node(
     if override_set.is_empty()
         && let Some(version) = reusable_existing_version(&request, packages)?
     {
-        let platform = info.platform.get(&version).cloned();
+        let platform = info.platform(&version);
         return Ok(Some(ResolvedNode {
             request,
             version,
@@ -207,7 +207,7 @@ pub(super) fn select_or_reuse_node(
                 }));
             }
         } else if let Some(version) = reusable_existing_version(&request, packages)? {
-            let platform = info.platform.get(&version).cloned();
+            let platform = info.platform(&version);
             return Ok(Some(ResolvedNode {
                 request,
                 version,
@@ -293,7 +293,7 @@ fn select_version_from_info(
     match outcome.selection {
         lpm_resolver::ExperimentalVersionSelection::Picked(version) => {
             let version = version.to_string();
-            let platform = info.platform.get(&version).cloned();
+            let platform = info.platform(&version);
             Ok(Some(SelectedVersion {
                 version,
                 platform,
@@ -371,7 +371,6 @@ pub(super) fn merge_node_into_packages(
             let registry_url = registry_source_url_for(&name, route_table, registry_client);
             let source = format!("registry+{registry_url}");
             let is_lpm = name.starts_with("@lpm.dev/");
-            let dist = node.info.dist.get(&version);
             let mut package = InstallPackage {
                 instance_id: None,
                 dependency_targets: HashMap::new(),
@@ -385,14 +384,14 @@ pub(super) fn merge_node_into_packages(
                 is_direct: node.request.direct,
                 is_lpm,
                 peers: Vec::new(),
-                integrity: dist.and_then(|dist| dist.integrity.clone()),
-                unpacked_size: dist.and_then(|dist| dist.unpacked_size),
-                registry_signatures: dist.map(|dist| dist.signatures.clone()).unwrap_or_default(),
-                registry_published_at: dist.and_then(|dist| dist.published_at.clone()),
+                integrity: node.info.integrity(&version).map(str::to_owned),
+                unpacked_size: node.info.unpacked_size(&version),
+                registry_signatures: node.info.signatures(&version).to_vec(),
+                registry_published_at: node.info.published_at(&version).map(str::to_owned),
                 platform: node.platform.clone(),
-                node_engine: node.info.node_engines.get(&version).cloned(),
+                node_engine: node.info.node_engine(&version).map(str::to_owned),
                 optional: node.request.optional,
-                tarball_url: dist.and_then(|dist| dist.tarball_url.clone()),
+                tarball_url: node.info.tarball_url(&version).map(str::to_owned),
                 metadata_checked_for_tarball: true,
                 manifest_fingerprint: None,
             };
@@ -496,32 +495,23 @@ pub(super) fn enqueue_dependencies(
     stats: &mut ExperimentalResolverStats,
 ) -> Result<(), LpmError> {
     let parent = Some((node.request.target_name.clone(), node.version.clone()));
-    let aliases = node.info.aliases.get(&node.version);
-    let optional_names = node.info.optional_dep_names.get(&node.version);
-    let bundled_names = node.info.bundled_dep_names.get(&node.version);
-    let Some(deps) = node.info.deps.get(&node.version) else {
+    let Some(dependencies) = node.info.dependencies(&node.version) else {
         return Ok(());
     };
-    let mut entries: Vec<(&String, &String)> = deps.iter().collect();
-    entries.sort_by_key(|(name, _)| *name);
-    for (local_name, range) in entries {
-        if bundled_names.is_some_and(|names| names.contains(local_name)) {
+    for dependency in dependencies {
+        if dependency.bundled {
             continue;
         }
-        let target_name = aliases
-            .and_then(|aliases| aliases.get(local_name))
-            .cloned()
-            .unwrap_or_else(|| local_name.clone());
-        let optional =
-            node.request.optional || optional_names.is_some_and(|names| names.contains(local_name));
+        let target_name = dependency.alias.unwrap_or(dependency.name).to_owned();
+        let optional = node.request.optional || dependency.optional;
         if optional && !include_optional_dependencies {
             continue;
         }
         let request = ResolveRequest {
-            local_name: local_name.clone(),
+            local_name: dependency.name.to_owned(),
             root_ancestor: node.request.root_ancestor.clone(),
             target_name,
-            range: range.clone(),
+            range: dependency.range.to_owned(),
             parent: parent.clone(),
             depth: node.request.depth.saturating_add(1),
             optional,
@@ -675,12 +665,8 @@ fn optional_dependency_names_from_drafts(
     packages
         .iter()
         .filter_map(|(identity, draft)| {
-            draft
-                .info
-                .optional_dep_names
-                .get(&draft.package.version)
-                .cloned()
-                .map(|names| (identity.clone(), names))
+            let names = draft.info.optional_dependency_names(&draft.package.version);
+            (!names.is_empty()).then(|| (identity.clone(), names))
         })
         .collect()
 }
@@ -695,8 +681,8 @@ pub(super) fn optional_dependency_names_from_resolver_cache(
             let canonical = lpm_resolver::CanonicalKey::from_dep_name(&package.name);
             resolver_cache
                 .get(&canonical)
-                .and_then(|info| info.optional_dep_names.get(&package.version))
-                .cloned()
+                .map(|info| info.optional_dependency_names(&package.version))
+                .filter(|names| !names.is_empty())
                 .map(|names| ((package.name.clone(), package.version.clone()), names))
         })
         .collect()

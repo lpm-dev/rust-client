@@ -1292,11 +1292,10 @@ fn cached_info_satisfies_peer_requirements(
         reqs.iter().all(|req| {
             req.range
                 .satisfies_with_latest_bound(version, info.latest_version.as_ref())
-        }) && (info.platform.is_empty()
+        }) && (!info.has_platform_metadata()
             || info
-                .platform
-                .get(&version.to_string())
-                .is_none_or(crate::provider::is_platform_compatible))
+                .platform_is_compatible(&version.to_string())
+                .unwrap_or(true))
     })
 }
 

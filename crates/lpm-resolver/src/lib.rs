@@ -51,7 +51,11 @@ pub use package::{CanonicalKey, ResolverPackage};
 pub use policy::{
     ReleaseAgeExclusion, ReleaseTimeStatus, ResolverPolicy, TrustEvidence, TrustPolicyMode,
 };
-pub use provider::{CachedDistInfo, CachedPackageInfo, PlatformMeta, is_platform_compatible};
+pub use provider::{
+    CachedDistInfo, CachedPackageInfo, ManifestDependency, ManifestDependencyIter,
+    ManifestDependencyRef, ManifestPeerDependency, ManifestPeerDependencyIter,
+    ManifestPeerDependencyRef, ManifestVersion, PlatformMeta, is_platform_compatible,
+};
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;
 pub use resolve::{
@@ -83,4 +87,37 @@ pub fn benchmark_parse_full_metadata_to_cache_info(
     metadata: &lpm_registry::PackageMetadata,
 ) -> CachedPackageInfo {
     provider::parse_full_metadata_to_cache_info(metadata)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn benchmark_parse_owned_metadata_to_cache_info(
+    metadata: lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    provider::parse_owned_metadata_to_cache_info(metadata)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn benchmark_parse_owned_full_metadata_to_cache_info(
+    metadata: lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    provider::parse_owned_full_metadata_to_cache_info(metadata)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn benchmark_parse_owned_partial_metadata_to_cache_info(
+    metadata: lpm_registry::PackageMetadata,
+) -> CachedPackageInfo {
+    provider::parse_owned_partial_metadata_to_cache_info(metadata)
+}
+
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn benchmark_merge_cached_package_info(
+    existing: &CachedPackageInfo,
+    incoming: &CachedPackageInfo,
+) -> CachedPackageInfo {
+    provider::merge_cached_package_info(existing, incoming)
 }

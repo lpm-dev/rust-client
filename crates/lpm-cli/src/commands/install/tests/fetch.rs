@@ -164,10 +164,9 @@ fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
     );
     assert_eq!(
         slim.info
-            .deps
-            .get("1.0.0")
-            .and_then(|dependencies| dependencies.get("left-pad")),
-        Some(&"^1.0.0".to_string())
+            .dependency("1.0.0", "left-pad")
+            .map(|dependency| dependency.range),
+        Some("^1.0.0")
     );
 }
 

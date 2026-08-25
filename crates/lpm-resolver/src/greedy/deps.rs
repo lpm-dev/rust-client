@@ -3,10 +3,7 @@ use super::state::ResolveState;
 use super::types::{DepBehavior, Edge, NodeId, PeerRequirement};
 use super::version::is_workspace_specifier;
 
-/// Read `info.deps[version]`, parse each child's range, push edges. Aliases
-/// are looked up in `info.aliases[version]` and rewritten to the target
-/// canonical at edge-creation time so the dispatch loop only ever has
-/// canonical keys to look up.
+/// Read one version's contiguous dependency records and push child edges.
 pub(super) fn enqueue_child_deps(
     parent_id: NodeId,
     parent_canonical: &CanonicalKey,
@@ -15,18 +12,12 @@ pub(super) fn enqueue_child_deps(
     state: &mut ResolveState,
 ) -> Result<(), ResolveError> {
     let ver_str = version.to_string();
-    let aliases = info.aliases.get(&ver_str);
-    let optional_names = info.optional_dep_names.get(&ver_str);
-    let bundled_names = info.bundled_dep_names.get(&ver_str);
     let selected_from_workspace = info.workspace_versions.contains(version);
 
-    if let Some(deps) = info.deps.get(&ver_str) {
-        // Sort for deterministic edge ordering — keeps test diffs stable
-        // and the resolved tree reproducible across runs.
-        let mut entries: Vec<(&String, &String)> = deps.iter().collect();
-        entries.sort_by_key(|(name, _)| *name);
-
-        for (local_name, range_str) in entries {
+    if let Some(dependencies) = info.dependencies(&ver_str) {
+        for dependency in dependencies {
+            let local_name = dependency.name;
+            let range_str = dependency.range;
             // Bundled deps are vendored inside the parent's tarball
             // (`node_modules/<bundled>/` extracted alongside the parent's
             // own files). Skip enqueueing them as separate edges so the
@@ -34,7 +25,7 @@ pub(super) fn enqueue_child_deps(
             // might shadow over the bundled one. The extractor preserves
             // the in-tarball subtree implicitly; the resolver's job is
             // just to NOT introduce a redundant registry fetch.
-            if bundled_names.is_some_and(|s| s.contains(local_name)) {
+            if dependency.bundled {
                 tracing::debug!(
                     "skipping bundled dep {} of {}@{} — provided by parent's tarball",
                     local_name,
@@ -44,12 +35,8 @@ pub(super) fn enqueue_child_deps(
                 continue;
             }
 
-            let canonical = match aliases.and_then(|a| a.get(local_name)) {
-                Some(target) => CanonicalKey::from_dep_name(target),
-                None => CanonicalKey::from_dep_name(local_name),
-            };
-            let optional = state.nodes[parent_id as usize].optional
-                || optional_names.is_some_and(|set| set.contains(local_name));
+            let canonical = CanonicalKey::from_dep_name(dependency.alias.unwrap_or(local_name));
+            let optional = state.nodes[parent_id as usize].optional || dependency.optional;
             if optional && !state.include_optional_dependencies {
                 tracing::debug!(
                     "skipping optional dep {} of {}@{} by install option",
@@ -109,7 +96,7 @@ pub(super) fn enqueue_child_deps(
 
             state.task_queue.push_back(Edge {
                 parent: parent_id,
-                local_name: local_name.clone(),
+                local_name: local_name.to_owned(),
                 canonical,
                 range,
                 behavior: DepBehavior {
@@ -132,20 +119,10 @@ pub(super) fn enqueue_child_deps(
     // Same alias / workspace / range-parse defenses as the regular-deps
     // loop above; bundled-deps gate doesn't apply to peers (npm forbids
     // peerBundle interactions; no real package ships both).
-    if let Some(peer_deps) = info.peer_deps.get(&ver_str) {
-        let optional_peers = info.optional_peer_names.get(&ver_str);
-        let peer_aliases = info.peer_aliases.get(&ver_str);
-        let mut peer_entries: Vec<(&String, &String)> = peer_deps.iter().collect();
-        peer_entries.sort_by_key(|(name, _)| *name);
-
-        for (peer_name, peer_range_str) in peer_entries {
-            if info
-                .deps
-                .get(&ver_str)
-                .is_some_and(|deps| deps.contains_key(peer_name))
-            {
-                continue;
-            }
+    if let Some(peers) = info.peer_dependencies(&ver_str) {
+        for peer in peers {
+            let peer_name = peer.name;
+            let peer_range_str = peer.range;
 
             // `workspace:` peers from a registry-published package
             // shouldn't exist (npm rejects them at publish time).
@@ -164,7 +141,7 @@ pub(super) fn enqueue_child_deps(
                     ver_str,
                     peer_name,
                 );
-                if optional_peers.is_some_and(|set| set.contains(peer_name)) {
+                if peer.optional {
                     continue;
                 }
                 return Err(ResolveError::DependencyFetch {
@@ -180,15 +157,12 @@ pub(super) fn enqueue_child_deps(
             // loop: a `"peer-local": "npm:target@range"` declaration
             // (rare on peers, but legal) keys the requirement on
             // `target` so the resolver consults the correct manifest.
-            let canonical = match peer_aliases.and_then(|a| a.get(peer_name)) {
-                Some(target) => CanonicalKey::from_dep_name(target),
-                None => CanonicalKey::from_dep_name(peer_name),
-            };
+            let canonical = CanonicalKey::from_dep_name(peer.alias.unwrap_or(peer_name));
 
             let range = match NpmRange::parse(peer_range_str) {
                 Ok(r) => r,
                 Err(e) => {
-                    if !optional_peers.is_some_and(|set| set.contains(peer_name)) {
+                    if !peer.optional {
                         return Err(ResolveError::DependencyFetch {
                             package: parent_canonical.to_string(),
                             version: ver_str,
@@ -208,14 +182,12 @@ pub(super) fn enqueue_child_deps(
                 }
             };
 
-            let optional = optional_peers.is_some_and(|set| set.contains(peer_name));
-
             state.peer_requirements.push(PeerRequirement {
                 consumer: parent_id,
-                peer_name: peer_name.clone(),
+                peer_name: peer_name.to_owned(),
                 canonical,
                 range,
-                optional,
+                optional: peer.optional,
             });
             state.work_stats.peer_requirement_count =
                 state.work_stats.peer_requirement_count.saturating_add(1);

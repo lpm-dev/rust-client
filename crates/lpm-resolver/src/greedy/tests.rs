@@ -122,55 +122,43 @@ fn version_document_json(name: &str, version: &str, deps: &[(&str, &str)]) -> se
 /// `versions` are passed already in descending order to mirror
 /// `parse_metadata_to_cache_info`'s contract.
 fn mk_info(versions: &[&str], deps_of_latest: &[(&str, &str)]) -> CachedPackageInfo {
-    let parsed: Vec<NpmVersion> = versions
+    let mut manifests: Vec<crate::provider::ManifestVersion> = versions
         .iter()
-        .map(|v| NpmVersion::parse(v).unwrap())
+        .map(|version| crate::provider::ManifestVersion {
+            version: NpmVersion::parse(version).unwrap(),
+            dependencies: Vec::new(),
+            peer_dependencies: Vec::new(),
+            node_engine: None,
+            platform: None,
+            dist: CachedDistInfo {
+                tarball_url: Some(format!("https://example.invalid/{version}.tgz")),
+                integrity: Some(format!("sha512-fake-{version}")),
+                ..CachedDistInfo::default()
+            },
+        })
         .collect();
-    let mut deps_map = HashMap::new();
-    let mut latest_deps = HashMap::new();
-    for (n, r) in deps_of_latest {
-        latest_deps.insert(n.to_string(), r.to_string());
-    }
-    if let Some(latest) = versions.first() {
-        deps_map.insert(latest.to_string(), latest_deps);
-    }
-    CachedPackageInfo {
-        modified: None,
-        modified_unix: None,
-        trust_metadata_complete: false,
-        versions_complete: true,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::new(),
-        platform_metadata_complete: true,
-        latest_version: None,
-        versions: parsed,
-        deps: deps_map,
-        peer_deps: HashMap::new(),
-        peer_aliases: HashMap::new(),
-        optional_dep_names: HashMap::new(),
-        optional_peer_names: HashMap::new(),
-        node_engines: HashMap::new(),
-        bundled_dep_names: HashMap::new(),
-        platform: HashMap::new(),
-        dist: versions
+    if let Some(latest) = manifests.first_mut() {
+        latest.dependencies = deps_of_latest
             .iter()
-            .map(|v| {
-                (
-                    v.to_string(),
-                    CachedDistInfo {
-                        tarball_url: Some(format!("https://example.invalid/{}.tgz", v)),
-                        integrity: Some(format!("sha512-fake-{}", v)),
-                        unpacked_size: None,
-                        signatures: Vec::new(),
-                        published_at: None,
-                        published_at_unix: None,
-                        trust_evidence: None,
-                    },
-                )
+            .map(|(name, range)| crate::provider::ManifestDependency {
+                name: (*name).to_owned(),
+                range: (*range).to_owned(),
+                alias: None,
+                optional: false,
+                bundled: false,
             })
-            .collect(),
-        aliases: HashMap::new(),
+            .collect();
     }
+    CachedPackageInfo::from_manifest_versions(
+        None,
+        false,
+        true,
+        HashSet::new(),
+        HashSet::new(),
+        true,
+        None,
+        manifests,
+    )
 }
 
 fn edge_for_range(name: &str, range: &str) -> Edge {
@@ -259,9 +247,8 @@ fn successful_registry_metadata_replaces_same_version_workspace_metadata() {
         insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(registry));
 
     assert!(selected.workspace_versions.is_empty());
-    let dependencies = &selected.deps["1.0.0"];
-    assert!(dependencies.contains_key("registry-child"));
-    assert!(!dependencies.contains_key("local-child"));
+    assert!(selected.dependency("1.0.0", "registry-child").is_some());
+    assert!(selected.dependency("1.0.0", "local-child").is_none());
 }
 
 #[test]
@@ -301,18 +288,14 @@ fn complete_base_metadata_does_not_discard_existing_policy_hydration() {
     let canonical = CanonicalKey::npm("policy-hydrated");
     let mut hydrated = mk_info(&["1.0.0"], &[]);
     hydrated.trust_metadata_complete = true;
-    hydrated.dist.get_mut("1.0.0").unwrap().published_at =
-        Some("2026-07-20T17:38:38.286Z".to_string());
+    set_published_at(&mut hydrated, "1.0.0", "2026-07-20T17:38:38.286Z");
     insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), Arc::new(hydrated));
 
     let base = mk_info(&["1.0.0"], &[]);
     let merged = insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(base));
 
     assert_eq!(
-        merged
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        merged.published_at("1.0.0"),
         Some("2026-07-20T17:38:38.286Z")
     );
     assert!(merged.trust_metadata_complete);
@@ -325,21 +308,13 @@ fn merging_cached_metadata_regular_dependency_shadows_same_named_peer_requiremen
     let regular = mk_info(&["1.0.0"], &[("zod", "^4.3.6")]);
     insert_or_merge_cached_package_info(&shared_cache, canonical.clone(), Arc::new(regular));
 
-    let mut peer_fragment = mk_info(&["1.0.0"], &[]);
+    let mut peer_fragment = mk_info_with_peers(&["1.0.0"], &[], &[("zod", "^4.0.0")], &[]);
     peer_fragment.versions_complete = false;
-    peer_fragment.deps.remove("1.0.0");
-    peer_fragment.peer_deps.insert(
-        "1.0.0".to_string(),
-        HashMap::from([("zod".to_string(), "^4.0.0".to_string())]),
-    );
     let merged =
         insert_or_merge_cached_package_info(&shared_cache, canonical, Arc::new(peer_fragment));
 
     assert!(
-        !merged
-            .peer_deps
-            .get("1.0.0")
-            .is_some_and(|peers| peers.contains_key("zod")),
+        merged.peer_dependency("1.0.0", "zod").is_none(),
         "a partial metadata merge must preserve regular-dependency precedence"
     );
 }
@@ -404,15 +379,13 @@ fn importer_policy_hydration_does_not_mutate_the_shared_base_fact() {
     assert!(Arc::ptr_eq(&importer, &base));
 
     let mut hydrated = (*importer).clone();
-    hydrated.dist.get_mut("1.0.0").unwrap().published_at =
-        Some("2025-01-01T00:00:00.000Z".to_string());
+    set_published_at(&mut hydrated, "1.0.0", "2025-01-01T00:00:00.000Z");
     importer_cache.insert(canonical.clone(), Arc::new(hydrated));
 
     assert!(
         shared_facts
             .get(&canonical)
-            .and_then(|fact| fact.dist.get("1.0.0").cloned())
-            .is_some_and(|dist| dist.published_at.is_none())
+            .is_some_and(|fact| fact.published_at("1.0.0").is_none())
     );
 }
 
@@ -429,10 +402,8 @@ fn parse_fetched_metadata_preserves_speculation_when_enabled() {
     assert_eq!(
         speculation
             .info
-            .deps
-            .get("1.0.0")
-            .and_then(|dependencies| dependencies.get("left-pad"))
-            .map(String::as_str),
+            .dependency("1.0.0", "left-pad")
+            .map(|dependency| dependency.range),
         Some("^1.0.0")
     );
 }
@@ -493,9 +464,20 @@ fn find_best_version_handles_exact_pin() {
 }
 
 fn set_published_at(info: &mut CachedPackageInfo, version: &str, published_at: &str) {
-    let dist = info.dist.get_mut(version).unwrap();
-    dist.published_at = Some(published_at.to_string());
-    dist.published_at_unix = parse_npm_time_unix(published_at);
+    assert!(info.update_manifest_version(version, |manifest| {
+        manifest.dist.published_at = Some(published_at.to_string());
+        manifest.dist.published_at_unix = parse_npm_time_unix(published_at);
+    }));
+}
+
+fn set_trust_evidence(
+    info: &mut CachedPackageInfo,
+    version: &str,
+    evidence: crate::policy::TrustEvidence,
+) {
+    assert!(info.update_manifest_version(version, |manifest| {
+        manifest.dist.trust_evidence = Some(evidence);
+    }));
 }
 
 #[test]
@@ -716,10 +698,15 @@ async fn preferred_tree_compatible_version_uses_bounded_release_age_lookahead() 
     let parent = CanonicalKey::npm("parent");
     let child = CanonicalKey::npm("child");
     let mut parent_info = mk_info(&["1.1.0", "1.0.0"], &[("child", "^2.0.0")]);
-    parent_info.deps.insert(
-        "1.0.0".to_string(),
-        HashMap::from_iter([("child".to_string(), "^1.0.0".to_string())]),
-    );
+    assert!(parent_info.update_manifest_version("1.0.0", |manifest| {
+        manifest.dependencies = vec![crate::provider::ManifestDependency {
+            name: "child".to_string(),
+            range: "^1.0.0".to_string(),
+            alias: None,
+            optional: false,
+            bundled: false,
+        }];
+    }));
     set_published_at(&mut parent_info, "1.1.0", "2025-01-01T00:00:00.000Z");
     set_published_at(&mut parent_info, "1.0.0", "2025-01-01T00:00:00.000Z");
     let mut child_info = mk_info(&["2.0.0", "1.0.0"], &[]);
@@ -824,11 +811,7 @@ async fn fetch_metadata_refetches_full_packument_when_release_age_needs_publish_
         .expect("policy fetch should escalate to full metadata");
 
     assert_eq!(
-        fetched
-            .info
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        fetched.info.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
 }
@@ -884,14 +867,7 @@ async fn fetch_metadata_skips_release_times_when_package_modified_before_cutoff(
         .await
         .expect("old modified timestamp should satisfy release-age without full metadata");
 
-    assert_eq!(
-        fetched
-            .info
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
-        None
-    );
+    assert_eq!(fetched.info.published_at("1.0.0"), None);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1011,18 +987,12 @@ async fn fetch_metadata_merges_release_times_without_rehydrating_versions() {
     assert_eq!(
         fetched
             .info
-            .deps
-            .get("1.0.0")
-            .and_then(|deps| deps.get("child"))
-            .map(String::as_str),
+            .dependency("1.0.0", "child")
+            .map(|dependency| dependency.range),
         Some("^2.0.0")
     );
     assert_eq!(
-        fetched
-            .info
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        fetched.info.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
 }
@@ -1127,11 +1097,7 @@ async fn fetch_metadata_uses_direct_full_when_worker_full_omits_release_time() {
 
     assert_eq!(worker_requests.load(Ordering::SeqCst), 2);
     assert_eq!(
-        fetched
-            .info
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        fetched.info.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
 }
@@ -1142,9 +1108,8 @@ fn find_best_version_ignores_platform_when_selecting_version() {
     // portable. The newest semver-satisfying version wins even when
     // it is incompatible with the current host.
     let mut info = mk_info(&["1.0.0"], &[]);
-    info.platform.insert(
-        "1.0.0".to_string(),
-        crate::provider::PlatformMeta {
+    assert!(info.update_manifest_version("1.0.0", |manifest| {
+        manifest.platform = Some(crate::provider::PlatformMeta {
             os: vec![
                 "!darwin".to_string(),
                 "!linux".to_string(),
@@ -1158,8 +1123,8 @@ fn find_best_version_ignores_platform_when_selecting_version() {
             ],
             cpu: vec![],
             libc: vec![],
-        },
-    );
+        });
+    }));
     let range = NpmRange::parse("^1.0.0").unwrap();
     assert_eq!(
         picked(find_best_version(&info, &range)).to_string(),
@@ -1171,8 +1136,11 @@ fn find_best_version_ignores_platform_when_selecting_version() {
 fn find_best_version_skips_trust_downgrade_when_older_candidate_satisfies_range() {
     let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
     set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
-    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
-        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_trust_evidence(
+        &mut info,
+        "1.0.0",
+        crate::policy::TrustEvidence::TrustedPublisher,
+    );
     set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
     let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
     let range = NpmRange::parse("^1.0.0").unwrap();
@@ -1193,8 +1161,11 @@ fn find_best_version_skips_trust_downgrade_when_older_candidate_satisfies_range(
 fn find_best_version_blocks_exact_trust_downgrade() {
     let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
     set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
-    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
-        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_trust_evidence(
+        &mut info,
+        "1.0.0",
+        crate::policy::TrustEvidence::TrustedPublisher,
+    );
     set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
     let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
     let range = NpmRange::parse("1.1.0").unwrap();
@@ -1209,8 +1180,11 @@ fn find_best_version_blocks_exact_trust_downgrade() {
 fn find_best_version_unprofiled_does_not_record_policy_checks() {
     let mut info = mk_info(&["1.1.0", "1.0.0"], &[]);
     set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
-    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
-        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_trust_evidence(
+        &mut info,
+        "1.0.0",
+        crate::policy::TrustEvidence::TrustedPublisher,
+    );
     set_published_at(&mut info, "1.1.0", "2025-01-02T00:00:00.000Z");
     let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
     let range = NpmRange::parse("1.1.0").unwrap();
@@ -2112,14 +2086,15 @@ fn enqueue_child_deps_skips_bundled_names() {
     // resolver must NOT enqueue `lodash` as a separate edge —
     // it's vendored inside the parent's tarball — but must still
     // enqueue `react`.
-    let mut info = mk_info(&["1.0.0"], &[]);
-    let mut deps_of_latest = HashMap::new();
-    deps_of_latest.insert("lodash".to_string(), "^4.0.0".to_string());
-    deps_of_latest.insert("react".to_string(), "^18.0.0".to_string());
-    info.deps.insert("1.0.0".to_string(), deps_of_latest);
-    let mut bundled = HashSet::new();
-    bundled.insert("lodash".to_string());
-    info.bundled_dep_names.insert("1.0.0".to_string(), bundled);
+    let mut info = mk_info(&["1.0.0"], &[("lodash", "^4.0.0"), ("react", "^18.0.0")]);
+    assert!(info.update_manifest_version("1.0.0", |manifest| {
+        manifest
+            .dependencies
+            .iter_mut()
+            .find(|dependency| dependency.name == "lodash")
+            .expect("lodash fixture dependency")
+            .bundled = true;
+    }));
 
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     state.nodes.push(ResolvedNodeBuilder {
@@ -2154,11 +2129,7 @@ fn enqueue_child_deps_no_bundled_names_unchanged() {
     // Sanity baseline: with no bundleDependencies, every dep
     // gets enqueued (the no-bundling fast path is byte-identical
     // to the unbundled fast path).
-    let mut info = mk_info(&["1.0.0"], &[]);
-    let mut deps_of_latest = HashMap::new();
-    deps_of_latest.insert("lodash".to_string(), "^4.0.0".to_string());
-    deps_of_latest.insert("react".to_string(), "^18.0.0".to_string());
-    info.deps.insert("1.0.0".to_string(), deps_of_latest);
+    let info = mk_info(&["1.0.0"], &[("lodash", "^4.0.0"), ("react", "^18.0.0")]);
     // No bundled_dep_names entry for 1.0.0.
 
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
@@ -2188,15 +2159,18 @@ fn enqueue_child_deps_no_bundled_names_unchanged() {
 
 #[test]
 fn enqueue_child_deps_omits_optional_dependencies_when_disabled() {
-    let mut info = mk_info(&["1.0.0"], &[]);
-    let mut deps_of_latest = HashMap::new();
-    deps_of_latest.insert("required-child".to_string(), "^1.0.0".to_string());
-    deps_of_latest.insert("optional-child".to_string(), "^2.0.0".to_string());
-    info.deps.insert("1.0.0".to_string(), deps_of_latest);
-    let mut optional = HashSet::new();
-    optional.insert("optional-child".to_string());
-    info.optional_dep_names
-        .insert("1.0.0".to_string(), optional);
+    let mut info = mk_info(
+        &["1.0.0"],
+        &[("required-child", "^1.0.0"), ("optional-child", "^2.0.0")],
+    );
+    assert!(info.update_manifest_version("1.0.0", |manifest| {
+        manifest
+            .dependencies
+            .iter_mut()
+            .find(|dependency| dependency.name == "optional-child")
+            .expect("optional-child fixture dependency")
+            .optional = true;
+    }));
 
     let mut state = ResolveState::new_with_options(HashMap::new(), OverrideSet::empty(), false);
     state.nodes.push(ResolvedNodeBuilder {
@@ -2247,11 +2221,10 @@ fn seed_root_edges_rejects_workspace_specifier() {
 
 #[test]
 fn enqueue_child_deps_rejects_required_workspace_specifier() {
-    let mut info = mk_info(&["1.0.0"], &[]);
-    let mut deps_of_latest = HashMap::new();
-    deps_of_latest.insert("workspace-leak".to_string(), "workspace:^1".to_string());
-    deps_of_latest.insert("plain-dep".to_string(), "^2.0.0".to_string());
-    info.deps.insert("1.0.0".to_string(), deps_of_latest);
+    let info = mk_info(
+        &["1.0.0"],
+        &[("workspace-leak", "workspace:^1"), ("plain-dep", "^2.0.0")],
+    );
 
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     state.nodes.push(ResolvedNodeBuilder {
@@ -2331,11 +2304,7 @@ fn enqueue_child_deps_rejects_workspace_edge_for_unmarked_selected_version() {
 
 #[test]
 fn enqueue_child_deps_rejects_invalid_required_range() {
-    let mut info = mk_info(&["1.0.0"], &[]);
-    info.deps.insert(
-        "1.0.0".to_string(),
-        HashMap::from([("malformed-child".to_string(), "not-a-range".to_string())]),
-    );
+    let info = mk_info(&[("1.0.0")], &[("malformed-child", "not-a-range")]);
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     state.nodes.push(ResolvedNodeBuilder {
         canonical: CanonicalKey::npm("parent"),
@@ -2402,19 +2371,21 @@ fn mk_info_with_peers(
     let Some(latest) = versions.first() else {
         return info;
     };
-    let mut peer_map = HashMap::new();
-    for (n, r) in peers_of_latest {
-        peer_map.insert(n.to_string(), r.to_string());
-    }
-    info.peer_deps.insert(latest.to_string(), peer_map);
-    if !optional_peers_of_latest.is_empty() {
-        let mut optional = HashSet::new();
-        for n in optional_peers_of_latest {
-            optional.insert(n.to_string());
-        }
-        info.optional_peer_names
-            .insert(latest.to_string(), optional);
-    }
+    let optional_peers = optional_peers_of_latest
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert!(info.update_manifest_version(latest, |manifest| {
+        manifest.peer_dependencies = peers_of_latest
+            .iter()
+            .map(|(name, range)| crate::provider::ManifestPeerDependency {
+                name: (*name).to_owned(),
+                range: (*range).to_owned(),
+                alias: None,
+                optional: optional_peers.contains(name),
+            })
+            .collect();
+    }));
     info
 }
 
@@ -2467,8 +2438,7 @@ fn peer_collection_records_one_requirement_per_peer() {
 
 #[test]
 fn peer_collection_runs_when_sparse_cache_omits_empty_dependency_entry() {
-    let mut info = mk_info_with_peers(&["1.0.0"], &[], &[("react", "^18.0.0")], &[]);
-    info.deps.remove("1.0.0");
+    let info = mk_info_with_peers(&["1.0.0"], &[], &[("react", "^18.0.0")], &[]);
 
     let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
 
@@ -2573,10 +2543,13 @@ fn peer_collection_alias_aware() {
     // manifest, while preserving the local `peer_name = "my-react"`
     // for the eventual `ResolvedPackage.peers` edge label.
     let mut info = mk_info_with_peers(&["1.0.0"], &[], &[("my-react", "^18.0.0")], &[]);
-    // Inject the alias map for the latest version.
-    let mut aliases = HashMap::new();
-    aliases.insert("my-react".to_string(), "react".to_string());
-    info.peer_aliases.insert("1.0.0".to_string(), aliases);
+    assert!(info.update_manifest_version("1.0.0", |manifest| {
+        manifest
+            .peer_dependencies
+            .first_mut()
+            .expect("peer alias fixture")
+            .alias = Some("react".to_string());
+    }));
 
     let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
     assert_eq!(state.peer_requirements.len(), 1);
@@ -3604,8 +3577,11 @@ async fn peer_drain_best_effort_skips_a_trust_downgrade_candidate() {
 
     let mut info = mk_info(&["2.0.0", "1.0.0"], &[]);
     set_published_at(&mut info, "1.0.0", "2025-01-01T00:00:00.000Z");
-    info.dist.get_mut("1.0.0").unwrap().trust_evidence =
-        Some(crate::policy::TrustEvidence::TrustedPublisher);
+    set_trust_evidence(
+        &mut info,
+        "1.0.0",
+        crate::policy::TrustEvidence::TrustedPublisher,
+    );
     set_published_at(&mut info, "2.0.0", "2025-01-02T00:00:00.000Z");
     let info = Arc::new(info);
 
@@ -5647,8 +5623,7 @@ async fn fusion_strict_release_age_selection_is_independent_of_persistent_cache_
 async fn fusion_auto_installs_peer_when_sparse_cache_omits_empty_dependency_entry() {
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
 
-    let mut peer_host = mk_info_with_peers(&["1.0.0"], &[], &[("ghost-peer", "^1.0.0")], &[]);
-    peer_host.deps.remove("1.0.0");
+    let peer_host = mk_info_with_peers(&["1.0.0"], &[], &[("ghost-peer", "^1.0.0")], &[]);
     shared_cache.insert(CanonicalKey::npm("peer-host"), Arc::new(peer_host));
     shared_cache.insert(
         CanonicalKey::npm("ghost-peer"),
@@ -6761,10 +6736,7 @@ async fn trace_metadata_fetch_records_cached_release_time_policy_followup() {
     .expect("cached release-age policy follow-up should hydrate publish times");
 
     assert_eq!(
-        hydrated
-            .dist
-            .get("1.0.0")
-            .and_then(|dist| dist.published_at.as_deref()),
+        hydrated.published_at("1.0.0"),
         Some("2025-01-01T00:00:00.000Z")
     );
     let snapshot = lpm_registry::timing::snapshot_metadata_fetch_detail();

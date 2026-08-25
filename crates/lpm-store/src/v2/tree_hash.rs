@@ -1150,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_tree_digest_is_independent_of_extraction_entry_order() {
+    fn streamed_content_digest_ignores_extraction_order_and_directory_timestamps() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("lib")).unwrap();
         std::fs::write(dir.path().join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
@@ -1162,6 +1162,12 @@ mod tests {
         ]);
         let forward = forward.finish(dir.path()).unwrap();
 
+        filetime::set_file_mtime(
+            dir.path().join("lib"),
+            filetime::FileTime::from_unix_time(1, 0),
+        )
+        .unwrap();
+
         let reverse = StreamedTreeBuilder::from_extraction(vec![
             fixture_file("lib/index.js", b"module.exports = 1;\n"),
             fixture_file("package.json", b"{\"name\":\"fixture\"}"),
@@ -1169,7 +1175,7 @@ mod tests {
         let reverse = reverse.finish(dir.path()).unwrap();
 
         assert_eq!(forward.content, reverse.content);
-        assert_eq!(forward.metadata, reverse.metadata);
+        assert_ne!(forward.metadata, reverse.metadata);
         assert_eq!(forward.content_schema, TreeContentSchema::EntryDigestV2);
     }
 

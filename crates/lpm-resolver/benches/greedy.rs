@@ -37,10 +37,11 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dashmap::DashMap;
 use lpm_registry::{NpmrcConfig, RegistryClient, RouteMode, RouteTable};
 use lpm_resolver::{
-    CachedPackageInfo, CanonicalKey, NotifyMap, NpmVersion, OverrideSet, SharedCache,
-    StreamingBfsMetrics, WalkerDone, resolve_with_shared_cache,
+    CachedDistInfo, CachedPackageInfo, CanonicalKey, ManifestDependency, ManifestVersion,
+    NotifyMap, NpmVersion, OverrideSet, SharedCache, StreamingBfsMetrics, WalkerDone,
+    resolve_with_shared_cache,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -69,48 +70,43 @@ fn make_graph(n: usize) -> (SharedCache, HashMap<String, String>) {
         let canonical = CanonicalKey::Npm { name };
 
         // Versions descending: N_VERSIONS.0.0 → 1.0.0 (resolver picks highest-first)
-        let versions: Vec<NpmVersion> = (1..=N_VERSIONS)
+        let manifests = (1..=N_VERSIONS)
             .rev()
-            .map(|m| NpmVersion::new(m, 0, 0))
+            .map(|major| ManifestVersion {
+                version: NpmVersion::new(major, 0, 0),
+                dependencies: if major == N_VERSIONS {
+                    // Highest version depends on up to 3 packages with lower indices.
+                    // Creates diamond deps: pkg-10 and pkg-11 both depend on pkg-8,
+                    // which the resolver resolves once and reuses (realistic graph pressure).
+                    (i.saturating_sub(3)..i)
+                        .map(|j| ManifestDependency {
+                            name: format!("pkg-{j}"),
+                            range: format!("^{N_VERSIONS}.0.0"),
+                            alias: None,
+                            optional: false,
+                            bundled: false,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                peer_dependencies: Vec::new(),
+                node_engine: None,
+                platform: None,
+                dist: CachedDistInfo::default(),
+            })
             .collect();
 
-        let top = format!("{N_VERSIONS}.0.0");
-
-        // Highest version depends on up to 3 packages with lower indices.
-        // Creates diamond deps: pkg-10 and pkg-11 both depend on pkg-8,
-        // which the resolver resolves once and reuses (realistic graph pressure).
-        let top_deps: HashMap<String, String> = (i.saturating_sub(3)..i)
-            .map(|j| (format!("pkg-{j}"), format!("^{N_VERSIONS}.0.0")))
-            .collect();
-
-        let mut deps: HashMap<String, HashMap<String, String>> = HashMap::new();
-        deps.insert(top, top_deps);
-        // Lower versions have no deps — version scan terminates at the top version
-        for major in 1..N_VERSIONS {
-            deps.insert(format!("{major}.0.0"), HashMap::new());
-        }
-
-        let info = CachedPackageInfo {
-            modified: None,
-            modified_unix: None,
-            trust_metadata_complete: false,
-            versions_complete: true,
-            covered_ranges: std::collections::HashSet::new(),
-            workspace_versions: std::collections::HashSet::new(),
-            platform_metadata_complete: true,
-            latest_version: None,
-            versions,
-            deps,
-            peer_deps: HashMap::new(),
-            peer_aliases: HashMap::new(),
-            optional_dep_names: HashMap::new(),
-            optional_peer_names: HashMap::new(),
-            node_engines: HashMap::new(),
-            bundled_dep_names: HashMap::new(),
-            platform: HashMap::new(),
-            dist: HashMap::new(),
-            aliases: HashMap::new(),
-        };
+        let info = CachedPackageInfo::from_manifest_versions(
+            None,
+            false,
+            true,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            None,
+            manifests,
+        );
 
         cache.insert(canonical, Arc::new(info));
     }

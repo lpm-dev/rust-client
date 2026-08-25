@@ -1526,43 +1526,35 @@ fn resolved_to_install_packages_carries_registry_signature_metadata() {
         keyid: Some("SHA256:test-key".to_string()),
         sig: Some("base64-signature".to_string()),
     };
-    let mut dist = HashMap::new();
-    dist.insert(
-        "1.0.0".to_string(),
-        lpm_resolver::CachedDistInfo {
-            tarball_url: Some("https://registry.npmjs.org/signed/-/signed-1.0.0.tgz".into()),
-            integrity: Some(VALID_SHA512_SRI.to_string()),
-            unpacked_size: None,
-            signatures: vec![signature.clone()],
-            published_at: Some("2026-01-02T03:04:05.000Z".to_string()),
-            published_at_unix: Some(1_767_323_045),
-            trust_evidence: None,
-        },
-    );
+    let dist = lpm_resolver::CachedDistInfo {
+        tarball_url: Some("https://registry.npmjs.org/signed/-/signed-1.0.0.tgz".into()),
+        integrity: Some(VALID_SHA512_SRI.to_string()),
+        unpacked_size: None,
+        signatures: vec![signature.clone()],
+        published_at: Some("2026-01-02T03:04:05.000Z".to_string()),
+        published_at_unix: Some(1_767_323_045),
+        trust_evidence: None,
+    };
     let mut resolver_cache = HashMap::new();
     resolver_cache.insert(
         lpm_resolver::CanonicalKey::npm("signed"),
-        Arc::new(lpm_resolver::CachedPackageInfo {
-            modified: None,
-            modified_unix: None,
-            trust_metadata_complete: false,
-            versions_complete: true,
-            covered_ranges: std::collections::HashSet::new(),
-            workspace_versions: std::collections::HashSet::new(),
-            platform_metadata_complete: true,
-            latest_version: None,
-            versions: vec![NpmVersion::parse("1.0.0").unwrap()],
-            deps: HashMap::new(),
-            peer_deps: HashMap::new(),
-            peer_aliases: HashMap::new(),
-            optional_dep_names: HashMap::new(),
-            optional_peer_names: HashMap::new(),
-            node_engines: HashMap::new(),
-            bundled_dep_names: HashMap::new(),
-            platform: HashMap::new(),
-            dist,
-            aliases: HashMap::new(),
-        }),
+        Arc::new(lpm_resolver::CachedPackageInfo::from_manifest_versions(
+            None,
+            false,
+            true,
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+            true,
+            None,
+            vec![lpm_resolver::ManifestVersion {
+                version: NpmVersion::parse("1.0.0").unwrap(),
+                dependencies: Vec::new(),
+                peer_dependencies: Vec::new(),
+                node_engine: None,
+                platform: None,
+                dist,
+            }],
+        )),
     );
 
     let resolved = vec![fake_resolved("signed", "1.0.0", None)];

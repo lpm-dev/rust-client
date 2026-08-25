@@ -245,13 +245,13 @@ pub(super) fn collect_peer_requirements(
     let mut requirements = Vec::new();
     for draft in packages.values() {
         let version = &draft.package.version;
-        let Some(peer_deps) = draft.info.peer_deps.get(version) else {
+        let Some(peer_dependencies) = draft.info.peer_dependencies(version) else {
             continue;
         };
-        let aliases = draft.info.peer_aliases.get(version);
-        let optional_peers = draft.info.optional_peer_names.get(version);
-        for (peer_name, peer_range) in peer_deps {
-            let optional = optional_peers.is_some_and(|peers| peers.contains(peer_name));
+        for peer in peer_dependencies {
+            let peer_name = peer.name;
+            let peer_range = peer.range;
+            let optional = peer.optional;
             let range = match lpm_resolver::NpmRange::parse(peer_range) {
                 Ok(range) => range,
                 Err(_) if optional => continue,
@@ -262,10 +262,7 @@ pub(super) fn collect_peer_requirements(
                     )));
                 }
             };
-            let target_name = aliases
-                .and_then(|aliases| aliases.get(peer_name))
-                .cloned()
-                .unwrap_or_else(|| peer_name.clone());
+            let target_name = peer.alias.unwrap_or(peer_name).to_owned();
             requirements.push(PeerRequirement {
                 target_name,
                 range,
@@ -310,7 +307,7 @@ fn peer_version_satisfying_most(
     reqs: &[PeerRequirement],
 ) -> Option<lpm_resolver::NpmVersion> {
     let mut best: Option<(lpm_resolver::NpmVersion, usize)> = None;
-    for version in &info.versions {
+    for version in info.versions.iter() {
         if !platform_allows_peer_version(info, version) {
             continue;
         }
@@ -332,9 +329,8 @@ fn platform_allows_peer_version(
     info: &lpm_resolver::CachedPackageInfo,
     version: &lpm_resolver::NpmVersion,
 ) -> bool {
-    info.platform
-        .get(&version.to_string())
-        .is_none_or(lpm_resolver::is_platform_compatible)
+    info.platform_is_compatible(&version.to_string())
+        .unwrap_or(true)
 }
 
 pub(super) fn attach_peer_edges_to_drafts(
@@ -355,23 +351,21 @@ pub(super) fn attach_peer_edges_to_drafts(
         });
 
     for draft in packages.values_mut() {
-        let Some(peer_deps) = draft.info.peer_deps.get(&draft.package.version) else {
+        let Some(peer_dependencies) = draft.info.peer_dependencies(&draft.package.version) else {
             draft.package.peers.clear();
             continue;
         };
-        let mut peers = Vec::with_capacity(peer_deps.len());
-        let peer_aliases = draft.info.peer_aliases.get(&draft.package.version);
-        let optional_peers = draft.info.optional_peer_names.get(&draft.package.version);
-        for (peer_name, peer_range) in peer_deps {
-            let target_name = peer_aliases
-                .and_then(|aliases| aliases.get(peer_name))
-                .unwrap_or(peer_name);
+        let mut peers = Vec::with_capacity(peer_dependencies.len());
+        for peer in peer_dependencies {
+            let peer_name = peer.name;
+            let peer_range = peer.range;
+            let target_name = peer.alias.unwrap_or(peer_name);
             let Some(candidates) = available.get(target_name) else {
                 continue;
             };
             let range = match lpm_resolver::NpmRange::parse(peer_range) {
                 Ok(range) => range,
-                Err(_) if optional_peers.is_some_and(|peers| peers.contains(peer_name)) => continue,
+                Err(_) if peer.optional => continue,
                 Err(error) => {
                     return Err(LpmError::Registry(format!(
                         "experimental resolver: invalid required peer range {peer_range:?} for {peer_name:?} declared by {}@{}: {error}",

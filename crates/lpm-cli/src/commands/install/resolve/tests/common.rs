@@ -35,27 +35,9 @@ pub(super) fn fake_package(name: &str, version: &str, deps: &[(&str, &str)]) -> 
 }
 
 pub(super) fn empty_info_value() -> lpm_resolver::CachedPackageInfo {
-    lpm_resolver::CachedPackageInfo {
-        modified: None,
-        modified_unix: None,
-        trust_metadata_complete: false,
-        versions_complete: true,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::new(),
-        platform_metadata_complete: true,
-        latest_version: None,
-        versions: Vec::new(),
-        deps: HashMap::new(),
-        peer_deps: HashMap::new(),
-        peer_aliases: HashMap::new(),
-        optional_dep_names: HashMap::new(),
-        optional_peer_names: HashMap::new(),
-        node_engines: HashMap::new(),
-        bundled_dep_names: HashMap::new(),
-        platform: HashMap::new(),
-        dist: HashMap::new(),
-        aliases: HashMap::new(),
-    }
+    let mut info = lpm_resolver::CachedPackageInfo::empty();
+    info.platform_metadata_complete = true;
+    info
 }
 
 pub(super) fn empty_info() -> Arc<lpm_resolver::CachedPackageInfo> {
@@ -94,12 +76,78 @@ pub(super) fn resolve_request_for_test(
 }
 
 pub(super) fn info_with_versions(versions: &[&str]) -> lpm_resolver::CachedPackageInfo {
-    let mut info = empty_info_value();
-    info.versions = versions
+    let manifests = versions
         .iter()
-        .map(|version| lpm_resolver::NpmVersion::parse(version).expect("test version should parse"))
+        .map(|version| lpm_resolver::ManifestVersion {
+            version: lpm_resolver::NpmVersion::parse(version).expect("test version should parse"),
+            dependencies: Vec::new(),
+            peer_dependencies: Vec::new(),
+            node_engine: None,
+            platform: None,
+            dist: lpm_resolver::CachedDistInfo::default(),
+        })
         .collect();
-    info
+    info_from_manifests(manifests)
+}
+
+pub(super) fn info_with_dependencies(
+    version: &str,
+    dependencies: &[(&str, &str, bool)],
+) -> lpm_resolver::CachedPackageInfo {
+    info_from_manifests(vec![lpm_resolver::ManifestVersion {
+        version: lpm_resolver::NpmVersion::parse(version).expect("test version should parse"),
+        dependencies: dependencies
+            .iter()
+            .map(|(name, range, optional)| lpm_resolver::ManifestDependency {
+                name: (*name).to_owned(),
+                range: (*range).to_owned(),
+                alias: None,
+                optional: *optional,
+                bundled: false,
+            })
+            .collect(),
+        peer_dependencies: Vec::new(),
+        node_engine: None,
+        platform: None,
+        dist: lpm_resolver::CachedDistInfo::default(),
+    }])
+}
+
+pub(super) fn info_with_peers(
+    version: &str,
+    peers: &[(&str, &str)],
+) -> lpm_resolver::CachedPackageInfo {
+    info_from_manifests(vec![lpm_resolver::ManifestVersion {
+        version: lpm_resolver::NpmVersion::parse(version).expect("test version should parse"),
+        dependencies: Vec::new(),
+        peer_dependencies: peers
+            .iter()
+            .map(|(name, range)| lpm_resolver::ManifestPeerDependency {
+                name: (*name).to_owned(),
+                range: (*range).to_owned(),
+                alias: None,
+                optional: false,
+            })
+            .collect(),
+        node_engine: None,
+        platform: None,
+        dist: lpm_resolver::CachedDistInfo::default(),
+    }])
+}
+
+fn info_from_manifests(
+    manifests: Vec<lpm_resolver::ManifestVersion>,
+) -> lpm_resolver::CachedPackageInfo {
+    lpm_resolver::CachedPackageInfo::from_manifest_versions(
+        None,
+        false,
+        true,
+        HashSet::new(),
+        HashSet::new(),
+        true,
+        None,
+        manifests,
+    )
 }
 
 pub(super) fn override_set(key: &str, target: &str) -> OverrideSet {

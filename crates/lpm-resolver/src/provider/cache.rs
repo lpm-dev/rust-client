@@ -54,73 +54,14 @@ pub(crate) fn activate_workspace_fallback(
     Some(fallback)
 }
 
-fn merge_cached_package_info(
+pub(crate) fn merge_cached_package_info(
     existing: &CachedPackageInfo,
     incoming: &CachedPackageInfo,
 ) -> CachedPackageInfo {
-    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
-    versions.extend(existing.versions.iter().cloned());
-    versions.extend(incoming.versions.iter().cloned());
-    versions.sort_by(|a, b| b.cmp(a));
-    versions.dedup();
-
-    let mut dist = existing.dist.clone();
-    for (version, incoming_dist) in &incoming.dist {
-        dist.entry(version.clone())
-            .and_modify(|existing_dist| {
-                *existing_dist = merge_cached_dist_info(existing_dist, incoming_dist);
-            })
-            .or_insert_with(|| incoming_dist.clone());
-    }
-
-    let mut deps = existing.deps.clone();
-    deps.extend(incoming.deps.clone());
-    let mut peer_deps = existing.peer_deps.clone();
-    peer_deps.extend(incoming.peer_deps.clone());
-    let mut peer_aliases = existing.peer_aliases.clone();
-    peer_aliases.extend(incoming.peer_aliases.clone());
-    let mut optional_dep_names = existing.optional_dep_names.clone();
-    optional_dep_names.extend(incoming.optional_dep_names.clone());
-    let mut optional_peer_names = existing.optional_peer_names.clone();
-    optional_peer_names.extend(incoming.optional_peer_names.clone());
-    let mut node_engines = existing.node_engines.clone();
-    node_engines.extend(incoming.node_engines.clone());
-    let mut bundled_dep_names = existing.bundled_dep_names.clone();
-    bundled_dep_names.extend(incoming.bundled_dep_names.clone());
-    let mut platform = existing.platform.clone();
-    platform.extend(incoming.platform.clone());
-    let mut aliases = existing.aliases.clone();
-    aliases.extend(incoming.aliases.clone());
     let mut covered_ranges = existing.covered_ranges.clone();
     covered_ranges.extend(incoming.covered_ranges.iter().cloned());
     let mut workspace_versions = existing.workspace_versions.clone();
     workspace_versions.extend(incoming.workspace_versions.iter().cloned());
-
-    for workspace_version in &workspace_versions {
-        let version = workspace_version.to_string();
-        preserve_workspace_entry(&mut deps, &existing.deps, &version);
-        preserve_workspace_entry(&mut peer_deps, &existing.peer_deps, &version);
-        preserve_workspace_entry(&mut peer_aliases, &existing.peer_aliases, &version);
-        preserve_workspace_entry(
-            &mut optional_dep_names,
-            &existing.optional_dep_names,
-            &version,
-        );
-        preserve_workspace_entry(
-            &mut optional_peer_names,
-            &existing.optional_peer_names,
-            &version,
-        );
-        preserve_workspace_entry(&mut node_engines, &existing.node_engines, &version);
-        preserve_workspace_entry(
-            &mut bundled_dep_names,
-            &existing.bundled_dep_names,
-            &version,
-        );
-        preserve_workspace_entry(&mut platform, &existing.platform, &version);
-        preserve_workspace_entry(&mut dist, &existing.dist, &version);
-        preserve_workspace_entry(&mut aliases, &existing.aliases, &version);
-    }
 
     let incoming_adds_versions = incoming
         .versions
@@ -139,47 +80,70 @@ fn merge_cached_package_info(
         && (incoming.platform_metadata_complete || !incoming_adds_versions))
         || (incoming.platform_metadata_complete && !existing_adds_versions);
 
-    let mut merged = CachedPackageInfo {
-        modified: incoming
-            .modified
-            .clone()
-            .or_else(|| existing.modified.clone()),
-        modified_unix: incoming.modified_unix.or(existing.modified_unix),
+    let modified = incoming
+        .modified
+        .clone()
+        .or_else(|| existing.modified.clone());
+    let latest_version = incoming
+        .latest_version
+        .clone()
+        .or_else(|| existing.latest_version.clone());
+    let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
+    versions.extend(existing.versions.iter().cloned());
+    versions.extend(incoming.versions.iter().cloned());
+    versions.sort_unstable_by(|left, right| right.cmp(left));
+    versions.dedup();
+    let mut builder = CachedPackageInfo::builder(
+        modified,
         trust_metadata_complete,
         versions_complete,
         covered_ranges,
         workspace_versions,
         platform_metadata_complete,
-        latest_version: incoming
-            .latest_version
-            .clone()
-            .or_else(|| existing.latest_version.clone()),
-        versions,
-        deps,
-        peer_deps,
-        peer_aliases,
-        optional_dep_names,
-        optional_peer_names,
-        node_engines,
-        bundled_dep_names,
-        platform,
-        dist,
-        aliases,
-    };
-    merged.remove_shadowed_peer_requirements();
-    merged
-}
-
-fn preserve_workspace_entry<T: Clone>(
-    merged: &mut HashMap<String, T>,
-    workspace: &HashMap<String, T>,
-    version: &str,
-) {
-    if let Some(value) = workspace.get(version) {
-        merged.insert(version.to_string(), value.clone());
-    } else {
-        merged.remove(version);
+        latest_version,
+        versions.len(),
+    );
+    for version in versions {
+        let existing_manifest = existing.manifest_version_owned_for(&version);
+        let incoming_manifest = incoming.manifest_version_owned_for(&version);
+        let manifest = if existing.workspace_versions.contains(&version) {
+            existing_manifest
+        } else {
+            match (existing_manifest, incoming_manifest) {
+                (Some(existing_manifest), Some(mut incoming_manifest)) => {
+                    if incoming_manifest.dependencies.is_empty() {
+                        incoming_manifest
+                            .dependencies
+                            .clone_from(&existing_manifest.dependencies);
+                    }
+                    if incoming_manifest.peer_dependencies.is_empty() {
+                        incoming_manifest
+                            .peer_dependencies
+                            .clone_from(&existing_manifest.peer_dependencies);
+                    }
+                    if incoming_manifest.node_engine.is_none() {
+                        incoming_manifest
+                            .node_engine
+                            .clone_from(&existing_manifest.node_engine);
+                    }
+                    if incoming_manifest.platform.is_none() {
+                        incoming_manifest
+                            .platform
+                            .clone_from(&existing_manifest.platform);
+                    }
+                    incoming_manifest.dist =
+                        merge_cached_dist_info(&existing_manifest.dist, &incoming_manifest.dist);
+                    Some(incoming_manifest)
+                }
+                (Some(existing_manifest), None) => Some(existing_manifest),
+                (None, incoming_manifest) => incoming_manifest,
+            }
+        };
+        if let Some(manifest) = manifest {
+            builder.push(manifest);
+        }
     }
+    builder.finish()
 }
 
 fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
@@ -470,30 +434,33 @@ impl LpmDependencyProvider {
     ///
     /// Canonicalizes before cache lookup — split-retry identities of the
     /// same canonical package share one cache entry.
-    pub(super) fn available_versions(&self, package: &ResolverPackage) -> Vec<NpmVersion> {
+    pub(super) fn available_versions(&self, package: &ResolverPackage) -> Arc<[NpmVersion]> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
         if let Some(cached) = self.available_versions_cache.lock().get(package) {
-            return cached.clone();
+            return Arc::clone(cached);
         }
         let key = CanonicalKey::from(package);
         let Some(info) = self.cache.get(&key) else {
-            return Vec::new();
+            return Arc::from([]);
         };
         let info = info.value();
-        let versions =
-            if !self.policy.release_age_active() && !self.policy.trust_policy().is_no_downgrade() {
-                info.versions.clone()
-            } else {
+        let versions = if !self.policy.release_age_active()
+            && !self.policy.trust_policy().is_no_downgrade()
+        {
+            Arc::clone(&info.versions)
+        } else {
+            Arc::from(
                 info.versions
                     .iter()
                     .filter(|version| version_allowed_by_policy(&key, info, version, &self.policy))
                     .cloned()
-                    .collect()
-            };
+                    .collect::<Vec<_>>(),
+            )
+        };
         self.available_versions_cache
             .lock()
-            .insert(package.clone(), versions.clone());
+            .insert(package.clone(), Arc::clone(&versions));
         versions
     }
 

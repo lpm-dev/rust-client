@@ -1,3 +1,4 @@
+use super::manifest_core::{ManifestDependency, ManifestPeerDependency, ManifestVersion};
 use super::prelude::*;
 
 /// Shared metadata → CachedPackageInfo parser.
@@ -52,33 +53,7 @@ pub(crate) fn merge_release_times_into_cache_info(
     info: &mut CachedPackageInfo,
     release_times: &lpm_registry::ReleaseTimeMetadata,
 ) {
-    for (version, dist) in &mut info.dist {
-        if dist.published_at.is_none()
-            && let Some(published_at) = release_times.time.get(version)
-        {
-            dist.published_at = Some(published_at.clone());
-            dist.published_at_unix = parse_npm_time_unix(published_at);
-        }
-    }
-
-    if let Some(release_platforms) = &release_times.versions {
-        for (version, release_platform) in release_platforms {
-            if !info.dist.contains_key(version) {
-                continue;
-            }
-            let platform = info.platform.entry(version.clone()).or_default();
-            if platform.os.is_empty() {
-                platform.os.clone_from(&release_platform.os);
-            }
-            if platform.cpu.is_empty() {
-                platform.cpu.clone_from(&release_platform.cpu);
-            }
-            if platform.libc.is_empty() {
-                platform.libc.clone_from(&release_platform.libc);
-            }
-        }
-        info.platform_metadata_complete = true;
-    }
+    info.merge_release_times(release_times);
 }
 
 fn parse_metadata_to_cache_info_inner(
@@ -88,13 +63,6 @@ fn parse_metadata_to_cache_info_inner(
     platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
-    let dependency_entry_count = metadata
-        .versions
-        .values()
-        .filter(|version| {
-            !version.dependencies.is_empty() || !version.optional_dependencies.is_empty()
-        })
-        .count();
     let latest_version = metadata
         .latest_version_tag()
         .and_then(|version| NpmVersion::parse(version).ok());
@@ -108,7 +76,6 @@ fn parse_metadata_to_cache_info_inner(
         ReleaseTimes::Borrowed(&metadata.time),
         projected_versions,
         version_count,
-        dependency_entry_count,
         trust_metadata_complete,
         versions_complete,
         platform_metadata_complete,
@@ -124,13 +91,6 @@ fn parse_owned_metadata_to_cache_info_inner(
     let latest_version = metadata
         .latest_version_tag()
         .and_then(|version| NpmVersion::parse(version).ok());
-    let dependency_entry_count = metadata
-        .versions
-        .values()
-        .filter(|version| {
-            !version.dependencies.is_empty() || !version.optional_dependencies.is_empty()
-        })
-        .count();
     let lpm_registry::PackageMetadata {
         modified,
         versions,
@@ -147,7 +107,6 @@ fn parse_owned_metadata_to_cache_info_inner(
         ReleaseTimes::Owned(time),
         projected_versions,
         version_count,
-        dependency_entry_count,
         trust_metadata_complete,
         versions_complete,
         platform_metadata_complete,
@@ -166,6 +125,13 @@ struct ProjectedVersion {
     cpu: Vec<String>,
     libc: Vec<String>,
     dist: CachedDistInfo,
+}
+
+struct ProjectedDependency {
+    range: String,
+    alias: Option<String>,
+    optional: bool,
+    bundled: bool,
 }
 
 fn project_borrowed_version(
@@ -273,29 +239,20 @@ fn parse_projected_metadata(
     mut release_times: ReleaseTimes<'_>,
     projected_versions: impl Iterator<Item = ProjectedVersion>,
     version_count: usize,
-    dependency_entry_count: usize,
     trust_metadata_complete: bool,
     versions_complete: bool,
     platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
-    let mut versions: Vec<NpmVersion> = Vec::with_capacity(version_count);
-    let mut deps: HashMap<String, HashMap<String, String>> =
-        HashMap::with_capacity(dependency_entry_count);
-    let mut peer_deps: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut peer_aliases: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut optional_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut optional_peer_names: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut node_engines: HashMap<String, String> = HashMap::new();
-    let mut bundled_dep_names: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut platform: HashMap<String, PlatformMeta> = HashMap::new();
-    let mut dist_info: HashMap<String, CachedDistInfo> = HashMap::with_capacity(version_count);
-    // Per-version alias map: local_name → target_canonical_name.
-    // Only populated when the version declares at least one `npm:<target>@<range>`
-    // dep. The `deps` map above stores local_name → INNER range (range after
-    // the `npm:<target>@` prefix) so downstream range parsing is identical to
-    // the non-aliased path. Lookup is the single source of truth for
-    // "is this local name an alias and if so, what's the target".
-    let mut aliases: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut builder = CachedPackageInfo::builder(
+        modified,
+        trust_metadata_complete,
+        versions_complete,
+        HashSet::new(),
+        HashSet::new(),
+        platform_metadata_complete,
+        latest_version,
+        version_count,
+    );
 
     // Helper: normalize a `(local_name, raw_range)` dep declaration through
     // the alias rewrite. Returns `(inner_range_string, target_name_if_alias)`.
@@ -314,11 +271,10 @@ fn parse_projected_metadata(
             tracing::warn!("skipping invalid version string: {ver_str:?}");
             continue;
         }
-        if let Ok(v) = NpmVersion::parse(&ver_str) {
-            let mut ver_deps = HashMap::with_capacity(
+        if let Ok(version) = NpmVersion::parse(&ver_str) {
+            let mut dependencies = HashMap::with_capacity(
                 projected.dependencies.len() + projected.optional_dependencies.len(),
             );
-            let mut ver_aliases: HashMap<String, String> = HashMap::new();
 
             for (dep_name, dep_range) in projected.dependencies {
                 if !is_valid_dep_name(&dep_name) {
@@ -326,169 +282,131 @@ fn parse_projected_metadata(
                     continue;
                 }
                 let (inner_range, target) = split_alias(dep_range);
-                if let Some(target) = target {
+                let alias = if let Some(target) = target {
                     if !is_valid_dep_name(&target) {
                         tracing::debug!(
                             "skipping alias dep {dep_name:?}: invalid target name {target:?}"
                         );
                         continue;
                     }
-                    ver_aliases.insert(dep_name.clone(), target);
-                }
-                ver_deps.insert(dep_name, inner_range);
+                    Some(target)
+                } else {
+                    None
+                };
+                dependencies.insert(
+                    dep_name,
+                    ProjectedDependency {
+                        range: inner_range,
+                        alias,
+                        optional: false,
+                        bundled: false,
+                    },
+                );
             }
 
-            let mut opt_names = HashSet::new();
             for (dep_name, dep_range) in projected.optional_dependencies {
                 if !is_valid_dep_name(&dep_name) {
                     tracing::debug!("skipping invalid optional dep name: {dep_name:?}");
                     continue;
                 }
                 let (inner_range, target) = split_alias(dep_range);
-                if let Some(target) = target {
+                let alias = if let Some(target) = target {
                     if !is_valid_dep_name(&target) {
                         tracing::debug!(
                             "skipping optional alias dep {dep_name:?}: invalid target name {target:?}"
                         );
                         continue;
                     }
-                    ver_aliases.insert(dep_name.clone(), target);
-                }
-                ver_deps.insert(dep_name.clone(), inner_range);
-                opt_names.insert(dep_name);
-            }
-            if !opt_names.is_empty() {
-                optional_dep_names.insert(ver_str.clone(), opt_names);
-            }
-            if !ver_aliases.is_empty() {
-                aliases.insert(ver_str.clone(), ver_aliases);
-            }
-
-            if !ver_deps.is_empty() {
-                deps.insert(ver_str.clone(), ver_deps);
-            }
-
-            if !projected.peer_dependencies.is_empty() {
-                let mut ver_peers = HashMap::with_capacity(projected.peer_dependencies.len());
-                let mut ver_peer_aliases = HashMap::new();
-                for (dep_name, dep_range) in projected.peer_dependencies {
-                    if !is_valid_dep_name(&dep_name) {
-                        tracing::debug!("skipping invalid peer dep name: {dep_name:?}");
-                        continue;
-                    }
-                    let (inner_range, target) = split_alias(dep_range);
-                    if let Some(target) = target {
-                        if !is_valid_dep_name(&target) {
-                            tracing::debug!(
-                                "skipping peer alias {dep_name:?}: invalid target name {target:?}"
-                            );
-                            continue;
-                        }
-                        ver_peer_aliases.insert(dep_name.clone(), target);
-                    }
-                    ver_peers.insert(dep_name, inner_range);
-                }
-                if !ver_peers.is_empty() {
-                    peer_deps.insert(ver_str.clone(), ver_peers);
-                }
-                if !ver_peer_aliases.is_empty() {
-                    peer_aliases.insert(ver_str.clone(), ver_peer_aliases);
-                }
-            }
-
-            // Collect bundled dep names. The extractor preserves
-            // the bundled subtree implicitly; this set lets the
-            // resolver skip enqueuing those names as separate fetches
-            // so the registry copy can't shadow the vendored one
-            // depending on hoisting precedence.
-            if !projected.bundle_dependencies.is_empty() {
-                let mut bundled = HashSet::new();
-                for name in projected.bundle_dependencies {
-                    if !is_valid_dep_name(&name) {
-                        tracing::debug!("skipping invalid bundleDependency name: {name:?}");
-                        continue;
-                    }
-                    bundled.insert(name);
-                }
-                if !bundled.is_empty() {
-                    bundled_dep_names.insert(ver_str.clone(), bundled);
-                }
-            }
-
-            // Collect optional peer names from `peerDependenciesMeta`.
-            // Only entries whose `optional` flag is true are stored; the
-            // open-ended npm spec allows other keys today, none of which
-            // the resolver consumes. Filtering by name validity matches
-            // the peer-deps loop above so a malformed key in one source
-            // can't poison the other.
-            if !projected.peer_dependencies_meta.is_empty() {
-                let mut opt_peers = HashSet::new();
-                for (peer_name, peer_meta) in projected.peer_dependencies_meta {
-                    if !peer_meta.optional {
-                        continue;
-                    }
-                    if !is_valid_dep_name(&peer_name) {
-                        tracing::debug!("skipping invalid optional-peer name: {peer_name:?}");
-                        continue;
-                    }
-                    opt_peers.insert(peer_name);
-                }
-                if !opt_peers.is_empty() {
-                    optional_peer_names.insert(ver_str.clone(), opt_peers);
-                }
-            }
-
-            if let Some(required) = projected.node_engine {
-                node_engines.insert(ver_str.clone(), required);
-            }
-
-            if !projected.os.is_empty() || !projected.cpu.is_empty() || !projected.libc.is_empty() {
-                platform.insert(
-                    ver_str.clone(),
-                    PlatformMeta {
-                        os: projected.os,
-                        cpu: projected.cpu,
-                        libc: projected.libc,
+                    Some(target)
+                } else {
+                    None
+                };
+                dependencies.insert(
+                    dep_name,
+                    ProjectedDependency {
+                        range: inner_range,
+                        alias,
+                        optional: true,
+                        bundled: false,
                     },
                 );
+            }
+
+            for name in projected.bundle_dependencies {
+                if !is_valid_dep_name(&name) {
+                    tracing::debug!("skipping invalid bundleDependency name: {name:?}");
+                    continue;
+                }
+                if let Some(dependency) = dependencies.get_mut(&name) {
+                    dependency.bundled = true;
+                }
+            }
+
+            let optional_peers = projected
+                .peer_dependencies_meta
+                .into_iter()
+                .filter_map(|(name, metadata)| {
+                    (metadata.optional && is_valid_dep_name(&name)).then_some(name)
+                })
+                .collect::<HashSet<_>>();
+            let mut peer_dependencies = Vec::with_capacity(projected.peer_dependencies.len());
+            for (peer_name, peer_range) in projected.peer_dependencies {
+                if !is_valid_dep_name(&peer_name) {
+                    tracing::debug!("skipping invalid peer dep name: {peer_name:?}");
+                    continue;
+                }
+                let (range, target) = split_alias(peer_range);
+                let alias = if let Some(target) = target {
+                    if !is_valid_dep_name(&target) {
+                        tracing::debug!(
+                            "skipping peer alias {peer_name:?}: invalid target name {target:?}"
+                        );
+                        continue;
+                    }
+                    Some(target)
+                } else {
+                    None
+                };
+                peer_dependencies.push(ManifestPeerDependency {
+                    optional: optional_peers.contains(&peer_name),
+                    name: peer_name,
+                    range,
+                    alias,
+                });
             }
 
             let mut dist = projected.dist;
             dist.published_at = release_times.published_at(&ver_str);
             dist.published_at_unix = dist.published_at.as_deref().and_then(parse_npm_time_unix);
-            dist_info.insert(ver_str, dist);
-
-            versions.push(v);
+            let platform = (!projected.os.is_empty()
+                || !projected.cpu.is_empty()
+                || !projected.libc.is_empty())
+            .then_some(PlatformMeta {
+                os: projected.os,
+                cpu: projected.cpu,
+                libc: projected.libc,
+            });
+            builder.push(ManifestVersion {
+                version,
+                dependencies: dependencies
+                    .into_iter()
+                    .map(|(name, dependency)| ManifestDependency {
+                        name,
+                        range: dependency.range,
+                        alias: dependency.alias,
+                        optional: dependency.optional,
+                        bundled: dependency.bundled,
+                    })
+                    .collect(),
+                peer_dependencies,
+                node_engine: projected.node_engine,
+                platform,
+                dist,
+            });
         }
     }
 
-    versions.sort();
-    versions.reverse(); // Newest first
-
-    let modified_unix = modified.as_deref().and_then(parse_npm_time_unix);
-    let mut info = CachedPackageInfo {
-        modified,
-        modified_unix,
-        trust_metadata_complete,
-        versions_complete,
-        covered_ranges: HashSet::new(),
-        workspace_versions: HashSet::new(),
-        platform_metadata_complete,
-        latest_version,
-        versions,
-        deps,
-        peer_deps,
-        peer_aliases,
-        optional_dep_names,
-        optional_peer_names,
-        node_engines,
-        bundled_dep_names,
-        platform,
-        dist: dist_info,
-        aliases,
-    };
-    info.remove_shadowed_peer_requirements();
-    info
+    builder.finish()
 }
 
 fn detect_trust_evidence(ver_meta: &lpm_registry::VersionMetadata) -> Option<TrustEvidence> {

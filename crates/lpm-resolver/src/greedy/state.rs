@@ -603,17 +603,11 @@ impl ResolveState {
             name: canonical.to_string(),
             version: version.clone(),
             is_lpm: matches!(canonical, CanonicalKey::Lpm { .. }),
-            tarball_url: info
-                .dist
-                .get(&version)
-                .and_then(|dist| dist.tarball_url.clone()),
-            integrity: info
-                .dist
-                .get(&version)
-                .and_then(|dist| dist.integrity.clone()),
-            unpacked_size: info.dist.get(&version).and_then(|dist| dist.unpacked_size),
-            platform: info.platform.get(&version).cloned(),
-            node_engine: info.node_engines.get(&version).cloned(),
+            tarball_url: info.tarball_url(&version).map(str::to_owned),
+            integrity: info.integrity(&version).map(str::to_owned),
+            unpacked_size: info.unpacked_size(&version),
+            platform: info.platform(&version),
+            node_engine: info.node_engine(&version).map(str::to_owned),
             optional,
         };
         match tx.try_send(event) {
@@ -777,8 +771,7 @@ impl ResolveState {
 
                 let cached_aliases: HashMap<String, String> = cache
                     .get(&n.canonical)
-                    .and_then(|info| info.aliases.get(&ver_str))
-                    .cloned()
+                    .map(|info| info.dependency_aliases(&ver_str))
                     .unwrap_or_default();
 
                 // Sort each parent's dependency list by local_name for
@@ -808,8 +801,7 @@ impl ResolveState {
                     .collect();
                 let optional_dependencies = cache
                     .get(&n.canonical)
-                    .and_then(|info| info.optional_dep_names.get(&ver_str))
-                    .cloned()
+                    .map(|info| info.optional_dependency_names(&ver_str))
                     .unwrap_or_default();
 
                 let alive_locals: HashSet<&String> = dependencies.iter().map(|(l, _)| l).collect();
@@ -819,36 +811,33 @@ impl ResolveState {
                     .map(|(l, t)| (l.clone(), t.clone()))
                     .collect();
 
-                let (tarball_url, integrity) = cache
-                    .get(&n.canonical)
-                    .and_then(|info| info.dist.get(&ver_str))
-                    .map(|d| (d.tarball_url.clone(), d.integrity.clone()))
-                    .unwrap_or_default();
+                let (tarball_url, integrity) = cache.get(&n.canonical).map_or_else(
+                    || (None, None),
+                    |info| {
+                        (
+                            info.tarball_url(&ver_str).map(str::to_owned),
+                            info.integrity(&ver_str).map(str::to_owned),
+                        )
+                    },
+                );
                 let platform = cache
                     .get(&n.canonical)
-                    .and_then(|info| info.platform.get(&ver_str))
-                    .cloned();
+                    .and_then(|info| info.platform(&ver_str));
                 let node_engine = cache
                     .get(&n.canonical)
-                    .and_then(|info| info.node_engines.get(&ver_str))
-                    .cloned();
+                    .and_then(|info| info.node_engine(&ver_str).map(str::to_owned));
 
                 // Surface resolved peers per package so the v2 GraphKey
                 // can fold them in. The resolved-versions lookup is built
                 // from the same node table.
                 let peers: Vec<lpm_common::PeerEdge> = cache
                     .get(&n.canonical)
-                    .and_then(|info| info.peer_deps.get(&ver_str))
-                    .map(|peer_deps| {
-                        let peer_aliases = cache
-                            .get(&n.canonical)
-                            .and_then(|info| info.peer_aliases.get(&ver_str));
-                        let mut out: Vec<lpm_common::PeerEdge> = peer_deps
-                            .iter()
-                            .filter_map(|(peer_name, peer_range)| {
-                                let target_name = peer_aliases
-                                    .and_then(|aliases| aliases.get(peer_name))
-                                    .unwrap_or(peer_name);
+                    .and_then(|info| info.peer_dependencies(&ver_str))
+                    .map(|peer_dependencies| {
+                        let mut out: Vec<lpm_common::PeerEdge> = peer_dependencies
+                            .filter_map(|peer| {
+                                let peer_name = peer.name;
+                                let target_name = peer.alias.unwrap_or(peer_name);
                                 if let Some(&target_id) = selected_peer_bindings
                                     .and_then(|bindings| bindings.get(peer_name))
                                 {
@@ -859,7 +848,6 @@ impl ResolveState {
                                         version,
                                     ));
                                 }
-                                let _ = peer_range;
                                 None
                             })
                             .collect();
@@ -982,27 +970,23 @@ mod tests {
     use super::*;
 
     fn empty_info() -> CachedPackageInfo {
-        CachedPackageInfo {
-            modified: None,
-            modified_unix: None,
-            trust_metadata_complete: false,
-            versions_complete: true,
-            covered_ranges: HashSet::new(),
-            workspace_versions: HashSet::new(),
-            platform_metadata_complete: true,
-            latest_version: None,
-            versions: vec![NpmVersion::parse("1.0.0").expect("valid version")],
-            deps: HashMap::new(),
-            peer_deps: HashMap::new(),
-            peer_aliases: HashMap::new(),
-            optional_dep_names: HashMap::new(),
-            optional_peer_names: HashMap::new(),
-            node_engines: HashMap::new(),
-            bundled_dep_names: HashMap::new(),
-            platform: HashMap::new(),
-            dist: HashMap::new(),
-            aliases: HashMap::new(),
-        }
+        CachedPackageInfo::from_manifest_versions(
+            None,
+            false,
+            true,
+            HashSet::new(),
+            HashSet::new(),
+            true,
+            None,
+            vec![crate::provider::ManifestVersion {
+                version: NpmVersion::parse("1.0.0").expect("valid version"),
+                dependencies: Vec::new(),
+                peer_dependencies: Vec::new(),
+                node_engine: None,
+                platform: None,
+                dist: crate::provider::CachedDistInfo::default(),
+            }],
+        )
     }
 
     fn shape(raw: &str) -> MetadataEdgeMissRangeShape {

@@ -11,8 +11,11 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use lpm_registry::PackageMetadata;
 use lpm_resolver::{
-    SpeculativePackageMetadata, benchmark_parse_full_metadata_to_cache_info,
-    benchmark_parse_metadata_to_cache_info,
+    SpeculativePackageMetadata, benchmark_merge_cached_package_info,
+    benchmark_parse_full_metadata_to_cache_info, benchmark_parse_metadata_to_cache_info,
+    benchmark_parse_owned_full_metadata_to_cache_info,
+    benchmark_parse_owned_metadata_to_cache_info,
+    benchmark_parse_owned_partial_metadata_to_cache_info,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -134,6 +137,34 @@ fn bench_metadata_hydration(c: &mut Criterion) {
         );
 
         group.bench_with_input(
+            BenchmarkId::new("resolver_projection_owned_abbreviated", version_count),
+            &abbreviated_metadata,
+            |b, metadata| {
+                b.iter_batched(
+                    || metadata.clone(),
+                    |metadata| black_box(benchmark_parse_owned_metadata_to_cache_info(metadata)),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("resolver_projection_owned_partial", version_count),
+            &abbreviated_metadata,
+            |b, metadata| {
+                b.iter_batched(
+                    || metadata.clone(),
+                    |metadata| {
+                        black_box(benchmark_parse_owned_partial_metadata_to_cache_info(
+                            metadata,
+                        ))
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
             BenchmarkId::new(
                 "resolver_projection_abbreviated_latest_deps_only",
                 version_count,
@@ -141,6 +172,21 @@ fn bench_metadata_hydration(c: &mut Criterion) {
             &sparse_abbreviated_metadata,
             |b, metadata| {
                 b.iter(|| black_box(benchmark_parse_metadata_to_cache_info(black_box(metadata))));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                "resolver_projection_owned_abbreviated_latest_deps_only",
+                version_count,
+            ),
+            &sparse_abbreviated_metadata,
+            |b, metadata| {
+                b.iter_batched(
+                    || metadata.clone(),
+                    |metadata| black_box(benchmark_parse_owned_metadata_to_cache_info(metadata)),
+                    BatchSize::SmallInput,
+                );
             },
         );
 
@@ -166,6 +212,20 @@ fn bench_metadata_hydration(c: &mut Criterion) {
                         metadata,
                     )))
                 });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("resolver_projection_owned_full", version_count),
+            &full_metadata,
+            |b, metadata| {
+                b.iter_batched(
+                    || metadata.clone(),
+                    |metadata| {
+                        black_box(benchmark_parse_owned_full_metadata_to_cache_info(metadata))
+                    },
+                    BatchSize::SmallInput,
+                );
             },
         );
 
@@ -203,6 +263,36 @@ fn bench_metadata_hydration(c: &mut Criterion) {
     }
 
     group.finish();
+
+    let (_, metadata) = synthetic_packument(32, false, DependencyShape::EveryVersion);
+    let mut version_names = metadata.versions.keys().cloned().collect::<Vec<_>>();
+    version_names.sort();
+    let fragments = version_names
+        .into_iter()
+        .map(|selected| {
+            let mut fragment = metadata.clone();
+            fragment.versions.retain(|version, _| version == &selected);
+            benchmark_parse_owned_partial_metadata_to_cache_info(fragment)
+        })
+        .collect::<Vec<_>>();
+    let mut merge_group = c.benchmark_group("metadata_fragment_merge");
+    merge_group.sample_size(30);
+    for fragment_count in [1usize, 8, 32] {
+        merge_group.bench_with_input(
+            BenchmarkId::new("sequential_exact_fragments", fragment_count),
+            &fragment_count,
+            |b, &fragment_count| {
+                b.iter(|| {
+                    let mut merged = fragments[0].clone();
+                    for fragment in &fragments[1..fragment_count] {
+                        merged = benchmark_merge_cached_package_info(&merged, fragment);
+                    }
+                    black_box(merged)
+                });
+            },
+        );
+    }
+    merge_group.finish();
 }
 
 criterion_group!(benches, bench_metadata_hydration);

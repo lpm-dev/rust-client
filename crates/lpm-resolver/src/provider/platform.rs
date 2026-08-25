@@ -55,17 +55,23 @@ impl Platform {
 /// A value must match none of the negative entries and, when positive entries
 /// are present, at least one positive entry. A sole `"any"` entry allows all.
 /// Matches npm-install-checks' `checkList` predicate.
+#[cfg(test)]
 pub(super) fn check_platform_filter(entries: &[String], current: &str, field_name: &str) -> bool {
-    if entries.is_empty() {
-        return true;
-    }
-    if entries.len() == 1 && entries[0] == "any" {
-        return true;
-    }
+    check_platform_filter_values(entries.iter().map(String::as_str), current, field_name)
+}
 
+fn check_platform_filter_values<'a>(
+    entries: impl IntoIterator<Item = &'a str>,
+    current: &str,
+    field_name: &str,
+) -> bool {
+    let mut entry_count = 0usize;
     let mut negative_count = 0usize;
     let mut positive_match = false;
+    let mut saw_any = false;
     for entry in entries {
+        entry_count += 1;
+        saw_any |= entry == "any";
         if let Some(negative) = entry.strip_prefix('!') {
             negative_count += 1;
             if negative == current {
@@ -75,7 +81,10 @@ pub(super) fn check_platform_filter(entries: &[String], current: &str, field_nam
             positive_match = true;
         }
     }
-    let compatible = positive_match || negative_count == entries.len();
+    if entry_count == 0 || (entry_count == 1 && saw_any) {
+        return true;
+    }
+    let compatible = positive_match || negative_count == entry_count;
     tracing::debug!(field_name, current, compatible, "checked platform filter");
     compatible
 }
@@ -85,6 +94,14 @@ pub(super) fn check_platform_filter(entries: &[String], current: &str, field_nam
 /// Entries starting with `!` are exclusions (e.g., `!win32` = all except win32).
 pub fn is_platform_compatible(meta: &PlatformMeta) -> bool {
     is_platform_compatible_for(meta, &Platform::current())
+}
+
+pub(super) fn is_platform_compatible_values<'a>(
+    os: impl IntoIterator<Item = &'a str>,
+    cpu: impl IntoIterator<Item = &'a str>,
+    libc: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    is_platform_compatible_values_for(os, cpu, libc, &Platform::current())
 }
 
 /// Testable inner gate: the same predicate against an explicit [`Platform`]
@@ -100,13 +117,28 @@ pub fn is_platform_compatible(meta: &PlatformMeta) -> bool {
 ///   a load-time interpreter mismatch, so the safer choice is to drop
 ///   the version and surface a `platform_skipped` count.
 pub(super) fn is_platform_compatible_for(meta: &PlatformMeta, platform: &Platform) -> bool {
-    let os_ok = check_platform_filter(&meta.os, platform.os, "os");
-    let cpu_ok = check_platform_filter(&meta.cpu, platform.cpu, "cpu");
-    let libc_ok = if meta.libc.is_empty() {
+    is_platform_compatible_values_for(
+        meta.os.iter().map(String::as_str),
+        meta.cpu.iter().map(String::as_str),
+        meta.libc.iter().map(String::as_str),
+        platform,
+    )
+}
+
+fn is_platform_compatible_values_for<'a>(
+    os: impl IntoIterator<Item = &'a str>,
+    cpu: impl IntoIterator<Item = &'a str>,
+    libc: impl IntoIterator<Item = &'a str>,
+    platform: &Platform,
+) -> bool {
+    let os_ok = check_platform_filter_values(os, platform.os, "os");
+    let cpu_ok = check_platform_filter_values(cpu, platform.cpu, "cpu");
+    let mut libc = libc.into_iter().peekable();
+    let libc_ok = if libc.peek().is_none() {
         true
     } else {
         match platform.libc {
-            Some(host_libc) => check_platform_filter(&meta.libc, host_libc, "libc"),
+            Some(host_libc) => check_platform_filter_values(libc, host_libc, "libc"),
             None => false,
         }
     };
