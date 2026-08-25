@@ -1200,11 +1200,10 @@ jobs:
           --packages "$PWD/npm-release-packages"
           --version "${{ needs.release-metadata.outputs.version }}"
 
-      - name: Bootstrap npm 11 (required for trusted publishers OIDC)
+      - name: Install pinned npm 11 (required for trusted publishers OIDC)
         run: |
-          npx --yes npm@11.12.1 --version
-          echo "Runner npm: $(npm --version)"
-          echo "npx npm@11: $(npx npm@11.12.1 --version)"
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          test "$(npm --version)" = "11.12.1"
 
       - name: Preflight npm platform package existence
         run: |
@@ -1238,7 +1237,7 @@ jobs:
 
             echo "Publishing ${package}@${VERSION} from verified tarball ${tarball}..."
             set +e
-            npx npm@11.12.1 publish "./npm-release-packages/$tarball" \
+            npm publish "./npm-release-packages/$tarball" \
               --provenance --access public --tag "$NPM_TAG" 2>&1 | tee /tmp/npm-publish.log
             local exit_code=${PIPESTATUS[0]}
             set -e
@@ -1298,11 +1297,10 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Bootstrap npm 11 (required for trusted publishers OIDC)
+      - name: Install pinned npm 11 (required for trusted publishers OIDC)
         run: |
-          npx --yes npm@11.12.1 --version
-          echo "Runner npm: $(npm --version)"
-          echo "npx npm@11: $(npx npm@11.12.1 --version)"
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          test "$(npm --version)" = "11.12.1"
 
       - name: Download verified full-release tarballs
         if: inputs.mode != 'wrapper-only' && inputs.mode != 'npm-publish-only'
@@ -1390,7 +1388,7 @@ jobs:
           fi
           echo "Publishing @lpm-registry/cli@${VERSION} from verified tarball ${TARBALL}..."
           set +e
-          npx npm@11.12.1 publish "./npm-release-packages/$TARBALL" \
+          npm publish "./npm-release-packages/$TARBALL" \
             --provenance --access public --tag "$NPM_TAG" 2>&1 | tee /tmp/npm-publish.log
           exit_code=${PIPESTATUS[0]}
           set -e

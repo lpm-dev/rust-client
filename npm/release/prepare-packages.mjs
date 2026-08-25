@@ -150,11 +150,18 @@ function packPackage({ packageDir, output, manifest, platform, binaryHashes }) {
       cause: error,
     });
   }
-  if (!Array.isArray(packResults) || packResults.length !== 1) {
-    throw new Error(`npm pack returned an unexpected result count for ${manifest.name}`);
+  const resultEntries = Array.isArray(packResults)
+    ? packResults
+    : packResults && typeof packResults === "object"
+      ? Object.values(packResults)
+      : [];
+  if (resultEntries.length !== 1) {
+    throw new Error(
+      `npm pack returned an unexpected result count for ${manifest.name}: ${result.stdout}`,
+    );
   }
 
-  const packResult = packResults[0];
+  const packResult = resultEntries[0];
   const actualFiles = (packResult.files ?? []).map(file => file.path).sort();
   if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
     throw new Error(

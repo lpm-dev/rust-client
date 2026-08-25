@@ -10,6 +10,7 @@ import {
   verifyLocalTarball,
   verifyNpmSignatures,
   verifyPublishedPackage,
+  readManifest,
 } from "../verify-published-package.mjs";
 
 const PACKAGE = "@lpm-registry/cli";
@@ -23,6 +24,7 @@ const SHA512_HEX = SHA512_BYTES.toString("hex");
 const INTEGRITY = `sha512-${SHA512_BYTES.toString("base64")}`;
 const PUBLISH_PREDICATE = "https://github.com/npm/attestation/tree/main/specs/publish/v0.1";
 const PROVENANCE_PREDICATE = "https://slsa.dev/provenance/v1";
+const TRUSTED_NPM_CLI = "/trusted/npm-cli.js";
 
 test("existing npm publication verification accepts exact stable metadata", async () => {
   const fixture = publicationFixture();
@@ -392,19 +394,125 @@ test("npm cryptographic verification uses the pinned script-disabled audit flow"
     };
   };
 
-  assert.deepEqual(verifyNpmSignatures({ packageName: PACKAGE, version: VERSION, spawnImpl }), {
+  assert.deepEqual(verifyNpmSignatures({
+    packageName: PACKAGE,
+    version: VERSION,
+    spawnImpl,
+    npmCliPath: TRUSTED_NPM_CLI,
+  }), {
     attestations: bundles,
   });
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].command, "npx");
-  assert.deepEqual(calls[0].args.slice(0, 4), ["--yes", "npm@11.12.1", "install", "--prefix"]);
+  assert.equal(calls[0].command, process.execPath);
+  assert.deepEqual(calls[0].args.slice(0, 3), [TRUSTED_NPM_CLI, "install", "--prefix"]);
   assert.ok(calls[0].args.includes("--ignore-scripts"));
   assert.ok(calls[0].args.includes("--omit=optional"));
   assert.ok(calls[0].args.includes("--"));
-  assert.deepEqual(calls[1].args.slice(0, 4), ["--yes", "npm@11.12.1", "audit", "signatures"]);
+  assert.deepEqual(calls[1].args.slice(0, 3), [TRUSTED_NPM_CLI, "audit", "signatures"]);
   assert.ok(calls[1].args.includes("--include-attestations"));
   assert.equal(Object.hasOwn(calls[0].options, "shell"), false);
   assert.match(calls[0].options.env.NPM_CONFIG_USERCONFIG, /lpm-npm-signatures-/);
+});
+
+test("npm cryptographic verification removes ambient npm configuration from both commands", () => {
+  const ambient = {
+    npm_config_registry: process.env.npm_config_registry,
+    NPM_CONFIG_GLOBALCONFIG: process.env.NPM_CONFIG_GLOBALCONFIG,
+    npm_config_proxy: process.env.npm_config_proxy,
+    NPM_TOKEN: process.env.NPM_TOKEN,
+  };
+  process.env.npm_config_registry = "https://attacker.example.test";
+  process.env.NPM_CONFIG_GLOBALCONFIG = "/tmp/attacker-npmrc";
+  process.env.npm_config_proxy = "https://attacker.example.test";
+  process.env.NPM_TOKEN = "ambient-secret";
+  const calls = [];
+  const bundles = JSON.parse(JSON.stringify(publicationFixture().attestations.attestations));
+  const spawnImpl = (command, args, options) => {
+    calls.push({ command, args, options });
+    if (calls.length === 1) return { status: 0, stdout: "", stderr: "" };
+    return {
+      status: 0,
+      stdout: JSON.stringify({
+        invalid: [],
+        missing: [],
+        verified: [{
+          name: PACKAGE,
+          version: VERSION,
+          registry: "https://registry.npmjs.org/",
+          attestationBundles: bundles,
+        }],
+      }),
+      stderr: "",
+    };
+  };
+
+  try {
+    verifyNpmSignatures({
+      packageName: PACKAGE,
+      version: VERSION,
+      spawnImpl,
+      npmCliPath: TRUSTED_NPM_CLI,
+    });
+  } finally {
+    for (const [key, value] of Object.entries(ambient)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+
+  assert.equal(calls.length, 2);
+  for (const { options } of calls) {
+    assert.equal(options.env.NPM_CONFIG_REGISTRY, "https://registry.npmjs.org");
+    assert.equal(options.env.NPM_TOKEN, undefined);
+    assert.equal(options.env.npm_config_registry, undefined);
+    assert.equal(options.env.npm_config_proxy, undefined);
+    assert.notEqual(
+      options.env.NPM_CONFIG_USERCONFIG,
+      options.env.NPM_CONFIG_GLOBALCONFIG,
+      "npm refuses to load one file as both user and global config",
+    );
+    const unexpected = Object.keys(options.env).filter(
+      key => /^npm_config_/i.test(key) && ![
+        "NPM_CONFIG_AUDIT",
+        "NPM_CONFIG_CACHE",
+        "NPM_CONFIG_FUND",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "NPM_CONFIG_IGNORE_SCRIPTS",
+        "NPM_CONFIG_REGISTRY",
+        "NPM_CONFIG_UPDATE_NOTIFIER",
+        "NPM_CONFIG_USERCONFIG",
+      ].includes(key),
+    );
+    assert.deepEqual(unexpected, []);
+  }
+});
+
+test("release manifest loading rejects replacement with a symlink after inspection", t => {
+  if (process.platform === "win32") {
+    t.skip("deterministic symlink replacement requires Unix symlink semantics");
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-manifest-race-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const manifest = path.join(directory, "release-packages.json");
+  const replacement = path.join(directory, "replacement.json");
+  fs.writeFileSync(manifest, '{"trusted":true}\n');
+  fs.writeFileSync(replacement, '{"trusted":false}\n');
+  const originalLstat = fs.lstatSync;
+  fs.lstatSync = (...args) => {
+    const metadata = originalLstat(...args);
+    fs.unlinkSync(manifest);
+    fs.symlinkSync(replacement, manifest);
+    return metadata;
+  };
+  try {
+    assert.throws(
+      () => readManifest(manifest),
+      /not a regular file|changed|unsafe/,
+    );
+  } finally {
+    fs.lstatSync = originalLstat;
+  }
 });
 
 test("npm cryptographic verification rejects a report for a different package", () => {
@@ -431,7 +539,12 @@ test("npm cryptographic verification rejects a report for a different package", 
   };
 
   assert.throws(
-    () => verifyNpmSignatures({ packageName: PACKAGE, version: VERSION, spawnImpl }),
+    () => verifyNpmSignatures({
+      packageName: PACKAGE,
+      version: VERSION,
+      spawnImpl,
+      npmCliPath: TRUSTED_NPM_CLI,
+    }),
     /did not verify the expected package/,
   );
 });
@@ -469,7 +582,12 @@ test("npm cryptographic verification rejects unexpected verified packages", () =
   };
 
   assert.throws(
-    () => verifyNpmSignatures({ packageName: PACKAGE, version: VERSION, spawnImpl }),
+    () => verifyNpmSignatures({
+      packageName: PACKAGE,
+      version: VERSION,
+      spawnImpl,
+      npmCliPath: TRUSTED_NPM_CLI,
+    }),
     /did not verify every signature/,
   );
 });

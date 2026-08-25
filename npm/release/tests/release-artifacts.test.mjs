@@ -195,7 +195,7 @@ test("npm publish workflow treats release tarballs as local filesystem paths", (
     path.join(repoRoot, ".github/workflows/release.yml"),
     "utf8",
   );
-  const publishSpecs = [...releaseWorkflow.matchAll(/npx npm@11\.12\.1 publish "([^"]+)"/g)].map(
+  const publishSpecs = [...releaseWorkflow.matchAll(/npm publish "([^"]+)"/g)].map(
     match => match[1],
   );
 
@@ -220,7 +220,7 @@ test("OIDC publish jobs verify release archives before consuming them", () => {
   const platformJob = jobSource("publish-npm-platform", "publish-npm-wrapper");
   const wrapperJob = jobSource("publish-npm-wrapper", "update-homebrew");
   for (const [job, firstConsumer] of [
-    [platformJob, "npx npm@11.12.1 publish"],
+    [platformJob, "npm publish"],
     [wrapperJob, "npm install --prefix"],
   ]) {
     const verification = job.indexOf("node npm/release/verify-packages.mjs");
