@@ -750,9 +750,9 @@ jobs:
           raw_smoke_project="$RUNNER_TEMP/raw-keychain-project"
           mkdir -p "$raw_smoke_home" "$raw_smoke_project"
           cd "$raw_smoke_project"
-          HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env set LPM_RELEASE_SMOKE=verified
-          HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env get LPM_RELEASE_SMOKE >/dev/null
-          HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env delete LPM_RELEASE_SMOKE
+          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env set LPM_RELEASE_SMOKE=verified
+          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env get LPM_RELEASE_SMOKE >/dev/null
+          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env delete LPM_RELEASE_SMOKE
 
       - name: Execute release binary (Linux glibc)
         if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
