@@ -90,6 +90,24 @@ test("macOS release smoke isolates LPM state without hiding the login Keychain",
   assert.doesNotMatch(smoke, /(?:^|\s)HOME="\$raw_smoke_home"/m);
 });
 
+test("macOS release signing preserves the login Keychain search list", () => {
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const start = workflow.indexOf("- name: Import Developer ID certificate (macOS)");
+  const end = workflow.indexOf("- name: Sign legacy binary and provisioned app bundle", start + 1);
+
+  assert.notEqual(start, -1, "missing macOS certificate import step");
+  assert.notEqual(end, -1, "missing macOS signing step after certificate import");
+
+  const certificateImport = workflow.slice(start, end);
+  assert.doesNotMatch(
+    certificateImport,
+    /security list-keychains\s+-d user\s+-s/,
+    "a temporary signing Keychain must not replace the login Keychain search list",
+  );
+});
+
 test("every macOS release retains the pre-bundle standalone updater bridge", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
