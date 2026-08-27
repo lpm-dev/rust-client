@@ -70,6 +70,26 @@ test("release inputs are uploaded before any staged binary executes natively", (
   );
 });
 
+test("macOS release smoke isolates LPM state without hiding the login Keychain", () => {
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const start = workflow.indexOf(
+    "- name: Execute release app bundle and compatibility binary (macOS)",
+  );
+  const end = workflow.indexOf(
+    "- name: Execute release binary (Linux glibc)",
+    start + 1,
+  );
+
+  assert.notEqual(start, -1, "missing macOS release smoke step");
+  assert.notEqual(end, -1, "missing step after macOS release smoke");
+
+  const smoke = workflow.slice(start, end);
+  assert.match(smoke, /LPM_HOME="\$raw_smoke_home"/);
+  assert.doesNotMatch(smoke, /(?:^|\s)HOME="\$raw_smoke_home"/m);
+});
+
 test("every macOS release retains the pre-bundle standalone updater bridge", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
