@@ -561,21 +561,21 @@ jobs:
 
           CERT_PATH="$RUNNER_TEMP/developer-id-application.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/lpm-release-signing.keychain-db"
+          KEYCHAIN_SEARCH_LIST_STATE="$RUNNER_TEMP/lpm-release-keychain-search-list"
           KEYCHAIN_PASSWORD="$(uuidgen)"
           trap 'rm -f "$CERT_PATH"' EXIT
+
+          echo "APPLE_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "APPLE_KEYCHAIN_SEARCH_LIST_STATE=$KEYCHAIN_SEARCH_LIST_STATE" >> "$GITHUB_ENV"
 
           printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$CERT_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # codesign receives this keychain explicitly below. Do not replace the
-          # user's search list: the raw compatibility CLI needs the runner's
-          # unlocked login Keychain for its legacy storage smoke test.
           security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          echo "APPLE_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          "$GITHUB_WORKSPACE/scripts/ci/macos-keychain-search-list.sh" add "$KEYCHAIN_PATH" "$KEYCHAIN_SEARCH_LIST_STATE"
 
       - name: Sign legacy binary and provisioned app bundle (macOS)
         if: runner.os == 'macOS'
@@ -699,10 +699,11 @@ jobs:
           # The public ZIP must contain the stapled bundle, not the pre-staple bytes.
           ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${{ matrix.binary }}.zip"
 
-      - name: Delete signing keychain before executing release code (macOS)
+      - name: Restore Keychain search list before executing release code (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
+          "$GITHUB_WORKSPACE/scripts/ci/macos-keychain-search-list.sh" restore "$APPLE_KEYCHAIN_SEARCH_LIST_STATE"
           security delete-keychain "$APPLE_SIGNING_KEYCHAIN"
 
       # Upload immutable release inputs before executing built code. A release
@@ -767,9 +768,21 @@ jobs:
       - name: Delete temporary signing keychain (macOS)
         if: always() && runner.os == 'macOS'
         run: |
-          if [ -n "${APPLE_SIGNING_KEYCHAIN:-}" ]; then
-            security delete-keychain "$APPLE_SIGNING_KEYCHAIN" || true
+          cleanup_status=0
+          if [ -n "${APPLE_KEYCHAIN_SEARCH_LIST_STATE:-}" ] && [ -f "$APPLE_KEYCHAIN_SEARCH_LIST_STATE" ]; then
+            if ! "$GITHUB_WORKSPACE/scripts/ci/macos-keychain-search-list.sh" restore "$APPLE_KEYCHAIN_SEARCH_LIST_STATE"; then
+              echo "::error::Could not restore the original user Keychain search list."
+              cleanup_status=1
+            fi
           fi
+          if [ -n "${APPLE_SIGNING_KEYCHAIN:-}" ]; then
+            if [ "$cleanup_status" -eq 0 ]; then
+              if [ -e "$APPLE_SIGNING_KEYCHAIN" ]; then
+                security delete-keychain "$APPLE_SIGNING_KEYCHAIN" || cleanup_status=1
+              fi
+            fi
+          fi
+          exit "$cleanup_status"
 
   build-windows:
     name: Build x86_64-pc-windows-msvc
