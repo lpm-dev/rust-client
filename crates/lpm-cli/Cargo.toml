@@ -108,6 +108,7 @@ toml_edit = { workspace = true }
 # Tarball creation
 tar = { workspace = true }
 flate2 = { workspace = true }
+zip = { workspace = true }
 
 # File collection
 glob = { workspace = true }
@@ -222,6 +223,8 @@ acceptance-test-hooks = [
 	"lpm-auth/acceptance-test-hooks",
 	"lpm-vault/acceptance-test-hooks",
 ]
+# Temporary raw macOS updater bridge for pre-app-bundle installations.
+legacy-macos-keychain = ["lpm-vault/legacy-macos-keychain"]
 
 [dependencies.dhat]
 version = "0.3"

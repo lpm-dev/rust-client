@@ -15,7 +15,7 @@ use support::auth_state::{
     token_expiry_path,
 };
 use support::mock_registry::{MockRegistry, TEST_OIDC_POLICY_ID};
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, write_private_file};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -37,9 +37,8 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
 
     let fallback_key = "workflow-test-fallback-key-workflow-test-fallback-key-123456";
     let salt = [0x42u8; 32];
-    std::fs::write(lpm_dir.join(".vault-fallback-key"), fallback_key)
-        .expect("failed to write fallback vault key");
-    std::fs::write(lpm_dir.join(".vault-salt"), salt).expect("failed to write vault salt");
+    write_private_file(&lpm_dir.join(".vault-fallback-key"), fallback_key);
+    write_private_file(&lpm_dir.join(".vault-salt"), salt);
 
     let params = scrypt::Params::new(10, 8, 1, 32).expect("invalid test scrypt params");
     let mut derived_key = [0u8; 32];
@@ -63,8 +62,7 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
         BASE64.encode(encrypted)
     );
 
-    std::fs::write(vaults_dir.join(format!("{vault_id}.enc")), encoded)
-        .expect("failed to write encrypted local vault file");
+    write_private_file(&vaults_dir.join(format!("{vault_id}.enc")), encoded);
 }
 
 fn parse_clean_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -90,7 +88,7 @@ fn seed_org_sharing_key(project: &TempProject) -> ([u8; 32], [u8; 32], String, S
     let (private_key, public_key) = lpm_vault::crypto::generate_x25519_keypair();
     let lpm_dir = project.home().join(".lpm");
     std::fs::create_dir_all(&lpm_dir).expect("create LPM home for sharing key");
-    std::fs::write(lpm_dir.join(".x25519_key"), private_key).expect("seed sharing key");
+    write_private_file(&lpm_dir.join(".x25519_key"), private_key);
     let public_key_base64 = BASE64.encode(public_key);
     let fingerprint = hex::encode(Sha256::digest(public_key));
     (private_key, public_key, public_key_base64, fingerprint)
@@ -990,7 +988,7 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
     assert_eq!(synced_config["vault"].as_str(), Some(vault_id));
     assert_eq!(
         synced_config["vaultSync"]["personalVersion"].as_i64(),
-        Some(7)
+        Some(8)
     );
 }
 

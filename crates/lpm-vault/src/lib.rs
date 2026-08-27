@@ -28,14 +28,26 @@ pub mod signature;
 pub mod sync;
 pub mod vault_id;
 
+mod storage_transaction;
+
 #[cfg(target_os = "macos")]
 pub mod keychain;
+
+#[cfg(all(target_os = "macos", not(feature = "legacy-macos-keychain")))]
+mod macos_keychain;
+
+#[cfg(all(target_os = "macos", feature = "legacy-macos-keychain"))]
+#[path = "legacy_macos_keychain.rs"]
+mod macos_keychain;
 
 #[cfg(test)]
 pub(crate) mod test_env_lock;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+pub type SecretMap = HashMap<String, String>;
+pub type EnvironmentMap = HashMap<String, SecretMap>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VaultStorageBackend {
@@ -229,13 +241,17 @@ pub fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
         .display()
         .to_string();
 
-    let mut secrets = read_secrets(&vault_id)?.unwrap_or_default();
-
-    for (key, value) in pairs {
-        secrets.insert(key.to_string(), value.to_string());
-    }
-
-    write_secrets(&vault_id, &project_name, &project_path, &secrets)
+    mutate_secrets_env(
+        &vault_id,
+        &project_name,
+        &project_path,
+        "default",
+        |secrets| {
+            for (key, value) in pairs {
+                secrets.insert((*key).to_owned(), (*value).to_owned());
+            }
+        },
+    )
 }
 
 /// Set secrets for a specific environment.
@@ -250,13 +266,11 @@ pub fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<
         .display()
         .to_string();
 
-    let mut secrets = read_secrets_env(&vault_id, env)?.unwrap_or_default();
-
-    for (key, value) in pairs {
-        secrets.insert(key.to_string(), value.to_string());
-    }
-
-    write_secrets_env(&vault_id, &project_name, &project_path, env, &secrets)
+    mutate_secrets_env(&vault_id, &project_name, &project_path, env, |secrets| {
+        for (key, value) in pairs {
+            secrets.insert((*key).to_owned(), (*value).to_owned());
+        }
+    })
 }
 
 pub fn replace_all_environments(
@@ -280,6 +294,167 @@ pub fn replace_all_environments(
     write_all_environments(&vault_id, &project_name, &project_path, environments)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteSyncTarget {
+    Personal,
+    Organization { slug: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEnvironmentCommit {
+    Committed(EnvironmentMap),
+    Conflict(EnvironmentMap),
+}
+
+/// Commit a cloud pull against the snapshot captured before the request.
+///
+/// `expected_vault_id` must be the ID used to fetch `remote`; the commit is
+/// rejected if `lpm.json` names a different vault by the time the locks are
+/// acquired.
+///
+/// Personal pulls preserve their explicit replacement semantics and reject
+/// any intervening local mutation. Organization pulls merge remote keys into
+/// the latest local snapshot, but reject a key changed locally to a different
+/// value while the request was in flight. Vault contents and sync-version
+/// metadata are written under the shared Vault/CLI transaction lock; a
+/// metadata failure restores the prior vault snapshot.
+pub fn commit_remote_environments(
+    project_dir: &Path,
+    expected_vault_id: &str,
+    baseline: &EnvironmentMap,
+    remote: &EnvironmentMap,
+    target: &RemoteSyncTarget,
+    version: i32,
+) -> Result<RemoteEnvironmentCommit, String> {
+    reject_invalid_keys(
+        remote
+            .values()
+            .flat_map(|map| map.keys().map(String::as_str)),
+    )?;
+    let project_name = vault_id::read_project_name(project_dir);
+    let project_path = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf())
+        .display()
+        .to_string();
+
+    storage_transaction::with_vault_transaction(|directory| {
+        let latest =
+            read_all_environments_unlocked(directory, expected_vault_id)?.unwrap_or_default();
+        let resolved = match target {
+            RemoteSyncTarget::Personal => {
+                if &latest != baseline {
+                    return Ok(RemoteEnvironmentCommit::Conflict(latest));
+                }
+                remote.clone()
+            }
+            RemoteSyncTarget::Organization { .. } => {
+                let mut merged = latest.clone();
+                for (environment, remote_secrets) in remote {
+                    for (key, remote_value) in remote_secrets {
+                        let baseline_value = baseline.get(environment).and_then(|map| map.get(key));
+                        let latest_value = latest.get(environment).and_then(|map| map.get(key));
+                        if latest_value != baseline_value && latest_value != Some(remote_value) {
+                            return Ok(RemoteEnvironmentCommit::Conflict(latest));
+                        }
+                    }
+                    merged
+                        .entry(environment.clone())
+                        .or_default()
+                        .extend(remote_secrets.clone());
+                }
+                merged
+            }
+        };
+
+        let mut vault_written = false;
+        let sync_target = match target {
+            RemoteSyncTarget::Personal => vault_id::SyncVersionTarget::Personal,
+            RemoteSyncTarget::Organization { slug } => {
+                vault_id::SyncVersionTarget::Organization(slug)
+            }
+        };
+        let metadata_result = vault_id::commit_sync_version_if_vault_matches(
+            project_dir,
+            expected_vault_id,
+            sync_target,
+            version,
+            || {
+                write_all_environments_unlocked(
+                    directory,
+                    expected_vault_id,
+                    &project_name,
+                    &project_path,
+                    &resolved,
+                )?;
+                vault_written = true;
+                Ok(())
+            },
+        );
+        if let Err(metadata_error) = metadata_result {
+            if !vault_written {
+                return Err(metadata_error);
+            }
+            return match write_all_environments_unlocked(
+                directory,
+                expected_vault_id,
+                &project_name,
+                &project_path,
+                &latest,
+            ) {
+                Ok(()) => Err(metadata_error),
+                Err(rollback_error) => Err(format!(
+                    "{metadata_error}; vault rollback also failed: {rollback_error}"
+                )),
+            };
+        }
+        Ok(RemoteEnvironmentCommit::Committed(resolved))
+    })
+}
+
+fn read_all_environments_unlocked(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<Option<EnvironmentMap>, String> {
+    if force_file_vault_backend() {
+        return fallback::read_all_environments_unlocked(directory, vault_id);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        keychain::try_read_all_environments_unlocked(vault_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback::read_all_environments_unlocked(directory, vault_id)
+    }
+}
+
+fn write_all_environments_unlocked(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    project_name: &str,
+    project_path: &str,
+    environments: &EnvironmentMap,
+) -> Result<(), String> {
+    if force_file_vault_backend() {
+        return fallback::write_all_environments_unlocked(directory, vault_id, environments);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        keychain::write_all_environments_unlocked(
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (project_name, project_path);
+        fallback::write_all_environments_unlocked(directory, vault_id, environments)
+    }
+}
+
 /// Delete one or more secrets from the vault.
 pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
@@ -294,13 +469,17 @@ pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
         .display()
         .to_string();
 
-    let mut secrets = read_secrets(&vault_id)?.unwrap_or_default();
-
-    for key in keys {
-        secrets.remove(*key);
-    }
-
-    write_secrets(&vault_id, &project_name, &project_path, &secrets)
+    mutate_secrets_env(
+        &vault_id,
+        &project_name,
+        &project_path,
+        "default",
+        |secrets| {
+            for key in keys {
+                secrets.remove(*key);
+            }
+        },
+    )
 }
 
 /// Get a single secret from a specific environment.
@@ -327,11 +506,11 @@ pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), St
         .display()
         .to_string();
 
-    let mut secrets = read_secrets_env(&vault_id, env)?.unwrap_or_default();
-    for key in keys {
-        secrets.remove(*key);
-    }
-    write_secrets_env(&vault_id, &project_name, &project_path, env, &secrets)
+    mutate_secrets_env(&vault_id, &project_name, &project_path, env, |secrets| {
+        for key in keys {
+            secrets.remove(*key);
+        }
+    })
 }
 
 /// List all secret keys (without values) for the project.
@@ -367,17 +546,22 @@ pub fn import_env_file(
         .display()
         .to_string();
 
-    let mut secrets = read_secrets(&vault_id)?.unwrap_or_default();
-    let mut imported = 0;
-
-    for (key, value) in &parsed {
-        if overwrite || !secrets.contains_key(key) {
-            secrets.insert(key.clone(), value.clone());
-            imported += 1;
-        }
-    }
-
-    write_secrets(&vault_id, &project_name, &project_path, &secrets)?;
+    let imported = mutate_secrets_env(
+        &vault_id,
+        &project_name,
+        &project_path,
+        "default",
+        |secrets| {
+            let mut imported = 0;
+            for (key, value) in &parsed {
+                if overwrite || !secrets.contains_key(key) {
+                    secrets.insert(key.clone(), value.clone());
+                    imported += 1;
+                }
+            }
+            imported
+        },
+    )?;
 
     // Auto-add the .env file to .gitignore
     add_to_gitignore(project_dir, env_path);
@@ -411,17 +595,16 @@ pub fn import_env_file_to_env(
         .display()
         .to_string();
 
-    let mut secrets = read_secrets_env(&vault_id, env)?.unwrap_or_default();
-    let mut imported = 0;
-
-    for (key, value) in &parsed {
-        if overwrite || !secrets.contains_key(key) {
-            secrets.insert(key.clone(), value.clone());
-            imported += 1;
+    let imported = mutate_secrets_env(&vault_id, &project_name, &project_path, env, |secrets| {
+        let mut imported = 0;
+        for (key, value) in &parsed {
+            if overwrite || !secrets.contains_key(key) {
+                secrets.insert(key.clone(), value.clone());
+                imported += 1;
+            }
         }
-    }
-
-    write_secrets_env(&vault_id, &project_name, &project_path, env, &secrets)?;
+        imported
+    })?;
     add_to_gitignore(project_dir, env_path);
 
     Ok(imported)
@@ -502,10 +685,6 @@ pub fn export_env_file(project_dir: &Path, output_path: &Path) -> Result<usize, 
 
 // ─── Platform dispatch ─────────────────────────────────────────────
 
-fn read_secrets(vault_id: &str) -> Result<Option<HashMap<String, String>>, String> {
-    read_secrets_env(vault_id, "default")
-}
-
 fn read_secrets_env(vault_id: &str, env: &str) -> Result<Option<HashMap<String, String>>, String> {
     if force_file_vault_backend() {
         return fallback::read_vault_file_env(vault_id, env);
@@ -522,48 +701,26 @@ fn read_secrets_env(vault_id: &str, env: &str) -> Result<Option<HashMap<String, 
     fallback::read_vault_file_env(vault_id, env)
 }
 
-fn write_secrets(
-    vault_id: &str,
-    project_name: &str,
-    project_path: &str,
-    secrets: &HashMap<String, String>,
-) -> Result<(), String> {
-    if force_file_vault_backend() {
-        return fallback::write_vault_file(vault_id, secrets);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        keychain::write_vault(vault_id, project_name, project_path, secrets)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (project_name, project_path); // unused on non-macOS
-        fallback::write_vault_file(vault_id, secrets)
-    }
-}
-
-fn write_secrets_env(
+fn mutate_secrets_env<T>(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
     env: &str,
-    secrets: &HashMap<String, String>,
-) -> Result<(), String> {
+    operation: impl FnOnce(&mut HashMap<String, String>) -> T,
+) -> Result<T, String> {
     if force_file_vault_backend() {
-        return fallback::write_vault_file_env(vault_id, env, secrets);
+        return fallback::mutate_vault_file_env(vault_id, env, operation);
     }
 
     #[cfg(target_os = "macos")]
     {
-        keychain::write_vault_env(vault_id, project_name, project_path, env, secrets)
+        keychain::mutate_vault_env(vault_id, project_name, project_path, env, operation)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (project_name, project_path);
-        fallback::write_vault_file_env(vault_id, env, secrets)
+        fallback::mutate_vault_file_env(vault_id, env, operation)
     }
 }
 
@@ -1076,6 +1233,242 @@ KEY3=no-quotes"#;
         let err = replace_all_environments(dir.path(), &envs)
             .expect_err("must reject if any env has an invalid key");
         assert!(err.contains("env keys must match"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn personal_remote_commit_rejects_an_intervening_local_change() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("BASE", "one")]).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            set(dir.path(), &[("LOCAL", "two")]).unwrap();
+            let remote = HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("REMOTE".to_owned(), "three".to_owned())]),
+            )]);
+
+            let result = commit_remote_environments(
+                dir.path(),
+                &vault_id::read_vault_id(dir.path()).unwrap(),
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Personal,
+                7,
+            )
+            .unwrap();
+
+            assert!(matches!(result, RemoteEnvironmentCommit::Conflict(_)));
+            assert_eq!(
+                get_all(dir.path()).get("LOCAL").map(String::as_str),
+                Some("two")
+            );
+            assert_eq!(vault_id::read_personal_sync_version(dir.path()), None);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn organization_remote_commit_merges_disjoint_local_changes_atomically() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("BASE", "one")]).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            set(dir.path(), &[("LOCAL", "two")]).unwrap();
+            let remote = HashMap::from([(
+                "live".to_owned(),
+                HashMap::from([("REMOTE".to_owned(), "three".to_owned())]),
+            )]);
+
+            let result = commit_remote_environments(
+                dir.path(),
+                &vault_id::read_vault_id(dir.path()).unwrap(),
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Organization {
+                    slug: "acme".to_owned(),
+                },
+                9,
+            )
+            .unwrap();
+
+            let RemoteEnvironmentCommit::Committed(environments) = result else {
+                panic!("disjoint changes should commit");
+            };
+            assert_eq!(environments["default"]["LOCAL"], "two");
+            assert_eq!(environments["live"]["REMOTE"], "three");
+            assert_eq!(vault_id::read_org_sync_version(dir.path(), "acme"), Some(9));
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn organization_remote_commit_rejects_an_overlapping_local_change() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("API_KEY", "baseline")]).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            set(dir.path(), &[("API_KEY", "local")]).unwrap();
+            let remote = HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("API_KEY".to_owned(), "remote".to_owned())]),
+            )]);
+
+            let result = commit_remote_environments(
+                dir.path(),
+                &vault_id::read_vault_id(dir.path()).unwrap(),
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Organization {
+                    slug: "acme".to_owned(),
+                },
+                9,
+            )
+            .unwrap();
+
+            assert!(matches!(result, RemoteEnvironmentCommit::Conflict(_)));
+            assert_eq!(get_all(dir.path())["API_KEY"], "local");
+            assert_eq!(vault_id::read_org_sync_version(dir.path(), "acme"), None);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn remote_commit_rolls_back_vault_when_sync_metadata_write_fails() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("BASE", "one")]).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            let vault_id = vault_id::read_vault_id(dir.path()).unwrap();
+            let padding = "x".repeat(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize - 128);
+            std::fs::write(
+                dir.path().join("lpm.json"),
+                format!(r#"{{"vault":"{vault_id}","padding":"{padding}"}}"#),
+            )
+            .unwrap();
+            let remote = HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("REMOTE".to_owned(), "two".to_owned())]),
+            )]);
+
+            let error = commit_remote_environments(
+                dir.path(),
+                &vault_id,
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Personal,
+                7,
+            )
+            .expect_err("oversized sync metadata must reject the commit");
+
+            assert!(error.contains("exceeds"), "{error}");
+            assert_eq!(try_get_all_environments(dir.path()).unwrap(), baseline);
+            assert_eq!(vault_id::read_personal_sync_version(dir.path()), None);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn remote_commit_rejects_malformed_sync_metadata_before_writing_vault() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("BASE", "one")]).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            let vault_id = vault_id::read_vault_id(dir.path()).unwrap();
+            std::fs::write(
+                dir.path().join("lpm.json"),
+                format!(r#"{{"vault":"{vault_id}","vaultSync":[]}}"#),
+            )
+            .unwrap();
+            let remote = HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("REMOTE".to_owned(), "two".to_owned())]),
+            )]);
+
+            let error = commit_remote_environments(
+                dir.path(),
+                &vault_id,
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Personal,
+                7,
+            )
+            .expect_err("malformed sync metadata must reject the commit");
+
+            assert!(error.contains("vaultSync"), "{error}");
+            assert_eq!(try_get_all_environments(dir.path()).unwrap(), baseline);
+            assert_eq!(vault_id::read_personal_sync_version(dir.path()), None);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn personal_remote_commit_rejects_a_vault_id_replaced_after_fetch_started() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("BASE", "one")]).unwrap();
+            let fetched_vault_id = vault_id::read_vault_id(dir.path()).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            lpm_common::update_lpm_json(dir.path(), |root, _| {
+                root.insert("vault".to_owned(), serde_json::json!("replacement-vault"));
+                Ok(lpm_common::LpmJsonMutation::Changed(()))
+            })
+            .unwrap();
+            replace_all_environments(dir.path(), &baseline).unwrap();
+            let remote = HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("REMOTE".to_owned(), "two".to_owned())]),
+            )]);
+
+            let result = commit_remote_environments(
+                dir.path(),
+                &fetched_vault_id,
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Personal,
+                7,
+            );
+
+            assert!(result.is_err(), "fetched vault was {fetched_vault_id}");
+            assert_eq!(try_get_all_environments(dir.path()).unwrap(), baseline);
+            assert_eq!(vault_id::read_personal_sync_version(dir.path()), None);
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn organization_remote_commit_rejects_a_vault_id_replaced_after_fetch_started() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+            set(dir.path(), &[("BASE", "one")]).unwrap();
+            let fetched_vault_id = vault_id::read_vault_id(dir.path()).unwrap();
+            let baseline = try_get_all_environments(dir.path()).unwrap();
+            lpm_common::update_lpm_json(dir.path(), |root, _| {
+                root.insert("vault".to_owned(), serde_json::json!("replacement-vault"));
+                Ok(lpm_common::LpmJsonMutation::Changed(()))
+            })
+            .unwrap();
+            replace_all_environments(dir.path(), &baseline).unwrap();
+            let remote = HashMap::from([(
+                "live".to_owned(),
+                HashMap::from([("REMOTE".to_owned(), "two".to_owned())]),
+            )]);
+
+            let result = commit_remote_environments(
+                dir.path(),
+                &fetched_vault_id,
+                &baseline,
+                &remote,
+                &RemoteSyncTarget::Organization {
+                    slug: "acme".to_owned(),
+                },
+                9,
+            );
+
+            assert!(result.is_err(), "fetched vault was {fetched_vault_id}");
+            assert_eq!(try_get_all_environments(dir.path()).unwrap(), baseline);
+            assert_eq!(vault_id::read_org_sync_version(dir.path(), "acme"), None);
+        });
     }
 
     #[cfg(debug_assertions)]

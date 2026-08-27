@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-import { validateRecoverySource } from "../validate-recovery-source.mjs";
+import {
+  RECOVERY_REQUIRED_JOBS,
+  validateRecoverySource,
+} from "../validate-recovery-source.mjs";
 
 const REPOSITORY = "lpm-dev/rust-client";
 const RUN_ID = 31925614412;
@@ -25,10 +31,68 @@ const PUBLISH_JOBS = [
   "Smoke npm artifacts (linux-x64)",
   "Smoke npm artifacts (linux-x64-musl)",
   "Smoke npm artifacts (win32-x64)",
-  "Create Release",
+  "Stage Draft Release",
   "Smoke standalone installer on Debian 12 (arm64)",
   "Smoke standalone installer on Debian 12 (x64)",
+  "Smoke standalone installer on macOS (arm64)",
+  "Smoke standalone installer on macOS (x64)",
+  "Publish Smoke-Verified Release",
 ];
+
+function workflowJobNames(source, repoRoot) {
+  const names = new Set();
+  const jobs = source.matchAll(
+    /^  ([a-z0-9-]+):\n([\s\S]*?)(?=^  [a-z0-9-]+:|(?![\s\S]))/gm,
+  );
+  for (const [, jobId, body] of jobs) {
+    const name = /^    name: (.+)$/m.exec(body)?.[1];
+    if (!name) {
+      const reusablePath = /^    uses: \.\/(.+)$/m.exec(body)?.[1];
+      if (reusablePath) {
+        const reusable = fs.readFileSync(path.join(repoRoot, reusablePath), "utf8");
+        const reusableJobNames = [...reusable.matchAll(/^    name: (.+)$/gm)].map(
+          match => match[1],
+        );
+        assert.ok(reusableJobNames.length > 0, `reusable workflow ${reusablePath} must name its jobs`);
+        for (const reusableJobName of reusableJobNames) {
+          names.add(`${jobId} / ${reusableJobName}`);
+        }
+      }
+      continue;
+    }
+    const countBefore = names.size;
+    if (name === "Build ${{ matrix.target }}") {
+      for (const match of body.matchAll(/^          - target: (.+)$/gm)) {
+        names.add(`Build ${match[1]}`);
+      }
+    } else if (name === "Smoke npm artifacts (${{ matrix.platform }})") {
+      for (const match of body.matchAll(/^          - platform: (.+)$/gm)) {
+        names.add(`Smoke npm artifacts (${match[1]})`);
+      }
+    } else if (name === "${{ matrix.name }}") {
+      for (const match of body.matchAll(/^          - name: (.+)$/gm)) names.add(match[1]);
+    } else {
+      names.add(name);
+    }
+    assert.ok(names.size > countBefore, `workflow job ${jobId} must resolve to a unique name`);
+  }
+  return names;
+}
+
+test("every recovery prerequisite matches a current release workflow job name", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
+  const actualJobNames = workflowJobNames(workflow.replaceAll("\r\n", "\n"), repoRoot);
+
+  for (const [purpose, requiredJobs] of Object.entries(RECOVERY_REQUIRED_JOBS)) {
+    for (const requiredJob of requiredJobs) {
+      assert.ok(
+        actualJobNames.has(requiredJob),
+        `${purpose} recovery requires missing workflow job ${requiredJob}`,
+      );
+    }
+  }
+});
 
 function stableFixture() {
   const run = {
@@ -193,7 +257,9 @@ test("Windows smoke recovery requires the signed package artifact but not prior 
   fixture.jobs = fixture.jobs.filter(job => !job.name.startsWith("Smoke npm artifacts"));
   fixture.jobs = fixture.jobs.filter(
     job =>
-      job.name !== "Create Release" && !job.name.startsWith("Smoke standalone installer"),
+      job.name !== "Stage Draft Release" &&
+      job.name !== "Publish Smoke-Verified Release" &&
+      !job.name.startsWith("Smoke standalone installer"),
   );
 
   assert.equal(validateRecoverySource(fixture).artifactId, 9258360160);

@@ -115,22 +115,62 @@ function verifyInstalledBinaries({ platform, platformRecord, nativeRoot, wrapper
     assertRegularFile(installed, `installed ${platform.packageName}/${mapping.destination}`);
     assertFileHash(installed, record.sha256);
 
-    if (mapping.destination.startsWith("lpm-sandbox-helper")) continue;
+    if (platform.os === "darwin" || mapping.destination.startsWith("lpm-sandbox-helper")) continue;
     const staged = path.join(wrapperRoot, "bin", mapping.destination);
     assertRegularFile(staged, `postinstall-staged ${mapping.destination}`);
     assertFileHash(staged, record.sha256);
+  }
+
+  if (platform.os === "darwin") {
+    const internalExecutable = path.join(
+      nativeRoot,
+      "LPM CLI.app",
+      "Contents",
+      "MacOS",
+      "lpm-rs",
+    );
+    for (const command of ["lpm", "lpx"]) {
+      const staged = path.join(wrapperRoot, "bin", command);
+      if (!fs.lstatSync(staged).isSymbolicLink()) {
+        throw new Error(`postinstall-staged ${command} is not a symbolic link`);
+      }
+      if (fs.realpathSync(staged) !== fs.realpathSync(internalExecutable)) {
+        throw new Error(`postinstall-staged ${command} does not preserve the app bundle`);
+      }
+    }
   }
 }
 
 function verifyPlatformSignatures({ platform, nativeRoot, wrapperRoot }) {
   if (platform.os === "darwin") {
-    for (const binary of [
-      path.join(nativeRoot, "lpm"),
-      path.join(nativeRoot, "lpx"),
-      path.join(wrapperRoot, "bin", "lpm"),
-      path.join(wrapperRoot, "bin", "lpx"),
-    ]) {
+    const appBundle = path.join(nativeRoot, "LPM CLI.app");
+    const internalExecutable = path.join(appBundle, "Contents", "MacOS", "lpm-rs");
+    for (const binary of [appBundle, internalExecutable]) {
       runChecked("codesign", ["--verify", "--strict", "--verbose=4", binary]);
+    }
+    assertRegularFile(
+      path.join(appBundle, "Contents", "embedded.provisionprofile"),
+      "installed macOS provisioning profile",
+    );
+    assertRegularFile(
+      path.join(appBundle, "Contents", "CodeResources"),
+      "installed macOS notarization ticket",
+    );
+    runChecked("/usr/bin/xcrun", ["stapler", "validate", appBundle]);
+    runChecked("/usr/sbin/spctl", [
+      "--assess",
+      "--type",
+      "execute",
+      "--verbose=4",
+      appBundle,
+    ]);
+    for (const command of ["lpm", "lpx"]) {
+      runChecked("codesign", [
+        "--verify",
+        "--strict",
+        "--verbose=4",
+        fs.realpathSync(path.join(wrapperRoot, "bin", command)),
+      ]);
     }
   }
 

@@ -3437,6 +3437,7 @@ dependencies = [
  "windows-sys 0.60.2",
  "wiremock",
  "x509-parser",
+ "zip",
 ]
 
 [[package]]
@@ -4000,6 +4001,9 @@ version = "0.75.0"
 dependencies = [
  "aes-gcm",
  "base64",
+ "cap-fs-ext",
+ "cap-std",
+ "core-foundation 0.10.1",
  "dirs",
  "elliptic-curve",
  "futures",
@@ -4007,12 +4011,15 @@ dependencies = [
  "hkdf",
  "hmac",
  "keyring",
+ "libc",
  "lpm-common",
  "lpm-http",
  "p256",
  "rand 0.8.6",
  "reqwest",
  "scrypt",
+ "security-framework 3.7.0",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
@@ -4021,6 +4028,7 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "windows-sys 0.60.2",
  "wiremock",
  "x25519-dalek",
 ]

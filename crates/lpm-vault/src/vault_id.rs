@@ -14,6 +14,11 @@ pub struct VaultSyncSummary {
     pub synced_at: Option<String>,
 }
 
+pub(crate) enum SyncVersionTarget<'a> {
+    Personal,
+    Organization(&'a str),
+}
+
 /// Read the vault ID from lpm.json, or generate one if it doesn't exist.
 ///
 /// The vault ID is stored as `"vault": "uuid-string"` at the top level of lpm.json.
@@ -194,6 +199,96 @@ pub fn write_org_sync_version_at(
     })
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+pub(crate) fn commit_sync_version_if_vault_matches(
+    project_dir: &Path,
+    expected_vault_id: &str,
+    target: SyncVersionTarget<'_>,
+    version: i32,
+    commit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    validate_vault_id(expected_vault_id)?;
+    let synced_at = rfc3339_now();
+    let mut commit = Some(commit);
+    let mut commit_executed = false;
+    let mut previous_sync = None;
+    let mut committed_sync = None;
+    let update_result = lpm_common::update_lpm_json(project_dir, |root, _| {
+        let current_vault_id = root.get("vault").and_then(|value| value.as_str());
+        if current_vault_id != Some(expected_vault_id) {
+            return Err(
+                "the project vault ID changed while the cloud pull was in flight".to_owned(),
+            );
+        }
+        previous_sync = Some(root.get("vaultSync").cloned());
+        let sync = object_entry(root, "vaultSync")?;
+        match target {
+            SyncVersionTarget::Personal => {
+                sync.insert("personalVersion".into(), serde_json::json!(version));
+                sync.insert(
+                    "personalSyncedAt".into(),
+                    serde_json::json!(synced_at.clone()),
+                );
+            }
+            SyncVersionTarget::Organization(slug) => {
+                object_entry(sync, "orgVersions")?
+                    .insert(slug.to_owned(), serde_json::json!(version));
+                object_entry(sync, "orgSyncedAt")?
+                    .insert(slug.to_owned(), serde_json::json!(synced_at.clone()));
+            }
+        }
+        committed_sync = Some(root.get("vaultSync").cloned());
+
+        let commit = commit
+            .take()
+            .ok_or_else(|| "cloud pull commit was invoked more than once".to_owned())?;
+        commit()?;
+        commit_executed = true;
+        Ok(lpm_common::LpmJsonMutation::Changed(()))
+    });
+
+    match update_result {
+        Ok(_) => Ok(()),
+        Err(error) if !commit_executed => Err(error.to_string()),
+        Err(error) => {
+            let metadata_error = error.to_string();
+            let previous_sync = previous_sync.flatten();
+            let committed_sync = committed_sync.flatten();
+            let rollback = lpm_common::update_lpm_json(project_dir, |root, _| {
+                if root.get("vault").and_then(|value| value.as_str()) != Some(expected_vault_id) {
+                    return Err(
+                        "the project vault ID changed before sync metadata rollback".to_owned()
+                    );
+                }
+                let current_sync = root.get("vaultSync").cloned();
+                if current_sync == previous_sync {
+                    return Ok(lpm_common::LpmJsonMutation::Unchanged(()));
+                }
+                if current_sync != committed_sync {
+                    return Err(
+                        "sync metadata changed concurrently; refusing to overwrite it during rollback"
+                            .to_owned(),
+                    );
+                }
+                match &previous_sync {
+                    Some(value) => {
+                        root.insert("vaultSync".to_owned(), value.clone());
+                    }
+                    None => {
+                        root.remove("vaultSync");
+                    }
+                }
+                Ok(lpm_common::LpmJsonMutation::Changed(()))
+            });
+            match rollback {
+                Ok(_) => Err(metadata_error),
+                Err(rollback_error) => Err(format!(
+                    "{metadata_error}; sync metadata rollback also failed: {rollback_error}"
+                )),
+            }
+        }
+    }
 }
 
 pub fn read_sync_summary(project_dir: &Path) -> VaultSyncSummary {

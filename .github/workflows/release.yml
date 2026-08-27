@@ -35,7 +35,7 @@ on:
         required: false
 
 concurrency:
-  group: release-${{ (github.event_name == 'schedule' || inputs.channel == 'nightly') && 'nightly' || format('{0}-{1}', github.event_name, github.ref) }}
+  group: release-${{ (github.event_name == 'schedule' || inputs.channel == 'nightly') && 'nightly' || github.ref }}
   cancel-in-progress: false
 
 # Jobs that publish, attest, or request an OIDC token grant those scopes locally.
@@ -47,6 +47,8 @@ env:
   APPLE_TEAM_ID: "823S8YKMRW"
   APPLE_CODESIGN_IDENTITY: "Developer ID Application: Tolga Ergin (823S8YKMRW)"
   APPLE_CODESIGN_IDENTIFIER: "dev.lpm.cli"
+  APPLE_CODESIGN_ENTITLEMENTS: "macos/lpm.entitlements"
+  APPLE_KEYCHAIN_ACCESS_GROUP: "823S8YKMRW.dev.lpm.vault.shared"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -403,10 +405,12 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-15-intel
             binary: lpm-darwin-x64
+            bundle_platform: darwin-x64
             timeout_minutes: 60
           - target: aarch64-apple-darwin
             os: macos-15
             binary: lpm-darwin-arm64
+            bundle_platform: darwin-arm64
             timeout_minutes: 60
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -447,6 +451,15 @@ jobs:
         if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.portable_glibc != true
         run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
 
+      - name: Build legacy-only macOS compatibility binary
+        if: runner.os == 'macOS'
+        run: >-
+          cargo build --locked --release
+          --target ${{ matrix.target }}
+          --target-dir target/legacy-macos-keychain
+          -p lpm-cli
+          --features legacy-macos-keychain
+
       - name: Build portable GNU Linux binary
         if: matrix.portable_glibc == true
         run: |
@@ -480,7 +493,11 @@ jobs:
 
       - name: Stage binary
         run: |
-          cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp target/legacy-macos-keychain/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
+          else
+            cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
+          fi
           chmod +x ${{ matrix.binary }}
 
       - name: Install Node 22 for GNU Linux ABI verification
@@ -558,11 +575,16 @@ jobs:
 
           echo "APPLE_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
-      - name: Sign binary (macOS)
+      - name: Sign legacy binary and provisioned app bundle (macOS)
         if: runner.os == 'macOS'
+        env:
+          APPLE_CLI_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_CLI_PROVISIONING_PROFILE_BASE64 }}
         run: |
           set -euo pipefail
 
+          # Keep this entitlement-free compatibility artifact in every macOS
+          # release until the 0.75 standalone updater baseline is retired.
+          # Old updaters resolve the raw asset from whichever release is latest.
           codesign --force --timestamp --options runtime \
             --keychain "$APPLE_SIGNING_KEYCHAIN" \
             --identifier "$APPLE_CODESIGN_IDENTIFIER" \
@@ -572,7 +594,54 @@ jobs:
           codesign --verify --strict --verbose=4 "${{ matrix.binary }}"
           codesign -dv --verbose=4 "${{ matrix.binary }}" 2>&1 | grep -E "Authority|TeamIdentifier|Runtime|Timestamp"
 
-      - name: Notarize binary (macOS)
+          if [ -z "${APPLE_CLI_PROVISIONING_PROFILE_BASE64:-}" ]; then
+            echo "::error::Set APPLE_CLI_PROVISIONING_PROFILE_BASE64 to the Developer ID profile for dev.lpm.cli."
+            exit 1
+          fi
+
+          PROFILE_PATH="$RUNNER_TEMP/lpm-cli.provisionprofile"
+          PROFILE_PLIST="$RUNNER_TEMP/lpm-cli-profile.plist"
+          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          mkdir -p "$APP_BUNDLE/Contents/MacOS"
+          cp macos/LPMCLI-Info.plist "$APP_BUNDLE/Contents/Info.plist"
+          cp "target/${{ matrix.target }}/release/lpm-rs" "$APP_BUNDLE/Contents/MacOS/lpm-rs"
+          chmod 755 "$APP_BUNDLE/Contents/MacOS/lpm-rs"
+          printf '%s' "$APPLE_CLI_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+
+          PROFILE_TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")
+          PROFILE_APPLICATION_ID=$(
+            /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$PROFILE_PLIST" 2>/dev/null ||
+              /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST"
+          )
+          PROFILE_ACCESS_GROUPS=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:keychain-access-groups' "$PROFILE_PLIST")
+          test "$PROFILE_TEAM_ID" = "$APPLE_TEAM_ID"
+          test "$PROFILE_APPLICATION_ID" = "$APPLE_TEAM_ID.$APPLE_CODESIGN_IDENTIFIER"
+          printf '%s\n' "$PROFILE_ACCESS_GROUPS" | awk \
+            -v exact="$APPLE_KEYCHAIN_ACCESS_GROUP" \
+            -v wildcard="$APPLE_TEAM_ID.*" \
+            '{ value = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if (value == exact || value == wildcard) found = 1 } END { exit(found ? 0 : 1) }'
+          cp "$PROFILE_PATH" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+
+          codesign --force --timestamp --options runtime \
+            --keychain "$APPLE_SIGNING_KEYCHAIN" \
+            --entitlements "$APPLE_CODESIGN_ENTITLEMENTS" \
+            --sign "$APPLE_CODESIGN_IDENTITY" \
+            "$APP_BUNDLE"
+
+          codesign --verify --strict --verbose=4 "$APP_BUNDLE"
+          codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1 | grep -E "Authority|Identifier|TeamIdentifier|Runtime|Timestamp"
+
+          SIGNED_ENTITLEMENTS="$RUNNER_TEMP/${{ matrix.binary }}-bundle-entitlements.plist"
+          codesign -d --entitlements :- "$APP_BUNDLE" > "$SIGNED_ENTITLEMENTS" 2>/dev/null
+          SIGNED_ACCESS_GROUP=$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' "$SIGNED_ENTITLEMENTS")
+          test "$SIGNED_ACCESS_GROUP" = "$APPLE_KEYCHAIN_ACCESS_GROUP"
+          SIGNED_TEAM_ID=$(codesign -dvv "$APP_BUNDLE" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')
+          SIGNED_IDENTIFIER=$(codesign -dvv "$APP_BUNDLE" 2>&1 | awk -F= '/^Identifier=/{print $2}')
+          test "$SIGNED_TEAM_ID" = "$APPLE_TEAM_ID"
+          test "$SIGNED_IDENTIFIER" = "$APPLE_CODESIGN_IDENTIFIER"
+
+      - name: Notarize and staple macOS artifacts
         if: runner.os == 'macOS'
         env:
           APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
@@ -583,8 +652,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          NOTARY_ZIP="$RUNNER_TEMP/${{ matrix.binary }}.zip"
-          zip -j "$NOTARY_ZIP" "${{ matrix.binary }}"
+          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          BUNDLE_NOTARY_ZIP="$RUNNER_TEMP/${{ matrix.binary }}-bundle-notary.zip"
+          ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "$BUNDLE_NOTARY_ZIP"
+          LEGACY_NOTARY_ZIP="$RUNNER_TEMP/${{ matrix.binary }}-legacy-notary.zip"
+          ditto -c -k --keepParent --norsrc "${{ matrix.binary }}" "$LEGACY_NOTARY_ZIP"
 
           if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
             if [ -z "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -z "${APPLE_NOTARY_KEY_ID:-}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
@@ -597,37 +669,72 @@ jobs:
             printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
             chmod 600 "$NOTARY_KEY_PATH"
 
-            xcrun notarytool submit "$NOTARY_ZIP" \
-              --key "$NOTARY_KEY_PATH" \
-              --key-id "$APPLE_NOTARY_KEY_ID" \
-              --issuer "$APPLE_NOTARY_ISSUER_ID" \
-              --wait \
-              --timeout 30m
+            NOTARY_AUTH=(
+              --key "$NOTARY_KEY_PATH"
+              --key-id "$APPLE_NOTARY_KEY_ID"
+              --issuer "$APPLE_NOTARY_ISSUER_ID"
+            )
           else
             if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
               echo "::error::Set App Store Connect API key secrets, or set APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD for notarization."
               exit 1
             fi
 
-            xcrun notarytool submit "$NOTARY_ZIP" \
-              --apple-id "$APPLE_ID" \
-              --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-              --wait \
-              --timeout 30m
+            NOTARY_AUTH=(
+              --apple-id "$APPLE_ID"
+              --team-id "$APPLE_TEAM_ID"
+              --password "$APPLE_APP_SPECIFIC_PASSWORD"
+            )
           fi
 
-      - name: Execute release binary (macOS)
+          xcrun notarytool submit "$BUNDLE_NOTARY_ZIP" "${NOTARY_AUTH[@]}" --wait --timeout 30m
+          xcrun notarytool submit "$LEGACY_NOTARY_ZIP" "${NOTARY_AUTH[@]}" --wait --timeout 30m
+          xcrun stapler staple "$APP_BUNDLE"
+          xcrun stapler validate "$APP_BUNDLE"
+          codesign --verify --strict --verbose=4 "$APP_BUNDLE"
+          spctl --assess --type execute --verbose=4 "$APP_BUNDLE"
+
+          # The public ZIP must contain the stapled bundle, not the pre-staple bytes.
+          ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${{ matrix.binary }}.zip"
+
+      - name: Delete signing keychain before executing release code (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          security delete-keychain "$APPLE_SIGNING_KEYCHAIN"
+
+      # Upload immutable release inputs before executing built code. A release
+      # binary can no longer replace the bytes later attested and published.
+      - name: Upload non-macOS artifact
+        if: runner.os != 'macOS'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
+
+      - name: Upload macOS bundle and compatibility artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.binary }}
+          path: |
+            ${{ matrix.binary }}
+            ${{ matrix.binary }}.zip
+
+      - name: Execute release app bundle and compatibility binary (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           VERSION="${{ needs.release-metadata.outputs.version }}"
+          APP_EXECUTABLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app/Contents/MacOS/lpm-rs"
           case "${{ matrix.target }}" in
             aarch64-apple-darwin)
-              actual=$(arch -arm64 "./${{ matrix.binary }}" --version)
+              actual=$(arch -arm64 "$APP_EXECUTABLE" --version)
+              legacy_actual=$(arch -arm64 "./${{ matrix.binary }}" --version)
               ;;
             x86_64-apple-darwin)
-              actual=$(arch -x86_64 "./${{ matrix.binary }}" --version)
+              actual=$(arch -x86_64 "$APP_EXECUTABLE" --version)
+              legacy_actual=$(arch -x86_64 "./${{ matrix.binary }}" --version)
               ;;
             *)
               echo "::error::Unexpected macOS target ${{ matrix.target }}"
@@ -635,8 +742,17 @@ jobs:
               ;;
           esac
           test "$actual" = "lpm $VERSION"
-          arch_name=$(file "./${{ matrix.binary }}")
+          test "$legacy_actual" = "lpm $VERSION"
+          arch_name=$(file "$APP_EXECUTABLE")
           echo "$arch_name"
+
+          raw_smoke_home="$RUNNER_TEMP/raw-keychain-home"
+          raw_smoke_project="$RUNNER_TEMP/raw-keychain-project"
+          mkdir -p "$raw_smoke_home" "$raw_smoke_project"
+          cd "$raw_smoke_project"
+          HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env set LPM_RELEASE_SMOKE=verified
+          HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env get LPM_RELEASE_SMOKE >/dev/null
+          HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env delete LPM_RELEASE_SMOKE
 
       - name: Execute release binary (Linux glibc)
         if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
@@ -645,12 +761,6 @@ jobs:
           VERSION="${{ needs.release-metadata.outputs.version }}"
           actual=$("./${{ matrix.binary }}" --version)
           test "$actual" = "lpm $VERSION"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: ${{ matrix.binary }}
-          path: ${{ matrix.binary }}
 
       - name: Delete temporary signing keychain (macOS)
         if: always() && runner.os == 'macOS'
@@ -690,6 +800,16 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/lpm-rs.exe lpm-win32-x64.exe
           cp target/x86_64-pc-windows-msvc/release/lpm-sandbox-helper.exe lpm-sandbox-helper-win32-x64.exe
 
+      - name: Upload immutable unsigned binaries
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unsigned-windows-binaries
+          path: |
+            lpm-win32-x64.exe
+            lpm-sandbox-helper-win32-x64.exe
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Execute release binary
         shell: pwsh
         run: |
@@ -699,16 +819,6 @@ jobs:
             Write-Error "Release binary reported '$actual', expected 'lpm $version'."
             exit 1
           }
-
-      - name: Upload unsigned binaries
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: unsigned-windows-binaries
-          path: |
-            lpm-win32-x64.exe
-            lpm-sandbox-helper-win32-x64.exe
-          if-no-files-found: error
-          retention-days: 1
 
   sign-windows:
     name: Sign Windows binaries
@@ -833,6 +943,38 @@ jobs:
           pattern: lpm-*
           merge-multiple: true
           path: binaries
+
+      - name: Extract macOS app bundles for npm packages
+        run: |
+          set -euo pipefail
+          for binary in lpm-darwin-arm64 lpm-darwin-x64; do
+            platform="${binary#lpm-}"
+            archive="binaries/${binary}.zip"
+            entries=$(unzip -Z1 "$archive")
+            if printf '%s\n' "$entries" | grep -Eq '(^/|(^|/)\.\.(/|$)|\\)'; then
+              echo "::error::Unsafe path in ${archive}."
+              exit 1
+            fi
+            if printf '%s\n' "$entries" | grep -Ev '^LPM CLI\.app(/|$)' >/dev/null; then
+              echo "::error::${archive} must contain only LPM CLI.app."
+              exit 1
+            fi
+            mkdir -p "binaries/${platform}"
+            # ditto stores macOS extended attributes as AppleDouble files.
+            # npm tar archives cannot preserve them, so exclude them here.
+            unzip -q "$archive" -d "binaries/${platform}" -x '*/._*'
+            unexpected_entries=$(
+              cd "binaries/${platform}" &&
+                find 'LPM CLI.app' -print |
+                  grep -Ev '^(LPM CLI\.app|LPM CLI\.app/Contents|LPM CLI\.app/Contents/Info\.plist|LPM CLI\.app/Contents/CodeResources|LPM CLI\.app/Contents/embedded\.provisionprofile|LPM CLI\.app/Contents/MacOS|LPM CLI\.app/Contents/MacOS/lpm-rs|LPM CLI\.app/Contents/_CodeSignature|LPM CLI\.app/Contents/_CodeSignature/CodeResources)$' || true
+            )
+            if [ -n "$unexpected_entries" ]; then
+              echo "::error::${archive} produced unexpected npm bundle entries:"
+              printf '%s\n' "$unexpected_entries"
+              exit 1
+            fi
+            chmod 755 "binaries/${platform}/LPM CLI.app/Contents/MacOS/lpm-rs"
+          done
 
       - name: Pack and hash release packages
         run: |
@@ -978,7 +1120,7 @@ jobs:
           --version ${{ needs.release-metadata.outputs.version }}
 
   release:
-    name: Create Release
+    name: Stage Draft Release
     needs:
       - build
       - release-metadata
@@ -1009,10 +1151,14 @@ jobs:
       - name: Generate SHA256SUMS.txt
         working-directory: binaries
         run: |
-          sha256sum lpm-darwin-arm64 lpm-darwin-x64 \
-                    lpm-linux-x64 lpm-linux-x64-musl lpm-linux-arm64 \
-                    lpm-win32-x64.exe lpm-sandbox-helper-win32-x64.exe \
-                    > SHA256SUMS.txt
+          set -euo pipefail
+          assets=(
+            lpm-darwin-arm64.zip lpm-darwin-x64.zip
+            lpm-linux-x64 lpm-linux-x64-musl lpm-linux-arm64
+            lpm-win32-x64.exe lpm-sandbox-helper-win32-x64.exe
+          )
+          assets+=(lpm-darwin-arm64 lpm-darwin-x64)
+          sha256sum "${assets[@]}" > SHA256SUMS.txt
           echo "Manifest contents:"
           cat SHA256SUMS.txt
 
@@ -1040,6 +1186,29 @@ jobs:
       - name: Stage Sigstore bundle next to manifest
         run: cp "${{ steps.attest.outputs.bundle-path }}" binaries/SHA256SUMS.txt.sigstore
 
+      - name: Remove stale draft release for the exact tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          published_ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\" and .draft == false) | .id")
+          if [ -n "$published_ids" ]; then
+            echo "::error::A published release already exists for $RELEASE_TAG; refusing to replace it."
+            exit 1
+          fi
+
+          draft_ids=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\" and .draft == true) | .id")
+          draft_count=$(printf '%s\n' "$draft_ids" | awk 'NF { count += 1 } END { print count + 0 }')
+          if [ "$draft_count" -gt 1 ]; then
+            echo "::error::Multiple stale drafts exist for $RELEASE_TAG; refusing ambiguous cleanup."
+            exit 1
+          fi
+          if [ "$draft_count" -eq 1 ]; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_ids}"
+          fi
+
       # The release action retries while a new release becomes discoverable by
       # tag. Supplying one precomputed body keeps those retries idempotent.
       - name: Generate release notes
@@ -1054,7 +1223,7 @@ jobs:
             --jq '.body' > "$RUNNER_TEMP/release-notes.md"
           test -s "$RUNNER_TEMP/release-notes.md"
 
-      - name: Create GitHub Release
+      - name: Create draft GitHub Release
         uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1063,12 +1232,20 @@ jobs:
           append_body: false
           fail_on_unmatched_files: true
           overwrite_files: false
+          draft: true
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
-          make_latest: ${{ needs.release-metadata.outputs.channel == 'stable' }}
+          make_latest: false
           target_commitish: ${{ github.sha }}
 
+      - name: Upload exact staged GitHub release
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: staged-github-release
+          path: binaries/
+          if-no-files-found: error
+
   smoke-standalone-installer:
-    name: Smoke standalone installer on Debian 12 (${{ matrix.arch }})
+    name: ${{ matrix.name }}
     needs:
       - release
       - release-metadata
@@ -1079,48 +1256,249 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
+          - name: Smoke standalone installer on Debian 12 (x64)
+            platform: linux
+            arch: x64
             os: ubuntu-latest
             binary: lpm-linux-x64
             image: debian:12.11-slim@sha256:cea2634840f5a87503d8210e4df97b9f23a2acd67ff860a76c133d963032f866
-          - arch: arm64
+          - name: Smoke standalone installer on Debian 12 (arm64)
+            platform: linux
+            arch: arm64
             os: ubuntu-24.04-arm
             binary: lpm-linux-arm64
             image: debian:12.11-slim@sha256:f6af819c6ac3902cbd1df3c4a00208abf8bfbbdf65fd25bbb330d2f8ad961d29
+          - name: Smoke standalone installer on macOS (arm64)
+            platform: macos
+            arch: arm64
+            os: macos-15
+          - name: Smoke standalone installer on macOS (x64)
+            platform: macos
+            arch: x64
+            os: macos-15-intel
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
+      - name: Download exact staged GitHub release
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: staged-github-release
+          path: staged-release
+
       - name: Install exact release through install.sh
+        if: matrix.platform == 'linux'
         env:
           EXPECTED_BINARY: ${{ matrix.binary }}
           LPM_INSTALL_VERSION: ${{ needs.release-metadata.outputs.tag }}
         run: |
           set -euo pipefail
           docker run --rm \
-            -e EXPECTED_BINARY \
-            -e LPM_INSTALL_VERSION \
-            -v "$PWD:/work:ro" \
-            "${{ matrix.image }}" \
+              -e EXPECTED_BINARY \
+              -e LPM_INSTALL_VERSION \
+              -v "$PWD:/work:ro" \
+              -v "$PWD/staged-release:/release:ro" \
+              "${{ matrix.image }}" \
             sh -ceu '
               export DEBIAN_FRONTEND=noninteractive
               apt-get update
-              apt-get install -y --no-install-recommends ca-certificates curl
+              apt-get install -y --no-install-recommends ca-certificates curl python3
               rm -rf /var/lib/apt/lists/*
 
-              release_url="https://github.com/lpm-dev/rust-client/releases/download/${LPM_INSTALL_VERSION}"
-              curl --retry 10 --retry-all-errors --retry-delay 5 \
-                --fail --silent --show-error --location \
-                --range 0-0 \
-                --output /dev/null "${release_url}/${EXPECTED_BINARY}"
-              curl --retry 10 --retry-all-errors --retry-delay 5 \
-                --fail --silent --show-error --location \
-                --output /dev/null "${release_url}/SHA256SUMS.txt"
+              cd /release
+              python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/lpm-release-server.log 2>&1 &
+              attempt=0
+              until curl --fail --silent --output /dev/null http://127.0.0.1:8765/SHA256SUMS.txt; do
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 30 ]; then
+                  cat /tmp/lpm-release-server.log
+                  exit 1
+                fi
+                sleep 0.1
+              done
 
               export HOME=/tmp/lpm-home
+              export LPM_INSTALL_TEST_DOWNLOAD_BASE=http://127.0.0.1:8765
               sh /work/install.sh
               actual=$("$HOME/.lpm/bin/lpm" --version)
               test "$actual" = "lpm ${LPM_INSTALL_VERSION#v}"
             '
+
+      - name: Install exact macOS release through install.sh
+        if: matrix.platform == 'macos'
+        env:
+          LPM_INSTALL_VERSION: ${{ needs.release-metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${LPM_INSTALL_VERSION#v}"
+          raw_asset="lpm-darwin-${{ matrix.arch }}"
+          sigstore_bundle="staged-release/SHA256SUMS.txt.sigstore"
+          integrated_time=$(jq -er 'first(.. | objects | .integratedTime? // empty)' "$sigstore_bundle")
+          published_at=$(date -u -r "$integrated_time" '+%Y-%m-%dT%H:%M:%SZ')
+          printf '{"published_at":"%s"}\n' "$published_at" \
+            > "staged-release/release-v${version}.json"
+
+          python3 -m http.server 8765 --bind 127.0.0.1 \
+            --directory staged-release >"$RUNNER_TEMP/lpm-release-server.log" 2>&1 &
+          server_pid=$!
+          migration_pid=''
+          cleanup() {
+            if [ -n "$migration_pid" ]; then
+              kill "$migration_pid" 2>/dev/null || true
+            fi
+            kill "$server_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+          for attempt in {1..30}; do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:8765/SHA256SUMS.txt; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat "$RUNNER_TEMP/lpm-release-server.log"
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+          # Exercise the real compatibility path before install.sh replaces it:
+          # a raw 0.75-compatible artifact starts as ~/.lpm/bin/lpm, a normal
+          # command triggers the signed-bundle migration, and the same process
+          # re-execs from the installed app before it runs the command.
+          test ! -e "$HOME/.lpm/bin/lpm"
+          mkdir -p "$HOME/.lpm/bin"
+          cp "staged-release/$raw_asset" "$HOME/.lpm/bin/lpm"
+          chmod 0755 "$HOME/.lpm/bin/lpm"
+          cmp -s "staged-release/$raw_asset" "$HOME/.lpm/bin/lpm"
+
+          now=$(date +%s)
+          printf '{"latest":"%s","lastCheck":%s,"nightly":{"latest":"%s","lastCheck":%s}}\n' \
+            "$version" "$now" "$version" "$now" > "$HOME/.lpm/update-check.json"
+
+          migration_project="$RUNNER_TEMP/raw-bundle-migration-project"
+          migration_log="$RUNNER_TEMP/raw-bundle-migration.log"
+          mkdir -p "$migration_project"
+          printf '%s\n' \
+            '{"name":"raw-bundle-migration-smoke","version":"1.0.0","scripts":{"migration-proof":"touch .migration-started && while [ ! -e .migration-finish ]; do sleep 0.1; done"}}' \
+            > "$migration_project/package.json"
+          (
+            cd "$migration_project"
+            exec env LPM_NO_UPDATE_CHECK=1 \
+              LPM_GITHUB_RELEASE_DOWNLOAD_URL_OVERRIDE='http://127.0.0.1:8765/{file}?tag={tag}' \
+              LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE='http://127.0.0.1:8765/release-v{tag}.json' \
+              "$HOME/.lpm/bin/lpm" run migration-proof > "$migration_log" 2>&1
+          ) &
+          migration_pid=$!
+
+          for attempt in {1..600}; do
+            if [ -e "$migration_project/.migration-started" ]; then
+              break
+            fi
+            if ! kill -0 "$migration_pid" 2>/dev/null; then
+              cat "$migration_log"
+              echo "::error::Raw-to-bundle migration command exited before its script started."
+              exit 1
+            fi
+            if [ "$attempt" -eq 600 ]; then
+              cat "$migration_log"
+              echo "::error::Timed out waiting for the migrated command to start."
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+          expected_migrated_executable="$HOME/.lpm/libexec/LPM CLI.app/Contents/MacOS/lpm-rs"
+          test -L "$HOME/.lpm/bin/lpm"
+          test -L "$HOME/.lpm/bin/lpx"
+          test "$(readlink "$HOME/.lpm/bin/lpm")" = '../libexec/LPM CLI.app/Contents/MacOS/lpm-rs'
+          test "$(readlink "$HOME/.lpm/bin/lpx")" = '../libexec/LPM CLI.app/Contents/MacOS/lpm-rs'
+          test "$(realpath "$HOME/.lpm/bin/lpm")" = "$expected_migrated_executable"
+          /usr/sbin/lsof -a -p "$migration_pid" -d txt -Fn \
+            | grep -Fxq "n$expected_migrated_executable"
+
+          touch "$migration_project/.migration-finish"
+          if ! wait "$migration_pid"; then
+            cat "$migration_log"
+            exit 1
+          fi
+          migration_pid=''
+          test "$("$HOME/.lpm/bin/lpm" --version)" = "lpm $version"
+
+          LPM_INSTALL_TEST_DOWNLOAD_BASE=http://127.0.0.1:8765 sh install.sh
+
+          app="$HOME/.lpm/libexec/LPM CLI.app"
+          executable="$app/Contents/MacOS/lpm-rs"
+          expected_version="lpm ${LPM_INSTALL_VERSION#v}"
+          expected_link='../libexec/LPM CLI.app/Contents/MacOS/lpm-rs'
+          access_group='823S8YKMRW.dev.lpm.vault.shared'
+
+          test -d "$app"
+          test -x "$executable"
+          test -x "$HOME/.lpm/libexec/LPM CLI.app/Contents/MacOS/lpm-rs"
+          test -L "$HOME/.lpm/bin/lpm"
+          test -L "$HOME/.lpm/bin/lpx"
+          test "$(readlink "$HOME/.lpm/bin/lpm")" = "$expected_link"
+          test "$(readlink "$HOME/.lpm/bin/lpx")" = "$expected_link"
+          test "$("$executable" --version)" = "$expected_version"
+
+          /usr/bin/codesign --verify --strict --verbose=4 "$app"
+          signature_details=$(/usr/bin/codesign -dvv "$app" 2>&1)
+          grep -Fxq 'Identifier=dev.lpm.cli' <<<"$signature_details"
+          grep -Fxq 'TeamIdentifier=823S8YKMRW' <<<"$signature_details"
+
+          entitlements="$RUNNER_TEMP/lpm-cli-entitlements.plist"
+          /usr/bin/codesign -d --entitlements :- "$app" > "$entitlements"
+          /usr/libexec/PlistBuddy -c 'Print :keychain-access-groups' "$entitlements" \
+            | grep -Fq "$access_group"
+
+          profile="$RUNNER_TEMP/lpm-cli-profile.plist"
+          /usr/bin/security cms -D -i "$app/Contents/embedded.provisionprofile" > "$profile"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile")" = '823S8YKMRW'
+          profile_application=$(
+            /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile" 2>/dev/null ||
+              /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile"
+          )
+          test "$profile_application" = '823S8YKMRW.dev.lpm.cli'
+          profile_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:keychain-access-groups' "$profile")
+          printf '%s\n' "$profile_access_groups" | awk \
+            -v exact="$access_group" \
+            -v wildcard='823S8YKMRW.*' \
+            '{ value = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if (value == exact || value == wildcard) found = 1 } END { exit(found ? 0 : 1) }'
+
+          /usr/bin/xcrun stapler validate "$app"
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$app"
+
+  publish-release:
+    name: Publish Smoke-Verified Release
+    needs:
+      - release
+      - release-metadata
+      - smoke-standalone-installer
+    if: >-
+      always() &&
+      needs.release.result == 'success' &&
+      needs.smoke-standalone-installer.result == 'success' &&
+      needs.release-metadata.outputs.should_release == 'true' &&
+      needs.release-metadata.outputs.mode == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Promote the exact draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+          MAKE_LATEST: ${{ needs.release-metadata.outputs.channel == 'stable' }}
+        run: |
+          set -euo pipefail
+          release_id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\" and .draft == true) | .id")
+          if [ -z "$release_id" ] || [ "$(printf '%s\n' "$release_id" | wc -l | tr -d ' ')" != "1" ]; then
+            echo "::error::Expected exactly one draft release for $RELEASE_TAG."
+            exit 1
+          fi
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false \
+            -f make_latest="$MAKE_LATEST" >/dev/null
 
   publish-npm-platform:
     name: Publish npm Platform Packages
@@ -1128,11 +1506,13 @@ jobs:
       - release
       - release-metadata
       - smoke-standalone-installer
+      - publish-release
     if: >-
       always() &&
       needs.release-metadata.outputs.should_release == 'true' &&
       ((needs.release.result == 'success' &&
       needs.smoke-standalone-installer.result == 'success' &&
+      needs.publish-release.result == 'success' &&
       needs.release-metadata.outputs.mode == 'full') ||
       (github.event_name == 'workflow_dispatch' &&
       needs.release-metadata.outputs.mode == 'npm-publish-only'))
@@ -1472,9 +1852,13 @@ jobs:
   update-homebrew:
     name: Update Homebrew Formula
     needs:
-      - release
+      - publish-release
       - release-metadata
+      - smoke-standalone-installer
     if: >-
+      always() &&
+      needs.publish-release.result == 'success' &&
+      needs.smoke-standalone-installer.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       needs.release-metadata.outputs.channel == 'stable' &&
       needs.release-metadata.outputs.mode == 'full'
@@ -1518,8 +1902,8 @@ jobs:
             echo "${env_name}=${hash}" >> "$GITHUB_ENV"
           }
 
-          export_manifest_hash lpm-darwin-arm64 SHA_DARWIN_ARM64
-          export_manifest_hash lpm-darwin-x64 SHA_DARWIN_X64
+          export_manifest_hash lpm-darwin-arm64.zip SHA_DARWIN_ARM64
+          export_manifest_hash lpm-darwin-x64.zip SHA_DARWIN_X64
           export_manifest_hash lpm-linux-arm64 SHA_LINUX_ARM64
           export_manifest_hash lpm-linux-x64 SHA_LINUX_X64
           echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"

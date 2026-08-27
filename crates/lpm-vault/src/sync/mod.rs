@@ -82,10 +82,11 @@ pub use personal::{
 };
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, OrgMemberKeyAccess, PendingPublicKey,
-    PublicKeyRegistrationState, UploadPublicKeyResponse, classify_public_key_state,
-    create_pending_x25519_keypair, discard_pending_x25519_keypair, get_my_public_key,
-    get_org_member_key_access, get_org_member_keys, promote_pending_x25519_keypair,
-    read_pending_x25519_keypair, upload_public_key,
+    PublicKeyRegistrationState, SharingKeyRotationLock, UploadPublicKeyResponse,
+    classify_public_key_state, create_pending_x25519_keypair, discard_pending_x25519_keypair,
+    get_my_public_key, get_org_member_key_access, get_org_member_keys,
+    promote_pending_x25519_keypair, read_pending_x25519_keypair,
+    try_acquire_sharing_key_rotation_lock, upload_public_key,
 };
 pub use step_up::{
     CLI_STEP_UP_HEADER_NAME, CliStepUpCredential, CliStepUpPolicy, discover_cli_step_up_policy,

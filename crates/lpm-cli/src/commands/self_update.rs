@@ -11,7 +11,7 @@ use crate::sigstore_verify::{
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -60,6 +60,7 @@ pub async fn run(
 ) -> Result<(), LpmError> {
     let started = Instant::now();
     let account_home = canonical_account_home()?;
+    let current_executable = canonical_current_executable()?;
     let _operation_lock = try_acquire_self_update_lock(&account_home)?.ok_or_else(|| {
         LpmError::SelfUpdate(
             "another self-update operation is already running; wait for it to finish and retry"
@@ -155,7 +156,10 @@ pub async fn run(
         );
     }
 
-    if !should_install_update(current, &latest, channel, target_channel) {
+    let bundle_migration_needed =
+        macos_raw_standalone_requires_bundle_migration(&current_executable, &account_home);
+    if !should_install_update(current, &latest, channel, target_channel) && !bundle_migration_needed
+    {
         if json_output {
             let json = serde_json::json!({
                 "success": true,
@@ -194,7 +198,6 @@ pub async fn run(
     let project_root = active_project_root(&working_dir, &account_home)?;
     let environment_exclusion_root =
         environment_exclusion_root(&working_dir, &project_root, &account_home)?;
-    let current_executable = canonical_current_executable()?;
     if project_root
         .as_deref()
         .is_some_and(|root| current_executable.starts_with(root))
@@ -364,8 +367,10 @@ pub async fn run(
                 .verify_requested(&latest)?;
         }
         InstallMethod::Standalone => {
-            standalone_audit =
-                Some(run_standalone_update(&latest, &current_executable, !json_output).await?);
+            standalone_audit = Some(
+                run_standalone_update(&latest, &current_executable, &account_home, !json_output)
+                    .await?,
+            );
         }
     }
 
@@ -2094,23 +2099,49 @@ fn verify_release_asset_digest(
 async fn run_standalone_update(
     version: &str,
     current_executable: &Path,
+    account_home: &Path,
     human_output: bool,
 ) -> Result<AttestationAudit, LpmError> {
     validate_standalone_install_location(current_executable)?;
-    let assets = verify_and_stage_for_standalone(version, current_executable, human_output).await?;
-    VersionProbe::verify_staged(
-        &assets.staged_binary.temporary,
-        &assets.staged_binary.sha256,
-        version,
-    )?;
-    ensure_staged_file_unchanged(
-        &assets.staged_binary.temporary,
-        &assets.staged_binary.sha256,
-    )?;
-    let StagedAsset {
-        temporary, sha256, ..
-    } = assets.staged_binary;
-    install_staged_binary(current_executable, temporary, &sha256)?;
+    #[cfg(target_os = "macos")]
+    let macos_layout = prepare_macos_standalone_layout(current_executable, account_home)?;
+    #[cfg(target_os = "macos")]
+    let staging_anchor = macos_layout.app_parent.join(".lpm-release-asset.zip");
+    #[cfg(not(target_os = "macos"))]
+    let staging_anchor = current_executable.to_path_buf();
+
+    let assets = verify_and_stage_for_standalone(version, &staging_anchor, human_output).await?;
+
+    #[cfg(target_os = "macos")]
+    {
+        ensure_staged_file_unchanged(
+            &assets.staged_binary.temporary,
+            &assets.staged_binary.sha256,
+        )?;
+        let staged_bundle = stage_macos_bundle(
+            assets.staged_binary.temporary.path(),
+            &macos_layout.app_parent,
+        )?;
+        VersionProbe::verify_staged_path(&staged_bundle.executable, version)?;
+        install_staged_macos_bundle(&macos_layout, staged_bundle, version)?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        VersionProbe::verify_staged(
+            &assets.staged_binary.temporary,
+            &assets.staged_binary.sha256,
+            version,
+        )?;
+        ensure_staged_file_unchanged(
+            &assets.staged_binary.temporary,
+            &assets.staged_binary.sha256,
+        )?;
+        let StagedAsset {
+            temporary, sha256, ..
+        } = assets.staged_binary;
+        install_staged_binary(current_executable, temporary, &sha256)?;
+    }
 
     tracing::info!(
         target: "lpm_cli::self_update",
@@ -2153,6 +2184,756 @@ fn audit_json(audit: &AttestationAudit) -> serde_json::Value {
 struct StandaloneAssets {
     staged_binary: StagedAsset,
     audit: AttestationAudit,
+}
+
+const MACOS_APP_NAME: &str = "LPM CLI.app";
+const MACOS_INTERNAL_EXECUTABLE: &str = "Contents/MacOS/lpm-rs";
+const MACOS_BUNDLE_MAX_ENTRIES: usize = 64;
+const MACOS_BUNDLE_MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+const MACOS_BUNDLE_MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+const MACOS_EXPECTED_TEAM_ID: &str = "823S8YKMRW";
+const MACOS_EXPECTED_BUNDLE_ID: &str = "dev.lpm.cli";
+const MACOS_EXPECTED_ACCESS_GROUP: &str = "823S8YKMRW.dev.lpm.vault.shared";
+const MACOS_EXPECTED_PROFILE_ACCESS_GROUP: &str = "823S8YKMRW.*";
+const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
+    "LPM CLI.app/Contents/Info.plist",
+    "LPM CLI.app/Contents/CodeResources",
+    "LPM CLI.app/Contents/embedded.provisionprofile",
+    "LPM CLI.app/Contents/MacOS/lpm-rs",
+    "LPM CLI.app/Contents/_CodeSignature/CodeResources",
+];
+const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 4] = [
+    "LPM CLI.app",
+    "LPM CLI.app/Contents",
+    "LPM CLI.app/Contents/MacOS",
+    "LPM CLI.app/Contents/_CodeSignature",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacOSStandaloneLayout {
+    app_parent: PathBuf,
+    app_bundle: PathBuf,
+    lpm_link: PathBuf,
+    lpx_link: PathBuf,
+}
+
+fn macos_standalone_layout_for(
+    current_executable: &Path,
+    account_home: &Path,
+) -> Result<MacOSStandaloneLayout, LpmError> {
+    if !current_executable.is_absolute() || !account_home.is_absolute() {
+        return Err(LpmError::SelfUpdate(
+            "macOS standalone installation paths must be absolute".to_string(),
+        ));
+    }
+    let install_root = account_home.join(".lpm");
+    let app_parent = install_root.join("libexec");
+    let app_bundle = app_parent.join(MACOS_APP_NAME);
+    let lpm_link = install_root.join("bin/lpm");
+    let lpx_link = install_root.join("bin/lpx");
+    let internal_executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
+    if current_executable != lpm_link && current_executable != internal_executable {
+        return Err(LpmError::SelfUpdate(format!(
+            "macOS standalone bundle migration supports only {} and {}; reinstall with https://github.com/lpm-dev/rust-client/blob/main/install.sh",
+            lpm_link.display(),
+            internal_executable.display()
+        )));
+    }
+    Ok(MacOSStandaloneLayout {
+        app_parent,
+        app_bundle,
+        lpm_link,
+        lpx_link,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_raw_standalone_requires_bundle_migration(
+    current_executable: &Path,
+    account_home: &Path,
+) -> bool {
+    macos_standalone_layout_for(current_executable, account_home)
+        .is_ok_and(|layout| current_executable == layout.lpm_link)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_raw_standalone_requires_bundle_migration(
+    _current_executable: &Path,
+    _account_home: &Path,
+) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn migrate_raw_standalone_bundle_if_needed() -> Result<Option<PathBuf>, LpmError> {
+    let account_home = canonical_account_home()?;
+    let current_executable = canonical_current_executable()?;
+    if !macos_raw_standalone_requires_bundle_migration(&current_executable, &account_home) {
+        return Ok(None);
+    }
+
+    let layout = macos_standalone_layout_for(&current_executable, &account_home)?;
+    run(false, false, None).await?;
+
+    let internal_executable = layout.app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
+    validate_macos_app_bundle(&layout.app_bundle)?;
+    let expected_executable = std::fs::canonicalize(&internal_executable).map_err(LpmError::Io)?;
+    let invoked_as_lpx = std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|argument| Path::new(argument).file_name())
+        .is_some_and(|name| name == "lpx");
+    let launcher = if invoked_as_lpx {
+        layout.lpx_link
+    } else {
+        layout.lpm_link
+    };
+    if std::fs::canonicalize(&launcher).map_err(LpmError::Io)? != expected_executable {
+        return Err(LpmError::SelfUpdate(format!(
+            "migrated macOS launcher does not resolve to the signed app bundle: {}",
+            launcher.display()
+        )));
+    }
+    Ok(Some(launcher))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn reexec_migrated_macos_bundle(launcher: &Path) -> Result<(), LpmError> {
+    use std::os::unix::process::CommandExt as _;
+
+    let error = std::process::Command::new(launcher)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(LpmError::SelfUpdate(format!(
+        "could not restart LPM from the signed macOS app bundle: {error}"
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_macos_standalone_layout(
+    current_executable: &Path,
+    account_home: &Path,
+) -> Result<MacOSStandaloneLayout, LpmError> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let layout = macos_standalone_layout_for(current_executable, account_home)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&layout.app_parent) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS bundle parent is not a real directory: {}",
+                layout.app_parent.display()
+            )));
+        }
+    } else {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(false).mode(0o755);
+        builder.create(&layout.app_parent).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not create macOS bundle parent {}: {error}",
+                layout.app_parent.display()
+            ))
+        })?;
+    }
+    let metadata = std::fs::symlink_metadata(&layout.app_parent).map_err(LpmError::Io)?;
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(LpmError::SelfUpdate(format!(
+            "macOS bundle parent is not private to the current account: {}",
+            layout.app_parent.display()
+        )));
+    }
+    Ok(layout)
+}
+
+fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
+    let archive_file = std::fs::File::open(archive_path).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not open staged macOS app archive {}: {error}",
+            archive_path.display()
+        ))
+    })?;
+    let mut archive = zip::ZipArchive::new(archive_file).map_err(|error| {
+        LpmError::SelfUpdate(format!("could not parse staged macOS app archive: {error}"))
+    })?;
+    if archive.is_empty() || archive.len() > MACOS_BUNDLE_MAX_ENTRIES {
+        return Err(LpmError::SelfUpdate(format!(
+            "macOS app archive entry count {} is outside the allowed range 1..={MACOS_BUNDLE_MAX_ENTRIES}",
+            archive.len()
+        )));
+    }
+
+    let required = MACOS_REQUIRED_BUNDLE_FILES
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let allowed_directories = MACOS_ALLOWED_BUNDLE_DIRECTORIES
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::with_capacity(archive.len());
+    let mut seen_required = HashSet::with_capacity(required.len());
+    let mut total_bytes = 0_u64;
+
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not inspect macOS app archive entry {index}: {error}"
+            ))
+        })?;
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            LpmError::SelfUpdate(format!(
+                "macOS app archive contains an unsafe path: {}",
+                entry.name()
+            ))
+        })?;
+        let relative = enclosed.to_str().ok_or_else(|| {
+            LpmError::SelfUpdate("macOS app archive contains a non-UTF-8 path".to_string())
+        })?;
+        if !seen.insert(relative.to_string()) {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive contains a duplicate entry: {relative}"
+            )));
+        }
+        if !enclosed.starts_with(MACOS_APP_NAME) || enclosed.components().count() > 8 {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive contains an unsafe path: {relative}"
+            )));
+        }
+        if let Some(mode) = entry.unix_mode() {
+            let file_type = mode & 0o170000;
+            if file_type == 0o120000
+                || (file_type != 0 && file_type != 0o040000 && file_type != 0o100000)
+            {
+                return Err(LpmError::SelfUpdate(format!(
+                    "macOS app archive contains a link or special file: {relative}"
+                )));
+            }
+        }
+
+        let declared = entry.size();
+        if declared > MACOS_BUNDLE_MAX_ENTRY_BYTES {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive entry {relative} exceeds {MACOS_BUNDLE_MAX_ENTRY_BYTES} bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(declared);
+        if total_bytes > MACOS_BUNDLE_MAX_EXTRACTED_BYTES {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive exceeds {MACOS_BUNDLE_MAX_EXTRACTED_BYTES} extracted bytes"
+            )));
+        }
+
+        if entry.is_dir() {
+            if !allowed_directories.contains(relative.trim_end_matches('/')) {
+                return Err(LpmError::SelfUpdate(format!(
+                    "macOS app archive contains an unexpected entry: {relative}"
+                )));
+            }
+        } else if required.contains(relative) {
+            seen_required.insert(relative.to_string());
+        } else if !enclosed
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive contains an unexpected entry: {relative}"
+            )));
+        }
+    }
+
+    for required_file in required {
+        if !seen_required.contains(required_file) {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive is missing required entry: {required_file}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct StagedMacOSBundle {
+    staging_root: tempfile::TempDir,
+    app_bundle: PathBuf,
+    executable: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+fn stage_macos_bundle(
+    archive_path: &Path,
+    app_parent: &Path,
+) -> Result<StagedMacOSBundle, LpmError> {
+    validate_macos_bundle_zip(archive_path)?;
+    let staging_root = tempfile::Builder::new()
+        .prefix(".lpm-bundle-update-")
+        .tempdir_in(app_parent)
+        .map_err(LpmError::Io)?;
+    let status = std::process::Command::new("/usr/bin/ditto")
+        .args([OsStr::new("-x"), OsStr::new("-k")])
+        .arg(archive_path)
+        .arg(staging_root.path())
+        .status()
+        .map_err(|error| {
+            LpmError::SelfUpdate(format!("could not start ditto for app extraction: {error}"))
+        })?;
+    if !status.success() {
+        return Err(LpmError::SelfUpdate(format!(
+            "ditto failed to extract the macOS app archive with status {status}"
+        )));
+    }
+    let app_bundle = staging_root.path().join(MACOS_APP_NAME);
+    validate_macos_app_bundle(&app_bundle)?;
+    let executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
+    Ok(StagedMacOSBundle {
+        staging_root,
+        app_bundle,
+        executable,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let app_metadata = std::fs::symlink_metadata(app_bundle).map_err(|error| {
+        LpmError::SelfUpdate(format!(
+            "could not inspect staged macOS app bundle {}: {error}",
+            app_bundle.display()
+        ))
+    })?;
+    if app_metadata.file_type().is_symlink() || !app_metadata.is_dir() {
+        return Err(LpmError::SelfUpdate(
+            "staged macOS app bundle is not a real directory".to_string(),
+        ));
+    }
+
+    let expected_directories = [
+        PathBuf::from("Contents"),
+        PathBuf::from("Contents/MacOS"),
+        PathBuf::from("Contents/_CodeSignature"),
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let expected_files = [
+        PathBuf::from("Contents/Info.plist"),
+        PathBuf::from("Contents/CodeResources"),
+        PathBuf::from("Contents/embedded.provisionprofile"),
+        PathBuf::from("Contents/MacOS/lpm-rs"),
+        PathBuf::from("Contents/_CodeSignature/CodeResources"),
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let mut seen_files = HashSet::with_capacity(expected_files.len());
+    let mut stack = vec![app_bundle.to_path_buf()];
+    let mut total_bytes = 0_u64;
+    let mut entry_count = 0_usize;
+
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).map_err(LpmError::Io)? {
+            let entry = entry.map_err(LpmError::Io)?;
+            entry_count += 1;
+            if entry_count > MACOS_BUNDLE_MAX_ENTRIES {
+                return Err(LpmError::SelfUpdate(
+                    "staged macOS app bundle contains too many entries".to_string(),
+                ));
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(app_bundle).map_err(|_| {
+                LpmError::SelfUpdate(
+                    "staged macOS app bundle escaped its extraction root".to_string(),
+                )
+            })?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(LpmError::Io)?;
+            if metadata.file_type().is_symlink() {
+                return Err(LpmError::SelfUpdate(format!(
+                    "staged macOS app bundle contains a symbolic link: {}",
+                    relative.display()
+                )));
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(LpmError::SelfUpdate(format!(
+                    "staged macOS app bundle contains a shared-writable entry: {}",
+                    relative.display()
+                )));
+            }
+            if metadata.is_dir() {
+                if !expected_directories.contains(relative) {
+                    return Err(LpmError::SelfUpdate(format!(
+                        "staged macOS app bundle contains an unexpected directory: {}",
+                        relative.display()
+                    )));
+                }
+                stack.push(path);
+            } else if metadata.is_file() {
+                if !expected_files.contains(relative) {
+                    return Err(LpmError::SelfUpdate(format!(
+                        "staged macOS app bundle contains an unexpected file: {}",
+                        relative.display()
+                    )));
+                }
+                total_bytes = total_bytes.saturating_add(metadata.len());
+                if total_bytes > MACOS_BUNDLE_MAX_EXTRACTED_BYTES {
+                    return Err(LpmError::SelfUpdate(
+                        "staged macOS app bundle exceeds its extracted-size limit".to_string(),
+                    ));
+                }
+                seen_files.insert(relative.to_path_buf());
+            } else {
+                return Err(LpmError::SelfUpdate(format!(
+                    "staged macOS app bundle contains an unsupported file type: {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+
+    if seen_files != expected_files {
+        return Err(LpmError::SelfUpdate(
+            "staged macOS app bundle is missing a required signed file".to_string(),
+        ));
+    }
+    let executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
+    let mode = std::fs::metadata(&executable)
+        .map_err(LpmError::Io)?
+        .permissions()
+        .mode();
+    if mode & 0o111 == 0 {
+        return Err(LpmError::SelfUpdate(
+            "staged macOS app bundle executable does not have an executable mode".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_validation_tool(
+    program: &str,
+    arguments: &[&OsStr],
+    description: &str,
+) -> Result<std::process::Output, LpmError> {
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| LpmError::SelfUpdate(format!("could not start {description}: {error}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(LpmError::SelfUpdate(format!(
+            "{description} failed with status {}{}",
+            output.status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        )));
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn plist_buddy_value(plist: &Path, key: &str) -> Result<String, LpmError> {
+    let command = format!("Print :{key}");
+    let output = run_macos_validation_tool(
+        "/usr/libexec/PlistBuddy",
+        &[OsStr::new("-c"), command.as_ref(), plist.as_os_str()],
+        "provisioning-profile metadata validation",
+    )?;
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_string())
+        .map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "provisioning-profile metadata is not valid UTF-8: {error}"
+            ))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn plist_array_contains(value: &str, expected: &str) -> bool {
+    value.lines().any(|line| line.trim() == expected)
+}
+
+#[cfg(target_os = "macos")]
+fn provisioning_profile_application_identifier(plist: &Path) -> Result<String, LpmError> {
+    plist_buddy_value(plist, "Entitlements:com.apple.application-identifier")
+        .or_else(|_| plist_buddy_value(plist, "Entitlements:application-identifier"))
+}
+
+#[cfg(target_os = "macos")]
+fn provisioning_profile_authorizes_access_group(groups: &str) -> bool {
+    plist_array_contains(groups, MACOS_EXPECTED_ACCESS_GROUP)
+        || plist_array_contains(groups, MACOS_EXPECTED_PROFILE_ACCESS_GROUP)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_entitlement_inspection_arguments(app_bundle: &Path) -> [&OsStr; 4] {
+    [
+        OsStr::new("-d"),
+        OsStr::new("--entitlements"),
+        OsStr::new(":-"),
+        app_bundle.as_os_str(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
+    use std::io::Write as _;
+
+    validate_macos_app_inventory(app_bundle)?;
+    run_macos_validation_tool(
+        "/usr/bin/codesign",
+        &[
+            OsStr::new("--verify"),
+            OsStr::new("--strict"),
+            OsStr::new("--verbose=4"),
+            app_bundle.as_os_str(),
+        ],
+        "macOS app code-signature validation",
+    )?;
+
+    let details = run_macos_validation_tool(
+        "/usr/bin/codesign",
+        &[OsStr::new("-dvv"), app_bundle.as_os_str()],
+        "macOS app signing-identity inspection",
+    )?;
+    let details = format!(
+        "{}{}",
+        String::from_utf8_lossy(&details.stdout),
+        String::from_utf8_lossy(&details.stderr)
+    );
+    let detail_value = |name: &str| {
+        details
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::trim)
+    };
+    if detail_value("TeamIdentifier") != Some(MACOS_EXPECTED_TEAM_ID)
+        || detail_value("Identifier") != Some(MACOS_EXPECTED_BUNDLE_ID)
+    {
+        return Err(LpmError::SelfUpdate(
+            "macOS app has an unexpected Team ID or bundle identifier".to_string(),
+        ));
+    }
+
+    let entitlement_arguments = macos_entitlement_inspection_arguments(app_bundle);
+    let signed_entitlements = run_macos_validation_tool(
+        "/usr/bin/codesign",
+        &entitlement_arguments,
+        "macOS app entitlement inspection",
+    )?;
+    let mut entitlement_plist = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
+    entitlement_plist
+        .write_all(&signed_entitlements.stdout)
+        .map_err(LpmError::Io)?;
+    entitlement_plist.flush().map_err(LpmError::Io)?;
+    let signed_groups = plist_buddy_value(entitlement_plist.path(), "keychain-access-groups")?;
+    if !plist_array_contains(&signed_groups, MACOS_EXPECTED_ACCESS_GROUP) {
+        return Err(LpmError::SelfUpdate(
+            "macOS app does not have the LPM Vault shared Keychain access group".to_string(),
+        ));
+    }
+
+    let profile = app_bundle.join("Contents/embedded.provisionprofile");
+    let decoded_profile = run_macos_validation_tool(
+        "/usr/bin/security",
+        &[
+            OsStr::new("cms"),
+            OsStr::new("-D"),
+            OsStr::new("-i"),
+            profile.as_os_str(),
+        ],
+        "macOS provisioning-profile decoding",
+    )?;
+    let mut profile_plist = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
+    profile_plist
+        .write_all(&decoded_profile.stdout)
+        .map_err(LpmError::Io)?;
+    profile_plist.flush().map_err(LpmError::Io)?;
+    let profile_team = plist_buddy_value(profile_plist.path(), "TeamIdentifier:0")?;
+    let profile_application = provisioning_profile_application_identifier(profile_plist.path())?;
+    let profile_groups =
+        plist_buddy_value(profile_plist.path(), "Entitlements:keychain-access-groups")?;
+    if profile_team != MACOS_EXPECTED_TEAM_ID
+        || profile_application != format!("{MACOS_EXPECTED_TEAM_ID}.{MACOS_EXPECTED_BUNDLE_ID}")
+        || !provisioning_profile_authorizes_access_group(&profile_groups)
+    {
+        return Err(LpmError::SelfUpdate(
+            "macOS provisioning profile does not authorize the shared Keychain contract"
+                .to_string(),
+        ));
+    }
+
+    run_macos_validation_tool(
+        "/usr/bin/stapler",
+        &[OsStr::new("validate"), app_bundle.as_os_str()],
+        "macOS notarization-ticket validation",
+    )?;
+    run_macos_validation_tool(
+        "/usr/sbin/spctl",
+        &[
+            OsStr::new("--assess"),
+            OsStr::new("--type"),
+            OsStr::new("execute"),
+            OsStr::new("--verbose=4"),
+            app_bundle.as_os_str(),
+        ],
+        "macOS Gatekeeper validation",
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_staged_macos_bundle(
+    layout: &MacOSStandaloneLayout,
+    staged: StagedMacOSBundle,
+    version: &str,
+) -> Result<(), LpmError> {
+    let staging_root = staged.staging_root.path();
+    if staged.app_bundle.parent() != Some(staging_root) {
+        return Err(LpmError::SelfUpdate(
+            "staged macOS app bundle is not inside its bound staging directory".to_string(),
+        ));
+    }
+    let previous_app = staging_root.join("previous-LPM CLI.app");
+    let previous_lpm = staging_root.join("previous-lpm");
+    let previous_lpx = staging_root.join("previous-lpx");
+    let failed_app = staging_root.join("failed-LPM CLI.app");
+
+    let app_metadata = std::fs::symlink_metadata(&layout.app_bundle);
+    let had_app = match app_metadata {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+        Ok(_) => {
+            return Err(LpmError::SelfUpdate(format!(
+                "existing macOS app path is not a real directory: {}",
+                layout.app_bundle.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    for command_path in [&layout.lpm_link, &layout.lpx_link] {
+        if std::fs::symlink_metadata(command_path).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(LpmError::SelfUpdate(format!(
+                "refusing to replace command directory {}",
+                command_path.display()
+            )));
+        }
+    }
+
+    let had_lpm = std::fs::symlink_metadata(&layout.lpm_link).is_ok();
+    let had_lpx = std::fs::symlink_metadata(&layout.lpx_link).is_ok();
+    let mut moved_app = false;
+    let mut moved_lpm = false;
+    let mut moved_lpx = false;
+    let mut installed_app = false;
+    let mut installed_lpm = false;
+    let mut installed_lpx = false;
+
+    let install_result = (|| -> Result<(), LpmError> {
+        if had_app {
+            std::fs::rename(&layout.app_bundle, &previous_app).map_err(LpmError::Io)?;
+            moved_app = true;
+        }
+        if had_lpm {
+            std::fs::rename(&layout.lpm_link, &previous_lpm).map_err(LpmError::Io)?;
+            moved_lpm = true;
+        }
+        if had_lpx {
+            std::fs::rename(&layout.lpx_link, &previous_lpx).map_err(LpmError::Io)?;
+            moved_lpx = true;
+        }
+
+        std::fs::rename(&staged.app_bundle, &layout.app_bundle).map_err(LpmError::Io)?;
+        installed_app = true;
+        let link_target = Path::new("../libexec/LPM CLI.app/Contents/MacOS/lpm-rs");
+        lpm_common::replace_symlink_atomic(&layout.lpm_link, link_target).map_err(LpmError::Io)?;
+        installed_lpm = true;
+        lpm_common::replace_symlink_atomic(&layout.lpx_link, link_target).map_err(LpmError::Io)?;
+        installed_lpx = true;
+        validate_macos_app_bundle(&layout.app_bundle)?;
+        let final_executable = layout.app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
+        VersionProbe::verify_staged_path(&final_executable, version)?;
+        let expected_executable = std::fs::canonicalize(&final_executable).map_err(LpmError::Io)?;
+        for link in [&layout.lpm_link, &layout.lpx_link] {
+            if std::fs::canonicalize(link).map_err(LpmError::Io)? != expected_executable {
+                return Err(LpmError::SelfUpdate(format!(
+                    "installed command does not resolve to the staged macOS app: {}",
+                    link.display()
+                )));
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(install_error) = install_result {
+        let mut rollback_errors = Vec::new();
+        for (installed, link) in [
+            (installed_lpm, &layout.lpm_link),
+            (installed_lpx, &layout.lpx_link),
+        ] {
+            if !installed {
+                continue;
+            }
+            match std::fs::remove_file(link) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => rollback_errors.push(format!("remove {}: {error}", link.display())),
+            }
+        }
+        if installed_app
+            && std::fs::symlink_metadata(&layout.app_bundle).is_ok()
+            && let Err(error) = std::fs::rename(&layout.app_bundle, &failed_app)
+        {
+            rollback_errors.push(format!(
+                "move failed app {} aside: {error}",
+                layout.app_bundle.display()
+            ));
+        }
+        for (moved, previous, destination) in [
+            (moved_app, &previous_app, &layout.app_bundle),
+            (moved_lpm, &previous_lpm, &layout.lpm_link),
+            (moved_lpx, &previous_lpx, &layout.lpx_link),
+        ] {
+            if !moved {
+                continue;
+            }
+            match std::fs::symlink_metadata(destination) {
+                Ok(_) => {
+                    rollback_errors.push(format!(
+                        "refuse to restore over occupied destination {}",
+                        destination.display()
+                    ));
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    rollback_errors.push(format!(
+                        "inspect restore destination {}: {error}",
+                        destination.display()
+                    ));
+                    continue;
+                }
+            }
+            if let Err(error) = std::fs::rename(previous, destination) {
+                rollback_errors.push(format!("restore {}: {error}", destination.display()));
+            }
+        }
+        if rollback_errors.is_empty() {
+            return Err(install_error);
+        }
+        let retained_staging_root = staged.staging_root.keep();
+        return Err(LpmError::SelfUpdate(format!(
+            "{install_error}; rollback also failed: {}; recovery data was retained at {}",
+            rollback_errors.join("; "),
+            retained_staging_root.display()
+        )));
+    }
+    Ok(())
 }
 
 fn release_http_client() -> Result<reqwest::Client, LpmError> {
@@ -2223,11 +3004,11 @@ async fn fetch_verified_release_manifest(
 
 async fn verify_and_stage_for_standalone(
     version: &str,
-    current_exe: &std::path::Path,
+    staging_anchor: &std::path::Path,
     human_output: bool,
 ) -> Result<StandaloneAssets, LpmError> {
     let (platform, ext) = detect_platform()?;
-    let binary_name = format!("lpm-{platform}{ext}");
+    let binary_name = standalone_asset_name_for(std::env::consts::OS, platform, ext);
     let asset_url = github_release_download_url(version, &binary_name);
 
     let client = release_http_client()?;
@@ -2238,7 +3019,7 @@ async fn verify_and_stage_for_standalone(
         )));
     }
 
-    let staged = fetch_asset_to_staged_file(&client, &asset_url, ASSET_MAX_BYTES, current_exe)
+    let staged = fetch_asset_to_staged_file(&client, &asset_url, ASSET_MAX_BYTES, staging_anchor)
         .await?
         .ok_or_else(|| {
             LpmError::SelfUpdate(format!(
@@ -2279,6 +3060,7 @@ async fn verify_and_fetch_for_standalone(version: &str) -> Result<StandaloneAsse
 /// (legal even with a live handle), then `rename(new, current_exe)`,
 /// then best-effort delete the `.old` (OS releases the handle when
 /// this process exits, so the delete will succeed on the next run).
+#[cfg(any(not(target_os = "macos"), test))]
 fn install_staged_binary(
     current_exe: &std::path::Path,
     temporary: tempfile::NamedTempFile,
@@ -2468,6 +3250,7 @@ fn swap_current_binary(current_exe: &std::path::Path, new_bytes: &[u8]) -> Resul
     install_staged_binary(current_exe, temporary, &sha256_hex(new_bytes))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn copy_executable_atomic(
     source: &std::path::Path,
     destination: &std::path::Path,
@@ -2490,6 +3273,14 @@ fn detect_platform() -> Result<(&'static str, &'static str), LpmError> {
         std::env::consts::ARCH,
         resolve_linux_libc(EXECUTABLE_LINUX_LIBC, lpm_common::platform::detect_libc()),
     )
+}
+
+fn standalone_asset_name_for(os: &str, platform: &str, extension: &str) -> String {
+    if os == "macos" {
+        format!("lpm-{platform}.zip")
+    } else {
+        format!("lpm-{platform}{extension}")
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "musl"))]
@@ -2605,6 +3396,262 @@ mod tests {
     #[test]
     fn detect_platform_rejects_linux_arm64_musl_without_release_asset() {
         assert!(detect_platform_for("linux", "aarch64", Some("musl")).is_err());
+    }
+
+    #[test]
+    fn standalone_release_asset_uses_a_bundle_zip_only_on_macos() {
+        assert_eq!(
+            standalone_asset_name_for("macos", "darwin-arm64", ""),
+            "lpm-darwin-arm64.zip"
+        );
+        assert_eq!(
+            standalone_asset_name_for("linux", "linux-x64", ""),
+            "lpm-linux-x64"
+        );
+        assert_eq!(
+            standalone_asset_name_for("windows", "win32-x64", ".exe"),
+            "lpm-win32-x64.exe"
+        );
+    }
+
+    #[test]
+    fn macos_bundle_zip_contract_rejects_traversal_and_unknown_payloads() {
+        use std::io::Write as _;
+
+        fn archive_with(entries: &[(&str, &[u8])]) -> tempfile::NamedTempFile {
+            let mut archive = tempfile::NamedTempFile::new().unwrap();
+            {
+                let mut writer = zip::ZipWriter::new(archive.as_file_mut());
+                let options = zip::write::SimpleFileOptions::default();
+                for (name, body) in entries {
+                    writer.start_file(*name, options).unwrap();
+                    writer.write_all(body).unwrap();
+                }
+                writer.finish().unwrap();
+            }
+            archive
+        }
+
+        let traversal = archive_with(&[("LPM CLI.app/../../escape", b"no")]);
+        let error = validate_macos_bundle_zip(traversal.path())
+            .expect_err("parent traversal must fail closed");
+        assert!(error.to_string().contains("unsafe path"));
+
+        let unknown = archive_with(&[("LPM CLI.app/Contents/extra", b"no")]);
+        let error = validate_macos_bundle_zip(unknown.path())
+            .expect_err("unknown bundle payloads must fail closed");
+        assert!(error.to_string().contains("unexpected entry"));
+    }
+
+    #[test]
+    fn macos_bundle_zip_contract_accepts_the_signed_bundle_inventory() {
+        use std::io::Write as _;
+
+        let mut archive = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = zip::ZipWriter::new(archive.as_file_mut());
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("LPM CLI.app/Contents/Info.plist", b"plist".as_slice()),
+                (
+                    "LPM CLI.app/Contents/CodeResources",
+                    b"notarization-ticket".as_slice(),
+                ),
+                (
+                    "LPM CLI.app/Contents/embedded.provisionprofile",
+                    b"profile".as_slice(),
+                ),
+                ("LPM CLI.app/Contents/MacOS/lpm-rs", b"binary".as_slice()),
+                (
+                    "LPM CLI.app/Contents/_CodeSignature/CodeResources",
+                    b"signature".as_slice(),
+                ),
+                (
+                    "LPM CLI.app/Contents/MacOS/._lpm-rs",
+                    b"apple-double".as_slice(),
+                ),
+            ] {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+
+        validate_macos_bundle_zip(archive.path()).unwrap();
+    }
+
+    #[test]
+    fn macos_standalone_layout_accepts_raw_migration_and_bundle_execution_paths() {
+        let home = Path::new("/Users/alice");
+        let root = home.join(".lpm");
+        let expected_app = root.join("libexec/LPM CLI.app");
+        for current in [
+            root.join("bin/lpm"),
+            expected_app.join("Contents/MacOS/lpm-rs"),
+        ] {
+            let layout = macos_standalone_layout_for(&current, home).unwrap();
+            assert_eq!(layout.app_bundle, expected_app);
+            assert_eq!(layout.lpm_link, root.join("bin/lpm"));
+            assert_eq!(layout.lpx_link, root.join("bin/lpx"));
+        }
+
+        assert!(macos_standalone_layout_for(Path::new("/usr/local/bin/lpm"), home).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_entitlement_inspection_writes_the_plist_to_stdout() {
+        let app_bundle = Path::new("/Applications/LPM CLI.app");
+
+        assert_eq!(
+            macos_entitlement_inspection_arguments(app_bundle),
+            [
+                OsStr::new("-d"),
+                OsStr::new("--entitlements"),
+                OsStr::new(":-"),
+                app_bundle.as_os_str(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_profile_accepts_the_exact_shared_keychain_group() {
+        assert!(provisioning_profile_authorizes_access_group(
+            "Array {\n    823S8YKMRW.dev.lpm.vault.shared\n}"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_profile_accepts_the_team_scoped_keychain_wildcard() {
+        assert!(provisioning_profile_authorizes_access_group(
+            "Array {\n    823S8YKMRW.*\n}"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_profile_rejects_another_team_keychain_wildcard() {
+        assert!(!provisioning_profile_authorizes_access_group(
+            "Array {\n    WRONGTEAM.*\n}"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provisioning_profile_rejects_a_shared_group_prefix_match() {
+        assert!(!provisioning_profile_authorizes_access_group(
+            "Array {\n    823S8YKMRW.dev.lpm.vault.shared.attacker\n}"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_install_restores_the_app_when_command_backup_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let install_root = root.path().join(".lpm");
+        let app_parent = install_root.join("libexec");
+        let app_bundle = app_parent.join(MACOS_APP_NAME);
+        let command_parent = install_root.join("bin");
+        let lpm_link = command_parent.join("lpm");
+        let lpx_link = command_parent.join("lpx");
+        std::fs::create_dir_all(&app_bundle).unwrap();
+        std::fs::create_dir_all(&command_parent).unwrap();
+        std::fs::write(app_bundle.join("existing-marker"), b"existing app").unwrap();
+        std::fs::write(&lpm_link, b"existing command").unwrap();
+
+        let staging_root = tempfile::Builder::new()
+            .prefix(".lpm-bundle-update-")
+            .tempdir_in(&app_parent)
+            .unwrap();
+        let staged_app = staging_root.path().join(MACOS_APP_NAME);
+        let staged_executable = staged_app.join(MACOS_INTERNAL_EXECUTABLE);
+        std::fs::create_dir_all(&staged_app).unwrap();
+        std::fs::create_dir(staging_root.path().join("previous-lpm")).unwrap();
+
+        let layout = MacOSStandaloneLayout {
+            app_parent,
+            app_bundle: app_bundle.clone(),
+            lpm_link: lpm_link.clone(),
+            lpx_link,
+        };
+        let staged = StagedMacOSBundle {
+            staging_root,
+            app_bundle: staged_app,
+            executable: staged_executable,
+        };
+
+        let error = install_staged_macos_bundle(&layout, staged, "0.75.0")
+            .expect_err("command backup collision must fail");
+
+        assert!(matches!(error, LpmError::Io(_)));
+        assert_eq!(
+            std::fs::read(app_bundle.join("existing-marker")).unwrap(),
+            b"existing app"
+        );
+        assert_eq!(std::fs::read(lpm_link).unwrap(), b"existing command");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_install_retains_recovery_data_when_rollback_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let install_root = root.path().join(".lpm");
+        let app_parent = install_root.join("libexec");
+        let app_bundle = app_parent.join(MACOS_APP_NAME);
+        let command_parent = install_root.join("bin");
+        let lpm_link = command_parent.join("lpm");
+        let lpx_link = command_parent.join("lpx");
+        std::fs::create_dir_all(&app_bundle).unwrap();
+        std::fs::create_dir_all(&command_parent).unwrap();
+        std::fs::write(app_bundle.join("existing-marker"), b"existing app").unwrap();
+        std::fs::write(&lpm_link, b"existing lpm").unwrap();
+        std::fs::write(&lpx_link, b"existing lpx").unwrap();
+
+        let staging_root = tempfile::Builder::new()
+            .prefix(".lpm-bundle-update-")
+            .tempdir_in(&app_parent)
+            .unwrap();
+        let staging_path = staging_root.path().to_path_buf();
+        let staged_app = staging_path.join(MACOS_APP_NAME);
+        let staged_executable = staged_app.join(MACOS_INTERNAL_EXECUTABLE);
+        std::fs::create_dir_all(&staged_app).unwrap();
+        std::fs::write(staged_app.join("unexpected-marker"), b"invalid staged app").unwrap();
+        let failed_app = staging_path.join("failed-LPM CLI.app");
+        std::fs::create_dir(&failed_app).unwrap();
+        std::fs::write(failed_app.join("collision"), b"occupied").unwrap();
+
+        let layout = MacOSStandaloneLayout {
+            app_parent,
+            app_bundle: app_bundle.clone(),
+            lpm_link,
+            lpx_link,
+        };
+        let staged = StagedMacOSBundle {
+            staging_root,
+            app_bundle: staged_app,
+            executable: staged_executable,
+        };
+
+        let error = install_staged_macos_bundle(&layout, staged, "0.75.0")
+            .expect_err("occupied rollback destination must retain recovery data");
+
+        let message = error.to_string();
+        assert!(message.contains("rollback also failed"), "{message}");
+        assert!(
+            message.contains(&staging_path.display().to_string()),
+            "{message}"
+        );
+        assert!(staging_path.is_dir());
+        assert_eq!(
+            std::fs::read(staging_path.join("previous-LPM CLI.app/existing-marker")).unwrap(),
+            b"existing app"
+        );
+        assert_eq!(
+            std::fs::read(app_bundle.join("unexpected-marker")).unwrap(),
+            b"invalid staged app"
+        );
     }
 
     #[test]
@@ -3060,7 +4107,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         )
         .expect("axios fixture must exist");
         let (platform, ext) = detect_platform().expect("platform must be supported");
-        let asset_name = format!("lpm-{platform}{ext}");
+        let asset_name = standalone_asset_name_for(std::env::consts::OS, platform, ext);
         let asset_path = format!("/download/v0.42.0/{asset_name}");
 
         let server = wiremock::MockServer::start().await;

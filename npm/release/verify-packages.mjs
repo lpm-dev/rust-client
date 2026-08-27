@@ -230,10 +230,12 @@ function validateExpectedArchiveFiles(packageName, archiveFiles, platform) {
     ? [
         { path: "README.md", mode: 0o644 },
         { path: "package.json", mode: 0o644 },
-        ...platform.binaries.map(binary => ({
-          path: binary.destination,
-          mode: platform.os === "win32" ? 0o644 : 0o755,
-        })),
+        ...(platform.bundleSource
+          ? platform.bundleFiles
+          : platform.binaries.map(binary => ({
+              path: binary.destination,
+              mode: platform.os === "win32" ? 0o644 : 0o755,
+            }))),
       ]
     : WRAPPER_ARCHIVE_FILES;
 

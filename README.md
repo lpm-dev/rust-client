@@ -47,7 +47,11 @@ curl -fsSL https://cli.lpm.dev/install | sh
 
 Run the installer and all LPM CLI user commands without `sudo`. LPM CLI elevates only the specific operating-system operation that requires administrator access.
 
-The npm package is a dependency-free launcher for the native Rust binary. npm installs the matching platform package through `optionalDependencies`; the approved `postinstall` verifier checks the native binary and wires the global command where the platform allows it.
+The npm package installs the matching platform package through `optionalDependencies`. The approved `postinstall` script verifies the native program and connects the global commands to it.
+
+On macOS, each install method stores a signed `LPM CLI.app` in its private support directory. The `lpm` and `lpx` commands are direct links to its Rust executable. Normal commands do not start Node or a shell. LPM CLI does not require LPM Vault to run.
+
+If install scripts are disabled, the npm package keeps its small Node launcher as a fallback. Reinstall with scripts enabled to restore direct native commands.
 
 If your npm version or policy does not require explicit script approval, this also works:
 
@@ -62,6 +66,8 @@ lpm self-update                    # follow the installed stable/nightly channel
 lpm self-update --channel nightly  # switch to nightly
 lpm self-update --channel stable   # switch back to stable
 ```
+
+Pre-bundle macOS standalone installs have one extra step. Run `lpm self-update` twice when the first run replaces version 0.75 or older. The second run migrates into `~/.lpm/libexec/LPM CLI.app` and creates direct `lpm` and `lpx` links. Releases retain the signed raw compatibility artifact until this updater baseline is retired.
 
 Nightly snapshots are available through npm and the standalone installer:
 

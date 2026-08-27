@@ -7,14 +7,8 @@ const SEMVER_PATTERN =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 export const PLATFORM_PACKAGES = Object.freeze([
-  platformPackage("darwin-arm64", "darwin", "arm64", [
-    binary("lpm-darwin-arm64", "lpm"),
-    binary("lpm-darwin-arm64", "lpx"),
-  ]),
-  platformPackage("darwin-x64", "darwin", "x64", [
-    binary("lpm-darwin-x64", "lpm"),
-    binary("lpm-darwin-x64", "lpx"),
-  ]),
+  macOSPlatformPackage("darwin-arm64", "arm64"),
+  macOSPlatformPackage("darwin-x64", "x64"),
   platformPackage("linux-arm64", "linux", "arm64", [
     binary("lpm-linux-arm64", "lpm"),
     binary("lpm-linux-arm64", "lpx"),
@@ -97,7 +91,15 @@ export function assertCliVersion(output, expectedVersion) {
   return reported;
 }
 
-function platformPackage(key, os, cpu, binaries, libc = undefined) {
+function platformPackage(
+  key,
+  os,
+  cpu,
+  binaries,
+  libc = undefined,
+  bundleSource = undefined,
+  bundleFiles = [],
+) {
   return Object.freeze({
     key,
     packageName: `@lpm-registry/cli-${key}`,
@@ -106,7 +108,33 @@ function platformPackage(key, os, cpu, binaries, libc = undefined) {
     cpu,
     libc,
     binaries: Object.freeze(binaries),
+    bundleSource,
+    bundleFiles: Object.freeze(bundleFiles),
   });
+}
+
+function macOSPlatformPackage(key, cpu) {
+  const bundleSource = `${key}/LPM CLI.app`;
+  return platformPackage(
+    key,
+    "darwin",
+    cpu,
+    [
+      binary(
+        `${bundleSource}/Contents/MacOS/lpm-rs`,
+        "LPM CLI.app/Contents/MacOS/lpm-rs",
+      ),
+    ],
+    undefined,
+    bundleSource,
+    [
+      Object.freeze({ path: "LPM CLI.app/Contents/Info.plist", mode: 0o644 }),
+      Object.freeze({ path: "LPM CLI.app/Contents/CodeResources", mode: 0o644 }),
+      Object.freeze({ path: "LPM CLI.app/Contents/embedded.provisionprofile", mode: 0o644 }),
+      Object.freeze({ path: "LPM CLI.app/Contents/MacOS/lpm-rs", mode: 0o755 }),
+      Object.freeze({ path: "LPM CLI.app/Contents/_CodeSignature/CodeResources", mode: 0o644 }),
+    ],
+  );
 }
 
 function binary(artifact, destination) {
@@ -154,7 +182,9 @@ function validatePlatformManifest(manifest, platform) {
     throw new Error(`${platform.packageName} must not declare a libc contract`);
   }
 
-  const expectedFiles = platform.binaries.map(entry => entry.destination).sort();
+  const expectedFiles = platform.bundleSource
+    ? ["LPM CLI.app"]
+    : platform.binaries.map(entry => entry.destination).sort();
   const declaredFiles = [...(manifest.files ?? [])].sort();
   if (JSON.stringify(declaredFiles) !== JSON.stringify(expectedFiles)) {
     throw new Error(

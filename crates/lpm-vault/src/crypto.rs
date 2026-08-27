@@ -1,7 +1,7 @@
 //! E2E encryption for vault sync.
 //!
 //! ## Personal sync (Pro)
-//! - Wrapping key stored in system keyring (or `~/.lpm/.vault-key` fallback)
+//! - Wrapping key stored in the system credential store
 //! - Generate random AES-256 key per vault
 //! - Encrypt vault data with AES key
 //! - Wrap AES key with wrapping key
@@ -53,58 +53,106 @@ pub enum VaultScope<'a> {
 
 /// Get or create the vault wrapping key, independent of any auth token.
 ///
-/// Storage priority:
-/// 1. System keyring (`dev.lpm.vault-key` / `wrapping-key`)
-/// 2. File fallback (`~/.lpm/.vault-key`, 0o600 permissions)
-///
-/// If neither exists, generates a random 32-byte key and stores in both locations.
+/// All platforms serialize first-use key selection with the vault transaction
+/// lock. On macOS, shared-Keychain failures fail closed. An exact legacy file
+/// is retained during the compatibility window; divergent copies fail closed.
 pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
     #[cfg(debug_assertions)]
     if let Ok(error) = std::env::var("LPM_TEST_VAULT_WRAPPING_KEY_ERROR") {
         return Err(error);
     }
 
+    crate::storage_transaction::with_vault_transaction(get_or_create_wrapping_key_unlocked)
+}
+
+fn get_or_create_wrapping_key_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+) -> Result<[u8; 32], String> {
     if force_file_wrapping_key() {
-        if let Some(key) = read_wrapping_key_from_file() {
-            return Ok(key);
-        }
-
-        let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
-        store_wrapping_key_in_file(&key)?;
-        tracing::debug!("generated new vault wrapping key in file-only mode");
-        return Ok(key);
+        let mut candidate = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut candidate);
+        return get_or_create_wrapping_key_file(directory, &candidate);
     }
 
-    // Try keyring first
-    if let Some(key) = read_wrapping_key_from_keyring() {
-        // Clean up stale file-based key if keyring is the source of truth
-        if let Some(path) = crate::lpm_home_dir().map(|h| h.join(".lpm").join(".vault-key"))
-            && path.exists()
+    // macOS shared-Keychain failures are authorization or integrity errors and
+    // must fail closed. Other platforms retain their historical fallback when
+    // their credential service is unavailable.
+    let keyring_key = apply_keyring_read_policy(try_read_wrapping_key_from_keyring())?;
+    if let Some(key) = keyring_key {
+        if let Some(legacy) = read_wrapping_key_from_file(directory)?
+            && legacy != key
         {
-            let _ = std::fs::remove_file(&path);
+            return Err(
+                "the protected and legacy-file vault wrapping keys conflict; both were preserved"
+                    .to_owned(),
+            );
         }
         return Ok(key);
     }
 
-    // Try file fallback
-    if let Some(key) = read_wrapping_key_from_file() {
-        // Promote to keyring for next time (best effort)
-        let _ = store_wrapping_key_in_keyring(&key);
-        return Ok(key);
+    if let Some(key) = read_wrapping_key_from_file(directory)? {
+        #[cfg(target_os = "macos")]
+        let stored = get_or_insert_wrapping_key_in_keyring(&key)?;
+
+        #[cfg(not(target_os = "macos"))]
+        let stored = store_and_read_wrapping_key_from_keyring(&key).unwrap_or(key);
+        if stored != key {
+            return Err(
+                "the protected and legacy-file vault wrapping keys conflict; both were preserved"
+                    .to_owned(),
+            );
+        }
+        return Ok(stored);
     }
 
-    // Generate new key
-    let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    let mut candidate = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut candidate);
 
-    // Store in keyring; only fall back to file if keyring is unavailable
-    if store_wrapping_key_in_keyring(&key).is_err() {
-        store_wrapping_key_in_file(&key)?;
+    #[cfg(target_os = "macos")]
+    return get_or_insert_wrapping_key_in_keyring(&candidate);
+
+    #[cfg(not(target_os = "macos"))]
+    match store_and_read_wrapping_key_from_keyring(&candidate) {
+        Ok(stored) => Ok(stored),
+        Err(error) => {
+            tracing::debug!(%error, "system keyring write unavailable; using owner-only vault-key file");
+            get_or_create_wrapping_key_file(directory, &candidate)
+        }
     }
+}
 
-    tracing::debug!("generated new vault wrapping key");
-    Ok(key)
+#[cfg(target_os = "macos")]
+fn get_or_insert_wrapping_key_in_keyring(candidate: &[u8; 32]) -> Result<[u8; 32], String> {
+    let encoded = hex::encode(candidate);
+    let stored = crate::macos_keychain::get_or_insert_string(
+        VAULT_KEY_SERVICE,
+        VAULT_KEY_ACCOUNT,
+        &encoded,
+    )?;
+    decode_wrapping_key(&stored)
+}
+
+fn apply_keyring_read_policy(
+    result: Result<Option<[u8; 32]>, String>,
+) -> Result<Option<[u8; 32]>, String> {
+    apply_keyring_read_policy_for(result, cfg!(target_os = "macos"))
+}
+
+fn apply_keyring_read_policy_for(
+    result: Result<Option<[u8; 32]>, String>,
+    fail_closed: bool,
+) -> Result<Option<[u8; 32]>, String> {
+    match result {
+        Ok(key) => Ok(key),
+        Err(error) if fail_closed => Err(error),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "system keyring is unavailable; trying the existing vault-key file fallback"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn force_file_wrapping_key() -> bool {
@@ -118,29 +166,57 @@ fn force_file_wrapping_key() -> bool {
 }
 
 /// Read the wrapping key from the system keyring.
-fn read_wrapping_key_from_keyring() -> Option<[u8; 32]> {
+fn try_read_wrapping_key_from_keyring() -> Result<Option<[u8; 32]>, String> {
     #[cfg(target_os = "macos")]
-    let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT).ok()?;
-    let hex_key = entry.get_password().ok()?;
-    let bytes = hex::decode(hex_key.trim()).ok()?;
+    let Some(hex_key) = crate::macos_keychain::read_string(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)?
+    else {
+        return Ok(None);
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let hex_key = {
+        let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)
+            .map_err(|error| format!("keyring entry error: {error}"))?;
+        match entry.get_password() {
+            Ok(value) => value,
+            Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(error) => return Err(format!("keyring get error: {error}")),
+        }
+    };
+
+    Ok(Some(decode_wrapping_key(&hex_key)?))
+}
+
+fn decode_wrapping_key(encoded: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(encoded.trim())
+        .map_err(|_| "vault wrapping key is not valid hexadecimal data".to_owned())?;
     if bytes.len() != 32 {
-        return None;
+        return Err(format!(
+            "vault wrapping key must contain exactly 32 bytes, found {}",
+            bytes.len()
+        ));
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
-    Some(key)
+    Ok(key)
 }
 
-/// Store the wrapping key in the system keyring.
+/// Store the wrapping key in the system credential store.
+#[cfg(not(target_os = "macos"))]
 fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let _lock = lpm_common::platform::macos_keychain_operation_lock();
+    let encoded = hex::encode(key);
     let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)
-        .map_err(|e| format!("keyring entry error: {e}"))?;
+        .map_err(|error| format!("keyring entry error: {error}"))?;
     entry
-        .set_password(&hex::encode(key))
-        .map_err(|e| format!("keyring set error: {e}"))
+        .set_password(&encoded)
+        .map_err(|error| format!("keyring set error: {error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn store_and_read_wrapping_key_from_keyring(candidate: &[u8; 32]) -> Result<[u8; 32], String> {
+    store_wrapping_key_in_keyring(candidate)?;
+    try_read_wrapping_key_from_keyring()?
+        .ok_or_else(|| "system keyring write succeeded but no wrapping key was readable".to_owned())
 }
 
 /// Read the wrapping key from the file fallback.
@@ -152,53 +228,36 @@ fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
 /// at read time forces the user to notice and re-chmod (or force a
 /// fresh key by removing the file), rather than silently using a
 /// key any local UID could exfiltrate.
-fn read_wrapping_key_from_file() -> Option<[u8; 32]> {
-    let key_path = crate::lpm_home_dir()?.join(".lpm").join(".vault-key");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&key_path)
-            && (meta.permissions().mode() & 0o777) > 0o600
-        {
-            tracing::warn!(
-                ".vault-key at {} has permissive mode {:o} (>0o600); refusing to use \
-                 the file-fallback wrapping key. Run `chmod 600 {}` to restore the \
-                 source, or delete the file to force a fresh key on next write.",
-                key_path.display(),
-                meta.permissions().mode() & 0o777,
-                key_path.display(),
-            );
-            return None;
-        }
-    }
-    let hex_key =
-        lpm_common::read_text_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES).ok()?;
-    let bytes = hex::decode(hex_key.trim()).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Some(key)
+fn read_wrapping_key_from_file(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(data) = directory.read_owner_only_file(".vault-key", "vault wrapping-key file")?
+    else {
+        return Ok(None);
+    };
+    let encoded = std::str::from_utf8(&data)
+        .map_err(|_| "vault wrapping-key file is not valid UTF-8".to_owned())?;
+    decode_wrapping_key(encoded).map(Some)
 }
 
-/// Store the wrapping key in the file fallback with restricted permissions.
-fn store_wrapping_key_in_file(key: &[u8; 32]) -> Result<(), String> {
-    let home = crate::lpm_home_dir().ok_or("no home directory")?;
-    let lpm_dir = home.join(".lpm");
-    std::fs::create_dir_all(&lpm_dir).map_err(|e| format!("failed to create ~/.lpm: {e}"))?;
-
-    let key_path = lpm_dir.join(".vault-key");
-    std::fs::write(&key_path, hex::encode(key))
-        .map_err(|e| format!("failed to write vault key file: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+fn get_or_create_wrapping_key_file(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    candidate: &[u8; 32],
+) -> Result<[u8; 32], String> {
+    if let Some(existing) = read_wrapping_key_from_file(directory)? {
+        return Ok(existing);
     }
-
-    Ok(())
+    let encoded = hex::encode(candidate);
+    if directory.create_owner_only_file(
+        ".vault-key",
+        encoded.as_bytes(),
+        "vault wrapping-key file",
+    )? {
+        return Ok(*candidate);
+    }
+    read_wrapping_key_from_file(directory)?.ok_or_else(|| {
+        "vault wrapping-key file was created concurrently but could not be read".to_owned()
+    })
 }
 
 /// Legacy: derive a wrapping key from the auth token.
@@ -751,6 +810,36 @@ pub fn browser_key_fingerprint(browser_public_key_b64: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_macos_keyring_backend_error_keeps_the_file_wrapping_key_reachable() {
+        let file_key = [7_u8; 32];
+        let selected =
+            apply_keyring_read_policy_for(Err("credential service unavailable".into()), false)
+                .unwrap()
+                .or(Some(file_key));
+
+        assert_eq!(selected, Some(file_key));
+    }
+
+    #[test]
+    fn non_macos_malformed_keyring_value_keeps_the_file_wrapping_key_reachable() {
+        let file_key = [11_u8; 32];
+        let selected =
+            apply_keyring_read_policy_for(Err("not valid hexadecimal data".into()), false)
+                .unwrap()
+                .or(Some(file_key));
+
+        assert_eq!(selected, Some(file_key));
+    }
+
+    #[test]
+    fn macos_keyring_errors_remain_fail_closed() {
+        let error =
+            apply_keyring_read_policy_for(Err("missing entitlement".into()), true).unwrap_err();
+
+        assert_eq!(error, "missing entitlement");
+    }
 
     /// Hermetic test environment for wrapping-key tests.
     ///
