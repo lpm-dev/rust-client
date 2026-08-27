@@ -2103,6 +2103,8 @@ async fn run_standalone_update(
     human_output: bool,
 ) -> Result<AttestationAudit, LpmError> {
     validate_standalone_install_location(current_executable)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = account_home;
     #[cfg(target_os = "macos")]
     let macos_layout = prepare_macos_standalone_layout(current_executable, account_home)?;
     #[cfg(target_os = "macos")]
@@ -2186,15 +2188,25 @@ struct StandaloneAssets {
     audit: AttestationAudit,
 }
 
+#[cfg(any(target_os = "macos", test))]
 const MACOS_APP_NAME: &str = "LPM CLI.app";
+#[cfg(any(target_os = "macos", test))]
 const MACOS_INTERNAL_EXECUTABLE: &str = "Contents/MacOS/lpm-rs";
+#[cfg(any(target_os = "macos", test))]
 const MACOS_BUNDLE_MAX_ENTRIES: usize = 64;
+#[cfg(any(target_os = "macos", test))]
 const MACOS_BUNDLE_MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
 const MACOS_BUNDLE_MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(target_os = "macos")]
 const MACOS_EXPECTED_TEAM_ID: &str = "823S8YKMRW";
+#[cfg(target_os = "macos")]
 const MACOS_EXPECTED_BUNDLE_ID: &str = "dev.lpm.cli";
+#[cfg(target_os = "macos")]
 const MACOS_EXPECTED_ACCESS_GROUP: &str = "823S8YKMRW.dev.lpm.vault.shared";
+#[cfg(target_os = "macos")]
 const MACOS_EXPECTED_PROFILE_ACCESS_GROUP: &str = "823S8YKMRW.*";
+#[cfg(any(target_os = "macos", test))]
 const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
     "LPM CLI.app/Contents/Info.plist",
     "LPM CLI.app/Contents/CodeResources",
@@ -2202,6 +2214,7 @@ const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
     "LPM CLI.app/Contents/MacOS/lpm-rs",
     "LPM CLI.app/Contents/_CodeSignature/CodeResources",
 ];
+#[cfg(any(target_os = "macos", test))]
 const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 4] = [
     "LPM CLI.app",
     "LPM CLI.app/Contents",
@@ -2209,6 +2222,7 @@ const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 4] = [
     "LPM CLI.app/Contents/_CodeSignature",
 ];
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MacOSStandaloneLayout {
     app_parent: PathBuf,
@@ -2217,6 +2231,7 @@ struct MacOSStandaloneLayout {
     lpx_link: PathBuf,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn macos_standalone_layout_for(
     current_executable: &Path,
     account_home: &Path,
@@ -2350,6 +2365,7 @@ fn prepare_macos_standalone_layout(
     Ok(layout)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
     let archive_file = std::fs::File::open(archive_path).map_err(|error| {
         LpmError::SelfUpdate(format!(

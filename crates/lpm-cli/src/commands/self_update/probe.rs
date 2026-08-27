@@ -696,6 +696,7 @@ impl VersionProbe {
         .verify(version, "in the staged release asset", false)
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn verify_staged_path(path: &Path, version: &str) -> Result<(), LpmError> {
         let path = std::fs::canonicalize(path).map_err(|error| {
             LpmError::SelfUpdate(format!(

@@ -132,6 +132,7 @@ pub(crate) fn run() -> Result<()> {
     run_async_main()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn should_auto_migrate_macos_raw_bridge(command: &Commands) -> bool {
     !matches!(
         command,
