@@ -11,7 +11,9 @@ use crate::sigstore_verify::{
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(any(target_os = "macos", test))]
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
