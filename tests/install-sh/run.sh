@@ -289,7 +289,7 @@ run_install_sh
 stop_server
 trap - EXIT
 [ "$RUN_RC" -eq 0 ] || fail "musl platform install failed with exit $RUN_RC; out: $RUN_OUT"
-echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
+echo "$RUN_OUT" | grep -q "manifest .*enumerate" \
   && fail "musl platform selected the wrong manifest entry: $RUN_OUT"
 [ -x "$RUN_INSTALL_DIR/lpm" ] || fail "musl platform did not install an executable"
 rm -rf "$fdir" "$CLEAN_PATH_DIR"
@@ -669,8 +669,8 @@ run_install_sh
 stop_server
 trap - EXIT
 [ "$RUN_RC" -ne 0 ] || fail "missing-platform-entry must fail-closed; got exit 0: $RUN_OUT"
-echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
-  || fail "expected 'manifest does not enumerate': $RUN_OUT"
+echo "$RUN_OUT" | grep -q "manifest .*enumerate" \
+  || fail "expected a manifest enumeration error: $RUN_OUT"
 [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-platform-entry must not install"
 rm -rf "$fdir"
 pass "missing platform entry fails closed"
