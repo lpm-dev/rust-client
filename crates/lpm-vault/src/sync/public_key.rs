@@ -142,15 +142,26 @@ pub async fn get_my_public_key(
 }
 
 /// Locally-resolved sharing keypair material. The private half stays
-/// in memory and on disk (keychain on macOS, file fallback otherwise);
+/// in memory and in protected storage (Keychain on macOS, an owner-only file
+/// elsewhere);
 /// the public half is the canonical Base64 form the server expects.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LocalPublicKeyState {
     /// Raw 32-byte X25519 private key. Callers should not log or surface
     /// this material.
     pub private_key: [u8; 32],
     /// Standard Base64 encoding of the matching X25519 public key.
     pub public_key_b64: String,
+}
+
+impl std::fmt::Debug for LocalPublicKeyState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalPublicKeyState")
+            .field("private_key", &"<redacted>")
+            .field("public_key_b64", &self.public_key_b64)
+            .finish()
+    }
 }
 
 /// Classification of the local-vs-server sharing-key state, produced by
@@ -219,16 +230,17 @@ pub async fn classify_public_key_state(
 /// Load the local X25519 keypair, creating one if absent.
 fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
     #[cfg(target_os = "macos")]
-    let (private_key, public) = if should_use_file_backed_x25519_keypair(
-        force_file_x25519_keypair(),
-        live_x25519_key_path()?.exists(),
-    ) {
-        get_or_create_file_backed_x25519_keypair()?
+    let (private_key, public) = if force_file_x25519_keypair() {
+        crate::storage_transaction::with_vault_transaction(
+            get_or_create_file_backed_x25519_keypair,
+        )?
     } else {
         crate::keychain::get_or_create_x25519_keypair()?
     };
     #[cfg(not(target_os = "macos"))]
-    let (private_key, public) = get_or_create_file_backed_x25519_keypair()?;
+    let (private_key, public) = crate::storage_transaction::with_vault_transaction(
+        get_or_create_file_backed_x25519_keypair,
+    )?;
 
     let public_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public);
     Ok(LocalPublicKeyState {
@@ -259,21 +271,26 @@ fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
 ///      promotion. If the pending slot exists but doesn't match the
 ///      server, the upload failed before commit; discard the pending.
 ///
-/// Storage backend: ALWAYS the file-backed slots (`.x25519_key.pending`
-/// in the user's `~/.lpm` directory). The macOS keychain backend only
-/// supports a single named entry per service/account pair; juggling a
-/// transient pending entry there adds complexity (and a multi-keychain-
-/// item ACL surface) that the file slot avoids cleanly. Promotion
-/// writes the new private key to the live slot via the same code path
-/// `get_or_create_file_backed_x25519_keypair` uses for first-set, so
-/// permissions stay consistent (`0o600` on Unix).
+/// macOS stores live and pending keys under separate accounts in the shared
+/// Data Protection Keychain. Other platforms use owner-only file slots.
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PendingPublicKey {
     pub private_key: [u8; 32],
     pub public_key_b64: String,
 }
 
+impl std::fmt::Debug for PendingPublicKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingPublicKey")
+            .field("private_key", &"<redacted>")
+            .field("public_key_b64", &self.public_key_b64)
+            .finish()
+    }
+}
+
+#[cfg(test)]
 fn pending_x25519_key_path() -> Result<std::path::PathBuf, String> {
     Ok(crate::lpm_home_dir()
         .ok_or("no home directory")?
@@ -281,11 +298,34 @@ fn pending_x25519_key_path() -> Result<std::path::PathBuf, String> {
         .join(".x25519_key.pending"))
 }
 
+#[cfg(test)]
 fn live_x25519_key_path() -> Result<std::path::PathBuf, String> {
     Ok(crate::lpm_home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
         .join(".x25519_key"))
+}
+
+const PENDING_X25519_KEY_FILE: &str = ".x25519_key.pending";
+const LIVE_X25519_KEY_FILE: &str = ".x25519_key";
+const X25519_ROTATION_LOCK_FILE: &str = ".x25519-rotation.lock";
+
+/// Process-wide and cross-process exclusion for one complete sharing-key
+/// rotation, including the remote upload and local promotion phases.
+pub struct SharingKeyRotationLock {
+    _handle: lpm_common::SingleFileExclusiveLockHandle,
+}
+
+/// Try to reserve the complete sharing-key rotation lifecycle.
+///
+/// A second command fails immediately instead of waiting and accidentally
+/// performing another rotation after the first command completes.
+pub fn try_acquire_sharing_key_rotation_lock() -> Result<Option<SharingKeyRotationLock>, String> {
+    crate::storage_transaction::try_acquire_named_lock(
+        X25519_ROTATION_LOCK_FILE,
+        "sharing-key rotation lock",
+    )
+    .map(|handle| handle.map(|_handle| SharingKeyRotationLock { _handle }))
 }
 
 /// Generate a fresh X25519 keypair and persist it to the pending slot.
@@ -295,24 +335,17 @@ fn live_x25519_key_path() -> Result<std::path::PathBuf, String> {
 /// safe to overwrite (stale orphan from a failed prior attempt).
 pub fn create_pending_x25519_keypair() -> Result<PendingPublicKey, String> {
     let (private_key, public_key) = crate::crypto::generate_x25519_keypair();
-    let path = pending_x25519_key_path()?;
-    let parent = path.parent().ok_or("invalid pending key path")?;
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("failed to create pending key dir: {e}"))?;
-    std::fs::write(&path, private_key).map_err(|e| format!("failed to write pending key: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to set pending key permissions: {e}"))?;
+
+    #[cfg(target_os = "macos")]
+    if !force_file_x25519_keypair() {
+        crate::keychain::write_pending_x25519_private_key(&private_key)?;
+        return Ok(pending_public_key(private_key, public_key));
     }
-    Ok(PendingPublicKey {
-        private_key,
-        public_key_b64: base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            public_key,
-        ),
-    })
+
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        write_private_key_file(directory, PENDING_X25519_KEY_FILE, &private_key, "pending")
+    })?;
+    Ok(pending_public_key(private_key, public_key))
 }
 
 /// Read the pending slot without promoting. Returns `Ok(None)` when no
@@ -320,82 +353,53 @@ pub fn create_pending_x25519_keypair() -> Result<PendingPublicKey, String> {
 /// `rotate-sharing-key` invocation to detect crash-interrupted prior
 /// rotations.
 pub fn read_pending_x25519_keypair() -> Result<Option<PendingPublicKey>, String> {
-    let path = pending_x25519_key_path()?;
-    if !path.exists() {
-        return Ok(None);
+    #[cfg(target_os = "macos")]
+    if !force_file_x25519_keypair() {
+        return Ok(crate::keychain::read_pending_x25519_private_key()?
+            .map(pending_public_key_from_private));
     }
-    let data = lpm_common::read_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-        .map_err(|e| format!("failed to read pending key: {e}"))?;
-    if data.len() != 32 {
-        return Err(format!(
-            "pending key file has invalid length {} (expected 32)",
-            data.len()
-        ));
-    }
-    let mut private_key = [0u8; 32];
-    private_key.copy_from_slice(&data);
-    let secret = x25519_dalek::StaticSecret::from(private_key);
-    let public_key = x25519_dalek::PublicKey::from(&secret);
-    let public_key_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        public_key.as_bytes(),
-    );
-    Ok(Some(PendingPublicKey {
-        private_key,
-        public_key_b64,
-    }))
+
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        Ok(
+            read_private_key_file(directory, PENDING_X25519_KEY_FILE, "pending")?
+                .map(pending_public_key_from_private),
+        )
+    })
 }
 
-/// Atomically promote the pending slot into the live slot.
+/// Promote the pending slot into the live slot and then remove pending state.
 ///
-/// Writes the pending private key to the live file with `0o600` perms,
-/// then deletes the pending file. The write-then-delete order means a
-/// crash between the two steps leaves BOTH files with the same key
-/// (next promotion is a no-op); a crash before the write leaves only
-/// pending (next rotation discovers it). Both orderings are safe; the
-/// only unsafe state would be "live updated, pending still present
-/// with a stale key" — which cannot happen because pending always
-/// holds the key we just wrote to live.
-///
-/// Also clears any prior keychain entry on macOS so subsequent
-/// `load_local_public_key_state` calls observe the new file-backed key
-/// instead of the stale keychain entry. (The keychain entry survives
-/// across rotations otherwise.)
+/// A crash before the live write leaves pending state for recovery. A crash
+/// after the live write leaves two identical copies, so repeating promotion is
+/// safe. On macOS both accounts remain in the shared Data Protection Keychain.
 pub fn promote_pending_x25519_keypair() -> Result<(), String> {
-    let pending = read_pending_x25519_keypair()?.ok_or("no pending key to promote")?;
-    let live_path = live_x25519_key_path()?;
-    let parent = live_path.parent().ok_or("invalid live key path")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create live key dir: {e}"))?;
-    std::fs::write(&live_path, pending.private_key)
-        .map_err(|e| format!("failed to write live key: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&live_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to set live key permissions: {e}"))?;
-    }
-
-    // Clear macOS keychain entry if present so subsequent reads see
-    // the file-backed key. Best-effort: a "not found" error here is
-    // expected when the user was already on the file fallback, so we
-    // intentionally swallow keychain errors.
     #[cfg(target_os = "macos")]
-    {
-        let _ = crate::keychain::delete_x25519_keypair();
+    if !force_file_x25519_keypair() {
+        return crate::keychain::promote_pending_x25519_private_key();
     }
 
-    discard_pending_x25519_keypair()
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        let pending = read_private_key_file(directory, PENDING_X25519_KEY_FILE, "pending")?
+            .ok_or("no pending key to promote")?;
+        write_private_key_file(directory, LIVE_X25519_KEY_FILE, &pending, "live")?;
+        directory.remove_file(PENDING_X25519_KEY_FILE, "pending X25519 key")?;
+        Ok(())
+    })
 }
 
 /// Delete the pending slot without promoting. Called when the prior
 /// upload failed before commit (pending key doesn't match server's
 /// current key), or after a successful promotion.
 pub fn discard_pending_x25519_keypair() -> Result<(), String> {
-    let path = pending_x25519_key_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("failed to delete pending key: {e}"))?;
+    #[cfg(target_os = "macos")]
+    if !force_file_x25519_keypair() {
+        return crate::keychain::delete_pending_x25519_private_key();
     }
-    Ok(())
+
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        directory.remove_file(PENDING_X25519_KEY_FILE, "pending X25519 key")?;
+        Ok(())
+    })
 }
 
 /// Org member public key info.
@@ -511,42 +515,63 @@ fn force_file_x25519_keypair() -> bool {
     )
 }
 
-#[cfg(target_os = "macos")]
-fn should_use_file_backed_x25519_keypair(force_file: bool, live_key_exists: bool) -> bool {
-    force_file || live_key_exists
+fn get_or_create_file_backed_x25519_keypair(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+) -> Result<([u8; 32], [u8; 32]), String> {
+    if let Some(private_key) = read_private_key_file(directory, LIVE_X25519_KEY_FILE, "X25519")? {
+        let public_key = crate::crypto::x25519_public_from_private(&private_key);
+        return Ok((private_key, public_key));
+    }
+
+    let (candidate, public_key) = crate::crypto::generate_x25519_keypair();
+    if directory.create_owner_only_file(LIVE_X25519_KEY_FILE, &candidate, "X25519 key")? {
+        return Ok((candidate, public_key));
+    }
+    let private_key = read_private_key_file(directory, LIVE_X25519_KEY_FILE, "X25519")?
+        .ok_or("X25519 key was created concurrently but could not be read")?;
+    let public_key = crate::crypto::x25519_public_from_private(&private_key);
+    Ok((private_key, public_key))
 }
 
-fn get_or_create_file_backed_x25519_keypair() -> Result<([u8; 32], [u8; 32]), String> {
-    let key_path = crate::lpm_home_dir()
-        .ok_or("no home directory")?
-        .join(".lpm")
-        .join(".x25519_key");
-
-    if key_path.exists() {
-        let data = lpm_common::read_file_capped(&key_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-            .map_err(|e| format!("failed to read X25519 key: {e}"))?;
-        if data.len() == 32 {
-            let mut private_key = [0u8; 32];
-            private_key.copy_from_slice(&data);
-            let secret = x25519_dalek::StaticSecret::from(private_key);
-            let public_key = x25519_dalek::PublicKey::from(&secret);
-            return Ok((private_key, *public_key.as_bytes()));
-        }
+fn pending_public_key(private_key: [u8; 32], public_key: [u8; 32]) -> PendingPublicKey {
+    PendingPublicKey {
+        private_key,
+        public_key_b64: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            public_key,
+        ),
     }
+}
 
-    let (private_key, public_key) = crate::crypto::generate_x25519_keypair();
-    let parent = key_path.parent().ok_or("invalid X25519 key path")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create X25519 key dir: {e}"))?;
-    std::fs::write(&key_path, private_key)
-        .map_err(|e| format!("failed to write X25519 key: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("failed to set X25519 key permissions: {e}"))?;
-    }
+fn pending_public_key_from_private(private_key: [u8; 32]) -> PendingPublicKey {
+    let public_key = crate::crypto::x25519_public_from_private(&private_key);
+    pending_public_key(private_key, public_key)
+}
 
-    Ok((private_key, public_key))
+fn read_private_key_file(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    name: &str,
+    label: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(data) = directory.read_owner_only_file(name, &format!("{label} key"))? else {
+        return Ok(None);
+    };
+    let private_key: [u8; 32] = data.try_into().map_err(|data: Vec<u8>| {
+        format!(
+            "{label} key file has invalid length {} (expected 32)",
+            data.len()
+        )
+    })?;
+    Ok(Some(private_key))
+}
+
+fn write_private_key_file(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    name: &str,
+    private_key: &[u8; 32],
+    label: &str,
+) -> Result<(), String> {
+    directory.write_owner_only_file(name, private_key, &format!("{label} key"))
 }
 
 #[cfg(test)]
@@ -940,14 +965,31 @@ mod tests {
         assert!(err.contains("no pending"), "got: {err}");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(debug_assertions)]
     #[test]
-    fn x25519_backend_selection_uses_live_file_after_rotation_without_force_env() {
-        assert!(
-            should_use_file_backed_x25519_keypair(false, true),
-            "a promoted live file must win over the default keychain path so post-rotation reads keep using the rotated key"
-        );
-        assert!(!should_use_file_backed_x25519_keypair(false, false));
-        assert!(should_use_file_backed_x25519_keypair(true, false));
+    fn sharing_key_rotation_lock_rejects_a_concurrent_command() {
+        let _guard = env_lock_guard();
+        let _env = IsolatedVaultKeyEnv::new();
+        let first = try_acquire_sharing_key_rotation_lock()
+            .expect("acquire first rotation lock")
+            .expect("first rotation lock should be available");
+
+        let second = try_acquire_sharing_key_rotation_lock().expect("probe second rotation lock");
+
+        assert!(second.is_none());
+        drop(first);
+    }
+
+    #[test]
+    fn private_key_debug_output_is_redacted() {
+        let state = LocalPublicKeyState {
+            private_key: [7; 32],
+            public_key_b64: "public".to_owned(),
+        };
+
+        let debug = format!("{state:?}");
+
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("7, 7"));
     }
 }

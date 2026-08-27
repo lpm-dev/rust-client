@@ -662,6 +662,7 @@ impl LauncherBinding {
 }
 
 impl VersionProbe {
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(super) fn verify_staged(
         temporary: &tempfile::NamedTempFile,
         expected_sha256: &str,
@@ -693,6 +694,34 @@ impl VersionProbe {
             timeout: VERSION_PROBE_TIMEOUT,
         }
         .verify(version, "in the staged release asset", false)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn verify_staged_path(path: &Path, version: &str) -> Result<(), LpmError> {
+        let path = std::fs::canonicalize(path).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "could not resolve the staged self-update executable {}: {error}",
+                path.display()
+            ))
+        })?;
+        let environment = ProbeEnvironment::for_staged_binary();
+        let working_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new(std::path::MAIN_SEPARATOR_STR))
+            .to_path_buf();
+        Self {
+            program: ResolvedProgram {
+                path: path.clone(),
+                kind: ProgramKind::Native,
+            },
+            launcher_dir: working_dir.clone(),
+            launcher_binding: None,
+            environment,
+            working_dir,
+            expected_executable: path,
+            timeout: VERSION_PROBE_TIMEOUT,
+        }
+        .verify(version, "in the staged macOS app bundle", false)
     }
 
     pub(super) fn bind_and_preflight(

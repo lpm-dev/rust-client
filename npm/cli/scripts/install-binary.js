@@ -73,6 +73,8 @@ export function installNativeBinaries(options = {}) {
     validateTimeoutMs,
   });
 
+  const retainLauncherShims = shouldRetainLauncherShims({ platform, env });
+
   const optimized = [];
   for (const command of commands) {
     const native =
@@ -87,12 +89,14 @@ export function installNativeBinaries(options = {}) {
             requireFn,
           });
     const target = optimizedTargetPath(wrapperRoot, platform, command);
-    const action = stageOptimizedBinary({
-      source: native.path,
-      target,
-      platform,
-      fsModule,
-    });
+    const action = retainLauncherShims
+      ? "launcher"
+      : stageOptimizedBinary({
+          source: native.path,
+          target,
+          platform,
+          fsModule,
+        });
     optimized.push({
       command,
       source: native.path,
@@ -101,8 +105,20 @@ export function installNativeBinaries(options = {}) {
     });
   }
 
-  logFn(`[lpm] Installed native binary from ${spec.pkg}`);
+  if (retainLauncherShims) {
+    logFn(
+      `[lpm] Validated native binary from ${spec.pkg}; retaining pnpm-compatible launchers.`,
+    );
+  } else {
+    logFn(`[lpm] Installed native binary from ${spec.pkg}`);
+  }
   return { status: "installed", platform: key, package: spec.pkg, optimized };
+}
+
+export function shouldRetainLauncherShims({ platform, env = process.env } = {}) {
+  if (platform !== "darwin") return false;
+  const userAgent = env.npm_config_user_agent ?? env.NPM_CONFIG_USER_AGENT ?? "";
+  return /^pnpm\//i.test(userAgent.trim());
 }
 
 export function isSudoTransition({ geteuid, env = process.env } = {}) {
@@ -178,6 +194,10 @@ export function validateNativeBinary(
 
 export function stageOptimizedBinary({ source, target, platform, fsModule = fs }) {
   fsModule.mkdirSync(path.dirname(target), { recursive: true });
+  if (platform === "darwin") {
+    atomicSymlink(source, target, fsModule);
+    return "symlink";
+  }
   if (platform === "win32") {
     atomicCopy(source, target, fsModule);
     return "copy";
@@ -190,6 +210,13 @@ export function stageOptimizedBinary({ source, target, platform, fsModule = fs }
     atomicCopy(source, target, fsModule);
     return "copy";
   }
+}
+
+function atomicSymlink(source, target, fsModule) {
+  replaceWithTemp(target, fsModule, temp => {
+    const relativeSource = path.relative(path.dirname(target), source);
+    fsModule.symlinkSync(relativeSource, temp, "file");
+  });
 }
 
 function optimizedTargetPath(wrapperRoot, platform, command) {

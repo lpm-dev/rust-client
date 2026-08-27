@@ -125,15 +125,30 @@ fn attributes_are_test_only(attributes: &[syn::Attribute]) -> bool {
         attribute.path().is_ident("test")
             || (attribute.path().is_ident("cfg")
                 && match &attribute.meta {
-                    syn::Meta::List(list) => {
-                        list.tokens.to_string().split_whitespace().any(|part| {
-                            part.trim_matches(|character: char| !character.is_ascii_alphanumeric())
-                                == "test"
-                        })
-                    }
+                    syn::Meta::List(list) => syn::parse2::<syn::Meta>(list.tokens.clone())
+                        .is_ok_and(|predicate| cfg_predicate_requires_test(&predicate)),
                     _ => false,
                 })
     })
+}
+
+fn cfg_predicate_requires_test(predicate: &syn::Meta) -> bool {
+    match predicate {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|predicates| predicates.iter().any(cfg_predicate_requires_test)),
+        syn::Meta::List(list) if list.path.is_ident("any") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|predicates| {
+                !predicates.is_empty() && predicates.iter().all(cfg_predicate_requires_test)
+            }),
+        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+    }
 }
 
 fn reviewed_raw_atomic_writer(key: &str) -> bool {
@@ -190,6 +205,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
         "crates/lpm-cli/src/commands/self_update.rs::install_staged_binary",
         "receives an exclusively created same-directory NamedTempFile; Windows needs a custom running-binary swap",
+    ),
+    (
+        "crates/lpm-cli/src/commands/self_update.rs::install_staged_macos_bundle",
+        "swaps a validated app bundle and launchers from an exclusively created same-directory TempDir with rollback",
     ),
     (
         "crates/lpm-cli/src/commands/skills/managed.rs::write_state",
@@ -312,6 +331,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "moves a corrupt CAS entry to a randomized quarantine path without rewriting its contents",
     ),
     (
+        "crates/lpm-store/src/v3/cas.rs::ensure_materialized_entry",
+        "publishes a complete materialized tree from a randomized private staging directory",
+    ),
+    (
         "crates/lpm-store/src/v3/cas.rs::replace_with_hardlink",
         "swaps a duplicate object file for its validated CAS hardlink with a randomized rollback backup",
     ),
@@ -380,4 +403,18 @@ fn production_atomic_rewrites_use_exclusive_temporary_files() {
         "production code contains raw replacements outside the reviewed inventory:\n{}",
         findings.join("\n")
     );
+}
+
+#[test]
+fn cfg_with_a_production_branch_is_not_test_only() {
+    let attribute: syn::Attribute = syn::parse_quote!(#[cfg(any(not(target_os = "macos"), test))]);
+
+    assert!(!attributes_are_test_only(&[attribute]));
+}
+
+#[test]
+fn cfg_all_branch_that_requires_test_is_test_only() {
+    let attribute: syn::Attribute = syn::parse_quote!(#[cfg(all(unix, test))]);
+
+    assert!(attributes_are_test_only(&[attribute]));
 }

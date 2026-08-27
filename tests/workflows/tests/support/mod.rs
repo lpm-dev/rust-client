@@ -267,7 +267,7 @@ impl TempProject {
     }
 }
 
-fn write_private_file(path: &Path, content: impl AsRef<[u8]>) {
+pub fn write_private_file(path: &Path, content: impl AsRef<[u8]>) {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
 

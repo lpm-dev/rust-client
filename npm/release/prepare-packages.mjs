@@ -70,12 +70,35 @@ function preparePlatformPackage({ root, binaries, output, staging, releaseVersio
   const manifest = manifestForRelease(sourceManifest, releaseVersion, platform);
   writeJson(path.join(packageDir, "package.json"), manifest);
 
+  if (platform.bundleSource) {
+    const sourceBundle = path.join(binaries, platform.bundleSource);
+    const destinationBundle = path.join(packageDir, "LPM CLI.app");
+    assertDirectory(sourceBundle, `release app bundle ${platform.bundleSource}`);
+    const bundleLabel = `release app bundle ${platform.bundleSource}`;
+    const actualBundleFiles = assertRegularTree(sourceBundle, bundleLabel).sort();
+    const expectedBundleFiles = platform.bundleFiles
+      .map(entry => entry.path.slice("LPM CLI.app/".length))
+      .sort();
+    if (JSON.stringify(actualBundleFiles) !== JSON.stringify(expectedBundleFiles)) {
+      throw new Error(
+        `${bundleLabel} file inventory drifted:\nexpected ${expectedBundleFiles.join("\n")}\nactual ${actualBundleFiles.join("\n")}`,
+      );
+    }
+    fs.cpSync(sourceBundle, destinationBundle, {
+      recursive: true,
+      dereference: false,
+      preserveTimestamps: true,
+    });
+  }
+
   const binaryHashes = {};
   for (const mapping of platform.binaries) {
     const source = path.join(binaries, mapping.artifact);
     const destination = path.join(packageDir, mapping.destination);
     assertRegularFile(source, `release binary ${mapping.artifact}`);
-    fs.copyFileSync(source, destination);
+    if (!platform.bundleSource) {
+      fs.copyFileSync(source, destination);
+    }
     if (platform.os !== "win32") {
       fs.chmodSync(destination, 0o755);
     }
@@ -229,6 +252,24 @@ function assertDirectory(directory, label) {
   if (!metadata?.isDirectory()) {
     throw new Error(`${label} is missing or is not a directory`);
   }
+}
+
+function assertRegularTree(directory, label, root = directory, files = []) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const candidate = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new Error(`${label} must not contain symbolic links: ${candidate}`);
+    }
+    if (entry.isDirectory()) {
+      assertRegularTree(candidate, label, root, files);
+      continue;
+    }
+    if (!entry.isFile()) {
+      throw new Error(`${label} contains an unsupported file type: ${candidate}`);
+    }
+    files.push(path.relative(root, candidate).split(path.sep).join("/"));
+  }
+  return files;
 }
 
 function sha256File(file) {

@@ -40,15 +40,21 @@ const COMMON_REQUIRED_JOBS = [
 const PUBLISH_REQUIRED_JOBS = [
   ...COMMON_REQUIRED_JOBS,
   ...NPM_SMOKE_JOBS,
-  "Create Release",
+  "Stage Draft Release",
   "Smoke standalone installer on Debian 12 (arm64)",
   "Smoke standalone installer on Debian 12 (x64)",
+  "Smoke standalone installer on macOS (arm64)",
+  "Smoke standalone installer on macOS (x64)",
+  "Publish Smoke-Verified Release",
 ];
 
-const REQUIRED_JOBS = Object.freeze({
-  "npm-publish": PUBLISH_REQUIRED_JOBS,
-  "windows-smoke": COMMON_REQUIRED_JOBS,
-  "wrapper-publish": [...PUBLISH_REQUIRED_JOBS, "Publish npm Platform Packages"],
+export const RECOVERY_REQUIRED_JOBS = Object.freeze({
+  "npm-publish": Object.freeze(PUBLISH_REQUIRED_JOBS),
+  "windows-smoke": Object.freeze(COMMON_REQUIRED_JOBS),
+  "wrapper-publish": Object.freeze([
+    ...PUBLISH_REQUIRED_JOBS,
+    "Publish npm Platform Packages",
+  ]),
 });
 
 export function validateRecoverySource({
@@ -173,7 +179,7 @@ function validateInputs({ repository, runId, version, channel, purpose }) {
   if (channel !== "stable" && channel !== "nightly") {
     throw new Error(`invalid release channel: ${channel ?? ""}`);
   }
-  if (!Object.hasOwn(REQUIRED_JOBS, purpose)) {
+  if (!Object.hasOwn(RECOVERY_REQUIRED_JOBS, purpose)) {
     throw new Error(`invalid recovery purpose: ${purpose ?? ""}`);
   }
   const pattern = channel === "stable" ? STABLE_VERSION_PATTERN : NIGHTLY_VERSION_PATTERN;
@@ -218,7 +224,7 @@ function validateRequiredJobs({ jobs, purpose, headSha }) {
     existing.push(job);
     jobsByName.set(job?.name, existing);
   }
-  for (const name of REQUIRED_JOBS[purpose]) {
+  for (const name of RECOVERY_REQUIRED_JOBS[purpose]) {
     const matches = jobsByName.get(name) ?? [];
     if (matches.length !== 1) {
       throw new Error(`source run must contain exactly one ${name} job, found ${matches.length}`);

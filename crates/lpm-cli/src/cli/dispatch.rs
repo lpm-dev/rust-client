@@ -132,6 +132,17 @@ pub(crate) fn run() -> Result<()> {
     run_async_main()
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn should_auto_migrate_macos_raw_bridge(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::SelfUpdate(_)
+            | Commands::InternalUpdateCheck
+            | Commands::Completions(_)
+            | Commands::Schema(_)
+    )
+}
+
 fn run_async_main() -> Result<()> {
     const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
@@ -265,6 +276,20 @@ async fn async_main() -> Result<()> {
             std::process::exit(1);
         }
         std::process::exit(0);
+    }
+
+    #[cfg(target_os = "macos")]
+    if should_auto_migrate_macos_raw_bridge(&command) {
+        match commands::self_update::migrate_raw_standalone_bundle_if_needed().await {
+            Ok(Some(launcher)) => {
+                if let Err(error) = commands::self_update::reexec_migrated_macos_bundle(&launcher) {
+                    exit_with_lpm_error(&error, cli.json);
+                }
+                unreachable!("a successful macOS bundle re-exec does not return");
+            }
+            Ok(None) => {}
+            Err(error) => exit_with_lpm_error(&error, cli.json),
+        }
     }
 
     // Set up tracing based on verbosity. Tracing is pinned to stderr so
@@ -3238,7 +3263,44 @@ fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSe
 
 #[cfg(test)]
 mod tests {
-    use super::lockfile_contains_lpm_package;
+    use clap::Parser as _;
+
+    use super::{lockfile_contains_lpm_package, should_auto_migrate_macos_raw_bridge};
+    use crate::Cli;
+
+    fn parse_command(arguments: &[&str]) -> super::Commands {
+        Cli::try_parse_from(arguments)
+            .expect("command must parse")
+            .command
+            .expect("test command must be present")
+    }
+
+    #[test]
+    fn raw_macos_bridge_migrates_before_commands_that_can_reach_vault_storage() {
+        for arguments in [
+            ["lpm", "env", "list"].as_slice(),
+            ["lpm", "dev"].as_slice(),
+            ["lpm", "run", "start"].as_slice(),
+        ] {
+            assert!(should_auto_migrate_macos_raw_bridge(&parse_command(
+                arguments
+            )));
+        }
+    }
+
+    #[test]
+    fn raw_macos_bridge_does_not_reenter_migration_for_update_or_internal_commands() {
+        for arguments in [
+            ["lpm", "self-update"].as_slice(),
+            ["lpm", "internal-update-check"].as_slice(),
+            ["lpm", "completions", "zsh"].as_slice(),
+            ["lpm", "schema", "lpm.json"].as_slice(),
+        ] {
+            assert!(!should_auto_migrate_macos_raw_bridge(&parse_command(
+                arguments
+            )));
+        }
+    }
 
     fn lockfile_with_packages(names: &[&str]) -> lpm_lockfile::Lockfile {
         let mut lockfile = lpm_lockfile::Lockfile::new();

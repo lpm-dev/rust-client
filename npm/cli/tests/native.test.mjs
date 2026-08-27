@@ -110,29 +110,37 @@ test("resolveNativeBinary finds lpm in the matching optional dependency", () => 
   assert.deepEqual(resolved.argsPrefix, []);
 });
 
-test("resolveNativeBinary finds lpx separately from lpm", () => {
+test("resolveNativeBinary uses the macOS app bundle and preserves lpx fallback behavior", () => {
   const root = makePackageTree("darwin-arm64");
   const requireFn = createFakeRequire(root);
 
-  const resolved = resolveNativeBinary({
-    command: "lpx",
-    platform: "darwin",
-    arch: "arm64",
-    requireFn,
-    env: {},
-  });
+  const resolve = command =>
+    resolveNativeBinary({
+      command,
+      platform: "darwin",
+      arch: "arm64",
+      requireFn,
+      env: {},
+    });
+  const lpm = resolve("lpm");
+  const lpx = resolve("lpx");
 
   assert.equal(
-    resolved.path,
+    lpm.path,
     path.join(
       root,
       "node_modules",
       "@lpm-registry",
       "cli-darwin-arm64",
-      "lpx",
+      "LPM CLI.app",
+      "Contents",
+      "MacOS",
+      "lpm-rs",
     ),
   );
-  assert.deepEqual(resolved.argsPrefix, []);
+  assert.equal(lpx.path, lpm.path);
+  assert.deepEqual(lpm.argsPrefix, []);
+  assert.deepEqual(lpx.argsPrefix, ["dlx"]);
 });
 
 test("LPM_BINARY_PATH bypasses package resolution", () => {
@@ -370,19 +378,11 @@ test("postinstall stages the musl package on Linux x64 musl", () => {
   assert.equal(result.package, "@lpm-registry/cli-linux-x64-musl");
 });
 
-test("postinstall copies unix binaries when hard-linking is unavailable", () => {
+test("postinstall keeps the signed macOS bundle intact and creates direct symlinks", () => {
   const tree = makeInstallTree("darwin-arm64", {
     version: "2.0.0",
-    packageBinaryNames: ["lpm", "lpx"],
+    packageBinaryNames: ["LPM CLI.app/Contents/MacOS/lpm-rs"],
   });
-  const fsModule = {
-    ...fs,
-    linkSync() {
-      const error = new Error("cross-device link");
-      error.code = "EXDEV";
-      throw error;
-    },
-  };
 
   const result = installNativeBinaries({
     wrapperRoot: tree.wrapperRoot,
@@ -390,7 +390,6 @@ test("postinstall copies unix binaries when hard-linking is unavailable", () => 
     arch: "arm64",
     requireFn: createFakeRequire(tree.root),
     spawnSyncFn: createVersionSpawn("lpm 2.0.0"),
-    fsModule,
     logFn() {},
   });
 
@@ -398,17 +397,58 @@ test("postinstall copies unix binaries when hard-linking is unavailable", () => 
   assert.deepEqual(
     result.optimized.map(entry => [entry.command, entry.action]),
     [
-      ["lpm", "copy"],
-      ["lpx", "copy"],
+      ["lpm", "symlink"],
+      ["lpx", "symlink"],
+    ],
+  );
+  const internalExecutable = path.join(
+    tree.packageDir,
+    "LPM CLI.app",
+    "Contents",
+    "MacOS",
+    "lpm-rs",
+  );
+  for (const command of ["lpm", "lpx"]) {
+    const commandPath = path.join(tree.wrapperRoot, "bin", command);
+    assert.equal(fs.lstatSync(commandPath).isSymbolicLink(), true);
+    assert.equal(path.resolve(path.dirname(commandPath), fs.readlinkSync(commandPath)), internalExecutable);
+  }
+  assert.equal(
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
+    tree.lpmShim,
+  );
+});
+
+test("postinstall retains macOS launcher files for pnpm bin-link compatibility", () => {
+  const tree = makeInstallTree("darwin-arm64", {
+    version: "2.0.0",
+    packageBinaryNames: ["LPM CLI.app/Contents/MacOS/lpm-rs"],
+  });
+
+  const result = installNativeBinaries({
+    wrapperRoot: tree.wrapperRoot,
+    platform: "darwin",
+    arch: "arm64",
+    env: { npm_config_user_agent: "pnpm/11.3.0 npm/? node/v26.5.0 darwin arm64" },
+    requireFn: createFakeRequire(tree.root),
+    spawnSyncFn: createVersionSpawn("lpm 2.0.0"),
+    logFn() {},
+  });
+
+  assert.deepEqual(
+    result.optimized.map(entry => [entry.command, entry.action]),
+    [
+      ["lpm", "launcher"],
+      ["lpx", "launcher"],
     ],
   );
   assert.equal(
     fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm"), "utf8"),
-    fs.readFileSync(path.join(tree.packageDir, "lpm"), "utf8"),
+    tree.lpmShim,
   );
   assert.equal(
-    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpm.js"), "utf8"),
-    tree.lpmShim,
+    fs.readFileSync(path.join(tree.wrapperRoot, "bin", "lpx"), "utf8"),
+    tree.lpxShim,
   );
 });
 
@@ -493,6 +533,9 @@ function makePackageTree(platform) {
   for (const name of ["lpm", "lpx", "lpm.exe", "lpx.exe"]) {
     fs.writeFileSync(path.join(pkgDir, name), "");
   }
+  const macOSExecutable = path.join(pkgDir, "LPM CLI.app", "Contents", "MacOS", "lpm-rs");
+  fs.mkdirSync(path.dirname(macOSExecutable), { recursive: true });
+  fs.writeFileSync(macOSExecutable, "");
   return root;
 }
 
@@ -524,8 +567,10 @@ function makeInstallTree(platform, { version, packageBinaryNames }) {
     JSON.stringify({ name: `@lpm-registry/cli-${platform}`, version }),
   );
   for (const name of packageBinaryNames) {
-    fs.writeFileSync(path.join(packageDir, name), `native ${name} ${version}\n`);
-    fs.chmodSync(path.join(packageDir, name), 0o755);
+    const binaryPath = path.join(packageDir, name);
+    fs.mkdirSync(path.dirname(binaryPath), { recursive: true });
+    fs.writeFileSync(binaryPath, `native ${name} ${version}\n`);
+    fs.chmodSync(binaryPath, 0o755);
   }
   return { root, wrapperRoot, packageDir, lpmShim, lpxShim, legacyLpmShim, legacyLpxShim };
 }

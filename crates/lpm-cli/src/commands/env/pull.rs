@@ -45,6 +45,9 @@ pub(super) async fn vars_pull(
             ));
         }
 
+        let baseline_environments =
+            lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
+
         let pulled = super::auth::execute_sync_with_bearer(
             client,
             lpm_auth::AuthRequirement::TokenRequired,
@@ -64,47 +67,34 @@ pub(super) async fn vars_pull(
         )
         .await?;
 
-        // Same merge logic as personal pull
-        let total_keys;
-        if let Ok(wrapper) = serde_json::from_str::<
-            std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, std::collections::HashMap<String, String>>,
-            >,
-        >(&pulled.raw_json)
-        {
-            if let Some(remote_envs) = wrapper.get("environments") {
-                let mut total = 0;
-                for (env_name, remote_secrets) in remote_envs {
-                    let mut env = lpm_vault::try_get_all_env(project_dir, env_name)
-                        .map_err(LpmError::Script)?;
-                    env.extend(remote_secrets.clone());
-                    total += env.len();
-                    let pairs: Vec<(&str, &str)> =
-                        env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    lpm_vault::set_env(project_dir, env_name, &pairs).map_err(LpmError::Script)?;
-                }
-                total_keys = total;
-            } else {
-                total_keys = 0;
+        let remote_environments =
+            super::sync_payload::parse_remote_pull_payload_for_overwrite(&pulled.raw_json)
+                .map_err(LpmError::Script)?;
+        let target = lpm_vault::RemoteSyncTarget::Organization {
+            slug: org_slug.to_owned(),
+        };
+        let committed = lpm_vault::commit_remote_environments(
+            project_dir,
+            &vault_id,
+            &baseline_environments,
+            &remote_environments,
+            &target,
+            pulled.version,
+        )
+        .map_err(LpmError::Script)?;
+        let committed_environments = match committed {
+            lpm_vault::RemoteEnvironmentCommit::Committed(environments) => environments,
+            lpm_vault::RemoteEnvironmentCommit::Conflict(_) => {
+                return Err(LpmError::Script(
+                    "local secrets changed while the organization vault was downloading; no remote changes were applied. Review the local values and retry."
+                        .into(),
+                ));
             }
-        } else if let Ok(remote_secrets) =
-            serde_json::from_str::<std::collections::HashMap<String, String>>(&pulled.raw_json)
-        {
-            let mut merged = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
-            merged.extend(remote_secrets);
-            total_keys = merged.len();
-            let pairs: Vec<(&str, &str)> = merged
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            lpm_vault::set(project_dir, &pairs).map_err(LpmError::Script)?;
-        } else {
-            return Err(LpmError::Script("failed to parse pulled vault data".into()));
-        }
-
-        lpm_vault::vault_id::write_org_sync_version(project_dir, org_slug, pulled.version)
-            .map_err(LpmError::Script)?;
+        };
+        let total_keys = committed_environments
+            .values()
+            .map(|env| env.len())
+            .sum::<usize>();
 
         if json_output {
             super::response::print_json_value(&serde_json::json!({
@@ -128,13 +118,18 @@ pub(super) async fn vars_pull(
     }
 
     let project_name = lpm_vault::vault_id::read_project_name(project_dir);
-    let local_secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
+    let baseline_environments =
+        lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
+    let local_key_count = baseline_environments
+        .values()
+        .map(|env| env.len())
+        .sum::<usize>();
 
     // Confirmation prompt
     if !yes && !json_output {
         output::warn("this will overwrite your local secrets with the cloud vault");
         output::field("project", &project_name);
-        output::field("local keys", &format!("{}", local_secrets.len()));
+        output::field("local keys", &format!("{local_key_count}"));
         let confirm = cliclack::confirm("Continue?")
             .initial_value(false)
             .interact()
@@ -161,11 +156,28 @@ pub(super) async fn vars_pull(
 
     let remote_envs = super::sync_payload::parse_remote_pull_payload_for_overwrite(&raw_json)
         .map_err(LpmError::Script)?;
-    let total_keys: usize = remote_envs.values().map(|env| env.len()).sum();
-    lpm_vault::replace_all_environments(project_dir, &remote_envs).map_err(LpmError::Script)?;
-
-    lpm_vault::vault_id::write_personal_sync_version(project_dir, version)
-        .map_err(LpmError::Script)?;
+    let committed = lpm_vault::commit_remote_environments(
+        project_dir,
+        &vault_id,
+        &baseline_environments,
+        &remote_envs,
+        &lpm_vault::RemoteSyncTarget::Personal,
+        version,
+    )
+    .map_err(LpmError::Script)?;
+    let committed_environments = match committed {
+        lpm_vault::RemoteEnvironmentCommit::Committed(environments) => environments,
+        lpm_vault::RemoteEnvironmentCommit::Conflict(_) => {
+            return Err(LpmError::Script(
+                "local secrets changed while the cloud vault was downloading; no remote changes were applied. Review the local values and retry."
+                    .into(),
+            ));
+        }
+    };
+    let total_keys = committed_environments
+        .values()
+        .map(|env| env.len())
+        .sum::<usize>();
 
     if json_output {
         super::response::print_json_value(&serde_json::json!({

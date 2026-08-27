@@ -348,6 +348,15 @@ pub(super) async fn env_rotate_sharing_key(
         ));
     }
 
+    let _rotation_lock = lpm_vault::sync::try_acquire_sharing_key_rotation_lock()
+        .map_err(LpmError::Script)?
+        .ok_or_else(|| {
+            LpmError::Script(
+                "another `lpm env rotate-sharing-key` command is already running; wait for it to finish before retrying"
+                    .into(),
+            )
+        })?;
+
     // Crash recovery — if a pending key exists and matches the server,
     // the previous run committed the server side but didn't promote
     // locally. Promote and return; no second rotation needed.
@@ -448,9 +457,10 @@ pub(super) async fn env_rotate_sharing_key(
     let response = match response {
         Ok(r) => r,
         Err(e) => {
-            // Server-side write failed — discard the pending so the
-            // next attempt starts from a clean slate.
-            let _ = lpm_vault::sync::discard_pending_x25519_keypair();
+            // The server may have committed before the response was lost or
+            // became unparsable. Preserve the pending private key so the next
+            // invocation can compare its public half with the authoritative
+            // server key and either promote it or discard a confirmed orphan.
             return Err(LpmError::Script(e.to_string()));
         }
     };

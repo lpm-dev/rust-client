@@ -67,6 +67,13 @@ case "$(uname -s)" in
   *) fail "unsupported OS $(uname -s) — install.sh tests run on macOS/Linux only" ;;
 esac
 
+HOST_OS="$(uname -s)"
+if [ "$HOST_OS" = "Darwin" ]; then
+  RELEASE_ASSET="$PLATFORM.zip"
+else
+  RELEASE_ASSET="$PLATFORM"
+fi
+
 # ── SHA hasher — same selection install.sh would make ──
 if command -v sha256sum >/dev/null 2>&1; then SHA_TOOL="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then SHA_TOOL="shasum -a 256"
@@ -123,12 +130,35 @@ make_happy_fixture() {
   # Placeholder binary at the path install.sh expects after the
   # `$VERSION` is substituted. install.sh's $BASE_URL is the override,
   # so the path is `<base>/$PLATFORM` (NO $VERSION segment).
-  printf 'happy-fixture-binary-bytes' > "$FIXTURE_DIR/$PLATFORM"
-  bin_sha="$($SHA_TOOL "$FIXTURE_DIR/$PLATFORM" | awk '{print $1}')"
-  printf '%s  %s\n' "$bin_sha" "$PLATFORM" > "$FIXTURE_DIR/SHA256SUMS.txt"
+  write_release_asset "$FIXTURE_DIR" 'happy-fixture-binary-bytes'
+  bin_sha="$($SHA_TOOL "$FIXTURE_DIR/$RELEASE_ASSET" | awk '{print $1}')"
+  printf '%s  %s\n' "$bin_sha" "$RELEASE_ASSET" > "$FIXTURE_DIR/SHA256SUMS.txt"
   # Dummy bundle. cosign isn't on PATH during these tests; the file's
   # presence just exercises the bundle-fetch step.
   printf 'dummy-sigstore-bundle' > "$FIXTURE_DIR/SHA256SUMS.txt.sigstore"
+}
+
+write_release_asset() {
+  destination_dir="$1"
+  executable_bytes="$2"
+  if [ "$HOST_OS" != "Darwin" ]; then
+    printf '%s' "$executable_bytes" > "$destination_dir/$RELEASE_ASSET"
+    LAST_FIXTURE_EXECUTABLE="$destination_dir/$RELEASE_ASSET"
+    return
+  fi
+
+  fixture_bundle_root="$destination_dir/.bundle-fixture"
+  fixture_app="$fixture_bundle_root/LPM CLI.app"
+  mkdir -p "$fixture_app/Contents/MacOS" "$fixture_app/Contents/_CodeSignature"
+  printf '%s' "$executable_bytes" > "$fixture_app/Contents/MacOS/lpm-rs"
+  chmod 755 "$fixture_app/Contents/MacOS/lpm-rs"
+  printf '<plist><dict><key>CFBundleIdentifier</key><string>dev.lpm.cli</string></dict></plist>\n' \
+    > "$fixture_app/Contents/Info.plist"
+  printf 'fixture-profile' > "$fixture_app/Contents/embedded.provisionprofile"
+  printf 'fixture-notarization-ticket' > "$fixture_app/Contents/CodeResources"
+  printf 'fixture-signature' > "$fixture_app/Contents/_CodeSignature/CodeResources"
+  ditto -c -k --keepParent "$fixture_app" "$destination_dir/$RELEASE_ASSET"
+  LAST_FIXTURE_EXECUTABLE="$fixture_app/Contents/MacOS/lpm-rs"
 }
 
 # Build a controlled PATH that has the essentials install.sh needs
@@ -139,7 +169,7 @@ make_happy_fixture() {
 build_clean_path() {
   CLEAN_PATH_DIR="$(mktemp -d)"
   # Tools install.sh shells out to during the integrity flow.
-  for tool in sh id uname mktemp rm basename grep awk curl sed cat tr chmod mv mkdir ln; do
+  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp; do
     src="$(command -v "$tool" 2>/dev/null || true)"
     if [ -n "$src" ]; then
       ln -s "$src" "$CLEAN_PATH_DIR/$tool"
@@ -151,17 +181,63 @@ build_clean_path() {
   elif command -v shasum >/dev/null 2>&1; then
     ln -s "$(command -v shasum)" "$CLEAN_PATH_DIR/shasum"
   fi
+  if [ "$(PATH="$CLEAN_PATH_DIR" uname -s)" = "Darwin" ]; then
+    ln -s "$(command -v ditto)" "$CLEAN_PATH_DIR/ditto"
+    ln -s "$(command -v unzip)" "$CLEAN_PATH_DIR/unzip"
+    cat > "$CLEAN_PATH_DIR/codesign" <<'EOF'
+#!/bin/sh
+case " $* " in
+  *" --entitlements "*)
+    printf '%s\n' '<?xml version="1.0"?><plist><dict><key>keychain-access-groups</key><array><string>823S8YKMRW.dev.lpm.vault.shared</string></array></dict></plist>'
+    ;;
+  *" -dvv "*)
+    echo 'Identifier=dev.lpm.cli' >&2
+    echo 'TeamIdentifier=823S8YKMRW' >&2
+    ;;
+esac
+exit 0
+EOF
+    cat > "$CLEAN_PATH_DIR/security" <<'EOF'
+#!/bin/sh
+cat <<'PLIST'
+<?xml version="1.0"?><plist><dict><key>TeamIdentifier</key><array><string>823S8YKMRW</string></array><key>Entitlements</key><dict><key>com.apple.application-identifier</key><string>823S8YKMRW.dev.lpm.cli</string><key>keychain-access-groups</key><array><string>823S8YKMRW.*</string></array></dict></dict></plist>
+PLIST
+EOF
+    printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/spctl"
+    printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/xcrun"
+    chmod +x "$CLEAN_PATH_DIR/codesign" "$CLEAN_PATH_DIR/security" \
+      "$CLEAN_PATH_DIR/spctl" "$CLEAN_PATH_DIR/xcrun"
+  fi
 }
 
 # Run install.sh against the running server with a clean install dir.
 # Sets RUN_OUT (combined stdout+stderr) and RUN_RC (exit code).
 run_install_sh() {
-  install_root="$(mktemp -d)"
+  install_root="${RUN_INSTALL_ROOT_OVERRIDE:-}"
+  if [ -z "$install_root" ]; then
+    install_root="$(mktemp -d)"
+  fi
+  test_codesign=""
+  test_security=""
+  test_spctl=""
+  test_xcrun=""
+  if [ "$(PATH="$CLEAN_PATH_DIR" uname -s)" = "Darwin" ]; then
+    test_codesign="$CLEAN_PATH_DIR/codesign"
+    test_security="$CLEAN_PATH_DIR/security"
+    test_spctl="$CLEAN_PATH_DIR/spctl"
+    test_xcrun="$CLEAN_PATH_DIR/xcrun"
+  fi
   set +e
   RUN_OUT="$(
     PATH="$CLEAN_PATH_DIR" \
     LPM_INSTALL_TEST_API_URL="http://127.0.0.1:$SERVER_PORT/api.json" \
     LPM_INSTALL_TEST_DOWNLOAD_BASE="http://127.0.0.1:$SERVER_PORT" \
+    LPM_INSTALL_TEST_CODESIGN="$test_codesign" \
+    LPM_INSTALL_TEST_SECURITY="$test_security" \
+    LPM_INSTALL_TEST_SPCTL="$test_spctl" \
+    LPM_INSTALL_TEST_XCRUN="$test_xcrun" \
+    LPM_INSTALL_TEST_INTERRUPT_AFTER="${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" \
+    LPM_MV_FAILURE_COUNT_FILE="${LPM_MV_FAILURE_COUNT_FILE:-}" \
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_VERSION="${LPM_INSTALL_VERSION:-}" \
@@ -213,7 +289,7 @@ run_install_sh
 stop_server
 trap - EXIT
 [ "$RUN_RC" -eq 0 ] || fail "musl platform install failed with exit $RUN_RC; out: $RUN_OUT"
-echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
+echo "$RUN_OUT" | grep -q "manifest .*enumerate" \
   && fail "musl platform selected the wrong manifest entry: $RUN_OUT"
 [ -x "$RUN_INSTALL_DIR/lpm" ] || fail "musl platform did not install an executable"
 rm -rf "$fdir" "$CLEAN_PATH_DIR"
@@ -262,6 +338,20 @@ actual_exit=0
 out="$(LPM_INSTALL_TEST_DOWNLOAD_BASE="http://attacker.example/x" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
 [ "$actual_exit" -ne 0 ] || fail "non-loopback DOWNLOAD_BASE should fail-closed; got exit 0"
 echo "$out" | grep -q "127.0.0.1" || fail "expected loopback-only error: $out"
+for spoofed_url in \
+  "http://localhost.attacker.example/x" \
+  "http://127.0.0.1.attacker.example/x" \
+  "http://localhost:80.attacker.example/x"
+do
+  actual_exit=0
+  out="$(LPM_INSTALL_TEST_API_URL="$spoofed_url" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+  [ "$actual_exit" -ne 0 ] || fail "loopback-prefix hostname should fail-closed: $spoofed_url"
+done
+actual_exit=0
+out="$(LPM_INSTALL_TEST_CODESIGN="/tmp/fake-codesign" sh "$INSTALL_SH" 2>&1)" || actual_exit=$?
+[ "$actual_exit" -ne 0 ] || fail "macOS tool override should require loopback endpoints"
+echo "$out" | grep -q "loopback test endpoints" \
+  || fail "tool-override failure did not explain the loopback requirement: $out"
 pass "test-override env vars are loopback-gated"
 
 # ── Case 5: happy path ─────────────────────────────────────────
@@ -280,18 +370,136 @@ echo "$RUN_OUT" | grep -q "Verified SHA-256:" \
 # guards against a future regression that "verifies" but installs
 # different bytes.
 installed_sha="$($SHA_TOOL "$RUN_INSTALL_DIR/lpm" | awk '{print $1}')"
-fixture_sha="$($SHA_TOOL "$FIXTURE_DIR/$PLATFORM" | awk '{print $1}')"
+fixture_sha="$($SHA_TOOL "$LAST_FIXTURE_EXECUTABLE" | awk '{print $1}')"
 [ "$installed_sha" = "$fixture_sha" ] \
   || fail "happy-path installed bytes differ from fixture (installed=$installed_sha fixture=$fixture_sha)"
+if [ "$HOST_OS" = "Darwin" ]; then
+  [ -d "$(dirname "$RUN_INSTALL_DIR")/libexec/LPM CLI.app" ] \
+    || fail "macOS install did not preserve LPM CLI.app"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "macOS lpm command is not a direct symlink"
+  [ -L "$RUN_INSTALL_DIR/lpx" ] || fail "macOS lpx command is not a direct symlink"
+  [ "$(readlink "$RUN_INSTALL_DIR/lpm")" = "../libexec/LPM CLI.app/Contents/MacOS/lpm-rs" ] \
+    || fail "macOS lpm symlink target is incorrect"
+  [ "$(readlink "$RUN_INSTALL_DIR/lpx")" = "../libexec/LPM CLI.app/Contents/MacOS/lpm-rs" ] \
+    || fail "macOS lpx symlink target is incorrect"
+
+  rollback_home="${RUN_INSTALL_DIR%/.lpm/bin}"
+  rollback_app="$(dirname "$RUN_INSTALL_DIR")/libexec/LPM CLI.app"
+  rollback_executable="$rollback_app/Contents/MacOS/lpm-rs"
+  rollback_sha="$($SHA_TOOL "$rollback_executable" | awk '{print $1}')"
+  mv_count_file="$(mktemp)"
+  rm -f "$CLEAN_PATH_DIR/mv"
+  cat > "$CLEAN_PATH_DIR/mv" <<'EOF'
+#!/bin/sh
+count=0
+if [ -s "$LPM_MV_FAILURE_COUNT_FILE" ]; then count=$(cat "$LPM_MV_FAILURE_COUNT_FILE"); fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$LPM_MV_FAILURE_COUNT_FILE"
+if [ "$count" -eq 2 ]; then exit 91; fi
+exec /bin/mv "$@"
+EOF
+  chmod +x "$CLEAN_PATH_DIR/mv"
+  trap 'stop_server' EXIT
+  start_server "$FIXTURE_DIR"
+  RUN_INSTALL_ROOT_OVERRIDE="$rollback_home" LPM_MV_FAILURE_COUNT_FILE="$mv_count_file" run_install_sh
+  unset RUN_INSTALL_ROOT_OVERRIDE LPM_MV_FAILURE_COUNT_FILE
+  stop_server
+  trap - EXIT
+  rm -f "$CLEAN_PATH_DIR/mv"
+  ln -s "$(command -v mv)" "$CLEAN_PATH_DIR/mv"
+  [ "$RUN_RC" -ne 0 ] || fail "macOS partial backup failure should fail the install"
+  echo "$RUN_OUT" | grep -q "restoring the previous installation" \
+    || fail "macOS partial backup failure did not start rollback: $RUN_OUT"
+  [ -d "$rollback_app" ] || fail "macOS rollback did not restore the existing app"
+  [ "$($SHA_TOOL "$rollback_executable" | awk '{print $1}')" = "$rollback_sha" ] \
+    || fail "macOS rollback changed the existing app executable"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "macOS rollback did not preserve the lpm command"
+  [ -L "$RUN_INSTALL_DIR/lpx" ] || fail "macOS rollback did not preserve the lpx command"
+
+  write_release_asset "$FIXTURE_DIR" 'replacement-binary-bytes'
+  replacement_sha="$($SHA_TOOL "$FIXTURE_DIR/$RELEASE_ASSET" | awk '{print $1}')"
+  printf '%s  %s\n' "$replacement_sha" "$RELEASE_ASSET" > "$FIXTURE_DIR/SHA256SUMS.txt"
+  for interruption_boundary in \
+    moved-app moved-lpm moved-lpx installed-app installed-lpm installed-lpx
+  do
+    trap 'stop_server' EXIT
+    start_server "$FIXTURE_DIR"
+    RUN_INSTALL_ROOT_OVERRIDE="$rollback_home" \
+      LPM_INSTALL_TEST_INTERRUPT_AFTER="$interruption_boundary" \
+      run_install_sh
+    unset RUN_INSTALL_ROOT_OVERRIDE LPM_INSTALL_TEST_INTERRUPT_AFTER
+    stop_server
+    trap - EXIT
+
+    [ "$RUN_RC" -ne 0 ] \
+      || fail "macOS interruption at $interruption_boundary should fail the install"
+    echo "$RUN_OUT" | grep -q "restoring the previous installation" \
+      || fail "macOS interruption at $interruption_boundary did not start rollback: $RUN_OUT"
+    [ -d "$rollback_app" ] \
+      || fail "macOS interruption at $interruption_boundary removed the existing app"
+    [ "$($SHA_TOOL "$rollback_executable" | awk '{print $1}')" = "$rollback_sha" ] \
+      || fail "macOS interruption at $interruption_boundary changed the existing app"
+    [ -L "$RUN_INSTALL_DIR/lpm" ] \
+      || fail "macOS interruption at $interruption_boundary removed lpm"
+    [ -L "$RUN_INSTALL_DIR/lpx" ] \
+      || fail "macOS interruption at $interruption_boundary removed lpx"
+  done
+
+  rollback_failure_count_file="$(mktemp)"
+  rm -f "$CLEAN_PATH_DIR/mv"
+  cat > "$CLEAN_PATH_DIR/mv" <<'EOF'
+#!/bin/sh
+count=0
+if [ -s "$LPM_MV_FAILURE_COUNT_FILE" ]; then count=$(cat "$LPM_MV_FAILURE_COUNT_FILE"); fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$LPM_MV_FAILURE_COUNT_FILE"
+# Fail installation of the new lpx link, then fail restoration of the old lpm
+# link after the previous app has already been restored.
+case "$count" in
+  6|9) exit 91 ;;
+esac
+exec /bin/mv "$@"
+EOF
+  chmod +x "$CLEAN_PATH_DIR/mv"
+  trap 'stop_server' EXIT
+  start_server "$FIXTURE_DIR"
+  RUN_INSTALL_ROOT_OVERRIDE="$rollback_home" \
+    LPM_MV_FAILURE_COUNT_FILE="$rollback_failure_count_file" \
+    run_install_sh
+  unset RUN_INSTALL_ROOT_OVERRIDE LPM_MV_FAILURE_COUNT_FILE
+  stop_server
+  trap - EXIT
+  rm -f "$CLEAN_PATH_DIR/mv"
+  ln -s "$(command -v mv)" "$CLEAN_PATH_DIR/mv"
+
+  [ "$RUN_RC" -ne 0 ] || fail "macOS rollback-operation failure should fail the install"
+  echo "$RUN_OUT" | grep -q "rollback was incomplete" \
+    || fail "macOS rollback-operation failure was not reported: $RUN_OUT"
+  rollback_stage=$(printf '%s\n' "$RUN_OUT" | sed -n 's/^Rollback data was retained at //p')
+  [ -n "$rollback_stage" ] \
+    || fail "macOS rollback-operation failure did not report retained data: $RUN_OUT"
+  [ "$(cat "$rollback_failure_count_file")" -eq 10 ] \
+    || fail "macOS rollback was attempted more than once after an inverse failed"
+  [ -d "$rollback_app" ] \
+    || fail "macOS rollback re-entry moved the already-restored app away"
+  [ "$($SHA_TOOL "$rollback_executable" | awk '{print $1}')" = "$rollback_sha" ] \
+    || fail "macOS rollback-operation failure changed the restored app"
+  [ -L "$rollback_stage/previous-lpm" ] \
+    || fail "macOS rollback did not retain the unrestored lpm command"
+  [ -L "$RUN_INSTALL_DIR/lpx" ] \
+    || fail "macOS rollback-operation failure removed the restored lpx command"
+  rm -rf "$rollback_stage"
+  rm -f "$rollback_failure_count_file"
+fi
 rm -rf "$FIXTURE_DIR"
 pass "happy path installs the verified binary"
 
 # ── Case 6: nightly channel installs the verified nightly ──────
 fdir="$(mktemp -d)"
 printf '{"version": "%s"}\n' "${NIGHTLY_VERSION#v}" > "$fdir/api.json"
-printf 'nightly-binary-bytes' > "$fdir/$PLATFORM"
-sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
-printf '%s  %s\n' "$sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+write_release_asset "$fdir" 'nightly-binary-bytes'
+sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
 printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
 trap 'stop_server' EXIT
 start_server "$fdir"
@@ -344,9 +552,9 @@ pass "invalid install channel fails closed"
 
 # ── Case 9: explicit version skips the latest-release API ──────
 fdir="$(mktemp -d)"
-printf 'explicit-version-binary-bytes' > "$fdir/$PLATFORM"
-sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
-printf '%s  %s\n' "$sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+write_release_asset "$fdir" 'explicit-version-binary-bytes'
+sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
 printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
 # Deliberately omit api.json. If install.sh still fetches the latest
 # release API while LPM_INSTALL_VERSION is set, this case fails closed.
@@ -388,7 +596,7 @@ pass "explicit stable and nightly versions install without latest-release API"
 # ── Case 10: manifest 404 fails closed ────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-printf 'placeholder' > "$fdir/$PLATFORM"
+write_release_asset "$fdir" 'placeholder'
 printf 'bundle' > "$fdir/SHA256SUMS.txt.sigstore"
 # Deliberately omit SHA256SUMS.txt — server returns 404.
 trap 'stop_server' EXIT
@@ -406,9 +614,9 @@ pass "manifest 404 fails closed"
 # ── Case 8: bundle 404 fails closed ───────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-printf 'placeholder' > "$fdir/$PLATFORM"
-sha="$($SHA_TOOL "$fdir/$PLATFORM" | awk '{print $1}')"
-printf '%s  %s\n' "$sha" "$PLATFORM" > "$fdir/SHA256SUMS.txt"
+write_release_asset "$fdir" 'placeholder'
+sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
 # Bundle file omitted — 404.
 trap 'stop_server' EXIT
 start_server "$fdir"
@@ -430,9 +638,9 @@ pass "bundle 404 falls back to SHA-only floor"
 # ── Case 9: SHA mismatch fails closed ─────────────────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-printf 'real-bytes' > "$fdir/$PLATFORM"
+write_release_asset "$fdir" 'real-bytes'
 # Manifest lists a wrong SHA (all zeros) for the platform.
-printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$PLATFORM" \
+printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$RELEASE_ASSET" \
   > "$fdir/SHA256SUMS.txt"
 printf 'bundle' > "$fdir/SHA256SUMS.txt.sigstore"
 trap 'stop_server' EXIT
@@ -450,7 +658,7 @@ pass "SHA mismatch fails closed"
 # ── Case 10: missing platform entry in manifest ──────────────
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-printf 'real-bytes' > "$fdir/$PLATFORM"
+write_release_asset "$fdir" 'real-bytes'
 # Manifest enumerates SOME other platform but not the running one.
 printf '0000000000000000000000000000000000000000000000000000000000000000  lpm-some-other-platform\n' \
   > "$fdir/SHA256SUMS.txt"
@@ -461,8 +669,8 @@ run_install_sh
 stop_server
 trap - EXIT
 [ "$RUN_RC" -ne 0 ] || fail "missing-platform-entry must fail-closed; got exit 0: $RUN_OUT"
-echo "$RUN_OUT" | grep -q "manifest does not enumerate" \
-  || fail "expected 'manifest does not enumerate': $RUN_OUT"
+echo "$RUN_OUT" | grep -q "manifest .*enumerate" \
+  || fail "expected a manifest enumeration error: $RUN_OUT"
 [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "missing-platform-entry must not install"
 rm -rf "$fdir"
 pass "missing platform entry fails closed"
@@ -470,7 +678,7 @@ pass "missing platform entry fails closed"
 # ── Case 11: LPM_INSTALL_INSECURE=1 bypasses missing manifest ─
 fdir="$(mktemp -d)"
 printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
-printf 'unsigned-bytes' > "$fdir/$PLATFORM"
+write_release_asset "$fdir" 'unsigned-bytes'
 # Deliberately no manifest.
 trap 'stop_server' EXIT
 start_server "$fdir"

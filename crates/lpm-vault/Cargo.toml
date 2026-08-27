@@ -16,6 +16,9 @@ dirs = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+libc = "0.2"
+cap-fs-ext = { workspace = true }
+cap-std = "4.0.2"
 
 # Encryption
 aes-gcm = { workspace = true }
@@ -46,10 +49,20 @@ keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypt
 keyring = { workspace = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 keyring = { workspace = true, features = ["apple-native"] }
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2", features = ["OSX_10_15"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
+windows-sys = { version = "0.60", features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -58,6 +71,7 @@ wiremock = "0.6"
 
 [features]
 acceptance-test-hooks = []
+legacy-macos-keychain = []
 
 [lints]
 workspace = true

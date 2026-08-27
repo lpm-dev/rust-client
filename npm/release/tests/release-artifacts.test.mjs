@@ -119,6 +119,144 @@ test("Apple Silicon release builds keep enough timeout headroom for cold builds"
   );
 });
 
+test("macOS CLI releases use the shared LPM Vault Keychain access group", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const entitlementPath = path.join(repoRoot, "macos/lpm.entitlements");
+  const entitlements = fs.readFileSync(entitlementPath, "utf8");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+
+  assert.match(entitlements, /<key>keychain-access-groups<\/key>/);
+  assert.match(entitlements, /823S8YKMRW\.dev\.lpm\.vault\.shared/);
+  assert.match(entitlements, /<key>com\.apple\.application-identifier<\/key>/);
+  assert.doesNotMatch(entitlements, /com\.apple\.security\.app-sandbox/);
+  assert.match(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"/);
+  assert.match(releaseWorkflow, /codesign -d --entitlements :-/);
+});
+
+test("raw macOS compatibility assets use a separate legacy-only build", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+  const cliManifest = fs.readFileSync(
+    path.join(repoRoot, "crates/lpm-cli/Cargo.toml"),
+    "utf8",
+  );
+  const vaultManifest = fs.readFileSync(
+    path.join(repoRoot, "crates/lpm-vault/Cargo.toml"),
+    "utf8",
+  );
+
+  assert.match(cliManifest, /legacy-macos-keychain = \["lpm-vault\/legacy-macos-keychain"\]/);
+  assert.match(vaultManifest, /legacy-macos-keychain = \[\]/);
+  assert.match(releaseWorkflow, /--target-dir target\/legacy-macos-keychain/);
+  assert.match(releaseWorkflow, /--features legacy-macos-keychain/);
+  assert.match(
+    releaseWorkflow,
+    /cp target\/legacy-macos-keychain\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs \$\{\{ matrix\.binary \}\}/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs" "\$APP_BUNDLE\/Contents\/MacOS\/lpm-rs"/,
+  );
+  assert.match(releaseWorkflow, /env set LPM_RELEASE_SMOKE=verified/);
+  assert.match(releaseWorkflow, /env get LPM_RELEASE_SMOKE >\/dev\/null/);
+  assert.match(releaseWorkflow, /env delete LPM_RELEASE_SMOKE/);
+});
+
+test("macOS release packaging preserves a provisioned app bundle", () => {
+  const darwinPackages = PLATFORM_PACKAGES.filter(platform => platform.os === "darwin");
+
+  assert.equal(darwinPackages.length, 2);
+  for (const platform of darwinPackages) {
+    assert.equal(platform.bundleSource, `${platform.key}/LPM CLI.app`);
+    assert.deepEqual(
+      platform.binaries.map(binary => binary.destination),
+      ["LPM CLI.app/Contents/MacOS/lpm-rs"],
+    );
+    const source = JSON.parse(
+      fs.readFileSync(
+        path.resolve(
+          path.dirname(fileURLToPath(import.meta.url)),
+          "../..",
+          `cli-${platform.key}/package.json`,
+        ),
+        "utf8",
+      ),
+    );
+    assert.deepEqual(source.files, ["LPM CLI.app"]);
+    assert.equal(manifestForRelease(source, "0.69.0", platform).version, "0.69.0");
+  }
+});
+
+test("macOS release workflow provisions, notarizes, staples, and executes the bundle", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+  const infoPlist = fs.readFileSync(path.join(repoRoot, "macos/LPMCLI-Info.plist"), "utf8");
+  const localBuild = fs.readFileSync(
+    path.join(repoRoot, "scripts/build-signed-macos.sh"),
+    "utf8",
+  );
+
+  assert.match(infoPlist, /<key>LSMinimumSystemVersion<\/key>\s*<string>11\.0<\/string>/);
+  assert.match(localBuild, /Entitlements:com\.apple\.application-identifier/);
+  assert.match(localBuild, /EXPECTED_PROFILE_ACCESS_GROUP="\$EXPECTED_TEAM_ID\.\*"/);
+  assert.match(releaseWorkflow, /Contents\/embedded\.provisionprofile/);
+  assert.match(releaseWorkflow, /xcrun stapler staple/);
+  assert.match(releaseWorkflow, /xcrun stapler validate/);
+  assert.equal(
+    [...releaseWorkflow.matchAll(/ditto -c -k --keepParent --norsrc/g)].length,
+    3,
+    "every public or notarization ZIP must exclude AppleDouble metadata",
+  );
+  assert.match(releaseWorkflow, /unzip -q "\$archive" -d "binaries\/\$\{platform\}" -x '\*\/\._\*'/);
+  assert.match(releaseWorkflow, /LPM CLI\.app\/Contents\/MacOS\/lpm-rs/);
+  assert.match(localBuild, /Contents\/embedded\.provisionprofile/);
+  assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{\{ matrix\.binary \}\}"/);
+});
+
+test("release workflow smoke-tests standalone macOS bundle installation on both architectures", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+
+  assert.match(releaseWorkflow, /Smoke standalone installer on macOS \(arm64\)/);
+  assert.match(releaseWorkflow, /Smoke standalone installer on macOS \(x64\)/);
+  assert.match(releaseWorkflow, /\.lpm\/libexec\/LPM CLI\.app\/Contents\/MacOS\/lpm-rs/);
+  assert.match(releaseWorkflow, /test -L "\$HOME\/.lpm\/bin\/lpm"/);
+  assert.match(releaseWorkflow, /codesign --verify --strict --verbose=4/);
+  assert.match(releaseWorkflow, /stapler validate/);
+
+  const npmSmoke = fs.readFileSync(
+    path.join(repoRoot, "npm/release/smoke-install.mjs"),
+    "utf8",
+  );
+  assert.match(npmSmoke, /Contents", "CodeResources"/);
+  assert.match(npmSmoke, /"\/usr\/bin\/xcrun", \["stapler", "validate"/);
+  assert.match(npmSmoke, /"\/usr\/sbin\/spctl"/);
+});
+
+test("macOS vault storage never delegates secret access to the security utility", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const keychainSource = ["keychain.rs", "macos_keychain.rs"]
+    .map(file =>
+      fs.readFileSync(path.join(repoRoot, "crates/lpm-vault/src", file), "utf8"),
+    )
+    .join("\n");
+
+  assert.doesNotMatch(keychainSource, /Command::new\("security"\)/);
+  assert.doesNotMatch(keychainSource, /\["-A"\]/);
+});
+
 test("Windows filesystem gate isolates file-count stress from lock timing tests", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const workflow = fs
@@ -167,7 +305,8 @@ test("release workflow grants write permissions only to jobs that use them", () 
     ["smoke-npm-packages", "smoke-windows-recovery", []],
     ["smoke-windows-recovery", "release", []],
     ["release", "smoke-standalone-installer", ["contents", "id-token", "attestations"]],
-    ["smoke-standalone-installer", "publish-npm-platform", []],
+    ["smoke-standalone-installer", "publish-release", []],
+    ["publish-release", "publish-npm-platform", ["contents"]],
     ["publish-npm-platform", "publish-npm-wrapper", ["id-token"]],
     ["publish-npm-wrapper", "update-homebrew", ["id-token"]],
     ["update-homebrew", undefined, []],
@@ -592,10 +731,7 @@ test("release packaging emits one hash-bound tarball for every published package
   });
 
   for (const platform of PLATFORM_PACKAGES) {
-    for (const mapping of platform.binaries) {
-      const artifact = path.join(binaries, mapping.artifact);
-      if (!fs.existsSync(artifact)) fs.writeFileSync(artifact, `fixture:${mapping.artifact}\n`);
-    }
+    stagePlatformFixture(binaries, platform);
   }
 
   const manifest = prepareReleasePackages({
@@ -636,6 +772,35 @@ test("release packaging rejects a symlinked output directory", t => {
   );
 });
 
+test("release packaging rejects AppleDouble files in an npm app bundle", t => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const binaries = fs.mkdtempSync(path.join(os.tmpdir(), "lpm-release-appledouble-"));
+  const output = path.join(os.tmpdir(), `lpm-release-output-${process.pid}-${Date.now()}`);
+  t.after(() => {
+    fs.rmSync(binaries, { recursive: true, force: true });
+    fs.rmSync(output, { recursive: true, force: true });
+  });
+
+  for (const platform of PLATFORM_PACKAGES) {
+    stagePlatformFixture(binaries, platform);
+  }
+  fs.writeFileSync(
+    path.join(binaries, "darwin-arm64/LPM CLI.app/Contents/MacOS/._lpm-rs"),
+    "AppleDouble metadata",
+  );
+
+  assert.throws(
+    () =>
+      prepareReleasePackages({
+        repoRoot,
+        binariesDir: binaries,
+        outputDir: output,
+        version: "0.69.0",
+      }),
+    /file inventory drifted[\s\S]*\._lpm-rs/,
+  );
+});
+
 test(
   "packed wrapper and Linux platform tarballs install and execute without registry access",
   { skip: process.platform !== "linux" || process.arch !== "x64" },
@@ -649,10 +814,7 @@ test(
     });
 
     for (const platform of PLATFORM_PACKAGES) {
-      for (const mapping of platform.binaries) {
-        const artifact = path.join(binaries, mapping.artifact);
-        if (!fs.existsSync(artifact)) fs.writeFileSync(artifact, `fixture:${mapping.artifact}\n`);
-      }
+      stagePlatformFixture(binaries, platform);
     }
     const linuxBinary = path.join(binaries, "lpm-linux-x64");
     fs.writeFileSync(
@@ -677,3 +839,25 @@ test(
     assert.equal(result.version, "0.69.0");
   },
 );
+
+function stagePlatformFixture(binaries, platform) {
+  if (platform.bundleSource) {
+    for (const entry of platform.bundleFiles) {
+      const artifact = path.join(
+        binaries,
+        platform.bundleSource,
+        path.relative("LPM CLI.app", entry.path),
+      );
+      fs.mkdirSync(path.dirname(artifact), { recursive: true });
+      fs.writeFileSync(artifact, `fixture:${entry.path}\n`);
+      fs.chmodSync(artifact, entry.mode);
+    }
+    return;
+  }
+
+  for (const mapping of platform.binaries) {
+    const artifact = path.join(binaries, mapping.artifact);
+    fs.mkdirSync(path.dirname(artifact), { recursive: true });
+    if (!fs.existsSync(artifact)) fs.writeFileSync(artifact, `fixture:${mapping.artifact}\n`);
+  }
+}

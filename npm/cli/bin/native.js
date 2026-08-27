@@ -9,13 +9,13 @@ const require = createRequire(import.meta.url);
 export const PLATFORMS = Object.freeze({
   "darwin-arm64": {
     pkg: "@lpm-registry/cli-darwin-arm64",
-    lpm: "lpm",
-    lpx: "lpx",
+    lpm: "LPM CLI.app/Contents/MacOS/lpm-rs",
+    lpx: "LPM CLI.app/Contents/MacOS/lpm-rs",
   },
   "darwin-x64": {
     pkg: "@lpm-registry/cli-darwin-x64",
-    lpm: "lpm",
-    lpx: "lpx",
+    lpm: "LPM CLI.app/Contents/MacOS/lpm-rs",
+    lpx: "LPM CLI.app/Contents/MacOS/lpm-rs",
   },
   "linux-arm64": {
     pkg: "@lpm-registry/cli-linux-arm64",
@@ -114,7 +114,7 @@ export function resolveNativeBinary(options = {}) {
   return {
     path: binaryPath,
     source: spec.pkg,
-    argsPrefix: [],
+    argsPrefix: command === "lpx" && spec.lpm === spec.lpx ? ["dlx"] : [],
   };
 }
 

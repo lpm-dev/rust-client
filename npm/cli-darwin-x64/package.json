@@ -14,8 +14,7 @@
     "x64"
   ],
   "files": [
-    "lpm",
-    "lpx"
+    "LPM CLI.app"
   ],
   "preferUnplugged": true
 }

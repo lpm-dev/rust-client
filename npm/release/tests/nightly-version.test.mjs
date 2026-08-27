@@ -86,7 +86,12 @@ test("scheduled nightly publishing is changed-only and preserves stable release 
     2,
   );
   assert.match(workflow, /prerelease: \$\{\{ needs\.release-metadata\.outputs\.prerelease \}\}/);
-  assert.match(workflow, /make_latest: \$\{\{ needs\.release-metadata\.outputs\.channel == 'stable' \}\}/);
+  assert.match(workflow, /draft: true/);
+  assert.match(workflow, /make_latest: false/);
+  assert.match(
+    workflow,
+    /MAKE_LATEST: \$\{\{ needs\.release-metadata\.outputs\.channel == 'stable' \}\}/,
+  );
   assert.match(
     workflow,
     /needs\.release-metadata\.outputs\.should_release == 'true' &&\s+needs\.release-metadata\.outputs\.channel == 'stable' &&\s+needs\.release-metadata\.outputs\.mode == 'full'/,

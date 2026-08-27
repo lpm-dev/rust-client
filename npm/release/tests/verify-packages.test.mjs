@@ -573,8 +573,22 @@ function createFullFixture(t) {
   const output = createWrapperFixture(t);
   t.after(() => fs.rmSync(binaries, { recursive: true, force: true }));
   for (const platform of PLATFORM_PACKAGES) {
+    if (platform.bundleSource) {
+      for (const entry of platform.bundleFiles) {
+        const artifact = path.join(
+          binaries,
+          platform.bundleSource,
+          path.relative("LPM CLI.app", entry.path),
+        );
+        fs.mkdirSync(path.dirname(artifact), { recursive: true });
+        fs.writeFileSync(artifact, `fixture:${entry.path}\n`);
+        fs.chmodSync(artifact, entry.mode);
+      }
+      continue;
+    }
     for (const mapping of platform.binaries) {
       const artifact = path.join(binaries, mapping.artifact);
+      fs.mkdirSync(path.dirname(artifact), { recursive: true });
       if (!fs.existsSync(artifact)) fs.writeFileSync(artifact, `fixture:${mapping.artifact}\n`);
     }
   }
@@ -597,14 +611,27 @@ function prepareValidFullPackageSet(binaries, output, hostPlatform = process.pla
       fs.readFileSync(path.join(repoRoot, platform.directory, "package.json"), "utf8"),
     );
     const packageManifest = manifestForRelease(sourceManifest, VERSION, platform);
+    const platformContents = platform.bundleSource
+      ? platform.bundleFiles.map(entry => [
+          entry.path,
+          fs.readFileSync(
+            path.join(
+              binaries,
+              platform.bundleSource,
+              path.relative("LPM CLI.app", entry.path),
+            ),
+          ),
+          entry.mode,
+        ])
+      : platform.binaries.map(mapping => [
+          mapping.destination,
+          fs.readFileSync(path.join(binaries, mapping.artifact)),
+          platform.os === "win32" ? 0o644 : 0o755,
+        ]);
     const contents = [
       ["README.md", Buffer.from("platform readme\n"), 0o644],
       ["package.json", Buffer.from(JSON.stringify(packageManifest)), 0o644],
-      ...platform.binaries.map(mapping => [
-        mapping.destination,
-        fs.readFileSync(path.join(binaries, mapping.artifact)),
-        platform.os === "win32" ? 0o644 : 0o755,
-      ]),
+      ...platformContents,
     ];
     const entries = contents.map(([relative, body, mode]) =>
       tarFile(`package/${relative}`, body, mode),

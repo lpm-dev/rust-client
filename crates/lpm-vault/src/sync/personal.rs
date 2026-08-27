@@ -284,7 +284,7 @@ pub async fn pull(
         .encrypted_blob
         .ok_or("server returned no encrypted data")?;
     let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
-    let version = result.version.unwrap_or(0);
+    let mut version = result.version.unwrap_or(0);
     let crypto_version = result.crypto_version.unwrap_or(1);
 
     let result = crypto::decrypt_vault_from_sync(
@@ -297,8 +297,14 @@ pub async fn pull(
     let secrets_json = &result.plaintext;
 
     if result.needs_reencrypt {
-        attempt_legacy_reencrypt_push(registry_url, auth_token, vault_id, version, secrets_json)
-            .await;
+        version = attempt_legacy_reencrypt_push(
+            registry_url,
+            auth_token,
+            vault_id,
+            version,
+            secrets_json,
+        )
+        .await;
     }
 
     // Try environments format first: {"environments": {"default": {...}, "live": {...}}}
@@ -377,7 +383,7 @@ async fn pull_raw_with_migration(
         .encrypted_blob
         .ok_or("server returned no encrypted data")?;
     let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
-    let version = result.version.unwrap_or(0);
+    let mut version = result.version.unwrap_or(0);
     let crypto_version = result.crypto_version.unwrap_or(1);
 
     let result = crypto::decrypt_vault_from_sync(
@@ -389,7 +395,7 @@ async fn pull_raw_with_migration(
     )?;
 
     if migrate_legacy && result.needs_reencrypt {
-        attempt_legacy_reencrypt_push(
+        version = attempt_legacy_reencrypt_push(
             registry_url,
             auth_token,
             vault_id,
@@ -418,7 +424,7 @@ async fn attempt_legacy_reencrypt_push(
     vault_id: &str,
     version: i32,
     secrets_json: &str,
-) {
+) -> i32 {
     tracing::info!("migrating vault {vault_id} to stored wrapping key");
 
     let (new_blob, new_wrapped) = match crypto::encrypt_vault_for_sync(secrets_json, vault_id) {
@@ -428,7 +434,7 @@ async fn attempt_legacy_reencrypt_push(
                 "legacy vault migration: encrypt failed for vault {vault_id}: {e} \
                  (will retry on next successful pull)"
             );
-            return;
+            return version;
         }
     };
 
@@ -439,7 +445,7 @@ async fn attempt_legacy_reencrypt_push(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("legacy vault migration: client build failed for vault {vault_id}: {e}");
-            return;
+            return version;
         }
     };
 
@@ -454,28 +460,93 @@ async fn attempt_legacy_reencrypt_push(
         "expectedVersion": version,
     });
 
-    match client
+    let response = match client
         .post(&url)
         .bearer_auth(auth_token)
         .json(&body)
         .send()
         .await
     {
-        Ok(response) => {
-            let status = response.status();
-            if !status.is_success() {
-                tracing::warn!(
-                    "legacy vault migration: re-push returned {status} for vault {vault_id} \
-                     (will retry on next successful pull)"
-                );
-            }
-        }
+        Ok(response) => response,
         Err(e) => {
             tracing::warn!(
-                "legacy vault migration: re-push failed for vault {vault_id}: {} \
-                 (will retry on next successful pull)",
+                "legacy vault migration: re-push response was ambiguous for vault {vault_id}: {}",
                 lpm_http::display_error(&e)
             );
+            return recover_personal_version(&client, &url, auth_token, vault_id, version).await;
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(
+            "legacy vault migration: re-push returned {status} for vault {vault_id} \
+             (will retry on next successful pull)"
+        );
+        return version;
+    }
+
+    let body = match read_verified_response(response, auth_token).await {
+        Ok((_, body)) => body,
+        Err(error) => {
+            tracing::warn!(
+                "legacy vault migration: could not verify the success response for vault \
+                 {vault_id}: {error}"
+            );
+            return recover_personal_version(&client, &url, auth_token, vault_id, version).await;
+        }
+    };
+    match serde_json::from_slice::<PushResponse>(&body)
+        .ok()
+        .and_then(|result| result.version)
+    {
+        Some(committed_version) if committed_version > version => committed_version,
+        _ => {
+            tracing::warn!(
+                "legacy vault migration: success response omitted an advanced version for vault \
+                 {vault_id}"
+            );
+            recover_personal_version(&client, &url, auth_token, vault_id, version).await
+        }
+    }
+}
+
+async fn recover_personal_version(
+    client: &reqwest::Client,
+    url: &str,
+    auth_token: &str,
+    vault_id: &str,
+    fallback: i32,
+) -> i32 {
+    let recovered = async {
+        let response = client
+            .get(url)
+            .bearer_auth(auth_token)
+            .send()
+            .await
+            .map_err(super::http::network_error)?;
+        let (status, body) = read_verified_response(response, auth_token).await?;
+        if !status.is_success() {
+            return Err(SyncError::http(
+                status,
+                "version recovery returned a non-success response".to_owned(),
+            ));
+        }
+        serde_json::from_slice::<PullResponse>(&body)
+            .map_err(|error| SyncError::from(format!("response parse error: {error}")))?
+            .version
+            .ok_or_else(|| SyncError::from("version recovery response omitted the version"))
+    }
+    .await;
+
+    match recovered {
+        Ok(version) => version,
+        Err(error) => {
+            tracing::warn!(
+                "legacy vault migration: could not recover committed version for vault \
+                 {vault_id}: {error}; the next pull will retry migration"
+            );
+            fallback
         }
     }
 }
@@ -643,7 +714,10 @@ mod tests {
             .await
             .expect("pull must succeed when legacy fallback unwraps the blob");
 
-        assert_eq!(version, 9, "pull returns the server-reported version");
+        assert_eq!(
+            version, 10,
+            "pull returns the version committed by the migration push"
+        );
         assert_eq!(
             secrets.get("DATABASE_URL").map(String::as_str),
             Some("postgres://legacy"),
@@ -654,6 +728,48 @@ mod tests {
             1,
             "pull must attempt exactly one migration re-push after legacy decrypt"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn migration_recovers_committed_version_after_malformed_success_response() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        let auth_token = "auth-token";
+        let malformed = "{";
+        let malformed_signature = signature::sign_body(malformed.as_bytes(), auth_token);
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-ambiguous/sync"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(signature::SIGNATURE_HEADER, malformed_signature.as_str())
+                    .set_body_string(malformed),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-ambiguous/sync"))
+            .respond_with(signed_ok_response(
+                serde_json::json!({ "version": 10 }),
+                auth_token,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let version = attempt_legacy_reencrypt_push(
+            &server.uri(),
+            auth_token,
+            "vault-ambiguous",
+            9,
+            r#"{"API_KEY":"legacy"}"#,
+        )
+        .await;
+
+        assert_eq!(version, 10);
     }
 
     #[cfg(debug_assertions)]

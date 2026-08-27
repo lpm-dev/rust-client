@@ -20,8 +20,29 @@ fi
 
 REPO="lpm-dev/rust-client"
 INSTALL_DIR="$HOME/.lpm/bin"
+LIBEXEC_DIR="$HOME/.lpm/libexec"
 BINARY_NAME="lpm"
 ALIAS_NAME="lpx"
+EXPECTED_APP_NAME="LPM CLI.app"
+EXPECTED_BUNDLE_ID="dev.lpm.cli"
+EXPECTED_TEAM_ID="823S8YKMRW"
+EXPECTED_ACCESS_GROUP="$EXPECTED_TEAM_ID.dev.lpm.vault.shared"
+EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
+MACOS_BUNDLE=0
+LEGACY_MACOS=0
+
+plist_array_contains_exact() {
+  plist_values_="$1"
+  expected_value_="$2"
+  printf '%s\n' "$plist_values_" | awk -v expected="$expected_value_" '
+    {
+      value = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (value == expected) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
 
 # Minimum version this installer is willing to deliver. Bumped manually
 # alongside each release that fixes a security-relevant gap. The floor
@@ -81,6 +102,7 @@ case "$OS" in
       x86_64)        PLATFORM="lpm-darwin-x64" ;;
       *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
+    MACOS_BUNDLE=1
     ;;
   Linux)
     case "$ARCH" in
@@ -138,8 +160,19 @@ fi
 # malicious value is rejected even when the other is unset.
 is_loopback_http() {
   case "$1" in
-    http://127.0.0.1*|http://127.0.0.1:*|http://localhost*|http://localhost:*|http://\[::1\]*)
-      return 0 ;;
+    http://*) loopback_authority=${1#http://} ;;
+    *) return 1 ;;
+  esac
+  loopback_authority=${loopback_authority%%/*}
+  case "$loopback_authority" in
+    127.0.0.1|localhost|'[::1]') return 0 ;;
+    127.0.0.1:*|localhost:*|'[::1]':*)
+      loopback_port=${loopback_authority##*:}
+      case "$loopback_port" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
     *) return 1 ;;
   esac
 }
@@ -151,6 +184,33 @@ fi
 if [ -n "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ] && ! is_loopback_http "$LPM_INSTALL_TEST_DOWNLOAD_BASE"; then
   echo "ERROR: LPM_INSTALL_TEST_DOWNLOAD_BASE must point at 127.0.0.1 / localhost / [::1] over http"
   exit 1
+fi
+if [ -n "${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" ] && { \
+   [ -z "${LPM_INSTALL_TEST_API_URL:-}" ] || \
+   [ -z "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ]; \
+}; then
+  echo "ERROR: installer interruption hooks require both loopback test endpoints"
+  exit 1
+fi
+
+MACOS_CODESIGN_TOOL="/usr/bin/codesign"
+MACOS_SECURITY_TOOL="/usr/bin/security"
+MACOS_SPCTL_TOOL="/usr/sbin/spctl"
+MACOS_XCRUN_TOOL="/usr/bin/xcrun"
+MACOS_DITTO_TOOL="/usr/bin/ditto"
+MACOS_UNZIP_TOOL="/usr/bin/unzip"
+
+if [ -n "${LPM_INSTALL_TEST_CODESIGN:-}${LPM_INSTALL_TEST_SECURITY:-}${LPM_INSTALL_TEST_SPCTL:-}${LPM_INSTALL_TEST_XCRUN:-}" ]; then
+  if [ "$OS" != "Darwin" ] || \
+     [ -z "${LPM_INSTALL_TEST_API_URL:-}" ] || \
+     [ -z "${LPM_INSTALL_TEST_DOWNLOAD_BASE:-}" ]; then
+    echo "ERROR: macOS tool overrides require both loopback test endpoints on macOS"
+    exit 1
+  fi
+  MACOS_CODESIGN_TOOL="${LPM_INSTALL_TEST_CODESIGN:-$MACOS_CODESIGN_TOOL}"
+  MACOS_SECURITY_TOOL="${LPM_INSTALL_TEST_SECURITY:-$MACOS_SECURITY_TOOL}"
+  MACOS_SPCTL_TOOL="${LPM_INSTALL_TEST_SPCTL:-$MACOS_SPCTL_TOOL}"
+  MACOS_XCRUN_TOOL="${LPM_INSTALL_TEST_XCRUN:-$MACOS_XCRUN_TOOL}"
 fi
 
 REQUESTED_VERSION="${LPM_INSTALL_VERSION:-}"
@@ -245,7 +305,6 @@ echo "Installing LPM CLI $VERSION ($RESOLVED_CHANNEL channel) for $OS/$ARCH..."
 
 BASE_URL="${LPM_INSTALL_TEST_DOWNLOAD_BASE:-https://github.com/$REPO/releases/download/$VERSION}"
 
-URL="$BASE_URL/$PLATFORM"
 MANIFEST_URL="$BASE_URL/SHA256SUMS.txt"
 BUNDLE_URL="$BASE_URL/SHA256SUMS.txt.sigstore"
 
@@ -255,10 +314,127 @@ BUNDLE_URL="$BASE_URL/SHA256SUMS.txt.sigstore"
 # stragglers when integrity gates trip.
 mkdir -p "$INSTALL_DIR"
 STAGE_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGE_DIR"' EXIT
+BUNDLE_STAGE_ROOT=""
+BUNDLE_TRANSACTION_ACTIVE=0
+BUNDLE_ROLLBACK_INCOMPLETE=0
+BUNDLE_MOVED_APP=0
+BUNDLE_MOVED_LPM=0
+BUNDLE_MOVED_LPX=0
+BUNDLE_INSTALLED_APP=0
+BUNDLE_INSTALLED_LPM=0
+BUNDLE_INSTALLED_LPX=0
+BUNDLE_STAGED_APP=""
+BUNDLE_PREVIOUS_APP=""
+BUNDLE_PREVIOUS_LPM=""
+BUNDLE_PREVIOUS_LPX=""
+BUNDLE_FINAL_APP=""
+BUNDLE_FINAL_LPM="$INSTALL_DIR/$BINARY_NAME"
+BUNDLE_FINAL_LPX="$INSTALL_DIR/$ALIAS_NAME"
+
+rollback_macos_bundle_transaction() {
+  [ "$BUNDLE_TRANSACTION_ACTIVE" = "1" ] || return 0
+
+  # Rollback is single-shot. The EXIT trap must never repeat successful
+  # inverse operations after a later inverse fails.
+  BUNDLE_TRANSACTION_ACTIVE=0
+  rollback_ok=1
+  if [ "$BUNDLE_INSTALLED_LPM" = "1" ]; then
+    if { [ ! -e "$BUNDLE_FINAL_LPM" ] && [ ! -L "$BUNDLE_FINAL_LPM" ]; } || \
+       rm -f "$BUNDLE_FINAL_LPM"; then
+      BUNDLE_INSTALLED_LPM=0
+    else
+      rollback_ok=0
+    fi
+  fi
+  if [ "$BUNDLE_INSTALLED_LPX" = "1" ]; then
+    if { [ ! -e "$BUNDLE_FINAL_LPX" ] && [ ! -L "$BUNDLE_FINAL_LPX" ]; } || \
+       rm -f "$BUNDLE_FINAL_LPX"; then
+      BUNDLE_INSTALLED_LPX=0
+    else
+      rollback_ok=0
+    fi
+  fi
+  if [ "$BUNDLE_INSTALLED_APP" = "1" ]; then
+    if [ ! -e "$BUNDLE_FINAL_APP" ] && [ ! -L "$BUNDLE_FINAL_APP" ]; then
+      BUNDLE_INSTALLED_APP=0
+    elif { [ -e "$BUNDLE_STAGED_APP" ] || [ -L "$BUNDLE_STAGED_APP" ]; }; then
+      rollback_ok=0
+    elif mv "$BUNDLE_FINAL_APP" "$BUNDLE_STAGED_APP"; then
+      BUNDLE_INSTALLED_APP=0
+    else
+      rollback_ok=0
+    fi
+  fi
+
+  if [ "$BUNDLE_MOVED_APP" = "1" ]; then
+    if { [ ! -e "$BUNDLE_PREVIOUS_APP" ] && [ ! -L "$BUNDLE_PREVIOUS_APP" ]; } || \
+       { [ -e "$BUNDLE_FINAL_APP" ] || [ -L "$BUNDLE_FINAL_APP" ]; }; then
+      rollback_ok=0
+    elif mv "$BUNDLE_PREVIOUS_APP" "$BUNDLE_FINAL_APP"; then
+      BUNDLE_MOVED_APP=0
+    else
+      rollback_ok=0
+    fi
+  fi
+  if [ "$BUNDLE_MOVED_LPM" = "1" ]; then
+    if { [ ! -e "$BUNDLE_PREVIOUS_LPM" ] && [ ! -L "$BUNDLE_PREVIOUS_LPM" ]; } || \
+       { [ -e "$BUNDLE_FINAL_LPM" ] || [ -L "$BUNDLE_FINAL_LPM" ]; }; then
+      rollback_ok=0
+    elif mv "$BUNDLE_PREVIOUS_LPM" "$BUNDLE_FINAL_LPM"; then
+      BUNDLE_MOVED_LPM=0
+    else
+      rollback_ok=0
+    fi
+  fi
+  if [ "$BUNDLE_MOVED_LPX" = "1" ]; then
+    if { [ ! -e "$BUNDLE_PREVIOUS_LPX" ] && [ ! -L "$BUNDLE_PREVIOUS_LPX" ]; } || \
+       { [ -e "$BUNDLE_FINAL_LPX" ] || [ -L "$BUNDLE_FINAL_LPX" ]; }; then
+      rollback_ok=0
+    elif mv "$BUNDLE_PREVIOUS_LPX" "$BUNDLE_FINAL_LPX"; then
+      BUNDLE_MOVED_LPX=0
+    else
+      rollback_ok=0
+    fi
+  fi
+
+  if [ "$rollback_ok" = "1" ]; then
+    return 0
+  fi
+
+  BUNDLE_ROLLBACK_INCOMPLETE=1
+  echo "ERROR: macOS installation rollback was incomplete." >&2
+  echo "Rollback data was retained at $BUNDLE_STAGE_ROOT" >&2
+  return 1
+}
+
+cleanup() {
+  rm -rf "$STAGE_DIR"
+  if [ -n "$BUNDLE_STAGE_ROOT" ] && [ "$BUNDLE_ROLLBACK_INCOMPLETE" != "1" ]; then
+    rm -rf "$BUNDLE_STAGE_ROOT"
+  fi
+}
+
+on_exit() {
+  exit_status=$?
+  trap - 0 HUP INT TERM
+  if [ "$BUNDLE_TRANSACTION_ACTIVE" = "1" ]; then
+    echo "ERROR: macOS installation was interrupted; restoring the previous installation." >&2
+    if ! rollback_macos_bundle_transaction; then exit_status=1; fi
+  fi
+  cleanup
+  exit "$exit_status"
+}
+
+interrupt_install_test_after() {
+  [ "${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" = "$1" ] || return 0
+  kill -TERM "$$"
+  exit 1
+}
+
+trap on_exit 0
+trap 'exit 1' HUP INT TERM
 MANIFEST_TMP="$STAGE_DIR/SHA256SUMS.txt"
 BUNDLE_TMP="$STAGE_DIR/SHA256SUMS.txt.sigstore"
-BIN_TMP="$STAGE_DIR/$PLATFORM"
 
 if [ "${LPM_INSTALL_INSECURE:-0}" = "1" ]; then
   echo "WARN: LPM_INSTALL_INSECURE=1 — skipping ALL integrity checks"
@@ -279,20 +455,52 @@ elif [ -n "$SHA_TOOL" ]; then
   curl -fsSL --max-time 30 "$BUNDLE_URL" -o "$BUNDLE_TMP" 2>/dev/null || rm -f "$BUNDLE_TMP"
 fi
 
-curl -fsSL --max-time 300 "$URL" -o "$BIN_TMP"
+RELEASE_ASSET="$PLATFORM"
+if [ "$MACOS_BUNDLE" = "1" ]; then
+  RELEASE_ASSET="$PLATFORM.zip"
+  if [ "${LPM_INSTALL_INSECURE:-0}" != "1" ] && [ -n "$SHA_TOOL" ]; then
+    if ! awk -v p="$RELEASE_ASSET" '$2 == p { found=1 } END { exit !found }' "$MANIFEST_TMP"; then
+      # Only the final pre-bundle release may use the historical raw asset.
+      if [ "$VERSION" = "v0.75.0" ] && \
+         awk -v p="$PLATFORM" '$2 == p { found=1 } END { exit !found }' "$MANIFEST_TMP"; then
+        RELEASE_ASSET="$PLATFORM"
+        LEGACY_MACOS=1
+      else
+        echo "ERROR: manifest does not enumerate the required $PLATFORM.zip bundle; cannot verify download."
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+URL="$BASE_URL/$RELEASE_ASSET"
+DOWNLOAD_TMP="$STAGE_DIR/$RELEASE_ASSET"
+if ! curl -fsSL --max-time 300 "$URL" -o "$DOWNLOAD_TMP"; then
+  if [ "$MACOS_BUNDLE" = "1" ] && \
+     [ "${LPM_INSTALL_INSECURE:-0}" = "1" ] && \
+     [ "$VERSION" = "v0.75.0" ]; then
+    RELEASE_ASSET="$PLATFORM"
+    LEGACY_MACOS=1
+    URL="$BASE_URL/$RELEASE_ASSET"
+    DOWNLOAD_TMP="$STAGE_DIR/$RELEASE_ASSET"
+    curl -fsSL --max-time 300 "$URL" -o "$DOWNLOAD_TMP"
+  else
+    exit 1
+  fi
+fi
 
 if [ "${LPM_INSTALL_INSECURE:-0}" = "1" ]; then
   : # already warned above
 elif [ -n "$SHA_TOOL" ]; then
-  ACTUAL_SHA=$($SHA_TOOL "$BIN_TMP" | awk '{print $1}')
-  EXPECTED_SHA=$(awk -v p="$PLATFORM" '$2 == p { print $1; exit }' "$MANIFEST_TMP")
+  ACTUAL_SHA=$($SHA_TOOL "$DOWNLOAD_TMP" | awk '{print $1}')
+  EXPECTED_SHA=$(awk -v p="$RELEASE_ASSET" '$2 == p { print $1; count++ } END { if (count != 1) exit 1 }' "$MANIFEST_TMP") || EXPECTED_SHA=""
   if [ -z "$EXPECTED_SHA" ]; then
-    echo "ERROR: manifest does not enumerate $PLATFORM; cannot verify download."
+    echo "ERROR: manifest must enumerate $RELEASE_ASSET exactly once; cannot verify download."
     echo "       This is a release-pipeline bug. Report at https://github.com/$REPO/issues"
     exit 1
   fi
   if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
-    echo "ERROR: SHA-256 mismatch for $PLATFORM"
+    echo "ERROR: SHA-256 mismatch for $RELEASE_ASSET"
     echo "  expected: $EXPECTED_SHA  (from signed manifest)"
     echo "  actual:   $ACTUAL_SHA"
     echo "Refusing to install — this is a strong tampering signal."
@@ -317,9 +525,225 @@ elif [ -n "$SHA_TOOL" ]; then
   fi
 fi
 
-mv "$BIN_TMP" "$INSTALL_DIR/$BINARY_NAME"
-chmod +x "$INSTALL_DIR/$BINARY_NAME"
-ln -sf "$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
+validate_macos_bundle() {
+  app_bundle="$1"
+  app_label="$2"
+  app_contents="$app_bundle/Contents"
+  app_executable="$app_contents/MacOS/lpm-rs"
+  app_profile="$app_contents/embedded.provisionprofile"
+  app_signature="$app_contents/_CodeSignature/CodeResources"
+  app_ticket="$app_contents/CodeResources"
+
+  for required_file in \
+    "$app_contents/Info.plist" \
+    "$app_ticket" \
+    "$app_executable" \
+    "$app_profile" \
+    "$app_signature"
+  do
+    if [ ! -f "$required_file" ] || [ -L "$required_file" ]; then
+      echo "ERROR: $app_label is missing a required regular file: $required_file"
+      return 1
+    fi
+  done
+
+  unexpected_entries=$(
+    cd "$app_bundle" &&
+      find . -print | grep -Ev '^(\.|\./Contents|\./Contents/Info\.plist|\./Contents/CodeResources|\./Contents/embedded\.provisionprofile|\./Contents/MacOS|\./Contents/MacOS/lpm-rs|\./Contents/_CodeSignature|\./Contents/_CodeSignature/CodeResources)$' || true
+  )
+  if [ -n "$unexpected_entries" ]; then
+    echo "ERROR: $app_label contains unexpected entries:"
+    printf '%s\n' "$unexpected_entries"
+    return 1
+  fi
+  if find "$app_bundle" -type l -print | grep -q .; then
+    echo "ERROR: $app_label contains a symbolic link."
+    return 1
+  fi
+  if find "$app_bundle" ! -type d ! -type f -print | grep -q .; then
+    echo "ERROR: $app_label contains an unsupported file type."
+    return 1
+  fi
+
+  if ! "$MACOS_CODESIGN_TOOL" --verify --strict --verbose=4 "$app_bundle"; then
+    echo "ERROR: $app_label failed code-signature validation."
+    return 1
+  fi
+  signature_details=$("$MACOS_CODESIGN_TOOL" -dvv "$app_bundle" 2>&1) || return 1
+  signed_team=$(printf '%s\n' "$signature_details" | awk -F= '/^TeamIdentifier=/{print $2}')
+  signed_identifier=$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2}')
+  if [ "$signed_team" != "$EXPECTED_TEAM_ID" ] || [ "$signed_identifier" != "$EXPECTED_BUNDLE_ID" ]; then
+    echo "ERROR: $app_label has an unexpected signing identity."
+    return 1
+  fi
+
+  signed_entitlements="$STAGE_DIR/signed-entitlements.plist"
+  if ! "$MACOS_CODESIGN_TOOL" -d --entitlements :- "$app_bundle" > "$signed_entitlements" 2>/dev/null; then
+    echo "ERROR: $app_label has no readable signed entitlements."
+    return 1
+  fi
+  signed_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups' "$signed_entitlements" 2>/dev/null) || return 1
+  if ! plist_array_contains_exact "$signed_access_groups" "$EXPECTED_ACCESS_GROUP"; then
+    echo "ERROR: $app_label does not have the LPM Vault shared Keychain access group."
+    return 1
+  fi
+
+  profile_plist="$STAGE_DIR/profile.plist"
+  if ! "$MACOS_SECURITY_TOOL" cms -D -i "$app_profile" > "$profile_plist"; then
+    echo "ERROR: $app_label has an unreadable provisioning profile."
+    return 1
+  fi
+  profile_team=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist" 2>/dev/null) || return 1
+  profile_application=$(
+    /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null ||
+      /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist" 2>/dev/null
+  ) || return 1
+  profile_access_groups=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:keychain-access-groups' "$profile_plist" 2>/dev/null) || return 1
+  if [ "$profile_team" != "$EXPECTED_TEAM_ID" ] || \
+     [ "$profile_application" != "$EXPECTED_TEAM_ID.$EXPECTED_BUNDLE_ID" ] || \
+     { ! plist_array_contains_exact "$profile_access_groups" "$EXPECTED_ACCESS_GROUP" && \
+       ! plist_array_contains_exact "$profile_access_groups" "$EXPECTED_PROFILE_ACCESS_GROUP"; }; then
+    echo "ERROR: $app_label provisioning profile does not authorize the shared Keychain contract."
+    return 1
+  fi
+
+  if ! "$MACOS_XCRUN_TOOL" stapler validate "$app_bundle"; then
+    echo "ERROR: $app_label does not contain a valid notarization ticket."
+    return 1
+  fi
+  if ! "$MACOS_SPCTL_TOOL" --assess --type execute --verbose=4 "$app_bundle"; then
+    echo "ERROR: Gatekeeper rejected $app_label."
+    return 1
+  fi
+}
+
+install_macos_bundle() {
+  archive="$1"
+  archive_entries=$("$MACOS_UNZIP_TOOL" -Z1 "$archive") || {
+    echo "ERROR: cannot read the macOS app archive."
+    return 1
+  }
+  if [ -z "$archive_entries" ] || \
+     printf '%s\n' "$archive_entries" | grep -Eq '(^/|(^|/)\.\.(/|$)|\\|[[:cntrl:]])'; then
+    echo "ERROR: macOS app archive contains an unsafe path."
+    return 1
+  fi
+  if printf '%s\n' "$archive_entries" | grep -Ev '^LPM CLI\.app(/|$)' >/dev/null; then
+    echo "ERROR: macOS app archive must contain only $EXPECTED_APP_NAME."
+    return 1
+  fi
+
+  extracted_root="$STAGE_DIR/extracted"
+  mkdir "$extracted_root"
+  "$MACOS_DITTO_TOOL" -x -k "$archive" "$extracted_root"
+  extracted_app="$extracted_root/$EXPECTED_APP_NAME"
+  validate_macos_bundle "$extracted_app" "downloaded $EXPECTED_APP_NAME"
+
+  mkdir -p "$LIBEXEC_DIR"
+  BUNDLE_STAGE_ROOT=$(mktemp -d "$LIBEXEC_DIR/.lpm-install.XXXXXX")
+  BUNDLE_STAGED_APP="$BUNDLE_STAGE_ROOT/$EXPECTED_APP_NAME"
+  BUNDLE_PREVIOUS_APP="$BUNDLE_STAGE_ROOT/previous-$EXPECTED_APP_NAME"
+  BUNDLE_PREVIOUS_LPM="$BUNDLE_STAGE_ROOT/previous-lpm"
+  BUNDLE_PREVIOUS_LPX="$BUNDLE_STAGE_ROOT/previous-lpx"
+  BUNDLE_FINAL_APP="$LIBEXEC_DIR/$EXPECTED_APP_NAME"
+  link_target="../libexec/$EXPECTED_APP_NAME/Contents/MacOS/lpm-rs"
+  new_lpm="$BUNDLE_STAGE_ROOT/new-lpm"
+  new_lpx="$BUNDLE_STAGE_ROOT/new-lpx"
+
+  "$MACOS_DITTO_TOOL" "$extracted_app" "$BUNDLE_STAGED_APP"
+  validate_macos_bundle "$BUNDLE_STAGED_APP" "staged $EXPECTED_APP_NAME"
+  ln -s "$link_target" "$new_lpm"
+  ln -s "$link_target" "$new_lpx"
+
+  if [ -d "$INSTALL_DIR/$BINARY_NAME" ] && [ ! -L "$INSTALL_DIR/$BINARY_NAME" ]; then
+    echo "ERROR: $INSTALL_DIR/$BINARY_NAME is a directory; refusing to replace it."
+    return 1
+  fi
+  if [ -d "$INSTALL_DIR/$ALIAS_NAME" ] && [ ! -L "$INSTALL_DIR/$ALIAS_NAME" ]; then
+    echo "ERROR: $INSTALL_DIR/$ALIAS_NAME is a directory; refusing to replace it."
+    return 1
+  fi
+
+  BUNDLE_MOVED_APP=0
+  BUNDLE_MOVED_LPM=0
+  BUNDLE_MOVED_LPX=0
+  BUNDLE_INSTALLED_APP=0
+  BUNDLE_INSTALLED_LPM=0
+  BUNDLE_INSTALLED_LPX=0
+  install_ok=1
+  BUNDLE_TRANSACTION_ACTIVE=1
+
+  if [ -e "$BUNDLE_FINAL_APP" ] || [ -L "$BUNDLE_FINAL_APP" ]; then
+    BUNDLE_MOVED_APP=1
+    if mv "$BUNDLE_FINAL_APP" "$BUNDLE_PREVIOUS_APP"; then
+      interrupt_install_test_after moved-app
+    else
+      BUNDLE_MOVED_APP=0
+      install_ok=0
+    fi
+  fi
+  if [ "$install_ok" = "1" ] && { [ -e "$INSTALL_DIR/$BINARY_NAME" ] || [ -L "$INSTALL_DIR/$BINARY_NAME" ]; }; then
+    BUNDLE_MOVED_LPM=1
+    if mv "$BUNDLE_FINAL_LPM" "$BUNDLE_PREVIOUS_LPM"; then
+      interrupt_install_test_after moved-lpm
+    else
+      BUNDLE_MOVED_LPM=0
+      install_ok=0
+    fi
+  fi
+  if [ "$install_ok" = "1" ] && { [ -e "$INSTALL_DIR/$ALIAS_NAME" ] || [ -L "$INSTALL_DIR/$ALIAS_NAME" ]; }; then
+    BUNDLE_MOVED_LPX=1
+    if mv "$BUNDLE_FINAL_LPX" "$BUNDLE_PREVIOUS_LPX"; then
+      interrupt_install_test_after moved-lpx
+    else
+      BUNDLE_MOVED_LPX=0
+      install_ok=0
+    fi
+  fi
+  if [ "$install_ok" = "1" ]; then
+    BUNDLE_INSTALLED_APP=1
+    if mv "$BUNDLE_STAGED_APP" "$BUNDLE_FINAL_APP"; then
+      interrupt_install_test_after installed-app
+    else
+      BUNDLE_INSTALLED_APP=0
+      install_ok=0
+    fi
+  fi
+  if [ "$install_ok" = "1" ]; then
+    BUNDLE_INSTALLED_LPM=1
+    if mv "$new_lpm" "$BUNDLE_FINAL_LPM"; then
+      interrupt_install_test_after installed-lpm
+    else
+      BUNDLE_INSTALLED_LPM=0
+      install_ok=0
+    fi
+  fi
+  if [ "$install_ok" = "1" ]; then
+    BUNDLE_INSTALLED_LPX=1
+    if mv "$new_lpx" "$BUNDLE_FINAL_LPX"; then
+      interrupt_install_test_after installed-lpx
+    else
+      BUNDLE_INSTALLED_LPX=0
+      install_ok=0
+    fi
+  fi
+  if [ "$install_ok" = "1" ]; then
+    BUNDLE_TRANSACTION_ACTIVE=0
+    return 0
+  fi
+
+  echo "ERROR: macOS installation failed; restoring the previous installation."
+  rollback_macos_bundle_transaction || true
+  return 1
+}
+
+if [ "$MACOS_BUNDLE" = "1" ] && [ "$LEGACY_MACOS" != "1" ]; then
+  install_macos_bundle "$DOWNLOAD_TMP"
+else
+  mv "$DOWNLOAD_TMP" "$INSTALL_DIR/$BINARY_NAME"
+  chmod +x "$INSTALL_DIR/$BINARY_NAME"
+  ln -sf "$BINARY_NAME" "$INSTALL_DIR/$ALIAS_NAME"
+fi
 
 echo "Installed to $INSTALL_DIR/$BINARY_NAME"
 echo "Alias installed to $INSTALL_DIR/$ALIAS_NAME"
