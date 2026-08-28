@@ -1,6 +1,6 @@
 {
   "name": "@lpm-registry/cli-darwin-arm64",
-  "version": "0.76.3",
+  "version": "0.76.4",
   "description": "LPM CLI native binary for macOS ARM64 (Apple Silicon)",
   "repository": {
     "type": "git",
