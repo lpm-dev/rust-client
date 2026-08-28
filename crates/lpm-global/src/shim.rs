@@ -58,6 +58,8 @@ pub enum ShimError {
         attempts: u32,
         source: io::Error,
     },
+    #[error("invalid shim artifact at {path:?}: {reason}")]
+    InvalidArtifact { path: PathBuf, reason: String },
 }
 
 impl From<ShimError> for LpmError {
@@ -279,6 +281,51 @@ pub fn artifacts_complete(bin_dir: &Path, command_name: &str) -> bool {
         .all(|p| p.exists())
 }
 
+const WINDOWS_SHIM_CONTENT_CAP_BYTES: u64 = 64 * 1024;
+
+/// Verify the complete Windows shim triple against the canonical templates.
+///
+/// The check is compiled on every platform so the script formats can be
+/// regression-tested without a Windows host. Each artifact must be a bounded,
+/// regular, non-reparse file whose bytes exactly match the expected target.
+pub fn verify_windows_shim_triple(
+    bin_dir: &Path,
+    command_name: &str,
+    target: &Path,
+) -> Result<(), ShimError> {
+    validate_command_name(command_name)?;
+    let target = target.to_string_lossy();
+    validate_windows_target_path(&target)?;
+    let expected = [
+        (
+            bin_dir.join(format!("{command_name}.cmd")),
+            cmd_template(&target),
+        ),
+        (
+            bin_dir.join(format!("{command_name}.ps1")),
+            ps1_template(&target),
+        ),
+        (bin_dir.join(command_name), bash_template(&target)),
+    ];
+
+    for (path, expected_content) in expected {
+        let actual =
+            lpm_common::read_text_file_capped_nofollow(&path, WINDOWS_SHIM_CONTENT_CAP_BYTES)
+                .map_err(|error| ShimError::InvalidArtifact {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                })?;
+        if actual != expected_content {
+            return Err(ShimError::InvalidArtifact {
+                path,
+                reason: "content does not match the expected target".to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 // ─── Unix internals ───────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -288,7 +335,6 @@ fn atomic_replace_symlink_unix(link_path: &Path, target: &Path) -> Result<(), Sh
 
 // ─── Windows internals ────────────────────────────────────────────────
 
-#[cfg(windows)]
 fn cmd_template(target: &str) -> String {
     // Mirrors lpm-linker's existing .cmd template at lib.rs:1080-1085 so
     // global shims behave the same as project node_modules/.bin shims:
@@ -298,7 +344,6 @@ fn cmd_template(target: &str) -> String {
     )
 }
 
-#[cfg(windows)]
 fn ps1_template(target: &str) -> String {
     // PowerShell mirror of the .cmd template. `$env:PATH` covers the
     // PATH-fallback branch since PowerShell's `&` operator resolves
@@ -312,7 +357,6 @@ fn ps1_template(target: &str) -> String {
     )
 }
 
-#[cfg(windows)]
 fn bash_template(target: &str) -> String {
     // Mirrors npm's no-extension bash shim. Path-fallback model matches
     // the .cmd/.ps1 templates so all three artifacts behave the same.
@@ -371,6 +415,81 @@ mod tests {
             command_name: name.to_string(),
             target: PathBuf::from(target),
         }
+    }
+
+    fn write_windows_triple(bin_dir: &Path, name: &str, target: &str) {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        std::fs::write(bin_dir.join(format!("{name}.cmd")), cmd_template(target)).unwrap();
+        std::fs::write(bin_dir.join(format!("{name}.ps1")), ps1_template(target)).unwrap();
+        std::fs::write(bin_dir.join(name), bash_template(target)).unwrap();
+    }
+
+    #[test]
+    fn windows_shim_verifier_accepts_the_canonical_triple() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = Path::new(r"C:\lpm\global\pkg\node_modules\.bin\tool");
+        write_windows_triple(dir.path(), "tool", &target.to_string_lossy());
+
+        assert!(verify_windows_shim_triple(dir.path(), "tool", target).is_ok());
+    }
+
+    #[test]
+    fn windows_shim_verifier_rejects_an_altered_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = Path::new(r"C:\lpm\global\pkg\node_modules\.bin\tool");
+        write_windows_triple(dir.path(), "tool", &target.to_string_lossy());
+        std::fs::write(dir.path().join("tool.cmd"), "@echo hijacked\n").unwrap();
+
+        let error = verify_windows_shim_triple(dir.path(), "tool", target).unwrap_err();
+        assert!(error.to_string().contains("content does not match"));
+    }
+
+    #[test]
+    fn windows_shim_verifier_rejects_a_wrong_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = r"C:\lpm\global\old\node_modules\.bin\tool";
+        let expected = Path::new(r"C:\lpm\global\new\node_modules\.bin\tool");
+        write_windows_triple(dir.path(), "tool", stale);
+
+        let error = verify_windows_shim_triple(dir.path(), "tool", expected).unwrap_err();
+        assert!(error.to_string().contains("content does not match"));
+    }
+
+    #[test]
+    fn windows_shim_verifier_rejects_a_missing_triple_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = Path::new(r"C:\lpm\global\pkg\node_modules\.bin\tool");
+        write_windows_triple(dir.path(), "tool", &target.to_string_lossy());
+        std::fs::remove_file(dir.path().join("tool.ps1")).unwrap();
+
+        let error = verify_windows_shim_triple(dir.path(), "tool", target).unwrap_err();
+        assert!(error.to_string().contains("was not found"));
+    }
+
+    #[test]
+    fn windows_shim_verifier_rejects_a_directory_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = Path::new(r"C:\lpm\global\pkg\node_modules\.bin\tool");
+        write_windows_triple(dir.path(), "tool", &target.to_string_lossy());
+        std::fs::remove_file(dir.path().join("tool.cmd")).unwrap();
+        std::fs::create_dir(dir.path().join("tool.cmd")).unwrap();
+
+        let error = verify_windows_shim_triple(dir.path(), "tool", target).unwrap_err();
+        assert!(error.to_string().contains("not a safe regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_shim_verifier_does_not_follow_a_linked_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = Path::new(r"C:\lpm\global\pkg\node_modules\.bin\tool");
+        write_windows_triple(dir.path(), "tool", &target.to_string_lossy());
+        let external = dir.path().join("external.cmd");
+        std::fs::write(&external, cmd_template(&target.to_string_lossy())).unwrap();
+        std::fs::remove_file(dir.path().join("tool.cmd")).unwrap();
+        std::os::unix::fs::symlink(&external, dir.path().join("tool.cmd")).unwrap();
+
+        assert!(verify_windows_shim_triple(dir.path(), "tool", target).is_err());
     }
 
     // ─── Validation tests ───────────────────────────────────────────

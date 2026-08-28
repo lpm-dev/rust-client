@@ -737,6 +737,11 @@ impl BinaryLockfileReader {
         Ok(Some(Self { mmap }))
     }
 
+    #[inline]
+    pub fn matches_bytes(&self, expected: &[u8]) -> bool {
+        self.mmap.as_ref() == expected
+    }
+
     fn pkg_count(&self) -> u32 {
         read_u32_le(&self.mmap, 8)
     }

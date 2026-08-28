@@ -159,7 +159,13 @@ pub(crate) async fn run(
 pub(crate) fn load_policy_extension_configs_checked() -> Result<Vec<PolicyExtensionConfig>, LpmError>
 {
     let global = GlobalConfig::load_checked()?;
-    load_policy_extension_configs(&global)
+    load_policy_extension_configs_from_global(&global)
+}
+
+pub(crate) fn load_policy_extension_configs_from_global(
+    global: &GlobalConfig,
+) -> Result<Vec<PolicyExtensionConfig>, LpmError> {
+    load_policy_extension_configs(global)
 }
 
 pub(crate) fn inspect_policy_extensions(configs: &[PolicyExtensionConfig]) -> PolicyInspection {

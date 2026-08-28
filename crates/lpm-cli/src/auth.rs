@@ -16,13 +16,13 @@ pub use lpm_auth::{
     clear_custom_registry_token, clear_github_token, clear_gitlab_token, clear_login_state_async,
     clear_npm_token, clear_rejected_legacy_session_if_current, clear_token_expiry,
     clear_token_expiry_checked, get_custom_registry_token, get_github_token,
-    get_gitlab_token_for_host, get_token, has_refresh_token_checked,
-    has_stored_access_token_checked, is_otp_required, list_registry_auth_statuses,
-    resolve_github_credential, resolve_github_environment_credential,
-    resolve_gitlab_credential_for_host, resolve_gitlab_environment_credential,
-    set_custom_registry_token_with_backend, set_github_token_with_backend,
-    set_gitlab_token_with_backend, set_npm_token_with_backend, set_otp_required, set_token_expiry,
-    set_token_with_backend, store_refresh_backed_session, try_get_npm_token,
+    get_gitlab_token_for_host, has_refresh_token_checked, has_stored_access_token_checked,
+    is_otp_required, list_registry_auth_statuses, resolve_github_credential,
+    resolve_github_environment_credential, resolve_gitlab_credential_for_host,
+    resolve_gitlab_environment_credential, set_custom_registry_token_with_backend,
+    set_github_token_with_backend, set_gitlab_token_with_backend, set_npm_token_with_backend,
+    set_otp_required, set_token_expiry, set_token_with_backend, store_refresh_backed_session,
+    try_get_npm_token,
 };
 
 #[cfg(test)]

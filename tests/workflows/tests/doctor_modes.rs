@@ -23,6 +23,9 @@
 mod support;
 
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::time::{Duration, Instant};
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm_with_registry};
 
@@ -43,6 +46,7 @@ const EXTENDED_SENTINEL_CODES: &[&str] = &[
     "gitattributes_lockb_unmarked",
     "gitattributes_missing",
     "v2_store_orphans",
+    "store_orphan_analysis_unavailable",
     "lint_clean",
     "lint_warnings",
     "fmt_clean",
@@ -81,6 +85,25 @@ fn emitted_codes(stdout: &[u8]) -> HashSet<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn assert_doctor_preserves_torn_global_wal(arguments: &[&str]) {
+    let project = TempProject::empty(r#"{"name":"doctor-wal","version":"1.0.0"}"#);
+    let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
+    std::fs::create_dir_all(root.global_root()).unwrap();
+    let original = b"torn-global-transaction";
+    std::fs::write(root.global_wal(), original).unwrap();
+
+    let _ = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(arguments)
+        .output()
+        .expect("failed to run lpm doctor");
+
+    assert_eq!(
+        std::fs::read(root.global_wal()).unwrap(),
+        original,
+        "diagnostic commands must not truncate or recover the global WAL"
+    );
 }
 
 // ─── Default mode: no Extended codes, no network ───────────────────
@@ -123,6 +146,21 @@ fn doctor_default_emits_only_fast_tier_codes() {
 }
 
 #[test]
+fn doctor_list_does_not_recover_or_mutate_the_global_wal() {
+    assert_doctor_preserves_torn_global_wal(&["--json", "doctor", "list"]);
+}
+
+#[test]
+fn doctor_default_does_not_recover_or_mutate_the_global_wal() {
+    assert_doctor_preserves_torn_global_wal(&["--json", "doctor"]);
+}
+
+#[test]
+fn doctor_all_does_not_recover_or_mutate_the_global_wal() {
+    assert_doctor_preserves_torn_global_wal(&["--json", "doctor", "--all"]);
+}
+
+#[test]
 fn doctor_default_envelope_has_mode_fast() {
     let project = TempProject::empty(r#"{"name": "fast-mode", "version": "1.0.0"}"#);
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
@@ -135,6 +173,185 @@ fn doctor_default_envelope_has_mode_fast() {
         json["mode"].as_str(),
         Some("fast"),
         "default `lpm doctor --json` must carry `mode: \"fast\"`. Envelope: {json}"
+    );
+}
+
+#[test]
+fn doctor_reports_an_invalid_package_manifest_without_aborting_json_output() {
+    let project = TempProject::empty("{not-json");
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+
+    let json = parse_json_output(&output.stdout);
+    assert!(
+        json["checks"].as_array().is_some_and(|checks| checks
+            .iter()
+            .any(|check| check["code"] == "package_json_invalid")),
+        "doctor must preserve its JSON report and identify the invalid manifest: {json:#}"
+    );
+}
+
+#[test]
+fn doctor_reports_an_invalid_pnpm_workspace_manifest_without_aborting() {
+    let project = TempProject::empty(r#"{"name":"workspace-yaml","version":"1.0.0"}"#);
+    project.write_file("pnpm-workspace.yaml", "packages: [\n");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+    let json = parse_json_output(&output.stdout);
+
+    assert!(
+        json["checks"].as_array().is_some_and(|checks| checks
+            .iter()
+            .any(|check| check["code"] == "workspace_discovery_failed")),
+        "doctor must preserve its report and identify the invalid workspace manifest: {json:#}"
+    );
+}
+
+#[test]
+fn doctor_reports_an_invalid_workspace_member_manifest_without_aborting() {
+    let project = TempProject::empty(
+        r#"{"name":"workspace-member","version":"1.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file("packages/app/package.json", "{not-json");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+    let json = parse_json_output(&output.stdout);
+
+    assert!(
+        json["checks"].as_array().is_some_and(|checks| checks
+            .iter()
+            .any(|check| check["code"] == "workspace_discovery_failed")),
+        "doctor must preserve its report and identify the invalid member manifest: {json:#}"
+    );
+}
+
+#[test]
+fn doctor_reports_a_store_path_that_is_a_regular_file_as_inaccessible() {
+    let project = TempProject::empty(r#"{"name":"store-file","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    std::fs::write(project.home().join(".lpm/store"), b"not a directory").unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+    let codes = emitted_codes(&output.stdout);
+
+    assert!(codes.contains("global_store_inaccessible"), "{codes:?}");
+    assert!(!codes.contains("global_store_accessible"), "{codes:?}");
+}
+
+#[test]
+fn doctor_list_combined_filters_do_not_call_a_valid_code_unknown() {
+    let project = TempProject::empty(r#"{"name":"catalog","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args([
+            "doctor",
+            "list",
+            "--code",
+            "registry_reachable",
+            "--category",
+            "runtime",
+            "--json",
+        ])
+        .output()
+        .expect("failed to run filtered lpm doctor list");
+
+    let json = parse_json_output(&output.stdout);
+    assert!(output.status.success(), "{json:#}");
+    assert_eq!(json["count"], 0, "{json:#}");
+    assert_eq!(json["entries"], serde_json::json!([]), "{json:#}");
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_default_does_not_execute_project_local_node_shim() {
+    let project = TempProject::empty(r#"{"name":"untrusted-node","version":"1.0.0"}"#);
+    let shim = project.path().join("node_modules/.bin/node");
+    let marker = project.path().join("node-shim-executed");
+    project.write_file(
+        "node_modules/.bin/node",
+        "#!/bin/sh\ntouch \"$DOCTOR_RUNTIME_MARKER\"\nprintf 'v99.0.0\\n'\n",
+    );
+    let mut permissions = std::fs::metadata(&shim)
+        .expect("read project-local node shim metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).expect("make project-local node shim executable");
+
+    let _ = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("DOCTOR_RUNTIME_MARKER", &marker)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+
+    assert!(
+        !marker.exists(),
+        "doctor must not execute a project-controlled node_modules/.bin/node shim"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_default_does_not_execute_project_local_bun_shim() {
+    let project = TempProject::empty(r#"{"name":"untrusted-bun","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"runtime":{"bun":"1.3.0"}}"#);
+    let shim = project.path().join("node_modules/.bin/bun");
+    let marker = project.path().join("bun-shim-executed");
+    project.write_file(
+        "node_modules/.bin/bun",
+        "#!/bin/sh\ntouch \"$DOCTOR_RUNTIME_MARKER\"\nprintf '1.3.0\\n'\n",
+    );
+    let mut permissions = std::fs::metadata(&shim)
+        .expect("read project-local bun shim metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).expect("make project-local bun shim executable");
+
+    let _ = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("DOCTOR_RUNTIME_MARKER", &marker)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+
+    assert!(
+        !marker.exists(),
+        "doctor must not execute a project-controlled node_modules/.bin/bun shim"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_runtime_probe_times_out_and_reaps_a_hanging_node() {
+    let project = TempProject::empty(r#"{"name":"hanging-node","version":"1.0.0"}"#);
+    let runtime_dir = project.home().join("trusted-runtime-bin");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let node = runtime_dir.join("node");
+    std::fs::write(&node, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    let mut permissions = std::fs::metadata(&node).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&node, permissions).unwrap();
+
+    let started = Instant::now();
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("PATH", &runtime_dir)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --json");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(12),
+        "runtime probe exceeded its deadline: {:?}\n{}",
+        started.elapsed(),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -192,6 +409,113 @@ fn doctor_all_envelope_has_mode_all() {
         json["mode"].as_str(),
         Some("all"),
         "`lpm doctor --all --json` must carry `mode: \"all\"`. Envelope: {json}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_all_output_redacts_registry_credentials() {
+    let project = TempProject::empty(r#"{"name":"redacted-registry","version":"1.0.0"}"#);
+    let mock = support::mock_registry::MockRegistry::start().await;
+    mock.with_health().await;
+    let registry_url = mock.url().replacen("://", "://audit-user:audit-secret@", 1);
+
+    for arguments in [vec!["doctor", "--all"], vec!["doctor", "--all", "--json"]] {
+        let output = lpm_with_registry(&project, &registry_url)
+            .args(arguments)
+            .output()
+            .expect("failed to run lpm doctor --all");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !combined.contains("audit-user") && !combined.contains("audit-secret"),
+            "doctor must not expose registry URL credentials: {combined}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn doctor_all_validates_an_lpm_token_environment_credential() {
+    let project = TempProject::empty(r#"{"name":"env-auth","version":"1.0.0"}"#);
+    let mock = support::mock_registry::MockRegistry::start().await;
+    mock.with_health().await;
+    mock.with_authenticated_whoami("doctor-token", "doctor", "doctor@example.test")
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "doctor-token")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .expect("failed to run authenticated lpm doctor --all");
+    let codes = emitted_codes(&output.stdout);
+
+    assert!(codes.contains("auth_valid"), "{codes:?}");
+    assert!(!codes.contains("auth_missing"), "{codes:?}");
+}
+
+#[tokio::test]
+async fn doctor_all_does_not_call_a_token_invalid_when_whoami_returns_500() {
+    let project = TempProject::empty(r#"{"name":"auth-outage","version":"1.0.0"}"#);
+    let mock = support::mock_registry::MockRegistry::start().await;
+    mock.with_health().await;
+    mock.with_authenticated_whoami_error("doctor-token", 500, 4)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "doctor-token")
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "1")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .expect("failed to run lpm doctor --all");
+    let codes = emitted_codes(&output.stdout);
+
+    assert!(codes.contains("auth_unverified"), "{codes:?}");
+    assert!(!codes.contains("auth_invalid"), "{codes:?}");
+}
+
+#[tokio::test]
+async fn doctor_all_skips_authenticated_tunnel_lookup_after_token_rejection() {
+    let project = TempProject::empty(r#"{"name":"auth-tunnel","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tunnel":{"domain":"doctor-auth.lpm.fyi"}}"#);
+    let mock = support::mock_registry::MockRegistry::start().await;
+    mock.with_health().await;
+    mock.with_authenticated_whoami_error("rejected-token", 401, 1)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "rejected-token")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .expect("failed to run doctor with a rejected token");
+    let codes = emitted_codes(&output.stdout);
+
+    assert!(codes.contains("auth_invalid"), "{codes:?}");
+    assert!(
+        codes.contains("tunnel_unauthenticated"),
+        "a rejected token must not enable authenticated tunnel checks: {codes:?}"
+    );
+    assert!(!codes.contains("tunnel_unverified"), "{codes:?}");
+}
+
+#[test]
+fn doctor_all_does_not_claim_no_orphans_without_a_known_projects_registry() {
+    let project = TempProject::empty(r#"{"name":"unknown-orphans","version":"1.0.0"}"#);
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .expect("failed to run doctor without known-projects state");
+    let json = parse_json_output(&output.stdout);
+    let orphan = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["code"] == "v2_store_orphans");
+
+    assert!(
+        orphan.is_none_or(|check| check["detail"] != "no orphans"),
+        "doctor must not report a healthy orphan analysis without registry roots: {json:#}"
     );
 }
 

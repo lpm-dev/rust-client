@@ -700,4 +700,29 @@ impl RegistryClient {
         self.execute_with_recovery(AuthPosture::SessionRequired, || self.get_json(&url))
             .await
     }
+
+    /// Issue one authenticated tunnel ownership lookup without install-grade retries.
+    /// Diagnostic callers apply the whole-operation deadline.
+    pub async fn diagnostic_tunnel_domain_lookup_once(
+        &self,
+        domain: &str,
+    ) -> Result<serde_json::Value, LpmError> {
+        let url = format!(
+            "{}/api/tunnel/domains/{}",
+            self.base_url,
+            urlencoding::encode(domain)
+        );
+        let request = self
+            .build_get_with_posture(&url, AuthPosture::SessionRequired)
+            .await?;
+        let response = self.send_once_preserving_status(request).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LpmError::Http {
+                status: status.as_u16(),
+                message: "tunnel diagnostic lookup failed".into(),
+            });
+        }
+        parse_capped_api_json(response, "tunnel diagnostic lookup response").await
+    }
 }

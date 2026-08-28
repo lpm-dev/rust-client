@@ -367,7 +367,7 @@ fn doctor_without_fix_does_not_create_gitattributes_or_lockb() {
 // ─── --fix JSON envelope surfaces fixes_applied ──────────────────────
 
 #[test]
-fn doctor_fix_json_envelope_carries_fixes_applied_array() {
+fn doctor_fix_json_envelope_carries_fix_outcome_arrays() {
     let project = TempProject::empty(r#"{"name":"doctor-json","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
@@ -388,12 +388,58 @@ fn doctor_fix_json_envelope_carries_fixes_applied_array() {
     let fixes = envelope["fixes_applied"]
         .as_array()
         .expect("fixes_applied must be an array even when no fixes ran");
+    let failures = envelope["fixes_failed"]
+        .as_array()
+        .expect("fixes_failed must be an array even when no fixes fail");
 
     // Sanity: at least one fix should have run (gitattributes,
     // lpm.lockb, or both, depending on doctor's check order).
     assert!(
         !fixes.is_empty(),
         "doctor --fix --json on the seeded project must report at least one fix, got: {envelope}",
+    );
+    assert!(
+        failures.is_empty(),
+        "all fixture fixes must succeed: {envelope}"
+    );
+    assert!(
+        envelope["checks"].as_array().is_some_and(|checks| checks
+            .iter()
+            .all(|check| check["code"] != "lockfile_binary_missing")),
+        "the final report must not retain the repaired lockfile finding: {envelope:#}"
+    );
+}
+
+#[test]
+fn doctor_fix_json_reports_a_failed_action_and_exits_nonzero() {
+    let project = TempProject::empty(r#"{"name":"doctor-lockb-failure","version":"1.0.0"}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+    std::fs::create_dir(project.path().join("lpm.lockb"))
+        .expect("failed to create lpm.lockb directory fixture");
+
+    let output = lpm_doctor_offline(&project)
+        .args(["--json", "doctor", "--fix", "--yes"])
+        .output()
+        .expect("failed to run lpm doctor --fix --json");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("doctor must emit one JSON document: {error}\n{stdout}"));
+
+    assert!(
+        !output.status.success(),
+        "a failed fix must make doctor fail"
+    );
+    assert!(
+        envelope["fixes_failed"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["action"] == "reconcile lpm.lockb"
+                    && failure["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("write lockfiles failed"))
+            })
+        }),
+        "the failed action and error must be machine-readable: {envelope:#}"
     );
 }
 
@@ -474,13 +520,10 @@ async fn doctor_fix_installs_the_pinned_bun_runtime_from_verified_release_metada
         .unwrap_or_else(|error| panic!("doctor must emit JSON: {error}\nstdout={stdout}"));
 
     assert!(
-        envelope["checks"]
-            .as_array()
-            .is_some_and(|checks| checks.iter().any(|check| matches!(
-                check["code"].as_str(),
-                Some("bun_missing_pinned" | "bun_pinned_unmet")
-            ))),
-        "fixture must emit a pinned Bun runtime mismatch: {envelope:#}"
+        envelope["checks"].as_array().is_some_and(|checks| checks
+            .iter()
+            .any(|check| check["code"] == "bun_managed_match")),
+        "the final report must reflect the installed Bun runtime: {envelope:#}"
     );
     assert!(
         envelope["fixes_applied"]
@@ -495,13 +538,13 @@ async fn doctor_fix_installs_the_pinned_bun_runtime_from_verified_release_metada
 }
 
 #[tokio::test]
-async fn doctor_all_fix_routes_plugin_updates_through_the_managed_updater() {
+async fn doctor_all_compares_the_current_platform_plugin_with_upstream() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/repos/biomejs/biome/releases"))
         .and(query_param("per_page", "20"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            { "tag_name": "@biomejs/biome@2.5.9" }
+            { "tag_name": "@biomejs/biome@2.5.10" }
         ])))
         .expect(1)
         .mount(&server)
@@ -514,37 +557,29 @@ async fn doctor_all_fix_routes_plugin_updates_through_the_managed_updater() {
     let cache_path = plugin_version_cache(&project);
     std::fs::create_dir_all(cache_path.parent().expect("plugin cache directory"))
         .expect("create plugin cache directory");
-    std::fs::write(&cache_path, r#"{"versions":{"biome":"2.5.10"}}"#)
-        .expect("seed newer approved plugin version");
+    std::fs::write(&cache_path, r#"{"versions":{"biome":"9.9.9"}}"#)
+        .expect("seed an approved cache value that must not stand in for upstream");
 
     let output = lpm_doctor_offline(&project)
         .env("LPM_PLUGIN_GITHUB_API_BASE", server.uri())
-        .args(["--json", "doctor", "--all", "--fix", "--yes"])
+        .args(["--json", "doctor", "--all"])
         .output()
-        .expect("run doctor plugin auto-fix");
+        .expect("run doctor plugin update check");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|error| panic!("doctor must emit JSON: {error}\nstdout={stdout}"));
 
     assert!(
-        envelope["checks"].as_array().is_some_and(|checks| checks
-            .iter()
-            .any(|check| check["code"] == "plugin_update_available")),
-        "fixture must emit the plugin update warning: {envelope:#}"
+        envelope["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["code"] == "plugin_update_available"
+                    && check["detail"]
+                        .as_str()
+                        .is_some_and(|detail| detail.contains("v2.5.9 → v2.5.10"))
+            })),
+        "doctor must report the actual upstream version, not the approved cache: {envelope:#}"
     );
-    assert!(
-        envelope["fixes_applied"].as_array().is_some_and(|fixes| {
-            fixes
-                .iter()
-                .any(|fix| fix == "updated plugin biome to 2.5.9")
-        }),
-        "doctor must report the managed plugin update: {envelope:#}"
-    );
-    let cache: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(cache_path).expect("read updated plugin version cache"),
-    )
-    .expect("plugin version cache must remain valid JSON");
-    assert_eq!(cache["versions"]["biome"], "2.5.9");
 }
 
 #[test]
@@ -555,12 +590,14 @@ fn doctor_all_fix_keeps_formatter_output_out_of_the_json_document() {
     seed_minimal_lockfile(&project);
     let marker = project.path().join("format-applied");
     let formatter = format!(
-        "#!/bin/sh\nif [ \"$2\" = \"--check\" ]; then\n  echo 'Formatter would have printed fixture.js' >&2\n  exit 1\nfi\necho 'formatter stdout must stay captured'\nprintf 'applied' > \"{}\"\n",
+        "#!/bin/sh\nif [ \"$2\" = \"--check\" ]; then\n  if [ -f \"{}\" ]; then exit 0; fi\n  echo 'Formatter would have printed fixture.js' >&2\n  exit 1\nfi\necho 'formatter stdout must stay captured'\nprintf 'applied' > \"{}\"\n",
+        marker.display(),
         marker.display()
     );
     seed_verified_plugin_with_binary(&project, "biome", "2.5.9", formatter.as_bytes());
 
     let output = lpm_doctor_offline(&project)
+        .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
         .args(["--json", "doctor", "--all", "--fix", "--yes"])
         .output()
         .expect("run doctor format auto-fix");
@@ -569,10 +606,10 @@ fn doctor_all_fix_keeps_formatter_output_out_of_the_json_document() {
         .unwrap_or_else(|error| panic!("doctor must emit one JSON document: {error}\n{stdout}"));
 
     assert!(
-        envelope["checks"].as_array().is_some_and(|checks| checks
-            .iter()
-            .any(|check| check["code"] == "fmt_unformatted")),
-        "fixture must emit the unformatted warning: {envelope:#}"
+        envelope["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| check["code"] == "fmt_clean")),
+        "the final report must reflect the formatter result: {envelope:#}"
     );
     assert!(
         envelope["fixes_applied"]

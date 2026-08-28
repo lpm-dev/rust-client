@@ -13,7 +13,9 @@ use super::check::Check;
 /// construct. Without that, a user who opted into degraded posture
 /// on a kernel < 6.7 would see "strict / fail" in doctor while
 /// their installs silently run under V1 (or vice-versa).
-pub(super) fn probe_sandbox_backend() -> Check {
+pub(super) fn probe_sandbox_backend_with_global(
+    global_config: &crate::commands::config::GlobalConfig,
+) -> Check {
     use lpm_sandbox::{
         SandboxError, SandboxMode, SandboxPosture, SandboxSpec, new_for_platform_with_options,
     };
@@ -56,7 +58,13 @@ pub(super) fn probe_sandbox_backend() -> Check {
         // `LPM_STRICT_SANDBOX=1` and `[sandbox] mode` flow through
         // the doctor probe identically to the install pipeline.
         Ok(cwd) => {
-            match crate::sandbox_config::resolve_sandbox_mode_from_chain(&cwd, false, false, true) {
+            match crate::sandbox_config::resolve_sandbox_mode_from_chain_with_global(
+                &cwd,
+                false,
+                false,
+                true,
+                global_config,
+            ) {
                 Ok(pair) => pair,
                 Err(e) => {
                     if e.error_code() == "security_approval_required" {
@@ -258,6 +266,11 @@ pub(super) fn probe_sandbox_backend() -> Check {
             ),
         ),
     }
+}
+
+#[cfg(test)]
+fn probe_sandbox_backend() -> Check {
+    probe_sandbox_backend_with_global(&crate::commands::config::GlobalConfig::load())
 }
 
 #[cfg(test)]

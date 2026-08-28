@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::doctor_catalog;
 
 use super::check::Check;
@@ -20,20 +18,8 @@ use super::check::Check;
 /// Each issue's `code` is preserved verbatim as the `Check.code`, so
 /// `lpm doctor --json` consumers can match on `pnpm_overrides_drift`,
 /// `engines_pnpm_ignored`, etc.
-pub(super) fn check_manifest_compat(project_dir: &Path) -> Vec<Check> {
-    // Mirror engine_check's "workspace root is the gate" semantics: a
-    // member-dir invocation walks up to the root, but a single-package
-    // project just reads its own manifest.
-    let root_pkg = match lpm_workspace::discover_workspace(project_dir) {
-        Ok(Some(ws)) => ws.root_package,
-        Ok(None) => match lpm_workspace::read_package_json(&project_dir.join("package.json")) {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-
-    root_pkg
+pub(super) fn check_manifest_compat(root_package: &lpm_workspace::PackageJson) -> Vec<Check> {
+    root_package
         .manifest_compat_issues()
         .into_iter()
         .filter_map(|issue| {

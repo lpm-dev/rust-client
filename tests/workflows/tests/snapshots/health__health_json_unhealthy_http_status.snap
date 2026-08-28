@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/health.rs
+assertion_line: 131
+expression: json
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error": "network error: registry at [registry-url] is unreachable",
+  "error_code": "network"
+}

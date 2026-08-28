@@ -111,11 +111,27 @@ pub fn resolve_sandbox_mode_from_chain(
     strict_sandbox_flag: bool,
     json_output: bool,
 ) -> Result<(SandboxOptions, ResolvedSandboxMode), LpmError> {
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
+    resolve_sandbox_mode_from_chain_with_global(
+        project_dir,
+        no_sandbox_flag,
+        strict_sandbox_flag,
+        json_output,
+        &global_config,
+    )
+}
+
+pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
+    project_dir: &Path,
+    no_sandbox_flag: bool,
+    strict_sandbox_flag: bool,
+    json_output: bool,
+    global_config: &crate::commands::config::GlobalConfig,
+) -> Result<(SandboxOptions, ResolvedSandboxMode), LpmError> {
     let project_path = project_dir.join("lpm.toml");
     let mut project = read_sandbox_keys_from_file(&project_path)?;
 
-    let global_path = lpm_common::LpmRoot::from_env()?.root().join("config.toml");
-    let global = read_sandbox_keys_from_file(&global_path)?;
+    let global = read_sandbox_keys_from_table(global_config.table(), "~/.lpm/config.toml")?;
     let authorized = crate::security_approval::load_effective_authorized_posture()?.posture;
     let authorized_mode = authorized.sandbox_mode();
     let authorized_mode_key = match authorized_mode {
@@ -203,9 +219,7 @@ pub fn resolve_sandbox_mode_from_chain(
             false
         };
 
-    let force_security_floor = crate::security_floor::force_security_floor_enabled(
-        &crate::commands::config::GlobalConfig::load(),
-    );
+    let force_security_floor = crate::security_floor::force_security_floor_enabled(global_config);
     let mut effective_no_sandbox_flag = no_sandbox_flag;
     if force_security_floor {
         let floor_mode = global.mode.unwrap_or(SandboxModeKey::Default);

@@ -1,10 +1,12 @@
 use crate::doctor_catalog::{self, Severity};
-use crate::{auth, install_ui};
+use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
 use lpm_store::PackageStore;
+use std::borrow::Cow;
 use std::path::Path;
+use std::time::Duration;
 
 mod check;
 mod config_file;
@@ -22,24 +24,64 @@ mod sigstore;
 mod storage;
 #[cfg(test)]
 mod test_support;
-mod tooling;
+pub(in crate::commands) mod tooling;
 mod tunnel;
 mod workspace;
 
 use self::check::{Check, FixTarget, format_doctor_issue_summary_colored};
-use self::config_file::validate_lpm_json;
+use self::config_file::load_lpm_json;
 use self::global::check_global_installs;
 use self::local_sources::check_local_source_paths;
-use self::lockfile::{check_deps_in_sync, check_gitattributes_state, check_lockfile_state};
+use self::lockfile::{
+    DiagnosticLockfile, check_deps_in_sync, check_gitattributes_state, check_lockfile_state,
+};
 use self::manifest::check_manifest_compat;
 use self::policy::check_policy_extensions;
-use self::runtime::get_system_bun_version;
-use self::script_policy::check_script_policy_surface;
+use self::runtime::{
+    get_system_bun_version, get_system_node_version, probe_system_version_if_unmanaged,
+};
+use self::script_policy::check_script_policy_surface_with_global;
 use self::sigstore::check_sigstore_verify_posture;
 use self::storage::{auth_storage_check, vault_storage_check};
-use self::tooling::{check_plugins, check_typescript_setup, run_fmt_check, run_lint_check};
-use self::tunnel::check_tunnel_domain;
+use self::tooling::{
+    check_plugins, check_typescript_setup, discover_installed_plugins, run_fmt_check,
+    run_lint_check,
+};
+use self::tunnel::check_tunnel_domain_from_config;
 use self::workspace::check_workspace;
+
+const DIAGNOSTIC_NETWORK_DEADLINE: Duration = Duration::from_secs(5);
+
+enum AuthProbe {
+    Missing,
+    Valid(&'static str),
+    Invalid(&'static str),
+    Unverified(String),
+}
+
+#[derive(serde::Serialize)]
+struct DoctorCheckJson<'a> {
+    code: &'static str,
+    check: &'static str,
+    passed: bool,
+    severity: &'static str,
+    detail: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct DoctorOutputJson<'a> {
+    success: bool,
+    mode: &'static str,
+    no_failures: bool,
+    clean: bool,
+    has_warnings: bool,
+    checks: Vec<DoctorCheckJson<'a>>,
+    passed: usize,
+    failed: usize,
+    warnings: usize,
+    fixes_applied: &'a [String],
+    fixes_failed: &'a [self::fix::FixFailure],
+}
 
 /// Render the canonical catalog inventory.
 ///
@@ -67,6 +109,7 @@ pub fn list(
     category_filter: Option<&str>,
 ) -> Result<(), LpmError> {
     let mut rows = doctor_catalog::all_entries();
+    let code_exists = code_filter.is_none_or(|code| rows.iter().any(|row| row.code == code));
 
     if let Some(code) = code_filter {
         rows.retain(|r| r.code == code);
@@ -84,7 +127,7 @@ pub fn list(
     // canonical `{success: false, error, error_code}` envelope, so
     // stdout stays a single valid JSON document either way.
     if let Some(code) = code_filter
-        && rows.is_empty()
+        && !code_exists
     {
         return Err(LpmError::Script(format!(
             "no catalog entry matches code `{code}` — run `lpm doctor list` to see the full inventory",
@@ -193,7 +236,46 @@ pub async fn run(
     fix: bool,
     yes: bool,
 ) -> Result<(), LpmError> {
+    let (workspace, workspace_discovery_error) =
+        match lpm_workspace::discover_workspace(project_dir) {
+            Ok(workspace) => (workspace.map(std::sync::Arc::new), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+    crate::workspace_discovery_cache::scope_discovery(
+        project_dir,
+        workspace,
+        run_inner(
+            client,
+            registry_url,
+            project_dir,
+            json_output,
+            all,
+            fix,
+            yes,
+            None,
+            workspace_discovery_error.as_deref(),
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    client: &RegistryClient,
+    registry_url: &str,
+    project_dir: &Path,
+    json_output: bool,
+    all: bool,
+    fix: bool,
+    yes: bool,
+    fix_report: Option<self::fix::FixReport>,
+    workspace_discovery_error: Option<&str>,
+) -> Result<(), LpmError> {
     let mut checks: Vec<Check> = Vec::new();
+    let loaded_global_config = crate::commands::config::GlobalConfig::load_checked();
+    let global_config_error = loaded_global_config.as_ref().err().map(ToString::to_string);
+    let global_config =
+        loaded_global_config.unwrap_or_else(|_| crate::commands::config::GlobalConfig::empty());
     let mut sweep_progress = if all && !json_output {
         Some(install_ui::spin("Running doctor --all checks"))
     } else {
@@ -203,75 +285,65 @@ pub async fn run(
     // Shared between the registry/auth probe (Extended) and the
     // tunnel block (Extended). Stays `false` on the fast path since
     // both consumers are gated behind `if all`.
-    let mut token_exists = false;
+    let mut auth_verified = false;
+
+    let registry_auth_task = all.then(|| {
+        let diagnostic_client = client.clone_with_config();
+        let auth_source = diagnostic_client.auth_source_label();
+        tokio::spawn(async move {
+            tokio::join!(
+                tokio::time::timeout(
+                    DIAGNOSTIC_NETWORK_DEADLINE,
+                    diagnostic_client.diagnostic_health_check_once()
+                ),
+                probe_auth(&diagnostic_client, auth_source)
+            )
+        })
+    });
+    let installed_plugins = all.then(|| std::sync::Arc::new(discover_installed_plugins()));
+    let lint_task = installed_plugins.as_ref().map(|plugins| {
+        let project = project_dir.to_path_buf();
+        let plugins = std::sync::Arc::clone(plugins);
+        tokio::task::spawn_blocking(move || run_lint_check(&project, &plugins))
+    });
+    let fmt_task = installed_plugins.as_ref().map(|plugins| {
+        let project = project_dir.to_path_buf();
+        let plugins = std::sync::Arc::clone(plugins);
+        tokio::task::spawn_blocking(move || run_fmt_check(&project, &plugins))
+    });
+    let plugin_task = installed_plugins.as_ref().map(|plugins| {
+        let plugins = std::sync::Arc::clone(plugins);
+        tokio::spawn(async move { check_plugins(&plugins).await })
+    });
+    let global_task = all.then(|| tokio::task::spawn_blocking(check_global_installs));
 
     // === Infrastructure: registry + auth (Extended) ===
     //
     // Both probes touch the network. Skipped on the fast path —
     // default `lpm doctor` is local-only.
-    if all {
-        token_exists = auth::get_token(registry_url).is_some();
-        let (registry_result, auth_result) = tokio::join!(client.health_check(), async {
-            if token_exists {
-                client.whoami().await.is_ok()
-            } else {
-                false
-            }
-        });
-
-        // 1. Registry reachable?
-        let registry_ok = registry_result.unwrap_or(false);
-        if registry_ok {
-            checks.push(Check::pass(
-                &doctor_catalog::REGISTRY_REACHABLE,
-                registry_url,
-            ));
-        } else {
-            checks.push(Check::fail(
-                &doctor_catalog::REGISTRY_UNREACHABLE,
-                &format!("{registry_url} — unreachable. Check your network or try again later"),
-            ));
-        }
-
-        // 2. Auth token valid?
-        if auth_result {
-            checks.push(Check::pass(&doctor_catalog::AUTH_VALID, "valid token"));
-        } else if token_exists {
-            checks.push(Check::fail(
-                &doctor_catalog::AUTH_INVALID,
-                "token exists but invalid — run: lpm login",
-            ));
-        } else {
-            checks.push(Check::fail(
-                &doctor_catalog::AUTH_MISSING,
-                "no token — run: lpm login",
-            ));
-        }
-    }
-
-    if let Some(check) = auth_storage_check(auth::auth_storage_status(registry_url)) {
+    if let Some(check) = auth_storage_check(client.diagnostic_auth_storage_status(registry_url)) {
         checks.push(check);
     }
 
     checks.push(vault_storage_check(lpm_vault::storage_backend()));
-    checks.extend(check_policy_extensions());
+    checks.extend(check_policy_extensions(
+        &global_config,
+        global_config_error.as_deref(),
+    ));
 
     // 3. Global store accessible?
-    let store_result = PackageStore::default_location();
-    let store_ok = store_result.is_ok();
-    let store_detail = store_result.map_or_else(
-        |_| "inaccessible".into(),
-        |s| s.root().display().to_string(),
-    );
-    if store_ok {
+    let store_result = check_store_accessibility();
+    if let Ok(store_detail) = &store_result {
         checks.push(Check::pass(
             &doctor_catalog::GLOBAL_STORE_ACCESSIBLE,
-            &store_detail,
+            store_detail,
         ));
     } else {
         checks.push(Check::fail(
             &doctor_catalog::GLOBAL_STORE_INACCESSIBLE,
-            &store_detail,
+            store_result
+                .as_ref()
+                .expect_err("inaccessible store must carry an error"),
         ));
     }
 
@@ -279,14 +351,42 @@ pub async fn run(
 
     // 4. package.json exists?
     let pkg_json_path = project_dir.join("package.json");
-    if pkg_json_path.exists() {
-        checks.push(Check::pass(&doctor_catalog::PACKAGE_JSON_PRESENT, "found"));
-    } else {
-        checks.push(Check::fail(
-            &doctor_catalog::PACKAGE_JSON_MISSING,
-            "not found — run: lpm init (or cd to your project root)",
-        ));
-    }
+    let workspace = crate::workspace_discovery_cache::active_workspace(project_dir);
+    let cached_package_manifest = workspace.as_ref().and_then(|workspace| {
+        if workspace.root == project_dir {
+            Some(&workspace.root_package)
+        } else {
+            workspace
+                .members
+                .iter()
+                .find(|member| member.path == project_dir)
+                .map(|member| &member.package)
+        }
+    });
+    let package_manifest = match cached_package_manifest.map_or_else(
+        || lpm_workspace::read_package_json(&pkg_json_path).map(Cow::Owned),
+        |package| Ok(Cow::Borrowed(package)),
+    ) {
+        Ok(package) => {
+            checks.push(Check::pass(&doctor_catalog::PACKAGE_JSON_PRESENT, "found"));
+            Some(package)
+        }
+        Err(lpm_workspace::WorkspaceError::NotFound(_)) => {
+            checks.push(Check::fail(
+                &doctor_catalog::PACKAGE_JSON_MISSING,
+                "not found — run: lpm init (or cd to your project root)",
+            ));
+            None
+        }
+        Err(error) => {
+            checks.push(Check::fail(
+                &doctor_catalog::PACKAGE_JSON_INVALID,
+                &error.to_string(),
+            ));
+            None
+        }
+    };
+    let package_manifest_valid = package_manifest.is_some();
 
     // 4.5. Resolved linker mode + source — surfaces "why is my linker
     // mode X?" so users running `lpm doctor` after the workspace-aware
@@ -296,26 +396,22 @@ pub async fn run(
     // the resolution-error path emits a fail anyway via the install
     // pipeline. Best-effort: any I/O / parse failure here downgrades
     // to a quiet skip rather than failing doctor.
-    if let Ok(pkg_content) =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        && let Ok(pkg_parsed) = serde_json::from_str::<lpm_workspace::PackageJson>(&pkg_content)
-    {
-        let cfg = crate::commands::config::GlobalConfig::load();
-        if let Ok((mode, source)) = crate::linker_config::resolve_effective_linker_with_source(
+    if let Some(pkg_parsed) = package_manifest.as_ref()
+        && let Ok((mode, source)) = crate::linker_config::resolve_effective_linker_with_source(
             None,
-            &pkg_parsed,
-            &cfg,
+            pkg_parsed,
+            &global_config,
             project_dir,
-        ) {
-            let mode_str = match mode {
-                lpm_linker::LinkerMode::Isolated => "isolated",
-                lpm_linker::LinkerMode::Hoisted => "hoisted",
-            };
-            checks.push(Check::pass(
-                &doctor_catalog::LINKER_MODE_RESOLVED,
-                &format!("{mode_str} (source: {})", source.as_str()),
-            ));
-        }
+        )
+    {
+        let mode_str = match mode {
+            lpm_linker::LinkerMode::Isolated => "isolated",
+            lpm_linker::LinkerMode::Hoisted => "hoisted",
+        };
+        checks.push(Check::pass(
+            &doctor_catalog::LINKER_MODE_RESOLVED,
+            &format!("{mode_str} (source: {})", source.as_str()),
+        ));
     }
 
     // 5. node_modules intact?
@@ -423,36 +519,53 @@ pub async fn run(
     if all && let Ok(lpm_root) = lpm_common::LpmRoot::from_env() {
         let mut orphan_links = 0usize;
         let mut orphan_objects = 0usize;
-        let mut orphan_bytes = 0u64;
-        let mut plans_valid = true;
-        for version in [lpm_store::StoreVersion::V2, lpm_store::StoreVersion::V3] {
-            let store = lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, version);
-            match crate::commands::cache_prune::compute_prune_plan(
-                &lpm_root,
-                &store,
-                &crate::commands::cache::PruneFlags::default(),
-                None,
-            ) {
-                Ok(plan) => {
-                    orphan_links += plan.link_entries_orphaned.len();
-                    orphan_objects += plan.object_entries_orphaned.len();
-                    orphan_bytes = orphan_bytes.saturating_add(plan.bytes_freed_or_eligible);
+        let mut analysis_unavailable = None;
+        let stores = [
+            lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, lpm_store::StoreVersion::V2),
+            lpm_store::v2::Store::from_lpm_root_for_version(&lpm_root, lpm_store::StoreVersion::V3),
+        ];
+        match crate::commands::cache_prune::compute_prune_stats_for_stores(&lpm_root, &stores) {
+            Ok(stats_by_store) => {
+                for stats in stats_by_store {
+                    match stats.analysis {
+                        crate::commands::cache_prune::PruneAnalysis::Available => {
+                            orphan_links += stats.link_entries_orphaned;
+                            orphan_objects += stats.object_entries_orphaned;
+                        }
+                        crate::commands::cache_prune::PruneAnalysis::RegistryMissing => {
+                            analysis_unavailable.get_or_insert_with(|| {
+                                "known-projects registry is missing; reachability is unknown"
+                                    .to_string()
+                            });
+                        }
+                        crate::commands::cache_prune::PruneAnalysis::RegistryCorrupt(reason) => {
+                            analysis_unavailable.get_or_insert_with(|| {
+                                format!("known-projects registry is corrupt: {reason}")
+                            });
+                        }
+                    }
                 }
-                Err(_) => plans_valid = false,
+            }
+            Err(error) => {
+                analysis_unavailable.get_or_insert_with(|| format!("store scan failed: {error}"));
             }
         }
-        if plans_valid {
+        if let Some(reason) = analysis_unavailable {
+            checks.push(Check::warn(
+                &doctor_catalog::STORE_ORPHAN_ANALYSIS_UNAVAILABLE,
+                &reason,
+            ));
+        } else {
             if orphan_links == 0 && orphan_objects == 0 {
                 checks.push(Check::pass(&doctor_catalog::V2_STORE_ORPHANS, "no orphans"));
             } else {
                 checks.push(Check::warn(
                     &doctor_catalog::V2_STORE_ORPHANS,
                     &format!(
-                        "{orphan_links} link orphan{} + {orphan_objects} object orphan{} \
-                         ({}); run: lpm cache prune --apply",
+                        "{orphan_links} link orphan{} + {orphan_objects} object orphan{}; \
+                         run: lpm cache prune --apply",
                         if orphan_links == 1 { "" } else { "s" },
                         if orphan_objects == 1 { "" } else { "s" },
-                        lpm_common::format_bytes(orphan_bytes),
                     ),
                 ));
             }
@@ -460,17 +573,18 @@ pub async fn run(
     }
 
     // 6. Lockfile? (Fast — load-bearing for install)
-    checks.extend(check_lockfile_state(project_dir));
+    let diagnostic_lockfile = DiagnosticLockfile::load(project_dir);
+    checks.extend(check_lockfile_state(&diagnostic_lockfile));
 
     // 6b. .gitattributes hygiene (Extended) — git-side correctness for
     // the binary lockfile, not a runtime-install gate.
     if all {
-        checks.extend(check_gitattributes_state(project_dir));
+        checks.extend(check_gitattributes_state(project_dir, &diagnostic_lockfile));
     }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)
-    if pkg_json_path.exists()
-        && let Some(sync_check) = check_deps_in_sync(project_dir)
+    if let Some(package_manifest) = package_manifest.as_ref()
+        && let Some(sync_check) = check_deps_in_sync(package_manifest, &diagnostic_lockfile)
     {
         checks.push(sync_check);
     }
@@ -479,14 +593,20 @@ pub async fn run(
     // Reports broken paths, missing package.json, exotic file types
     // — anything that would cause a runtime install error users
     // could pre-detect.
-    if pkg_json_path.exists() {
-        checks.extend(check_local_source_paths(project_dir));
+    if package_manifest_valid {
+        checks.extend(check_local_source_paths(
+            project_dir,
+            package_manifest
+                .as_deref()
+                .expect("valid package manifest was checked above"),
+        ));
     }
 
     // === lpm.json Validation ===
 
     // 7. Validate lpm.json (if exists)
-    if let Some(lpm_json_check) = validate_lpm_json(project_dir) {
+    let mut diagnostic_lpm_json = load_lpm_json(project_dir);
+    if let Some(lpm_json_check) = diagnostic_lpm_json.check.take() {
         checks.push(lpm_json_check);
     }
 
@@ -507,28 +627,57 @@ pub async fn run(
     // it exists. Re-uses the workspace discovery so member-dir
     // invocations gate against the workspace root manifest, matching
     // the engine-check semantics (root manifest is the gate).
-    if all && pkg_json_path.exists() {
-        checks.extend(check_manifest_compat(project_dir));
+    if all && package_manifest_valid {
+        let root_package = workspace
+            .as_ref()
+            .map_or_else(
+                || package_manifest.as_deref(),
+                |workspace| Some(&workspace.root_package),
+            )
+            .expect("valid package manifest was checked above");
+        checks.extend(check_manifest_compat(root_package));
     }
 
     // === Runtime ===
 
     // 8. Node.js version
-    let detected = lpm_runtime::detect::detect_node_version(project_dir)?;
-    let script_path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
-    let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
+    let detected = lpm_runtime::detect::detect_node_version_with_lpm_json_spec(
         project_dir,
-        std::ffi::OsStr::new(&script_path),
-    );
-    let effective_version = effective_node
-        .version()
-        .map(|version| format!("v{version}"));
+        diagnostic_lpm_json.node_spec(),
+    )?;
+    let managed_versions = lpm_runtime::node::list_installed().unwrap_or_default();
+    let matched_managed_node = detected.as_ref().and_then(|detected| {
+        lpm_runtime::node::find_matching_installed(&detected.spec, &managed_versions)
+    });
+    let system_node_version =
+        probe_system_version_if_unmanaged(matched_managed_node.as_deref(), || {
+            get_system_node_version(project_dir)
+        });
+    let effective_node_version = matched_managed_node
+        .as_deref()
+        .or(system_node_version.as_deref());
+    let effective_source = if matched_managed_node.is_some() {
+        "managed runtime"
+    } else {
+        "system PATH"
+    };
+    let effective_version = effective_node_version.map(|version| format!("v{version}"));
 
-    if let Some(requirement) =
-        crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
-        && let Some(actual) = effective_node.version()
+    if package_manifest_valid
+        && let Some(requirement) =
+            crate::engine_check::resolve_root_node_engine_requirement_from_package(
+                workspace
+                    .as_ref()
+                    .map_or_else(
+                        || package_manifest.as_deref(),
+                        |workspace| Some(&workspace.root_package),
+                    )
+                    .expect("valid package manifest was checked above"),
+                &global_config,
+            )
+        && let Some(actual) = effective_node_version
     {
-        let source = "script PATH";
+        let source = effective_source;
         match crate::engine_check::version_satisfies(&requirement.required, actual) {
             Ok(true) => checks.push(Check::pass(
                 &doctor_catalog::NODE_ENGINE_COMPATIBLE,
@@ -569,16 +718,8 @@ pub async fn run(
     }
 
     if let Some(ref det) = detected {
-        let managed_versions = lpm_runtime::node::list_installed().unwrap_or_default();
-
         let spec = &det.spec;
-        let clean = spec
-            .trim_start_matches(">=")
-            .trim_start_matches('^')
-            .trim_start_matches('~')
-            .trim_start_matches('>');
-
-        let matched_managed = lpm_runtime::node::find_matching_installed(clean, &managed_versions);
+        let matched_managed = matched_managed_node;
 
         if let Some(ver) = matched_managed {
             checks.push(Check::pass(
@@ -589,26 +730,26 @@ pub async fn run(
             checks.push(Check::warn_with_fix_target(
                 &doctor_catalog::NODE_PINNED_UNMET,
                 &format!(
-                    "{sys} (script PATH) — pinned {spec} from {} not installed. Run: lpm use node@{clean}",
+                    "{sys} (system PATH) — pinned {spec} from {} not installed. Run: lpm use node@{spec}",
                     det.source_label()
                 ),
-                FixTarget::NodeSpec(clean.to_string()),
+                FixTarget::NodeSpec(spec.to_string()),
             ));
         } else {
             checks.push(Check::fail_with_fix_target(
                 &doctor_catalog::NODE_MISSING_PINNED,
                 &format!(
-                    "not found — pinned {spec} from {}. Run: lpm use node@{clean}",
+                    "not found — pinned {spec} from {}. Run: lpm use node@{spec}",
                     det.source_label()
                 ),
-                FixTarget::NodeSpec(clean.to_string()),
+                FixTarget::NodeSpec(spec.to_string()),
             ));
         }
     } else {
         if let Some(v) = effective_version {
             checks.push(Check::pass(
                 &doctor_catalog::NODE_SYSTEM_UNPINNED,
-                &format!("{v} (script PATH, no version pinned)"),
+                &format!("{v} (system PATH, no version pinned)"),
             ));
         } else {
             checks.push(Check::fail_with_fix_target(
@@ -619,12 +760,15 @@ pub async fn run(
         }
     }
 
-    if let Some(det) = lpm_runtime::detect::detect_bun_version(project_dir)? {
-        let system_bun = get_system_bun_version(project_dir)?;
+    if let Some(det) =
+        lpm_runtime::detect::detect_bun_version_with_lpm_json_spec(diagnostic_lpm_json.bun_spec())
+    {
         let managed_versions = lpm_runtime::bun::list_installed().unwrap_or_default();
         let spec = &det.spec;
-        let clean = lpm_runtime::bun::normalize_spec(spec);
         let matched_managed = lpm_runtime::bun::find_matching_installed(spec, &managed_versions);
+        let system_bun = probe_system_version_if_unmanaged(matched_managed.as_deref(), || {
+            get_system_bun_version(project_dir)
+        });
 
         if let Some(ver) = matched_managed {
             checks.push(Check::pass(
@@ -635,66 +779,127 @@ pub async fn run(
             checks.push(Check::warn_with_fix_target(
                 &doctor_catalog::BUN_PINNED_UNMET,
                 &format!(
-                    "{sys} (system) — pinned {spec} from {} not installed. Run: lpm use bun@{clean}",
+                    "{sys} (system) — pinned {spec} from {} not installed. Run: lpm use bun@{spec}",
                     det.source
                 ),
-                FixTarget::BunSpec(clean),
+                FixTarget::BunSpec(spec.clone()),
             ));
         } else {
             checks.push(Check::fail_with_fix_target(
                 &doctor_catalog::BUN_MISSING_PINNED,
                 &format!(
-                    "not found — pinned {spec} from {}. Run: lpm use bun@{clean}",
+                    "not found — pinned {spec} from {}. Run: lpm use bun@{spec}",
                     det.source
                 ),
-                FixTarget::BunSpec(clean),
+                FixTarget::BunSpec(spec.clone()),
             ));
         }
     }
 
-    // === Tunnel  ===
-    //
-    // Touches network in the authenticated path (`tunnel_domain_lookup`
-    // + HTTP reachability probe). Skipped on fast path.
-    if all {
-        let tunnel_checks = check_tunnel_domain(project_dir, client, token_exists).await;
-        checks.extend(tunnel_checks);
+    if let Some(task) = registry_auth_task {
+        let display_registry_url = install_ui::safe_url_origin(registry_url);
+        let mut infrastructure_checks = Vec::with_capacity(2);
+        match task.await {
+            Ok((registry_result, auth_result)) => {
+                let registry_ok = registry_result.is_ok_and(|result| result.unwrap_or(false));
+                if registry_ok {
+                    infrastructure_checks.push(Check::pass(
+                        &doctor_catalog::REGISTRY_REACHABLE,
+                        &display_registry_url,
+                    ));
+                } else {
+                    infrastructure_checks.push(Check::fail(
+                        &doctor_catalog::REGISTRY_UNREACHABLE,
+                        &format!(
+                            "{display_registry_url} — unreachable. Check your network or try again later"
+                        ),
+                    ));
+                }
+                match auth_result {
+                    AuthProbe::Valid(source) => {
+                        auth_verified = true;
+                        infrastructure_checks.push(Check::pass(
+                            &doctor_catalog::AUTH_VALID,
+                            &format!("valid token from {source}"),
+                        ));
+                    }
+                    AuthProbe::Invalid(source) => infrastructure_checks.push(Check::fail(
+                        &doctor_catalog::AUTH_INVALID,
+                        &format!("token from {source} was rejected — run: lpm login"),
+                    )),
+                    AuthProbe::Missing => infrastructure_checks.push(Check::fail(
+                        &doctor_catalog::AUTH_MISSING,
+                        "no token — run: lpm login",
+                    )),
+                    AuthProbe::Unverified(error) => infrastructure_checks
+                        .push(Check::warn(&doctor_catalog::AUTH_UNVERIFIED, &error)),
+                }
+            }
+            Err(error) => {
+                infrastructure_checks.push(Check::fail(
+                    &doctor_catalog::REGISTRY_UNREACHABLE,
+                    &format!("{display_registry_url} — diagnostic worker failed: {error}"),
+                ));
+                infrastructure_checks.push(Check::warn(
+                    &doctor_catalog::AUTH_UNVERIFIED,
+                    &format!("authentication diagnostic worker failed: {error}"),
+                ));
+            }
+        }
+        checks.splice(0..0, infrastructure_checks);
     }
 
-    // === Code Quality + TypeScript + Plugins  ===
-    //
-    // Subprocess spawns (oxlint, biome) + network calls (plugin
-    // version fetch). All Extended-tier; default fast preset stays
-    // pure local file I/O. TypeScript readiness is a cheap file probe
-    // but lives next to the tooling cluster the user expects to see
-    // together — promoted under `--all` for output cohesion.
+    // === Tunnel + Code Quality + TypeScript + Plugins ===
     if all {
-        // Lint check (if oxlint installed)
-        if let Some(lint_result) = run_lint_check(project_dir) {
-            checks.push(lint_result);
+        let typescript_checks = package_manifest.as_ref().map_or_else(Vec::new, |package| {
+            check_typescript_setup(project_dir, package, workspace.as_deref())
+        });
+
+        let tunnel_future = check_tunnel_domain_from_config(
+            diagnostic_lpm_json.config.as_ref(),
+            client,
+            auth_verified,
+        );
+        let (tunnel_checks, plugin_result, lint_result, fmt_result) = tokio::join!(
+            tunnel_future,
+            plugin_task.expect("plugin task exists in all mode"),
+            lint_task.expect("lint task exists in all mode"),
+            fmt_task.expect("format task exists in all mode"),
+        );
+
+        checks.extend(tunnel_checks);
+        match lint_result {
+            Ok(Some(check)) => checks.push(check),
+            Ok(None) => {}
+            Err(error) => checks.push(Check::warn(
+                &doctor_catalog::LINT_PROBE_FAILED,
+                &format!("lint diagnostic worker failed: {error}"),
+            )),
         }
-
-        // Format check (if biome installed)
-        if let Some(fmt_result) = run_fmt_check(project_dir) {
-            checks.push(fmt_result);
+        match fmt_result {
+            Ok(Some(check)) => checks.push(check),
+            Ok(None) => {}
+            Err(error) => checks.push(Check::warn(
+                &doctor_catalog::FMT_PROBE_FAILED,
+                &format!("format diagnostic worker failed: {error}"),
+            )),
         }
-
-        // TypeScript readiness — workspace-aware reachability check.
-        // Cheap local-bin lookup + dep-declaration check, no blocking
-        // `tsc --noEmit` invocation. The actual type-check belongs to
-        // `lpm check`; doctor only verifies the project is set up so
-        // that `lpm check` will work when the user runs it.
-        checks.extend(check_typescript_setup(project_dir));
-
-        // Plugin status — fetches latest plugin versions in parallel.
-        let plugin_checks = check_plugins().await;
-        checks.extend(plugin_checks);
+        checks.extend(typescript_checks);
+        match plugin_result {
+            Ok(plugin_checks) => checks.extend(plugin_checks),
+            Err(error) => checks.push(Check::warn(
+                &doctor_catalog::PLUGIN_UPDATE_CHECK_FAILED,
+                &format!("plugin diagnostic worker failed: {error}"),
+            )),
+        }
     }
 
     // === Workspace ===
 
     // 13. Workspace health
-    if let Some(ws_check) = check_workspace(project_dir) {
+    if package_manifest_valid
+        && let Some(ws_check) = check_workspace(project_dir, workspace_discovery_error)
+    {
         checks.push(ws_check);
     }
 
@@ -712,8 +917,12 @@ pub async fn run(
     // project breakage, and the per-platform PATH probe is host
     // state rather than current-directory state.
     if all {
-        for check in check_global_installs() {
-            checks.push(check);
+        match global_task.expect("global task exists in all mode").await {
+            Ok(global_checks) => checks.extend(global_checks),
+            Err(error) => checks.push(Check::warn(
+                &doctor_catalog::GLOBAL_MANIFEST_CORRUPT,
+                &format!("global diagnostic worker failed: {error}"),
+            )),
         }
     }
 
@@ -721,7 +930,7 @@ pub async fn run(
     // `EnforceMode` (env > [sigstore].verify > default) so an
     // operator who flipped the knob once and forgot doesn't fly
     // blind. Fast-tier: one config-file read, no network.
-    checks.push(check_sigstore_verify_posture());
+    checks.push(check_sigstore_verify_posture(&global_config));
 
     // === — Script policy + sandbox (Extended) ===
     //
@@ -732,7 +941,9 @@ pub async fn run(
     // capabilities (kernel version, helper availability) rather than
     // current-project breakage.
     if all {
-        for check in check_script_policy_surface() {
+        for check in
+            check_script_policy_surface_with_global(&global_config, package_manifest.as_deref())
+        {
             checks.push(check);
         }
     }
@@ -741,12 +952,23 @@ pub async fn run(
         progress.settle();
     }
 
-    let fixes_applied = if fix {
-        self::fix::confirm_before_apply(&checks, json_output, yes)?;
-        self::fix::apply(&checks, client, project_dir, json_output).await
-    } else {
-        Vec::new()
-    };
+    if fix && self::fix::confirm_before_apply(&checks, json_output, yes)? {
+        let report = self::fix::apply(&checks, client, project_dir, json_output).await;
+        return Box::pin(run_inner(
+            client,
+            registry_url,
+            project_dir,
+            json_output,
+            all,
+            false,
+            true,
+            Some(report),
+            workspace_discovery_error,
+        ))
+        .await;
+    }
+    let fix_report = fix_report.unwrap_or_default();
+    let fix_failed = !fix_report.failed.is_empty();
 
     // Tier-leak tripwire: in fast mode, every emitted check MUST
     // carry `Tier::Fast` — block-level gates above are the source of
@@ -771,41 +993,49 @@ pub async fn run(
     let mode_str = if all { "all" } else { "fast" };
 
     if json_output {
-        let results: Vec<_> = checks
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "code": c.code(),
-                    "check": c.name(),
-                    "passed": c.passed,
-                    "severity": c.severity.as_str(),
-                    "detail": c.detail,
-                })
-            })
-            .collect();
-        let no_failures = checks.iter().all(|c| c.passed);
-        let has_warnings = checks.iter().any(|c| matches!(c.severity, Severity::Warn));
+        let mut results = Vec::with_capacity(checks.len());
+        let mut passed_count = 0usize;
+        let mut warning_count = 0usize;
+        for check in &checks {
+            passed_count += usize::from(check.passed);
+            warning_count += usize::from(matches!(check.severity, Severity::Warn));
+            results.push(DoctorCheckJson {
+                code: check.code(),
+                check: check.name(),
+                passed: check.passed,
+                severity: check.severity.as_str(),
+                detail: &check.detail,
+            });
+        }
+        let failed_count = checks.len() - passed_count;
+        let no_failures = failed_count == 0;
+        let has_warnings = warning_count != 0;
         let clean = no_failures && !has_warnings;
-        let warning_count = checks
+        let payload = DoctorOutputJson {
+            success: true,
+            mode: mode_str,
+            no_failures,
+            clean,
+            has_warnings,
+            checks: results,
+            passed: passed_count,
+            failed: failed_count,
+            warnings: warning_count,
+            fixes_applied: &fix_report.applied,
+            fixes_failed: &fix_report.failed,
+        };
+        let estimated_detail_bytes = checks
             .iter()
-            .filter(|c| matches!(c.severity, Severity::Warn))
-            .count();
-        let passed_count = checks.iter().filter(|c| c.passed).count();
-        let failed_count = checks.iter().filter(|c| !c.passed).count();
-        let output = serde_json::to_string_pretty(&serde_json::json!({
-            "success": true,
-            "mode": mode_str,
-            "no_failures": no_failures,
-            "clean": clean,
-            "has_warnings": has_warnings,
-            "checks": results,
-            "passed": passed_count,
-            "failed": failed_count,
-            "warnings": warning_count,
-            "fixes_applied": fixes_applied,
-        }))
-        .map_err(|e| LpmError::Script(format!("failed to serialize doctor output: {e}")))?;
-        println!("{output}");
+            .map(|check| check.detail.len())
+            .fold(0usize, usize::saturating_add);
+        let mut output = Vec::with_capacity(
+            estimated_detail_bytes.saturating_add(checks.len().saturating_mul(160)),
+        );
+        serde_json::to_writer_pretty(&mut output, &payload)
+            .map_err(|e| LpmError::Script(format!("failed to serialize doctor output: {e}")))?;
+        output.push(b'\n');
+        use std::io::Write as _;
+        std::io::stdout().lock().write_all(&output)?;
     } else {
         let failed = checks.iter().filter(|c| !c.passed).count();
         let warned = checks
@@ -887,12 +1117,60 @@ pub async fn run(
     }
 
     // Exit code 1 when any check has hard failures (not warnings)
-    let has_failures = checks.iter().any(|c| !c.passed);
+    let has_failures = checks.iter().any(|c| !c.passed) || fix_failed;
     if has_failures {
         return Err(LpmError::ExitCode(1));
     }
 
     Ok(())
+}
+
+fn check_store_accessibility() -> Result<String, String> {
+    let store = PackageStore::default_location().map_err(|error| error.to_string())?;
+    let root = store.root();
+    match root.symlink_metadata() {
+        Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) => Err(format!(
+            "{} is a symlink or directory junction",
+            root.display()
+        )),
+        Ok(metadata) if !metadata.is_dir() => Err(format!("{} is not a directory", root.display())),
+        Ok(_) => std::fs::read_dir(root)
+            .map(|_| root.display().to_string())
+            .map_err(|error| format!("cannot read {}: {error}", root.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = root
+                .parent()
+                .ok_or_else(|| format!("{} has no parent directory", root.display()))?;
+            std::fs::read_dir(parent)
+                .map(|_| format!("{} (not created yet; parent is accessible)", root.display()))
+                .map_err(|parent_error| {
+                    format!("cannot access {}: {parent_error}", parent.display())
+                })
+        }
+        Err(error) => Err(format!("cannot inspect {}: {error}", root.display())),
+    }
+}
+
+async fn probe_auth(
+    client: &RegistryClient,
+    source: Result<Option<&'static str>, LpmError>,
+) -> AuthProbe {
+    let source = match source {
+        Ok(Some(source)) => source,
+        Ok(None) => return AuthProbe::Missing,
+        Err(error) => return AuthProbe::Unverified(error.to_string()),
+    };
+    match tokio::time::timeout(DIAGNOSTIC_NETWORK_DEADLINE, client.whoami()).await {
+        Ok(Ok(_)) => AuthProbe::Valid(source),
+        Ok(Err(LpmError::AuthRequired | LpmError::Forbidden(_))) => AuthProbe::Invalid(source),
+        Ok(Err(error)) => AuthProbe::Unverified(format!(
+            "token from {source} could not be verified: {error}"
+        )),
+        Err(_) => AuthProbe::Unverified(format!(
+            "token from {source} could not be verified within {} seconds",
+            DIAGNOSTIC_NETWORK_DEADLINE.as_secs()
+        )),
+    }
 }
 
 fn render_autofix_failed(action: &str, error: &impl std::fmt::Display) {

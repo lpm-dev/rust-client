@@ -1675,6 +1675,40 @@ fn ensure_gitattributes_preserves_existing_content() {
 }
 
 #[test]
+#[cfg(unix)]
+fn ensure_gitattributes_refuses_symlink_without_modifying_target() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("outside-attributes");
+    std::fs::write(&target, "outside-content\n").unwrap();
+    std::os::unix::fs::symlink(&target, project.path().join(".gitattributes")).unwrap();
+
+    let result = ensure_gitattributes(project.path());
+
+    assert!(result.is_err(), "a linked .gitattributes must be refused");
+    assert_eq!(
+        std::fs::read_to_string(target).unwrap(),
+        "outside-content\n"
+    );
+}
+
+#[test]
+fn ensure_gitattributes_refuses_oversized_file_without_modifying_it() {
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().join(".gitattributes");
+    let oversized = vec![b'x'; lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize + 1];
+    std::fs::write(&path, &oversized).unwrap();
+
+    let result = ensure_gitattributes(project.path());
+
+    assert!(
+        result.is_err(),
+        "an oversized .gitattributes must be refused"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), oversized);
+}
+
+#[test]
 fn safe_source_https_lpm() {
     assert!(is_safe_source("registry+https://lpm.dev"));
 }
