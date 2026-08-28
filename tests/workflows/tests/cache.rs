@@ -24,6 +24,30 @@ fn seed_subcat(project: &TempProject, subcat: &str, filename: &str, bytes: &[u8]
 }
 
 #[test]
+fn cache_actions_reject_unrelated_operands_and_flags() {
+    let project = TempProject::empty(r#"{"name":"cache-args","version":"1.0.0"}"#);
+
+    for args in [
+        &["cache", "clean", "--apply"][..],
+        &["cache", "path", "--max-age", "1d"][..],
+        &["cache", "status", "metadata"][..],
+        &["cache", "prune", "metadata"][..],
+    ] {
+        let output = lpm(&project)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {args:?}: {error}"));
+
+        assert!(
+            !output.status.success(),
+            "unrelated cache arguments must be rejected for {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[test]
 fn cache_prune_apply_json_exits_nonzero_when_tombstone_sweep_fails() {
     let project = TempProject::empty(r#"{"name":"cache-prune","version":"1.0.0"}"#);
     let root = lpm_common::LpmRoot::from_dir(project.home().join(".lpm"));
@@ -104,6 +128,109 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
     assert_eq!(envelope["remote"]["status"], serde_json::json!("enabled"));
     assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(1024));
     assert_eq!(envelope["remote"]["limit_bytes"], serde_json::json!(2048));
+}
+
+#[tokio::test]
+async fn cache_status_rejects_an_oversized_remote_response() {
+    let server = MockServer::start().await;
+    let oversized = format!(r#"{{"status":"{}"}}"#, "x".repeat(2 * 1024 * 1024));
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized.into_bytes()))
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(
+        output.status.success(),
+        "cache status must remain best-effort: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache status must emit valid JSON");
+    let error = envelope["remote"]["error"]
+        .as_str()
+        .expect("oversized remote status must report an error");
+    assert!(
+        error.contains("exceeds") && error.contains("limit"),
+        "oversized response must be rejected by the byte limit, got: {error}",
+    );
+}
+
+#[test]
+fn cache_status_fails_when_lpm_json_is_malformed() {
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    project.write_file("lpm.json", "{ not valid json");
+
+    let output = lpm(&project)
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("run cache status with malformed lpm.json");
+
+    assert!(
+        !output.status.success(),
+        "malformed lpm.json must not be reported as a successful disabled cache\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let failure = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        failure.contains("lpm.json"),
+        "the failure must identify lpm.json: {failure}",
+    );
+}
+
+#[test]
+fn cache_status_fails_when_the_task_cache_is_not_a_directory() {
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    let tasks = cache_root(&project).join("tasks");
+    std::fs::create_dir_all(tasks.parent().unwrap()).expect("create cache root");
+    std::fs::write(&tasks, b"not a directory").expect("write malformed tasks leaf");
+
+    let output = lpm(&project)
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("run cache status with malformed task cache");
+
+    assert!(
+        !output.status.success(),
+        "a malformed task cache must not be reported as zero bytes\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let failure = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        failure.contains("task cache"),
+        "the failure must identify the task cache: {failure}",
+    );
 }
 
 #[tokio::test]
@@ -651,7 +778,7 @@ fn cache_path_unknown_subcategory_fails_with_helpful_message() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unknown cache subcategory") && stderr.contains("metadata"),
+        stderr.contains("invalid value") && stderr.contains("values metadata, tasks, dlx, mcp"),
         "stderr must list valid subcategories, got:\n{stderr}"
     );
 }
@@ -767,6 +894,121 @@ fn cache_clean_with_subcategory_only_removes_that_subcat() {
 }
 
 #[test]
+#[cfg(unix)]
+fn cache_clean_removes_a_dangling_category_link() {
+    let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
+    let cache = cache_root(&project);
+    std::fs::create_dir_all(&cache).expect("create cache root");
+    let category = cache.join("metadata");
+    std::os::unix::fs::symlink(project.home().join("missing-target"), &category)
+        .expect("create dangling category link");
+
+    let output = lpm(&project)
+        .args(["cache", "clean", "metadata"])
+        .output()
+        .expect("run cache clean metadata");
+
+    assert!(
+        output.status.success(),
+        "cleaning a dangling category link should succeed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        std::fs::symlink_metadata(&category).is_err(),
+        "the dangling category link must be removed",
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cache_clean_rejects_a_linked_cache_root_without_touching_its_target() {
+    let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
+    let victim = project.home().join("victim");
+    let sentinel = victim.join("metadata").join("keep.txt");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).expect("create victim tree");
+    std::fs::write(&sentinel, b"keep").expect("write victim sentinel");
+    let cache = cache_root(&project);
+    std::fs::create_dir_all(cache.parent().unwrap()).expect("create LPM home");
+    std::os::unix::fs::symlink(&victim, &cache).expect("link cache root to victim");
+
+    let output = lpm(&project)
+        .args(["cache", "clean", "metadata"])
+        .output()
+        .expect("run cache clean metadata");
+
+    assert!(
+        !output.status.success(),
+        "a linked cache root must fail closed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).expect("victim sentinel must survive"),
+        b"keep",
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cache_clean_unlinks_a_category_link_without_counting_or_deleting_its_target() {
+    let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
+    let victim = project.home().join("victim-metadata");
+    let sentinel = victim.join("keep.txt");
+    std::fs::create_dir_all(&victim).expect("create victim directory");
+    std::fs::write(&sentinel, vec![b'x'; 4096]).expect("write victim sentinel");
+    let cache = cache_root(&project);
+    std::fs::create_dir_all(&cache).expect("create cache root");
+    let category = cache.join("metadata");
+    std::os::unix::fs::symlink(&victim, &category).expect("link category to victim");
+
+    let output = lpm(&project)
+        .args(["--json", "cache", "clean", "metadata"])
+        .output()
+        .expect("run cache clean metadata");
+
+    assert!(
+        output.status.success(),
+        "a final category link should be unlinked safely: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache clean must emit JSON");
+    assert_eq!(
+        envelope["total_bytes_freed"],
+        serde_json::json!(0),
+        "external target bytes must not be counted as cache bytes",
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), vec![b'x'; 4096]);
+    assert!(std::fs::symlink_metadata(&category).is_err());
+}
+
+#[test]
+fn cache_clean_removes_a_regular_file_in_place_of_a_category_directory() {
+    let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
+    let category = cache_root(&project).join("tasks");
+    std::fs::create_dir_all(category.parent().unwrap()).expect("create cache root");
+    std::fs::write(&category, b"stale cache payload").expect("write category file");
+
+    let output = lpm(&project)
+        .args(["--json", "cache", "clean", "tasks"])
+        .output()
+        .expect("run cache clean tasks");
+
+    assert!(
+        output.status.success(),
+        "cache clean should remove a malformed category leaf: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        std::fs::symlink_metadata(&category).is_err(),
+        "the malformed category leaf must be removed",
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache clean must emit JSON");
+    assert_eq!(envelope["total_bytes_freed"], serde_json::json!(19),);
+}
+
+#[test]
 fn cache_clean_unknown_subcategory_fails_with_helpful_message() {
     let project = TempProject::empty(r#"{"name":"cache-clean","version":"1.0.0"}"#);
 
@@ -782,7 +1024,7 @@ fn cache_clean_unknown_subcategory_fails_with_helpful_message() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unknown cache subcategory") && stderr.contains("metadata"),
+        stderr.contains("invalid value") && stderr.contains("values metadata, tasks, dlx, mcp"),
         "stderr must list valid subcategories, got:\n{stderr}"
     );
 }

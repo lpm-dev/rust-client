@@ -19,6 +19,7 @@ use std::time::Duration;
 type HmacSha256 = Hmac<Sha256>;
 
 const MAX_REMOTE_ARTIFACT_BYTES: u64 = 500 * 1024 * 1024;
+const MAX_REMOTE_STATUS_BYTES: u64 = 64 * 1024;
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 const ARTIFACT_TAG_HEADER: &str = "x-artifact-tag";
 const ARTIFACT_SHA_HEADER: &str = "x-artifact-sha";
@@ -134,21 +135,46 @@ pub fn try_store(
 pub fn status_for_project(
     project_dir: &Path,
     session: Option<Arc<lpm_auth::SessionManager>>,
-) -> CacheStatus {
+) -> Result<CacheStatus, LpmError> {
     let root = LpmRoot::from_env().ok();
     let local_path = root
         .as_ref()
         .map_or_else(|| PathBuf::from("~/.lpm/cache/tasks"), LpmRoot::cache_tasks);
-    let local_bytes = crate::commands::cache::dir_size(&local_path).unwrap_or(0);
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .ok()
-        .flatten();
-    let remote = remote_status(lpm_config.as_ref(), session);
+        .map_err(|error| LpmError::Task(format!("cache status: {error}")))?;
+    if !remote_cache_requested(lpm_config.as_ref()) {
+        let local_bytes = local_task_cache_size(&local_path)?;
+        return Ok(CacheStatus {
+            local_path,
+            local_bytes,
+            remote: remote_status(lpm_config.as_ref(), session),
+        });
+    }
 
-    CacheStatus {
-        local_path,
-        local_bytes,
-        remote,
+    let local_worker_path = local_path.clone();
+    std::thread::scope(|scope| {
+        let local = scope.spawn(move || local_task_cache_size(&local_worker_path));
+        let remote = remote_status(lpm_config.as_ref(), session);
+        let local_bytes = local
+            .join()
+            .map_err(|_| LpmError::Task("cache status local sizing worker panicked".into()))??;
+
+        Ok(CacheStatus {
+            local_path,
+            local_bytes,
+            remote,
+        })
+    })
+}
+
+fn local_task_cache_size(path: &Path) -> Result<u64, LpmError> {
+    match crate::commands::cache::dir_size(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(LpmError::Task(format!(
+            "failed to inspect local task cache at {}: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -790,9 +816,8 @@ impl RemoteCacheClient {
             ));
         }
 
-        let body: serde_json::Value = response
-            .json()
-            .map_err(|e| format!("remote cache status returned invalid JSON: {e}"))?;
+        let content_length = response.content_length();
+        let body = decode_remote_status_body(response, content_length)?;
         Ok(FetchedRemoteStatus {
             status: body
                 .get("status")
@@ -808,6 +833,33 @@ impl RemoteCacheClient {
                 .and_then(serde_json::Value::as_u64),
         })
     }
+}
+
+fn decode_remote_status_body(
+    mut response: impl Read,
+    content_length: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    if content_length.is_some_and(|length| length > MAX_REMOTE_STATUS_BYTES) {
+        return Err(format!(
+            "remote cache status response exceeds the {} limit",
+            format_bytes(MAX_REMOTE_STATUS_BYTES)
+        ));
+    }
+    let initial_capacity = content_length.unwrap_or(0).min(MAX_REMOTE_STATUS_BYTES) as usize;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    response
+        .by_ref()
+        .take(MAX_REMOTE_STATUS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read remote cache status response: {error}"))?;
+    if bytes.len() as u64 > MAX_REMOTE_STATUS_BYTES {
+        return Err(format!(
+            "remote cache status response exceeds the {} limit",
+            format_bytes(MAX_REMOTE_STATUS_BYTES)
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("remote cache status returned invalid JSON: {error}"))
 }
 
 fn blocking_http_client() -> Result<Client, String> {
@@ -1111,6 +1163,32 @@ fn warn_once(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_status_body_accepts_valid_json_at_the_exact_size_limit() {
+        let prefix = br#"{"padding":""#;
+        let suffix = br#""}"#;
+        let padding = MAX_REMOTE_STATUS_BYTES as usize - prefix.len() - suffix.len();
+        let mut body = Vec::with_capacity(MAX_REMOTE_STATUS_BYTES as usize);
+        body.extend_from_slice(prefix);
+        body.resize(body.len() + padding, b'x');
+        body.extend_from_slice(suffix);
+
+        let decoded =
+            decode_remote_status_body(std::io::Cursor::new(body), Some(MAX_REMOTE_STATUS_BYTES))
+                .unwrap();
+
+        assert_eq!(decoded["padding"].as_str().unwrap().len(), padding);
+    }
+
+    #[test]
+    fn remote_status_body_rejects_chunked_content_past_the_size_limit() {
+        let body = vec![b'x'; MAX_REMOTE_STATUS_BYTES as usize + 1];
+
+        let error = decode_remote_status_body(std::io::Cursor::new(body), None).unwrap_err();
+
+        assert!(error.contains("exceeds"));
+    }
 
     #[test]
     fn invalid_active_registry_never_authorizes_a_remote_cache_origin() {

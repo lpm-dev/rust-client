@@ -298,12 +298,18 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // `cache prune --apply` walks every globally-installed package's
         // lockfile + sweeps deferred tombstones — the manifest must be
         // settled before either step runs.
-        Commands::Cache(args) if args.action == "prune" => true,
+        Commands::Cache(args)
+            if matches!(&args.action, commands::cache::CacheCmd::Prune { .. }) =>
+        {
+            true
+        }
         // Any `cache clean` invocation, regardless of subcategory.
         // Bare `cache clean` cleans metadata + tasks + dlx + mcp, so the dlx
         // dir is always in scope; the per-subcategory form trivially is
         // too.
-        Commands::Cache(args) => args.action == "clean",
+        Commands::Cache(args) => {
+            matches!(&args.action, commands::cache::CacheCmd::Clean { .. })
+        }
         // Doctor is diagnostic unless the user explicitly selects one of its
         // catalogued fixes. Pre-dispatch recovery would mutate global state
         // before Doctor can report it and before fix consent is collected.

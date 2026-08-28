@@ -2940,18 +2940,20 @@ impl Store {
 
     pub fn file_cas_prune_plan(
         &self,
-        objects_to_remove: &std::collections::HashSet<PathBuf>,
+        objects_to_remove: &[PathBuf],
     ) -> Result<Option<crate::v3::FileCasPrunePlan>, LpmError> {
         let Some(cas) = &self.file_cas else {
             return Ok(None);
         };
-        let mut reachable_trees = std::collections::HashSet::new();
+        let objects_to_remove = objects_to_remove
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<std::collections::HashSet<_>>();
+        let mut reachable_trees = std::collections::HashMap::new();
         let mut reachable_blobs = std::collections::HashSet::new();
-        let mut reachable_materialized = std::collections::HashSet::new();
-        let mut live_source_records = std::collections::HashSet::new();
-        let mut live_source_validations = std::collections::HashSet::new();
+        let mut live_source_digests = std::collections::HashSet::new();
         for (object_dir, _) in self.iter_object_dirs()? {
-            if objects_to_remove.contains(&object_dir) {
+            if objects_to_remove.contains(object_dir.as_path()) {
                 continue;
             }
             let source_sri =
@@ -2961,50 +2963,48 @@ impl Store {
                         object_dir.display()
                     ))
                 })?;
-            let (record, manifest) =
-                cas.source_manifest_for_verify(&object_dir, source_sri.trim())?;
-            reachable_trees.insert(cas.tree_manifest_path(&record.tree_digest)?);
-            reachable_materialized.insert(cas.materialized_entry_dir(&record.tree_digest)?);
-            live_source_records.insert(cas.source_record_path(source_sri.trim())?);
-            live_source_validations.insert(cas.source_validation_path(source_sri.trim())?);
-            for blob in manifest
-                .entries
-                .iter()
-                .filter_map(|entry| entry.blob.as_ref())
-            {
-                reachable_blobs.insert(cas.blob_path(blob)?);
+            let source_sri = source_sri.trim();
+            let record = cas.source_record_for_prune(&object_dir, source_sri)?;
+            live_source_digests.insert(blake3::hash(source_sri.as_bytes()).to_hex().to_string());
+            if let Some(allows_symlinks) = reachable_trees.get(&record.tree_digest) {
+                if record.local_source != *allows_symlinks {
+                    return Err(LpmError::Store(format!(
+                        "v3 CAS source/tree symlink policy mismatch for {}",
+                        record.source_sri
+                    )));
+                }
+                continue;
             }
+            let manifest = cas.manifest_for_prune(&record.tree_digest)?;
+            if record.local_source != manifest.allows_symlinks {
+                return Err(LpmError::Store(format!(
+                    "invalid v3 CAS tree manifest for {}",
+                    object_dir.display()
+                )));
+            }
+            for blob in manifest.entries.into_iter().filter_map(|entry| entry.blob) {
+                reachable_blobs.insert(cas.blob_path(&blob)?);
+            }
+            reachable_trees.insert(record.tree_digest, record.local_source);
         }
 
-        let tree_files = cas.tree_manifest_files()?;
-        let blob_files = cas.blob_files()?;
-        let source_record_files = cas.source_record_files()?;
-        let source_validation_files = cas.source_validation_files()?;
-        let materialized_entries = cas.materialized_entry_dirs()?;
+        let (trees_total, tree_files_orphaned) = cas.prune_tree_inventory(&reachable_trees)?;
+        let (blobs_total, blob_files_orphaned) = cas.prune_blob_inventory(&reachable_blobs)?;
+        let (_, source_record_files_orphaned) =
+            cas.prune_source_record_inventory(&live_source_digests)?;
+        let (_, source_validation_files_orphaned) =
+            cas.prune_source_validation_inventory(&live_source_digests)?;
+        let (materialized_total, materialized_entries_orphaned) =
+            cas.prune_materialized_inventory(&reachable_trees)?;
         Ok(Some(crate::v3::FileCasPrunePlan {
-            trees_total: tree_files.len(),
-            tree_files_orphaned: tree_files
-                .into_iter()
-                .filter(|path| !reachable_trees.contains(path))
-                .collect(),
-            blobs_total: blob_files.len(),
-            blob_files_orphaned: blob_files
-                .into_iter()
-                .filter(|path| !reachable_blobs.contains(path))
-                .collect(),
-            source_record_files_orphaned: source_record_files
-                .into_iter()
-                .filter(|path| !live_source_records.contains(path))
-                .collect(),
-            source_validation_files_orphaned: source_validation_files
-                .into_iter()
-                .filter(|path| !live_source_validations.contains(path))
-                .collect(),
-            materialized_total: materialized_entries.len(),
-            materialized_entries_orphaned: materialized_entries
-                .into_iter()
-                .filter(|path| !reachable_materialized.contains(path))
-                .collect(),
+            trees_total,
+            tree_files_orphaned,
+            blobs_total,
+            blob_files_orphaned,
+            source_record_files_orphaned,
+            source_validation_files_orphaned,
+            materialized_total,
+            materialized_entries_orphaned,
         }))
     }
 
